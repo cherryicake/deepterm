@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    Styled, Window,
+    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
+    Styled, Subscription, Window,
 };
 use std::collections::HashMap;
 
@@ -72,6 +72,8 @@ pub struct Workspace {
     /// 下一个panel序号
     next_panel_id: usize,
     focus_handle: FocusHandle,
+    /// Panel事件订阅
+    panel_subscriptions: HashMap<String, Subscription>,
 }
 
 impl Workspace {
@@ -117,6 +119,7 @@ impl Workspace {
             next_tab_id: 3,
             next_panel_id: 3,
             focus_handle,
+            panel_subscriptions: HashMap::new(),
         });
 
         // 订阅所有面板的事件
@@ -183,10 +186,16 @@ impl Workspace {
         }
 
         for panel in panels {
-            cx.subscribe(&panel, |this, _panel, event: &PanelEvent, cx| {
-                this.handle_panel_event(event, cx);
-            })
-            .detach();
+            // 检查是否已经订阅过这个panel
+            let panel_id = panel.read(cx).panel_id().to_string();
+            let already_subscribed = self.panel_subscriptions.contains_key(&panel_id);
+
+            if !already_subscribed {
+                let subscription = cx.subscribe(&panel, |this, _panel, event: &PanelEvent, cx| {
+                    this.handle_panel_event(event, cx);
+                });
+                self.panel_subscriptions.insert(panel_id, subscription);
+            }
         }
     }
 
@@ -210,7 +219,105 @@ impl Workspace {
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
             }
+            PanelEvent::Close { panel_id } => {
+                println!("Panel {} close requested", panel_id);
+                self.handle_panel_close(panel_id, cx);
+            }
+            PanelEvent::Selected { panel_id } => {
+                println!("Panel {} selected event received in workspace", panel_id);
+                self.handle_panel_selected(panel_id, cx);
+            }
         }
+    }
+
+    /// 处理panel选中事件 - 确保同一组只有一个panel被选中
+    fn handle_panel_selected(&mut self, selected_panel_id: &str, cx: &mut Context<Self>) {
+        let active_tab_id = self.active_tab_id.clone();
+
+        // 获取当前活动的tab信息
+        let Some(tab_info) = self.tabs.get(&active_tab_id) else {
+            println!("Active tab {} not found", active_tab_id);
+            return;
+        };
+
+        // 获取该tab下的所有panel
+        let panels = tab_info.container.collect_panels_vec();
+
+        println!("Found {} panels in current tab", panels.len());
+        for panel in &panels {
+            let panel_id = panel.read(cx).panel_id().to_string();
+            let is_selected = panel.read(cx).is_selected();
+            println!("  Panel {}: selected={}", panel_id, is_selected);
+        }
+
+        // 取消其他panel的选中状态，设置当前panel为选中
+        for panel in panels {
+            panel.update(cx, |p, cx| {
+                let should_be_selected = p.panel_id() == selected_panel_id;
+                println!(
+                    "  Updating panel {}: should_be_selected={}",
+                    p.panel_id(),
+                    should_be_selected
+                );
+                if p.is_selected() != should_be_selected {
+                    p.set_selected(should_be_selected, cx);
+                }
+            });
+        }
+
+        cx.notify();
+        println!(
+            "Panel {} is now selected, others deselected",
+            selected_panel_id
+        );
+    }
+
+    /// 处理关闭panel事件
+    fn handle_panel_close(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        let active_tab_id = self.active_tab_id.clone();
+
+        // 获取当前活动的tab信息
+        let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
+            println!("Active tab {} not found", active_tab_id);
+            return;
+        };
+
+        // 从container中移除指定的panel
+        let new_container = tab_info.container.remove_panel(panel_id, cx);
+
+        // 更新container
+        tab_info.container = new_container;
+
+        // 如果移除后只剩一个panel，更新tab类型为Normal
+        let panel_count = tab_info.container.panel_count();
+        if panel_count == 1 && tab_info.tab_type == TabType::Workspace {
+            tab_info.tab_type = TabType::Normal;
+
+            // 更新TabBar显示
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                let tabs: Vec<TabItem> = tab_bar
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        if t.id == active_tab_id {
+                            TabItem::new(&active_tab_id, &tab_info.label)
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+                tab_bar.set_tabs(tabs, cx);
+            });
+        }
+
+        // 重新订阅所有panel
+        self.subscribe_to_panels(cx);
+
+        cx.notify();
+        println!(
+            "Panel {} closed, remaining panels: {}",
+            panel_id, panel_count
+        );
     }
 
     /// 处理tab拖拽到panel上的事件
@@ -252,14 +359,14 @@ impl Workspace {
         // 获取被拖拽的container
         let dragged_container = dragged_tab_info.container;
 
+        // 先获取被拖入的panels（在dragged_container被move之前）
+        let dragged_panels = dragged_container.collect_panels_vec();
+
         // 在目标container中找到目标panel并进行分割
-        let new_container = Self::split_container_at_panel(
-            &target_tab_info.container,
-            target_panel_id,
-            placement,
-            dragged_container,
-            cx,
-        );
+        let new_container =
+            target_tab_info
+                .container
+                .split_at(target_panel_id, placement, dragged_container, cx);
 
         // 更新目标tab为Workspace类型
         target_tab_info.container = new_container;
@@ -286,91 +393,20 @@ impl Workspace {
         // 重新订阅所有panel
         self.subscribe_to_panels(cx);
 
+        // 设置新拖入的panel为选中状态，其他panel取消选中
+        for panel in &dragged_panels {
+            let panel_id = panel.read(cx).panel_id().to_string();
+            // 延迟执行选中操作，确保panel已经添加到container中
+            let workspace_entity = cx.entity().clone();
+            cx.defer(move |cx| {
+                workspace_entity.update(cx, |workspace, cx| {
+                    workspace.handle_panel_selected(&panel_id, cx);
+                });
+            });
+        }
+
         cx.notify();
         println!("Tab merged into workspace: {}", target_tab_id);
-    }
-
-    /// 在container中找到指定panel并进行分割
-    fn split_container_at_panel(
-        container: &SplitContainer,
-        target_panel_id: &str,
-        placement: PanelPlacement,
-        new_container: SplitContainer,
-        cx: &App,
-    ) -> SplitContainer {
-        let direction = SplitDirection::from(placement);
-
-        match container {
-            SplitContainer::Panel(panel) => {
-                // 检查当前panel是否是目标panel
-                if panel.read(cx).panel_id() == target_panel_id {
-                    // 是目标panel，创建一个分割
-                    // 根据placement决定children的顺序
-                    // Left/Top: 新panel在前（左边/上边），目标panel在后
-                    // Right/Bottom: 目标panel在前，新panel在后（右边/下边）
-                    let children = match placement {
-                        PanelPlacement::Left | PanelPlacement::Top => {
-                            // 新panel在左边/上边
-                            vec![new_container, container.clone()]
-                        }
-                        PanelPlacement::Right | PanelPlacement::Bottom => {
-                            // 新panel在右边/下边
-                            vec![container.clone(), new_container]
-                        }
-                    };
-
-                    SplitContainer::Split {
-                        direction,
-                        children,
-                        sizes: vec![1.0, 1.0],
-                    }
-                } else {
-                    // 不是目标panel，保持原样
-                    container.clone()
-                }
-            }
-            SplitContainer::Split {
-                direction: dir,
-                children,
-                sizes,
-            } => {
-                // 在子容器中递归查找，只处理包含目标panel的那个
-                let new_children: Vec<SplitContainer> = children
-                    .iter()
-                    .map(|child| {
-                        // 检查这个子容器是否包含目标panel
-                        if Self::container_contains_panel(child, target_panel_id, cx) {
-                            Self::split_container_at_panel(
-                                child,
-                                target_panel_id,
-                                placement,
-                                new_container.clone(),
-                                cx,
-                            )
-                        } else {
-                            // 不包含目标panel，保持原样
-                            child.clone()
-                        }
-                    })
-                    .collect();
-
-                SplitContainer::Split {
-                    direction: *dir,
-                    children: new_children,
-                    sizes: sizes.clone(),
-                }
-            }
-        }
-    }
-
-    /// 检查container是否包含指定的panel
-    fn container_contains_panel(container: &SplitContainer, panel_id: &str, cx: &App) -> bool {
-        match container {
-            SplitContainer::Panel(panel) => panel.read(cx).panel_id() == panel_id,
-            SplitContainer::Split { children, .. } => children
-                .iter()
-                .any(|child| Self::container_contains_panel(child, panel_id, cx)),
-        }
     }
 
     /// 处理tab重新排序
@@ -471,7 +507,10 @@ impl Workspace {
     /// 递归渲染分割容器
     fn render_split_container(&self, container: &SplitContainer, cx: &Context<Self>) -> gpui::Div {
         match container {
-            SplitContainer::Panel(panel) => div().size_full().child(panel.clone()),
+            SplitContainer::Panel(panel) => {
+                // 为每个panel添加padding和圆角容器
+                div().size_full().child(panel.clone())
+            }
             SplitContainer::Split {
                 direction,
                 children,
@@ -482,6 +521,7 @@ impl Workspace {
                 div()
                     .size_full()
                     .flex()
+                    .gap(px(4.0))
                     .when(is_horizontal, |this| this.flex_row())
                     .when(!is_horizontal, |this| this.flex_col())
                     .children(children.iter().enumerate().map(|(i, child)| {
@@ -507,6 +547,17 @@ impl Render for Workspace {
             .get(&self.active_tab_id)
             .map(|tab_info| &tab_info.container);
 
+        // 更新所有panel的is_solo状态
+        if let Some(container) = active_container {
+            let panel_count = container.panel_count();
+            let panels = container.collect_panels_vec();
+            for panel in panels {
+                panel.update(cx, |p, cx| {
+                    p.set_solo(panel_count == 1, cx);
+                });
+            }
+        }
+
         div()
             .id("workspace")
             .size_full()
@@ -519,6 +570,9 @@ impl Render for Workspace {
             .child(
                 div()
                     .flex_1()
+                    .pl(px(4.0))
+                    .pr(px(4.0))
+                    .pb(px(4.0))
                     .when_some(active_container, |this, container| {
                         this.child(self.render_split_container(container, cx))
                     }),

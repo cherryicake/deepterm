@@ -239,42 +239,37 @@ impl Render for TabBar {
 
         div()
             .id("tab-bar")
-            .h(px(36.0))
+            .h(px(40.0))
             .w_full()
-            .bg(rgb(0x1e1e2e))
-            .border_b_1()
-            .border_color(rgb(0x2d2d44))
+            .bg(rgb(0x0f0f1a))
             .flex()
             .items_center()
+            .px(px(8.0))
+            .gap(px(4.0))
             .child(
                 // 标签列表
                 div()
                     .flex_1()
                     .flex()
                     .items_center()
+                    .gap(px(4.0))
                     .overflow_x_hidden()
                     .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                         let tab_id = tab.id.clone();
                         let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                         let label = tab.label.clone();
                         let is_modified = tab.is_modified;
-                        let tabs_count = self.tabs.len();
 
                         div()
                             .id(tab_id.clone())
-                            .h(px(36.0))
-                            .px(px(16.0))
+                            .h(px(28.0))
+                            .px(px(12.0))
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
-                            .border_b_2()
-                            .border_color(if is_active {
-                                rgb(0x6c5ce7)
-                            } else {
-                                rgb(0x000000)
-                            })
+                            .gap(px(6.0))
+                            .rounded(px(6.0))
                             .bg(if is_active {
-                                rgb(0x252538)
+                                rgb(0x2d2d44)
                             } else {
                                 rgb(0x1e1e2e)
                             })
@@ -339,15 +334,15 @@ impl Render for TabBar {
                             )
                             .child(
                                 div()
-                                    .w(px(16.0))
-                                    .h(px(16.0))
+                                    .w(px(14.0))
+                                    .h(px(14.0))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .rounded_full()
-                                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                                    .hover(|style| style.bg(rgb(0x2d2d44)))
                                     .cursor_pointer()
-                                    .text_color(rgb(0x8888aa))
+                                    .text_color(rgb(0x666688))
                                     .text_xs()
                                     .child(if is_modified { "●" } else { "×" })
                                     .on_mouse_down(
@@ -378,14 +373,16 @@ impl Render for TabBar {
             .child(
                 // 新建标签按钮
                 div()
-                    .w(px(36.0))
-                    .h_full()
+                    .w(px(28.0))
+                    .h(px(28.0))
                     .flex()
                     .items_center()
                     .justify_center()
+                    .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x252538)))
-                    .child(div().text_color(rgb(0x8888aa)).child("+"))
+                    .bg(rgb(0x1e1e2e))
+                    .hover(|style| style.bg(rgb(0x2d2d44)))
+                    .child(div().text_color(rgb(0x666688)).child("+"))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {

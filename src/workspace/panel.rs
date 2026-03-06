@@ -1,9 +1,13 @@
 use gpui::{
-    div, prelude::*, rgb, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window,
+    div, prelude::*, px, rgb, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
+    Render, SharedString, Styled, Window,
 };
 
 use crate::components::tab_bar::DraggedTab;
+
+/// 拖拽阈值常量
+const DRAG_THRESHOLD_START: f32 = 0.35;
+const DRAG_THRESHOLD_END: f32 = 0.65;
 
 /// 面板放置位置
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +37,10 @@ pub enum PanelEvent {
         panel_id: String,
         tab_id: SharedString,
     },
+    /// 关闭panel事件
+    Close { panel_id: String },
+    /// 选中状态变更事件
+    Selected { panel_id: String },
 }
 
 /// 单个面板视图 - 只包含内容区域，不包含TabBar
@@ -46,6 +54,10 @@ pub struct Panel {
     active_tab_id: Option<SharedString>,
     /// 关联的 workspace_id
     workspace_id: String,
+    /// 是否是工作区中唯一的panel（不渲染边框）
+    is_solo: bool,
+    /// 是否被选中（点击后边框加深）
+    is_selected: bool,
 }
 
 impl Panel {
@@ -68,6 +80,8 @@ impl Panel {
             focus_handle: cx.focus_handle(),
             drag_preview: None,
             active_tab_id,
+            is_solo: false,
+            is_selected: false,
         }
     }
 
@@ -82,6 +96,28 @@ impl Panel {
     /// 设置关联的 workspace_id
     pub fn set_workspace_id(&mut self, workspace_id: impl Into<String>) {
         self.workspace_id = workspace_id.into();
+    }
+
+    /// 设置是否为唯一的panel
+    pub fn set_solo(&mut self, is_solo: bool, cx: &mut Context<Self>) {
+        self.is_solo = is_solo;
+        cx.notify();
+    }
+
+    /// 获取是否为唯一的panel
+    pub fn is_solo(&self) -> bool {
+        self.is_solo
+    }
+
+    /// 设置选中状态
+    pub fn set_selected(&mut self, is_selected: bool, cx: &mut Context<Self>) {
+        self.is_selected = is_selected;
+        cx.notify();
+    }
+
+    /// 获取选中状态
+    pub fn is_selected(&self) -> bool {
+        self.is_selected
     }
 
     /// 获取活动 tab ID
@@ -109,13 +145,13 @@ impl Panel {
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<PanelPlacement> {
         // 使用 gpui-component 的方式：35%/65% 阈值
-        if position.x < bounds.left() + bounds.size.width * 0.35 {
+        if position.x < bounds.left() + bounds.size.width * DRAG_THRESHOLD_START {
             Some(PanelPlacement::Left)
-        } else if position.x > bounds.left() + bounds.size.width * 0.65 {
+        } else if position.x > bounds.left() + bounds.size.width * DRAG_THRESHOLD_END {
             Some(PanelPlacement::Right)
-        } else if position.y < bounds.top() + bounds.size.height * 0.35 {
+        } else if position.y < bounds.top() + bounds.size.height * DRAG_THRESHOLD_START {
             Some(PanelPlacement::Top)
-        } else if position.y > bounds.top() + bounds.size.height * 0.65 {
+        } else if position.y > bounds.top() + bounds.size.height * DRAG_THRESHOLD_END {
             Some(PanelPlacement::Bottom)
         } else {
             None
@@ -131,128 +167,224 @@ impl Focusable for Panel {
 
 impl EventEmitter<PanelEvent> for Panel {}
 
+impl Panel {
+    /// 渲染标题栏
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel_id = self.panel_id.clone();
+        let active_tab_id = self.active_tab_id.clone();
+
+        div()
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                // 标题
+                div().text_sm().text_color(rgb(0x8888aa)).child(
+                    active_tab_id
+                        .as_ref()
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "Panel".to_string()),
+                ),
+            )
+            .child(
+                // 关闭按钮
+                div()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                    .cursor_pointer()
+                    .text_color(rgb(0x666688))
+                    .text_xs()
+                    .child("×")
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener({
+                            let panel_id = panel_id.clone();
+                            move |_this, _event, _window, cx| {
+                                println!("Panel {} close button clicked", panel_id);
+                                cx.emit(PanelEvent::Close {
+                                    panel_id: panel_id.clone(),
+                                });
+                            }
+                        }),
+                    ),
+            )
+    }
+
+    /// 渲染内容区域
+    fn render_content(&self) -> impl IntoElement {
+        div().flex_1().flex().items_center().justify_center().child(
+            self.active_tab_id
+                .as_ref()
+                .map(|id| format!("Panel: {} | Tab: {}", self.panel_id, id))
+                .unwrap_or_else(|| format!("Panel: {}", self.panel_id)),
+        )
+    }
+
+    /// 渲染拖拽预览层
+    fn render_drag_preview(&self) -> Option<impl IntoElement> {
+        self.drag_preview.map(|preview| {
+            div()
+                .absolute()
+                .bg(rgb(0x6c5ce7))
+                .rounded(px(8.0))
+                .map(|div| match preview {
+                    PanelPlacement::Left => div
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(gpui::DefiniteLength::Fraction(0.5)),
+                    PanelPlacement::Right => div
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(gpui::DefiniteLength::Fraction(0.5)),
+                    PanelPlacement::Top => div
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(gpui::DefiniteLength::Fraction(0.5)),
+                    PanelPlacement::Bottom => div
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(gpui::DefiniteLength::Fraction(0.5)),
+                })
+        })
+    }
+
+    /// 处理拖拽移动事件
+    fn handle_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedTab>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = event.bounds;
+        let position = event.event.position;
+
+        // 检查鼠标是否还在内容区域内
+        let is_inside = position.x >= bounds.left()
+            && position.x <= bounds.right()
+            && position.y >= bounds.top()
+            && position.y <= bounds.bottom();
+
+        if !is_inside {
+            // 鼠标离开内容区域，清除预览
+            if self.drag_preview.is_some() {
+                self.drag_preview = None;
+                println!(
+                    "Panel {} drag preview cleared (left content)",
+                    self.panel_id
+                );
+                cx.emit(PanelEvent::DragPreview {
+                    panel_id: self.panel_id.clone(),
+                    placement: None,
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        let preview = self.calculate_placement(&bounds, position);
+
+        if preview != self.drag_preview {
+            self.drag_preview = preview;
+            println!("Panel {} drag preview: {:?}", self.panel_id, preview);
+
+            // 发送事件给父组件
+            cx.emit(PanelEvent::DragPreview {
+                panel_id: self.panel_id.clone(),
+                placement: preview,
+            });
+
+            cx.notify();
+        }
+    }
+
+    /// 处理放置事件
+    fn handle_drop(&mut self, dragged: &DraggedTab, cx: &mut Context<Self>) {
+        println!(
+            "Panel {} on_drop called, preview={:?}",
+            self.panel_id, self.drag_preview
+        );
+
+        // 如果有preview就使用它，否则默认使用Right
+        let placement = self.drag_preview.unwrap_or(PanelPlacement::Right);
+        println!("Panel {} drop: {:?}", self.panel_id, placement);
+
+        // 发送放置事件
+        cx.emit(PanelEvent::Drop {
+            panel_id: self.panel_id.clone(),
+            dragged_tab: dragged.clone(),
+            placement,
+        });
+
+        self.drag_preview = None;
+        cx.notify();
+    }
+}
+
 impl Render for Panel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _panel_id = self.panel_id.clone();
+        let is_solo = self.is_solo;
+        let is_selected = self.is_selected;
 
         div()
             .id(format!("panel-{}", self.panel_id))
             .size_full()
-            .bg(rgb(0x1e1e2e))
-            .border_1()
-            .border_color(rgb(0x2d2d44))
-            .relative()
-            // 内容区域背景
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        self.active_tab_id
-                            .as_ref()
-                            .map(|id| format!("Panel: {} | Tab: {}", self.panel_id, id))
-                            .unwrap_or_else(|| format!("Panel: {}", self.panel_id)),
-                    ),
+            .bg(rgb(0x0f0f1a))
+            .when(!is_solo, |this| {
+                // 选中时边框颜色加深，未选中时使用浅色边框
+                let border_color = if is_selected {
+                    rgb(0x5d5d7c) // 浅色边框（选中状态）
+                } else {
+                    rgb(0x2d2d44) // 深色边框（未选中状态）
+                };
+                this.border_1().border_color(border_color)
+            })
+            .rounded(px(8.0))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // 点击选中panel - 发送事件给Workspace统一管理
+            .on_click(
+                cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
+                    if !this.is_selected {
+                        println!("Panel {} clicked, requesting selection", this.panel_id);
+                        cx.emit(PanelEvent::Selected {
+                            panel_id: this.panel_id.clone(),
+                        });
+                    }
+                }),
             )
+            // 标题栏 - 只在非solo状态下显示
+            .when(!is_solo, |this| this.child(self.render_title_bar(cx)))
+            // 内容区域
+            .child(self.render_content())
             // 渲染拖拽预览层
             .when(self.drag_preview.is_some(), |this| {
-                let preview = self.drag_preview.unwrap();
-                this.child(div().absolute().bg(rgb(0x6c5ce7)).map(|div| {
-                    match preview {
-                        PanelPlacement::Left => div
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(gpui::DefiniteLength::Fraction(0.5)),
-                        PanelPlacement::Right => div
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(gpui::DefiniteLength::Fraction(0.5)),
-                        PanelPlacement::Top => div
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h(gpui::DefiniteLength::Fraction(0.5)),
-                        PanelPlacement::Bottom => div
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .h(gpui::DefiniteLength::Fraction(0.5)),
-                    }
-                }))
+                if let Some(preview) = self.render_drag_preview() {
+                    this.child(preview)
+                } else {
+                    this
+                }
             })
             // 拖拽检测
-            .on_drag_move::<DraggedTab>(cx.listener(
-                move |this, event: &gpui::DragMoveEvent<DraggedTab>, _window, cx| {
-                    let bounds = event.bounds;
-                    let position = event.event.position;
-
-                    // 检查鼠标是否还在内容区域内
-                    let is_inside = position.x >= bounds.left()
-                        && position.x <= bounds.right()
-                        && position.y >= bounds.top()
-                        && position.y <= bounds.bottom();
-
-                    if !is_inside {
-                        // 鼠标离开内容区域，清除预览
-                        if this.drag_preview.is_some() {
-                            this.drag_preview = None;
-                            println!(
-                                "Panel {} drag preview cleared (left content)",
-                                this.panel_id
-                            );
-                            cx.emit(PanelEvent::DragPreview {
-                                panel_id: this.panel_id.clone(),
-                                placement: None,
-                            });
-                            cx.notify();
-                        }
-                        return;
-                    }
-
-                    let preview = this.calculate_placement(&bounds, position);
-
-                    if preview != this.drag_preview {
-                        this.drag_preview = preview;
-                        println!("Panel {} drag preview: {:?}", this.panel_id, preview);
-
-                        // 发送事件给父组件
-                        cx.emit(PanelEvent::DragPreview {
-                            panel_id: this.panel_id.clone(),
-                            placement: preview,
-                        });
-
-                        cx.notify();
-                    }
-                },
-            ))
+            .on_drag_move::<DraggedTab>(cx.listener(move |this, event, _window, cx| {
+                this.handle_drag_move(event, cx);
+            }))
             // 放置处理
-            .on_drop(cx.listener(move |this, dragged: &DraggedTab, _window, cx| {
-                println!(
-                    "Panel {} on_drop called, preview={:?}",
-                    this.panel_id, this.drag_preview
-                );
-
-                // 如果有preview就使用它，否则默认使用Right
-                let placement = this.drag_preview.unwrap_or(PanelPlacement::Right);
-                println!("Panel {} drop: {:?}", this.panel_id, placement);
-
-                // 发送放置事件
-                cx.emit(PanelEvent::Drop {
-                    panel_id: this.panel_id.clone(),
-                    dragged_tab: dragged.clone(),
-                    placement,
-                });
-
-                this.drag_preview = None;
-                cx.notify();
+            .on_drop(cx.listener(move |this, dragged, _window, cx| {
+                this.handle_drop(dragged, cx);
             }))
             // 添加一个通用的on_drop来捕获任何类型的拖拽
-            .on_drop(cx.listener(move |this, _dragged: &(), _window, cx| {
+            .on_drop(cx.listener(move |this, _dragged: &(), _window, _cx| {
                 println!("Panel {} received generic drop event", this.panel_id);
             }))
     }

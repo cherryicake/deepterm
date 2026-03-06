@@ -110,6 +110,16 @@ impl SplitContainer {
         }
     }
 
+    /// 计算容器中的panel数量
+    pub fn panel_count(&self) -> usize {
+        match self {
+            SplitContainer::Panel(_) => 1,
+            SplitContainer::Split { children, .. } => {
+                children.iter().map(|c| c.panel_count()).sum()
+            }
+        }
+    }
+
     /// 分割面板
     pub fn split_panel(
         &mut self,
@@ -143,6 +153,125 @@ impl SplitContainer {
                     }
                 }
                 false
+            }
+        }
+    }
+
+    /// 从容器中移除指定的panel
+    /// 返回新的容器，如果移除后只剩一个子容器，则提升该子容器
+    pub fn remove_panel(&self, panel_id: &str, cx: &App) -> Self {
+        match self {
+            SplitContainer::Panel(panel) => {
+                if panel.read(cx).panel_id() == panel_id {
+                    // 找到了要移除的panel，返回克隆（调用者应该处理这种情况）
+                    self.clone()
+                } else {
+                    self.clone()
+                }
+            }
+            SplitContainer::Split {
+                direction,
+                children,
+                sizes,
+            } => {
+                let mut new_children = Vec::new();
+                let mut new_sizes = Vec::new();
+
+                for (i, child) in children.iter().enumerate() {
+                    // 检查这个child是否包含要移除的panel
+                    if let SplitContainer::Panel(p) = child {
+                        if p.read(cx).panel_id() == panel_id {
+                            // 跳过这个panel
+                            continue;
+                        }
+                    }
+
+                    let new_child = child.remove_panel(panel_id, cx);
+                    new_children.push(new_child);
+                    if let Some(size) = sizes.get(i) {
+                        new_sizes.push(*size);
+                    }
+                }
+
+                // 如果只剩一个子容器，提升它
+                if new_children.len() == 1 {
+                    new_children[0].clone()
+                } else {
+                    SplitContainer::Split {
+                        direction: *direction,
+                        children: new_children,
+                        sizes: new_sizes,
+                    }
+                }
+            }
+        }
+    }
+
+    /// 在指定位置分割容器
+    /// 在target_panel_id对应的panel处，按照placement方向插入new_container
+    pub fn split_at(
+        &self,
+        target_panel_id: &str,
+        placement: PanelPlacement,
+        new_container: Self,
+        cx: &App,
+    ) -> Self {
+        let direction = SplitDirection::from(placement);
+
+        match self {
+            SplitContainer::Panel(panel) => {
+                if panel.read(cx).panel_id() == target_panel_id {
+                    // 找到目标panel，创建新的split
+                    let children = match placement {
+                        PanelPlacement::Left | PanelPlacement::Top => {
+                            vec![new_container, self.clone()]
+                        }
+                        PanelPlacement::Right | PanelPlacement::Bottom => {
+                            vec![self.clone(), new_container]
+                        }
+                    };
+
+                    SplitContainer::Split {
+                        direction,
+                        children,
+                        sizes: vec![1.0, 1.0],
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            SplitContainer::Split {
+                direction: dir,
+                children,
+                sizes,
+            } => {
+                // 在子容器中递归查找
+                let new_children: Vec<SplitContainer> = children
+                    .iter()
+                    .map(|child| {
+                        if child.contains_panel(target_panel_id, cx) {
+                            child.split_at(target_panel_id, placement, new_container.clone(), cx)
+                        } else {
+                            child.clone()
+                        }
+                    })
+                    .collect();
+
+                SplitContainer::Split {
+                    direction: *dir,
+                    children: new_children,
+                    sizes: sizes.clone(),
+                }
+            }
+        }
+    }
+
+    /// 检查容器是否包含指定的panel
+    pub fn contains_panel(&self, panel_id: &str, cx: &App) -> bool {
+        match self {
+            SplitContainer::Panel(panel) => panel.read(cx).panel_id() == panel_id,
+            SplitContainer::Split { children, .. } => {
+                children.iter().any(|c| c.contains_panel(panel_id, cx))
             }
         }
     }
