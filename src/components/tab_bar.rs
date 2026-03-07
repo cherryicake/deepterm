@@ -46,14 +46,12 @@ impl Render for DragPreview {
             .flex()
             .items_center()
             .rounded(px(6.0))
-            .bg(rgb(0x2d2d44))
-            .border_1()
-            .border_color(rgb(0x6c5ce7))
+            .bg(rgb(0x3d3d5c))
             .shadow_md()
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgb(0x8888aa))
                     .child(self.tab_label.clone()),
             )
     }
