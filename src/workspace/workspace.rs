@@ -175,6 +175,20 @@ impl Workspace {
                 });
             });
         });
+
+        let workspace_entity = cx.entity().clone();
+        self.tab_bar.update(cx, |tab_bar, _cx| {
+            // 设置tab关闭事件
+            tab_bar.on_tab_close(move |tab_id, cx| {
+                let id = tab_id.to_string();
+                let ws_entity = workspace_entity.clone();
+                cx.defer(move |cx| {
+                    ws_entity.update(cx, |workspace, cx| {
+                        workspace.handle_tab_close(&id, cx);
+                    });
+                });
+            });
+        });
     }
 
     /// 订阅所有面板的事件
@@ -502,6 +516,35 @@ impl Workspace {
         self.switch_to_tab(&new_tab_id, cx);
 
         println!("New tab created: {}", new_tab_id);
+    }
+
+    /// 处理关闭tab事件
+    fn handle_tab_close(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        println!("Closing tab: {}", tab_id);
+
+        // 从tabs中移除
+        self.tabs.remove(tab_id);
+
+        // 从TabBar中移除
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.remove_tab(tab_id, cx);
+        });
+
+        // 如果关闭的是当前活动tab，切换到其他tab
+        if self.active_tab_id == tab_id {
+            // 尝试切换到第一个可用的tab
+            if let Some(first_tab_id) = self.tabs.keys().next().cloned() {
+                self.active_tab_id = first_tab_id.clone();
+                self.switch_to_tab(&first_tab_id, cx);
+            } else {
+                // 没有tab了，退出应用程序
+                println!("No more tabs, quitting application");
+                cx.quit();
+            }
+        }
+
+        cx.notify();
+        println!("Tab {} closed", tab_id);
     }
 
     /// 递归渲染分割容器
