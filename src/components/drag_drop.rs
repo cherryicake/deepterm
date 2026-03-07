@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels,
-    Render, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div,
+    prelude::*, px, rgb,
 };
 
 /// 拖拽状态

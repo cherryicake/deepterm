@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, prelude::*, px,
+    rgb,
 };
 use std::time::Duration;
 

@@ -4,12 +4,13 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId, Entity,
-    FocusHandle, Font, FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement,
-    LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace, Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
+    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
+use crate::terminal_view::terminal_view::TerminalView;
 
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug)]
@@ -84,6 +85,7 @@ pub struct TerminalElement {
     focus: FocusHandle,
     focused: bool,
     cursor_visible: bool,
+    view: Entity<TerminalView>,
 }
 
 impl TerminalElement {
@@ -93,12 +95,14 @@ impl TerminalElement {
         focus: FocusHandle,
         focused: bool,
         cursor_visible: bool,
+        view: Entity<TerminalView>,
     ) -> Self {
         Self {
             terminal,
             focus,
             focused,
             cursor_visible,
+            view,
         }
     }
 
@@ -120,7 +124,7 @@ impl TerminalElement {
             row_cells[cell.row].push(cell);
         }
 
-        for (row_idx, row) in row_cells.iter().enumerate() {
+        for (_row_idx, row) in row_cells.iter().enumerate() {
             // Flush any existing batch at line boundaries
             if let Some(batch) = current_batch.take() {
                 batched_runs.push(batch);
@@ -357,5 +361,12 @@ impl Element for TerminalElement {
                 ));
             }
         }
+
+        // Register input handler for IME support
+        window.handle_input(
+            &self.focus,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
     }
 }

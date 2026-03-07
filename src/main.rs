@@ -7,7 +7,7 @@ pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
 
-use gpui::{size, App, Bounds, WindowOptions};
+use gpui::{App, Bounds, WindowOptions, size};
 use gpui_platform::application;
 
 use workspace::workspace::Workspace;

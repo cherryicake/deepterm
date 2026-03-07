@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable,
-    IntoElement, Render, Window,
+    AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
+    div, prelude::*, px, rgb,
 };
 
 /// 分割方向

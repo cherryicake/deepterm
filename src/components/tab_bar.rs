@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels,
-    Point, Render, SharedString, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Point, Render, SharedString,
+    Window, div, prelude::*, px, rgb,
 };
 use std::sync::Arc;
 

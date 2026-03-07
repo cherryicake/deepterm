@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    SharedString, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    prelude::*, px, rgb,
 };
 
 use crate::terminal_view::terminal_view::TerminalView;

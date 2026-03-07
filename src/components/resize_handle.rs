@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement,
-    Pixels, Render, Window,
+    App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div,
+    prelude::*, px, rgb,
 };
 
 /// 可调整大小的拖拽句柄

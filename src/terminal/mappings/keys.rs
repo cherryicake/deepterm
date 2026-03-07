@@ -2,7 +2,7 @@
 //!
 //! Maps GPUI keystrokes to terminal escape sequences
 
-use gpui::{KeyBinding, Keystroke, Modifiers};
+use gpui::{Keystroke, Modifiers};
 
 /// Convert a keystroke to terminal input bytes
 pub fn keystroke_to_bytes(
@@ -10,6 +10,14 @@ pub fn keystroke_to_bytes(
     _modifiers: &Modifiers,
     _mode: TermMode,
 ) -> Option<Vec<u8>> {
+    // First check key_char for IME input (Chinese, etc.)
+    // key_char contains the actual typed character including IME composition results
+    if let Some(ref key_char) = keystroke.key_char {
+        if !key_char.is_empty() {
+            return Some(key_char.as_bytes().to_vec());
+        }
+    }
+
     let key = keystroke.key.as_str();
 
     // Handle special keys
@@ -50,37 +58,50 @@ pub fn keystroke_to_bytes(
         }
     }
 
-    // Handle regular characters
-    if key.len() == 1 {
-        let mut bytes = vec![];
-        let ch = key.chars().next().unwrap();
+    // Handle regular characters and multi-byte Unicode characters
+    // Check if the key is a single character (could be multi-byte in UTF-8)
+    let mut chars = key.chars();
+    if let Some(ch) = chars.next() {
+        // Make sure there's only one character
+        if chars.next().is_none() {
+            let mut bytes = vec![];
 
-        // Handle Ctrl+key combinations
-        if keystroke.modifiers.control {
-            if ch.is_ascii_alphabetic() {
-                bytes.push((ch as u8) & 0x1f);
-                return Some(bytes);
+            // Handle Ctrl+key combinations
+            if keystroke.modifiers.control {
+                if ch.is_ascii_alphabetic() {
+                    // Ctrl+A = 0x01, Ctrl+B = 0x02, etc.
+                    // For uppercase letters, we still send the control code
+                    // (same as lowercase in terminal)
+                    let lower = ch.to_ascii_lowercase();
+                    bytes.push((lower as u8) & 0x1f);
+                    return Some(bytes);
+                }
+                match ch {
+                    '2' | '@' | ' ' => bytes.push(0),
+                    '3' | '[' => bytes.push(0x1b),
+                    '4' | '\\' => bytes.push(0x1c),
+                    '5' | ']' => bytes.push(0x1d),
+                    '6' | '^' => bytes.push(0x1e),
+                    '7' | '_' | '/' => bytes.push(0x1f),
+                    '8' | '?' => bytes.push(0x7f),
+                    _ => {}
+                }
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
             }
-            match ch {
-                '2' | '@' | ' ' => bytes.push(0),
-                '3' | '[' => bytes.push(0x1b),
-                '4' | '\\' => bytes.push(0x1c),
-                '5' | ']' => bytes.push(0x1d),
-                '6' | '^' => bytes.push(0x1e),
-                '7' | '_' | '/' => bytes.push(0x1f),
-                '8' | '?' => bytes.push(0x7f),
-                _ => {}
+
+            // Handle Alt+key combinations (send ESC prefix)
+            if keystroke.modifiers.alt {
+                bytes.push(0x1b);
             }
-            if !bytes.is_empty() {
-                return Some(bytes);
-            }
+
+            // Regular character - UTF-8 encoding
+            let mut buf = [0; 4];
+            ch.encode_utf8(&mut buf);
+            bytes.extend_from_slice(&buf[..ch.len_utf8()]);
+            return Some(bytes);
         }
-
-        // Regular character
-        let mut buf = [0; 4];
-        ch.encode_utf8(&mut buf);
-        bytes.extend_from_slice(&buf[..ch.len_utf8()]);
-        return Some(bytes);
     }
 
     None

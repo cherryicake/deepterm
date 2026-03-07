@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    Styled, Subscription, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
+    Window, div, prelude::*, px, rgb,
 };
 use std::collections::HashMap;
 
