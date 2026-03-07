@@ -4,10 +4,9 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
-    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
-    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
-    Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
+    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
@@ -147,12 +146,11 @@ impl TerminalElement {
         }
     }
 
-    /// Layout the terminal grid into batched text runs with viewport culling and background merging
+    /// Layout the terminal grid into batched text runs with background merging
     fn layout_grid(
         cells: &[IndexedCell],
         text_style: &TextStyle,
         font_size: Pixels,
-        visible_rows: std::ops::Range<usize>,
     ) -> (Vec<BatchedTextRun>, Vec<BackgroundRegion>) {
         // Pre-allocate with estimated capacity to reduce reallocations
         let estimated_cells = cells.len();
@@ -166,11 +164,6 @@ impl TerminalElement {
         // Group cells by row
         let mut row_cells: Vec<Vec<&IndexedCell>> = Vec::new();
         for cell in cells {
-            // Viewport culling: skip cells outside visible range
-            if cell.row < visible_rows.start || cell.row >= visible_rows.end {
-                continue;
-            }
-
             if cell.row >= row_cells.len() {
                 row_cells.resize(cell.row + 1, Vec::new());
             }
@@ -407,16 +400,8 @@ impl Element for TerminalElement {
             (terminal.renderable_content(), terminal.renderable_cells())
         });
 
-        // Calculate visible row range for viewport culling
-        // Only render visible rows plus a small buffer to avoid flickering
-        let buffer_rows = 2usize;
-        let start_row = content.cursor.1.saturating_sub(buffer_rows);
-        let end_row = (content.cursor.1 + rows + buffer_rows).min(content.rows);
-        let visible_rows = start_row..end_row;
-
-        // Layout grid into batched runs with viewport culling
-        let (batched_runs, background_regions) =
-            Self::layout_grid(&cells, &text_style, font_size, visible_rows);
+        // Layout grid into batched runs with background merging
+        let (batched_runs, background_regions) = Self::layout_grid(&cells, &text_style, font_size);
 
         (
             content,
