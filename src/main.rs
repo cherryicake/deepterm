@@ -3,6 +3,8 @@
 pub mod components;
 pub mod layout;
 pub mod panels;
+pub mod terminal;
+pub mod terminal_view;
 pub mod workspace;
 
 use gpui::{size, App, Bounds, WindowOptions};

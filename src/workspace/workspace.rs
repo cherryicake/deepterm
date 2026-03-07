@@ -5,7 +5,8 @@ use gpui::{
 use std::collections::HashMap;
 
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::workspace::panel::{Panel, PanelEvent, PanelPlacement};
+use crate::terminal_view::terminal_view::TerminalView;
+use crate::workspace::panel::{Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 /// Tab类型
@@ -71,6 +72,8 @@ pub struct Workspace {
     next_tab_id: usize,
     /// 下一个panel序号
     next_panel_id: usize,
+    /// Local Terminal创建计数（用于生成标签名，只增不减）
+    local_terminal_count: usize,
     focus_handle: FocusHandle,
     /// Panel事件订阅
     panel_subscriptions: HashMap<String, Subscription>,
@@ -80,44 +83,35 @@ impl Workspace {
     pub fn new(cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
-        // 创建初始tabs（都是普通tab）
-        let initial_tab_items = vec![
-            TabItem::new("tab-0", "admin@server1"),
-            TabItem::new("tab-1", "root@db-server"),
-            TabItem::new("tab-2", "dev@localhost"),
-        ];
+        // 创建初始tab - 只有一个终端Tab
+        let initial_tab_items = vec![TabItem::new("tab-0", "Local Terminal")];
         let tab_bar = TabBar::new_with_tabs(cx, initial_tab_items);
 
-        // 初始化tabs信息，每个tab有自己的panel
+        // 初始化tabs信息
         let mut tabs = HashMap::new();
 
-        // tab-0 对应 panel-0
-        let panel_0 = cx.new(|cx| Panel::new("panel-0", "group-0", Some("tab-0".into()), cx));
+        // tab-0 对应 panel-0 - 使用终端
+        let panel_0 = cx.new(|cx| {
+            Panel::with_terminal(
+                "panel-0",
+                "group-0",
+                Some("tab-0".into()),
+                Some("Local Terminal".into()),
+                cx,
+            )
+        });
         tabs.insert(
             "tab-0".to_string(),
-            TabInfo::new_normal("tab-0", "admin@server1", panel_0),
-        );
-
-        // tab-1 对应 panel-1
-        let panel_1 = cx.new(|cx| Panel::new("panel-1", "group-0", Some("tab-1".into()), cx));
-        tabs.insert(
-            "tab-1".to_string(),
-            TabInfo::new_normal("tab-1", "root@db-server", panel_1),
-        );
-
-        // tab-2 对应 panel-2
-        let panel_2 = cx.new(|cx| Panel::new("panel-2", "group-0", Some("tab-2".into()), cx));
-        tabs.insert(
-            "tab-2".to_string(),
-            TabInfo::new_normal("tab-2", "dev@localhost", panel_2),
+            TabInfo::new_normal("tab-0", "Local Terminal", panel_0),
         );
 
         let workspace = cx.new(|_cx| Self {
             tab_bar,
             tabs,
             active_tab_id: "tab-0".to_string(),
-            next_tab_id: 3,
-            next_panel_id: 3,
+            next_tab_id: 1,
+            next_panel_id: 1,
+            local_terminal_count: 1, // 初始已经创建了1个Local Terminal
             focus_handle,
             panel_subscriptions: HashMap::new(),
         });
@@ -471,19 +465,22 @@ impl Workspace {
     /// 处理新建tab
     fn handle_new_tab(&mut self, cx: &mut Context<Self>) {
         let new_tab_id = format!("tab-{}", self.next_tab_id);
-        let new_tab_label = format!("new-tab@{}", self.next_tab_id);
         let new_panel_id = format!("panel-{}", self.next_panel_id);
         self.next_tab_id += 1;
         self.next_panel_id += 1;
 
+        // 生成Tab标签名：Local Terminal 或 Local Terminal[编号]
+        let new_tab_label = self.generate_terminal_tab_name();
+
         println!("Creating new tab: {} - {}", new_tab_id, new_tab_label);
 
-        // 创建新的panel
+        // 创建新的panel（默认创建终端Panel）
         let new_panel = cx.new(|cx| {
-            Panel::new(
+            Panel::with_terminal(
                 &new_panel_id,
                 "group-0",
                 Some(new_tab_id.clone().into()),
+                Some(new_tab_label.clone().into()),
                 cx,
             )
         });
@@ -516,6 +513,23 @@ impl Workspace {
         self.switch_to_tab(&new_tab_id, cx);
 
         println!("New tab created: {}", new_tab_id);
+    }
+
+    /// 生成终端类型的Tab名称
+    /// 第一个返回"Local Terminal"，之后返回"Local Terminal[编号]"
+    /// 编号根据local_terminal_count累加，不管之前的Tab是否关闭
+    fn generate_terminal_tab_name(&mut self) -> String {
+        let base_name = "Local Terminal";
+
+        // 累加计数器
+        self.local_terminal_count += 1;
+
+        // 第一个是Local Terminal，之后是Local Terminal[1], Local Terminal[2], ...
+        if self.local_terminal_count == 1 {
+            base_name.to_string()
+        } else {
+            format!("{}[{}]", base_name, self.local_terminal_count - 1)
+        }
     }
 
     /// 处理关闭tab事件

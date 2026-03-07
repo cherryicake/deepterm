@@ -1,9 +1,10 @@
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement,
-    Render, SharedString, Styled, Window,
+    div, prelude::*, px, rgb, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, Render, SharedString, Styled, Window,
 };
 
 use crate::components::tab_bar::DraggedTab;
+use crate::terminal_view::terminal_view::TerminalView;
 
 /// 拖拽阈值常量
 const DRAG_THRESHOLD_START: f32 = 0.35;
@@ -43,6 +44,15 @@ pub enum PanelEvent {
     Selected { panel_id: String },
 }
 
+/// Panel content type
+#[derive(Clone, Debug)]
+pub enum PanelContent {
+    /// Empty panel with just text
+    Text(String),
+    /// Terminal panel
+    Terminal(Entity<TerminalView>),
+}
+
 /// 单个面板视图 - 只包含内容区域，不包含TabBar
 /// TabBar由Workspace统一管理
 pub struct Panel {
@@ -52,12 +62,16 @@ pub struct Panel {
     drag_preview: Option<PanelPlacement>,
     /// 当前活动 tab ID
     active_tab_id: Option<SharedString>,
+    /// 当前活动 tab 标签名（用于标题栏显示）
+    active_tab_label: Option<SharedString>,
     /// 关联的 workspace_id
     workspace_id: String,
     /// 是否是工作区中唯一的panel（不渲染边框）
     is_solo: bool,
     /// 是否被选中（点击后边框加深）
     is_selected: bool,
+    /// Panel content
+    content: PanelContent,
 }
 
 impl Panel {
@@ -74,15 +88,70 @@ impl Panel {
         let panel_id = panel_id.into();
         let workspace_id = workspace_id.into();
 
+        let panel_id_clone = panel_id.clone();
         Self {
             panel_id,
             workspace_id,
             focus_handle: cx.focus_handle(),
             drag_preview: None,
             active_tab_id,
+            active_tab_label: None,
             is_solo: false,
             is_selected: false,
+            content: PanelContent::Text(format!("Panel: {}", panel_id_clone)),
         }
+    }
+
+    /// 创建带终端的Panel
+    pub fn with_terminal(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let panel_id = panel_id.into();
+        let workspace_id = workspace_id.into();
+        let terminal_view = TerminalView::new(cx);
+
+        Self {
+            panel_id: panel_id.clone(),
+            workspace_id,
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label,
+            is_solo: false,
+            is_selected: false,
+            content: PanelContent::Terminal(terminal_view),
+        }
+    }
+
+    /// 设置panel内容
+    pub fn set_content(&mut self, content: PanelContent, cx: &mut Context<Self>) {
+        self.content = content;
+        cx.notify();
+    }
+
+    /// 获取panel内容
+    pub fn content(&self) -> &PanelContent {
+        &self.content
+    }
+
+    /// 检查是否是终端内容
+    pub fn has_terminal_content(&self) -> bool {
+        matches!(self.content, PanelContent::Terminal(_))
+    }
+
+    /// 设置Tab标签名
+    pub fn set_tab_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.active_tab_label = Some(label.into());
+        cx.notify();
+    }
+
+    /// 获取Tab标签名
+    pub fn tab_label(&self) -> Option<&SharedString> {
+        self.active_tab_label.as_ref()
     }
 
     pub fn panel_id(&self) -> &str {
@@ -171,7 +240,13 @@ impl Panel {
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let panel_id = self.panel_id.clone();
-        let active_tab_id = self.active_tab_id.clone();
+        // 使用Tab标签名作为标题，如果没有则使用Tab ID，最后使用Panel ID
+        let title = self
+            .active_tab_label
+            .as_ref()
+            .map(|label| label.to_string())
+            .or_else(|| self.active_tab_id.as_ref().map(|id| id.to_string()))
+            .unwrap_or_else(|| self.panel_id.clone());
 
         div()
             .h(px(28.0))
@@ -180,13 +255,8 @@ impl Panel {
             .items_center()
             .justify_between()
             .child(
-                // 标题
-                div().text_sm().text_color(rgb(0x8888aa)).child(
-                    active_tab_id
-                        .as_ref()
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "Panel".to_string()),
-                ),
+                // 标题 - 显示Tab标签名（使用更小的字体）
+                div().text_xs().text_color(rgb(0x8888aa)).child(title),
             )
             .child(
                 // 关闭按钮
@@ -219,12 +289,22 @@ impl Panel {
 
     /// 渲染内容区域
     fn render_content(&self) -> impl IntoElement {
-        div().flex_1().flex().items_center().justify_center().child(
-            self.active_tab_id
-                .as_ref()
-                .map(|id| format!("Panel: {} | Tab: {}", self.panel_id, id))
-                .unwrap_or_else(|| format!("Panel: {}", self.panel_id)),
-        )
+        match &self.content {
+            PanelContent::Text(text) => {
+                div().flex_1().flex().items_center().justify_center().child(
+                    self.active_tab_id
+                        .as_ref()
+                        .map(|id| format!("{} | Tab: {}", text, id))
+                        .unwrap_or_else(|| text.clone()),
+                )
+            }
+            PanelContent::Terminal(terminal_view) => {
+                div()
+                    .flex_1()
+                    .min_h(px(100.0)) // Ensure minimum height
+                    .child(terminal_view.clone())
+            }
+        }
     }
 
     /// 渲染拖拽预览层
@@ -338,6 +418,7 @@ impl Render for Panel {
         div()
             .id(format!("panel-{}", self.panel_id))
             .size_full()
+            // 所有Panel使用一致的背景色
             .bg(rgb(0x0f0f1a))
             .when(!is_solo, |this| {
                 // 选中时边框颜色加深，未选中时使用浅色边框
@@ -363,7 +444,7 @@ impl Render for Panel {
                     }
                 }),
             )
-            // 标题栏 - 只在非solo状态下显示
+            // 标题栏 - 只在非solo状态下显示（一组Panel时）
             .when(!is_solo, |this| this.child(self.render_title_bar(cx)))
             // 内容区域
             .child(self.render_content())

@@ -247,7 +247,7 @@ impl Render for TabBar {
             .px(px(8.0))
             .gap(px(4.0))
             .child(
-                // 标签列表
+                // 标签列表（包含新建标签按钮）
                 div()
                     .flex_1()
                     .flex()
@@ -368,28 +368,28 @@ impl Render for TabBar {
                                     }
                                 }
                             }))
-                    })),
-            )
-            .child(
-                // 新建标签按钮
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(rgb(0x1e1e2e))
-                    .hover(|style| style.bg(rgb(0x2d2d44)))
-                    .child(div().text_color(rgb(0x666688)).child("+"))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |_, _, _, cx| {
-                            if let Some(ref callback) = on_new_tab {
-                                callback(cx);
-                            }
-                        }),
+                    }))
+                    // 新建标签按钮 - 放在最后一个tab后面
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .bg(rgb(0x1e1e2e))
+                            .hover(|style| style.bg(rgb(0x2d2d44)))
+                            .child(div().text_color(rgb(0x666688)).child("+"))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    if let Some(ref callback) = on_new_tab {
+                                        callback(cx);
+                                    }
+                                }),
+                            ),
                     ),
             )
     }
