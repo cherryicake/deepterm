@@ -393,6 +393,10 @@ impl Render for TabBar {
                                     }
                                 }
                             }))
+                            // 阻止事件冒泡到 TitleBar，防止在 macOS 上触发窗口拖拽
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                     }))
                     // 新建标签按钮 - 放在最后一个tab后面
                     .child(
