@@ -2,8 +2,8 @@
 //!
 //! Cross-platform PTY creation and management
 
+use std::collections::HashMap;
 use std::io;
-use std::process::Command;
 
 /// PTY configuration
 #[derive(Clone, Debug)]
@@ -13,7 +13,7 @@ pub struct PtyConfig {
     /// Working directory
     pub working_directory: Option<String>,
     /// Environment variables
-    pub env: Vec<(String, String)>,
+    pub env: HashMap<String, String>,
     /// Terminal size (cols, rows)
     pub size: (usize, usize),
 }
@@ -29,7 +29,7 @@ impl Default for PtyConfig {
         Self {
             shell: std::env::var("SHELL").unwrap_or_else(|_| default_shell.to_string()),
             working_directory: None,
-            env: vec![],
+            env: HashMap::new(),
             size: (80, 24),
         }
     }
