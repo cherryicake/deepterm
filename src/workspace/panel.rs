@@ -277,7 +277,6 @@ impl Panel {
                         cx.listener({
                             let panel_id = panel_id.clone();
                             move |_this, _event, _window, cx| {
-                                println!("Panel {} close button clicked", panel_id);
                                 cx.emit(PanelEvent::Close {
                                     panel_id: panel_id.clone(),
                                 });
@@ -358,10 +357,6 @@ impl Panel {
             // 鼠标离开内容区域，清除预览
             if self.drag_preview.is_some() {
                 self.drag_preview = None;
-                println!(
-                    "Panel {} drag preview cleared (left content)",
-                    self.panel_id
-                );
                 cx.emit(PanelEvent::DragPreview {
                     panel_id: self.panel_id.clone(),
                     placement: None,
@@ -375,7 +370,6 @@ impl Panel {
 
         if preview != self.drag_preview {
             self.drag_preview = preview;
-            println!("Panel {} drag preview: {:?}", self.panel_id, preview);
 
             // 发送事件给父组件
             cx.emit(PanelEvent::DragPreview {
@@ -389,14 +383,8 @@ impl Panel {
 
     /// 处理放置事件
     fn handle_drop(&mut self, dragged: &DraggedTab, cx: &mut Context<Self>) {
-        println!(
-            "Panel {} on_drop called, preview={:?}",
-            self.panel_id, self.drag_preview
-        );
-
         // 如果有preview就使用它，否则默认使用Right
         let placement = self.drag_preview.unwrap_or(PanelPlacement::Right);
-        println!("Panel {} drop: {:?}", self.panel_id, placement);
 
         // 发送放置事件
         cx.emit(PanelEvent::Drop {
@@ -437,7 +425,6 @@ impl Render for Panel {
             .on_click(
                 cx.listener(move |this, _event: &gpui::ClickEvent, _window, cx| {
                     if !this.is_selected {
-                        println!("Panel {} clicked, requesting selection", this.panel_id);
                         cx.emit(PanelEvent::Selected {
                             panel_id: this.panel_id.clone(),
                         });
@@ -466,7 +453,7 @@ impl Render for Panel {
             }))
             // 添加一个通用的on_drop来捕获任何类型的拖拽
             .on_drop(cx.listener(move |this, _dragged: &(), _window, _cx| {
-                println!("Panel {} received generic drop event", this.panel_id);
+                // Generic drop handler
             }))
     }
 }

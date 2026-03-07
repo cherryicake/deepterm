@@ -2,12 +2,9 @@
 //!
 //! High-level terminal UI component integrating with GPUI
 
-use std::time::Duration;
-
 use gpui::{
-    App, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, Pixels, Point, Render, SharedString, UTF16Selection, Window, div, prelude::*, px,
-    rgb,
+    App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement, Pixels,
+    Point, Render, SharedString, UTF16Selection, Window, div, prelude::*,
 };
 
 use crate::terminal::event::Event as TerminalEvent;
@@ -73,19 +70,8 @@ impl TerminalView {
                 ime_state: None,
             };
 
-            // Spawn a timer to process terminal events periodically
-            let terminal_clone2 = terminal.clone();
-            cx.spawn(async move |_, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(16))
-                        .await;
-                    let _ = terminal_clone2.update(cx, |terminal, cx| {
-                        terminal.process_events(cx);
-                    });
-                }
-            })
-            .detach();
+            // Note: Events are now processed in TerminalElement::prepaint via sync()
+            // This matches Zed's architecture where sync() is called during render
 
             view
         })

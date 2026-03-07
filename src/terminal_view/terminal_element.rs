@@ -1,23 +1,24 @@
 //! Terminal element for GPUI rendering
 //!
 //! Implements the Element trait for custom terminal rendering
-//! Based on Zed's terminal implementation - uses cached last_content
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Based on Zed's terminal implementation
 
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
-    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
-    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
-    Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
+    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
+use itertools::Itertools;
 
-use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
+#[macro_export]
+macro_rules! render_log {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*)
+    };
+}
+
+use crate::terminal::terminal::{IndexedCell, Terminal};
 use crate::terminal_view::terminal_view::TerminalView;
-
-/// Global counter for tracking total prepaint allocations
-static PREPAINT_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
-static PREPAINT_TOTAL_CELLS: AtomicU64 = AtomicU64::new(0);
 
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug, Clone)]
@@ -32,7 +33,7 @@ pub struct BatchedTextRun {
 
 impl BatchedTextRun {
     fn new_from_char(row: usize, col: usize, c: char, style: TextRun, font_size: Pixels) -> Self {
-        let mut text = String::with_capacity(64);
+        let mut text = String::with_capacity(100);
         text.push(c);
         BatchedTextRun {
             start_col: col,
@@ -84,15 +85,6 @@ impl BatchedTextRun {
     }
 }
 
-/// Cached layout state
-struct LayoutCache {
-    batched_runs: Vec<BatchedTextRun>,
-    content_generation: u64,
-    display_offset: usize,
-    cursor_col: usize,
-    cursor_row: usize,
-}
-
 /// Terminal element for GPUI
 pub struct TerminalElement {
     terminal: Entity<Terminal>,
@@ -100,8 +92,6 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
-    /// Cached layout - only regenerated when content changes
-    layout_cache: Option<LayoutCache>,
 }
 
 impl TerminalElement {
@@ -119,118 +109,144 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
-            layout_cache: None,
         }
     }
 
     /// Layout the terminal grid into batched text runs
-    /// Uses cached last_content like Zed - no allocation
+    /// Based on Zed's implementation - only processes visible cells
     fn layout_grid(
-        cells: &[IndexedCell],
+        grid: impl Iterator<Item = IndexedCell>,
         display_offset: usize,
         text_style: &TextStyle,
         font_size: Pixels,
+        visible_line_start: usize,
+        visible_line_count: usize,
     ) -> Vec<BatchedTextRun> {
-        if cells.is_empty() {
+        let estimated_cells = grid.size_hint().0;
+        if estimated_cells == 0 {
             return Vec::new();
         }
 
-        let estimated_runs = (cells.len() / 10).max(16);
+        static RENDER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call_count = RENDER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call_count % 60 == 0 {
+            render_log!(
+                "[Render] layout_grid called: estimated_cells={}, visible_line_start={}, visible_line_count={}",
+                estimated_cells,
+                visible_line_start,
+                visible_line_count
+            );
+        }
+
+        let estimated_runs = (estimated_cells / 10).max(16);
         let mut batched_runs = Vec::with_capacity(estimated_runs);
         let mut current_batch: Option<BatchedTextRun> = None;
-        let mut last_row: i32 = -1;
 
-        for cell in cells {
-            // Convert absolute line to relative line using display_offset
-            let relative_line = (cell.point.line.0 - display_offset as i32) as usize;
-            let cell_row = relative_line as i32;
+        // Group cells by line and filter to only visible rows
+        // This matches Zed's approach using itertools::chunk_by
+        let line_groups = grid.into_iter().chunk_by(|cell| cell.point.line);
 
-            if cell_row != last_row {
-                if let Some(batch) = current_batch.take() {
-                    batched_runs.push(batch);
-                }
-                last_row = cell_row;
-            }
-
-            let ch = cell.cell.c;
-            if ch == '\0' || ch == ' ' {
-                if let Some(batch) = current_batch.take() {
-                    batched_runs.push(batch);
-                }
+        for (line_index, (_, line_cells)) in line_groups.into_iter().enumerate() {
+            // Skip lines outside the visible viewport
+            if line_index < visible_line_start
+                || line_index >= visible_line_start + visible_line_count
+            {
                 continue;
             }
 
-            let cell_style = TextRun {
-                len: ch.len_utf8(),
-                font: Font {
-                    weight: if cell
-                        .cell
-                        .flags
-                        .contains(alacritty_terminal::term::cell::Flags::BOLD)
-                    {
-                        FontWeight::BOLD
-                    } else {
-                        text_style.font_weight
-                    },
-                    style: if cell
-                        .cell
-                        .flags
-                        .contains(alacritty_terminal::term::cell::Flags::ITALIC)
-                    {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                    ..text_style.font()
-                },
-                color: convert_alacritty_color(&cell.cell.fg),
-                background_color: if cell.cell.bg
-                    == alacritty_terminal::vte::ansi::Color::Named(
-                        alacritty_terminal::vte::ansi::NamedColor::Background,
-                    ) {
-                    None
-                } else {
-                    Some(convert_alacritty_color(&cell.cell.bg))
-                },
-                underline: if cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
-                {
-                    Some(gpui::UnderlineStyle {
-                        color: Some(convert_alacritty_color(&cell.cell.fg)),
-                        thickness: px(1.0),
-                        wavy: false,
-                    })
-                } else {
-                    None
-                },
-                strikethrough: None,
-            };
+            // Calculate relative row position for rendering
+            let relative_row = line_index.saturating_sub(display_offset);
 
-            match current_batch.as_mut() {
-                Some(batch)
-                    if batch.can_append(&cell_style)
-                        && batch.start_row == relative_line
-                        && batch.start_col + batch.cell_count == cell.point.column.0 =>
-                {
-                    batch.append_char(ch);
-                }
-                _ => {
+            // Flush any existing batch at line boundaries
+            if let Some(batch) = current_batch.take() {
+                batched_runs.push(batch);
+            }
+
+            for cell in line_cells {
+                let ch = cell.cell.c;
+
+                // Skip null chars and spaces (like Zed does)
+                if ch == '\0' || ch == ' ' {
                     if let Some(batch) = current_batch.take() {
                         batched_runs.push(batch);
                     }
-                    current_batch = Some(BatchedTextRun::new_from_char(
-                        relative_line,
-                        cell.point.column.0,
-                        ch,
-                        cell_style,
-                        font_size,
-                    ));
+                    continue;
+                }
+
+                let cell_style = TextRun {
+                    len: ch.len_utf8(),
+                    font: Font {
+                        weight: if cell
+                            .cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::BOLD)
+                        {
+                            FontWeight::BOLD
+                        } else {
+                            text_style.font_weight
+                        },
+                        style: if cell
+                            .cell
+                            .flags
+                            .contains(alacritty_terminal::term::cell::Flags::ITALIC)
+                        {
+                            FontStyle::Italic
+                        } else {
+                            FontStyle::Normal
+                        },
+                        ..text_style.font()
+                    },
+                    color: convert_alacritty_color(&cell.cell.fg),
+                    background_color: if cell.cell.bg
+                        == alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Background,
+                        ) {
+                        None
+                    } else {
+                        Some(convert_alacritty_color(&cell.cell.bg))
+                    },
+                    underline: if cell
+                        .cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+                    {
+                        Some(gpui::UnderlineStyle {
+                            color: Some(convert_alacritty_color(&cell.cell.fg)),
+                            thickness: px(1.0),
+                            wavy: false,
+                        })
+                    } else {
+                        None
+                    },
+                    strikethrough: None,
+                };
+
+                // Try to batch with existing run
+                match current_batch.as_mut() {
+                    Some(batch)
+                        if batch.can_append(&cell_style)
+                            && batch.start_row == relative_row
+                            && batch.start_col + batch.cell_count == cell.point.column.0 =>
+                    {
+                        batch.append_char(ch);
+                    }
+                    _ => {
+                        if let Some(batch) = current_batch.take() {
+                            batched_runs.push(batch);
+                        }
+                        current_batch = Some(BatchedTextRun::new_from_char(
+                            relative_row,
+                            cell.point.column.0,
+                            ch,
+                            cell_style,
+                            font_size,
+                        ));
+                    }
                 }
             }
         }
 
+        // Flush any remaining batch
         if let Some(batch) = current_batch {
             batched_runs.push(batch);
         }
@@ -341,63 +357,69 @@ impl Element for TerminalElement {
         let cols = ((bounds.size.width - px(8.0)) / cell_width).floor() as usize;
         let rows = (bounds.size.height / line_height).floor() as usize;
 
-        if cols > 0 && rows > 0 {
-            self.terminal.update(cx, |terminal, cx| {
+        // Sync terminal and get content info (like Zed does)
+        let (display_offset, cursor) = self.terminal.update(cx, |terminal, cx| {
+            // Sync terminal - process events and update last_content
+            terminal.sync(window, cx);
+
+            // Handle resize if needed
+            if cols > 0 && rows > 0 {
                 let current_size = terminal.size();
                 if current_size.0 != cols || current_size.1 != rows {
                     terminal.resize(cols, rows, cx);
                 }
-            });
+            }
+
+            let content = terminal.last_content();
+            let cursor = content.cursor;
+            let display_offset = content.display_offset;
+
+            (display_offset, cursor)
+        });
+
+        // Calculate visible viewport for clipping (like Zed does)
+        let visible_bounds = window.content_mask().bounds;
+        let intersection = visible_bounds.intersect(&bounds);
+
+        // Calculate which rows are visible
+        let visible_line_start = if intersection.size.height > px(0.0) {
+            ((intersection.top() - bounds.top()).max(px(0.0)) / line_height).floor() as usize
+        } else {
+            0
+        };
+        let visible_line_count = if intersection.size.height > px(0.0) {
+            ((intersection.size.height / line_height).ceil() as usize).max(1)
+        } else {
+            rows
+        };
+
+        // Generate batched runs for visible cells only (no caching - like Zed)
+        let content = self.terminal.read(cx).last_content();
+        let batched_runs = Self::layout_grid(
+            content.cells.iter().cloned(),
+            display_offset,
+            &text_style,
+            font_size,
+            visible_line_start,
+            visible_line_count,
+        );
+
+        static PREPAINT_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let prepaint_count = PREPAINT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prepaint_count % 60 == 0 {
+            render_log!(
+                "[Render] prepaint: cells={}, batched_runs={}, cols={}, rows={}, visible_line_start={}, visible_line_count={}",
+                content.cells.len(),
+                batched_runs.len(),
+                cols,
+                rows,
+                visible_line_start,
+                visible_line_count
+            );
         }
 
-        // Check if we can use cached layout
-        let terminal_ref = self.terminal.read(cx);
-        let content = terminal_ref.last_content();
-        let current_generation = terminal_ref.content_generation();
-        let display_offset = content.display_offset;
-        let cursor = content.cursor;
         let cursor_row = (cursor.line.0 as usize).saturating_sub(display_offset);
-
-        // Use cache if generation matches and display_offset hasn't changed
-        let batched_runs = if let Some(ref cache) = self.layout_cache {
-            if cache.content_generation == current_generation
-                && cache.display_offset == display_offset
-            {
-                // Cache hit! Use cached batched_runs
-                eprintln!(
-                    "[Prepaint] CACHE HIT - generation: {}, runs: {}",
-                    current_generation,
-                    cache.batched_runs.len()
-                );
-                cache.batched_runs.clone()
-            } else {
-                // Cache miss - regenerate
-                eprintln!("[Prepaint] CACHE MISS - gen mismatch: cache={}, current={}, offset mismatch: cache={}, current={}",
-                    cache.content_generation, current_generation, cache.display_offset, display_offset);
-                let runs =
-                    Self::layout_grid(&content.cells, display_offset, &text_style, font_size);
-                self.layout_cache = Some(LayoutCache {
-                    batched_runs: runs.clone(),
-                    content_generation: current_generation,
-                    display_offset,
-                    cursor_col: cursor.column.0,
-                    cursor_row,
-                });
-                runs
-            }
-        } else {
-            // No cache - generate and store
-            eprintln!("[Prepaint] NO CACHE - generating new layout");
-            let runs = Self::layout_grid(&content.cells, display_offset, &text_style, font_size);
-            self.layout_cache = Some(LayoutCache {
-                batched_runs: runs.clone(),
-                content_generation: current_generation,
-                display_offset,
-                cursor_col: cursor.column.0,
-                cursor_row,
-            });
-            runs
-        };
 
         (
             batched_runs,
@@ -461,24 +483,6 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
-
-        // Save batched_runs back to cache for reuse
-        // Use std::mem::take to move the Vec out of prepaint_state
-        let runs = std::mem::take(batched_runs);
-        if !runs.is_empty() {
-            // Only save if we have content
-            let terminal_ref = self.terminal.read(cx);
-            let current_generation = terminal_ref.content_generation();
-            let display_offset = terminal_ref.last_content().display_offset;
-
-            self.layout_cache = Some(LayoutCache {
-                batched_runs: runs,
-                content_generation: current_generation,
-                display_offset,
-                cursor_col: *cursor_col,
-                cursor_row: *cursor_row,
-            });
-        }
     }
 }
 
@@ -548,7 +552,6 @@ fn convert_alacritty_color(color: &alacritty_terminal::vte::ansi::Color) -> gpui
                 let gray = 8 + (*idx - 232) as u8 * 10;
                 gpui::rgb((gray as u32) << 16 | (gray as u32) << 8 | gray as u32).into()
             }
-            _ => gpui::rgb(0xc0c0c0).into(),
         },
     }
 }

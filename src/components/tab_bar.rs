@@ -247,11 +247,6 @@ impl Render for TabBar {
         let on_tab_reorder = self.on_tab_reorder.clone();
         let on_tab_merge = self.on_tab_merge.clone();
 
-        println!(
-            "TabBar render: on_tab_merge is {:?}",
-            on_tab_merge.is_some()
-        );
-
         div()
             .id(self.id.clone())
             .h(px(34.0))

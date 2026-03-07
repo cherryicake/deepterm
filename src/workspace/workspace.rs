@@ -218,21 +218,15 @@ impl Workspace {
                 dragged_tab,
                 placement,
             } => {
-                println!(
-                    "Panel {} drop: dragged_tab={}, placement={:?}",
-                    panel_id, dragged_tab.tab_id, placement
-                );
                 self.handle_tab_drop_on_panel(panel_id, dragged_tab, *placement, cx);
             }
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
             }
             PanelEvent::Close { panel_id } => {
-                println!("Panel {} close requested", panel_id);
                 self.handle_panel_close(panel_id, cx);
             }
             PanelEvent::Selected { panel_id } => {
-                println!("Panel {} selected event received in workspace", panel_id);
                 self.handle_panel_selected(panel_id, cx);
             }
         }
@@ -244,29 +238,16 @@ impl Workspace {
 
         // 获取当前活动的tab信息
         let Some(tab_info) = self.tabs.get(&active_tab_id) else {
-            println!("Active tab {} not found", active_tab_id);
             return;
         };
 
         // 获取该tab下的所有panel
         let panels = tab_info.container.collect_panels_vec();
 
-        println!("Found {} panels in current tab", panels.len());
-        for panel in &panels {
-            let panel_id = panel.read(cx).panel_id().to_string();
-            let is_selected = panel.read(cx).is_selected();
-            println!("  Panel {}: selected={}", panel_id, is_selected);
-        }
-
         // 取消其他panel的选中状态，设置当前panel为选中
         for panel in panels {
             panel.update(cx, |p, cx| {
                 let should_be_selected = p.panel_id() == selected_panel_id;
-                println!(
-                    "  Updating panel {}: should_be_selected={}",
-                    p.panel_id(),
-                    should_be_selected
-                );
                 if p.is_selected() != should_be_selected {
                     p.set_selected(should_be_selected, cx);
                 }
@@ -274,10 +255,6 @@ impl Workspace {
         }
 
         cx.notify();
-        println!(
-            "Panel {} is now selected, others deselected",
-            selected_panel_id
-        );
     }
 
     /// 处理关闭panel事件
@@ -286,7 +263,6 @@ impl Workspace {
 
         // 获取当前活动的tab信息
         let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
-            println!("Active tab {} not found", active_tab_id);
             return;
         };
 
@@ -322,10 +298,6 @@ impl Workspace {
         self.subscribe_to_panels(cx);
 
         cx.notify();
-        println!(
-            "Panel {} closed, remaining panels: {}",
-            panel_id, panel_count
-        );
     }
 
     /// 处理tab拖拽到panel上的事件
@@ -343,26 +315,18 @@ impl Workspace {
 
         // 如果被拖拽的是同一个tab，不做处理
         if dragged_tab_id == target_tab_id {
-            println!("Same tab, skipping merge");
             return;
         }
 
         // 获取被拖拽的tab信息
         let Some(dragged_tab_info) = self.tabs.remove(&dragged_tab_id) else {
-            println!("Dragged tab {} not found", dragged_tab_id);
             return;
         };
 
         // 获取目标tab信息
         let Some(target_tab_info) = self.tabs.get_mut(&target_tab_id) else {
-            println!("Target tab {} not found", target_tab_id);
             return;
         };
-
-        println!(
-            "Merging tab {} into tab {} at panel {}",
-            dragged_tab_id, target_tab_id, target_panel_id
-        );
 
         // 获取被拖拽的container
         let dragged_container = dragged_tab_info.container;
@@ -414,7 +378,6 @@ impl Workspace {
         }
 
         cx.notify();
-        println!("Tab merged into workspace: {}", target_tab_id);
     }
 
     /// 处理tab重新排序
@@ -424,8 +387,6 @@ impl Workspace {
         to_index: usize,
         cx: &mut Context<Self>,
     ) {
-        println!("Reordering tab: {} to index {}", dragged_tab_id, to_index);
-
         self.tab_bar.update(cx, |tab_bar, cx| {
             if let Some(from_index) = tab_bar.tabs.iter().position(|t| t.id == dragged_tab_id) {
                 if from_index != to_index {
@@ -437,10 +398,6 @@ impl Workspace {
                     };
                     tab_bar.tabs.insert(insert_index, tab);
                     cx.notify();
-                    println!(
-                        "Tab reordered: {} from {} to {}",
-                        dragged_tab_id, from_index, insert_index
-                    );
                 }
             }
         });
@@ -449,11 +406,7 @@ impl Workspace {
     /// 切换到指定tab
     fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         let tab_id_owned = tab_id.to_string();
-        if let Some(tab_info) = self.tabs.get(&tab_id_owned) {
-            println!(
-                "Switching to tab: {} (type: {:?})",
-                tab_id_owned, tab_info.tab_type
-            );
+        if let Some(_tab_info) = self.tabs.get(&tab_id_owned) {
             // 更新TabBar的活动tab
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.set_active_tab(tab_id_owned.clone(), cx);
@@ -471,8 +424,6 @@ impl Workspace {
 
         // 生成Tab标签名：Local Terminal 或 Local Terminal[编号]
         let new_tab_label = self.generate_terminal_tab_name();
-
-        println!("Creating new tab: {} - {}", new_tab_id, new_tab_label);
 
         // 创建新的panel（默认创建终端Panel）
         let new_panel = cx.new(|cx| {
@@ -511,8 +462,6 @@ impl Workspace {
         // 切换到新tab
         self.active_tab_id = new_tab_id.clone();
         self.switch_to_tab(&new_tab_id, cx);
-
-        println!("New tab created: {}", new_tab_id);
     }
 
     /// 生成终端类型的Tab名称
@@ -534,8 +483,6 @@ impl Workspace {
 
     /// 处理关闭tab事件
     fn handle_tab_close(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        println!("Closing tab: {}", tab_id);
-
         // 从tabs中移除
         self.tabs.remove(tab_id);
 
@@ -552,13 +499,11 @@ impl Workspace {
                 self.switch_to_tab(&first_tab_id, cx);
             } else {
                 // 没有tab了，退出应用程序
-                println!("No more tabs, quitting application");
                 cx.quit();
             }
         }
 
         cx.notify();
-        println!("Tab {} closed", tab_id);
     }
 
     /// 递归渲染分割容器
