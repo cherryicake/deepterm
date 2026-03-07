@@ -9,6 +9,26 @@ use libc::{self, c_int, winsize};
 
 use super::{Pty, PtyConfig};
 
+/// Reset exception ports on macOS (required for proper PTY behavior)
+/// This is a workaround for macOS-specific issues with exception handling
+#[cfg(target_os = "macos")]
+fn reset_exception_ports() {
+    use mach2::exception_types::{EXCEPTION_DEFAULT, EXC_MASK_ALL, THREAD_STATE_NONE};
+    use mach2::port::{mach_port_t, MACH_PORT_NULL};
+    use mach2::task::task_set_exception_ports;
+    use mach2::traps::mach_task_self;
+
+    unsafe {
+        let _ = task_set_exception_ports(
+            mach_task_self(),
+            EXC_MASK_ALL,
+            MACH_PORT_NULL,
+            EXCEPTION_DEFAULT as i32,
+            THREAD_STATE_NONE,
+        );
+    }
+}
+
 /// Unix PTY implementation
 pub struct UnixPty {
     master: UnixMaster,
@@ -174,12 +194,14 @@ pub fn create_pty(config: PtyConfig) -> io::Result<Box<dyn Pty>> {
                 libc::_exit(1);
             }
 
-            // Set controlling terminal
-            // macOS requires a non-zero third argument, Linux accepts 0
+            // Reset exception ports on macOS (required for proper PTY behavior)
             #[cfg(target_os = "macos")]
-            let result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 1);
-            #[cfg(not(target_os = "macos"))]
-            let result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+            reset_exception_ports();
+
+            // Set controlling terminal
+            // Use TIOCSCTTY as _ to handle platform-specific type differences
+            // Zed uses 0 as third argument on all platforms
+            let result = libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
 
             if result < 0 {
                 libc::_exit(1);
@@ -212,6 +234,14 @@ pub fn create_pty(config: PtyConfig) -> io::Result<Box<dyn Pty>> {
                 let c_value = CString::new(value.as_str()).unwrap();
                 libc::setenv(c_key.as_ptr(), c_value.as_ptr(), 1);
             }
+
+            // Reset signal handlers to default (like Zed does)
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGALRM, libc::SIG_DFL);
 
             // Execute shell
             // Extract shell name from path for argv[0]
