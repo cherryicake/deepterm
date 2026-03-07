@@ -7,8 +7,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, TitlebarOptions, Window, WindowControlArea,
+    App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton, ParentElement, Pixels,
+    Render, TitlebarOptions, Window, WindowControlArea, div, prelude::*, px,
 };
 
 use crate::components::tab_bar::TabBar;
@@ -29,6 +29,8 @@ pub struct TitleBar {
     id: ElementId,
     last_click_time: Option<Instant>,
     tab_bar: Option<Entity<TabBar>>,
+    /// 用于跟踪是否应该移动窗口（macOS 手动拖拽实现）
+    should_move: bool,
 }
 
 impl TitleBar {
@@ -38,6 +40,7 @@ impl TitleBar {
             id: id.into(),
             last_click_time: None,
             tab_bar: None,
+            should_move: false,
         }
     }
 
@@ -102,13 +105,32 @@ impl Render for TitleBar {
             .h(TITLE_BAR_HEIGHT)
             .pl(TITLE_BAR_LEFT_PADDING)
             .bg(gpui::rgb(0x0f0f1a))
-            // 可拖拽区域容器，包含 TabBar 和空白区域
+            // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
+            .when_some(self.tab_bar.clone(), |this, tab_bar| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(tab_bar),
+                )
+            })
+            // 可拖拽区域容器 - 只有空白区域可以拖拽窗口
             .child(
                 div()
                     .flex()
                     .h_full()
                     .flex_1()
-                    .window_control_area(WindowControlArea::Drag)
+                    // Windows/Linux: 使用 window_control_area
+                    // macOS: 不使用 window_control_area，改用 GPUI 手动事件处理
+                    .when(!is_macos && !is_web, |this| {
+                        this.window_control_area(WindowControlArea::Drag)
+                    })
                     .when(window.is_fullscreen(), |this| this.pl_3())
                     // Right-click context menu on Linux
                     .when(is_linux && is_client_decorated && !is_web, |this| {
@@ -124,19 +146,43 @@ impl Render for TitleBar {
                                 }),
                         )
                     })
-                    // 双击最大化/恢复，单击拖拽
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, _| {
-                            this.handle_title_click(window);
-                        }),
-                    )
-                    // TabBar (如果有) - 放在可拖拽区域内部
-                    .when_some(self.tab_bar.clone(), |this, tab_bar| {
-                        this.child(div().flex_shrink_0().child(tab_bar))
+                    // macOS: 手动实现窗口拖拽
+                    .when(is_macos, |this| {
+                        this.on_mouse_down_out(cx.listener(|this, _, _, _| {
+                            this.should_move = false;
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.should_move = false;
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.should_move = true;
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            |this, _, window, _| {
+                                if this.should_move {
+                                    this.should_move = false;
+                                    window.start_window_move();
+                                }
+                            },
+                        ))
+                    })
+                    // Windows/Linux: 双击最大化/恢复，单击拖拽
+                    .when(!is_macos && !is_web, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, _| {
+                                this.handle_title_click(window);
+                            }),
+                        )
                     }),
             )
-            // 关闭窗口按钮
+            // 关闭窗口按钮 (仅 Windows/Linux)
             .when(!is_macos && !is_web, |this| {
                 this.child(
                     div()

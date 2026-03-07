@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, rgb, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement,
-    Render, SharedString, Window,
+    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Window, div, prelude::*, px, rgb,
 };
 
 /// 拖拽的 Tab 数据

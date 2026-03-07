@@ -7,11 +7,11 @@ pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
 
+use components::title_bar::TitleBar;
 use gpui::{
     App, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     WindowOptions, div, prelude::*, px, size,
 };
-use components::title_bar::TitleBar;
 use workspace::workspace::Workspace;
 
 /// Root component that contains title bar and workspace
@@ -56,6 +56,12 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitleBar::title_bar_options()),
+                // macOS: 禁用原生窗口拖拽，改用 GPUI 手动实现
+                // 这样可以避免透明标题栏导致整个区域都可拖拽的问题
+                #[cfg(target_os = "macos")]
+                is_movable: false,
+                #[cfg(not(target_os = "macos"))]
+                is_movable: true,
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| AppWindow::new(cx)),
