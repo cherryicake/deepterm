@@ -1,7 +1,7 @@
 //! Terminal element for GPUI rendering
 //!
 //! Implements the Element trait for custom terminal rendering
-//! Based on Zed's terminal implementation
+//! Based on Zed's terminal implementation - uses cached last_content
 
 use gpui::{
     fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
@@ -14,7 +14,7 @@ use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
 use crate::terminal_view::terminal_view::TerminalView;
 
 /// A batched text run that combines multiple adjacent cells with the same style
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BatchedTextRun {
     pub start_col: usize,
     pub start_row: usize,
@@ -67,7 +67,6 @@ impl BatchedTextRun {
             origin.y + self.start_row as f32 * line_height,
         );
 
-        // Try to shape the line
         let shaped_line = window.text_system().shape_line(
             self.text.clone().into(),
             self.font_size,
@@ -75,7 +74,6 @@ impl BatchedTextRun {
             Some(cell_width),
         );
 
-        // Paint the shaped line
         let _ = shaped_line.paint(pos, line_height, gpui::TextAlign::Left, None, window, cx);
     }
 }
@@ -87,20 +85,6 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
-    /// Cached prepaint state to avoid regenerating every frame
-    cached_prepaint: Option<CachedPrepaint>,
-}
-
-/// Cached prepaint state
-struct CachedPrepaint {
-    content: TerminalContent,
-    batched_runs: Vec<BatchedTextRun>,
-    text_style: TextStyle,
-    cell_width: Pixels,
-    line_height: Pixels,
-    font_size: Pixels,
-    /// Generation counter to invalidate cache
-    content_generation: u64,
 }
 
 impl TerminalElement {
@@ -118,13 +102,14 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
-            cached_prepaint: None,
         }
     }
 
     /// Layout the terminal grid into batched text runs
+    /// Uses cached last_content like Zed - no allocation
     fn layout_grid(
         cells: &[IndexedCell],
+        display_offset: usize,
         text_style: &TextStyle,
         font_size: Pixels,
     ) -> Vec<BatchedTextRun> {
@@ -132,16 +117,16 @@ impl TerminalElement {
             return Vec::new();
         }
 
-        // Estimate capacity
         let estimated_runs = (cells.len() / 10).max(16);
         let mut batched_runs = Vec::with_capacity(estimated_runs);
         let mut current_batch: Option<BatchedTextRun> = None;
         let mut last_row: i32 = -1;
 
         for cell in cells {
-            let cell_row = cell.row as i32;
+            // Convert absolute line to relative line using display_offset
+            let relative_line = (cell.point.line.0 - display_offset as i32) as usize;
+            let cell_row = relative_line as i32;
 
-            // Flush at line boundaries
             if cell_row != last_row {
                 if let Some(batch) = current_batch.take() {
                     batched_runs.push(batch);
@@ -149,8 +134,8 @@ impl TerminalElement {
                 last_row = cell_row;
             }
 
-            // Skip empty cells
-            if cell.ch == '\0' {
+            let ch = cell.cell.c;
+            if ch == '\0' || ch == ' ' {
                 if let Some(batch) = current_batch.take() {
                     batched_runs.push(batch);
                 }
@@ -158,25 +143,44 @@ impl TerminalElement {
             }
 
             let cell_style = TextRun {
-                len: cell.ch.len_utf8(),
+                len: ch.len_utf8(),
                 font: Font {
-                    weight: if cell.bold {
+                    weight: if cell
+                        .cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::BOLD)
+                    {
                         FontWeight::BOLD
                     } else {
                         text_style.font_weight
                     },
-                    style: if cell.italic {
+                    style: if cell
+                        .cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::ITALIC)
+                    {
                         FontStyle::Italic
                     } else {
                         FontStyle::Normal
                     },
                     ..text_style.font()
                 },
-                color: cell.fg_color,
-                background_color: cell.bg_color,
-                underline: if cell.underline {
+                color: convert_alacritty_color(&cell.cell.fg),
+                background_color: if cell.cell.bg
+                    == alacritty_terminal::vte::ansi::Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Background,
+                    ) {
+                    None
+                } else {
+                    Some(convert_alacritty_color(&cell.cell.bg))
+                },
+                underline: if cell
+                    .cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+                {
                     Some(gpui::UnderlineStyle {
-                        color: Some(cell.fg_color),
+                        color: Some(convert_alacritty_color(&cell.cell.fg)),
                         thickness: px(1.0),
                         wavy: false,
                     })
@@ -186,28 +190,29 @@ impl TerminalElement {
                 strikethrough: None,
             };
 
-            // Try to extend current batch
             match current_batch.as_mut() {
                 Some(batch)
                     if batch.can_append(&cell_style)
-                        && batch.start_row == cell.row
-                        && batch.start_col + batch.cell_count == cell.col =>
+                        && batch.start_row == relative_line
+                        && batch.start_col + batch.cell_count == cell.point.column.0 =>
                 {
-                    batch.append_char(cell.ch);
+                    batch.append_char(ch);
                 }
                 _ => {
-                    // Flush and start new batch
                     if let Some(batch) = current_batch.take() {
                         batched_runs.push(batch);
                     }
                     current_batch = Some(BatchedTextRun::new_from_char(
-                        cell.row, cell.col, cell.ch, cell_style, font_size,
+                        relative_line,
+                        cell.point.column.0,
+                        ch,
+                        cell_style,
+                        font_size,
                     ));
                 }
             }
         }
 
-        // Flush final batch
         if let Some(batch) = current_batch {
             batched_runs.push(batch);
         }
@@ -266,24 +271,6 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        // Check if we can use cached data
-        let current_generation = self.terminal.read(cx).content_generation();
-
-        if let Some(ref cached) = self.cached_prepaint {
-            if cached.content_generation == current_generation {
-                // Cache hit - return cached data
-                return (
-                    cached.content.clone(),
-                    cached.batched_runs.clone(),
-                    cached.text_style.clone(),
-                    cached.cell_width,
-                    cached.line_height,
-                    cached.font_size,
-                );
-            }
-        }
-
-        // Cache miss - regenerate everything
         let font_size = px(13.0);
         let line_height = font_size * 1.25;
 
@@ -344,25 +331,15 @@ impl Element for TerminalElement {
             });
         }
 
-        let (content, cells) = self.terminal.update(cx, |terminal, _ctx| {
-            (terminal.renderable_content(), terminal.renderable_cells())
-        });
+        // Use cached last_content - FAST, no allocation!
+        let last_content = self.terminal.read(cx).last_content().clone();
+        let display_offset = last_content.display_offset;
 
-        let batched_runs = Self::layout_grid(&cells, &text_style, font_size);
-
-        // Update cache
-        self.cached_prepaint = Some(CachedPrepaint {
-            content: content.clone(),
-            batched_runs: batched_runs.clone(),
-            text_style: text_style.clone(),
-            cell_width,
-            line_height,
-            font_size,
-            content_generation: current_generation,
-        });
+        let batched_runs =
+            Self::layout_grid(&last_content.cells, display_offset, &text_style, font_size);
 
         (
-            content,
+            last_content,
             batched_runs,
             text_style,
             cell_width,
@@ -393,8 +370,9 @@ impl Element for TerminalElement {
 
         // Draw cursor
         if self.cursor_visible {
-            let cursor_x = bounds.left() + px(4.0) + *cell_width * content.cursor.0 as f32;
-            let cursor_y = bounds.top() + *line_height * content.cursor.1 as f32;
+            let cursor_x = bounds.left() + px(4.0) + *cell_width * content.cursor.column.0 as f32;
+            let cursor_y = bounds.top()
+                + *line_height * (content.cursor.line.0 as usize - content.display_offset) as f32;
 
             let cursor_bounds =
                 Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));
@@ -415,5 +393,76 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
+    }
+}
+
+fn convert_alacritty_color(color: &alacritty_terminal::vte::ansi::Color) -> gpui::Hsla {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+
+    match color {
+        Color::Named(named) => match named {
+            NamedColor::Black => gpui::rgb(0x181825).into(),
+            NamedColor::Red => gpui::rgb(0xff728c).into(),
+            NamedColor::Green => gpui::rgb(0x7bf797).into(),
+            NamedColor::Yellow => gpui::rgb(0xffdb72).into(),
+            NamedColor::Blue => gpui::rgb(0xb88eea).into(),
+            NamedColor::Magenta => gpui::rgb(0x4c2d72).into(),
+            NamedColor::Cyan => gpui::rgb(0xcba6f7).into(),
+            NamedColor::White => gpui::rgb(0xf6efff).into(),
+            NamedColor::BrightBlack => gpui::rgb(0x9994a0).into(),
+            NamedColor::BrightRed => gpui::rgb(0xff9fb1).into(),
+            NamedColor::BrightGreen => gpui::rgb(0xa5ffba).into(),
+            NamedColor::BrightYellow => gpui::rgb(0xffe8a5).into(),
+            NamedColor::BrightBlue => gpui::rgb(0xd8b7ff).into(),
+            NamedColor::BrightMagenta => gpui::rgb(0xdfc4ff).into(),
+            NamedColor::BrightCyan => gpui::rgb(0xead9ff).into(),
+            NamedColor::BrightWhite => gpui::rgb(0xfbf8ff).into(),
+            NamedColor::Foreground => gpui::rgb(0xcdd6f4).into(),
+            NamedColor::Background => gpui::rgb(0x1e1e2e).into(),
+            NamedColor::Cursor => gpui::rgb(0xcba6f7).into(),
+            _ => gpui::rgb(0xcdd6f4).into(),
+        },
+        Color::Spec(rgb) => {
+            gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32).into()
+        }
+        Color::Indexed(idx) => match idx {
+            0..=15 => {
+                let named = match idx {
+                    0 => NamedColor::Black,
+                    1 => NamedColor::Red,
+                    2 => NamedColor::Green,
+                    3 => NamedColor::Yellow,
+                    4 => NamedColor::Blue,
+                    5 => NamedColor::Magenta,
+                    6 => NamedColor::Cyan,
+                    7 => NamedColor::White,
+                    8 => NamedColor::BrightBlack,
+                    9 => NamedColor::BrightRed,
+                    10 => NamedColor::BrightGreen,
+                    11 => NamedColor::BrightYellow,
+                    12 => NamedColor::BrightBlue,
+                    13 => NamedColor::BrightMagenta,
+                    14 => NamedColor::BrightCyan,
+                    15 => NamedColor::BrightWhite,
+                    _ => NamedColor::Foreground,
+                };
+                convert_alacritty_color(&Color::Named(named))
+            }
+            16..=231 => {
+                let idx = *idx - 16;
+                let r = (idx / 36) as u8;
+                let g = ((idx % 36) / 6) as u8;
+                let b = (idx % 6) as u8;
+                let r = if r == 0 { 0 } else { r * 40 + 55 };
+                let g = if g == 0 { 0 } else { g * 40 + 55 };
+                let b = if b == 0 { 0 } else { b * 40 + 55 };
+                gpui::rgb((r as u32) << 16 | (g as u32) << 8 | b as u32).into()
+            }
+            232..=255 => {
+                let gray = 8 + (*idx - 232) as u8 * 10;
+                gpui::rgb((gray as u32) << 16 | (gray as u32) << 8 | gray as u32).into()
+            }
+            _ => gpui::rgb(0xc0c0c0).into(),
+        },
     }
 }

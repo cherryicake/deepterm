@@ -1,6 +1,6 @@
 //! Terminal core implementation using alacritty_terminal's EventLoop
 //!
-//! Based on Zed's terminal implementation
+//! Based on Zed's terminal implementation - uses last_content caching
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -8,49 +8,51 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::Column;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{cell::Cell, Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions};
 use gpui::{App, Context, Entity, EventEmitter, Hsla, Pixels};
 
 use super::event::Event;
 
-/// Terminal content for rendering
+/// Terminal content for rendering - cached like Zed
 #[derive(Clone, Debug)]
 pub struct TerminalContent {
-    pub lines: Vec<String>,
-    pub cursor: (usize, usize),
+    /// Cells with styling
+    pub cells: Vec<IndexedCell>,
+    /// Cursor position
+    pub cursor: AlacPoint,
+    /// Cursor character
+    pub cursor_char: char,
+    /// Display offset for scrolling
+    pub display_offset: usize,
+    /// Terminal mode
+    pub mode: alacritty_terminal::term::TermMode,
+    /// Terminal dimensions
     pub cols: usize,
     pub rows: usize,
 }
 
-/// A styled cell with its grid position
-#[derive(Clone, Debug)]
-pub struct IndexedCell {
-    pub col: usize,
-    pub row: usize,
-    pub ch: char,
-    pub fg_color: Hsla,
-    pub bg_color: Option<Hsla>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-}
-
-impl IndexedCell {
-    pub fn new(col: usize, row: usize, ch: char) -> Self {
+impl Default for TerminalContent {
+    fn default() -> Self {
         Self {
-            col,
-            row,
-            ch,
-            fg_color: gpui::rgb(0xcdd6f4).into(),
-            bg_color: None,
-            bold: false,
-            italic: false,
-            underline: false,
+            cells: Vec::new(),
+            cursor: AlacPoint::new(Line(0), Column(0)),
+            cursor_char: ' ',
+            display_offset: 0,
+            mode: alacritty_terminal::term::TermMode::default(),
+            cols: 80,
+            rows: 24,
         }
     }
+}
+
+/// A styled cell with its grid position - matches alacritty's IndexedCell
+#[derive(Clone, Debug)]
+pub struct IndexedCell {
+    pub point: AlacPoint,
+    pub cell: Cell,
 }
 
 /// Event listener that forwards alacritty events to GPUI
@@ -66,8 +68,6 @@ impl EventListener for TerminalEventListener {
 /// Terminal bounds for dimensions
 #[derive(Clone, Copy, Debug)]
 struct TerminalBounds {
-    cell_width: Pixels,
-    line_height: Pixels,
     num_cols: usize,
     num_lines: usize,
 }
@@ -75,8 +75,6 @@ struct TerminalBounds {
 impl TerminalBounds {
     fn new(num_cols: usize, num_lines: usize) -> Self {
         Self {
-            cell_width: gpui::px(9.0),
-            line_height: gpui::px(16.0),
             num_cols,
             num_lines,
         }
@@ -117,8 +115,8 @@ pub struct Terminal {
     working_directory: Option<String>,
     event_receiver: async_channel::Receiver<AlacTermEvent>,
     events: VecDeque<AlacTermEvent>,
-    /// Content generation counter for cache invalidation
-    content_generation: u64,
+    /// Cached content for rendering - updated only in process_events
+    pub last_content: TerminalContent,
 }
 
 impl Terminal {
@@ -143,15 +141,10 @@ impl Terminal {
         };
 
         // Create PTY
-        let pty = match tty::new(
-            &pty_options,
-            TerminalBounds::new(size.0, size.1).into(),
-            0, // window_id
-        ) {
+        let pty = match tty::new(&pty_options, TerminalBounds::new(size.0, size.1).into(), 0) {
             Ok(pty) => pty,
             Err(e) => {
                 eprintln!("Failed to create PTY: {}", e);
-                // Create a dummy terminal without PTY
                 let config = Config::default();
                 let term = Arc::new(FairMutex::new(Term::new(
                     config,
@@ -167,22 +160,18 @@ impl Terminal {
                     working_directory: None,
                     event_receiver,
                     events: VecDeque::new(),
-                    content_generation: 0,
+                    last_content: TerminalContent::default(),
                 });
             }
         };
 
-        // Create alacritty terminal config
         let config = Config::default();
-
-        // Create alacritty terminal
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &TerminalBounds::new(size.0, size.1),
             listener.clone(),
         )));
 
-        // Create EventLoop
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
@@ -195,15 +184,12 @@ impl Terminal {
                     working_directory: None,
                     event_receiver,
                     events: VecDeque::new(),
-                    content_generation: 0,
+                    last_content: TerminalContent::default(),
                 });
             }
         };
 
-        // Get notifier for sending input
         let notifier = event_loop.channel();
-
-        // Spawn EventLoop in background
         let _ = event_loop.spawn();
 
         cx.new(|_cx| Self {
@@ -214,11 +200,11 @@ impl Terminal {
             working_directory: None,
             event_receiver,
             events: VecDeque::new(),
-            content_generation: 0,
+            last_content: TerminalContent::default(),
         })
     }
 
-    /// Process pending events from alacritty
+    /// Process pending events from alacritty - this is where we update last_content
     pub fn process_events(&mut self, cx: &mut Context<Self>) {
         // Collect events from async channel
         while let Ok(event) = self.event_receiver.try_recv() {
@@ -247,22 +233,48 @@ impl Terminal {
             }
         }
 
+        // Update cached content if changed - ONLY HERE, not in prepaint
         if content_changed {
-            self.content_generation += 1;
+            self.update_last_content();
             cx.emit(Event::ContentChanged);
         }
     }
 
-    /// Get content generation counter
-    pub fn content_generation(&self) -> u64 {
-        self.content_generation
+    /// Update last_content from terminal - called only in process_events
+    fn update_last_content(&mut self) {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+
+        // Pre-allocate with estimated size
+        let estimated_size = content.display_iter.size_hint().0;
+        let mut cells = Vec::with_capacity(estimated_size);
+
+        cells.extend(content.display_iter.map(|ic| IndexedCell {
+            point: ic.point,
+            cell: ic.cell.clone(),
+        }));
+
+        self.last_content = TerminalContent {
+            cells,
+            cursor: content.cursor.point,
+            cursor_char: term.grid()[content.cursor.point].c,
+            display_offset: content.display_offset,
+            mode: content.mode,
+            cols: self.size.0,
+            rows: self.size.1,
+        };
+    }
+
+    /// Get last_content for rendering - fast, no allocation
+    pub fn last_content(&self) -> &TerminalContent {
+        &self.last_content
     }
 
     /// Write data to terminal (sends to PTY)
     pub fn write(&mut self, data: &[u8]) {
-        if let Some(ref notifier) = self.sender {
+        if let Some(ref sender) = self.sender {
             let msg = Msg::Input(std::borrow::Cow::Owned(data.to_vec()));
-            let _ = notifier.send(msg);
+            let _ = sender.send(msg);
         }
     }
 
@@ -270,207 +282,40 @@ impl Terminal {
     pub fn resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
         self.size = (cols, rows);
 
-        if let Some(ref notifier) = self.sender {
+        if let Some(ref sender) = self.sender {
             let window_size = WindowSize {
                 num_lines: rows as u16,
                 num_cols: cols as u16,
                 cell_width: 9,
                 cell_height: 16,
             };
-            let _ = notifier.send(Msg::Resize(window_size));
+            let _ = sender.send(Msg::Resize(window_size));
         }
 
         let mut term = self.term.lock();
         term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
 
+        // Update cached content after resize
+        drop(term);
+        self.update_last_content();
+
         cx.emit(Event::ContentChanged);
     }
 
-    /// Get renderable content
-    pub fn renderable_content(&self) -> TerminalContent {
-        let term = self.term.lock();
-        let mut lines = Vec::new();
-
-        let grid = term.grid();
-        let screen_lines = grid.screen_lines();
-        let columns = grid.columns();
-        let display_offset = grid.display_offset();
-
-        for row in 0..screen_lines {
-            let line_idx = (display_offset + row) as i32;
-            let line_num = alacritty_terminal::index::Line(line_idx);
-
-            if line_idx < 0 || line_idx >= grid.total_lines() as i32 {
-                lines.push(String::new());
-                continue;
-            }
-
-            let grid_row = &grid[line_num];
-            let mut line_text = String::new();
-
-            for col in 0..columns {
-                let cell = &grid_row[Column(col)];
-                let ch = cell.c;
-                if ch != '\0' {
-                    line_text.push(ch);
-                } else {
-                    line_text.push(' ');
-                }
-            }
-
-            lines.push(line_text);
-        }
-
-        let cursor = &grid.cursor;
-        let cursor_line = (cursor.point.line.0 + display_offset as i32) as usize;
-        let cursor_pos = (cursor.point.column.0, cursor_line);
-
-        TerminalContent {
-            lines,
-            cursor: cursor_pos,
-            cols: self.size.0,
-            rows: self.size.1,
-        }
-    }
-
-    /// Get renderable cells with styling information
-    pub fn renderable_cells(&self) -> Vec<IndexedCell> {
-        let term = self.term.lock();
-        let mut cells = Vec::new();
-
-        let grid = term.grid();
-        let screen_lines = grid.screen_lines();
-        let columns = grid.columns();
-        let display_offset = grid.display_offset();
-
-        for row in 0..screen_lines {
-            let line_idx = (display_offset + row) as i32;
-            let line_num = alacritty_terminal::index::Line(line_idx);
-
-            if line_idx < 0 || line_idx >= grid.total_lines() as i32 {
-                continue;
-            }
-
-            let grid_row = &grid[line_num];
-
-            for col in 0..columns {
-                let cell = &grid_row[Column(col)];
-                let ch = cell.c;
-
-                if ch == '\0' {
-                    continue;
-                }
-
-                let fg_color = convert_alacritty_color(&cell.fg);
-                let bg_color = if cell.bg
-                    == alacritty_terminal::vte::ansi::Color::Named(
-                        alacritty_terminal::vte::ansi::NamedColor::Background,
-                    ) {
-                    None
-                } else {
-                    Some(convert_alacritty_color(&cell.bg))
-                };
-
-                let flags = cell.flags;
-
-                cells.push(IndexedCell {
-                    col,
-                    row,
-                    ch,
-                    fg_color,
-                    bg_color,
-                    bold: flags.contains(alacritty_terminal::term::cell::Flags::BOLD),
-                    italic: flags.contains(alacritty_terminal::term::cell::Flags::ITALIC),
-                    underline: flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE),
-                });
-            }
-        }
-
-        cells
-    }
-
+    /// Get terminal size
     pub fn size(&self) -> (usize, usize) {
         self.size
     }
 
+    /// Get title
     pub fn title(&self) -> Option<&String> {
         self.title.as_ref()
     }
 
+    /// Get working directory
     pub fn working_directory(&self) -> Option<&String> {
         self.working_directory.as_ref()
     }
 }
 
 impl EventEmitter<Event> for Terminal {}
-
-fn convert_alacritty_color(color: &alacritty_terminal::vte::ansi::Color) -> Hsla {
-    use alacritty_terminal::vte::ansi::{Color, NamedColor};
-
-    match color {
-        Color::Named(named) => match named {
-            NamedColor::Black => gpui::rgb(0x181825).into(),
-            NamedColor::Red => gpui::rgb(0xff728c).into(),
-            NamedColor::Green => gpui::rgb(0x7bf797).into(),
-            NamedColor::Yellow => gpui::rgb(0xffdb72).into(),
-            NamedColor::Blue => gpui::rgb(0xb88eea).into(),
-            NamedColor::Magenta => gpui::rgb(0x4c2d72).into(),
-            NamedColor::Cyan => gpui::rgb(0xcba6f7).into(),
-            NamedColor::White => gpui::rgb(0xf6efff).into(),
-            NamedColor::BrightBlack => gpui::rgb(0x9994a0).into(),
-            NamedColor::BrightRed => gpui::rgb(0xff9fb1).into(),
-            NamedColor::BrightGreen => gpui::rgb(0xa5ffba).into(),
-            NamedColor::BrightYellow => gpui::rgb(0xffe8a5).into(),
-            NamedColor::BrightBlue => gpui::rgb(0xd8b7ff).into(),
-            NamedColor::BrightMagenta => gpui::rgb(0xdfc4ff).into(),
-            NamedColor::BrightCyan => gpui::rgb(0xead9ff).into(),
-            NamedColor::BrightWhite => gpui::rgb(0xfbf8ff).into(),
-            NamedColor::Foreground => gpui::rgb(0xcdd6f4).into(),
-            NamedColor::Background => gpui::rgb(0x1e1e2e).into(),
-            NamedColor::Cursor => gpui::rgb(0xcba6f7).into(),
-            _ => gpui::rgb(0xcdd6f4).into(),
-        },
-        Color::Spec(rgb) => {
-            gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32).into()
-        }
-        Color::Indexed(idx) => match idx {
-            0..=15 => {
-                let named = match idx {
-                    0 => NamedColor::Black,
-                    1 => NamedColor::Red,
-                    2 => NamedColor::Green,
-                    3 => NamedColor::Yellow,
-                    4 => NamedColor::Blue,
-                    5 => NamedColor::Magenta,
-                    6 => NamedColor::Cyan,
-                    7 => NamedColor::White,
-                    8 => NamedColor::BrightBlack,
-                    9 => NamedColor::BrightRed,
-                    10 => NamedColor::BrightGreen,
-                    11 => NamedColor::BrightYellow,
-                    12 => NamedColor::BrightBlue,
-                    13 => NamedColor::BrightMagenta,
-                    14 => NamedColor::BrightCyan,
-                    15 => NamedColor::BrightWhite,
-                    _ => NamedColor::Foreground,
-                };
-                convert_alacritty_color(&Color::Named(named))
-            }
-            16..=231 => {
-                let idx = *idx - 16;
-                let r = (idx / 36) as u8;
-                let g = ((idx % 36) / 6) as u8;
-                let b = (idx % 6) as u8;
-                let r = if r == 0 { 0 } else { r * 40 + 55 };
-                let g = if g == 0 { 0 } else { g * 40 + 55 };
-                let b = if b == 0 { 0 } else { b * 40 + 55 };
-                gpui::rgb((r as u32) << 16 | (g as u32) << 8 | b as u32).into()
-            }
-            232..=255 => {
-                let gray = 8 + (*idx - 232) as u8 * 10;
-                gpui::rgb((gray as u32) << 16 | (gray as u32) << 8 | gray as u32).into()
-            }
-            _ => gpui::rgb(0xc0c0c0).into(),
-        },
-    }
-}
