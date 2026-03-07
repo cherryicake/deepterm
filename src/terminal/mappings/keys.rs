@@ -88,13 +88,15 @@ pub fn keystroke_to_bytes(
             // Handle Alt+key combinations (send ESC prefix)
             if keystroke.modifiers.alt {
                 bytes.push(0x1b);
+                let mut buf = [0; 4];
+                ch.encode_utf8(&mut buf);
+                bytes.extend_from_slice(&buf[..ch.len_utf8()]);
+                return Some(bytes);
             }
 
-            // Regular character - UTF-8 encoding
-            let mut buf = [0; 4];
-            ch.encode_utf8(&mut buf);
-            bytes.extend_from_slice(&buf[..ch.len_utf8()]);
-            return Some(bytes);
+            // For regular characters without modifiers, return None
+            // This allows IME to handle the input and prevents duplicate characters
+            // The IME will send the text via EntityInputHandler::replace_text_in_range
         }
     }
 
