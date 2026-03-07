@@ -311,8 +311,8 @@ impl Terminal {
                 let cell = &grid_row[Column(col)];
                 let ch = cell.c;
 
-                // Skip empty/null cells
-                if ch == '\0' || ch == ' ' {
+                // Skip null cells but keep spaces for proper layout
+                if ch == '\0' {
                     continue;
                 }
 
