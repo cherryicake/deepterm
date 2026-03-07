@@ -4,16 +4,17 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
+    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
+    Window,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
 use crate::terminal_view::terminal_view::TerminalView;
 
 /// A batched text run that combines multiple adjacent cells with the same style
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchedTextRun {
     pub start_col: usize,
     pub start_row: usize,
@@ -86,6 +87,20 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
+    /// Cached prepaint state to avoid regenerating every frame
+    cached_prepaint: Option<CachedPrepaint>,
+}
+
+/// Cached prepaint state
+struct CachedPrepaint {
+    content: TerminalContent,
+    batched_runs: Vec<BatchedTextRun>,
+    text_style: TextStyle,
+    cell_width: Pixels,
+    line_height: Pixels,
+    font_size: Pixels,
+    /// Generation counter to invalidate cache
+    content_generation: u64,
 }
 
 impl TerminalElement {
@@ -103,6 +118,7 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
+            cached_prepaint: None,
         }
     }
 
@@ -250,6 +266,24 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
+        // Check if we can use cached data
+        let current_generation = self.terminal.read(cx).content_generation();
+
+        if let Some(ref cached) = self.cached_prepaint {
+            if cached.content_generation == current_generation {
+                // Cache hit - return cached data
+                return (
+                    cached.content.clone(),
+                    cached.batched_runs.clone(),
+                    cached.text_style.clone(),
+                    cached.cell_width,
+                    cached.line_height,
+                    cached.font_size,
+                );
+            }
+        }
+
+        // Cache miss - regenerate everything
         let font_size = px(13.0);
         let line_height = font_size * 1.25;
 
@@ -315,6 +349,17 @@ impl Element for TerminalElement {
         });
 
         let batched_runs = Self::layout_grid(&cells, &text_style, font_size);
+
+        // Update cache
+        self.cached_prepaint = Some(CachedPrepaint {
+            content: content.clone(),
+            batched_runs: batched_runs.clone(),
+            text_style: text_style.clone(),
+            cell_width,
+            line_height,
+            font_size,
+            content_generation: current_generation,
+        });
 
         (
             content,

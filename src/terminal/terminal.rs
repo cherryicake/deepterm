@@ -117,6 +117,8 @@ pub struct Terminal {
     working_directory: Option<String>,
     event_receiver: async_channel::Receiver<AlacTermEvent>,
     events: VecDeque<AlacTermEvent>,
+    /// Content generation counter for cache invalidation
+    content_generation: u64,
 }
 
 impl Terminal {
@@ -165,6 +167,7 @@ impl Terminal {
                     working_directory: None,
                     event_receiver,
                     events: VecDeque::new(),
+                    content_generation: 0,
                 });
             }
         };
@@ -192,6 +195,7 @@ impl Terminal {
                     working_directory: None,
                     event_receiver,
                     events: VecDeque::new(),
+                    content_generation: 0,
                 });
             }
         };
@@ -210,6 +214,7 @@ impl Terminal {
             working_directory: None,
             event_receiver,
             events: VecDeque::new(),
+            content_generation: 0,
         })
     }
 
@@ -243,8 +248,14 @@ impl Terminal {
         }
 
         if content_changed {
+            self.content_generation += 1;
             cx.emit(Event::ContentChanged);
         }
+    }
+
+    /// Get content generation counter
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
     }
 
     /// Write data to terminal (sends to PTY)
