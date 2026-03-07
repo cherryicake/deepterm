@@ -265,23 +265,8 @@ impl Render for TerminalView {
             })
             .on_key_down(
                 cx.listener(move |this, event: &gpui::KeyDownEvent, _window, cx| {
-                    // If key_char is present and it's a printable character (not a control character),
-                    // IME will handle this input. Don't process it again to avoid duplicate characters.
-                    // But we still need to handle special keys like Enter, Tab, etc. even if they have key_char.
-                    if let Some(ref key_char) = event.keystroke.key_char {
-                        // Check if it's a printable character (not control character)
-                        // Control characters like \r, \n, \t should still be processed
-                        if key_char.len() == 1 {
-                            let ch = key_char.chars().next().unwrap();
-                            if !ch.is_control() {
-                                return;
-                            }
-                        } else {
-                            // Multi-byte characters should be handled by IME
-                            return;
-                        }
-                    }
-
+                    // Process all keystrokes directly, matching Zed's approach
+                    // Don't skip based on key_char - let the keystroke mapping handle everything
                     let term_mode = TermMode::default();
                     if let Some(bytes) =
                         keystroke_to_bytes(&event.keystroke, &event.keystroke.modifiers, term_mode)

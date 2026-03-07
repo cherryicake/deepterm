@@ -1,23 +1,17 @@
 //! Keyboard input mappings for terminal
 //!
 //! Maps GPUI keystrokes to terminal escape sequences
+//! Based on Zed's terminal implementation
 
 use gpui::{Keystroke, Modifiers};
 
 /// Convert a keystroke to terminal input bytes
+/// Follows Zed's approach: process based on keystroke.key, not key_char
 pub fn keystroke_to_bytes(
     keystroke: &Keystroke,
     _modifiers: &Modifiers,
     _mode: TermMode,
 ) -> Option<Vec<u8>> {
-    // First check key_char for IME input (Chinese, etc.)
-    // key_char contains the actual typed character including IME composition results
-    if let Some(ref key_char) = keystroke.key_char {
-        if !key_char.is_empty() {
-            return Some(key_char.as_bytes().to_vec());
-        }
-    }
-
     let key = keystroke.key.as_str();
 
     // Handle special keys
