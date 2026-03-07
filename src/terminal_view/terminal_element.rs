@@ -146,134 +146,100 @@ impl TerminalElement {
         }
     }
 
-    /// Layout the terminal grid into batched text runs with background merging
+    /// Layout the terminal grid into batched text runs
+    /// Simplified version focusing on performance - no background merging
     fn layout_grid(
         cells: &[IndexedCell],
         text_style: &TextStyle,
         font_size: Pixels,
-    ) -> (Vec<BatchedTextRun>, Vec<BackgroundRegion>) {
-        // Pre-allocate with estimated capacity to reduce reallocations
-        let estimated_cells = cells.len();
-        let estimated_runs = estimated_cells / 10; // Estimate ~10 cells per run
-        let estimated_regions = estimated_cells / 20; // Estimate ~20 cells per background region
-        let mut batched_runs = Vec::with_capacity(estimated_runs);
-        let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
-        let mut current_batch: Option<BatchedTextRun> = None;
-        let mut current_bg_region: Option<BackgroundRegion> = None;
-
-        // Group cells by row
-        let mut row_cells: Vec<Vec<&IndexedCell>> = Vec::new();
-        for cell in cells {
-            if cell.row >= row_cells.len() {
-                row_cells.resize(cell.row + 1, Vec::new());
-            }
-            row_cells[cell.row].push(cell);
+    ) -> Vec<BatchedTextRun> {
+        if cells.is_empty() {
+            return Vec::new();
         }
 
-        for (_row_idx, row) in row_cells.iter().enumerate() {
-            // Flush any existing batch at line boundaries
-            if let Some(batch) = current_batch.take() {
-                batched_runs.push(batch);
-            }
-            // Flush background region at line boundaries
-            if let Some(region) = current_bg_region.take() {
-                background_regions.push(region);
-            }
+        // Pre-allocate with estimated capacity
+        let estimated_runs = cells.len() / 10;
+        let mut batched_runs = Vec::with_capacity(estimated_runs);
+        let mut current_batch: Option<BatchedTextRun> = None;
+        let mut last_row: usize = usize::MAX;
 
-            for cell in row {
-                // Collect background regions for cells with non-default background
-                if let Some(bg_color) = cell.bg_color {
-                    if let Some(ref mut region) = current_bg_region {
-                        if region.can_extend(cell.row, cell.col, bg_color) {
-                            region.extend(cell.row, cell.col);
-                        } else {
-                            background_regions.push(region.clone());
-                            current_bg_region =
-                                Some(BackgroundRegion::new(cell.row, cell.col, bg_color));
-                        }
-                    } else {
-                        current_bg_region =
-                            Some(BackgroundRegion::new(cell.row, cell.col, bg_color));
-                    }
-                } else {
-                    // No background color, flush current region
-                    if let Some(region) = current_bg_region.take() {
-                        background_regions.push(region);
-                    }
+        for cell in cells {
+            // Flush batch at line boundaries
+            if cell.row != last_row {
+                if let Some(batch) = current_batch.take() {
+                    batched_runs.push(batch);
                 }
+                last_row = cell.row;
+            }
 
-                if cell.ch == ' ' || cell.ch == '\0' {
-                    // Skip blank cells but flush current batch
-                    if let Some(batch) = current_batch.take() {
-                        batched_runs.push(batch);
-                    }
-                    continue;
+            // Skip blank cells
+            if cell.ch == ' ' || cell.ch == '\0' {
+                if let Some(batch) = current_batch.take() {
+                    batched_runs.push(batch);
                 }
+                continue;
+            }
 
-                let cell_style = TextRun {
-                    len: cell.ch.len_utf8(),
-                    font: Font {
-                        weight: if cell.bold {
-                            FontWeight::BOLD
-                        } else {
-                            text_style.font_weight
-                        },
-                        style: if cell.italic {
-                            FontStyle::Italic
-                        } else {
-                            FontStyle::Normal
-                        },
-                        ..text_style.font()
-                    },
-                    color: cell.fg_color,
-                    background_color: cell.bg_color,
-                    underline: if cell.underline {
-                        Some(gpui::UnderlineStyle {
-                            color: Some(cell.fg_color),
-                            thickness: px(1.0),
-                            wavy: false,
-                        })
+            let cell_style = TextRun {
+                len: cell.ch.len_utf8(),
+                font: Font {
+                    weight: if cell.bold {
+                        FontWeight::BOLD
                     } else {
-                        None
+                        text_style.font_weight
                     },
-                    strikethrough: None,
-                };
-
-                // Try to batch with existing run
-                if let Some(ref mut batch) = current_batch {
-                    if batch.can_append(&cell_style)
-                        && batch.start_row == cell.row
-                        && batch.start_col + batch.cell_count == cell.col
-                    {
-                        batch.append_char(cell.ch);
+                    style: if cell.italic {
+                        FontStyle::Italic
                     } else {
-                        // Flush current batch and start new one
-                        let old_batch = current_batch.take().unwrap();
-                        batched_runs.push(old_batch);
-                        let new_batch = BatchedTextRun::new_from_char(
-                            cell.row, cell.col, cell.ch, cell_style, font_size,
-                        );
-                        current_batch = Some(new_batch);
-                    }
+                        FontStyle::Normal
+                    },
+                    ..text_style.font()
+                },
+                color: cell.fg_color,
+                background_color: cell.bg_color,
+                underline: if cell.underline {
+                    Some(gpui::UnderlineStyle {
+                        color: Some(cell.fg_color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    })
                 } else {
-                    // Start new batch
+                    None
+                },
+                strikethrough: None,
+            };
+
+            // Try to batch with existing run
+            if let Some(ref mut batch) = current_batch {
+                if batch.can_append(&cell_style)
+                    && batch.start_row == cell.row
+                    && batch.start_col + batch.cell_count == cell.col
+                {
+                    batch.append_char(cell.ch);
+                } else {
+                    // Flush current batch and start new one
+                    let old_batch = current_batch.take().unwrap();
+                    batched_runs.push(old_batch);
                     let new_batch = BatchedTextRun::new_from_char(
                         cell.row, cell.col, cell.ch, cell_style, font_size,
                     );
                     current_batch = Some(new_batch);
                 }
+            } else {
+                // Start new batch
+                let new_batch = BatchedTextRun::new_from_char(
+                    cell.row, cell.col, cell.ch, cell_style, font_size,
+                );
+                current_batch = Some(new_batch);
             }
         }
 
-        // Flush any remaining batch and background region
+        // Flush any remaining batch
         if let Some(batch) = current_batch {
             batched_runs.push(batch);
         }
-        if let Some(region) = current_bg_region {
-            background_regions.push(region);
-        }
 
-        (batched_runs, background_regions)
+        batched_runs
     }
 }
 
@@ -290,7 +256,6 @@ impl Element for TerminalElement {
     type PrepaintState = (
         TerminalContent,
         Vec<BatchedTextRun>,
-        Vec<BackgroundRegion>,
         TextStyle,
         Pixels,
         Pixels,
@@ -400,13 +365,12 @@ impl Element for TerminalElement {
             (terminal.renderable_content(), terminal.renderable_cells())
         });
 
-        // Layout grid into batched runs with background merging
-        let (batched_runs, background_regions) = Self::layout_grid(&cells, &text_style, font_size);
+        // Layout grid into batched runs
+        let batched_runs = Self::layout_grid(&cells, &text_style, font_size);
 
         (
             content,
             batched_runs,
-            background_regions,
             text_style,
             cell_width,
             line_height,
@@ -424,28 +388,10 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        let (
-            content,
-            batched_runs,
-            background_regions,
-            _text_style,
-            cell_width,
-            line_height,
-            _font_size,
-        ) = prepaint_state;
+        let (content, batched_runs, _text_style, cell_width, line_height, _font_size) =
+            prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
-
-        // Paint merged background regions first
-        for region in background_regions.iter() {
-            let bg_x = origin.x + region.start_col as f32 * *cell_width;
-            let bg_y = origin.y + region.start_row as f32 * *line_height;
-            let bg_width = (region.end_col - region.start_col + 1) as f32 * *cell_width;
-            let bg_height = (region.end_row - region.start_row + 1) as f32 * *line_height;
-
-            let bg_bounds = Bounds::new(point(bg_x, bg_y), size(bg_width, bg_height));
-            window.paint_quad(fill(bg_bounds, region.color));
-        }
 
         // Paint batched text runs
         for batch in batched_runs.iter() {
