@@ -117,6 +117,12 @@ pub struct Terminal {
     events: VecDeque<AlacTermEvent>,
     /// Cached content for rendering - updated only in process_events
     pub last_content: TerminalContent,
+    /// Content generation counter for cache invalidation
+    content_generation: u64,
+    /// Font size for rendering
+    font_size: gpui::Pixels,
+    /// Cached batched runs for rendering - updated only when content changes
+    pub cached_batched_runs: Option<Vec<crate::terminal_view::terminal_element::BatchedTextRun>>,
 }
 
 impl Terminal {
@@ -161,6 +167,10 @@ impl Terminal {
                     event_receiver,
                     events: VecDeque::new(),
                     last_content: TerminalContent::default(),
+
+                    content_generation: 0,
+                    cached_batched_runs: None,
+                    font_size: gpui::px(13.0),
                 });
             }
         };
@@ -185,6 +195,10 @@ impl Terminal {
                     event_receiver,
                     events: VecDeque::new(),
                     last_content: TerminalContent::default(),
+
+                    content_generation: 0,
+                    cached_batched_runs: None,
+                    font_size: gpui::px(13.0),
                 });
             }
         };
@@ -201,6 +215,10 @@ impl Terminal {
             event_receiver,
             events: VecDeque::new(),
             last_content: TerminalContent::default(),
+
+            content_generation: 0,
+                    cached_batched_runs: None,
+            font_size: gpui::px(13.0),
         })
     }
 
@@ -251,9 +269,15 @@ impl Terminal {
                 "[Terminal Update] Processing {} Wakeup events",
                 wakeup_count
             );
+            self.content_generation += 1;
             self.update_last_content();
             cx.emit(Event::ContentChanged);
         }
+    }
+
+    /// Get content generation counter
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
     }
 
     /// Update last_content from terminal - called only in process_events

@@ -20,7 +20,7 @@ static PREPAINT_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PREPAINT_TOTAL_CELLS: AtomicU64 = AtomicU64::new(0);
 
 /// A batched text run that combines multiple adjacent cells with the same style
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchedTextRun {
     pub start_col: usize,
     pub start_row: usize,
@@ -84,6 +84,15 @@ impl BatchedTextRun {
     }
 }
 
+/// Cached layout state
+struct LayoutCache {
+    batched_runs: Vec<BatchedTextRun>,
+    content_generation: u64,
+    display_offset: usize,
+    cursor_col: usize,
+    cursor_row: usize,
+}
+
 /// Terminal element for GPUI
 pub struct TerminalElement {
     terminal: Entity<Terminal>,
@@ -91,6 +100,8 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
+    /// Cached layout - only regenerated when content changes
+    layout_cache: Option<LayoutCache>,
 }
 
 impl TerminalElement {
@@ -108,6 +119,7 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
+            layout_cache: None,
         }
     }
 
@@ -338,34 +350,54 @@ impl Element for TerminalElement {
             });
         }
 
-        // Use cached last_content - AVOID CLONE by reading only what we need
+        // Check if we can use cached layout
         let terminal_ref = self.terminal.read(cx);
         let content = terminal_ref.last_content();
-        let cells = content.cells.clone();
+        let current_generation = terminal_ref.content_generation();
         let display_offset = content.display_offset;
         let cursor = content.cursor;
-        let cursor_char = content.cursor_char;
+        let cursor_row = (cursor.line.0 as usize).saturating_sub(display_offset);
 
-        let batched_runs = Self::layout_grid(&cells, display_offset, &text_style, font_size);
-
-        // Update global counters
-        let run_count = PREPAINT_RUN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let total_cells = PREPAINT_TOTAL_CELLS.fetch_add(cells.len() as u64, Ordering::Relaxed)
-            + cells.len() as u64;
-
-        // Calculate text memory (String allocations in BatchedTextRun)
-        let text_memory: usize = batched_runs.iter().map(|r| r.text.capacity()).sum();
-
-        // Log prepaint stats
-        eprintln!(
-            "[Prepaint #{}] cells: {} (total processed: {}), batched_runs: {}, text_memory: {} bytes, avg cells/run: {:.1}",
-            run_count,
-            cells.len(),
-            total_cells,
-            batched_runs.len(),
-            text_memory,
-            if batched_runs.len() > 0 { cells.len() as f32 / batched_runs.len() as f32 } else { 0.0 }
-        );
+        // Use cache if generation matches and display_offset hasn't changed
+        let batched_runs = if let Some(ref cache) = self.layout_cache {
+            if cache.content_generation == current_generation
+                && cache.display_offset == display_offset
+            {
+                // Cache hit! Use cached batched_runs
+                eprintln!(
+                    "[Prepaint] CACHE HIT - generation: {}, runs: {}",
+                    current_generation,
+                    cache.batched_runs.len()
+                );
+                cache.batched_runs.clone()
+            } else {
+                // Cache miss - regenerate
+                eprintln!("[Prepaint] CACHE MISS - gen mismatch: cache={}, current={}, offset mismatch: cache={}, current={}",
+                    cache.content_generation, current_generation, cache.display_offset, display_offset);
+                let runs =
+                    Self::layout_grid(&content.cells, display_offset, &text_style, font_size);
+                self.layout_cache = Some(LayoutCache {
+                    batched_runs: runs.clone(),
+                    content_generation: current_generation,
+                    display_offset,
+                    cursor_col: cursor.column.0,
+                    cursor_row,
+                });
+                runs
+            }
+        } else {
+            // No cache - generate and store
+            eprintln!("[Prepaint] NO CACHE - generating new layout");
+            let runs = Self::layout_grid(&content.cells, display_offset, &text_style, font_size);
+            self.layout_cache = Some(LayoutCache {
+                batched_runs: runs.clone(),
+                content_generation: current_generation,
+                display_offset,
+                cursor_col: cursor.column.0,
+                cursor_row,
+            });
+            runs
+        };
 
         (
             batched_runs,
@@ -374,7 +406,7 @@ impl Element for TerminalElement {
             line_height,
             font_size,
             cursor.column.0,
-            cursor.line.0 as usize - display_offset,
+            cursor_row,
         )
     }
 
