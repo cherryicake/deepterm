@@ -139,3 +139,19 @@ src/
 - **dirs**: System directories
 
 Always check Cargo.toml before adding new dependencies.
+
+## Workflow Requirements
+
+### Before Committing
+- **Notify user** to review code changes before creating a commit
+- Wait for **explicit approval** from user before running `git commit`
+- Do not commit automatically without user consent
+
+### Commit Message Format
+- Use conventional commits format: `type: description`
+- Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
+- Keep description concise and clear
+
+### Remote Repository
+- Currently not bound to any remote repository
+- User will provide remote URL when ready to push

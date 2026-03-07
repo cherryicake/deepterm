@@ -114,18 +114,18 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let terminal = self.terminal.clone();
-        let focused = self.focused;
         let focus_handle = self.focus_handle.clone();
+        // Check if this view is currently focused
+        let is_focused = focus_handle.is_focused(window);
 
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
-            .when(!focused, |this| {
+            .when(!is_focused, |this| {
                 this.on_click(cx.listener(|this, _event, window, cx| {
-                    this.focused = true;
                     this.focus_handle.focus(window, cx);
                 }))
             })
@@ -144,7 +144,7 @@ impl Render for TerminalView {
             .child(TerminalElement::new(
                 terminal,
                 focus_handle,
-                focused,
+                is_focused,
                 self.cursor_visible,
             ))
     }

@@ -4,9 +4,9 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    fill, point, px, rgb, size, Bounds, Element, ElementId, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId, Entity,
+    FocusHandle, Font, FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement,
+    LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace, Window,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
@@ -338,14 +338,24 @@ impl Element for TerminalElement {
         }
 
         // Draw cursor
-        if self.focused && self.cursor_visible {
+        if self.cursor_visible {
             let cursor_x = bounds.left() + px(4.0) + *cell_width * content.cursor.0 as f32;
             let cursor_y = bounds.top() + *line_height * content.cursor.1 as f32;
 
             let cursor_bounds =
                 Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));
 
-            window.paint_quad(fill(cursor_bounds, rgb(0xcba6f7))); // Ghostty cursor color
+            if self.focused {
+                // Focused: solid cursor (Ghostty cursor color)
+                window.paint_quad(fill(cursor_bounds, rgb(0xcba6f7)));
+            } else {
+                // Unfocused: hollow cursor (outline)
+                window.paint_quad(outline(
+                    cursor_bounds,
+                    rgb(0xcba6f7),
+                    BorderStyle::default(),
+                ));
+            }
         }
     }
 }
