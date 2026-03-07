@@ -4,13 +4,54 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
+    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
+    Window,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
 use crate::terminal_view::terminal_view::TerminalView;
+
+/// Represents a rectangular region with a specific background color
+#[derive(Debug, Clone)]
+pub struct BackgroundRegion {
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+    color: gpui::Hsla,
+}
+
+impl BackgroundRegion {
+    fn new(row: usize, col: usize, color: gpui::Hsla) -> Self {
+        BackgroundRegion {
+            start_row: row,
+            start_col: col,
+            end_row: row,
+            end_col: col,
+            color,
+        }
+    }
+
+    /// Check if this region can be extended with another cell
+    fn can_extend(&self, row: usize, col: usize, color: gpui::Hsla) -> bool {
+        if self.color != color {
+            return false;
+        }
+        // Check if cell is adjacent horizontally
+        if self.end_row == row && self.end_col + 1 == col {
+            return true;
+        }
+        false
+    }
+
+    /// Extend this region with another cell
+    fn extend(&mut self, row: usize, col: usize) {
+        self.end_row = row;
+        self.end_col = col;
+    }
+}
 
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug)]
@@ -106,18 +147,30 @@ impl TerminalElement {
         }
     }
 
-    /// Layout the terminal grid into batched text runs
+    /// Layout the terminal grid into batched text runs with viewport culling and background merging
     fn layout_grid(
         cells: &[IndexedCell],
         text_style: &TextStyle,
         font_size: Pixels,
-    ) -> Vec<BatchedTextRun> {
-        let mut batched_runs = Vec::new();
+        visible_rows: std::ops::Range<usize>,
+    ) -> (Vec<BatchedTextRun>, Vec<BackgroundRegion>) {
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let estimated_cells = cells.len();
+        let estimated_runs = estimated_cells / 10; // Estimate ~10 cells per run
+        let estimated_regions = estimated_cells / 20; // Estimate ~20 cells per background region
+        let mut batched_runs = Vec::with_capacity(estimated_runs);
+        let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
         let mut current_batch: Option<BatchedTextRun> = None;
+        let mut current_bg_region: Option<BackgroundRegion> = None;
 
         // Group cells by row
         let mut row_cells: Vec<Vec<&IndexedCell>> = Vec::new();
         for cell in cells {
+            // Viewport culling: skip cells outside visible range
+            if cell.row < visible_rows.start || cell.row >= visible_rows.end {
+                continue;
+            }
+
             if cell.row >= row_cells.len() {
                 row_cells.resize(cell.row + 1, Vec::new());
             }
@@ -129,8 +182,33 @@ impl TerminalElement {
             if let Some(batch) = current_batch.take() {
                 batched_runs.push(batch);
             }
+            // Flush background region at line boundaries
+            if let Some(region) = current_bg_region.take() {
+                background_regions.push(region);
+            }
 
             for cell in row {
+                // Collect background regions for cells with non-default background
+                if let Some(bg_color) = cell.bg_color {
+                    if let Some(ref mut region) = current_bg_region {
+                        if region.can_extend(cell.row, cell.col, bg_color) {
+                            region.extend(cell.row, cell.col);
+                        } else {
+                            background_regions.push(region.clone());
+                            current_bg_region =
+                                Some(BackgroundRegion::new(cell.row, cell.col, bg_color));
+                        }
+                    } else {
+                        current_bg_region =
+                            Some(BackgroundRegion::new(cell.row, cell.col, bg_color));
+                    }
+                } else {
+                    // No background color, flush current region
+                    if let Some(region) = current_bg_region.take() {
+                        background_regions.push(region);
+                    }
+                }
+
                 if cell.ch == ' ' || cell.ch == '\0' {
                     // Skip blank cells but flush current batch
                     if let Some(batch) = current_batch.take() {
@@ -194,12 +272,15 @@ impl TerminalElement {
             }
         }
 
-        // Flush any remaining batch
+        // Flush any remaining batch and background region
         if let Some(batch) = current_batch {
             batched_runs.push(batch);
         }
+        if let Some(region) = current_bg_region {
+            background_regions.push(region);
+        }
 
-        batched_runs
+        (batched_runs, background_regions)
     }
 }
 
@@ -216,6 +297,7 @@ impl Element for TerminalElement {
     type PrepaintState = (
         TerminalContent,
         Vec<BatchedTextRun>,
+        Vec<BackgroundRegion>,
         TextStyle,
         Pixels,
         Pixels,
@@ -325,12 +407,21 @@ impl Element for TerminalElement {
             (terminal.renderable_content(), terminal.renderable_cells())
         });
 
-        // Layout grid into batched runs
-        let batched_runs = Self::layout_grid(&cells, &text_style, font_size);
+        // Calculate visible row range for viewport culling
+        // Only render visible rows plus a small buffer to avoid flickering
+        let buffer_rows = 2usize;
+        let start_row = content.cursor.1.saturating_sub(buffer_rows);
+        let end_row = (content.cursor.1 + rows + buffer_rows).min(content.rows);
+        let visible_rows = start_row..end_row;
+
+        // Layout grid into batched runs with viewport culling
+        let (batched_runs, background_regions) =
+            Self::layout_grid(&cells, &text_style, font_size, visible_rows);
 
         (
             content,
             batched_runs,
+            background_regions,
             text_style,
             cell_width,
             line_height,
@@ -348,16 +439,31 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        let (content, batched_runs, _text_style, cell_width, line_height, _font_size) =
-            prepaint_state;
-
-        // Note: Terminal background is now handled by the Panel, not drawn here
-        // This allows the Panel's background color to show through
+        let (
+            content,
+            batched_runs,
+            background_regions,
+            _text_style,
+            cell_width,
+            line_height,
+            _font_size,
+        ) = prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
+        // Paint merged background regions first
+        for region in background_regions.iter() {
+            let bg_x = origin.x + region.start_col as f32 * *cell_width;
+            let bg_y = origin.y + region.start_row as f32 * *line_height;
+            let bg_width = (region.end_col - region.start_col + 1) as f32 * *cell_width;
+            let bg_height = (region.end_row - region.start_row + 1) as f32 * *line_height;
+
+            let bg_bounds = Bounds::new(point(bg_x, bg_y), size(bg_width, bg_height));
+            window.paint_quad(fill(bg_bounds, region.color));
+        }
+
         // Paint batched text runs
-        for batch in batched_runs {
+        for batch in batched_runs.iter() {
             batch.paint(origin, *cell_width, *line_height, window, cx);
         }
 
