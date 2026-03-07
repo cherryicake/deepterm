@@ -12,46 +12,6 @@ use gpui::{
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
 use crate::terminal_view::terminal_view::TerminalView;
 
-/// Represents a rectangular region with a specific background color
-#[derive(Debug, Clone)]
-pub struct BackgroundRegion {
-    start_row: usize,
-    start_col: usize,
-    end_row: usize,
-    end_col: usize,
-    color: gpui::Hsla,
-}
-
-impl BackgroundRegion {
-    fn new(row: usize, col: usize, color: gpui::Hsla) -> Self {
-        BackgroundRegion {
-            start_row: row,
-            start_col: col,
-            end_row: row,
-            end_col: col,
-            color,
-        }
-    }
-
-    /// Check if this region can be extended with another cell
-    fn can_extend(&self, row: usize, col: usize, color: gpui::Hsla) -> bool {
-        if self.color != color {
-            return false;
-        }
-        // Check if cell is adjacent horizontally
-        if self.end_row == row && self.end_col + 1 == col {
-            return true;
-        }
-        false
-    }
-
-    /// Extend this region with another cell
-    fn extend(&mut self, row: usize, col: usize) {
-        self.end_row = row;
-        self.end_col = col;
-    }
-}
-
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug)]
 pub struct BatchedTextRun {
@@ -65,7 +25,7 @@ pub struct BatchedTextRun {
 
 impl BatchedTextRun {
     fn new_from_char(row: usize, col: usize, c: char, style: TextRun, font_size: Pixels) -> Self {
-        let mut text = String::with_capacity(100);
+        let mut text = String::with_capacity(64);
         text.push(c);
         BatchedTextRun {
             start_col: col,
@@ -147,7 +107,6 @@ impl TerminalElement {
     }
 
     /// Layout the terminal grid into batched text runs
-    /// Simplified version focusing on performance - no background merging
     fn layout_grid(
         cells: &[IndexedCell],
         text_style: &TextStyle,
@@ -157,23 +116,25 @@ impl TerminalElement {
             return Vec::new();
         }
 
-        // Pre-allocate with estimated capacity
-        let estimated_runs = cells.len() / 10;
+        // Estimate capacity
+        let estimated_runs = (cells.len() / 10).max(16);
         let mut batched_runs = Vec::with_capacity(estimated_runs);
         let mut current_batch: Option<BatchedTextRun> = None;
-        let mut last_row: usize = usize::MAX;
+        let mut last_row: i32 = -1;
 
         for cell in cells {
-            // Flush batch at line boundaries
-            if cell.row != last_row {
+            let cell_row = cell.row as i32;
+
+            // Flush at line boundaries
+            if cell_row != last_row {
                 if let Some(batch) = current_batch.take() {
                     batched_runs.push(batch);
                 }
-                last_row = cell.row;
+                last_row = cell_row;
             }
 
-            // Skip blank cells
-            if cell.ch == ' ' || cell.ch == '\0' {
+            // Skip empty cells
+            if cell.ch == '\0' {
                 if let Some(batch) = current_batch.take() {
                     batched_runs.push(batch);
                 }
@@ -209,32 +170,28 @@ impl TerminalElement {
                 strikethrough: None,
             };
 
-            // Try to batch with existing run
-            if let Some(ref mut batch) = current_batch {
-                if batch.can_append(&cell_style)
-                    && batch.start_row == cell.row
-                    && batch.start_col + batch.cell_count == cell.col
+            // Try to extend current batch
+            match current_batch.as_mut() {
+                Some(batch)
+                    if batch.can_append(&cell_style)
+                        && batch.start_row == cell.row
+                        && batch.start_col + batch.cell_count == cell.col =>
                 {
                     batch.append_char(cell.ch);
-                } else {
-                    // Flush current batch and start new one
-                    let old_batch = current_batch.take().unwrap();
-                    batched_runs.push(old_batch);
-                    let new_batch = BatchedTextRun::new_from_char(
-                        cell.row, cell.col, cell.ch, cell_style, font_size,
-                    );
-                    current_batch = Some(new_batch);
                 }
-            } else {
-                // Start new batch
-                let new_batch = BatchedTextRun::new_from_char(
-                    cell.row, cell.col, cell.ch, cell_style, font_size,
-                );
-                current_batch = Some(new_batch);
+                _ => {
+                    // Flush and start new batch
+                    if let Some(batch) = current_batch.take() {
+                        batched_runs.push(batch);
+                    }
+                    current_batch = Some(BatchedTextRun::new_from_char(
+                        cell.row, cell.col, cell.ch, cell_style, font_size,
+                    ));
+                }
             }
         }
 
-        // Flush any remaining batch
+        // Flush final batch
         if let Some(batch) = current_batch {
             batched_runs.push(batch);
         }
@@ -277,7 +234,6 @@ impl Element for TerminalElement {
         _window: &mut Window,
         _cx: &mut gpui::App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // Request full size like Zed does
         let mut style = Style::default();
         style.size.width = gpui::relative(1.).into();
         style.size.height = gpui::relative(1.).into();
@@ -294,14 +250,9 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        // Calculate terminal dimensions based on bounds
-        let _rem_size = window.rem_size();
-        // Slightly larger font size than Ghostty (13px)
         let font_size = px(13.0);
-        // Slightly more spacing for better readability
         let line_height = font_size * 1.25;
 
-        // Platform-specific font configuration (matching Alacritty defaults)
         #[cfg(target_os = "macos")]
         let (font_family, font_fallbacks) = (
             "Menlo".into(),
@@ -350,7 +301,6 @@ impl Element for TerminalElement {
         let cols = ((bounds.size.width - px(8.0)) / cell_width).floor() as usize;
         let rows = (bounds.size.height / line_height).floor() as usize;
 
-        // Resize terminal if dimensions changed
         if cols > 0 && rows > 0 {
             self.terminal.update(cx, |terminal, cx| {
                 let current_size = terminal.size();
@@ -360,12 +310,10 @@ impl Element for TerminalElement {
             });
         }
 
-        // Get terminal content and cells
         let (content, cells) = self.terminal.update(cx, |terminal, _ctx| {
             (terminal.renderable_content(), terminal.renderable_cells())
         });
 
-        // Layout grid into batched runs
         let batched_runs = Self::layout_grid(&cells, &text_style, font_size);
 
         (
@@ -407,10 +355,8 @@ impl Element for TerminalElement {
                 Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));
 
             if self.focused {
-                // Focused: solid cursor (Ghostty cursor color)
                 window.paint_quad(fill(cursor_bounds, rgb(0xcba6f7)));
             } else {
-                // Unfocused: hollow cursor (outline)
                 window.paint_quad(outline(
                     cursor_bounds,
                     rgb(0xcba6f7),
@@ -419,7 +365,6 @@ impl Element for TerminalElement {
             }
         }
 
-        // Register input handler for IME support
         window.handle_input(
             &self.focus,
             ElementInputHandler::new(bounds, self.view.clone()),
