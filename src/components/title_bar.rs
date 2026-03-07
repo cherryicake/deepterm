@@ -7,8 +7,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton, ParentElement, Pixels,
-    Render, TitlebarOptions, Window, WindowControlArea, div, prelude::*, px,
+    div, prelude::*, px, App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton,
+    ParentElement, Pixels, Render, TitlebarOptions, Window, WindowControlArea,
 };
 
 use crate::components::tab_bar::TabBar;
@@ -102,11 +102,7 @@ impl Render for TitleBar {
             .h(TITLE_BAR_HEIGHT)
             .pl(TITLE_BAR_LEFT_PADDING)
             .bg(gpui::rgb(0x0f0f1a))
-            // 区域1: TabBar (如果有)
-            .when_some(self.tab_bar.clone(), |this, tab_bar| {
-                this.child(div().flex_shrink_0().child(tab_bar))
-            })
-            // 区域2: 可拖拽的空白区域
+            // 可拖拽区域容器，包含 TabBar 和空白区域
             .child(
                 div()
                     .flex()
@@ -134,9 +130,13 @@ impl Render for TitleBar {
                         cx.listener(|this, _, window, _| {
                             this.handle_title_click(window);
                         }),
-                    ),
+                    )
+                    // TabBar (如果有) - 放在可拖拽区域内部
+                    .when_some(self.tab_bar.clone(), |this, tab_bar| {
+                        this.child(div().flex_shrink_0().child(tab_bar))
+                    }),
             )
-            // 区域3: 关闭窗口按钮
+            // 关闭窗口按钮
             .when(!is_macos && !is_web, |this| {
                 this.child(
                     div()
