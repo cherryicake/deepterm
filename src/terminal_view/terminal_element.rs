@@ -3,6 +3,8 @@
 //! Implements the Element trait for custom terminal rendering
 //! Based on Zed's terminal implementation - uses cached last_content
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use gpui::{
     fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
     ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
@@ -12,6 +14,10 @@ use gpui::{
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
 use crate::terminal_view::terminal_view::TerminalView;
+
+/// Global counter for tracking total prepaint allocations
+static PREPAINT_RUN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PREPAINT_TOTAL_CELLS: AtomicU64 = AtomicU64::new(0);
 
 /// A batched text run that combines multiple adjacent cells with the same style
 #[derive(Debug)]
@@ -232,12 +238,13 @@ impl IntoElement for TerminalElement {
 impl Element for TerminalElement {
     type RequestLayoutState = ();
     type PrepaintState = (
-        TerminalContent,
         Vec<BatchedTextRun>,
         TextStyle,
         Pixels,
         Pixels,
         Pixels,
+        usize, // cursor column
+        usize, // cursor row
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -331,20 +338,43 @@ impl Element for TerminalElement {
             });
         }
 
-        // Use cached last_content - FAST, no allocation!
-        let last_content = self.terminal.read(cx).last_content().clone();
-        let display_offset = last_content.display_offset;
+        // Use cached last_content - AVOID CLONE by reading only what we need
+        let terminal_ref = self.terminal.read(cx);
+        let content = terminal_ref.last_content();
+        let cells = content.cells.clone();
+        let display_offset = content.display_offset;
+        let cursor = content.cursor;
+        let cursor_char = content.cursor_char;
 
-        let batched_runs =
-            Self::layout_grid(&last_content.cells, display_offset, &text_style, font_size);
+        let batched_runs = Self::layout_grid(&cells, display_offset, &text_style, font_size);
+
+        // Update global counters
+        let run_count = PREPAINT_RUN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let total_cells = PREPAINT_TOTAL_CELLS.fetch_add(cells.len() as u64, Ordering::Relaxed)
+            + cells.len() as u64;
+
+        // Calculate text memory (String allocations in BatchedTextRun)
+        let text_memory: usize = batched_runs.iter().map(|r| r.text.capacity()).sum();
+
+        // Log prepaint stats
+        eprintln!(
+            "[Prepaint #{}] cells: {} (total processed: {}), batched_runs: {}, text_memory: {} bytes, avg cells/run: {:.1}",
+            run_count,
+            cells.len(),
+            total_cells,
+            batched_runs.len(),
+            text_memory,
+            if batched_runs.len() > 0 { cells.len() as f32 / batched_runs.len() as f32 } else { 0.0 }
+        );
 
         (
-            last_content,
             batched_runs,
             text_style,
             cell_width,
             line_height,
             font_size,
+            cursor.column.0,
+            cursor.line.0 as usize - display_offset,
         )
     }
 
@@ -358,8 +388,15 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        let (content, batched_runs, _text_style, cell_width, line_height, _font_size) =
-            prepaint_state;
+        let (
+            batched_runs,
+            _text_style,
+            cell_width,
+            line_height,
+            _font_size,
+            cursor_col,
+            cursor_row,
+        ) = prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
@@ -370,9 +407,8 @@ impl Element for TerminalElement {
 
         // Draw cursor
         if self.cursor_visible {
-            let cursor_x = bounds.left() + px(4.0) + *cell_width * content.cursor.column.0 as f32;
-            let cursor_y = bounds.top()
-                + *line_height * (content.cursor.line.0 as usize - content.display_offset) as f32;
+            let cursor_x = bounds.left() + px(4.0) + *cell_width * *cursor_col as f32;
+            let cursor_y = bounds.top() + *line_height * *cursor_row as f32;
 
             let cursor_bounds =
                 Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));

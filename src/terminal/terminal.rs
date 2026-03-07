@@ -207,11 +207,22 @@ impl Terminal {
     /// Process pending events from alacritty - this is where we update last_content
     pub fn process_events(&mut self, cx: &mut Context<Self>) {
         // Collect events from async channel
+        let mut event_count = 0;
         while let Ok(event) = self.event_receiver.try_recv() {
             self.events.push_back(event);
+            event_count += 1;
+        }
+
+        if event_count > 0 {
+            eprintln!(
+                "[Terminal Events] Received {} events, queue size: {}",
+                event_count,
+                self.events.len()
+            );
         }
 
         let mut content_changed = false;
+        let mut wakeup_count = 0;
 
         // Process all pending events
         while let Some(event) = self.events.pop_front() {
@@ -221,6 +232,7 @@ impl Terminal {
                 }
                 AlacTermEvent::Wakeup => {
                     content_changed = true;
+                    wakeup_count += 1;
                 }
                 AlacTermEvent::Bell => {}
                 AlacTermEvent::Exit => {
@@ -235,6 +247,10 @@ impl Terminal {
 
         // Update cached content if changed - ONLY HERE, not in prepaint
         if content_changed {
+            eprintln!(
+                "[Terminal Update] Processing {} Wakeup events",
+                wakeup_count
+            );
             self.update_last_content();
             cx.emit(Event::ContentChanged);
         }
@@ -253,6 +269,17 @@ impl Terminal {
             point: ic.point,
             cell: ic.cell.clone(),
         }));
+
+        // Log cache size for debugging
+        let cells_size = cells.len() * std::mem::size_of::<IndexedCell>();
+        let total_size = cells_size + std::mem::size_of::<TerminalContent>();
+        eprintln!(
+            "[Terminal Cache] cells: {}, size: {} bytes, display_offset: {}, cursor: {:?}",
+            cells.len(),
+            total_size,
+            content.display_offset,
+            content.cursor.point
+        );
 
         self.last_content = TerminalContent {
             cells,
