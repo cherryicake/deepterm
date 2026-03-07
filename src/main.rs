@@ -11,8 +11,6 @@ use gpui::{
     App, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
     WindowOptions, div, prelude::*, px, size,
 };
-use gpui_platform::application;
-
 use components::title_bar::TitleBar;
 use workspace::workspace::Workspace;
 
@@ -52,7 +50,7 @@ impl Render for AppWindow {
 }
 
 fn main() {
-    application().run(|cx: &mut App| {
+    gpui::Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);
         cx.open_window(
             WindowOptions {

@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window, div, prelude::*, px, rgb,
+    div, prelude::*, px, rgb, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement,
+    Render, SharedString, Window,
 };
 
 /// 拖拽的 Tab 数据
@@ -259,6 +259,13 @@ impl Render for TabBar {
             .items_center()
             .px(px(8.0))
             .gap(px(4.0))
+            // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
             .child(
                 // 标签列表（包含新建标签按钮）
                 div()
@@ -303,6 +310,8 @@ impl Render for TabBar {
                                 {
                                     let label = label.clone();
                                     move |_drag_data, _, _, cx| {
+                                        // 阻止事件冒泡，防止触发窗口拖拽
+                                        cx.stop_propagation();
                                         // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
                                         cx.new(|_cx| DragPreview {
                                             tab_label: label.clone(),
