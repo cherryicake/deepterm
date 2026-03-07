@@ -274,6 +274,8 @@ impl Render for TerminalView {
                         this.terminal.update(cx, |terminal, _cx| {
                             terminal.write(&bytes);
                         });
+                        // Stop propagation to prevent duplicate key handling
+                        cx.stop_propagation();
                     }
                 }),
             )
