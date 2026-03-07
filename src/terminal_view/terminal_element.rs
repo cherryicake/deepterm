@@ -461,6 +461,24 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
+
+        // Save batched_runs back to cache for reuse
+        // Use std::mem::take to move the Vec out of prepaint_state
+        let runs = std::mem::take(batched_runs);
+        if !runs.is_empty() {
+            // Only save if we have content
+            let terminal_ref = self.terminal.read(cx);
+            let current_generation = terminal_ref.content_generation();
+            let display_offset = terminal_ref.last_content().display_offset;
+
+            self.layout_cache = Some(LayoutCache {
+                batched_runs: runs,
+                content_generation: current_generation,
+                display_offset,
+                cursor_col: *cursor_col,
+                cursor_row: *cursor_row,
+            });
+        }
     }
 }
 
