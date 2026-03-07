@@ -24,8 +24,13 @@ pub struct AppWindow {
 
 impl AppWindow {
     pub fn new(cx: &mut App) -> Self {
-        let title_bar = TitleBar::new_entity(cx);
+        // 先创建 Workspace
         let workspace = Workspace::new(cx);
+
+        // 从 Workspace 获取 TabBar，然后创建 TitleBar
+        let tab_bar = workspace.read(cx).tab_bar.clone();
+        let title_bar = cx.new(|_cx| TitleBar::new("title-bar").with_tab_bar(tab_bar));
+
         Self {
             title_bar,
             workspace,

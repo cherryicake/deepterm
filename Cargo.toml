@@ -1,5 +1,5 @@
 [package]
-name = "gpui-dock-demo"
+name = "deepterm"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -25,5 +25,5 @@ libc = "0.2"
 windows = { version = "0.52", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [[bin]]
-name = "gpui-dock-demo"
+name = "deepterm"
 path = "src/main.rs"

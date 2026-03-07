@@ -1,8 +1,9 @@
+use std::rc::Rc;
+
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Point, Render, SharedString,
+    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
     Window, div, prelude::*, px, rgb,
 };
-use std::sync::Arc;
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug)]
@@ -90,21 +91,23 @@ pub struct TabMergeEvent {
 
 /// 标签栏组件
 pub struct TabBar {
+    id: ElementId,
     pub tabs: Vec<TabItem>,
     pub active_tab_id: Option<SharedString>,
-    on_tab_click: Option<Arc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
-    on_tab_close: Option<Arc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
-    on_new_tab: Option<Arc<dyn Fn(&mut App) + Send + Sync>>,
-    on_tab_reorder: Option<Arc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
-    on_tab_split: Option<Arc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
-    on_tab_merge: Option<Arc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
+    on_tab_click: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
+    on_tab_close: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
+    on_new_tab: Option<Rc<dyn Fn(&mut App) + Send + Sync>>,
+    on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
+    on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
+    on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
     focus_handle: FocusHandle,
 }
 
 impl TabBar {
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    pub fn new(id: impl Into<ElementId>, cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         cx.new(|_cx| Self {
+            id: id.into(),
             tabs: Vec::new(),
             active_tab_id: None,
             on_tab_click: None,
@@ -117,7 +120,11 @@ impl TabBar {
         })
     }
 
-    pub fn new_with_tabs(cx: &mut App, tabs: Vec<TabItem>) -> Entity<Self> {
+    pub fn new_with_tabs(
+        id: impl Into<ElementId>,
+        cx: &mut App,
+        tabs: Vec<TabItem>,
+    ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         let active_tab_id = if tabs.is_empty() {
             None
@@ -126,6 +133,7 @@ impl TabBar {
         };
 
         cx.new(|_cx| Self {
+            id: id.into(),
             tabs,
             active_tab_id,
             on_tab_click: None,
@@ -142,42 +150,42 @@ impl TabBar {
     where
         F: Fn(SharedString, &mut App) + Send + Sync + 'static,
     {
-        self.on_tab_click = Some(Arc::new(callback));
+        self.on_tab_click = Some(Rc::new(callback));
     }
 
     pub fn on_tab_close<F>(&mut self, callback: F)
     where
         F: Fn(SharedString, &mut App) + Send + Sync + 'static,
     {
-        self.on_tab_close = Some(Arc::new(callback));
+        self.on_tab_close = Some(Rc::new(callback));
     }
 
     pub fn on_new_tab<F>(&mut self, callback: F)
     where
         F: Fn(&mut App) + Send + Sync + 'static,
     {
-        self.on_new_tab = Some(Arc::new(callback));
+        self.on_new_tab = Some(Rc::new(callback));
     }
 
     pub fn on_tab_reorder<F>(&mut self, callback: F)
     where
         F: Fn(DraggedTab, usize, &mut App) + Send + Sync + 'static,
     {
-        self.on_tab_reorder = Some(Arc::new(callback));
+        self.on_tab_reorder = Some(Rc::new(callback));
     }
 
     pub fn on_tab_split<F>(&mut self, callback: F)
     where
         F: Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync + 'static,
     {
-        self.on_tab_split = Some(Arc::new(callback));
+        self.on_tab_split = Some(Rc::new(callback));
     }
 
     pub fn on_tab_merge<F>(&mut self, callback: F)
     where
         F: Fn(DraggedTab, SharedString, &mut App) + Send + Sync + 'static,
     {
-        self.on_tab_merge = Some(Arc::new(callback));
+        self.on_tab_merge = Some(Rc::new(callback));
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
@@ -245,10 +253,8 @@ impl Render for TabBar {
         );
 
         div()
-            .id("tab-bar")
-            .h(px(40.0))
-            .w_full()
-            .bg(rgb(0x0f0f1a))
+            .id(self.id.clone())
+            .h(px(34.0))
             .flex()
             .items_center()
             .px(px(8.0))

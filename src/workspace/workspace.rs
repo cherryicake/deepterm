@@ -63,7 +63,7 @@ impl TabInfo {
 /// 主工作区组件
 pub struct Workspace {
     /// 全局TabBar
-    tab_bar: Entity<TabBar>,
+    pub tab_bar: Entity<TabBar>,
     /// 所有tab信息
     tabs: HashMap<String, TabInfo>,
     /// 当前活动的tab ID
@@ -85,7 +85,7 @@ impl Workspace {
 
         // 创建初始tab - 只有一个终端Tab
         let initial_tab_items = vec![TabItem::new("tab-0", "Local Terminal")];
-        let tab_bar = TabBar::new_with_tabs(cx, initial_tab_items);
+        let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 初始化tabs信息
         let mut tabs = HashMap::new();
@@ -621,8 +621,6 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(rgb(0x0f0f1a))
-            // 顶部全局TabBar
-            .child(self.tab_bar.clone())
             // 内容区域 - 只渲染当前活动tab对应的panel(s)
             .child(
                 div()

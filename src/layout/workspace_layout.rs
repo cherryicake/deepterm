@@ -43,7 +43,7 @@ impl WorkspaceLayout {
         let sidebar = Sidebar::new(cx);
 
         // 创建标签栏
-        let tab_bar = TabBar::new(cx);
+        let tab_bar = TabBar::new("workspace-tab-bar", cx);
 
         cx.new(|_cx| Self {
             sidebar,
