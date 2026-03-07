@@ -35,18 +35,27 @@ pub struct TabSplitEvent {
 
 /// 拖拽预览视图
 pub struct DragPreview {
-    tab_id: SharedString,
+    tab_label: SharedString,
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px(px(16.0))
-            .h(px(36.0))
-            .bg(rgb(0x3d3d5c))
+            .h(px(28.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .rounded(px(6.0))
+            .bg(rgb(0x2d2d44))
             .border_1()
             .border_color(rgb(0x6c5ce7))
-            .child(self.tab_id.clone())
+            .shadow_md()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xffffff))
+                    .child(self.tab_label.clone()),
+            )
     }
 }
 
@@ -287,11 +296,14 @@ impl Render for TabBar {
                                     tab_id: tab_id.clone(),
                                     from_index: index,
                                 },
-                                |drag_data, _, _, cx| {
-                                    // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
-                                    cx.new(|_cx| DragPreview {
-                                        tab_id: drag_data.tab_id.clone(),
-                                    })
+                                {
+                                    let label = label.clone();
+                                    move |_drag_data, _, _, cx| {
+                                        // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
+                                        cx.new(|_cx| DragPreview {
+                                            tab_label: label.clone(),
+                                        })
+                                    }
                                 },
                             )
                             // 拖拽悬停效果
