@@ -7,7 +7,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
 
 use super::{Pty, PtyConfig};

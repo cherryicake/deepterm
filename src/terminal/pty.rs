@@ -20,8 +20,14 @@ pub struct PtyConfig {
 
 impl Default for PtyConfig {
     fn default() -> Self {
+        // Platform-specific default shell
+        #[cfg(target_os = "macos")]
+        let default_shell = "/bin/zsh";
+        #[cfg(not(target_os = "macos"))]
+        let default_shell = "/bin/sh";
+
         Self {
-            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            shell: std::env::var("SHELL").unwrap_or_else(|_| default_shell.to_string()),
             working_directory: None,
             env: vec![],
             size: (80, 24),

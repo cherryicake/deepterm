@@ -4,9 +4,10 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
+    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
+    Window,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
@@ -261,16 +262,32 @@ impl Element for TerminalElement {
         // Slightly more spacing for better readability
         let line_height = font_size * 1.25;
 
-        // Use Noto Sans Mono CJK SC - same as system default monospace font
-        let text_style = TextStyle {
-            font_family: "Noto Sans Mono CJK SC".into(),
-            font_features: Default::default(),
-            font_weight: FontWeight::NORMAL,
-            font_fallbacks: Some(FontFallbacks::from_fonts(vec![
+        // Platform-specific font configuration
+        #[cfg(target_os = "macos")]
+        let (font_family, font_fallbacks) = (
+            "SF Mono".into(),
+            Some(FontFallbacks::from_fonts(vec![
+                "Menlo".to_string(),
+                "Monaco".to_string(),
+                "Courier New".to_string(),
+            ])),
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        let (font_family, font_fallbacks) = (
+            "Noto Sans Mono CJK SC".into(),
+            Some(FontFallbacks::from_fonts(vec![
                 "Noto Sans Mono".to_string(),
                 "Source Code Pro".to_string(),
                 "Adwaita Mono".to_string(),
             ])),
+        );
+
+        let text_style = TextStyle {
+            font_family,
+            font_features: Default::default(),
+            font_weight: FontWeight::NORMAL,
+            font_fallbacks,
             font_size: font_size.into(),
             font_style: FontStyle::Normal,
             line_height: line_height.into(),

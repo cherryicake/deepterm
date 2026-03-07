@@ -170,15 +170,28 @@ pub fn create_pty(config: PtyConfig) -> io::Result<Box<dyn Pty>> {
             libc::close(master_fd);
 
             // Create new session
-            libc::setsid();
+            if libc::setsid() < 0 {
+                libc::_exit(1);
+            }
 
             // Set controlling terminal
-            libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+            // macOS requires a non-zero third argument, Linux accepts 0
+            #[cfg(target_os = "macos")]
+            let result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 1);
+            #[cfg(not(target_os = "macos"))]
+            let result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+
+            if result < 0 {
+                libc::_exit(1);
+            }
 
             // Redirect stdin/stdout/stderr to slave
-            libc::dup2(slave_fd, 0);
-            libc::dup2(slave_fd, 1);
-            libc::dup2(slave_fd, 2);
+            if libc::dup2(slave_fd, 0) < 0
+                || libc::dup2(slave_fd, 1) < 0
+                || libc::dup2(slave_fd, 2) < 0
+            {
+                libc::_exit(1);
+            }
 
             // Close slave (now duplicated)
             if slave_fd > 2 {
@@ -188,7 +201,9 @@ pub fn create_pty(config: PtyConfig) -> io::Result<Box<dyn Pty>> {
             // Set working directory
             if let Some(ref dir) = config.working_directory {
                 let c_dir = CString::new(dir.as_str()).unwrap();
-                libc::chdir(c_dir.as_ptr());
+                if libc::chdir(c_dir.as_ptr()) < 0 {
+                    libc::_exit(1);
+                }
             }
 
             // Set environment variables
@@ -199,14 +214,17 @@ pub fn create_pty(config: PtyConfig) -> io::Result<Box<dyn Pty>> {
             }
 
             // Execute shell
-            let shell = CString::new(config.shell.as_str()).unwrap();
-            let arg0 = CString::new("-").unwrap();
-            libc::execl(
-                shell.as_ptr(),
-                shell.as_ptr(),
-                arg0.as_ptr(),
-                std::ptr::null::<()>(),
-            );
+            // Extract shell name from path for argv[0]
+            let shell_path = config.shell.as_str();
+            let shell_name = std::path::Path::new(shell_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sh");
+
+            let shell = CString::new(shell_path).unwrap();
+            let argv0 = CString::new(format!("-{}", shell_name)).unwrap();
+
+            libc::execl(shell.as_ptr(), argv0.as_ptr(), std::ptr::null::<()>());
 
             // If execl fails, exit
             libc::_exit(1);
