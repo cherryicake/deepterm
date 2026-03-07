@@ -4,10 +4,9 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
-    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
-    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
-    Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
+    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalContent};
@@ -262,24 +261,28 @@ impl Element for TerminalElement {
         // Slightly more spacing for better readability
         let line_height = font_size * 1.25;
 
-        // Platform-specific font configuration
+        // Platform-specific font configuration (matching Alacritty defaults)
         #[cfg(target_os = "macos")]
         let (font_family, font_fallbacks) = (
-            "SF Mono".into(),
+            "Menlo".into(),
             Some(FontFallbacks::from_fonts(vec![
-                "Menlo".to_string(),
                 "Monaco".to_string(),
                 "Courier New".to_string(),
             ])),
         );
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         let (font_family, font_fallbacks) = (
-            "Noto Sans Mono CJK SC".into(),
+            "Consolas".into(),
+            Some(FontFallbacks::from_fonts(vec!["Courier New".to_string()])),
+        );
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let (font_family, font_fallbacks) = (
+            "monospace".into(),
             Some(FontFallbacks::from_fonts(vec![
                 "Noto Sans Mono".to_string(),
                 "Source Code Pro".to_string(),
-                "Adwaita Mono".to_string(),
             ])),
         );
 
