@@ -269,9 +269,12 @@ impl Terminal {
             lines.push(line_text);
         }
 
-        // Get cursor position
+        // Get cursor position - adjust for display_offset to match visible area
         let cursor = &grid.cursor;
-        let cursor_pos = (cursor.point.column.0, cursor.point.line.0 as usize);
+        let display_offset = grid.display_offset();
+        // Convert cursor line from absolute to relative to visible area
+        let cursor_line = cursor.point.line.0.saturating_sub(display_offset as i32) as usize;
+        let cursor_pos = (cursor.point.column.0, cursor_line);
 
         TerminalContent {
             lines,
