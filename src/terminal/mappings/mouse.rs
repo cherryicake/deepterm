@@ -1,19 +1,14 @@
 //! Mouse input mappings for terminal
-//!
-//! Maps GPUI mouse events to terminal mouse sequences
-//! Based on Zed's terminal implementation
 
 use std::cmp::{self, min};
 use std::iter::repeat;
 
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column as GridCol, Line as GridLine, Point as AlacPoint, Side};
 use alacritty_terminal::term::TermMode;
-use gpui::{Modifiers, MouseButton, Pixels, Point, ScrollWheelEvent, px};
+use gpui::{px, Modifiers, MouseButton, Pixels, Point, ScrollWheelEvent};
 
 use crate::terminal::terminal::TerminalBounds;
 
-/// Mouse format for encoding
 #[derive(Clone, Copy, Debug)]
 enum MouseFormat {
     Sgr,
@@ -32,7 +27,6 @@ impl MouseFormat {
     }
 }
 
-/// Alacritty mouse button representation
 #[derive(Debug)]
 #[allow(dead_code)]
 enum AlacMouseButton {
@@ -86,7 +80,6 @@ impl AlacMouseButton {
     }
 }
 
-/// Generate scroll report for mouse mode
 pub fn scroll_report(
     point: AlacPoint,
     scroll_lines: i32,
@@ -107,7 +100,6 @@ pub fn scroll_report(
     }
 }
 
-/// Generate alternate scroll escape sequences
 pub fn alt_scroll(scroll_lines: i32) -> Vec<u8> {
     let cmd = if scroll_lines > 0 { b'A' } else { b'B' };
 
@@ -120,7 +112,6 @@ pub fn alt_scroll(scroll_lines: i32) -> Vec<u8> {
     content
 }
 
-/// Generate mouse button report
 pub fn mouse_button_report(
     point: AlacPoint,
     button: MouseButton,
@@ -142,7 +133,6 @@ pub fn mouse_button_report(
     }
 }
 
-/// Generate mouse moved report
 pub fn mouse_moved_report(
     point: AlacPoint,
     button: Option<MouseButton>,
@@ -152,7 +142,6 @@ pub fn mouse_moved_report(
     let button = AlacMouseButton::from_move_button(button);
 
     if !button.is_other() && mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG) {
-        // Only drags are reported in drag mode, so block NoneMove.
         if mode.contains(TermMode::MOUSE_DRAG) && matches!(button, AlacMouseButton::NoneMove) {
             None
         } else {
@@ -163,54 +152,55 @@ pub fn mouse_moved_report(
     }
 }
 
-/// Convert pixel position to grid point
-pub fn grid_point(
-    pos: Point<Pixels>,
-    cur_size: TerminalBounds,
-    display_offset: usize,
-    cell_width: Pixels,
-    line_height: Pixels,
-) -> AlacPoint {
-    grid_point_and_side(pos, cur_size, display_offset, cell_width, line_height).0
+pub fn grid_point(pos: Point<Pixels>, bounds: TerminalBounds, display_offset: usize) -> AlacPoint {
+    grid_point_and_side(pos, bounds, display_offset).0
 }
 
-/// Convert pixel position to grid point and side
 pub fn grid_point_and_side(
     pos: Point<Pixels>,
-    cur_size: TerminalBounds,
+    bounds: TerminalBounds,
     display_offset: usize,
-    cell_width: Pixels,
-    line_height: Pixels,
 ) -> (AlacPoint, Side) {
-    let mut col = GridCol((pos.x / cell_width).floor() as usize);
-    let cell_x = cmp::max(px(0.), pos.x) % cell_width;
-    let half_cell_width = cell_width / 2.0;
+    let cell_width = bounds.cell_width;
+    let line_height = bounds.line_height;
+
+    let mut col = GridCol((pos.x.as_f32() / cell_width.as_f32()).floor() as usize);
+    let cell_x = pos.x.as_f32().max(0.0) % cell_width.as_f32();
+    let half_cell_width = cell_width.as_f32() / 2.0;
     let mut side = if cell_x > half_cell_width {
         Side::Right
     } else {
         Side::Left
     };
 
-    if col > cur_size.last_column() {
-        col = cur_size.last_column();
+    let last_col = GridCol(bounds.num_columns().saturating_sub(1));
+    if col > last_col {
+        col = last_col;
         side = Side::Right;
     }
-    let col = min(col, cur_size.last_column());
-    let mut line = (pos.y / line_height).floor() as i32;
-    if line > cur_size.bottommost_line() {
-        line = cur_size.bottommost_line().0;
+    let col = min(col, last_col);
+
+    // Calculate line number based on mouse position
+    // The display_offset represents how many lines we've scrolled up in the scrollback buffer
+    // So we need to ADD it to get the actual line in the terminal's grid
+    let mut line = (pos.y.as_f32() / line_height.as_f32()).floor() as i32;
+    let bottommost = bounds.num_lines().saturating_sub(1) as i32;
+
+    // Clamp line to visible area first
+    if line > bottommost {
+        line = bottommost;
         side = Side::Right;
     } else if line < 0 {
+        line = 0;
         side = Side::Left;
     }
 
-    (
-        AlacPoint::new(GridLine(line - display_offset as i32), col),
-        side,
-    )
+    // Add display_offset to get the actual line in the terminal grid
+    let actual_line = line + display_offset as i32;
+
+    (AlacPoint::new(GridLine(actual_line), col), side)
 }
 
-/// Generate mouse report bytes
 fn mouse_report(
     point: AlacPoint,
     button: AlacMouseButton,
@@ -218,7 +208,7 @@ fn mouse_report(
     modifiers: Modifiers,
     format: MouseFormat,
 ) -> Option<Vec<u8>> {
-    if point.line < 0 {
+    if point.line.0 < 0 {
         return None;
     }
 
@@ -247,7 +237,6 @@ fn mouse_report(
     }
 }
 
-/// Generate normal mouse report (X10 or UTF-8 mode)
 fn normal_mouse_report(point: AlacPoint, button: u8, utf8: bool) -> Option<Vec<u8>> {
     let AlacPoint { line, column } = point;
     let max_point = if utf8 { 2015 } else { 223 };
@@ -280,7 +269,6 @@ fn normal_mouse_report(point: AlacPoint, button: u8, utf8: bool) -> Option<Vec<u
     Some(msg)
 }
 
-/// Generate SGR mouse report
 fn sgr_mouse_report(point: AlacPoint, button: u8, pressed: bool) -> String {
     let c = if pressed { 'M' } else { 'm' };
 

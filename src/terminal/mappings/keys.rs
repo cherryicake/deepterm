@@ -1,17 +1,10 @@
 //! Keyboard input mappings for terminal
-//!
-//! Maps GPUI keystrokes to terminal escape sequences
-//! Based on Zed's terminal implementation
 
-use gpui::{Keystroke, Modifiers};
+use alacritty_terminal::term::TermMode;
+use gpui::Keystroke;
 
-/// Convert a keystroke to terminal input bytes
-/// Follows Zed's approach: process based on keystroke.key, not key_char
-pub fn keystroke_to_bytes(
-    keystroke: &Keystroke,
-    _modifiers: &Modifiers,
-    _mode: TermMode,
-) -> Option<Vec<u8>> {
+/// Convert keystroke to terminal escape sequence
+pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, _vi_mode: bool) -> Option<Vec<u8>> {
     let key = keystroke.key.as_str();
 
     // Handle special keys
@@ -21,16 +14,16 @@ pub fn keystroke_to_bytes(
         "backspace" => return Some(vec![0x7f]),
         "escape" => return Some(vec![0x1b]),
         "space" => return Some(vec![b' ']),
-        "up" => return Some(encode_csi("A", keystroke)),
-        "down" => return Some(encode_csi("B", keystroke)),
-        "right" => return Some(encode_csi("C", keystroke)),
-        "left" => return Some(encode_csi("D", keystroke)),
-        "home" => return Some(encode_csi("H", keystroke)),
-        "end" => return Some(encode_csi("F", keystroke)),
-        "pageup" => return Some(encode_csi("5~", keystroke)),
-        "pagedown" => return Some(encode_csi("6~", keystroke)),
-        "delete" => return Some(encode_csi("3~", keystroke)),
-        "insert" => return Some(encode_csi("2~", keystroke)),
+        "up" => return Some(encode_csi("A", keystroke, mode)),
+        "down" => return Some(encode_csi("B", keystroke, mode)),
+        "right" => return Some(encode_csi("C", keystroke, mode)),
+        "left" => return Some(encode_csi("D", keystroke, mode)),
+        "home" => return Some(encode_csi("H", keystroke, mode)),
+        "end" => return Some(encode_csi("F", keystroke, mode)),
+        "pageup" => return Some(encode_csi("5~", keystroke, mode)),
+        "pagedown" => return Some(encode_csi("6~", keystroke, mode)),
+        "delete" => return Some(encode_csi("3~", keystroke, mode)),
+        "insert" => return Some(encode_csi("2~", keystroke, mode)),
         _ => {}
     }
 
@@ -47,25 +40,20 @@ pub fn keystroke_to_bytes(
                     9..=12 => &format!("{}~", n + 11),
                     _ => return None,
                 };
-                return Some(encode_csi(seq, keystroke));
+                return Some(encode_csi(seq, keystroke, mode));
             }
         }
     }
 
-    // Handle regular characters and multi-byte Unicode characters
-    // Check if the key is a single character (could be multi-byte in UTF-8)
+    // Handle regular characters
     let mut chars = key.chars();
     if let Some(ch) = chars.next() {
-        // Make sure there's only one character
         if chars.next().is_none() {
             let mut bytes = vec![];
 
             // Handle Ctrl+key combinations
             if keystroke.modifiers.control {
                 if ch.is_ascii_alphabetic() {
-                    // Ctrl+A = 0x01, Ctrl+B = 0x02, etc.
-                    // For uppercase letters, we still send the control code
-                    // (same as lowercase in terminal)
                     let lower = ch.to_ascii_lowercase();
                     bytes.push((lower as u8) & 0x1f);
                     return Some(bytes);
@@ -85,7 +73,7 @@ pub fn keystroke_to_bytes(
                 }
             }
 
-            // Handle Alt+key combinations (send ESC prefix)
+            // Handle Alt+key combinations
             if keystroke.modifiers.alt {
                 bytes.push(0x1b);
                 let mut buf = [0; 4];
@@ -93,48 +81,42 @@ pub fn keystroke_to_bytes(
                 bytes.extend_from_slice(&buf[..ch.len_utf8()]);
                 return Some(bytes);
             }
-
-            // For regular characters without modifiers, return None
-            // This allows IME to handle the input and prevents duplicate characters
-            // The IME will send the text via EntityInputHandler::replace_text_in_range
         }
     }
 
     None
 }
 
-/// Encode CSI sequence with modifiers
-fn encode_csi(suffix: &str, keystroke: &Keystroke) -> Vec<u8> {
+fn encode_csi(suffix: &str, keystroke: &Keystroke, mode: &TermMode) -> Vec<u8> {
     let mut result = vec![0x1b, b'['];
 
-    // Add modifier parameter if needed
     let modifier = encode_modifiers(keystroke);
-    if modifier > 1 || suffix.contains('~') {
-        // For keys with ~ suffix, insert modifier before ~
-        if suffix.contains('~') {
-            let num: String = suffix.chars().take_while(|c| c.is_ascii_digit()).collect();
-            result.extend_from_slice(num.as_bytes());
-            if modifier > 1 {
-                result.push(b';');
-                result.push(b'0' + modifier);
-            }
-            result.push(b'~');
-        } else {
-            if modifier > 1 {
-                result.push(b'1');
-                result.push(b';');
-                result.push(b'0' + modifier);
-            }
-            result.extend_from_slice(suffix.as_bytes());
+    let application_mode = mode.contains(TermMode::APP_CURSOR);
+
+    if suffix.contains('~') {
+        let num: String = suffix.chars().take_while(|c| c.is_ascii_digit()).collect();
+        result.extend_from_slice(num.as_bytes());
+        if modifier > 1 {
+            result.push(b';');
+            result.push(b'0' + modifier);
         }
+        result.push(b'~');
     } else {
+        if application_mode && matches!(suffix, "A" | "B" | "C" | "D" | "H" | "F") {
+            // Application mode: ESC O instead of ESC [
+            result = vec![0x1b, b'O'];
+        }
+        if modifier > 1 {
+            result.push(b'1');
+            result.push(b';');
+            result.push(b'0' + modifier);
+        }
         result.extend_from_slice(suffix.as_bytes());
     }
 
     result
 }
 
-/// Encode modifier bits
 fn encode_modifiers(keystroke: &Keystroke) -> u8 {
     let mut modifier = 1u8;
     if keystroke.modifiers.shift {
@@ -147,24 +129,4 @@ fn encode_modifiers(keystroke: &Keystroke) -> u8 {
         modifier += 4;
     }
     modifier
-}
-
-/// Terminal mode flags (simplified)
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TermMode {
-    pub cursor_keys: bool,
-    pub keypad: bool,
-    pub bracketed_paste: bool,
-    pub mouse_mode: MouseMode,
-}
-
-/// Mouse reporting mode
-#[derive(Clone, Copy, Debug, Default)]
-pub enum MouseMode {
-    #[default]
-    None,
-    X10,
-    Normal,
-    Sgr,
-    Utf8,
 }

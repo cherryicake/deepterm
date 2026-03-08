@@ -1,11 +1,10 @@
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
-    prelude::*, px, rgb,
+    div, prelude::*, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Window,
 };
 
 use crate::terminal_view::terminal_view::TerminalView;
 
-/// Terminal panel component - integrates real terminal functionality
 pub struct TerminalPanel {
     title: SharedString,
     terminal_view: Entity<TerminalView>,
@@ -29,12 +28,10 @@ impl TerminalPanel {
         self
     }
 
-    /// Get the terminal view entity
     pub fn terminal_view(&self) -> &Entity<TerminalView> {
         &self.terminal_view
     }
 
-    /// Get the title
     pub fn title(&self) -> SharedString {
         self.title.clone()
     }

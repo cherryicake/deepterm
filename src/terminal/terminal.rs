@@ -1,42 +1,156 @@
-//! Terminal core implementation using alacritty_terminal's EventLoop
-//!
-//! Based on Zed's terminal implementation - uses background event processing
+//! Terminal module - simplified but functional
 
-use std::sync::Arc;
-use std::time::Duration;
+use alacritty_terminal::{
+    Term,
+    event::{Event as AlacTermEvent, EventListener, WindowSize},
+    event_loop::{EventLoop, EventLoopSender, Msg},
+    grid::{Dimensions, Scroll as AlacScroll},
+    index::{Column, Line, Point as AlacPoint, Side},
+    selection::{Selection, SelectionType},
+    sync::FairMutex,
+    term::{Config, TermMode},
+    tty::{self},
+    vte::ansi::Handler,
+};
 
-use alacritty_terminal::event::{Event as AlacTermEvent, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term, TermMode, cell::Cell};
-use alacritty_terminal::tty::{self, Options as TtyOptions};
-use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Pixels, Point, Task};
+use futures::{
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
+    StreamExt,
+};
 
-use super::event::Event;
-use super::mappings::mouse::{
+use std::{
+    borrow::Cow,
+    path::PathBuf,
+    sync::Arc,
+};
+
+use gpui::{
+    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter,
+    Pixels, Point, Size, Task, Window, px,
+};
+
+use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
 };
 
-/// Terminal content for rendering - cached like Zed
+/// Terminal events
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    TitleChanged,
+    CloseTerminal,
+    Bell,
+    Wakeup,
+    SelectionsChanged,
+}
+
+#[derive(Clone)]
+pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
+
+impl EventListener for ZedListener {
+    fn send_event(&self, event: AlacTermEvent) {
+        self.0.unbounded_send(event).ok();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalBounds {
+    pub cell_width: Pixels,
+    pub line_height: Pixels,
+    pub bounds: Bounds<Pixels>,
+}
+
+impl TerminalBounds {
+    pub fn new(line_height: Pixels, cell_width: Pixels, bounds: Bounds<Pixels>) -> Self {
+        TerminalBounds {
+            cell_width,
+            line_height,
+            bounds,
+        }
+    }
+
+    pub fn num_lines(&self) -> usize {
+        (self.bounds.size.height.as_f32() / self.line_height.as_f32()).floor() as usize
+    }
+
+    pub fn num_columns(&self) -> usize {
+        (self.bounds.size.width.as_f32() / self.cell_width.as_f32()).floor() as usize
+    }
+
+    pub fn last_column(&self) -> Column {
+        Column(self.num_columns().saturating_sub(1))
+    }
+
+    pub fn bottommost_line(&self) -> Line {
+        Line(self.num_lines().saturating_sub(1) as i32)
+    }
+
+    pub fn width(&self) -> Pixels {
+        self.bounds.size.width
+    }
+
+    pub fn height(&self) -> Pixels {
+        self.bounds.size.height
+    }
+}
+
+impl Default for TerminalBounds {
+    fn default() -> Self {
+        TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: px(500.0),
+                    height: px(300.0),
+                },
+            },
+        )
+    }
+}
+
+impl From<TerminalBounds> for WindowSize {
+    fn from(val: TerminalBounds) -> Self {
+        WindowSize {
+            num_lines: val.num_lines() as u16,
+            num_cols: val.num_columns() as u16,
+            cell_width: val.cell_width.as_f32() as u16,
+            cell_height: val.line_height.as_f32() as u16,
+        }
+    }
+}
+
+impl Dimensions for TerminalBounds {
+    fn total_lines(&self) -> usize {
+        self.screen_lines()
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.num_lines()
+    }
+
+    fn columns(&self) -> usize {
+        self.num_columns()
+    }
+}
+
+/// Selection phase
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionPhase {
+    Ended,
+    Selecting,
+    Started,
+}
+
+/// Terminal content
 #[derive(Clone, Debug)]
 pub struct TerminalContent {
-    /// Cells with styling
     pub cells: Vec<IndexedCell>,
-    /// Cursor position
     pub cursor: AlacPoint,
-    /// Cursor character
     pub cursor_char: char,
-    /// Display offset for scrolling
     pub display_offset: usize,
-    /// Terminal mode
     pub mode: alacritty_terminal::term::TermMode,
-    /// Terminal dimensions
     pub cols: usize,
     pub rows: usize,
 }
@@ -55,175 +169,52 @@ impl Default for TerminalContent {
     }
 }
 
-/// A styled cell with its grid position - matches alacritty's IndexedCell
 #[derive(Clone, Debug)]
 pub struct IndexedCell {
     pub point: AlacPoint,
-    pub cell: Cell,
+    pub cell: alacritty_terminal::term::cell::Cell,
 }
 
-/// Event listener that forwards alacritty events to GPUI using futures channel
-#[derive(Clone)]
-pub struct TerminalEventListener(pub UnboundedSender<AlacTermEvent>);
-
-impl EventListener for TerminalEventListener {
-    fn send_event(&self, event: AlacTermEvent) {
-        let _ = self.0.unbounded_send(event);
-    }
-}
-
-/// Terminal bounds for dimensions
-#[derive(Clone, Copy, Debug)]
-pub struct TerminalBounds {
-    pub num_cols: usize,
-    pub num_lines: usize,
-}
-
-impl TerminalBounds {
-    pub fn new(num_cols: usize, num_lines: usize) -> Self {
-        Self {
-            num_cols,
-            num_lines,
-        }
-    }
-}
-
-impl TerminalBounds {
-    /// Get the last column index
-    pub fn last_column(&self) -> Column {
-        Column(self.num_cols.saturating_sub(1))
-    }
-
-    /// Get the bottommost line index
-    pub fn bottommost_line(&self) -> Line {
-        Line(self.num_lines.saturating_sub(1) as i32)
-    }
-}
-
-impl Dimensions for TerminalBounds {
-    fn total_lines(&self) -> usize {
-        self.num_lines
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.num_lines
-    }
-
-    fn columns(&self) -> usize {
-        self.num_cols
-    }
-}
-
-impl From<TerminalBounds> for WindowSize {
-    fn from(val: TerminalBounds) -> Self {
-        WindowSize {
-            num_lines: val.num_lines as u16,
-            num_cols: val.num_cols as u16,
-            cell_width: 9,
-            cell_height: 16,
-        }
-    }
-}
-
-/// Selection phase for mouse handling
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectionPhase {
-    /// No selection in progress
-    Ended,
-    /// Currently selecting with mouse drag
-    Selecting,
-    /// Selection was just started
-    Started,
-}
-
-/// Main terminal struct using alacritty_terminal's EventLoop
 pub struct Terminal {
-    term: Arc<FairMutex<Term<TerminalEventListener>>>,
+    term: Arc<FairMutex<Term<ZedListener>>>,
     sender: Option<EventLoopSender>,
-    size: (usize, usize),
-    title: Option<String>,
-    working_directory: Option<String>,
-    /// Receiver for alacritty events
-    events_rx: Option<UnboundedReceiver<AlacTermEvent>>,
-    /// Cached content for rendering - updated by background task
-    pub last_content: TerminalContent,
-    /// Content generation counter for cache invalidation
+    last_content: TerminalContent,
     content_generation: u64,
-    /// Dirty flag - set when terminal content has changed but not yet rendered
     content_dirty: bool,
-    /// Background event loop task
     event_loop_task: Option<Task<()>>,
-    /// Font size for rendering
-    font_size: gpui::Pixels,
-    /// Terminal bounds for mouse coordinate conversion
     terminal_bounds: TerminalBounds,
-    /// Current selection phase
     selection_phase: SelectionPhase,
-    /// Last mouse position for hyperlink detection
     last_mouse_position: Option<Point<Pixels>>,
-    /// Cell width for mouse coordinate conversion
-    cell_width: gpui::Pixels,
-    /// Line height for mouse coordinate conversion
-    line_height: gpui::Pixels,
 }
 
 impl Terminal {
-    /// Create a new terminal with EventLoop and background event processing
-    pub fn new(cx: &mut App, size: (usize, usize)) -> Entity<Self> {
-        // Create event channel using futures (like Zed)
+    pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
 
-        // Create event listener
-        let listener = TerminalEventListener(events_tx.clone());
-
-        // Create PTY options
-        let pty_options = TtyOptions {
+        let pty_options = tty::Options {
             shell: Some(tty::Shell::new(
                 std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
                 vec![],
             )),
-            working_directory: std::env::current_dir().ok(),
+            working_directory,
             ..Default::default()
         };
 
-        // Create PTY
-        let pty = match tty::new(&pty_options, TerminalBounds::new(size.0, size.1).into(), 0) {
+        let default_bounds = TerminalBounds::default();
+        let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
             Ok(pty) => pty,
             Err(e) => {
                 eprintln!("Failed to create PTY: {}", e);
-                let config = Config::default();
-                let term = Arc::new(FairMutex::new(Term::new(
-                    config,
-                    &TerminalBounds::new(size.0, size.1),
-                    listener.clone(),
-                )));
-
-                return cx.new(|_cx| Self {
-                    term,
-                    sender: None,
-                    size,
-                    title: None,
-                    working_directory: None,
-                    events_rx: Some(events_rx),
-                    last_content: TerminalContent::default(),
-                    content_generation: 0,
-                    content_dirty: false,
-                    event_loop_task: None,
-                    font_size: gpui::px(13.0),
-                    terminal_bounds: TerminalBounds::new(size.0, size.1),
-                    selection_phase: SelectionPhase::Ended,
-                    last_mouse_position: None,
-                    cell_width: gpui::px(9.0),
-                    line_height: gpui::px(16.0),
-                });
+                return cx.new(|_cx| Self::create_error_terminal());
             }
         };
 
         let mut config = Config::default();
-        config.scrolling_history = 1000;
+        config.scrolling_history = 10000;
         let term = Arc::new(FairMutex::new(Term::new(
             config,
-            &TerminalBounds::new(size.0, size.1),
+            &default_bounds,
             listener.clone(),
         )));
 
@@ -231,24 +222,7 @@ impl Terminal {
             Ok(event_loop) => event_loop,
             Err(e) => {
                 eprintln!("Failed to create EventLoop: {}", e);
-                return cx.new(|_cx| Self {
-                    term: term.clone(),
-                    sender: None,
-                    size,
-                    title: None,
-                    working_directory: None,
-                    events_rx: Some(events_rx),
-                    last_content: TerminalContent::default(),
-                    content_generation: 0,
-                    content_dirty: false,
-                    event_loop_task: None,
-                    font_size: gpui::px(13.0),
-                    terminal_bounds: TerminalBounds::new(size.0, size.1),
-                    selection_phase: SelectionPhase::Ended,
-                    last_mouse_position: None,
-                    cell_width: gpui::px(9.0),
-                    line_height: gpui::px(16.0),
-                });
+                return cx.new(|_cx| Self::create_error_terminal());
             }
         };
 
@@ -258,63 +232,12 @@ impl Terminal {
         cx.new(|cx| {
             let term_clone = term.clone();
 
-            // Start background event processing task (like Zed)
             let event_loop_task = cx.spawn(async move |this, cx| {
                 let mut events_rx = events_rx;
-                let mut wakeup_count: u64 = 0;
-
                 while let Some(event) = events_rx.next().await {
-                    // Process the first event immediately for low latency
                     let _ = this.update(cx, |terminal: &mut Self, cx| {
                         terminal.process_event(event, cx);
                     });
-
-                    // Collect additional events with a timeout
-                    let deadline = std::time::Instant::now() + Duration::from_millis(4);
-                    let mut events = Vec::new();
-                    let mut wakeup = false;
-
-                    // Try to collect more events within the time window
-                    loop {
-                        match events_rx.try_next() {
-                            Ok(Some(event)) => {
-                                if matches!(event, AlacTermEvent::Wakeup) {
-                                    wakeup = true;
-                                    wakeup_count += 1;
-                                    if wakeup_count % 100 == 0 {
-                                        eprintln!(
-                                            "[Terminal] Wakeup events processed: {}",
-                                            wakeup_count
-                                        );
-                                    }
-                                } else {
-                                    events.push(event);
-                                }
-                                if events.len() > 100 {
-                                    eprintln!("[Terminal] Events buffer full: {}", events.len());
-                                    break;
-                                }
-                                // Check if we've exceeded the deadline
-                                if std::time::Instant::now() >= deadline {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-
-                    if !events.is_empty() || wakeup {
-                        let _ = this.update(cx, |terminal: &mut Self, cx| {
-                            if wakeup {
-                                terminal.process_event(AlacTermEvent::Wakeup, cx);
-                            }
-                            for event in events {
-                                terminal.process_event(event, cx);
-                            }
-                        });
-                    }
-
-                    // Yield to allow other tasks to run
                     smol::future::yield_now().await;
                 }
             });
@@ -322,58 +245,62 @@ impl Terminal {
             Self {
                 term: term_clone,
                 sender: Some(notifier),
-                size,
-                title: None,
-                working_directory: None,
-                events_rx: None, // Moved to background task
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
                 event_loop_task: Some(event_loop_task),
-                font_size: gpui::px(13.0),
-                terminal_bounds: TerminalBounds::new(size.0, size.1),
+                terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
-                cell_width: gpui::px(9.0),
-                line_height: gpui::px(16.0),
             }
         })
     }
 
-    /// Process a single event - called from background task
+    fn create_error_terminal() -> Self {
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TerminalBounds::default(),
+            ZedListener(unbounded().0),
+        )));
+
+        Self {
+            term,
+            sender: None,
+            last_content: TerminalContent::default(),
+            content_generation: 0,
+            content_dirty: false,
+            event_loop_task: None,
+            terminal_bounds: TerminalBounds::default(),
+            selection_phase: SelectionPhase::Ended,
+            last_mouse_position: None,
+        }
+    }
+
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
         match event {
-            AlacTermEvent::Title(title) => {
-                let title_clone = title.clone();
-                self.title = Some(title);
-                cx.emit(Event::TitleChanged(title_clone));
+            AlacTermEvent::Title(_) => {
+                cx.emit(Event::TitleChanged);
             }
             AlacTermEvent::Wakeup => {
                 self.content_generation += 1;
                 self.content_dirty = true;
-                cx.emit(Event::ContentChanged);
+                cx.emit(Event::Wakeup);
             }
             AlacTermEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            AlacTermEvent::Exit => {
-                cx.emit(Event::Exited(0));
-            }
-            AlacTermEvent::ChildExit(exit_code) => {
-                cx.emit(Event::ExitedWithError(exit_code.to_string()));
+            AlacTermEvent::Exit | AlacTermEvent::ChildExit(_) => {
+                cx.emit(Event::CloseTerminal);
             }
             _ => {}
         }
     }
 
-    /// Update last_content from terminal - called when content changes
     fn update_last_content(&mut self) {
         let term = self.term.lock();
         let content = term.renderable_content();
 
         let estimated_size = content.display_iter.size_hint().0;
-
-        // Reuse existing vector capacity if possible
         let cells = &mut self.last_content.cells;
         cells.clear();
         if cells.capacity() < estimated_size {
@@ -389,83 +316,60 @@ impl Terminal {
         self.last_content.cursor_char = term.grid()[content.cursor.point].c;
         self.last_content.display_offset = content.display_offset;
         self.last_content.mode = content.mode;
-        self.last_content.cols = self.size.0;
-        self.last_content.rows = self.size.1;
-
-        let cell_count = cells.len();
-        eprintln!(
-            "[Terminal] update_last_content: cells={}, cols={}, rows={}",
-            cell_count, self.size.0, self.size.1
-        );
+        self.last_content.cols = self.terminal_bounds.num_columns();
+        self.last_content.rows = self.terminal_bounds.num_lines();
     }
 
-    /// Get content generation counter
-    pub fn content_generation(&self) -> u64 {
-        self.content_generation
-    }
-
-    /// Get last_content for rendering - fast, no allocation
-    pub fn last_content(&self) -> &TerminalContent {
-        &self.last_content
-    }
-
-    /// Sync terminal - called from prepaint
-    /// Only updates content if it has changed (dirty flag is set)
-    pub fn sync(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
+    pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         if self.content_dirty {
             self.update_last_content();
             self.content_dirty = false;
         }
     }
 
-    /// Write data to terminal (sends to PTY)
     pub fn write(&mut self, data: &[u8]) {
         if let Some(ref sender) = self.sender {
-            let msg = Msg::Input(std::borrow::Cow::Owned(data.to_vec()));
-            let _ = sender.send(msg);
+            let msg = Msg::Input(Cow::Owned(data.to_vec()));
+            sender.send(msg);
         }
     }
 
-    /// Resize terminal
-    pub fn resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
-        self.size = (cols, rows);
+    pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
+        self.terminal_bounds = bounds;
 
         if let Some(ref sender) = self.sender {
-            let window_size = WindowSize {
-                num_lines: rows as u16,
-                num_cols: cols as u16,
-                cell_width: 9,
-                cell_height: 16,
-            };
-            let _ = sender.send(Msg::Resize(window_size));
+            let window_size: WindowSize = bounds.into();
+            sender.send(Msg::Resize(window_size));
         }
 
         let mut term = self.term.lock();
-        term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
+        term.resize(alacritty_terminal::term::test::TermSize::new(
+            bounds.num_columns(),
+            bounds.num_lines(),
+        ));
 
-        // Update cached content after resize
         drop(term);
         self.update_last_content();
-
-        cx.emit(Event::ContentChanged);
+        cx.emit(Event::Wakeup);
     }
 
-    /// Get terminal size
-    pub fn size(&self) -> (usize, usize) {
-        self.size
+    pub fn content_generation(&self) -> u64 {
+        self.content_generation
     }
 
-    /// Get title
-    pub fn title(&self) -> Option<&String> {
-        self.title.as_ref()
+    pub fn last_content(&self) -> &TerminalContent {
+        &self.last_content
     }
 
-    /// Get working directory
-    pub fn working_directory(&self) -> Option<&String> {
-        self.working_directory.as_ref()
+    pub fn terminal_bounds(&self) -> TerminalBounds {
+        self.terminal_bounds
     }
 
-    /// Check if terminal is in mouse mode
+    pub fn set_terminal_bounds(&mut self, bounds: TerminalBounds) {
+        self.terminal_bounds = bounds;
+    }
+
+    // Mouse handling
     fn mouse_mode(&self, shift: bool) -> bool {
         if shift {
             return false;
@@ -475,20 +379,13 @@ impl Terminal {
         mode.intersects(TermMode::MOUSE_MODE)
     }
 
-    /// Check if selection has started
-    pub fn selection_started(&self) -> bool {
-        self.selection_phase == SelectionPhase::Selecting
-    }
-
-    /// Handle mouse down event
-    pub fn mouse_down(&mut self, e: &gpui::MouseDownEvent, _cx: &mut Context<Self>) {
-        let position = e.position;
+    pub fn mouse_down(&mut self, e: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        // Convert to local coordinates relative to terminal bounds
+        let position = e.position - self.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
             self.terminal_bounds,
             self.last_content.display_offset,
-            self.cell_width,
-            self.line_height,
         );
 
         if self.mouse_mode(e.modifiers.shift) {
@@ -504,8 +401,6 @@ impl Terminal {
                         position,
                         self.terminal_bounds,
                         self.last_content.display_offset,
-                        self.cell_width,
-                        self.line_height,
                     );
 
                     let selection_type = match e.click_count {
@@ -521,14 +416,7 @@ impl Terminal {
                         let selection = Selection::new(sel_type, point, side);
                         term.selection = Some(selection);
                         self.selection_phase = SelectionPhase::Started;
-                    }
-                }
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                gpui::MouseButton::Middle => {
-                    // Paste from primary selection on Linux
-                    if let Some(text) = _cx.read_from_primary() {
-                        let text = text.text().unwrap_or_default();
-                        self.write(text.as_bytes());
+                        cx.emit(Event::SelectionsChanged);
                     }
                 }
                 _ => {}
@@ -536,17 +424,15 @@ impl Terminal {
         }
     }
 
-    /// Handle mouse up event
     pub fn mouse_up(&mut self, e: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
-        let position = e.position;
+        // Convert to local coordinates relative to terminal bounds
+        let position = e.position - self.terminal_bounds.bounds.origin;
 
         if self.mouse_mode(e.modifiers.shift) {
             let point = grid_point(
                 position,
                 self.terminal_bounds,
                 self.last_content.display_offset,
-                self.cell_width,
-                self.line_height,
             );
 
             if let Some(bytes) =
@@ -556,10 +442,9 @@ impl Terminal {
             }
         } else {
             if e.button == gpui::MouseButton::Left {
-                // Copy selection to clipboard
                 let term = self.term.lock();
                 if let Some(text) = term.selection_to_string() {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
         }
@@ -567,18 +452,36 @@ impl Terminal {
         self.selection_phase = SelectionPhase::Ended;
     }
 
-    /// Handle mouse move event
-    pub fn mouse_move(&mut self, e: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        let position = e.position;
-        self.last_mouse_position = Some(position);
-
-        if self.mouse_mode(e.modifiers.shift) {
+    pub fn mouse_drag(&mut self, e: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.mouse_mode(e.modifiers.shift) && self.selection_phase != SelectionPhase::Ended {
+            self.selection_phase = SelectionPhase::Selecting;
+            // Convert to local coordinates relative to terminal bounds
+            let position = e.position - self.terminal_bounds.bounds.origin;
             let (point, side) = grid_point_and_side(
                 position,
                 self.terminal_bounds,
                 self.last_content.display_offset,
-                self.cell_width,
-                self.line_height,
+            );
+
+            let mut term = self.term.lock();
+            if let Some(mut selection) = term.selection.take() {
+                selection.update(point, side);
+                term.selection = Some(selection);
+                cx.emit(Event::SelectionsChanged);
+            }
+        }
+    }
+
+    pub fn mouse_move(&mut self, e: &gpui::MouseMoveEvent, _cx: &mut Context<Self>) {
+        // Convert to local coordinates relative to terminal bounds
+        let position = e.position - self.terminal_bounds.bounds.origin;
+        self.last_mouse_position = Some(position);
+
+        if self.mouse_mode(e.modifiers.shift) {
+            let (point, _side) = grid_point_and_side(
+                position,
+                self.terminal_bounds,
+                self.last_content.display_offset,
             );
 
             if let Some(bytes) =
@@ -586,52 +489,9 @@ impl Terminal {
             {
                 self.write(&bytes);
             }
-        } else if e.pressed_button.is_some() && self.selection_phase != SelectionPhase::Ended {
-            self.selection_phase = SelectionPhase::Selecting;
-            let (point, side) = grid_point_and_side(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-                self.cell_width,
-                self.line_height,
-            );
-
-            let mut term = self.term.lock();
-            if let Some(mut selection) = term.selection.take() {
-                selection.update(point, side);
-                term.selection = Some(selection);
-                cx.notify();
-            }
         }
     }
 
-    /// Handle mouse drag event
-    pub fn mouse_drag(
-        &mut self,
-        e: &gpui::MouseMoveEvent,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.mouse_mode(e.modifiers.shift) {
-            self.selection_phase = SelectionPhase::Selecting;
-            let position = e.position;
-            let (point, side) = grid_point_and_side(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-                self.cell_width,
-                self.line_height,
-            );
-
-            let mut term = self.term.lock();
-            if let Some(mut selection) = term.selection.take() {
-                selection.update(point, side);
-                term.selection = Some(selection);
-                cx.notify();
-            }
-        }
-    }
-
-    /// Handle scroll wheel event
     pub fn scroll_wheel(&mut self, e: &gpui::ScrollWheelEvent, scroll_multiplier: f32) {
         let mouse_mode = self.mouse_mode(e.shift);
         let scroll_multiplier = if mouse_mode { 1.0 } else { scroll_multiplier };
@@ -642,12 +502,12 @@ impl Terminal {
             }
 
             if mouse_mode {
+                // Convert to local coordinates relative to terminal bounds
+                let position = e.position - self.terminal_bounds.bounds.origin;
                 let point = grid_point(
-                    e.position,
+                    position,
                     self.terminal_bounds,
                     self.last_content.display_offset,
-                    self.cell_width,
-                    self.line_height,
                 );
 
                 if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
@@ -664,27 +524,26 @@ impl Terminal {
             {
                 self.write(&alt_scroll(scroll_lines));
             } else {
-                let scroll = alacritty_terminal::grid::Scroll::Delta(scroll_lines);
+                let scroll = AlacScroll::Delta(scroll_lines);
                 let mut term = self.term.lock();
                 term.scroll_display(scroll);
             }
         }
     }
 
-    /// Determine scroll lines from scroll wheel event
     fn determine_scroll_lines(
         &self,
         e: &gpui::ScrollWheelEvent,
         scroll_multiplier: f32,
     ) -> Option<i32> {
-        use gpui::{ScrollDelta, px};
+        use gpui::ScrollDelta;
 
         let lines = match e.delta {
             ScrollDelta::Lines(lines) => lines.y,
             ScrollDelta::Pixels(pixels) => {
-                let line_height = self.terminal_bounds.num_lines as f32;
+                let line_height = self.terminal_bounds.line_height.as_f32();
                 if line_height > 0.0 {
-                    pixels.y / px(line_height)
+                    pixels.y.as_f32() / line_height
                 } else {
                     0.0
                 }
@@ -698,73 +557,117 @@ impl Terminal {
         Some((lines * scroll_multiplier) as i32)
     }
 
-    /// Set terminal bounds for mouse coordinate conversion
-    pub fn set_terminal_bounds(&mut self, bounds: TerminalBounds) {
-        self.terminal_bounds = bounds;
-    }
-
-    /// Get current terminal bounds
-    pub fn terminal_bounds(&self) -> TerminalBounds {
-        self.terminal_bounds
-    }
-
-    /// Get selection text
+    // Selection
     pub fn selection_text(&self) -> Option<String> {
         let term = self.term.lock();
         term.selection_to_string()
     }
 
-    /// Get selection range for rendering
     pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
         let term = self.term.lock();
         term.selection.as_ref().and_then(|s| s.to_range(&term))
     }
 
-    /// Check if a cell is within the selection
     pub fn is_cell_selected(&self, point: &AlacPoint) -> bool {
         if let Some(range) = self.selection_range() {
-            // Check if point is within the selection range
-            let start = range.start;
-            let end = range.end;
+            let start_line = range.start.line.0;
+            let start_col = range.start.column.0;
+            let end_line = range.end.line.0;
+            let end_col = range.end.column.0;
             
-            // Normalize the range (start should be before end)
-            let (start_line, start_col, end_line, end_col) = if start.line < end.line || 
-                (start.line == end.line && start.column <= end.column) {
-                (start.line.0, start.column.0, end.line.0, end.column.0)
+            let (start_line, start_col, end_line, end_col) = if start_line < end_line || 
+                (start_line == end_line && start_col <= end_col) {
+                (start_line, start_col, end_line, end_col)
             } else {
-                (end.line.0, end.column.0, start.line.0, start.column.0)
+                (end_line, end_col, start_line, start_col)
             };
             
             let point_line = point.line.0;
             let point_col = point.column.0;
             
-            // Check if point is within range
             if point_line < start_line || point_line > end_line {
                 return false;
             }
             
             if point_line == start_line && point_line == end_line {
-                // Single line selection
                 return point_col >= start_col && point_col <= end_col;
             } else if point_line == start_line {
-                // First line of multi-line selection
                 return point_col >= start_col;
             } else if point_line == end_line {
-                // Last line of multi-line selection
                 return point_col <= end_col;
             } else {
-                // Middle line of multi-line selection
                 return true;
             }
         }
         false
     }
 
-    /// Clear selection
     pub fn clear_selection(&mut self) {
         let mut term = self.term.lock();
         term.selection = None;
         self.selection_phase = SelectionPhase::Ended;
+    }
+
+    pub fn select_all(&mut self) {
+        let mut term = self.term.lock();
+        let start = AlacPoint::new(Line(0), Column(0));
+        let selection = Selection::new(SelectionType::Lines, start, Side::Left);
+        term.selection = Some(selection);
+    }
+
+    // Scrolling
+    pub fn scroll_line_up(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(AlacScroll::Delta(-1));
+    }
+
+    pub fn scroll_line_down(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(AlacScroll::Delta(1));
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        let mut term = self.term.lock();
+        let lines = term.screen_lines() as i32;
+        term.scroll_display(AlacScroll::Delta(-lines));
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        let mut term = self.term.lock();
+        let lines = term.screen_lines() as i32;
+        term.scroll_display(AlacScroll::Delta(lines));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(AlacScroll::Top);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let mut term = self.term.lock();
+        term.scroll_display(AlacScroll::Bottom);
+    }
+
+    // Copy/Paste
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        let term = self.term.lock();
+        if let Some(text) = term.selection_to_string() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(item) = cx.read_from_clipboard() {
+            let text = item.text().unwrap_or_default();
+            self.write(text.as_bytes());
+        }
+    }
+
+    // Clear
+    pub fn clear(&mut self) {
+        use alacritty_terminal::vte::ansi::ClearMode;
+        let mut term = self.term.lock();
+        term.clear_screen(ClearMode::All);
     }
 }
 

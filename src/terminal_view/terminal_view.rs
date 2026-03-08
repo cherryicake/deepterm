@@ -1,138 +1,161 @@
-//! Terminal view component
-//!
-//! High-level terminal UI component integrating with GPUI
+//! Terminal view component - Full featured
 
 use gpui::{
-    div, prelude::*, App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, Pixels, Point, Render, SharedString, UTF16Selection, Window,
+    div, prelude::*, px, rgb, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
+    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
 };
 
-use crate::terminal::event::Event as TerminalEvent;
-use crate::terminal::mappings::keys::{keystroke_to_bytes, TermMode};
-use crate::terminal::terminal::Terminal;
+use crate::terminal::mappings::keys::to_esc_str;
+use crate::terminal::terminal::{Event as TerminalEvent, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_element::TerminalElement;
+use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
-/// IME state for tracking composition
-#[derive(Debug)]
-struct ImeState {
-    marked_text: String,
-}
-
-/// Terminal view component
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     focus_handle: FocusHandle,
     focused: bool,
     cursor_visible: bool,
     title: SharedString,
-    ime_state: Option<ImeState>,
+    show_scrollbar: bool,
+    selecting: bool,
 }
 
 impl TerminalView {
-    /// Create a new terminal view
     pub fn new(cx: &mut App) -> Entity<Self> {
-        let terminal = Terminal::new(cx, (80, 24));
+        let terminal = Terminal::new(cx, std::env::current_dir().ok());
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
             let terminal_clone = terminal.clone();
 
-            // Subscribe to terminal events
             cx.subscribe(
                 &terminal_clone,
-                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| {
-                    match event {
-                        TerminalEvent::TitleChanged(title) => {
-                            this.title = title.clone().into();
-                            cx.notify();
-                        }
-                        TerminalEvent::ContentChanged => {
-                            cx.notify();
-                        }
-                        TerminalEvent::Bell => {
-                            // Handle bell
-                        }
-                        TerminalEvent::Exited(_) | TerminalEvent::ExitedWithError(_) => {
-                            // Handle exit
-                        }
-                        _ => {}
+                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
+                    TerminalEvent::TitleChanged => {
+                        this.title = "Terminal".into();
+                        cx.notify();
                     }
+                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                        cx.notify();
+                    }
+                    TerminalEvent::Bell => {}
+                    TerminalEvent::CloseTerminal => {}
                 },
             )
             .detach();
 
-            let view = Self {
+            Self {
                 terminal: terminal_clone,
                 focus_handle,
                 focused: false,
                 cursor_visible: true,
                 title: "Terminal".into(),
-                ime_state: None,
-            };
-
-            // Note: Events are now processed in TerminalElement::prepaint via sync()
-            // This matches Zed's architecture where sync() is called during render
-
-            view
+                show_scrollbar: true,
+                selecting: false,
+            }
         })
     }
 
-    /// Get the terminal entity
     pub fn terminal(&self) -> &Entity<Terminal> {
         &self.terminal
     }
 
-    /// Get the title
     pub fn title(&self) -> SharedString {
         self.title.clone()
     }
 
-    /// Write data to terminal
-    pub fn write(&self, data: &[u8], cx: &mut App) {
-        self.terminal.update(cx, |terminal: &mut Terminal, _cx| {
-            terminal.write(data);
+    // Actions
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.copy(cx);
         });
     }
 
-    /// Resize terminal
-    pub fn resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |terminal: &mut Terminal, _cx| {
-            terminal.resize(cols, rows, _cx);
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.paste(cx);
+        });
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.clear();
+        });
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.select_all();
         });
         cx.notify();
     }
 
-    /// Set the marked (pre-edit) text from IME
-    pub fn set_marked_text(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() {
-            return self.clear_marked_text(cx);
-        }
-        self.ime_state = Some(ImeState { marked_text: text });
+    // Scrolling
+    pub fn scroll_line_up(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_line_up();
+        });
         cx.notify();
     }
 
-    /// Get the current marked range (UTF-16)
-    pub fn marked_text_range(&self) -> Option<std::ops::Range<usize>> {
-        self.ime_state
-            .as_ref()
-            .map(|state| 0..state.marked_text.encode_utf16().count())
+    pub fn scroll_line_down(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_line_down();
+        });
+        cx.notify();
     }
 
-    /// Clear the marked (pre-edit) text state
-    pub fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
-        if self.ime_state.is_some() {
-            self.ime_state = None;
-            cx.notify();
-        }
+    pub fn scroll_page_up(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_page_up();
+        });
+        cx.notify();
     }
 
-    /// Commit (send) the given text to the PTY
-    pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        if !text.is_empty() {
-            self.terminal.update(cx, |terminal, _| {
-                terminal.write(text.as_bytes());
-            });
-        }
+    pub fn scroll_page_down(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_page_down();
+        });
+        cx.notify();
+    }
+
+    pub fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_to_top();
+        });
+        cx.notify();
+    }
+
+    pub fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _cx| {
+            terminal.scroll_to_bottom();
+        });
+        cx.notify();
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal.update(cx, |terminal, _cx| {
+            let mode = terminal.last_content().mode;
+            if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
+                terminal.write(&bytes);
+            } else {
+                // Handle regular character input
+                let key = event.keystroke.key.as_str();
+                // Only handle single character keys without modifiers (except shift)
+                if key.len() == 1
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                {
+                    terminal.write(key.as_bytes());
+                }
+            }
+        });
     }
 }
 
@@ -149,8 +172,6 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        // Terminal doesn't have selectable text in the traditional sense
-        // Return empty selection at position 0
         Some(UTF16Selection {
             range: 0..0,
             reversed: false,
@@ -162,7 +183,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        self.marked_text_range()
+        None
     }
 
     fn text_for_range(
@@ -172,7 +193,6 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        // Terminal doesn't expose its content as editable text
         None
     }
 
@@ -183,9 +203,9 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Commit the final composed text from IME
-        self.clear_marked_text(cx);
-        self.commit_text(text, cx);
+        self.terminal.update(cx, |terminal, _| {
+            terminal.write(text.as_bytes());
+        });
     }
 
     fn replace_and_mark_text_in_range(
@@ -196,14 +216,12 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Handle composition updates (pre-edit text)
-        self.set_marked_text(new_text.to_string(), cx);
+        self.terminal.update(cx, |terminal, _| {
+            terminal.write(new_text.as_bytes());
+        });
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // Clear composition state
-        self.clear_marked_text(cx);
-    }
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn bounds_for_range(
         &mut self,
@@ -212,8 +230,6 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // Return cursor bounds for IME candidate window positioning
-        // For now, return None - the system will use default positioning
         None
     }
 
@@ -223,7 +239,6 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        // Terminal doesn't support point-to-character mapping
         None
     }
 
@@ -237,38 +252,22 @@ impl Render for TerminalView {
         let terminal = self.terminal.clone();
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
-        let terminal_for_mouse = self.terminal.clone();
-        // Check if this view is currently focused
         let is_focused = focus_handle.is_focused(window);
+        let show_scrollbar = self.show_scrollbar;
 
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
-            .when(!is_focused, |this| {
-                this.on_click(cx.listener(|this, _event, window, cx| {
-                    this.focus_handle.focus(window, cx);
-                }))
-            })
-            .on_key_down(
-                cx.listener(move |this, event: &gpui::KeyDownEvent, _window, cx| {
-                    // Process all keystrokes directly, matching Zed's approach
-                    // Don't skip based on key_char - let the keystroke mapping handle everything
-                    let term_mode = TermMode::default();
-                    if let Some(bytes) =
-                        keystroke_to_bytes(&event.keystroke, &event.keystroke.modifiers, term_mode)
-                    {
-                        this.terminal.update(cx, |terminal, _cx| {
-                            terminal.write(&bytes);
-                        });
-                        // Stop propagation to prevent duplicate key handling
-                        cx.stop_propagation();
-                    }
-                }),
-            )
+            .cursor(CursorStyle::IBeam)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key_down(event, window, cx);
+                cx.stop_propagation();
+            }))
             .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.selecting = true;
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_down(event, cx);
                     });
@@ -276,32 +275,29 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseUpEvent, _window, cx| {
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.selecting = false;
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_up(event, cx);
                     });
                     cx.notify();
                 }),
             )
-            .on_mouse_move(
-                cx.listener(move |this, event: &gpui::MouseMoveEvent, _window, cx| {
-                    // Handle mouse drag for selection when mouse button is pressed
-                    if event.pressed_button.is_some() && this.focus_handle.is_focused(_window) {
-                        this.terminal.update(cx, |terminal, cx| {
-                            terminal.mouse_drag(event, cx);
-                        });
-                        cx.notify();
-                    }
-                }),
-            )
-            .on_scroll_wheel(cx.listener(
-                move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                    this.terminal.update(cx, |terminal, _cx| {
-                        terminal.scroll_wheel(event, 3.0);
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.selecting {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_drag(event, cx);
                     });
-                },
-            ))
+                    cx.notify();
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                this.terminal.update(cx, |terminal, _cx| {
+                    terminal.scroll_wheel(event, 3.0);
+                });
+                cx.notify();
+            }))
             .child(TerminalElement::new(
                 terminal,
                 focus_handle,
