@@ -609,7 +609,6 @@ impl Terminal {
     pub fn mouse_drag(
         &mut self,
         e: &gpui::MouseMoveEvent,
-        _region: gpui::Bounds<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
         if !self.mouse_mode(e.modifiers.shift) {
@@ -713,6 +712,52 @@ impl Terminal {
     pub fn selection_text(&self) -> Option<String> {
         let term = self.term.lock();
         term.selection_to_string()
+    }
+
+    /// Get selection range for rendering
+    pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
+        let term = self.term.lock();
+        term.selection.as_ref().and_then(|s| s.to_range(&term))
+    }
+
+    /// Check if a cell is within the selection
+    pub fn is_cell_selected(&self, point: &AlacPoint) -> bool {
+        if let Some(range) = self.selection_range() {
+            // Check if point is within the selection range
+            let start = range.start;
+            let end = range.end;
+            
+            // Normalize the range (start should be before end)
+            let (start_line, start_col, end_line, end_col) = if start.line < end.line || 
+                (start.line == end.line && start.column <= end.column) {
+                (start.line.0, start.column.0, end.line.0, end.column.0)
+            } else {
+                (end.line.0, end.column.0, start.line.0, start.column.0)
+            };
+            
+            let point_line = point.line.0;
+            let point_col = point.column.0;
+            
+            // Check if point is within range
+            if point_line < start_line || point_line > end_line {
+                return false;
+            }
+            
+            if point_line == start_line && point_line == end_line {
+                // Single line selection
+                return point_col >= start_col && point_col <= end_col;
+            } else if point_line == start_line {
+                // First line of multi-line selection
+                return point_col >= start_col;
+            } else if point_line == end_line {
+                // Last line of multi-line selection
+                return point_col <= end_col;
+            } else {
+                // Middle line of multi-line selection
+                return true;
+            }
+        }
+        false
     }
 
     /// Clear selection

@@ -4,9 +4,10 @@
 //! Based on Zed's terminal implementation
 
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
+    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
+    Window,
 };
 use itertools::Itertools;
 
@@ -466,16 +467,14 @@ impl Element for TerminalElement {
         }
 
         // Draw selection highlight if any
-        if let Some(ref sel_text) = *selection {
-            // Get selection range from terminal
+        {
             let term = self.terminal.read(cx);
             let content = term.last_content();
 
             // Paint selection background for selected cells
             for cell in content.cells.iter() {
-                // Simple check: if cell is part of selection
-                // This is a basic implementation - can be improved
-                if sel_text.contains(cell.cell.c) {
+                // Check if cell is within the selection range
+                if term.is_cell_selected(&cell.point) {
                     let cell_x = bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
                     let cell_y = bounds.top()
                         + *line_height

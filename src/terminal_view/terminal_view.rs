@@ -3,12 +3,12 @@
 //! High-level terminal UI component integrating with GPUI
 
 use gpui::{
-    App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement, Pixels,
-    Point, Render, SharedString, UTF16Selection, Window, div, prelude::*,
+    div, prelude::*, App, Bounds, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
+    IntoElement, Pixels, Point, Render, SharedString, UTF16Selection, Window,
 };
 
 use crate::terminal::event::Event as TerminalEvent;
-use crate::terminal::mappings::keys::{TermMode, keystroke_to_bytes};
+use crate::terminal::mappings::keys::{keystroke_to_bytes, TermMode};
 use crate::terminal::terminal::Terminal;
 use crate::terminal_view::terminal_element::TerminalElement;
 
@@ -272,6 +272,7 @@ impl Render for TerminalView {
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_down(event, cx);
                     });
+                    cx.notify();
                 }),
             )
             .on_mouse_up(
@@ -280,6 +281,18 @@ impl Render for TerminalView {
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_up(event, cx);
                     });
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    // Handle mouse drag for selection when mouse button is pressed
+                    if event.pressed_button.is_some() && this.focus_handle.is_focused(_window) {
+                        this.terminal.update(cx, |terminal, cx| {
+                            terminal.mouse_drag(event, cx);
+                        });
+                        cx.notify();
+                    }
                 }),
             )
             .on_scroll_wheel(cx.listener(
