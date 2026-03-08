@@ -237,6 +237,7 @@ impl Render for TerminalView {
         let terminal = self.terminal.clone();
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
+        let terminal_for_mouse = self.terminal.clone();
         // Check if this view is currently focused
         let is_focused = focus_handle.is_focused(window);
 
@@ -265,6 +266,29 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_down(event, cx);
+                    });
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseUpEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_up(event, cx);
+                    });
+                }),
+            )
+            .on_scroll_wheel(cx.listener(
+                move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, _cx| {
+                        terminal.scroll_wheel(event, 3.0);
+                    });
+                },
+            ))
             .child(TerminalElement::new(
                 terminal,
                 focus_handle,

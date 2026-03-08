@@ -271,8 +271,9 @@ impl Element for TerminalElement {
         Pixels,
         Pixels,
         Pixels,
-        usize, // cursor column
-        usize, // cursor row
+        usize,          // cursor column
+        usize,          // cursor row
+        Option<String>, // selection text
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -421,6 +422,9 @@ impl Element for TerminalElement {
 
         let cursor_row = (cursor.line.0 as usize).saturating_sub(display_offset);
 
+        // Get selection from terminal
+        let selection = self.terminal.read(cx).selection_text();
+
         (
             batched_runs,
             text_style,
@@ -429,6 +433,7 @@ impl Element for TerminalElement {
             font_size,
             cursor.column.0,
             cursor_row,
+            selection,
         )
     }
 
@@ -450,6 +455,7 @@ impl Element for TerminalElement {
             _font_size,
             cursor_col,
             cursor_row,
+            selection,
         ) = prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
@@ -457,6 +463,31 @@ impl Element for TerminalElement {
         // Paint batched text runs
         for batch in batched_runs.iter() {
             batch.paint(origin, *cell_width, *line_height, window, cx);
+        }
+
+        // Draw selection highlight if any
+        if let Some(ref sel_text) = *selection {
+            // Get selection range from terminal
+            let term = self.terminal.read(cx);
+            let content = term.last_content();
+
+            // Paint selection background for selected cells
+            for cell in content.cells.iter() {
+                // Simple check: if cell is part of selection
+                // This is a basic implementation - can be improved
+                if sel_text.contains(cell.cell.c) {
+                    let cell_x = bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
+                    let cell_y = bounds.top()
+                        + *line_height
+                            * (cell.point.line.0 as usize).saturating_sub(content.display_offset)
+                                as f32;
+
+                    let cell_bounds =
+                        Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
+
+                    window.paint_quad(fill(cell_bounds, gpui::rgb(0x4a4a6a)));
+                }
+            }
         }
 
         // Draw cursor
