@@ -284,12 +284,18 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if this.selecting {
-                    this.terminal.update(cx, |terminal, cx| {
+                this.terminal.update(cx, |terminal, cx| {
+                    // Always send mouse move events in mouse mode (e.g., neovim)
+                    // so the application can handle selection in real-time
+                    if terminal.mouse_mode(event.modifiers.shift) {
+                        terminal.mouse_move(event, cx);
+                    }
+                    // Also handle terminal selection if we're dragging
+                    if this.selecting {
                         terminal.mouse_drag(event, cx);
-                    });
-                    cx.notify();
-                }
+                    }
+                });
+                cx.notify();
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 this.terminal.update(cx, |terminal, _cx| {

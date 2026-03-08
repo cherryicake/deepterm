@@ -370,7 +370,7 @@ impl Terminal {
     }
 
     // Mouse handling
-    fn mouse_mode(&self, shift: bool) -> bool {
+    pub fn mouse_mode(&self, shift: bool) -> bool {
         if shift {
             return false;
         }
