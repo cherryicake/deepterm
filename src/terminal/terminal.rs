@@ -192,11 +192,16 @@ impl Terminal {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
 
+        // Choose a sensible default shell per platform. On Windows prefer `COMSPEC` or `cmd.exe`;
+        // on Unix-like systems prefer the `SHELL` env var or `/bin/sh`.
+        let default_shell = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        };
+
         let pty_options = tty::Options {
-            shell: Some(tty::Shell::new(
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-                vec![],
-            )),
+            shell: Some(tty::Shell::new(default_shell, vec![])),
             working_directory,
             ..Default::default()
         };
