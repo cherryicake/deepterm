@@ -140,22 +140,22 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal.update(cx, |terminal, _cx| {
+        let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
             if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
                 terminal.write(&bytes);
+                true
             } else {
-                // Handle regular character input
-                let key = event.keystroke.key.as_str();
-                // Only handle single character keys without modifiers (except shift)
-                if key.len() == 1
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                {
-                    terminal.write(key.as_bytes());
-                }
+                false
             }
         });
+
+        if handled {
+            // Stop propagation only if we handled the key
+            cx.stop_propagation();
+        }
+        // Otherwise, let the event propagate to EntityInputHandler
+        // which will handle regular character input (including uppercase letters)
     }
 }
 
@@ -262,7 +262,6 @@ impl Render for TerminalView {
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
-                cx.stop_propagation();
             }))
             .on_mouse_down(
                 MouseButton::Left,
