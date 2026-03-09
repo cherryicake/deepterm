@@ -1,8 +1,9 @@
 //! Terminal scrollbar
 
+use gpui::prelude::*;
 use gpui::{
-    div, prelude::*, px, rgb, Context, Entity, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, Window,
+    div, px, rgb, Context, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, Window,
 };
 
 use crate::terminal::terminal::Terminal;

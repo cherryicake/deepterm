@@ -1,15 +1,20 @@
 //! Terminal view component - Full featured
 
+use gpui::prelude::*;
 use gpui::{
-    div, prelude::*, px, rgb, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
-    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
+    actions, div, px, rgb, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
+    FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    UTF16Selection, Window,
 };
 
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_element::TerminalElement;
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
+
+// Define terminal actions
+actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 
 pub struct TerminalView {
     terminal: Entity<Terminal>,
@@ -253,13 +258,19 @@ impl Render for TerminalView {
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
         let is_focused = focus_handle.is_focused(window);
-        let show_scrollbar = self.show_scrollbar;
+        let _show_scrollbar = self.show_scrollbar;
 
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(|this, _: &Copy, _window, cx| {
+                this.copy(cx);
+            }))
+            .on_action(cx.listener(|this, _: &Paste, _window, cx| {
+                this.paste(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))

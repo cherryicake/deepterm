@@ -1,8 +1,10 @@
-use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
-    Window, div, prelude::*, px, rgb,
-};
 use std::collections::HashMap;
+
+use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
+    Subscription, Window,
+};
 
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::terminal_view::terminal_view::TerminalView;
@@ -105,82 +107,93 @@ impl Workspace {
             TabInfo::new_normal("tab-0", "Local Terminal", panel_0),
         );
 
-        let workspace = cx.new(|_cx| Self {
-            tab_bar,
-            tabs,
-            active_tab_id: "tab-0".to_string(),
-            next_tab_id: 1,
-            next_panel_id: 1,
-            local_terminal_count: 1, // 初始已经创建了1个Local Terminal
-            focus_handle,
-            panel_subscriptions: HashMap::new(),
-        });
+        cx.new(|cx| {
+            let mut workspace = Self {
+                tab_bar,
+                tabs,
+                active_tab_id: "tab-0".to_string(),
+                next_tab_id: 1,
+                next_panel_id: 1,
+                local_terminal_count: 1,
+                focus_handle,
+                panel_subscriptions: HashMap::new(),
+            };
 
-        // 订阅所有面板的事件
-        workspace.update(cx, |this, cx| {
-            this.subscribe_to_panels(cx);
-            this.setup_tab_bar_handlers(cx);
-        });
+            // 在创建时完成所有初始化
+            workspace.subscribe_to_panels(cx);
+            workspace.setup_tab_bar_handlers(cx);
 
-        workspace
+            workspace
+        })
     }
 
     /// 设置TabBar事件处理器
     fn setup_tab_bar_handlers(&mut self, cx: &mut Context<Self>) {
-        let workspace_entity = cx.entity().clone();
+        let workspace = cx.entity();
 
         self.tab_bar.update(cx, |tab_bar, _cx| {
-            // 设置tab点击事件 - 使用defer避免在update中update
-            tab_bar.on_tab_click(move |tab_id, cx| {
-                let id = tab_id.to_string();
-                let ws_entity = workspace_entity.clone();
-                cx.defer(move |cx| {
-                    ws_entity.update(cx, |workspace, cx| {
-                        workspace.active_tab_id = id.clone();
-                        workspace.switch_to_tab(&id, cx);
+            // 设置tab点击事件
+            tab_bar.on_tab_click({
+                let workspace = workspace.clone();
+                move |tab_id, cx| {
+                    let id = tab_id.to_string();
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.active_tab_id = id.clone();
+                                this.switch_to_tab(&id, cx);
+                            });
+                        }
                     });
-                });
+                }
             });
-        });
 
-        let workspace_entity = cx.entity().clone();
-        self.tab_bar.update(cx, |tab_bar, _cx| {
             // 设置tab重新排序事件
-            tab_bar.on_tab_reorder(move |dragged_tab, to_index, cx| {
-                let dragged_id = dragged_tab.tab_id.to_string();
-                let ws_entity = workspace_entity.clone();
-                cx.defer(move |cx| {
-                    ws_entity.update(cx, |workspace, cx| {
-                        workspace.handle_tab_reorder(&dragged_id, to_index, cx);
+            tab_bar.on_tab_reorder({
+                let workspace = workspace.clone();
+                move |dragged_tab, to_index, cx| {
+                    let dragged_id = dragged_tab.tab_id.to_string();
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.handle_tab_reorder(&dragged_id, to_index, cx);
+                            });
+                        }
                     });
-                });
+                }
             });
-        });
 
-        let workspace_entity = cx.entity().clone();
-        self.tab_bar.update(cx, |tab_bar, _cx| {
             // 设置新建tab事件
-            tab_bar.on_new_tab(move |cx| {
-                let ws_entity = workspace_entity.clone();
-                cx.defer(move |cx| {
-                    ws_entity.update(cx, |workspace, cx| {
-                        workspace.handle_new_tab(cx);
+            tab_bar.on_new_tab({
+                let workspace = workspace.clone();
+                move |cx| {
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.handle_new_tab(cx);
+                            });
+                        }
                     });
-                });
+                }
             });
-        });
 
-        let workspace_entity = cx.entity().clone();
-        self.tab_bar.update(cx, |tab_bar, _cx| {
             // 设置tab关闭事件
-            tab_bar.on_tab_close(move |tab_id, cx| {
-                let id = tab_id.to_string();
-                let ws_entity = workspace_entity.clone();
-                cx.defer(move |cx| {
-                    ws_entity.update(cx, |workspace, cx| {
-                        workspace.handle_tab_close(&id, cx);
+            tab_bar.on_tab_close({
+                let workspace = workspace.clone();
+                move |tab_id, cx| {
+                    let id = tab_id.to_string();
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.handle_tab_close(&id, cx);
+                            });
+                        }
                     });
-                });
+                }
             });
         });
     }
@@ -234,10 +247,8 @@ impl Workspace {
 
     /// 处理panel选中事件 - 确保同一组只有一个panel被选中
     fn handle_panel_selected(&mut self, selected_panel_id: &str, cx: &mut Context<Self>) {
-        let active_tab_id = self.active_tab_id.clone();
-
         // 获取当前活动的tab信息
-        let Some(tab_info) = self.tabs.get(&active_tab_id) else {
+        let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
             return;
         };
 
@@ -366,13 +377,17 @@ impl Workspace {
         self.subscribe_to_panels(cx);
 
         // 设置新拖入的panel为选中状态，其他panel取消选中
-        for panel in &dragged_panels {
-            let panel_id = panel.read(cx).panel_id().to_string();
-            // 延迟执行选中操作，确保panel已经添加到container中
-            let workspace_entity = cx.entity().clone();
+        if !dragged_panels.is_empty() {
+            let panel_ids: Vec<_> = dragged_panels
+                .iter()
+                .map(|p| p.read(cx).panel_id().to_string())
+                .collect();
+            let workspace = cx.entity();
             cx.defer(move |cx| {
-                workspace_entity.update(cx, |workspace, cx| {
-                    workspace.handle_panel_selected(&panel_id, cx);
+                workspace.update(cx, |this, cx| {
+                    for panel_id in panel_ids {
+                        this.handle_panel_selected(&panel_id, cx);
+                    }
                 });
             });
         }
@@ -391,12 +406,7 @@ impl Workspace {
             if let Some(from_index) = tab_bar.tabs.iter().position(|t| t.id == dragged_tab_id) {
                 if from_index != to_index {
                     let tab = tab_bar.tabs.remove(from_index);
-                    let insert_index = if to_index > from_index {
-                        to_index
-                    } else {
-                        to_index
-                    };
-                    tab_bar.tabs.insert(insert_index, tab);
+                    tab_bar.tabs.insert(to_index, tab);
                     cx.notify();
                 }
             }
@@ -405,11 +415,11 @@ impl Workspace {
 
     /// 切换到指定tab
     fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        let tab_id_owned = tab_id.to_string();
-        if let Some(_tab_info) = self.tabs.get(&tab_id_owned) {
+        if self.tabs.get(tab_id).is_some() {
             // 更新TabBar的活动tab
+            let tab_id = tab_id.to_string();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.set_active_tab(tab_id_owned.clone(), cx);
+                tab_bar.set_active_tab(tab_id, cx);
             });
             cx.notify();
         }

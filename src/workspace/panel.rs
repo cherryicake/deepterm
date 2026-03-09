@@ -1,17 +1,19 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Styled, Window, div, prelude::*, px, rgb,
+    div, px, rgb, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Styled, Window,
 };
 
 use crate::components::tab_bar::DraggedTab;
 use crate::terminal_view::terminal_view::TerminalView;
 
-/// 拖拽阈值常量
-const DRAG_THRESHOLD_START: f32 = 0.35;
-const DRAG_THRESHOLD_END: f32 = 0.65;
+/// Panel placement threshold for drag operations (start at 35% of dimension)
+const PANEL_DRAG_THRESHOLD_START: f32 = 0.35;
+/// Panel placement threshold for drag operations (end at 65% of dimension)
+const PANEL_DRAG_THRESHOLD_END: f32 = 0.65;
 
 /// 面板放置位置
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelPlacement {
     Left,
     Right,
@@ -53,32 +55,43 @@ pub enum PanelContent {
     Terminal(Entity<TerminalView>),
 }
 
-/// 单个面板视图 - 只包含内容区域，不包含TabBar
-/// TabBar由Workspace统一管理
+/// A panel within the workspace that displays terminal or other content.
+///
+/// Each panel has its own focus handle and can display either terminal content
+/// or placeholder text. Panels support drag-and-drop operations for splitting
+/// the workspace layout.
+///
+/// Note: The tab bar is managed by the Workspace, not individual panels.
 pub struct Panel {
+    /// Unique identifier for this panel
     panel_id: String,
+    /// Focus handle for keyboard input
     focus_handle: FocusHandle,
-    /// 当前拖拽预览位置
+    /// Current drag preview position (if any)
     drag_preview: Option<PanelPlacement>,
-    /// 当前活动 tab ID
+    /// ID of the currently active tab in this panel
     active_tab_id: Option<SharedString>,
-    /// 当前活动 tab 标签名（用于标题栏显示）
+    /// Label for the active tab (shown in title bar)
     active_tab_label: Option<SharedString>,
-    /// 关联的 workspace_id
+    /// ID of the workspace this panel belongs to
     workspace_id: String,
-    /// 是否是工作区中唯一的panel（不渲染边框）
+    /// Whether this is the only panel in the workspace (affects border rendering)
     is_solo: bool,
-    /// 是否被选中（点击后边框加深）
+    /// Whether this panel is currently selected
     is_selected: bool,
-    /// Panel content
+    /// Content displayed in this panel
     content: PanelContent,
 }
 
 impl Panel {
-    /// 创建新的Panel
-    /// panel_id: 面板唯一标识
-    /// workspace_id: 所属workspace组的标识
-    /// active_tab_id: 当前活动的tab id
+    /// Creates a new panel with text content.
+    ///
+    /// # Arguments
+    ///
+    /// * `panel_id` - Unique identifier for this panel
+    /// * `workspace_id` - ID of the workspace this panel belongs to
+    /// * `active_tab_id` - ID of the currently active tab
+    /// * `cx` - The context for entity creation
     pub fn new(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -86,23 +99,30 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let workspace_id = workspace_id.into();
+        let content_text = format!("Panel: {}", panel_id);
 
-        let panel_id_clone = panel_id.clone();
         Self {
             panel_id,
-            workspace_id,
+            workspace_id: workspace_id.into(),
             focus_handle: cx.focus_handle(),
             drag_preview: None,
             active_tab_id,
             active_tab_label: None,
             is_solo: false,
             is_selected: false,
-            content: PanelContent::Text(format!("Panel: {}", panel_id_clone)),
+            content: PanelContent::Text(content_text),
         }
     }
 
-    /// 创建带终端的Panel
+    /// Creates a new panel with a terminal view.
+    ///
+    /// # Arguments
+    ///
+    /// * `panel_id` - Unique identifier for this panel
+    /// * `workspace_id` - ID of the workspace this panel belongs to
+    /// * `active_tab_id` - ID of the currently active tab
+    /// * `active_tab_label` - Label shown in the title bar
+    /// * `cx` - The context for entity creation
     pub fn with_terminal(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -110,13 +130,11 @@ impl Panel {
         active_tab_label: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let panel_id = panel_id.into();
-        let workspace_id = workspace_id.into();
         let terminal_view = TerminalView::new(cx);
 
         Self {
-            panel_id: panel_id.clone(),
-            workspace_id,
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
             focus_handle: cx.focus_handle(),
             drag_preview: None,
             active_tab_id,
@@ -133,12 +151,12 @@ impl Panel {
         cx.notify();
     }
 
-    /// 获取panel内容
+    /// Returns a reference to the panel's content.
     pub fn content(&self) -> &PanelContent {
         &self.content
     }
 
-    /// 检查是否是终端内容
+    /// Returns true if this panel contains a terminal view.
     pub fn has_terminal_content(&self) -> bool {
         matches!(self.content, PanelContent::Terminal(_))
     }
@@ -214,13 +232,13 @@ impl Panel {
         position: gpui::Point<gpui::Pixels>,
     ) -> Option<PanelPlacement> {
         // 使用 gpui-component 的方式：35%/65% 阈值
-        if position.x < bounds.left() + bounds.size.width * DRAG_THRESHOLD_START {
+        if position.x < bounds.left() + bounds.size.width * PANEL_DRAG_THRESHOLD_START {
             Some(PanelPlacement::Left)
-        } else if position.x > bounds.left() + bounds.size.width * DRAG_THRESHOLD_END {
+        } else if position.x > bounds.left() + bounds.size.width * PANEL_DRAG_THRESHOLD_END {
             Some(PanelPlacement::Right)
-        } else if position.y < bounds.top() + bounds.size.height * DRAG_THRESHOLD_START {
+        } else if position.y < bounds.top() + bounds.size.height * PANEL_DRAG_THRESHOLD_START {
             Some(PanelPlacement::Top)
-        } else if position.y > bounds.top() + bounds.size.height * DRAG_THRESHOLD_END {
+        } else if position.y > bounds.top() + bounds.size.height * PANEL_DRAG_THRESHOLD_END {
             Some(PanelPlacement::Bottom)
         } else {
             None
@@ -239,14 +257,15 @@ impl EventEmitter<PanelEvent> for Panel {}
 impl Panel {
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel_id = self.panel_id.clone();
         // 使用Tab标签名作为标题，如果没有则使用Tab ID，最后使用Panel ID
         let title = self
             .active_tab_label
             .as_ref()
-            .map(|label| label.to_string())
-            .or_else(|| self.active_tab_id.as_ref().map(|id| id.to_string()))
+            .map(|s| s.to_string())
+            .or_else(|| self.active_tab_id.as_ref().map(|s| s.to_string()))
             .unwrap_or_else(|| self.panel_id.clone());
+
+        let panel_id = self.panel_id.clone();
 
         div()
             .h(px(28.0))
@@ -274,13 +293,10 @@ impl Panel {
                     .child("×")
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        cx.listener({
-                            let panel_id = panel_id.clone();
-                            move |_this, _event, _window, cx| {
-                                cx.emit(PanelEvent::Close {
-                                    panel_id: panel_id.clone(),
-                                });
-                            }
+                        cx.listener(move |_this, _event, _window, cx| {
+                            cx.emit(PanelEvent::Close {
+                                panel_id: panel_id.clone(),
+                            });
                         }),
                     ),
             )

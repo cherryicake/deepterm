@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::workspace::template::{WorkspaceState, WorkspaceTemplate};
 

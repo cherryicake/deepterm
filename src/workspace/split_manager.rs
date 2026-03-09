@@ -1,12 +1,13 @@
+use gpui::prelude::*;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Window,
-    div,
+    div, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
+    Window,
 };
 
 use crate::workspace::panel::{Panel, PanelPlacement};
 
 /// 分割方向
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SplitDirection {
     Horizontal, // 水平分割 - 左右
     Vertical,   // 垂直分割 - 上下

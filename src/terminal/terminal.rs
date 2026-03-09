@@ -1,7 +1,12 @@
 //! Terminal module - simplified but functional
 
+use std::{
+    borrow::Cow,
+    path::PathBuf,
+    sync::Arc,
+};
+
 use alacritty_terminal::{
-    Term,
     event::{Event as AlacTermEvent, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll as AlacScroll},
@@ -11,22 +16,16 @@ use alacritty_terminal::{
     term::{Config, TermMode},
     tty::{self},
     vte::ansi::Handler,
+    Term,
 };
-
 use futures::{
-    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
+    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     StreamExt,
 };
-
-use std::{
-    borrow::Cow,
-    path::PathBuf,
-    sync::Arc,
-};
-
+use gpui::prelude::*;
 use gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter,
-    Pixels, Point, Size, Task, Window, px,
+    px, App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
+    Size, Task, Window,
 };
 
 use crate::terminal::mappings::mouse::{
@@ -35,7 +34,7 @@ use crate::terminal::mappings::mouse::{
 };
 
 /// Terminal events
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     TitleChanged,
     CloseTerminal,
@@ -53,7 +52,7 @@ impl EventListener for ZedListener {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalBounds {
     pub cell_width: Pixels,
     pub line_height: Pixels,
@@ -136,7 +135,7 @@ impl Dimensions for TerminalBounds {
 }
 
 /// Selection phase
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionPhase {
     Ended,
     Selecting,
@@ -574,37 +573,35 @@ impl Terminal {
     }
 
     pub fn is_cell_selected(&self, point: &AlacPoint) -> bool {
-        if let Some(range) = self.selection_range() {
-            let start_line = range.start.line.0;
-            let start_col = range.start.column.0;
-            let end_line = range.end.line.0;
-            let end_col = range.end.column.0;
-            
-            let (start_line, start_col, end_line, end_col) = if start_line < end_line || 
-                (start_line == end_line && start_col <= end_col) {
-                (start_line, start_col, end_line, end_col)
-            } else {
-                (end_line, end_col, start_line, start_col)
-            };
-            
-            let point_line = point.line.0;
-            let point_col = point.column.0;
-            
-            if point_line < start_line || point_line > end_line {
-                return false;
-            }
-            
-            if point_line == start_line && point_line == end_line {
-                return point_col >= start_col && point_col <= end_col;
-            } else if point_line == start_line {
-                return point_col >= start_col;
-            } else if point_line == end_line {
-                return point_col <= end_col;
-            } else {
-                return true;
-            }
+        let Some(range) = self.selection_range() else {
+            return false;
+        };
+        let point_line = point.line.0;
+        let point_col = point.column.0;
+
+        // 确定选择范围的正常顺序
+        let (start, end) = if range.start.line <= range.end.line {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+
+        // 检查行范围
+        if point_line < start.line.0 || point_line > end.line.0 {
+            return false;
         }
-        false
+
+        // 同一行的特殊情况
+        if start.line == end.line {
+            return point_col >= start.column.0 && point_col <= end.column.0;
+        }
+
+        // 多行选择的边界检查
+        match point_line.cmp(&start.line.0) {
+            std::cmp::Ordering::Equal => point_col >= start.column.0,
+            std::cmp::Ordering::Greater if point_line == end.line.0 => point_col <= end.column.0,
+            _ => true,
+        }
     }
 
     pub fn clear_selection(&mut self) {

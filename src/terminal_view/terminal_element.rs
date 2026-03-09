@@ -1,5 +1,6 @@
 //! Terminal element for rendering
 
+use gpui::prelude::*;
 use gpui::{
     fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
     ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
@@ -12,7 +13,7 @@ use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_view::TerminalView;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct BatchedTextRun {
     pub start_col: usize,
     pub start_row: usize,

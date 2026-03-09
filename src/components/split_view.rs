@@ -1,10 +1,11 @@
+use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
-    div, prelude::*, px, rgb,
+    div, px, rgb, AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement,
+    Render, Window,
 };
 
 /// 分割方向
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SplitDirection {
     Horizontal, // 水平分割 - 左右
     Vertical,   // 垂直分割 - 上下

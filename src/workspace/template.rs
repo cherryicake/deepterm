@@ -1,8 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// 面板类型
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PanelType {
     Terminal,
     FileManager,
@@ -11,7 +12,7 @@ pub enum PanelType {
 }
 
 /// 分割方向
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,

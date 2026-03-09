@@ -1,8 +1,9 @@
-use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, prelude::*, px,
-    rgb,
-};
 use std::time::Duration;
+
+use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
+};
 
 /// 动画配置
 #[derive(Clone, Debug)]

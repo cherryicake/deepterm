@@ -1,6 +1,7 @@
+use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window, div, prelude::*, rgb,
+    div, rgb, AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Window,
 };
 
 use crate::components::sidebar::{Sidebar, SidebarMode};

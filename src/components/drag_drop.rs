@@ -1,10 +1,11 @@
+use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div,
-    prelude::*, px, rgb,
+    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render,
+    Window,
 };
 
 /// 拖拽状态
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DragState {
     Idle,
     Dragging,
@@ -12,7 +13,7 @@ pub enum DragState {
 }
 
 /// 拖拽区域类型
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DropZone {
     None,
     Left,

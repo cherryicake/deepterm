@@ -7,12 +7,18 @@ pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
 
-use components::title_bar::TitleBar;
+use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    WindowOptions, div, prelude::*, px, size,
+    actions, div, px, size, App, Bounds, Context, Entity, InteractiveElement, IntoElement,
+    KeyBinding, ParentElement, Render, WindowOptions,
 };
-use workspace::workspace::Workspace;
+
+use crate::components::title_bar::TitleBar;
+use crate::terminal_view::terminal_view::{Copy, Paste};
+use crate::workspace::workspace::Workspace;
+
+// Define application-level actions
+actions!(app, [Quit]);
 
 /// Root component that contains title bar and workspace
 pub struct AppWindow {
@@ -51,6 +57,16 @@ impl Render for AppWindow {
 
 fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
+        // Bind keyboard shortcuts
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-c", Copy, None),
+            KeyBinding::new("cmd-v", Paste, None),
+        ]);
+
+        // Register action handlers
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
         let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);
         cx.open_window(
             WindowOptions {

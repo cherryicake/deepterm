@@ -1,8 +1,10 @@
-use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
-    prelude::*, px, rgb,
-};
 use std::sync::Arc;
+
+use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Window,
+};
 
 /// 侧边栏项
 #[derive(Clone)]
@@ -29,7 +31,7 @@ impl SidebarItem {
 }
 
 /// 侧边栏显示模式
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SidebarMode {
     /// 展开模式 - 显示图标和文字
     Expanded,

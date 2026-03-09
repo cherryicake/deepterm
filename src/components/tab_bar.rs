@@ -1,8 +1,9 @@
 use std::rc::Rc;
 
+use gpui::prelude::*;
 use gpui::{
-    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window, div, prelude::*, px, rgb,
+    div, px, rgb, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render,
+    SharedString, Window,
 };
 
 /// 拖拽的 Tab 数据
@@ -19,7 +20,7 @@ pub struct TabDropEvent {
 }
 
 /// 边缘区域
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EdgeZone {
     Left,
     Right,
