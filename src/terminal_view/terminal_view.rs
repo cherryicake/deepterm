@@ -11,6 +11,7 @@ use gpui::{
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_element::TerminalElement;
+use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
@@ -318,12 +319,29 @@ impl Render for TerminalView {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .child(TerminalElement::new(
-                terminal,
-                focus_handle,
-                is_focused,
-                self.cursor_visible,
-                view_entity,
-            ))
+            .child(
+                // Use flex layout: terminal content on left, scrollbar on right
+                div()
+                    .flex()
+                    .flex_row()
+                    .size_full()
+                    .child(
+                        // Terminal content takes remaining space
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(TerminalElement::new(
+                                terminal.clone(),
+                                focus_handle,
+                                is_focused,
+                                self.cursor_visible,
+                                view_entity,
+                            ))
+                    )
+                    .when(self.show_scrollbar, |this| {
+                        // Scrollbar on the right
+                        this.child(TerminalScrollbar::new(terminal, cx))
+                    })
+            )
     }
 }

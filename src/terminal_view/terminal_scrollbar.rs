@@ -2,7 +2,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    App, Context, Entity, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Render, Window, div, px, rgb,
 };
 
@@ -15,12 +15,12 @@ pub struct TerminalScrollbar {
 }
 
 impl TerminalScrollbar {
-    pub fn new(terminal: Entity<Terminal>) -> Self {
-        Self {
+    pub fn new(terminal: Entity<Terminal>, cx: &mut App) -> Entity<Self> {
+        cx.new(|_cx| Self {
             terminal,
             dragging: false,
             drag_start_y: None,
-        }
+        })
     }
 }
 
