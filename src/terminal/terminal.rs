@@ -1,12 +1,9 @@
 //! Terminal module - simplified but functional
 
-use std::{
-    borrow::Cow,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use alacritty_terminal::{
+    Term,
     event::{Event as AlacTermEvent, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll as AlacScroll},
@@ -16,16 +13,15 @@ use alacritty_terminal::{
     term::{Config, TermMode},
     tty::{self},
     vte::ansi::Handler,
-    Term,
 };
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     StreamExt,
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
 use gpui::prelude::*;
 use gpui::{
-    px, App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
-    Size, Task, Window,
+    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
+    Size, Task, Window, px,
 };
 
 use crate::terminal::mappings::mouse::{

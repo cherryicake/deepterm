@@ -1,11 +1,18 @@
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render,
-    SharedString, Styled, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    Render, SharedString, Styled, Window, div, px, rgb,
 };
 
-use crate::components::tab_bar::DraggedTab;
+use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::terminal_view::terminal_view::TerminalView;
+
+/// 拖拽的 Panel 数据
+#[derive(Clone, Debug)]
+pub struct DraggedPanel {
+    pub panel_id: String,
+    pub source_tab_id: String,
+}
 
 /// Panel placement threshold for drag operations (start at 35% of dimension)
 const PANEL_DRAG_THRESHOLD_START: f32 = 0.35;
@@ -29,10 +36,16 @@ pub enum PanelEvent {
         panel_id: String,
         placement: Option<PanelPlacement>,
     },
-    /// 放置事件
+    /// 放置事件（来自Tab拖拽）
     Drop {
         panel_id: String,
         dragged_tab: DraggedTab,
+        placement: PanelPlacement,
+    },
+    /// Panel放置事件（来自Panel标题栏拖拽）
+    PanelDrop {
+        target_panel_id: String,
+        dragged_panel: DraggedPanel,
         placement: PanelPlacement,
     },
     /// Tab 切换事件
@@ -266,6 +279,12 @@ impl Panel {
             .unwrap_or_else(|| self.panel_id.clone());
 
         let panel_id = self.panel_id.clone();
+        let source_tab_id = self
+            .active_tab_id
+            .clone()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let drag_title = title.clone();
 
         div()
             .h(px(28.0))
@@ -273,9 +292,26 @@ impl Panel {
             .flex()
             .items_center()
             .justify_between()
+            .cursor_move()
             .child(
                 // 标题 - 显示Tab标签名（使用更小的字体）
-                div().text_xs().text_color(rgb(0x8888aa)).child(title),
+                // 将on_drag绑定到标题元素上，确保拖拽位置计算正确
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8888aa))
+                    .id(format!("panel-title-{}", panel_id))
+                    .on_drag(
+                        DraggedPanel {
+                            panel_id: panel_id.clone(),
+                            source_tab_id,
+                        },
+                        move |_drag_data, _position, _window, cx| {
+                            cx.new(|_cx| DragPreview {
+                                tab_label: drag_title.clone().into(),
+                            })
+                        },
+                    )
+                    .child(title),
             )
             .child(
                 // 关闭按钮
@@ -313,12 +349,7 @@ impl Panel {
                         .unwrap_or_else(|| text.clone()),
                 )
             }
-            PanelContent::Terminal(terminal_view) => {
-                div()
-                    .flex_1()
-                    .min_h(px(100.0)) // Ensure minimum height
-                    .child(terminal_view.clone())
-            }
+            PanelContent::Terminal(terminal_view) => div().flex_1().child(terminal_view.clone()),
         }
     }
 
@@ -412,6 +443,79 @@ impl Panel {
         self.drag_preview = None;
         cx.notify();
     }
+
+    /// 处理Panel拖拽移动事件
+    fn handle_panel_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedPanel>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 获取拖拽数据
+        let dragged: &DraggedPanel = event.drag(cx);
+
+        // 不处理自己拖拽到自己
+        if dragged.panel_id == self.panel_id {
+            return;
+        }
+
+        let bounds = event.bounds;
+        let position = event.event.position;
+
+        // 检查鼠标是否还在内容区域内
+        let is_inside = position.x >= bounds.left()
+            && position.x <= bounds.right()
+            && position.y >= bounds.top()
+            && position.y <= bounds.bottom();
+
+        if !is_inside {
+            // 鼠标离开内容区域，清除预览
+            if self.drag_preview.is_some() {
+                self.drag_preview = None;
+                cx.emit(PanelEvent::DragPreview {
+                    panel_id: self.panel_id.clone(),
+                    placement: None,
+                });
+                cx.notify();
+            }
+            return;
+        }
+
+        let preview = self.calculate_placement(&bounds, position);
+
+        if preview != self.drag_preview {
+            self.drag_preview = preview;
+
+            // 发送事件给父组件
+            cx.emit(PanelEvent::DragPreview {
+                panel_id: self.panel_id.clone(),
+                placement: preview,
+            });
+
+            cx.notify();
+        }
+    }
+
+    /// 处理Panel放置事件
+    fn handle_panel_drop(&mut self, dragged: &DraggedPanel, cx: &mut Context<Self>) {
+        // 不处理自己拖拽到自己
+        if dragged.panel_id == self.panel_id {
+            return;
+        }
+
+        // 如果有preview就使用它，否则默认使用Right
+        let placement = self.drag_preview.unwrap_or(PanelPlacement::Right);
+
+        // 发送Panel放置事件
+        cx.emit(PanelEvent::PanelDrop {
+            target_panel_id: self.panel_id.clone(),
+            dragged_panel: dragged.clone(),
+            placement,
+        });
+
+        self.drag_preview = None;
+        cx.notify();
+    }
 }
 
 impl Render for Panel {
@@ -459,14 +563,24 @@ impl Render for Panel {
                     this
                 }
             })
-            // 拖拽检测
+            // 拖拽检测 - DraggedTab
             .on_drag_move::<DraggedTab>(cx.listener(move |this, event, _window, cx| {
                 this.handle_drag_move(event, cx);
             }))
-            // 放置处理
-            .on_drop(cx.listener(move |this, dragged, _window, cx| {
+            // 拖拽检测 - DraggedPanel
+            .on_drag_move::<DraggedPanel>(cx.listener(move |this, event, window, cx| {
+                this.handle_panel_drag_move(event, window, cx);
+            }))
+            // 放置处理 - DraggedTab
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, _window, cx| {
                 this.handle_drop(dragged, cx);
             }))
+            // 放置处理 - DraggedPanel
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanel, _window, cx| {
+                    this.handle_panel_drop(dragged, cx);
+                }),
+            )
             // 添加一个通用的on_drop来捕获任何类型的拖拽
             .on_drop(cx.listener(move |this, _dragged: &(), _window, _cx| {
                 // Generic drop handler

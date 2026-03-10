@@ -2,13 +2,12 @@ use std::collections::HashMap;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
-    Subscription, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
+    Window, div, px, rgb,
 };
 
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::terminal_view::terminal_view::TerminalView;
-use crate::workspace::panel::{Panel, PanelContent, PanelEvent, PanelPlacement};
+use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 /// Tab类型
@@ -195,6 +194,21 @@ impl Workspace {
                     });
                 }
             });
+
+            // 设置 Panel 拖拽到 TabBar 事件
+            tab_bar.on_panel_drop({
+                let workspace = workspace.clone();
+                move |dragged_panel, insert_index, cx| {
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.handle_panel_drop_on_tab_bar(dragged_panel, insert_index, cx);
+                            });
+                        }
+                    });
+                }
+            });
         });
     }
 
@@ -232,6 +246,13 @@ impl Workspace {
                 placement,
             } => {
                 self.handle_tab_drop_on_panel(panel_id, dragged_tab, *placement, cx);
+            }
+            PanelEvent::PanelDrop {
+                target_panel_id,
+                dragged_panel,
+                placement,
+            } => {
+                self.handle_panel_drop_on_panel(target_panel_id, dragged_panel, *placement, cx);
             }
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
@@ -391,6 +412,203 @@ impl Workspace {
                 });
             });
         }
+
+        cx.notify();
+    }
+
+    /// 处理Panel拖拽到另一个Panel上的事件
+    /// 这与Tab拖拽合并的行为完全一致，只是数据源是同一WorkSpace内的Panel
+    fn handle_panel_drop_on_panel(
+        &mut self,
+        target_panel_id: &str,
+        dragged_panel: &DraggedPanel,
+        placement: PanelPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        // 如果被拖拽的是同一个panel，不做处理
+        if dragged_panel.panel_id == target_panel_id {
+            return;
+        }
+
+        // 获取当前活动的tab信息
+        let active_tab_id = self.active_tab_id.clone();
+        let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
+            return;
+        };
+
+        // 从container中提取出被拖拽的panel（同时检查是否存在）
+        let Some(dragged_panel_entity) =
+            tab_info.container.find_panel(&dragged_panel.panel_id, cx)
+        else {
+            // 被拖拽的panel不在当前tab中，不处理
+            // （未来可以扩展为支持跨Tab拖拽）
+            return;
+        };
+
+        // 先从当前container中移除被拖拽的panel
+        // 这样可以避免同一个panel在容器中出现两次
+        let container_after_remove = tab_info.container.remove_panel(&dragged_panel.panel_id, cx);
+
+        // 创建包含被拖拽panel的容器
+        let dragged_container = SplitContainer::Panel(dragged_panel_entity);
+
+        // 在目标panel处进行分割
+        let new_container =
+            container_after_remove.split_at(target_panel_id, placement, dragged_container, cx);
+
+        // 更新container
+        tab_info.container = new_container;
+
+        // 如果当前不是WorkSpace类型，更新为WorkSpace类型
+        if tab_info.tab_type != TabType::Workspace {
+            tab_info.tab_type = TabType::Workspace;
+
+            // 更新TabBar显示
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                let tabs: Vec<TabItem> = tab_bar
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        if t.id == active_tab_id {
+                            TabItem::new(&active_tab_id, "WorkSpace")
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+                tab_bar.set_tabs(tabs, cx);
+            });
+        }
+
+        // 重新订阅所有panel
+        self.subscribe_to_panels(cx);
+
+        // 设置被拖拽的panel为选中状态
+        let dragged_panel_id = dragged_panel.panel_id.clone();
+        let workspace = cx.entity();
+        cx.defer(move |cx| {
+            workspace.update(cx, |this, cx| {
+                this.handle_panel_selected(&dragged_panel_id, cx);
+            });
+        });
+
+        cx.notify();
+    }
+
+    /// 处理 Panel 拖拽到 TabBar 的事件
+    /// 将 Panel 从当前 WorkSpace 中分离，创建一个新的独立 Tab
+    fn handle_panel_drop_on_tab_bar(
+        &mut self,
+        dragged_panel: DraggedPanel,
+        insert_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let active_tab_id = self.active_tab_id.clone();
+
+        // 获取当前活动的tab信息
+        let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
+            return;
+        };
+
+        // 从container中提取出被拖拽的panel（同时检查是否存在）
+        let Some(dragged_panel_entity) =
+            tab_info.container.find_panel(&dragged_panel.panel_id, cx)
+        else {
+            // 被拖拽的panel不在当前tab中，不处理跨Tab拖拽
+            return;
+        };
+
+        // 获取panel的标签名用于新tab
+        let panel_label = dragged_panel_entity
+            .read(cx)
+            .tab_label()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Panel".to_string());
+
+        // 从当前container中移除被拖拽的panel
+        let new_container = tab_info.container.remove_panel(&dragged_panel.panel_id, cx);
+
+        // 更新原tab的container
+        tab_info.container = new_container;
+
+        // 检查原tab是否只剩一个panel，如果是则恢复为Normal类型
+        let panel_count = tab_info.container.panel_count();
+        if panel_count == 1 && tab_info.tab_type == TabType::Workspace {
+            tab_info.tab_type = TabType::Normal;
+
+            // 获取剩余panel的标签名
+            if let Some(first_panel) = tab_info.container.get_first_panel() {
+                let new_label = first_panel
+                    .read(cx)
+                    .tab_label()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| tab_info.label.clone());
+                tab_info.label = new_label;
+            }
+
+            // 更新TabBar显示
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                let tabs: Vec<TabItem> = tab_bar
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        if t.id == active_tab_id {
+                            TabItem::new(&active_tab_id, &tab_info.label)
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+                tab_bar.set_tabs(tabs, cx);
+            });
+        }
+
+        // 创建新的tab
+        let new_tab_id = format!("tab-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+
+        // 创建新的tab信息，使用被拖拽panel的标签名
+        let new_tab_info = TabInfo::new_normal(
+            &new_tab_id,
+            &panel_label,
+            dragged_panel_entity.clone(),
+        );
+        self.tabs.insert(new_tab_id.clone(), new_tab_info);
+
+        // 添加到TabBar的指定位置
+        let new_tab_item = TabItem::new(&new_tab_id, &panel_label);
+        self.tab_bar.update(cx, |tab_bar, _cx| {
+            match insert_index {
+                Some(index) => {
+                    // 插入到指定位置
+                    if index <= tab_bar.tabs.len() {
+                        tab_bar.tabs.insert(index, new_tab_item);
+                    } else {
+                        tab_bar.tabs.push(new_tab_item);
+                    }
+                }
+                None => {
+                    // 添加到末尾
+                    tab_bar.tabs.push(new_tab_item);
+                }
+            }
+            // 不在这里调用 cx.notify()，外部会统一通知
+        });
+
+        // 订阅新panel的事件
+        // 只订阅这个新panel，不需要重新订阅所有panel
+        let subscription =
+            cx.subscribe(&dragged_panel_entity,
+                |this, _panel, event: &PanelEvent, cx| {
+                    this.handle_panel_event(event, cx);
+                },
+            );
+        self.panel_subscriptions
+            .insert(dragged_panel.panel_id.clone(), subscription);
+
+        // 切换到新tab
+        self.active_tab_id = new_tab_id.clone();
+        self.switch_to_tab(&new_tab_id, cx);
 
         cx.notify();
     }

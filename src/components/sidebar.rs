@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    px, rgb,
 };
 
 /// 侧边栏项

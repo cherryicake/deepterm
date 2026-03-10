@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, TitlebarOptions, Window, WindowControlArea,
+    App, Context, Decorations, ElementId, Entity, IntoElement, MouseButton, ParentElement, Pixels,
+    Render, TitlebarOptions, Window, WindowControlArea, div, px,
 };
 
 use crate::components::tab_bar::TabBar;

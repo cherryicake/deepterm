@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    div, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
-    Window,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Window,
+    div,
 };
 
 use crate::workspace::panel::{Panel, PanelPlacement};
@@ -117,6 +117,22 @@ impl SplitContainer {
             SplitContainer::Panel(_) => 1,
             SplitContainer::Split { children, .. } => {
                 children.iter().map(|c| c.panel_count()).sum()
+            }
+        }
+    }
+
+    /// 获取第一个panel，不收集所有panel
+    /// 用于当只需要第一个panel时，避免完整遍历
+    pub fn get_first_panel(&self) -> Option<Entity<Panel>> {
+        match self {
+            SplitContainer::Panel(panel) => Some(panel.clone()),
+            SplitContainer::Split { children, .. } => {
+                for child in children {
+                    if let Some(panel) = child.get_first_panel() {
+                        return Some(panel);
+                    }
+                }
+                None
             }
         }
     }

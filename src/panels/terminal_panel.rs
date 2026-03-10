@@ -1,6 +1,8 @@
 use gpui::prelude::*;
-use gpui::{div, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    SharedString, Window};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    rgb,
+};
 
 use crate::terminal_view::terminal_view::TerminalView;
 
@@ -47,7 +49,7 @@ impl Render for TerminalPanel {
         div()
             .id("terminal-panel")
             .size_full()
-            .bg(rgb(0x1a1a2e))
+            // .bg(rgb(0x1a1a2e))
             .child(self.terminal_view.clone())
     }
 }

@@ -2,10 +2,9 @@
 
 use gpui::prelude::*;
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
-    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
-    GlobalElementId, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle, WhiteSpace,
-    Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
+    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 use itertools::Itertools;
 
@@ -413,12 +412,13 @@ impl Element for TerminalElement {
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
+        // 设置背景色
         // Paint background
-        let bg_bounds = Bounds::new(
-            origin,
-            size(terminal_bounds.width() - px(8.0), terminal_bounds.height()),
-        );
-        window.paint_quad(fill(bg_bounds, rgb(0x1e1e2e)));
+        // let bg_bounds = Bounds::new(
+        //     origin,
+        //     size(terminal_bounds.width() - px(8.0), terminal_bounds.height()),
+        // );
+        // window.paint_quad(fill(bg_bounds, rgb(0x1e1e2e)));
 
         // Get terminal and content for selection checking
         let (selection_cells, content, mouse_mode) = {
@@ -503,6 +503,7 @@ impl Element for TerminalElement {
             let cursor_bounds =
                 Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));
 
+            // 光标
             if self.focused {
                 window.paint_quad(fill(cursor_bounds, rgb(0xcba6f7)));
             } else {

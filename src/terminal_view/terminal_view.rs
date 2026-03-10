@@ -2,16 +2,15 @@
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, rgb, App, Bounds, Context, CursorStyle, Entity, EntityInputHandler,
-    FocusHandle, Focusable, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    UTF16Selection, Window,
+    App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
+    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
+    actions, div, px, rgb,
 };
 
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_element::TerminalElement;
-use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);

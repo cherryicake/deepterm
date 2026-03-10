@@ -2,9 +2,11 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render,
-    SharedString, Window,
+    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Window, div, px, rgb,
 };
+
+use crate::workspace::panel::DraggedPanel;
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug)]
@@ -37,7 +39,7 @@ pub struct TabSplitEvent {
 
 /// 拖拽预览视图
 pub struct DragPreview {
-    tab_label: SharedString,
+    pub tab_label: SharedString,
 }
 
 impl Render for DragPreview {
@@ -101,6 +103,8 @@ pub struct TabBar {
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
+    /// Panel 拖拽到 TabBar 的回调
+    on_panel_drop: Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut App) + Send + Sync>>,
     focus_handle: FocusHandle,
 }
 
@@ -117,6 +121,7 @@ impl TabBar {
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
+            on_panel_drop: None,
             focus_handle,
         })
     }
@@ -143,6 +148,7 @@ impl TabBar {
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
+            on_panel_drop: None,
             focus_handle,
         })
     }
@@ -187,6 +193,14 @@ impl TabBar {
         F: Fn(DraggedTab, SharedString, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_merge = Some(Rc::new(callback));
+    }
+
+    /// 设置 Panel 拖拽到 TabBar 的回调
+    pub fn on_panel_drop<F>(&mut self, callback: F)
+    where
+        F: Fn(DraggedPanel, Option<usize>, &mut App) + Send + Sync + 'static,
+    {
+        self.on_panel_drop = Some(Rc::new(callback));
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
@@ -246,7 +260,8 @@ impl Render for TabBar {
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
         let on_tab_reorder = self.on_tab_reorder.clone();
-        let on_tab_merge = self.on_tab_merge.clone();
+        let _on_tab_merge = self.on_tab_merge.clone();
+        let on_panel_drop = self.on_panel_drop.clone();
 
         div()
             .id(self.id.clone())
@@ -262,6 +277,15 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }),
             )
+            // TabBar 整体接受 DraggedPanel drop - 放到最后
+            .on_drop(cx.listener({
+                let on_panel_drop = on_panel_drop.clone();
+                move |_this, dragged: &DraggedPanel, _window, cx| {
+                    if let Some(ref callback) = on_panel_drop {
+                        callback(dragged.clone(), None, cx);
+                    }
+                }
+            }))
             .child(
                 // 标签列表（包含新建标签按钮）
                 div()
@@ -275,6 +299,7 @@ impl Render for TabBar {
                         let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                         let label = tab.label.clone();
                         let is_modified = tab.is_modified;
+                        let on_panel_drop_for_tab = on_panel_drop.clone();
 
                         div()
                             .id(tab_id.clone())
@@ -315,7 +340,7 @@ impl Render for TabBar {
                                     }
                                 },
                             )
-                            // 拖拽悬停效果
+                            // 拖拽悬停效果 - DraggedTab
                             .drag_over::<DraggedTab>({
                                 let tab_id = tab_id.clone();
                                 move |tab, dragged: &DraggedTab, _, _cx| {
@@ -326,7 +351,13 @@ impl Render for TabBar {
                                     }
                                 }
                             })
-                            // 放置处理 - 只处理重新排序，不处理合并
+                            // 拖拽悬停效果 - DraggedPanel（显示放置指示器）
+                            .drag_over::<DraggedPanel>({
+                                move |tab, _dragged: &DraggedPanel, _, _cx| {
+                                    tab.border_color(rgb(0x6c5ce7)).border_l_2()
+                                }
+                            })
+                            // 放置处理 - DraggedTab 重新排序
                             .on_drop(cx.listener({
                                 let on_tab_reorder = on_tab_reorder.clone();
                                 let tab_id = tab_id.clone();
@@ -340,6 +371,16 @@ impl Render for TabBar {
                                                 callback(dragged.clone(), to_index, cx);
                                             }
                                         }
+                                    }
+                                }
+                            }))
+                            // 放置处理 - DraggedPanel，插入到当前 tab 位置
+                            .on_drop(cx.listener({
+                                let on_panel_drop_for_tab = on_panel_drop_for_tab.clone();
+                                move |_this, dragged: &DraggedPanel, _window, cx| {
+                                    cx.stop_propagation(); // 阻止事件冒泡到 TabBar 容器
+                                    if let Some(ref callback) = on_panel_drop_for_tab {
+                                        callback(dragged.clone(), Some(index), cx);
                                     }
                                 }
                             }))

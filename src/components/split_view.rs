@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement,
-    Render, Window,
+    AnyElement, App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
+    div, px, rgb,
 };
 
 /// 分割方向

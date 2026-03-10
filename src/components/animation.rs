@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, px, rgb,
 };
 
 /// 动画配置
