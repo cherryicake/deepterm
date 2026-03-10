@@ -180,6 +180,9 @@ pub struct Terminal {
     terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
     last_mouse_position: Option<Point<Pixels>>,
+    /// Scroll accumulator for smooth scrolling (trackpad support)
+    /// Accumulates partial scroll amounts and applies them when they reach a full line
+    scroll_accumulator: f32,
 }
 
 impl Terminal {
@@ -252,6 +255,7 @@ impl Terminal {
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
+                scroll_accumulator: 0.0,
             }
         })
     }
@@ -273,6 +277,7 @@ impl Terminal {
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             last_mouse_position: None,
+            scroll_accumulator: 0.0,
         }
     }
 
@@ -492,53 +497,64 @@ impl Terminal {
         }
     }
 
+    /// Handles scroll wheel events with smooth scrolling support.
+    /// Uses an accumulator to handle trackpad/trackpoint smooth scrolling.
     pub fn scroll_wheel(&mut self, e: &gpui::ScrollWheelEvent, scroll_multiplier: f32) {
         let mouse_mode = self.mouse_mode(e.shift);
         let scroll_multiplier = if mouse_mode { 1.0 } else { scroll_multiplier };
 
-        if let Some(scroll_lines) = self.determine_scroll_lines(e, scroll_multiplier) {
-            if scroll_lines == 0 {
-                return;
-            }
+        // Calculate scroll amount in lines, using accumulator for smooth scrolling
+        let scroll_lines =
+            self.determine_scroll_lines_with_accumulator(e, scroll_multiplier, mouse_mode);
 
-            if mouse_mode {
-                // Convert to local coordinates relative to terminal bounds
-                let position = e.position - self.terminal_bounds.bounds.origin;
-                let point = grid_point(
-                    position,
-                    self.terminal_bounds,
-                    self.last_content.display_offset,
-                );
+        if scroll_lines == 0 {
+            return;
+        }
 
-                if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
-                {
-                    for scroll in scrolls {
-                        self.write(&scroll);
-                    }
+        if mouse_mode {
+            // In mouse mode, send mouse events to the application (e.g., neovim)
+            // Convert to local coordinates relative to terminal bounds
+            let position = e.position - self.terminal_bounds.bounds.origin;
+            let point = grid_point(
+                position,
+                self.terminal_bounds,
+                self.last_content.display_offset,
+            );
+
+            if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode) {
+                for scroll in scrolls {
+                    self.write(&scroll);
                 }
-            } else if self
-                .last_content
-                .mode
-                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-                && !e.shift
-            {
-                self.write(&alt_scroll(scroll_lines));
-            } else {
-                let scroll = AlacScroll::Delta(scroll_lines);
-                let mut term = self.term.lock();
-                term.scroll_display(scroll);
             }
+        } else if self
+            .last_content
+            .mode
+            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+            && !e.shift
+        {
+            // In alternate screen with alternate scroll enabled (e.g., less, man pages)
+            // Send arrow key sequences instead of scrolling the buffer
+            self.write(&alt_scroll(scroll_lines));
+        } else {
+            // Normal mode: scroll the terminal history buffer
+            let scroll = AlacScroll::Delta(scroll_lines);
+            let mut term = self.term.lock();
+            term.scroll_display(scroll);
         }
     }
 
-    fn determine_scroll_lines(
-        &self,
+    /// Determines the number of lines to scroll, using an accumulator for smooth scrolling.
+    /// This allows trackpads and trackpoints to accumulate partial scroll amounts
+    /// and scroll only when a full line is reached.
+    fn determine_scroll_lines_with_accumulator(
+        &mut self,
         e: &gpui::ScrollWheelEvent,
         scroll_multiplier: f32,
-    ) -> Option<i32> {
+        mouse_mode: bool,
+    ) -> i32 {
         use gpui::ScrollDelta;
 
-        let lines = match e.delta {
+        let raw_scroll = match e.delta {
             ScrollDelta::Lines(lines) => lines.y,
             ScrollDelta::Pixels(pixels) => {
                 let line_height = self.terminal_bounds.line_height.as_f32();
@@ -550,11 +566,54 @@ impl Terminal {
             }
         };
 
-        if lines == 0.0 {
-            return None;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "Scroll: raw={:.4}, multiplier={:.1}, accumulator={:.4}",
+            raw_scroll, scroll_multiplier, self.scroll_accumulator
+        );
+
+        if raw_scroll == 0.0 {
+            // Reset accumulator when scrolling stops to prevent "stuck" scroll
+            if !mouse_mode {
+                self.scroll_accumulator = 0.0;
+            }
+            return 0;
         }
 
-        Some((lines * scroll_multiplier) as i32)
+        let adjusted_scroll = raw_scroll * scroll_multiplier;
+
+        // In mouse mode, don't accumulate - send each event immediately
+        if mouse_mode {
+            return adjusted_scroll as i32;
+        }
+
+        // Accumulate the scroll amount
+        self.scroll_accumulator += adjusted_scroll;
+
+        // Use a threshold of 0.5 lines for trackpad responsiveness
+        // This makes scrolling more responsive while still being smooth
+        let threshold = 0.5_f32;
+        let lines = if self.scroll_accumulator.abs() >= threshold {
+            let lines = self.scroll_accumulator.trunc() as i32;
+            if lines == 0 {
+                // If we haven't reached a full line but passed the threshold, scroll 1 line
+                self.scroll_accumulator.signum() as i32
+            } else {
+                lines
+            }
+        } else {
+            0
+        };
+
+        // Keep the fractional part for next time, but also apply threshold logic
+        if lines != 0 {
+            self.scroll_accumulator -= lines as f32;
+        }
+
+        #[cfg(debug_assertions)]
+        eprintln!("Scroll result: {} lines, remaining accumulator: {:.4}", lines, self.scroll_accumulator);
+
+        lines
     }
 
     // Selection
