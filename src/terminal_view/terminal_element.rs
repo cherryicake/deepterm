@@ -103,7 +103,7 @@ impl TerminalElement {
 
     fn layout_grid(
         grid: impl Iterator<Item = IndexedCell>,
-        display_offset: usize,
+        _display_offset: usize,
         text_style: &TextStyle,
         font_size: Pixels,
         _visible_line_start: usize,
@@ -121,7 +121,9 @@ impl TerminalElement {
         let line_groups = grid.into_iter().chunk_by(|cell| cell.point.line);
 
         for (line_index, (_, line_cells)) in line_groups.into_iter().enumerate() {
-            let relative_row = line_index.saturating_sub(display_offset);
+            // Use line_index directly as the row number for rendering
+            // The cells from display_iter() are already adjusted for display_offset
+            let row = line_index;
 
             if let Some(batch) = current_batch.take() {
                 batched_runs.push(batch);
@@ -199,7 +201,7 @@ impl TerminalElement {
                 match current_batch.as_mut() {
                     Some(batch)
                         if batch.can_append(&cell_style)
-                            && batch.start_row == relative_row
+                            && batch.start_row == row
                             && batch.start_col + batch.cell_count == cell.point.column.0 =>
                     {
                         batch.append_char(ch);
@@ -209,7 +211,7 @@ impl TerminalElement {
                             batched_runs.push(batch);
                         }
                         current_batch = Some(BatchedTextRun::new_from_char(
-                            relative_row,
+                            row,
                             cell.point.column.0,
                             ch,
                             cell_style,
@@ -244,8 +246,9 @@ impl Element for TerminalElement {
         Pixels,
         Pixels,
         Pixels,
-        usize,
-        usize,
+        usize,       // cursor_col
+        usize,       // cursor_row (viewport-relative)
+        bool,        // cursor_in_viewport
         Option<String>,
         TerminalBounds,
     );
@@ -362,6 +365,9 @@ impl Element for TerminalElement {
             terminal_bounds.num_lines()
         };
 
+        // Get viewport info for cursor calculation
+        let viewport_lines = terminal_bounds.num_lines();
+
         let content = self.terminal.read(cx).last_content();
         let batched_runs = Self::layout_grid(
             content.cells.iter().cloned(),
@@ -372,7 +378,21 @@ impl Element for TerminalElement {
             visible_line_count,
         );
 
-        let cursor_row = (cursor.line.0 as usize).saturating_sub(display_offset);
+        // Calculate cursor position relative to viewport
+        // In Alacritty: cursor.line is the line in the terminal grid (0 at terminal top)
+        // display_offset is how many lines we've scrolled up from the bottom
+        // To get viewport-relative position: cursor.line + display_offset
+        //
+        // Example with 24-line viewport, cursor at line 23 (bottom):
+        // - display_offset = 0 (no scroll): cursor at row 23 + 0 = 23 (visible)
+        // - display_offset = 5 (scrolled up 5 lines): cursor at row 23 + 5 = 28 (not visible)
+        let cursor_line_in_viewport = cursor.line.0 + display_offset as i32;
+
+        // Cursor is only visible if it's within the current viewport
+        let cursor_in_viewport = cursor_line_in_viewport >= 0
+            && (cursor_line_in_viewport as usize) < viewport_lines;
+        let cursor_row = cursor_line_in_viewport.max(0) as usize;
+
         let selection = self.terminal.read(cx).selection_text();
 
         (
@@ -383,6 +403,7 @@ impl Element for TerminalElement {
             font_size,
             cursor.column.0,
             cursor_row,
+            cursor_in_viewport,
             selection,
             terminal_bounds,
         )
@@ -406,6 +427,7 @@ impl Element for TerminalElement {
             _font_size,
             cursor_col,
             cursor_row,
+            cursor_in_viewport,
             _selection,
             terminal_bounds,
         ) = prepaint_state;
@@ -443,19 +465,31 @@ impl Element for TerminalElement {
             (selection_cells, content, mouse_mode)
         };
 
+        // Build a map of cell positions to their visible row index
+        let mut cell_to_visible_row: std::collections::HashMap<(i32, usize), usize> = std::collections::HashMap::new();
+        {
+            let term = self.terminal.read(cx);
+            let content = term.last_content();
+            let line_groups = content.cells.iter().chunk_by(|cell| cell.point.line);
+            for (visible_row, (line_idx, line_cells)) in line_groups.into_iter().enumerate() {
+                for cell in line_cells {
+                    cell_to_visible_row.insert((line_idx.0, cell.point.column.0), visible_row);
+                }
+            }
+        }
+
         // Paint selection backgrounds first (only if not in mouse mode)
         if !mouse_mode {
             for cell_point in &selection_cells {
-                let cell_x = bounds.left() + px(4.0) + *cell_width * cell_point.column.0 as f32;
-                let cell_y = bounds.top()
-                    + *line_height
-                        * (cell_point.line.0 as usize).saturating_sub(content.display_offset)
-                            as f32;
+                if let Some(&visible_row) = cell_to_visible_row.get(&(cell_point.line.0, cell_point.column.0)) {
+                    let cell_x = bounds.left() + px(4.0) + *cell_width * cell_point.column.0 as f32;
+                    let cell_y = bounds.top() + *line_height * visible_row as f32;
 
-                let cell_bounds =
-                    Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
+                    let cell_bounds =
+                        Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
 
-                window.paint_quad(fill(cell_bounds, gpui::rgb(0x4a4a6a)));
+                    window.paint_quad(fill(cell_bounds, gpui::rgb(0x4a4a6a)));
+                }
             }
         }
 
@@ -476,16 +510,15 @@ impl Element for TerminalElement {
                 };
 
                 if let Some(bg_color) = bg_color {
-                    let cell_x = bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
-                    let cell_y = bounds.top()
-                        + *line_height
-                            * (cell.point.line.0 as usize).saturating_sub(content.display_offset)
-                                as f32;
+                    if let Some(&visible_row) = cell_to_visible_row.get(&(cell.point.line.0, cell.point.column.0)) {
+                        let cell_x = bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
+                        let cell_y = bounds.top() + *line_height * visible_row as f32;
 
-                    let cell_bounds =
-                        Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
+                        let cell_bounds =
+                            Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
 
-                    window.paint_quad(fill(cell_bounds, bg_color));
+                        window.paint_quad(fill(cell_bounds, bg_color));
+                    }
                 }
             }
         }
@@ -495,8 +528,8 @@ impl Element for TerminalElement {
             batch.paint(origin, *cell_width, *line_height, window, cx);
         }
 
-        // Paint cursor
-        if self.cursor_visible {
+        // Paint cursor (only if it's within the current viewport)
+        if self.cursor_visible && *cursor_in_viewport {
             let cursor_x = bounds.left() + px(4.0) + *cell_width * *cursor_col as f32;
             let cursor_y = bounds.top() + *line_height * *cursor_row as f32;
 

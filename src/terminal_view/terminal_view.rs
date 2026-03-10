@@ -1,15 +1,17 @@
 //! Terminal view component - Full featured
 
+use std::time::Duration;
+
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
-    actions, div, px, rgb,
+    actions, div, px,
 };
 
 use crate::terminal::mappings::keys::to_esc_str;
-use crate::terminal::terminal::{Event as TerminalEvent, Terminal, TerminalBounds};
+use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::TerminalElement;
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
@@ -19,10 +21,8 @@ actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     focus_handle: FocusHandle,
-    focused: bool,
     cursor_visible: bool,
     title: SharedString,
-    show_scrollbar: bool,
     selecting: bool,
 }
 
@@ -53,10 +53,8 @@ impl TerminalView {
             Self {
                 terminal: terminal_clone,
                 focus_handle,
-                focused: false,
                 cursor_visible: true,
                 title: "Terminal".into(),
-                show_scrollbar: true,
                 selecting: false,
             }
         })
@@ -68,6 +66,32 @@ impl TerminalView {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    /// Check if the scrollbar should be visible
+    /// Scrollbar is visible when:
+    /// 1. There's scrollable content (total_lines > viewport_lines)
+    /// 2. User is dragging the scrollbar, OR
+    /// 3. Less than 2 seconds have passed since the last scroll
+    pub fn should_show_scrollbar(&self, cx: &App) -> bool {
+        let term = self.terminal.read(cx);
+        let total_lines = term.total_lines();
+        let viewport_lines = term.viewport_lines();
+
+        // No scrollbar if no scrollable content
+        if total_lines <= viewport_lines {
+            return false;
+        }
+
+        // Always show scrollbar while dragging
+        if term.scrollbar_drag_offset.get().is_some() {
+            return true;
+        }
+
+        // Show scrollbar if scrolled within the last 2 seconds
+        let last_scroll = term.last_scroll_time.get();
+        let elapsed = last_scroll.elapsed();
+        elapsed < Duration::from_secs(2)
     }
 
     // Actions
@@ -139,12 +163,45 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Helper method to write text and scroll to bottom if needed
+    fn write_text_and_scroll_to_bottom(&mut self, text: &str, cx: &mut Context<Self>) {
+        let was_scrolled = self.terminal.update(cx, |terminal, _cx| {
+            let was_scrolled = terminal.last_content().display_offset > 0;
+            if was_scrolled {
+                terminal.scroll_to_bottom();
+            }
+            terminal.write(text.as_bytes());
+            was_scrolled
+        });
+
+        // Only notify if we actually scrolled back to bottom
+        if was_scrolled {
+            cx.notify();
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // If user has scrolled up, pressing any key should scroll back to bottom
+        let was_scrolled = self.terminal.update(cx, |terminal, _cx| {
+            let display_offset = terminal.last_content().display_offset;
+            if display_offset > 0 {
+                terminal.scroll_to_bottom();
+                true
+            } else {
+                false
+            }
+        });
+
+        if was_scrolled {
+            // Scroll back to bottom, then process the key
+            cx.notify();
+        }
+
         let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
             if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
@@ -208,9 +265,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal.update(cx, |terminal, _| {
-            terminal.write(text.as_bytes());
-        });
+        self.write_text_and_scroll_to_bottom(text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -221,9 +276,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.terminal.update(cx, |terminal, _| {
-            terminal.write(new_text.as_bytes());
-        });
+        self.write_text_and_scroll_to_bottom(new_text, cx);
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -258,7 +311,17 @@ impl Render for TerminalView {
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
         let is_focused = focus_handle.is_focused(window);
-        let _show_scrollbar = self.show_scrollbar;
+        let show_scrollbar = self.should_show_scrollbar(cx);
+
+        // Schedule a refresh to hide the scrollbar after 2 seconds
+        if show_scrollbar {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(100)).await;
+                this.update(cx, |_this, cx| {
+                    cx.notify();
+                })
+            }).detach();
+        }
 
         div()
             .id("terminal-view")
@@ -309,10 +372,6 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                // Debug: print scroll event details
-                #[cfg(debug_assertions)]
-                eprintln!("Scroll event: {:?}, modifiers: shift={}", event.delta, event.modifiers.shift);
-
                 this.terminal.update(cx, |terminal, cx| {
                     terminal.scroll_wheel(event, 3.0);
                     // Sync immediately to update display_offset after scrolling
@@ -322,27 +381,32 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .child(
-                // Use flex layout: terminal content on left, scrollbar on right
+                // Use relative positioning: terminal fills container, scrollbar floats on top
                 div()
-                    .flex()
-                    .flex_row()
+                    .relative()
                     .size_full()
                     .child(
-                        // Terminal content takes remaining space
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(TerminalElement::new(
-                                terminal.clone(),
-                                focus_handle,
-                                is_focused,
-                                self.cursor_visible,
-                                view_entity,
-                            ))
+                        // Terminal content fills entire container
+                        TerminalElement::new(
+                            terminal.clone(),
+                            focus_handle,
+                            is_focused,
+                            self.cursor_visible,
+                            view_entity,
+                        )
                     )
-                    .when(self.show_scrollbar, |this| {
-                        // Scrollbar on the right
-                        this.child(TerminalScrollbar::new(terminal, cx))
+                    .when(show_scrollbar, |this| {
+                        // Scrollbar positioned absolutely on the right
+                        // No background color - only the thumb is visible (Zed style)
+                        this.child(
+                            div()
+                                .absolute()
+                                .right(px(2.0))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(8.0))
+                                .child(TerminalScrollbar::new(terminal, cx))
+                        )
                     })
             )
     }

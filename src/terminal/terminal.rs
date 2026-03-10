@@ -1,6 +1,6 @@
 //! Terminal module - simplified but functional
 
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use alacritty_terminal::{
     Term,
@@ -182,7 +182,12 @@ pub struct Terminal {
     last_mouse_position: Option<Point<Pixels>>,
     /// Scroll accumulator for smooth scrolling (trackpad support)
     /// Accumulates partial scroll amounts and applies them when they reach a full line
-    scroll_accumulator: f32,
+    scroll_px: Pixels,
+    /// Scrollbar drag state - stores the y-offset within the thumb where dragging started
+    /// This is stored in Terminal to persist across render cycles
+    pub scrollbar_drag_offset: Rc<Cell<Option<Pixels>>>,
+    /// Last time the terminal was scrolled (for scrollbar auto-hide)
+    pub last_scroll_time: Cell<Instant>,
 }
 
 impl Terminal {
@@ -214,7 +219,8 @@ impl Terminal {
         };
 
         let mut config = Config::default();
-        config.scrolling_history = 10000;
+        // Zed uses 100,000 lines of scrollback buffer for better history retention
+        config.scrolling_history = 100000;
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &default_bounds,
@@ -255,7 +261,9 @@ impl Terminal {
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
-                scroll_accumulator: 0.0,
+                scroll_px: px(0.0),
+                scrollbar_drag_offset: Rc::new(Cell::new(None)),
+                last_scroll_time: Cell::new(Instant::now()),
             }
         })
     }
@@ -277,7 +285,9 @@ impl Terminal {
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             last_mouse_position: None,
-            scroll_accumulator: 0.0,
+            scroll_px: px(0.0),
+            scrollbar_drag_offset: Rc::new(Cell::new(None)),
+            last_scroll_time: Cell::new(Instant::now()),
         }
     }
 
@@ -364,6 +374,18 @@ impl Terminal {
 
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
+    }
+
+    /// Get the total number of lines in the terminal including scrollback history
+    pub fn total_lines(&self) -> usize {
+        let term = self.term.lock();
+        term.total_lines()
+    }
+
+    /// Get the number of visible lines in the viewport (screen lines)
+    pub fn viewport_lines(&self) -> usize {
+        let term = self.term.lock();
+        term.screen_lines()
     }
 
     pub fn terminal_bounds(&self) -> TerminalBounds {
@@ -497,129 +519,72 @@ impl Terminal {
         }
     }
 
-    /// Handles scroll wheel events with smooth scrolling support.
-    /// Uses an accumulator to handle trackpad/trackpoint smooth scrolling.
+    /// Scroll the terminal
     pub fn scroll_wheel(&mut self, e: &gpui::ScrollWheelEvent, scroll_multiplier: f32) {
         let mouse_mode = self.mouse_mode(e.shift);
-        let scroll_multiplier = if mouse_mode { 1.0 } else { scroll_multiplier };
+        let scroll_multiplier = if mouse_mode { 1. } else { scroll_multiplier };
 
-        // Calculate scroll amount in lines, using accumulator for smooth scrolling
-        let scroll_lines =
-            self.determine_scroll_lines_with_accumulator(e, scroll_multiplier, mouse_mode);
-
-        if scroll_lines == 0 {
-            return;
-        }
-
-        if mouse_mode {
-            // In mouse mode, send mouse events to the application (e.g., neovim)
-            // Convert to local coordinates relative to terminal bounds
-            let position = e.position - self.terminal_bounds.bounds.origin;
-            let point = grid_point(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-            );
-
-            if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode) {
-                for scroll in scrolls {
-                    self.write(&scroll);
-                }
-            }
-        } else if self
-            .last_content
-            .mode
-            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-            && !e.shift
+        if let Some(scroll_lines) = self.determine_scroll_lines(e, scroll_multiplier)
+            && scroll_lines != 0
         {
-            // In alternate screen with alternate scroll enabled (e.g., less, man pages)
-            // Send arrow key sequences instead of scrolling the buffer
-            self.write(&alt_scroll(scroll_lines));
-        } else {
-            // Normal mode: scroll the terminal history buffer
-            let scroll = AlacScroll::Delta(scroll_lines);
-            let mut term = self.term.lock();
-            term.scroll_display(scroll);
+            if mouse_mode {
+                let point = grid_point(
+                    e.position - self.terminal_bounds.bounds.origin,
+                    self.terminal_bounds,
+                    self.last_content.display_offset,
+                );
 
-            // Mark content as dirty so sync() will update last_content
-            self.content_dirty = true;
-
-            #[cfg(debug_assertions)]
-            eprintln!("Scrolled {} lines, display_offset will update on next sync", scroll_lines);
+                if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
+                {
+                    for scroll in scrolls {
+                        self.write(&scroll);
+                    }
+                };
+            } else if self
+                .last_content
+                .mode
+                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+                && !e.shift
+            {
+                self.write(&alt_scroll(scroll_lines));
+            } else {
+                let scroll = AlacScroll::Delta(scroll_lines);
+                let mut term = self.term.lock();
+                term.scroll_display(scroll);
+                self.content_dirty = true;
+                self.last_scroll_time.set(Instant::now());
+            }
         }
     }
 
-    /// Determines the number of lines to scroll, using an accumulator for smooth scrolling.
-    /// This allows trackpads and trackpoints to accumulate partial scroll amounts
-    /// and scroll only when a full line is reached.
-    fn determine_scroll_lines_with_accumulator(
+    fn determine_scroll_lines(
         &mut self,
         e: &gpui::ScrollWheelEvent,
         scroll_multiplier: f32,
-        mouse_mode: bool,
-    ) -> i32 {
-        use gpui::ScrollDelta;
-
-        let raw_scroll = match e.delta {
-            ScrollDelta::Lines(lines) => lines.y,
-            ScrollDelta::Pixels(pixels) => {
-                let line_height = self.terminal_bounds.line_height.as_f32();
-                if line_height > 0.0 {
-                    pixels.y.as_f32() / line_height
-                } else {
-                    0.0
-                }
+    ) -> Option<i32> {
+        let line_height = self.terminal_bounds.line_height;
+        match e.touch_phase {
+            /* Reset scroll state on started */
+            gpui::TouchPhase::Started => {
+                self.scroll_px = px(0.);
+                None
             }
-        };
+            /* Calculate the appropriate scroll lines */
+            gpui::TouchPhase::Moved => {
+                let old_offset = (self.scroll_px / line_height) as i32;
 
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "Scroll: raw={:.4}, multiplier={:.1}, accumulator={:.4}",
-            raw_scroll, scroll_multiplier, self.scroll_accumulator
-        );
+                self.scroll_px += e.delta.pixel_delta(line_height).y * scroll_multiplier;
 
-        if raw_scroll == 0.0 {
-            // Reset accumulator when scrolling stops to prevent "stuck" scroll
-            if !mouse_mode {
-                self.scroll_accumulator = 0.0;
+                let new_offset = (self.scroll_px / line_height) as i32;
+
+                // Whenever we hit the edges, reset our stored scroll to 0
+                // so we can respond to changes in direction quickly
+                self.scroll_px %= self.terminal_bounds.height();
+
+                Some(new_offset - old_offset)
             }
-            return 0;
+            gpui::TouchPhase::Ended => None,
         }
-
-        let adjusted_scroll = raw_scroll * scroll_multiplier;
-
-        // In mouse mode, don't accumulate - send each event immediately
-        if mouse_mode {
-            return adjusted_scroll as i32;
-        }
-
-        // Accumulate the scroll amount
-        self.scroll_accumulator += adjusted_scroll;
-
-        // Use a threshold of 0.5 lines for trackpad responsiveness
-        // This makes scrolling more responsive while still being smooth
-        let threshold = 0.5_f32;
-        let lines = if self.scroll_accumulator.abs() >= threshold {
-            let lines = self.scroll_accumulator.trunc() as i32;
-            if lines == 0 {
-                // If we haven't reached a full line but passed the threshold, scroll 1 line
-                self.scroll_accumulator.signum() as i32
-            } else {
-                lines
-            }
-        } else {
-            0
-        };
-
-        // Keep the fractional part for next time, but also apply threshold logic
-        if lines != 0 {
-            self.scroll_accumulator -= lines as f32;
-        }
-
-        #[cfg(debug_assertions)]
-        eprintln!("Scroll result: {} lines, remaining accumulator: {:.4}", lines, self.scroll_accumulator);
-
-        lines
     }
 
     // Selection
@@ -681,34 +646,53 @@ impl Terminal {
     // Scrolling
     pub fn scroll_line_up(&mut self) {
         let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Delta(-1));
+        term.scroll_display(AlacScroll::Delta(1));
+        self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_line_down(&mut self) {
         let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Delta(1));
+        term.scroll_display(AlacScroll::Delta(-1));
+        self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_page_up(&mut self) {
         let mut term = self.term.lock();
         let lines = term.screen_lines() as i32;
-        term.scroll_display(AlacScroll::Delta(-lines));
+        term.scroll_display(AlacScroll::Delta(lines));
+        self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_page_down(&mut self) {
         let mut term = self.term.lock();
         let lines = term.screen_lines() as i32;
-        term.scroll_display(AlacScroll::Delta(lines));
+        term.scroll_display(AlacScroll::Delta(-lines));
+        self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_to_top(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Top);
+        self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_to_bottom(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Bottom);
+        self.last_scroll_time.set(Instant::now());
+    }
+
+    /// Set the display offset directly (for scrollbar dragging)
+    pub fn set_display_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let current_offset = self.last_content.display_offset;
+        let delta = offset as i32 - current_offset as i32;
+        if delta != 0 {
+            let mut term = self.term.lock();
+            term.scroll_display(AlacScroll::Delta(delta));
+            self.content_dirty = true;
+            self.last_scroll_time.set(Instant::now());
+            cx.emit(Event::Wakeup);
+        }
     }
 
     // Copy/Paste
