@@ -308,13 +308,15 @@ impl Render for TerminalView {
                 });
                 cx.notify();
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
                 // Debug: print scroll event details
                 #[cfg(debug_assertions)]
                 eprintln!("Scroll event: {:?}, modifiers: shift={}", event.delta, event.modifiers.shift);
 
-                this.terminal.update(cx, |terminal, _cx| {
+                this.terminal.update(cx, |terminal, cx| {
                     terminal.scroll_wheel(event, 3.0);
+                    // Sync immediately to update display_offset after scrolling
+                    terminal.sync(window, cx);
                 });
                 cx.stop_propagation();
                 cx.notify();

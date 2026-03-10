@@ -540,6 +540,12 @@ impl Terminal {
             let scroll = AlacScroll::Delta(scroll_lines);
             let mut term = self.term.lock();
             term.scroll_display(scroll);
+
+            // Mark content as dirty so sync() will update last_content
+            self.content_dirty = true;
+
+            #[cfg(debug_assertions)]
+            eprintln!("Scrolled {} lines, display_offset will update on next sync", scroll_lines);
         }
     }
 
