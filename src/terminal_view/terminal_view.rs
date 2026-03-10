@@ -10,6 +10,11 @@ use gpui::{
     actions, div, px,
 };
 
+/// IME state for tracking marked (pre-edit) text during composition
+pub struct ImeState {
+    pub marked_text: String,
+}
+
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::TerminalElement;
@@ -24,6 +29,8 @@ pub struct TerminalView {
     cursor_visible: bool,
     title: SharedString,
     selecting: bool,
+    /// IME composition state for CJK input methods
+    ime_state: Option<ImeState>,
 }
 
 impl TerminalView {
@@ -56,6 +63,7 @@ impl TerminalView {
                 cursor_visible: true,
                 title: "Terminal".into(),
                 selecting: false,
+                ime_state: None,
             }
         })
     }
@@ -92,6 +100,44 @@ impl TerminalView {
         let last_scroll = term.last_scroll_time.get();
         let elapsed = last_scroll.elapsed();
         elapsed < Duration::from_secs(2)
+    }
+
+    // IME handling methods for CJK input methods
+    /// Sets the marked (pre-edit) text from the IME.
+    /// During composition, this is called repeatedly to update the candidate text.
+    /// The text is NOT sent to the terminal - it's only for display purposes.
+    pub fn set_marked_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return self.clear_marked_text(cx);
+        }
+        self.ime_state = Some(ImeState { marked_text: text });
+        cx.notify();
+    }
+
+    /// Gets the current marked range (UTF-16).
+    pub fn marked_text_range(&self) -> Option<std::ops::Range<usize>> {
+        self.ime_state
+            .as_ref()
+            .map(|state| 0..state.marked_text.encode_utf16().count())
+    }
+
+    /// Clears the marked (pre-edit) text state.
+    /// Called when composition is cancelled or completed.
+    pub fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
+        if self.ime_state.is_some() {
+            self.ime_state = None;
+            cx.notify();
+        }
+    }
+
+    /// Commits (sends) the given text to the PTY.
+    /// This is called when the user confirms the input (e.g., pressing Space to select).
+    pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !text.is_empty() {
+            self.terminal.update(cx, |terminal, _| {
+                terminal.write(text.as_bytes());
+            });
+        }
     }
 
     // Actions
@@ -163,23 +209,6 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Helper method to write text and scroll to bottom if needed
-    fn write_text_and_scroll_to_bottom(&mut self, text: &str, cx: &mut Context<Self>) {
-        let was_scrolled = self.terminal.update(cx, |terminal, _cx| {
-            let was_scrolled = terminal.last_content().display_offset > 0;
-            if was_scrolled {
-                terminal.scroll_to_bottom();
-            }
-            terminal.write(text.as_bytes());
-            was_scrolled
-        });
-
-        // Only notify if we actually scrolled back to bottom
-        if was_scrolled {
-            cx.notify();
-        }
-    }
-
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -245,7 +274,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        None
+        self.marked_text_range()
     }
 
     fn text_for_range(
@@ -258,6 +287,8 @@ impl EntityInputHandler for TerminalView {
         None
     }
 
+    /// Called when text is committed (e.g., user pressed Space to confirm CJK input).
+    /// This sends the text to the terminal and clears any marked text state.
     fn replace_text_in_range(
         &mut self,
         _range: Option<std::ops::Range<usize>>,
@@ -265,9 +296,13 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.write_text_and_scroll_to_bottom(text, cx);
+        self.clear_marked_text(cx);
+        self.commit_text(text, cx);
     }
 
+    /// Called during IME composition to update the pre-edit text.
+    /// This does NOT send text to the terminal - it only updates the marked text state
+    /// for display purposes (showing the candidate text while typing pinyin).
     fn replace_and_mark_text_in_range(
         &mut self,
         _range: Option<std::ops::Range<usize>>,
@@ -276,10 +311,13 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.write_text_and_scroll_to_bottom(new_text, cx);
+        self.set_marked_text(new_text.to_string(), cx);
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// Called when IME composition is cancelled (e.g., user pressed Escape).
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_marked_text(cx);
+    }
 
     fn bounds_for_range(
         &mut self,
