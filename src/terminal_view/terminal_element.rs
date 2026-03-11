@@ -11,6 +11,52 @@ use itertools::Itertools;
 use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_view::TerminalView;
+use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
+
+/// 光标布局 - 参考Zed的CursorLayout简化实现
+/// 用于在prepaint阶段计算光标位置和形状，在paint阶段渲染
+pub struct CursorLayout {
+    origin: Point<Pixels>,
+    block_width: Pixels,
+    line_height: Pixels,
+    color: gpui::Hsla,
+    shape: CursorShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CursorShape {
+    Block,
+    Hollow,
+    Bar,
+    Underline,
+}
+
+impl CursorLayout {
+    fn paint(&self, window: &mut Window) {
+        let bounds = match self.shape {
+            CursorShape::Bar => Bounds {
+                origin: self.origin,
+                size: size(px(2.0), self.line_height),
+            },
+            CursorShape::Block | CursorShape::Hollow => Bounds {
+                origin: self.origin,
+                size: size(self.block_width, self.line_height),
+            },
+            CursorShape::Underline => Bounds {
+                origin: self.origin + point(px(0.0), self.line_height - px(2.0)),
+                size: size(self.block_width, px(2.0)),
+            },
+        };
+
+        let cursor_quad = if matches!(self.shape, CursorShape::Hollow) {
+            outline(bounds, self.color, BorderStyle::Solid)
+        } else {
+            fill(bounds, self.color)
+        };
+
+        window.paint_quad(cursor_quad);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BatchedTextRun {
@@ -246,11 +292,12 @@ impl Element for TerminalElement {
         Pixels,
         Pixels,
         Pixels,
-        usize,       // cursor_col
-        usize,       // cursor_row (viewport-relative)
-        bool,        // cursor_in_viewport
+        usize,
+        usize,
+        bool,
         Option<String>,
         TerminalBounds,
+        Option<CursorLayout>,
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -335,20 +382,25 @@ impl Element for TerminalElement {
         let terminal_bounds = TerminalBounds::new(line_height, cell_width, bounds);
 
         // Sync terminal and handle resize
-        let (display_offset, cursor) = self.terminal.update(cx, |terminal, cx| {
-            terminal.sync(window, cx);
+        let (display_offset, cursor_point, cursor_shape) =
+            self.terminal.update(cx, |terminal, cx| {
+                terminal.sync(window, cx);
 
-            let current_bounds = terminal.terminal_bounds();
-            if current_bounds.num_columns() != terminal_bounds.num_columns()
-                || current_bounds.num_lines() != terminal_bounds.num_lines()
-            {
-                terminal.resize(terminal_bounds, cx);
-            }
-            terminal.set_terminal_bounds(terminal_bounds);
+                let current_bounds = terminal.terminal_bounds();
+                if current_bounds.num_columns() != terminal_bounds.num_columns()
+                    || current_bounds.num_lines() != terminal_bounds.num_lines()
+                {
+                    terminal.resize(terminal_bounds, cx);
+                }
+                terminal.set_terminal_bounds(terminal_bounds);
 
-            let content = terminal.last_content();
-            (content.display_offset, content.cursor)
-        });
+                let content = terminal.last_content();
+                (
+                    content.display_offset,
+                    content.cursor,
+                    content.cursor_shape,
+                )
+            });
 
         // Calculate visible viewport
         let visible_bounds = window.content_mask().bounds;
@@ -379,21 +431,49 @@ impl Element for TerminalElement {
         );
 
         // Calculate cursor position relative to viewport
-        // In Alacritty: cursor.line is the line in the terminal grid (0 at terminal top)
-        // display_offset is how many lines we've scrolled up from the bottom
-        // To get viewport-relative position: cursor.line + display_offset
-        //
-        // Example with 24-line viewport, cursor at line 23 (bottom):
-        // - display_offset = 0 (no scroll): cursor at row 23 + 0 = 23 (visible)
-        // - display_offset = 5 (scrolled up 5 lines): cursor at row 23 + 5 = 28 (not visible)
-        let cursor_line_in_viewport = cursor.line.0 + display_offset as i32;
+        let cursor_line_in_viewport = cursor_point.line.0 + display_offset as i32;
 
         // Cursor is only visible if it's within the current viewport
-        let cursor_in_viewport = cursor_line_in_viewport >= 0
-            && (cursor_line_in_viewport as usize) < viewport_lines;
+        let cursor_in_viewport =
+            cursor_line_in_viewport >= 0 && (cursor_line_in_viewport as usize) < viewport_lines;
         let cursor_row = cursor_line_in_viewport.max(0) as usize;
 
         let selection = self.terminal.read(cx).selection_text();
+
+        // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
+        // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
+        // 终端不渲染光标，让应用程序自己处理
+        let cursor = if self.cursor_visible
+            && cursor_in_viewport
+            && cursor_shape != AlacCursorShape::Hidden
+        {
+            let cursor_display_line = cursor_point.line.0 + display_offset as i32;
+            let cursor_display_col = cursor_point.column.0;
+
+            let cursor_x =
+                bounds.left() + px(4.0) + (cursor_display_col as f32 * cell_width).floor();
+            let cursor_y =
+                bounds.top() + (cursor_display_line as f32 * line_height).floor() + px(1.0);
+
+            let shape = match cursor_shape {
+                AlacCursorShape::Block if !self.focused => CursorShape::Hollow,
+                AlacCursorShape::Block => CursorShape::Block,
+                AlacCursorShape::Underline => CursorShape::Underline,
+                AlacCursorShape::Beam => CursorShape::Bar,
+                AlacCursorShape::HollowBlock => CursorShape::Hollow,
+                AlacCursorShape::Hidden => unreachable!(),
+            };
+
+            Some(CursorLayout {
+                origin: point(cursor_x, cursor_y),
+                block_width: cell_width,
+                line_height,
+                color: rgb(0xcba6f7).into(),
+                shape,
+            })
+        } else {
+            None
+        };
 
         (
             batched_runs,
@@ -401,11 +481,12 @@ impl Element for TerminalElement {
             cell_width,
             line_height,
             font_size,
-            cursor.column.0,
+            cursor_point.column.0,
             cursor_row,
             cursor_in_viewport,
             selection,
             terminal_bounds,
+            cursor,
         )
     }
 
@@ -425,31 +506,23 @@ impl Element for TerminalElement {
             cell_width,
             line_height,
             _font_size,
-            cursor_col,
-            cursor_row,
-            cursor_in_viewport,
+            _cursor_col,
+            _cursor_row,
+            _cursor_in_viewport,
             _selection,
-            terminal_bounds,
+            _terminal_bounds,
+            cursor,
         ) = prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
-        // 设置背景色
-        // Paint background
-        // let bg_bounds = Bounds::new(
-        //     origin,
-        //     size(terminal_bounds.width() - px(8.0), terminal_bounds.height()),
-        // );
-        // window.paint_quad(fill(bg_bounds, rgb(0x1e1e2e)));
-
         // Get terminal and content for selection checking
-        let (selection_cells, content, mouse_mode) = {
+        let (selection_cells, _content, mouse_mode) = {
             let term = self.terminal.read(cx);
             let content = term.last_content();
             let mut selection_cells = Vec::new();
 
             // Check if terminal is in mouse mode (e.g., neovim mouse mode)
-            // In mouse mode, the application handles selection itself, so we shouldn't draw our own
             let mouse_mode = content
                 .mode
                 .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
@@ -466,7 +539,8 @@ impl Element for TerminalElement {
         };
 
         // Build a map of cell positions to their visible row index
-        let mut cell_to_visible_row: std::collections::HashMap<(i32, usize), usize> = std::collections::HashMap::new();
+        let mut cell_to_visible_row: std::collections::HashMap<(i32, usize), usize> =
+            std::collections::HashMap::new();
         {
             let term = self.terminal.read(cx);
             let content = term.last_content();
@@ -481,8 +555,11 @@ impl Element for TerminalElement {
         // Paint selection backgrounds first (only if not in mouse mode)
         if !mouse_mode {
             for cell_point in &selection_cells {
-                if let Some(&visible_row) = cell_to_visible_row.get(&(cell_point.line.0, cell_point.column.0)) {
-                    let cell_x = bounds.left() + px(4.0) + *cell_width * cell_point.column.0 as f32;
+                if let Some(&visible_row) = cell_to_visible_row
+                    .get(&(cell_point.line.0, cell_point.column.0))
+                {
+                    let cell_x =
+                        bounds.left() + px(4.0) + *cell_width * cell_point.column.0 as f32;
                     let cell_y = bounds.top() + *line_height * visible_row as f32;
 
                     let cell_bounds =
@@ -499,7 +576,6 @@ impl Element for TerminalElement {
             let content = term.last_content();
 
             for cell in content.cells.iter() {
-                // Check if cell has non-default background
                 let bg_color = if cell.cell.bg
                     != alacritty_terminal::vte::ansi::Color::Named(
                         alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -510,8 +586,11 @@ impl Element for TerminalElement {
                 };
 
                 if let Some(bg_color) = bg_color {
-                    if let Some(&visible_row) = cell_to_visible_row.get(&(cell.point.line.0, cell.point.column.0)) {
-                        let cell_x = bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
+                    if let Some(&visible_row) = cell_to_visible_row
+                        .get(&(cell.point.line.0, cell.point.column.0))
+                    {
+                        let cell_x =
+                            bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
                         let cell_y = bounds.top() + *line_height * visible_row as f32;
 
                         let cell_bounds =
@@ -528,24 +607,11 @@ impl Element for TerminalElement {
             batch.paint(origin, *cell_width, *line_height, window, cx);
         }
 
-        // Paint cursor (only if it's within the current viewport)
-        if self.cursor_visible && *cursor_in_viewport {
-            let cursor_x = bounds.left() + px(4.0) + *cell_width * *cursor_col as f32;
-            let cursor_y = bounds.top() + *line_height * *cursor_row as f32;
-
-            let cursor_bounds =
-                Bounds::new(point(cursor_x, cursor_y), size(*cell_width, *line_height));
-
-            // 光标
-            if self.focused {
-                window.paint_quad(fill(cursor_bounds, rgb(0xcba6f7)));
-            } else {
-                window.paint_quad(outline(
-                    cursor_bounds,
-                    rgb(0xcba6f7),
-                    BorderStyle::default(),
-                ));
-            }
+        // 使用prepaint阶段计算的光标布局进行渲染
+        // 如果cursor为None（光标形状为Hidden），则不渲染光标
+        // 这实现了光标委托：当应用程序自己处理光标时，终端不渲染
+        if let Some(cursor_layout) = cursor {
+            cursor_layout.paint(window);
         }
 
         window.handle_input(

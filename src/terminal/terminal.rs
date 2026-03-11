@@ -12,7 +12,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, TermMode},
     tty::{self},
-    vte::ansi::Handler,
+    vte::ansi::{CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler},
 };
 use futures::{
     StreamExt,
@@ -144,6 +144,11 @@ pub struct TerminalContent {
     pub cells: Vec<IndexedCell>,
     pub cursor: AlacPoint,
     pub cursor_char: char,
+    /// 光标形状 - 用于光标委托机制
+    /// 当光标形状为Hidden时，终端不渲染光标，由应用程序（如Claude Code）自己处理
+    pub cursor_shape: AlacCursorShape,
+    /// 光标所在单元格的背景色 - 用于块光标模式下的字符颜色
+    pub cursor_cell_bg: alacritty_terminal::vte::ansi::Color,
     pub display_offset: usize,
     pub mode: alacritty_terminal::term::TermMode,
     pub cols: usize,
@@ -156,6 +161,10 @@ impl Default for TerminalContent {
             cells: Vec::new(),
             cursor: AlacPoint::new(Line(0), Column(0)),
             cursor_char: ' ',
+            cursor_shape: AlacCursorShape::Block,
+            cursor_cell_bg: alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Background,
+            ),
             display_offset: 0,
             mode: alacritty_terminal::term::TermMode::default(),
             cols: 80,
@@ -203,9 +212,20 @@ impl Terminal {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
         };
 
+        // 设置终端环境变量 - 参考Zed的设置，确保终端应用能正确检测终端能力
+        // TERM=xterm-256color: 声明支持256色
+        // COLORTERM=truecolor: 声明支持真彩色
+        // TERM_PROGRAM/DEEPTERM: 标识终端程序
+        let mut env = std::collections::HashMap::new();
+        env.insert("DEEPTERM".to_string(), "true".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "deepterm".to_string());
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+
         let pty_options = tty::Options {
             shell: Some(tty::Shell::new(default_shell, vec![])),
             working_directory,
+            env,
             ..Default::default()
         };
 
@@ -219,8 +239,14 @@ impl Terminal {
         };
 
         let mut config = Config::default();
-        // Zed uses 100,000 lines of scrollback buffer for better history retention
+        // 设置滚动缓冲区大小 - Zed使用100000行以获得更好的历史记录保留
         config.scrolling_history = 100000;
+        // 设置默认光标样式为Block（块光标）
+        // 这是alacritty终端的默认光标形状，大多数终端模拟器都使用这种样式
+        config.default_cursor_style = AlacCursorStyle {
+            shape: AlacCursorShape::Block,
+            blinking: false,
+        };
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &default_bounds,
@@ -329,6 +355,11 @@ impl Terminal {
 
         self.last_content.cursor = content.cursor.point;
         self.last_content.cursor_char = term.grid()[content.cursor.point].c;
+        // 获取光标形状 - 用于光标委托机制
+        // 当光标形状为Hidden时，终端不渲染光标，由应用程序自己处理
+        self.last_content.cursor_shape = content.cursor.shape;
+        // 获取光标所在单元格的背景色 - 用于块光标模式下的字符颜色
+        self.last_content.cursor_cell_bg = term.grid()[content.cursor.point].bg;
         self.last_content.display_offset = content.display_offset;
         self.last_content.mode = content.mode;
         self.last_content.cols = self.terminal_bounds.num_columns();
