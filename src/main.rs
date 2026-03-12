@@ -3,6 +3,7 @@
 pub mod components;
 pub mod layout;
 pub mod panels;
+pub mod ssh;
 pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
@@ -18,7 +19,7 @@ use crate::terminal_view::terminal_view::{Copy, Paste};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(app, [Quit]);
+actions!(app, [Quit, NewSshTerminal]);
 
 /// Root component that contains title bar and workspace
 pub struct AppWindow {
@@ -40,10 +41,17 @@ impl AppWindow {
             workspace,
         }
     }
+
+    /// 处理 NewSshTerminal 动作
+    pub fn handle_new_ssh_terminal(&mut self, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.create_ssh_terminal(cx);
+        });
+    }
 }
 
 impl Render for AppWindow {
-    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -56,15 +64,32 @@ impl Render for AppWindow {
 }
 
 fn main() {
+    // 初始化文件日志
+    let _ = std::fs::remove_file("/tmp/deepterm.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("/tmp/deepterm.log")
+        .expect("无法创建日志文件");
+
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .filter_level(log::LevelFilter::Debug)
+        .init();
+
+    log::info!("=== DeepTerm 启动 ===");
+
     gpui::Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
         // Bind keyboard shortcuts
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-c", Copy, None),
             KeyBinding::new("cmd-v", Paste, None),
+            KeyBinding::new("cmd-shift-s", NewSshTerminal, None),
         ]);
 
-        // Register action handlers
+        // Register global action handlers
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);

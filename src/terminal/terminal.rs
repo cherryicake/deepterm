@@ -20,7 +20,7 @@ use futures::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
+    App, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
     Size, Task, Window, px,
 };
 
@@ -28,6 +28,23 @@ use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
 };
+use crate::ssh::{SshConnectionConfig, SshPtyTerminal};
+
+/// 终端类型 - 区分本地和远程终端
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalType {
+    /// 本地终端（通过PTY）
+    Local,
+    /// 远程SSH终端
+    Remote {
+        /// 主机地址
+        host: String,
+        /// 用户名
+        username: String,
+        /// 端口
+        port: u16,
+    },
+}
 
 /// Terminal events
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,12 +196,21 @@ pub struct IndexedCell {
     pub cell: alacritty_terminal::term::cell::Cell,
 }
 
+/// 远程终端输入回调类型
+pub type RemoteInputCallback = Box<dyn Fn(&[u8]) + Send>;
+
+/// 远程终端调整大小回调类型
+pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
+
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
+    /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
     last_content: TerminalContent,
     content_generation: u64,
     content_dirty: bool,
+    /// 事件循环任务（保持任务存活，防止被drop）
+    #[allow(dead_code)]
     event_loop_task: Option<Task<()>>,
     terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
@@ -197,6 +223,12 @@ pub struct Terminal {
     pub scrollbar_drag_offset: Rc<Cell<Option<Pixels>>>,
     /// Last time the terminal was scrolled (for scrollbar auto-hide)
     pub last_scroll_time: Cell<Instant>,
+    /// 终端类型（本地或远程）
+    terminal_type: TerminalType,
+    /// 远程终端输入回调（用于发送数据到SSH）
+    remote_input_callback: Option<RemoteInputCallback>,
+    /// 远程终端调整大小回调
+    remote_resize_callback: Option<RemoteResizeCallback>,
 }
 
 impl Terminal {
@@ -290,6 +322,9 @@ impl Terminal {
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
+                terminal_type: TerminalType::Local,
+                remote_input_callback: None,
+                remote_resize_callback: None,
             }
         })
     }
@@ -314,7 +349,236 @@ impl Terminal {
             scroll_px: px(0.0),
             scrollbar_drag_offset: Rc::new(Cell::new(None)),
             last_scroll_time: Cell::new(Instant::now()),
+            terminal_type: TerminalType::Local,
+            remote_input_callback: None,
+            remote_resize_callback: None,
         }
+    }
+
+    /// 创建新的 SSH 远程终端
+    ///
+    /// # 参数
+    ///
+    /// * `cx` - GPUI 上下文
+    /// * `ssh_config` - SSH 连接配置
+    /// * `on_data` - 数据发送回调，用于发送数据到 SSH 通道
+    /// * `on_resize` - 调整大小回调，用于通知远程主机窗口大小变化
+    pub fn new_remote<F, R>(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        on_data: F,
+        on_resize: R,
+    ) -> Entity<Self>
+    where
+        F: Fn(&[u8]) + Send + 'static,
+        R: Fn(u16, u16) + Send + 'static,
+    {
+        let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
+
+        let default_bounds = TerminalBounds::default();
+
+        let mut config = Config::default();
+        config.scrolling_history = 100000;
+        config.default_cursor_style = AlacCursorStyle {
+            shape: AlacCursorShape::Block,
+            blinking: false,
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            config,
+            &default_bounds,
+            listener.clone(),
+        )));
+
+        // 创建远程终端
+        cx.new(|cx| {
+            let term_clone = term.clone();
+
+            let event_loop_task = cx.spawn(async move |this, cx| {
+                let mut events_rx = events_rx;
+                while let Some(event) = events_rx.next().await {
+                    let _ = this.update(cx, |terminal: &mut Self, cx| {
+                        terminal.process_event(event, cx);
+                    });
+                    smol::future::yield_now().await;
+                }
+            });
+
+            Self {
+                term: term_clone,
+                sender: None, // 远程终端不使用本地 sender
+                last_content: TerminalContent::default(),
+                content_generation: 0,
+                content_dirty: false,
+                event_loop_task: Some(event_loop_task),
+                terminal_bounds: default_bounds,
+                selection_phase: SelectionPhase::Ended,
+                last_mouse_position: None,
+                scroll_px: px(0.0),
+                scrollbar_drag_offset: Rc::new(Cell::new(None)),
+                last_scroll_time: Cell::new(Instant::now()),
+                terminal_type: TerminalType::Remote {
+                    host: ssh_config.host.clone(),
+                    username: ssh_config.username.clone(),
+                    port: ssh_config.port,
+                },
+                remote_input_callback: Some(Box::new(on_data)),
+                remote_resize_callback: Some(Box::new(on_resize)),
+            }
+        })
+    }
+
+    /// 创建新的 SSH 远程终端
+    ///
+    /// 使用 PTY + 系统 ssh 命令方式创建连接。
+    /// 这是性能和兼容性最佳的方案：
+    /// - 数据路径短：PTY → EventLoop → Terminal
+    /// - 自动支持所有 SSH 功能（密钥、代理、配置等）
+    /// - 使用 alacritty 优化的事件循环处理刷新
+    pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
+
+        let default_bounds = TerminalBounds::default();
+
+        let mut config = Config::default();
+        config.scrolling_history = 100000;
+        config.default_cursor_style = AlacCursorStyle {
+            shape: AlacCursorShape::Block,
+            blinking: false,
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            config.clone(),
+            &default_bounds,
+            listener.clone(),
+        )));
+
+        // 使用 PTY + 系统 ssh 命令方式创建 SSH 终端
+        // 这是性能和兼容性最佳的方案
+        Self::create_ssh_pty_terminal(cx, ssh_config, term, listener, events_rx)
+    }
+
+    /// 创建 SSH PTY 终端（内部方法）
+    fn create_ssh_pty_terminal(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        term: Arc<FairMutex<Term<ZedListener>>>,
+        listener: ZedListener,
+        events_rx: UnboundedReceiver<AlacTermEvent>,
+    ) -> Entity<Self> {
+        let default_bounds = TerminalBounds::default();
+
+        // 创建 SshPtyTerminal - 使用传入的 listener，确保 EventLoop 的 Wakeup 事件能被正确处理
+        let ssh_pty = match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener) {
+            Ok(pty) => Arc::new(pty),
+            Err(e) => {
+                eprintln!("Failed to create SSH PTY: {}", e);
+                return cx.new(|_cx| Self::create_error_terminal());
+            }
+        };
+
+        let ssh_config_clone = ssh_config.clone();
+
+        cx.new(|cx| {
+            let term_clone = term.clone();
+
+            let event_loop_task = cx.spawn(async move |this, cx| {
+                let mut events_rx = events_rx;
+                while let Some(event) = events_rx.next().await {
+                    let _ = this.update(cx, |terminal: &mut Self, cx| {
+                        terminal.process_event(event, cx);
+                    });
+                    smol::future::yield_now().await;
+                }
+            });
+
+            // 克隆 Arc 指针用于闭包
+            let ssh_pty_for_input = ssh_pty.clone();
+            let ssh_pty_for_resize = ssh_pty.clone();
+
+            Self {
+                term: term_clone,
+                sender: None,
+                last_content: TerminalContent::default(),
+                content_generation: 0,
+                content_dirty: false,
+                event_loop_task: Some(event_loop_task),
+                terminal_bounds: default_bounds,
+                selection_phase: SelectionPhase::Ended,
+                last_mouse_position: None,
+                scroll_px: px(0.0),
+                scrollbar_drag_offset: Rc::new(Cell::new(None)),
+                last_scroll_time: Cell::new(Instant::now()),
+                terminal_type: TerminalType::Remote {
+                    host: ssh_config_clone.host.clone(),
+                    username: ssh_config_clone.username.clone(),
+                    port: ssh_config_clone.port,
+                },
+                remote_input_callback: Some(Box::new(move |data: &[u8]| {
+                    ssh_pty_for_input.write(data);
+                })),
+                remote_resize_callback: Some(Box::new(move |cols: u16, rows: u16| {
+                    let cell_width = px(9.0);
+                    let line_height = px(16.0);
+                    let new_bounds = TerminalBounds {
+                        cell_width,
+                        line_height,
+                        bounds: Bounds {
+                            origin: Point::default(),
+                            size: Size {
+                                width: px(cols as f32 * cell_width.as_f32()),
+                                height: px(rows as f32 * line_height.as_f32()),
+                            },
+                        },
+                    };
+                    ssh_pty_for_resize.resize(new_bounds);
+                })),
+            }
+        })
+    }
+
+    /// 获取终端类型
+    pub fn terminal_type(&self) -> &TerminalType {
+        &self.terminal_type
+    }
+
+    /// 检查是否是远程终端
+    pub fn is_remote(&self) -> bool {
+        matches!(self.terminal_type, TerminalType::Remote { .. })
+    }
+
+    /// 获取远程连接信息（如果是远程终端）
+    pub fn remote_info(&self) -> Option<(&str, &str, u16)> {
+        match &self.terminal_type {
+            TerminalType::Remote { host, username, port } => {
+                Some((host.as_str(), username.as_str(), *port))
+            }
+            _ => None,
+        }
+    }
+
+    /// 处理从 SSH 接收的数据
+    pub fn process_ssh_data(&mut self, data: &[u8]) {
+        log::debug!("Terminal 处理 SSH 数据: {} 字节", data.len());
+
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        // 创建处理器 (使用默认的 StdSyncHandler 作为超时处理器)
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        // 获取终端锁并处理数据
+        let mut term = self.term.lock();
+
+        // 处理数据（逐字节处理）
+        for byte in data {
+            processor.advance(&mut *term, *byte);
+        }
+
+        // 标记内容已更新
+        self.content_dirty = true;
+        self.content_generation += 1;
+
+        log::debug!("SSH 数据处理完成");
     }
 
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
@@ -374,18 +638,34 @@ impl Terminal {
     }
 
     pub fn write(&mut self, data: &[u8]) {
+        // 本地终端：通过 sender 发送到 PTY
         if let Some(ref sender) = self.sender {
             let msg = Msg::Input(Cow::Owned(data.to_vec()));
-            sender.send(msg);
+            let _ = sender.send(msg);
+            return;
+        }
+
+        // 远程终端：通过回调发送到 SSH 通道
+        if let Some(ref callback) = self.remote_input_callback {
+            callback(data);
         }
     }
 
     pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
         self.terminal_bounds = bounds;
 
+        let cols = bounds.num_columns() as u16;
+        let rows = bounds.num_lines() as u16;
+
+        // 本地终端：通过 sender 发送 resize 消息
         if let Some(ref sender) = self.sender {
             let window_size: WindowSize = bounds.into();
-            sender.send(Msg::Resize(window_size));
+            let _ = sender.send(Msg::Resize(window_size));
+        }
+
+        // 远程终端：通过回调通知 SSH 通道调整窗口大小
+        if let Some(ref callback) = self.remote_resize_callback {
+            callback(cols, rows);
         }
 
         let mut term = self.term.lock();

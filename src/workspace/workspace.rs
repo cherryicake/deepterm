@@ -7,7 +7,8 @@ use gpui::{
 };
 
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
+use crate::workspace::panel::{DraggedPanel, Panel, PanelEvent, PanelPlacement};
+use crate::ssh::SshConnectionConfig;
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 /// Tab类型
@@ -84,26 +85,39 @@ impl Workspace {
     pub fn new(cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
-        // 创建初始tab - 只有一个终端Tab
-        let initial_tab_items = vec![TabItem::new("tab-0", "Local Terminal")];
+        // 创建初始tab - SSH远程终端Tab（测试用）
+        let initial_tab_items = vec![TabItem::new("tab-0", "SSH: 192.168.194.4")];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 初始化tabs信息
         let mut tabs = HashMap::new();
 
-        // tab-0 对应 panel-0 - 使用终端
+        // tab-0 对应 panel-0 - 使用SSH远程终端（测试用）
+        let ssh_config = {
+            let key_path = dirs::home_dir()
+                .map(|h| h.join(".ssh/id_rsa"))
+                .filter(|p| p.exists());
+
+            if let Some(key) = key_path {
+                SshConnectionConfig::with_key("192.168.194.4", "zhousong", key)
+            } else {
+                SshConnectionConfig::with_password("192.168.194.4", "zhousong", "0000")
+            }
+        };
+
         let panel_0 = cx.new(|cx| {
-            Panel::with_terminal(
+            Panel::with_ssh_terminal(
                 "panel-0",
                 "group-0",
                 Some("tab-0".into()),
-                Some("Local Terminal".into()),
+                Some("SSH: 192.168.194.4".into()),
+                &ssh_config,
                 cx,
             )
         });
         tabs.insert(
             "tab-0".to_string(),
-            TabInfo::new_normal("tab-0", "Local Terminal", panel_0),
+            TabInfo::new_normal("tab-0", "SSH: 192.168.194.4", panel_0),
         );
 
         cx.new(|cx| {
@@ -670,6 +684,70 @@ impl Workspace {
 
         // 添加到TabBar
         let new_tab_item = TabItem::new(&new_tab_id, &new_tab_label);
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(new_tab_item, cx);
+        });
+
+        // 订阅新panel的事件
+        if let Some(panel) = self
+            .tabs
+            .get(&new_tab_id)
+            .map(|t| t.container.get_panel_entity(cx))
+            .flatten()
+        {
+            cx.subscribe(&panel, |this, _panel, event: &PanelEvent, cx| {
+                this.handle_panel_event(event, cx);
+            })
+            .detach();
+        }
+
+        // 切换到新tab
+        self.active_tab_id = new_tab_id.clone();
+        self.switch_to_tab(&new_tab_id, cx);
+    }
+
+    /// 创建SSH远程终端Tab（测试用）
+    pub fn create_ssh_terminal(&mut self, cx: &mut Context<Self>) {
+        // SSH连接配置（测试用）
+        // 首先尝试使用默认密钥路径
+        let key_path = dirs::home_dir()
+            .map(|h| h.join(".ssh/id_rsa"))
+            .filter(|p| p.exists());
+
+        let ssh_config = if let Some(key) = key_path {
+            // 使用密钥认证
+            SshConnectionConfig::with_key("192.168.194.4", "zhousong", key)
+        } else {
+            // 使用密码认证（备用）
+            SshConnectionConfig::with_password("192.168.194.4", "zhousong", "0000")
+        };
+
+        // 创建新的tab和panel ID
+        let new_tab_id = format!("tab-{}", self.next_tab_id);
+        let new_panel_id = format!("panel-{}", self.next_panel_id);
+        self.next_tab_id += 1;
+        self.next_panel_id += 1;
+
+        let tab_label = format!("SSH: {}", ssh_config.host);
+
+        // 创建SSH终端panel
+        let new_panel = cx.new(|cx| {
+            Panel::with_ssh_terminal(
+                &new_panel_id,
+                "group-0",
+                Some(new_tab_id.clone().into()),
+                Some(tab_label.clone().into()),
+                &ssh_config,
+                cx,
+            )
+        });
+
+        // 创建新的tab信息
+        let new_tab_info = TabInfo::new_normal(&new_tab_id, &tab_label, new_panel);
+        self.tabs.insert(new_tab_id.clone(), new_tab_info);
+
+        // 添加到TabBar
+        let new_tab_item = TabItem::new(&new_tab_id, &tab_label);
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(new_tab_item, cx);
         });

@@ -1,6 +1,5 @@
 //! Terminal element for rendering
 
-use gpui::prelude::*;
 use gpui::{
     BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
     FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
