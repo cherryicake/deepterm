@@ -284,6 +284,7 @@ pub struct SshGlobalConfig {
     #[serde(default = "default_true")]
     pub strict_host_key_checking: bool,
     /// 默认私钥路径列表
+    #[serde(default)]
     pub default_identity_files: Vec<PathBuf>,
     /// 已保存的连接配置
     pub saved_connections: Vec<SshConnectionConfig>,
@@ -358,6 +359,15 @@ impl SshGlobalConfig {
     /// 获取保存的连接数量
     pub fn saved_connections_count(&self) -> usize {
         self.saved_connections.len()
+    }
+
+    /// 从配置文件加载
+    /// 配置文件路径: ~/.config/deepterm/ssh.json
+    pub fn load() -> Option<Self> {
+        let config_path = dirs::home_dir()?.join(".config/deepterm/ssh.json");
+
+        let content = std::fs::read_to_string(&config_path).ok()?;
+        serde_json::from_str(&content).ok()
     }
 }
 

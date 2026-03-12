@@ -99,7 +99,7 @@ pub struct TabBar {
     pub active_tab_id: Option<SharedString>,
     on_tab_click: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
     on_tab_close: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
-    on_new_tab: Option<Rc<dyn Fn(&mut App) + Send + Sync>>,
+    on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
@@ -169,7 +169,7 @@ impl TabBar {
 
     pub fn on_new_tab<F>(&mut self, callback: F)
     where
-        F: Fn(&mut App) + Send + Sync + 'static,
+        F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_new_tab = Some(Rc::new(callback));
     }
@@ -450,9 +450,9 @@ impl Render for TabBar {
                             .child(div().text_color(rgb(0x666688)).child("+"))
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
+                                cx.listener(move |_, _, window, cx| {
                                     if let Some(ref callback) = on_new_tab {
-                                        callback(cx);
+                                        callback(window, cx);
                                     }
                                 }),
                             ),

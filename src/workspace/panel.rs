@@ -303,6 +303,18 @@ impl Focusable for Panel {
     }
 }
 
+impl Panel {
+    /// 获取内部 TerminalView 的 focus handle（如果有）
+    pub fn terminal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        match &self.content {
+            PanelContent::Terminal(terminal_view) => {
+                Some(terminal_view.read(cx).focus_handle(cx))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl EventEmitter<PanelEvent> for Panel {}
 
 impl Panel {

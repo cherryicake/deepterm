@@ -4,6 +4,7 @@ pub mod components;
 pub mod layout;
 pub mod panels;
 pub mod ssh;
+pub mod ssh_picker;
 pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
@@ -15,16 +16,22 @@ use gpui::{
 };
 
 use crate::components::title_bar::TitleBar;
+use crate::ssh_picker::ssh_picker::SshPicker;
 use crate::terminal_view::terminal_view::{Copy, Paste};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(app, [Quit, NewSshTerminal]);
+actions!(app, [Quit, NewLocalTerminal, ShowSshPicker]);
+
+/// 全局 SSH picker 引用，用于从 Workspace 触发显示
+struct GlobalSshPicker(Entity<SshPicker>);
+impl gpui::Global for GlobalSshPicker {}
 
 /// Root component that contains title bar and workspace
 pub struct AppWindow {
     title_bar: Entity<TitleBar>,
     workspace: Entity<Workspace>,
+    ssh_picker: Entity<SshPicker>,
 }
 
 impl AppWindow {
@@ -36,30 +43,49 @@ impl AppWindow {
         let tab_bar = workspace.read(cx).tab_bar.clone();
         let title_bar = cx.new(|_cx| TitleBar::new("title-bar").with_tab_bar(tab_bar));
 
+        // 创建 SSH 选择器（先不关联 workspace，在 cx.new 内部设置）
+        let workspace_for_picker = workspace.clone();
+        let ssh_picker = cx.new(|cx| SshPicker::new(cx).with_workspace(workspace_for_picker));
+
+        // 设置全局 SSH picker 引用，让 Workspace 可以通过 action 访问
+        cx.set_global(GlobalSshPicker(ssh_picker.clone()));
+
         Self {
             title_bar,
             workspace,
+            ssh_picker,
         }
     }
 
-    /// 处理 NewSshTerminal 动作
-    pub fn handle_new_ssh_terminal(&mut self, cx: &mut Context<Self>) {
-        self.workspace.update(cx, |workspace, cx| {
-            workspace.create_ssh_terminal(cx);
+    /// 显示 SSH 选择器
+    pub fn show_ssh_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.ssh_picker.update(cx, |picker, cx| {
+            picker.toggle(window, cx);
         });
     }
 }
 
 impl Render for AppWindow {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
             .flex_col()
+            .key_context("AppWindow")
+            .on_action(cx.listener(|this, _: &ShowSshPicker, window, cx| {
+                this.show_ssh_picker(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
+                this.workspace.update(cx, |workspace, cx| {
+                    workspace.create_local_terminal(window, cx);
+                });
+            }))
             // Title bar for window management
             .child(self.title_bar.clone())
             // Workspace content
             .child(div().flex().flex_1().child(self.workspace.clone()))
+            // SSH picker overlay
+            .child(self.ssh_picker.clone())
     }
 }
 
@@ -86,7 +112,8 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-c", Copy, None),
             KeyBinding::new("cmd-v", Paste, None),
-            KeyBinding::new("cmd-shift-s", NewSshTerminal, None),
+            KeyBinding::new("cmd-l", NewLocalTerminal, None),
+            KeyBinding::new("cmd-k", ShowSshPicker, None),
         ]);
 
         // Register global action handlers
@@ -105,7 +132,7 @@ fn main() {
                 is_movable: true,
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| AppWindow::new(cx)),
+            |_, cx| cx.new(|_cx| AppWindow::new(_cx)),
         )
         .unwrap();
         cx.activate(true);
