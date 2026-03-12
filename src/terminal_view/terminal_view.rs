@@ -19,6 +19,7 @@ use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::TerminalElement;
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
+use crate::ssh::SshConnectionConfig;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
@@ -34,6 +35,7 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    /// 创建新的本地终端
     pub fn new(cx: &mut App) -> Entity<Self> {
         let terminal = Terminal::new(cx, std::env::current_dir().ok());
         let focus_handle = cx.focus_handle();
@@ -45,8 +47,7 @@ impl TerminalView {
                 &terminal_clone,
                 |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
                     TerminalEvent::TitleChanged => {
-                        this.title = "Terminal".into();
-                        cx.notify();
+                        this.update_title(cx);
                     }
                     TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
                         cx.notify();
@@ -57,15 +58,79 @@ impl TerminalView {
             )
             .detach();
 
-            Self {
+            let mut this = Self {
                 terminal: terminal_clone,
                 focus_handle,
                 cursor_visible: true,
                 title: "Terminal".into(),
                 selecting: false,
                 ime_state: None,
-            }
+            };
+            this.update_title(cx);
+            this
         })
+    }
+
+    /// 创建新的 SSH 远程终端
+    ///
+    /// 优先使用 russh 连接，如果失败则回退到 PTY + ssh 命令方式
+    ///
+    /// # 参数
+    ///
+    /// * `cx` - GPUI 上下文
+    /// * `ssh_config` - SSH 连接配置
+    pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        log::info!("=== 创建 SSH 远程终端（优先 russh，失败回退到 ssh 命令）===");
+        log::info!("目标: {}@{}:{}", ssh_config.username, ssh_config.host, ssh_config.port);
+
+        let focus_handle = cx.focus_handle();
+        let ssh_config_clone = ssh_config.clone();
+
+        cx.new(|cx| {
+            // 首先尝试 russh 方式创建终端
+            let terminal = Terminal::new_ssh(cx, &ssh_config_clone);
+            let terminal_clone = terminal.clone();
+
+            cx.subscribe(
+                &terminal_clone,
+                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
+                    TerminalEvent::TitleChanged => {
+                        this.update_title(cx);
+                    }
+                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                        cx.notify();
+                    }
+                    TerminalEvent::Bell => {}
+                    TerminalEvent::CloseTerminal => {}
+                },
+            )
+            .detach();
+
+            let mut this = Self {
+                terminal: terminal_clone,
+                focus_handle,
+                cursor_visible: true,
+                title: format!("{}@{}", ssh_config_clone.username, ssh_config_clone.host).into(),
+                selecting: false,
+                ime_state: None,
+            };
+            this.update_title(cx);
+            this
+        })
+    }
+
+    /// 更新终端标题
+    fn update_title(&mut self, cx: &mut Context<Self>) {
+        self.title = self.terminal.read(cx).remote_info().map_or_else(
+            || "Terminal".into(),
+            |(host, username, port)| {
+                if port == 22 {
+                    format!("{}@{}", username, host).into()
+                } else {
+                    format!("{}@{}:{}", username, host, port).into()
+                }
+            },
+        );
     }
 
     pub fn terminal(&self) -> &Entity<Terminal> {
@@ -74,6 +139,11 @@ impl TerminalView {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    /// 检查是否是远程终端
+    pub fn is_remote(&self, cx: &App) -> bool {
+        self.terminal.read(cx).is_remote()
     }
 
     /// Check if the scrollbar should be visible

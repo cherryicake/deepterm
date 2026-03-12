@@ -19,6 +19,29 @@ itertools = "0.13"
 futures = "0.3"
 smol = "2.0"
 
+# SSH dependencies
+russh = "0.48"
+russh-keys = "0.48"
+async-trait = "0.1"
+
+# Credential storage (for secure password/key storage)
+keyring = "3.6"
+
+# Async runtime compatibility
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "fs"] }
+async-process = "2.3"
+async-io = "2.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1.0"
+
+# Utility
+rand = "0.8"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -7,6 +7,9 @@ use gpui::{
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::terminal_view::terminal_view::TerminalView;
 
+// Re-export for convenience
+pub use crate::ssh::SshConnectionConfig;
+
 /// 拖拽的 Panel 数据
 #[derive(Clone, Debug)]
 pub struct DraggedPanel {
@@ -144,6 +147,41 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let terminal_view = TerminalView::new(cx);
+
+        Self {
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label,
+            is_solo: false,
+            is_selected: false,
+            content: PanelContent::Terminal(terminal_view),
+        }
+    }
+
+    /// Creates a new panel with an SSH remote terminal view.
+    ///
+    /// # Arguments
+    ///
+    /// * `panel_id` - Unique identifier for this panel
+    /// * `workspace_id` - ID of the workspace this panel belongs to
+    /// * `active_tab_id` - ID of the currently active tab
+    /// * `active_tab_label` - Label shown in the title bar
+    /// * `ssh_config` - SSH connection configuration
+    /// * `on_data` - Callback for sending data to SSH
+    /// * `on_resize` - Callback for resizing SSH terminal
+    /// * `cx` - The context for entity creation
+    pub fn with_ssh_terminal(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        ssh_config: &crate::ssh::SshConnectionConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let terminal_view = TerminalView::new_ssh(cx, ssh_config);
 
         Self {
             panel_id: panel_id.into(),
