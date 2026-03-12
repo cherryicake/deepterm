@@ -70,7 +70,18 @@ mach2 = "0.4"
 # gpui = {path = "../zed/crates/gpui"}
 
 [package.metadata.bundle]
+name = "DeepTerm"
+identifier = "com.deepterm.app"
+icon = ["assets/icon.png"]
+version = "0.1.0"
 resources = ["assets"]
+copyright = "Copyright (c) 2024"
+category = "Developer Tool"
+short_description = "A modern terminal emulator"
+long_description = """
+DeepTerm is a modern terminal emulator built with Rust and GPUI.
+Supports local terminals and SSH remote connections.
+"""
 
 [[bin]]
 name = "deepterm"
