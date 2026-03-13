@@ -96,6 +96,7 @@ impl Render for TitleBar {
         let is_web = cfg!(target_family = "wasm");
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
+        let is_fullscreen = window.is_fullscreen();
 
         // Main title bar container - 与工作空间背景色一致
         div()
@@ -104,7 +105,10 @@ impl Render for TitleBar {
             .flex_row()
             .items_center()
             .h(TITLE_BAR_HEIGHT)
-            .pl(TITLE_BAR_LEFT_PADDING)
+            // macOS: 非全屏时留出红绿灯按钮位置，全屏时占据全部宽度
+            .when(is_macos && !is_fullscreen, |this| this.pl(TITLE_BAR_LEFT_PADDING))
+            .when(is_macos && is_fullscreen, |this| this.pl_3())
+            .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
             .bg(gpui::rgb(0x0f0f1a))
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
@@ -132,7 +136,6 @@ impl Render for TitleBar {
                     .when(!is_macos && !is_web, |this| {
                         this.window_control_area(WindowControlArea::Drag)
                     })
-                    .when(window.is_fullscreen(), |this| this.pl_3())
                     // Right-click context menu on Linux
                     .when(is_linux && is_client_decorated && !is_web, |this| {
                         this.child(
