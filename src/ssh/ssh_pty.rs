@@ -32,7 +32,7 @@ impl SshPtyTerminal {
         log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
 
         // 构建 SSH 命令
-        let ssh_program = "ssh";
+        let mut ssh_program = "ssh";
         let mut ssh_args = vec![
             "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
             "-o".to_string(), "ServerAliveInterval=60".to_string(),
@@ -49,9 +49,18 @@ impl SshPtyTerminal {
                 ssh_args.push("-i".to_string());
                 ssh_args.push(path.to_string_lossy().to_string());
             }
-            crate::ssh::config::AuthMethod::Password { .. } => {
-                log::warn!("密码认证需要 sshpass，尝试使用...");
-                // 密码认证比较复杂，暂时用密钥
+            crate::ssh::config::AuthMethod::Password { password } => {
+                log::info!("使用密码认证 (通过 sshpass)");
+                // 使用 sshpass 自动输入密码
+                // 命令格式: sshpass -p 'password' ssh [options] user@host
+                let mut sshpass_args = vec![
+                    "-p".to_string(),
+                    password.clone(),
+                    "ssh".to_string(),
+                ];
+                sshpass_args.append(&mut ssh_args);
+                ssh_args = sshpass_args;
+                ssh_program = "sshpass";
             }
             _ => {}
         }

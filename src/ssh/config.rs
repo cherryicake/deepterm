@@ -7,11 +7,13 @@ use std::path::PathBuf;
 
 use crate::ssh::parse_ssh_target;
 
+fn generate_id(username: &str, host: &str, port: u16) -> String {
+    format!("{}@{}:{}", username, host, port)
+}
+
 /// SSH 连接配置
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SshConnectionConfig {
-    /// 连接唯一标识符
-    pub id: String,
     /// 主机地址（IP 或域名）
     pub host: String,
     /// 端口号（默认 22）
@@ -32,6 +34,13 @@ pub struct SshConnectionConfig {
     /// 是否保存此配置
     #[serde(default = "default_save")]
     pub save_config: bool,
+}
+
+impl SshConnectionConfig {
+    /// 获取连接唯一标识符（基于用户名、主机和端口自动生成）
+    pub fn id(&self) -> String {
+        generate_id(&self.username, &self.host, self.port)
+    }
 }
 
 fn default_port() -> u16 {
@@ -55,10 +64,8 @@ impl SshConnectionConfig {
     ) -> Self {
         let host = host.into();
         let username = username.into();
-        let id = format!("{}@{}:{}", username, host, default_port());
 
         Self {
-            id,
             host,
             port: default_port(),
             username,
@@ -78,10 +85,8 @@ impl SshConnectionConfig {
     /// - `host`（使用当前用户名）
     pub fn from_string(target: &str, auth_method: AuthMethod) -> Self {
         let (username, host, port) = parse_ssh_target(target);
-        let id = format!("{}@{}:{}", username, host, port);
 
         Self {
-            id,
             host,
             port,
             username,
@@ -96,7 +101,6 @@ impl SshConnectionConfig {
     /// 设置端口号
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
-        self.id = format!("{}@{}:{}", self.username, self.host, port);
         self
     }
 
@@ -330,19 +334,20 @@ impl SshGlobalConfig {
     /// 添加保存的连接
     pub fn add_connection(&mut self, config: SshConnectionConfig) {
         // 如果已存在，先移除旧的
-        self.saved_connections.retain(|c| c.id != config.id);
+        let id = config.id();
+        self.saved_connections.retain(|c| c.id() != id);
         self.saved_connections.push(config);
     }
 
     /// 移除保存的连接
     pub fn remove_connection(&mut self, id: &str) -> Option<SshConnectionConfig> {
-        let pos = self.saved_connections.iter().position(|c| c.id == id)?;
+        let pos = self.saved_connections.iter().position(|c| c.id() == id)?;
         Some(self.saved_connections.remove(pos))
     }
 
     /// 查找连接配置
     pub fn find_connection(&self, id: &str) -> Option<&SshConnectionConfig> {
-        self.saved_connections.iter().find(|c| c.id == id)
+        self.saved_connections.iter().find(|c| c.id() == id)
     }
 
     /// 查找已知主机
@@ -432,9 +437,9 @@ mod tests {
         config.add_connection(conn.clone());
 
         assert_eq!(config.saved_connections_count(), 1);
-        assert!(config.find_connection(&conn.id).is_some());
+        assert!(config.find_connection(&conn.id()).is_some());
 
-        config.remove_connection(&conn.id);
+        config.remove_connection(&conn.id());
         assert_eq!(config.saved_connections_count(), 0);
     }
 }

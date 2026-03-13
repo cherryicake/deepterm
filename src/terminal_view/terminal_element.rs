@@ -330,7 +330,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        let font_size = px(15.0);
+        let font_size = px(18.0);
         let line_height = font_size * 1.25;
 
         #[cfg(target_os = "macos")]

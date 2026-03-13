@@ -433,7 +433,7 @@ impl SshPicker {
         let is_selected = actual_index == self.selected_index;
 
         div()
-            .id(format!("ssh-item-{}", config.id))
+            .id(format!("ssh-item-{}", config.id()))
             .mx(px(8.0))
             .h(px(30.0))
             .px(px(12.0))

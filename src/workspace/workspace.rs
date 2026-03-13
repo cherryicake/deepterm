@@ -663,7 +663,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let label = format!("SSH: {}", config.host);
+        let label = config.display_name();
         let panel = cx.new(|cx| {
             Panel::with_ssh_terminal(
                 format!("panel-{}", self.next_panel_id),
