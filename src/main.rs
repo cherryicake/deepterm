@@ -2,7 +2,6 @@
 
 pub mod components;
 pub mod layout;
-pub mod panels;
 pub mod ssh;
 pub mod ssh_picker;
 pub mod terminal;
@@ -21,7 +20,10 @@ use crate::terminal_view::terminal_view::{Copy, Paste};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(app, [Quit, NewLocalTerminal, ShowSshPicker]);
+actions!(
+    app,
+    [Quit, NewLocalTerminal, ShowSshPicker, CloseSelectedPanel]
+);
 
 /// 全局 SSH picker 引用，用于从 Workspace 触发显示
 struct GlobalSshPicker(Entity<SshPicker>);
@@ -80,6 +82,11 @@ impl Render for AppWindow {
                     workspace.create_local_terminal(window, cx);
                 });
             }))
+            .on_action(cx.listener(|this, _: &CloseSelectedPanel, _window, cx| {
+                this.workspace.update(cx, |workspace, cx| {
+                    workspace.close_selected_panel(cx);
+                });
+            }))
             // Title bar for window management
             .child(self.title_bar.clone())
             // Workspace content
@@ -114,6 +121,7 @@ fn main() {
             KeyBinding::new("cmd-v", Paste, None),
             KeyBinding::new("cmd-l", NewLocalTerminal, None),
             KeyBinding::new("cmd-k", ShowSshPicker, None),
+            KeyBinding::new("cmd-w", CloseSelectedPanel, None),
         ]);
 
         // Register global action handlers

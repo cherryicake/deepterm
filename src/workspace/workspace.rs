@@ -480,6 +480,40 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 关闭当前选中的 panel
+    /// 如果当前 Tab 下只有一个 Panel，则关闭整个 Tab
+    pub fn close_selected_panel(&mut self, cx: &mut Context<Self>) {
+        // 获取当前活动tab
+        let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
+            return;
+        };
+
+        let panel_count = tab_info.container.panel_count();
+
+        // 如果当前 Tab 下只有一个 Panel，关闭整个 Tab
+        if panel_count <= 1 {
+            let active_tab_id = self.active_tab_id.clone();
+            self.handle_tab_close(&active_tab_id, cx);
+            return;
+        }
+
+        // 找到当前选中的panel
+        let panels = tab_info.container.collect_panels_vec();
+        for panel in panels {
+            if panel.read(cx).is_selected() {
+                let panel_id = panel.read(cx).panel_id().to_string();
+                self.handle_panel_close(&panel_id, cx);
+                return;
+            }
+        }
+
+        // 如果没有选中的panel，但有多个panel存在，关闭第一个
+        if let Some(first_panel) = tab_info.container.get_first_panel() {
+            let panel_id = first_panel.read(cx).panel_id().to_string();
+            self.handle_panel_close(&panel_id, cx);
+        }
+    }
+
     /// 处理关闭panel事件
     fn handle_panel_close(&mut self, panel_id: &str, cx: &mut Context<Self>) {
         let active_tab_id = self.active_tab_id.clone();
