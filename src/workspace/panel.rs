@@ -60,6 +60,8 @@ pub enum PanelEvent {
     Close { panel_id: String },
     /// 选中状态变更事件
     Selected { panel_id: String },
+    /// 广播状态切换事件
+    BroadcastToggle { panel_id: String },
 }
 
 /// Panel content type
@@ -97,6 +99,8 @@ pub struct Panel {
     is_selected: bool,
     /// Content displayed in this panel
     content: PanelContent,
+    /// 广播状态 - 由Workspace同步给所有Panel
+    broadcast_enabled: bool,
 }
 
 impl Panel {
@@ -127,6 +131,7 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Text(content_text),
+            broadcast_enabled: false,
         }
     }
 
@@ -158,6 +163,7 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            broadcast_enabled: false,
         }
     }
 
@@ -193,6 +199,7 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            broadcast_enabled: false,
         }
     }
 
@@ -256,6 +263,38 @@ impl Panel {
     /// 获取选中状态
     pub fn is_selected(&self) -> bool {
         self.is_selected
+    }
+
+    /// 设置广播状态
+    pub fn set_broadcast_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.broadcast_enabled = enabled;
+
+        // 根据广播状态设置或清除TerminalView的广播回调
+        if let PanelContent::Terminal(terminal_view) = &self.content {
+            let panel_id = self.panel_id.clone();
+            let workspace_id = self.workspace_id.clone();
+            terminal_view.update(cx, |tv, _cx| {
+                if enabled {
+                    // 创建广播回调，当终端有输入时添加到全局队列
+                    tv.set_broadcast_callback(Box::new(move |data: &[u8]| {
+                        // 将输入添加到全局队列，由Workspace的render方法处理
+                        // 包含workspace_id以区分不同WorkSpace的广播
+                        crate::workspace::workspace::Workspace::queue_broadcast_input(
+                            &workspace_id, &panel_id, data,
+                        );
+                    }));
+                } else {
+                    tv.clear_broadcast_callback();
+                }
+            });
+        }
+
+        cx.notify();
+    }
+
+    /// 获取广播状态
+    pub fn is_broadcast_enabled(&self) -> bool {
+        self.broadcast_enabled
     }
 
     /// 获取活动 tab ID
@@ -329,12 +368,15 @@ impl Panel {
             .unwrap_or_else(|| self.panel_id.clone());
 
         let panel_id = self.panel_id.clone();
+        let panel_id_for_broadcast = panel_id.clone();
+        let panel_id_for_close = panel_id.clone();
         let source_tab_id = self
             .active_tab_id
             .clone()
             .map(|s| s.to_string())
             .unwrap_or_default();
         let drag_title = title.clone();
+        let broadcast_enabled = self.broadcast_enabled;
 
         div()
             .h(px(28.0))
@@ -364,26 +406,64 @@ impl Panel {
                     .child(title),
             )
             .child(
-                // 关闭按钮
+                // 右侧按钮组：广播按钮 + 关闭按钮
                 div()
-                    .w(px(16.0))
-                    .h(px(16.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded(px(4.0))
-                    .hover(|style| style.bg(rgb(0x3d3d5c)))
-                    .cursor_pointer()
-                    .text_color(rgb(0x666688))
-                    .text_xs()
-                    .child("×")
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |_this, _event, _window, cx| {
-                            cx.emit(PanelEvent::Close {
-                                panel_id: panel_id.clone(),
-                            });
-                        }),
+                    .gap(px(4.0))
+                    .child(
+                        // 广播按钮 - 开启/关闭终端输入广播功能
+                        div()
+                            .id(format!("broadcast-btn-{}", panel_id))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .when(broadcast_enabled, |this| {
+                                this.bg(rgb(0x4a9eff))
+                                    .text_color(rgb(0xffffff))
+                            })
+                            .when(!broadcast_enabled, |this| {
+                                this.text_color(rgb(0x666688))
+                                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                            })
+                            .cursor_pointer()
+                            .text_xs()
+                            .child(if broadcast_enabled { "B" } else { "b" })
+                            .on_click(
+                                cx.listener(move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                                    cx.emit(PanelEvent::BroadcastToggle {
+                                        panel_id: panel_id_for_broadcast.clone(),
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        // 关闭按钮
+                        div()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .hover(|style| style.bg(rgb(0x3d3d5c)))
+                            .cursor_pointer()
+                            .text_color(rgb(0x666688))
+                            .text_xs()
+                            .child("×")
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |_this, _event, _window, cx| {
+                                    cx.emit(PanelEvent::Close {
+                                        panel_id: panel_id_for_close.clone(),
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     ),
             )
     }

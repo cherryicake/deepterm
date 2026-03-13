@@ -24,6 +24,9 @@ use crate::ssh::SshConnectionConfig;
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 
+/// 广播输入回调类型 - 用于将输入广播给其他终端
+pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
+
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     focus_handle: FocusHandle,
@@ -32,6 +35,8 @@ pub struct TerminalView {
     selecting: bool,
     /// IME composition state for CJK input methods
     ime_state: Option<ImeState>,
+    /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
+    broadcast_callback: Option<BroadcastInputCallback>,
 }
 
 impl TerminalView {
@@ -65,6 +70,7 @@ impl TerminalView {
                 title: "Terminal".into(),
                 selecting: false,
                 ime_state: None,
+                broadcast_callback: None,
             };
             this.update_title(cx);
             this
@@ -113,6 +119,7 @@ impl TerminalView {
                 title: format!("{}@{}", ssh_config_clone.username, ssh_config_clone.host).into(),
                 selecting: false,
                 ime_state: None,
+                broadcast_callback: None,
             };
             this.update_title(cx);
             this
@@ -139,6 +146,17 @@ impl TerminalView {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    /// 设置广播输入回调
+    /// 当终端有输入时，会调用此回调将输入数据广播给其他终端
+    pub fn set_broadcast_callback(&mut self, callback: BroadcastInputCallback) {
+        self.broadcast_callback = Some(callback);
+    }
+
+    /// 清除广播输入回调
+    pub fn clear_broadcast_callback(&mut self) {
+        self.broadcast_callback = None;
     }
 
     /// 检查是否是远程终端
@@ -204,9 +222,18 @@ impl TerminalView {
     /// This is called when the user confirms the input (e.g., pressing Space to select).
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !text.is_empty() {
-            self.terminal.update(cx, |terminal, _| {
-                terminal.write(text.as_bytes());
-            });
+            self.write_with_broadcast(text.as_bytes(), cx);
+        }
+    }
+
+    /// 写入数据到终端，并可选地广播给其他终端
+    fn write_with_broadcast(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, _| {
+            terminal.write(data);
+        });
+        // 如果有广播回调，调用它来广播输入
+        if let Some(ref callback) = self.broadcast_callback {
+            callback(data);
         }
     }
 
@@ -218,9 +245,10 @@ impl TerminalView {
     }
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |terminal, cx| {
-            terminal.paste(cx);
-        });
+        if let Some(item) = cx.read_from_clipboard() {
+            let text = item.text().unwrap_or_default();
+            self.write_with_broadcast(text.as_bytes(), cx);
+        }
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -301,15 +329,24 @@ impl TerminalView {
             cx.notify();
         }
 
+        let mut input_bytes: Option<Vec<u8>> = None;
         let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
             if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
+                input_bytes = Some(bytes.to_vec());
                 terminal.write(&bytes);
                 true
             } else {
                 false
             }
         });
+
+        // 如果有输入数据且广播回调已设置，调用广播回调
+        if let Some(ref bytes) = input_bytes {
+            if let Some(ref callback) = self.broadcast_callback {
+                callback(bytes);
+            }
+        }
 
         if handled {
             // Stop propagation only if we handled the key

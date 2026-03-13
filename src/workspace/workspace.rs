@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use gpui::prelude::*;
 use gpui::{
@@ -6,8 +7,15 @@ use gpui::{
     div, px, rgb,
 };
 
+/// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
+/// (workspace_id, panel_id, input_data)
+fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
+    static QUEUE: OnceLock<Mutex<Vec<(String, String, Vec<u8>)>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::workspace::panel::{DraggedPanel, Panel, PanelEvent, PanelPlacement};
+use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::ssh::SshConnectionConfig;
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 use crate::GlobalSshPicker;
@@ -28,6 +36,8 @@ pub struct TabInfo {
     pub tab_type: TabType,
     /// 该tab对应的容器（单个Panel或分割的Split）
     pub container: SplitContainer,
+    /// 广播状态 - 每个WorkSpace类型的tab有独立的广播状态
+    pub broadcast_enabled: bool,
 }
 
 impl TabInfo {
@@ -41,6 +51,7 @@ impl TabInfo {
             label: label.into(),
             tab_type: TabType::Normal,
             container: SplitContainer::Panel(panel),
+            broadcast_enabled: false,
         }
     }
 
@@ -48,17 +59,24 @@ impl TabInfo {
         id: impl Into<String>,
         children: Vec<SplitContainer>,
         direction: SplitDirection,
+        workspace_index: usize,
     ) -> Self {
         let sizes = vec![1.0; children.len()];
+        let label = if workspace_index <= 1 {
+            "WorkSpace".to_string()
+        } else {
+            format!("WorkSpace[{}]", workspace_index)
+        };
         Self {
             id: id.into(),
-            label: "WorkSpace".to_string(),
+            label,
             tab_type: TabType::Workspace,
             container: SplitContainer::Split {
                 direction,
                 children,
                 sizes,
             },
+            broadcast_enabled: false,
         }
     }
 }
@@ -80,9 +98,67 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     /// Panel事件订阅
     panel_subscriptions: HashMap<String, Subscription>,
+    /// Workspace唯一标识
+    workspace_id: String,
 }
 
 impl Workspace {
+    /// 获取当前活动tab的广播状态
+    fn get_current_broadcast_state(&self) -> bool {
+        self.tabs
+            .get(&self.active_tab_id)
+            .map(|tab| tab.broadcast_enabled)
+            .unwrap_or(false)
+    }
+
+    /// 设置当前活动tab的广播状态
+    fn set_current_broadcast_state(&mut self, enabled: bool) {
+        if let Some(tab) = self.tabs.get_mut(&self.active_tab_id) {
+            tab.broadcast_enabled = enabled;
+        }
+    }
+
+    /// 生成WorkSpace标签名称
+    /// 根据当前WorkSpace类型的tab索引生成下一个不重复的索引
+    fn generate_workspace_label(&self) -> String {
+        // 收集所有现有WorkSpace的索引
+        let mut indices: Vec<usize> = self
+            .tabs
+            .values()
+            .filter(|tab| tab.tab_type == TabType::Workspace)
+            .filter_map(|tab| {
+                // 解析标签中的索引，如 "WorkSpace[2]" -> 2, "WorkSpace" -> 1
+                if tab.label == "WorkSpace" {
+                    Some(1)
+                } else if let Some(start) = tab.label.find('[') {
+                    if let Some(end) = tab.label.find(']') {
+                        tab.label[start + 1..end].parse().ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        indices.sort_unstable();
+
+        // 找到下一个可用的索引
+        let next_index = if indices.is_empty() {
+            1
+        } else {
+            indices.last().unwrap() + 1
+        };
+
+        // 生成标签
+        if next_index == 1 {
+            "WorkSpace".to_string()
+        } else {
+            format!("WorkSpace[{}]", next_index)
+        }
+    }
+
     pub fn new(cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
@@ -90,14 +166,18 @@ impl Workspace {
         let initial_tab_items = vec![TabItem::new("tab-0", "Local Terminal")];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
+        // 生成唯一的workspace ID（先创建，确保与Panel一致）
+        let workspace_id = format!("workspace-{}", uuid::Uuid::new_v4());
+
         // 初始化tabs信息
         let mut tabs = HashMap::new();
 
         // tab-0 对应 panel-0 - 使用本地终端
+        // 使用正确的 workspace_id 创建 Panel
         let panel_0 = cx.new(|cx| {
             Panel::with_terminal(
                 "panel-0",
-                "group-0",
+                workspace_id.clone(),
                 Some("tab-0".into()),
                 Some("Local Terminal".into()),
                 cx,
@@ -118,6 +198,7 @@ impl Workspace {
                 local_terminal_count: 0,
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
+                workspace_id,
             };
 
             // 在创建时完成所有初始化
@@ -218,12 +299,23 @@ impl Workspace {
             tab_info.container.collect_panels_vec_recursive(&mut panels);
         }
 
+        // 获取当前存在的所有panel ID
+        let current_panel_ids: std::collections::HashSet<String> = panels
+            .iter()
+            .map(|p| p.read(cx).panel_id().to_string())
+            .collect();
+
+        // 清理已不存在panel的订阅
+        self.panel_subscriptions
+            .retain(|panel_id, _| current_panel_ids.contains(panel_id));
+
         for panel in panels {
             // 检查是否已经订阅过这个panel
             let panel_id = panel.read(cx).panel_id().to_string();
             let already_subscribed = self.panel_subscriptions.contains_key(&panel_id);
 
             if !already_subscribed {
+                log::info!("Subscribing to panel: {}", panel_id);
                 let subscription = cx.subscribe(&panel, |this, _panel, event: &PanelEvent, cx| {
                     this.handle_panel_event(event, cx);
                 });
@@ -261,7 +353,108 @@ impl Workspace {
             PanelEvent::Selected { panel_id } => {
                 self.handle_panel_selected(panel_id, cx);
             }
+            PanelEvent::BroadcastToggle { .. } => {
+                self.handle_broadcast_toggle(cx);
+            }
         }
+    }
+
+    /// 处理广播状态切换
+    fn handle_broadcast_toggle(&mut self, cx: &mut Context<Self>) {
+        // 切换当前tab的广播状态
+        let new_state = !self.get_current_broadcast_state();
+        self.set_current_broadcast_state(new_state);
+
+        // 更新当前活动tab下所有panel的广播状态
+        if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
+            let panels = tab_info.container.collect_panels_vec();
+            log::info!("Updating broadcast state for {} panels", panels.len());
+            for panel in panels {
+                let panel_id = panel.read(cx).panel_id().to_string();
+                panel.update(cx, |p, cx| {
+                    log::info!("Setting panel {} broadcast_enabled to {}", panel_id, new_state);
+                    p.set_broadcast_enabled(new_state, cx);
+                });
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// 处理终端输入广播 - 将输入发送给当前Workspace中的所有其他终端
+    fn handle_broadcast_input(&mut self, source_panel_id: &str, data: &[u8], cx: &mut Context<Self>) {
+        // 获取当前活动tab的广播状态
+        if !self.get_current_broadcast_state() {
+            return;
+        }
+
+        // 获取当前活动tab
+        let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
+            return;
+        };
+
+        // 获取所有panel，并筛选出需要接收广播的目标
+        let panels = tab_info.container.collect_panels_vec();
+        let target_panels: Vec<Entity<Panel>> = panels
+            .into_iter()
+            .filter(|panel| {
+                let panel_ref = panel.read(cx);
+                panel_ref.panel_id() != source_panel_id && panel_ref.has_terminal_content()
+            })
+            .collect();
+
+        // 将输入发送给目标panel的终端
+        for panel in target_panels {
+            panel.update(cx, |panel_ref, _cx| {
+                if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
+                    terminal_view.update(_cx, |tv, cx| {
+                        tv.terminal().update(cx, |term, _| {
+                            term.write(data);
+                        });
+                    });
+                }
+            });
+        }
+    }
+
+    /// 获取当前广播状态
+    pub fn is_broadcast_enabled(&self) -> bool {
+        self.get_current_broadcast_state()
+    }
+
+    /// 处理广播输入队列中的数据
+    /// 这个方法应该在适当的时机（如render时）调用
+    pub fn process_broadcast_queue(&mut self, cx: &mut Context<Self>) {
+        // 获取当前活动tab的广播状态
+        if !self.get_current_broadcast_state() {
+            return;
+        }
+
+        // 从队列中取出所有待处理的输入（只处理属于当前Workspace的输入）
+        let inputs: Vec<(String, Vec<u8>)> = {
+            let mut queue = get_broadcast_queue().lock().unwrap();
+            if queue.is_empty() {
+                return;
+            }
+            // 只过滤出属于当前workspace的输入
+            let workspace_id = self.workspace_id.clone();
+            queue
+                .drain(..)
+                .filter(|(ws_id, _, _)| ws_id == &workspace_id)
+                .map(|(_, panel_id, data)| (panel_id, data))
+                .collect()
+        };
+
+        // 处理每个输入
+        for (panel_id, data) in inputs {
+            self.handle_broadcast_input(&panel_id, &data, cx);
+        }
+    }
+
+    /// 添加输入到广播队列（由TerminalView调用）
+    pub fn queue_broadcast_input(workspace_id: &str, panel_id: &str, data: &[u8]) {
+        let mut queue = get_broadcast_queue().lock().unwrap();
+        queue.push((workspace_id.to_string(), panel_id.to_string(), data.to_vec()));
     }
 
     /// 处理panel选中事件 - 确保同一组只有一个panel被选中
@@ -375,6 +568,7 @@ impl Workspace {
         target_tab_info.tab_type = TabType::Workspace;
 
         // 更新TabBar显示
+        let workspace_label = self.generate_workspace_label();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
             // 更新目标tab的标签
@@ -383,7 +577,7 @@ impl Workspace {
                 .iter()
                 .map(|t| {
                     if t.id == target_tab_id {
-                        TabItem::new(&target_tab_id, "WorkSpace")
+                        TabItem::new(&target_tab_id, &workspace_label)
                     } else {
                         t.clone()
                     }
@@ -394,6 +588,16 @@ impl Workspace {
 
         // 重新订阅所有panel
         self.subscribe_to_panels(cx);
+
+        // 设置新加入的panels的广播状态和workspace_id（与当前Workspace tab保持一致）
+        let broadcast_enabled = self.get_current_broadcast_state();
+        let workspace_id = self.workspace_id.clone();
+        for panel in &dragged_panels {
+            panel.update(cx, |p, cx| {
+                p.set_workspace_id(workspace_id.clone());
+                p.set_broadcast_enabled(broadcast_enabled, cx);
+            });
+        }
 
         // 设置新拖入的panel为选中状态，其他panel取消选中
         if !dragged_panels.is_empty() {
@@ -428,8 +632,11 @@ impl Workspace {
             return;
         }
 
-        // 获取当前活动的tab信息
+        // 保存广播状态（当前tab的广播状态）
+        let broadcast_enabled = self.get_current_broadcast_state();
         let active_tab_id = self.active_tab_id.clone();
+
+        // 获取当前活动的tab信息
         let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
             return;
         };
@@ -462,13 +669,14 @@ impl Workspace {
             tab_info.tab_type = TabType::Workspace;
 
             // 更新TabBar显示
+            let workspace_label = self.generate_workspace_label();
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, "WorkSpace")
+                            TabItem::new(&active_tab_id, &workspace_label)
                         } else {
                             t.clone()
                         }
@@ -478,8 +686,22 @@ impl Workspace {
             });
         }
 
-        // 重新订阅所有panel
+        // 保存被拖拽panel的ID和广播状态，用于后续设置
+        let dragged_panel_id = dragged_panel.panel_id.clone();
+
+        // 重新订阅所有panel（这会改变self）
         self.subscribe_to_panels(cx);
+
+        // 设置被拖拽的panel的广播状态和workspace_id（与当前Workspace保持一致）
+        let workspace_id = self.workspace_id.clone();
+        if let Some(tab_info) = self.tabs.get(&active_tab_id) {
+            if let Some(panel) = tab_info.container.find_panel(&dragged_panel_id, cx) {
+                panel.update(cx, |p, cx| {
+                    p.set_workspace_id(workspace_id.clone());
+                    p.set_broadcast_enabled(broadcast_enabled, cx);
+                });
+            }
+        }
 
         // 设置被拖拽的panel为选中状态
         let dragged_panel_id = dragged_panel.panel_id.clone();
@@ -697,10 +919,11 @@ impl Workspace {
         self.tab_bar
             .update(cx, |tab_bar, cx| tab_bar.add_tab(TabItem::new(&tab_id, &label), cx));
 
-        cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
+        let subscription = cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
             this.handle_panel_event(event, cx);
-        })
-        .detach();
+        });
+        self.panel_subscriptions
+            .insert(panel.read(cx).panel_id().to_string(), subscription);
 
         self.active_tab_id = tab_id.clone();
         self.switch_to_tab(&tab_id, cx);
@@ -791,6 +1014,11 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 只在广播开启时处理队列
+        if self.get_current_broadcast_state() {
+            self.process_broadcast_queue(cx);
+        }
+
         // 获取当前活动tab对应的容器
         let active_container = self
             .tabs
