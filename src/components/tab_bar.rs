@@ -265,11 +265,11 @@ impl Render for TabBar {
 
         div()
             .id(self.id.clone())
-            .h(px(34.0))
+            .h_full()
             .flex()
             .items_center()
-            .px(px(8.0))
-            .gap(px(4.0))
+            .pt_1()
+            .pb(px(2.))
             // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -292,7 +292,7 @@ impl Render for TabBar {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap_1()
                     .overflow_x_hidden()
                     .children(self.tabs.iter().enumerate().map(|(index, tab)| {
                         let tab_id = tab.id.clone();

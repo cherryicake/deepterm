@@ -14,7 +14,7 @@ use gpui::{
 
 use crate::components::tab_bar::TabBar;
 
-pub const TITLE_BAR_HEIGHT: Pixels = px(34.);
+pub const TITLE_BAR_HEIGHT: Pixels = px(38.);
 
 #[cfg(target_os = "macos")]
 const TITLE_BAR_LEFT_PADDING: Pixels = px(80.);
@@ -61,7 +61,7 @@ impl TitleBar {
         TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
+            traffic_light_position: Some(gpui::point(px(9.0), px(12.0))),
         }
     }
 
@@ -106,7 +106,9 @@ impl Render for TitleBar {
             .items_center()
             .h(TITLE_BAR_HEIGHT)
             // macOS: 非全屏时留出红绿灯按钮位置，全屏时占据全部宽度
-            .when(is_macos && !is_fullscreen, |this| this.pl(TITLE_BAR_LEFT_PADDING))
+            .when(is_macos && !is_fullscreen, |this| {
+                this.pl(TITLE_BAR_LEFT_PADDING)
+            })
             .when(is_macos && is_fullscreen, |this| this.pl_3())
             .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
             .bg(gpui::rgb(0x0f0f1a))
@@ -177,7 +179,7 @@ impl Render for TitleBar {
                         ))
                     })
                     // Windows/Linux: 双击最大化/恢复，单击拖拽
-                    .when(!is_macos && !is_web, |this| {
+                    .when(!is_web, |this| {
                         this.on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, window, _| {
