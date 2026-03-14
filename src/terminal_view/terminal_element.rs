@@ -367,7 +367,7 @@ impl Element for TerminalElement {
             line_height: line_height.into(),
             background_color: None,
             white_space: WhiteSpace::Normal,
-            color: rgb(0xcdd6f4).into(),
+            color: rgb(0x9aa3b8).into(),
             ..Default::default()
         };
 
