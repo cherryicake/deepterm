@@ -6,57 +6,14 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Render, SharedString, Styled, Window, actions, div, px, rgb, svg,
+    ParentElement, Render, Styled, Window, actions, div, px, rgb, svg,
 };
-use std::path::PathBuf;
 
+use crate::assets::Icon;
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
 use crate::workspace::workspace::Workspace;
 
 actions!(ssh_picker, [Dismiss, SelectNext, SelectPrevious, Confirm]);
-
-/// OS icon types
-#[derive(Clone, Copy, Debug)]
-pub enum OsIcon {
-    Linux,
-    Server,
-    Screen,
-    Terminal,
-}
-
-impl OsIcon {
-    /// Get the file path for this icon
-    pub fn path(&self) -> PathBuf {
-        let icon_name = match self {
-            OsIcon::Linux => "linux.svg",
-            OsIcon::Server => "server.svg",
-            OsIcon::Screen => "screen.svg",
-            OsIcon::Terminal => "terminal.svg",
-        };
-        // Get the project root directory (where Cargo.toml is)
-        let project_root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."));
-        project_root.join("assets/icons").join(icon_name)
-    }
-
-    /// Get the icon color based on OS type
-    pub fn color(&self) -> gpui::Rgba {
-        // 统一使用灰色/白色系，保持简洁中性
-        match self {
-            OsIcon::Linux => gpui::rgb(0xaaaaaa),    // Light gray
-            OsIcon::Server => gpui::rgb(0x8888aa),   // Muted purple/gray
-            OsIcon::Screen => gpui::rgb(0xaaaaaa),   // Light gray
-            OsIcon::Terminal => gpui::rgb(0xaaaaaa), // Light gray
-        }
-    }
-}
-
-/// Get the search icon path
-fn search_icon_path() -> PathBuf {
-    let project_root = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    project_root.join("assets/icons/magnifying_glass.svg")
-}
 
 /// SSH 连接选择器
 pub struct SshPicker {
@@ -278,7 +235,7 @@ impl SshPicker {
     }
 
     /// 根据主机地址或昵称推断 OS 类型并返回对应图标
-    fn get_os_icon(host: &str, nickname: Option<&str>) -> OsIcon {
+    fn get_os_icon(host: &str, nickname: Option<&str>) -> Icon {
         let text = nickname.unwrap_or(host).to_lowercase();
         if text.contains("ubuntu")
             || text.contains("centos")
@@ -288,13 +245,16 @@ impl SshPicker {
             || text.contains("alpine")
             || text.contains("linux")
         {
-            OsIcon::Linux
-        } else if text.contains("windows") || text.contains("win") {
-            OsIcon::Screen
-        } else if text.contains("mac") || text.contains("darwin") || text.contains("apple") {
-            OsIcon::Screen
+            Icon::Linux
+        } else if text.contains("windows")
+            || text.contains("win")
+            || text.contains("mac")
+            || text.contains("darwin")
+            || text.contains("apple")
+        {
+            Icon::Screen
         } else {
-            OsIcon::Server
+            Icon::Server
         }
     }
 
@@ -310,15 +270,15 @@ impl SshPicker {
                 .bg(rgb(0x252538)) // 使用项目配色
                 .rounded(px(8.0))
                 .child(
-                    // 搜索图标 - 使用 Zed 的 magnifying_glass SVG
+                    // 搜索图标 - 使用嵌入的 magnifying_glass SVG
                     div()
                         .w(px(16.0))
                         .h(px(16.0))
                         .child(
                             svg()
                                 .size(px(16.0))
-                                .text_color(rgb(0x666688))
-                                .external_path(SharedString::from(search_icon_path().to_string_lossy().to_string()))
+                                .text_color(Icon::MagnifyingGlass.color())
+                                .path(Icon::MagnifyingGlass.path())
                         ),
                 )
                 .child(
@@ -374,9 +334,6 @@ impl SshPicker {
 
     /// 渲染 Quick connect 项（Local Terminal）
     fn render_quick_connect_item(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let terminal_icon_path = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("assets/icons/terminal.svg");
         let is_selected = self.selected_index == 0;
 
         div()
@@ -396,7 +353,7 @@ impl SshPicker {
                 this.confirm_selection(window, cx);
             }))
             .child(
-                // Terminal 图标
+                // Terminal 图标 - 使用嵌入的 SVG
                 div()
                     .w(px(24.0))
                     .flex()
@@ -405,8 +362,8 @@ impl SshPicker {
                     .child(
                         svg()
                             .size(px(16.0))
-                            .text_color(gpui::rgb(0xaaaaaa))
-                            .external_path(SharedString::from(terminal_icon_path.to_string_lossy().to_string())),
+                            .text_color(Icon::Terminal.color())
+                            .path(Icon::Terminal.path()),
                     ),
             )
             .child(
@@ -451,10 +408,9 @@ impl SshPicker {
                 this.confirm_selection(window, cx);
             }))
             .child(
-                // OS 图标 - 使用 Zed SVG 图标
+                // OS 图标 - 使用嵌入的 SVG
                 {
-                    let os_icon = Self::get_os_icon(&config.host, config.nickname.as_deref());
-                    let icon_path = os_icon.path().to_string_lossy().to_string();
+                    let icon = Self::get_os_icon(&config.host, config.nickname.as_deref());
                     div()
                         .w(px(24.0))
                         .flex()
@@ -463,8 +419,8 @@ impl SshPicker {
                         .child(
                             svg()
                                 .size(px(16.0))
-                                .text_color(os_icon.color())
-                                .external_path(SharedString::from(icon_path)),
+                                .text_color(icon.color())
+                                .path(icon.path()),
                         )
                 },
             )

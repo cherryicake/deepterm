@@ -1,5 +1,6 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
+pub mod assets;
 pub mod components;
 pub mod layout;
 pub mod ssh;
@@ -113,7 +114,11 @@ fn main() {
 
     log::info!("=== DeepTerm 启动 ===");
 
-    gpui::Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
+    use crate::assets::Assets;
+
+    gpui::Application::with_platform(gpui_platform::current_platform(false))
+        .with_assets(Assets)
+        .run(|cx: &mut App| {
         // Bind keyboard shortcuts
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
