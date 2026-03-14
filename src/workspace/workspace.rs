@@ -288,6 +288,21 @@ impl Workspace {
                     });
                 }
             });
+
+            // 设置溢出检测回调 - 当 TabBar 标签过多时触发
+            tab_bar.on_overflow_changed({
+                let workspace = workspace.clone();
+                move |is_overflowing, cx| {
+                    cx.defer({
+                        let workspace = workspace.clone();
+                        move |cx| {
+                            workspace.update(cx, |this, cx| {
+                                this.handle_tab_bar_overflow(is_overflowing, cx);
+                            });
+                        }
+                    });
+                }
+            });
         });
     }
 
@@ -883,6 +898,18 @@ impl Workspace {
                 }
             }
         });
+    }
+
+    /// 处理 TabBar 溢出事件
+    /// 当标签页数量过多导致需要滚动时触发
+    fn handle_tab_bar_overflow(&mut self, is_overflowing: bool, _cx: &mut Context<Self>) {
+        // TabBar 已经自动处理滚动，这里只记录日志
+        // 可以在这里添加其他视觉效果，如显示滚动指示器
+        if is_overflowing {
+            eprintln!("[WORKSPACE] TabBar is overflowing!");
+        } else {
+            eprintln!("[WORKSPACE] TabBar overflow resolved");
+        }
     }
 
     /// 切换到指定tab

@@ -98,6 +98,9 @@ impl Render for TitleBar {
         let is_macos = cfg!(target_os = "macos");
         let is_fullscreen = window.is_fullscreen();
 
+        // 注意：TabBar 现在使用 ScrollHandle.max_offset() 自动检测溢出
+        // 不需要从外部传入可用宽度
+
         // Main title bar container - 与工作空间背景色一致
         div()
             .id(self.id.clone())
@@ -117,6 +120,7 @@ impl Render for TitleBar {
                 this.child(
                     div()
                         .flex_shrink_0()
+                        .max_w_full()
                         // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
                         .on_mouse_down(
                             MouseButton::Left,

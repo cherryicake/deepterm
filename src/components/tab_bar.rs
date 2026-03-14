@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Window, div, px, rgb,
+    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle,
+    SharedString, Window, canvas, div, px, rgb,
 };
 
 use crate::workspace::panel::DraggedPanel;
@@ -92,6 +92,10 @@ pub struct TabMergeEvent {
     pub target_tab_id: SharedString,
 }
 
+/// 溢出状态变化回调
+/// 当 TabBar 检测到溢出状态变化时触发
+pub type OnOverflowChanged = Rc<dyn Fn(bool, &mut App) + Send + Sync>;
+
 /// 标签栏组件
 pub struct TabBar {
     id: ElementId,
@@ -105,7 +109,15 @@ pub struct TabBar {
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
     /// Panel 拖拽到 TabBar 的回调
     on_panel_drop: Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut App) + Send + Sync>>,
+    /// 溢出状态变化回调
+    on_overflow_changed: Option<OnOverflowChanged>,
     focus_handle: FocusHandle,
+    /// 滚动句柄，用于控制水平滚动
+    scroll_handle: ScrollHandle,
+    /// 上一次检测到的溢出状态
+    last_overflow: Option<bool>,
+    /// 测量到的容器宽度（通过 canvas 获取）
+    measured_container_width: f32,
 }
 
 impl TabBar {
@@ -122,7 +134,11 @@ impl TabBar {
             on_tab_split: None,
             on_tab_merge: None,
             on_panel_drop: None,
+            on_overflow_changed: None,
             focus_handle,
+            scroll_handle: ScrollHandle::new(),
+            last_overflow: None,
+            measured_container_width: 0.0,
         })
     }
 
@@ -149,7 +165,11 @@ impl TabBar {
             on_tab_split: None,
             on_tab_merge: None,
             on_panel_drop: None,
+            on_overflow_changed: None,
             focus_handle,
+            scroll_handle: ScrollHandle::new(),
+            last_overflow: None,
+            measured_container_width: 0.0,
         })
     }
 
@@ -203,8 +223,20 @@ impl TabBar {
         self.on_panel_drop = Some(Rc::new(callback));
     }
 
+    /// 设置溢出状态变化回调
+    /// 当 TabBar 检测到溢出状态变化时触发
+    /// `is_overflowing` 为 true 表示内容已溢出需要滚动
+    pub fn on_overflow_changed<F>(&mut self, callback: F)
+    where
+        F: Fn(bool, &mut App) + Send + Sync + 'static,
+    {
+        self.on_overflow_changed = Some(Rc::new(callback));
+    }
+
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         self.tabs.push(tab);
+        // 提前检查溢出状态，避免 UI 上出现溢出后再切换
+        self.update_overflow_state(cx);
         cx.notify();
     }
 
@@ -222,6 +254,9 @@ impl TabBar {
                     None
                 };
             }
+
+            // 检查溢出状态是否改变（移除标签后可能不再溢出）
+            self.update_overflow_state(cx);
         }
         cx.notify();
     }
@@ -246,6 +281,38 @@ impl TabBar {
     pub fn tabs_count(&self) -> usize {
         self.tabs.len()
     }
+
+    /// 获取滚动句柄
+    pub fn scroll_handle(&self) -> &ScrollHandle {
+        &self.scroll_handle
+    }
+
+    /// 滚动到指定索引的标签
+    pub fn scroll_to_tab(&self, index: usize) {
+        self.scroll_handle.scroll_to_item(index);
+    }
+
+    /// 检查并更新溢出状态
+    /// 当溢出状态变化时触发回调
+    fn update_overflow_state(&mut self, cx: &mut Context<Self>) {
+        if self.measured_container_width <= 0.0 {
+            return;
+        }
+
+        // 预估内容宽度：每个 tab 约 180px（包含 gap），加上 "+" 按钮 40px
+        const ESTIMATED_TAB_WIDTH: f32 = 180.0;
+        const NEW_TAB_BUTTON_WIDTH: f32 = 40.0;
+
+        let estimated_content_width = self.tabs.len() as f32 * ESTIMATED_TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
+        let would_overflow = estimated_content_width > self.measured_container_width;
+
+        if self.last_overflow != Some(would_overflow) {
+            self.last_overflow = Some(would_overflow);
+            if let Some(ref callback) = self.on_overflow_changed {
+                callback(would_overflow, cx);
+            }
+        }
+    }
 }
 
 impl Focusable for TabBar {
@@ -263,11 +330,24 @@ impl Render for TabBar {
         let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
 
+        // 根据溢出状态决定布局模式
+        // 如果还没测量过，根据预估宽度预判；否则使用测量结果
+        let is_overflowing = match self.last_overflow {
+            Some(overflow) => overflow,
+            None => {
+                // 未测量时，如果有多个标签，默认启用滚动以避免溢出
+                // 一旦测量完成，会根据实际宽度调整
+                self.tabs.len() > 1
+            }
+        };
+
         div()
             .id(self.id.clone())
             .h_full()
+            .w_full()
             .flex()
             .items_center()
+            .overflow_hidden()
             .pt_1()
             .pb(px(2.))
             // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
@@ -277,7 +357,7 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }),
             )
-            // TabBar 整体接受 DraggedPanel drop - 放到最后
+            // TabBar 整体接受 DraggedPanel drop
             .on_drop(cx.listener({
                 let on_panel_drop = on_panel_drop.clone();
                 move |_this, dragged: &DraggedPanel, _window, cx| {
@@ -287,160 +367,206 @@ impl Render for TabBar {
                 }
             }))
             .child(
-                // 标签列表（包含新建标签按钮）
+                // 外层容器，用于测量实际可用宽度
                 div()
-                    .flex_1()
+                    .id("tab-bar-outer")
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .gap_1()
-                    .overflow_x_hidden()
-                    .children(self.tabs.iter().enumerate().map(|(index, tab)| {
-                        let tab_id = tab.id.clone();
-                        let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
-                        let label = tab.label.clone();
-                        let is_modified = tab.is_modified;
-                        let on_panel_drop_for_tab = on_panel_drop.clone();
-
-                        div()
-                            .id(tab_id.clone())
-                            .h(px(28.0))
-                            .px(px(12.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(if is_active {
-                                rgb(0x2d2d44)
-                            } else {
-                                rgb(0x1e1e2e)
-                            })
-                            .hover(|style| {
-                                if !is_active {
-                                    style.bg(rgb(0x252538))
-                                } else {
-                                    style
-                                }
-                            })
-                            .cursor_pointer()
-                            // 拖拽功能
-                            .on_drag(
-                                DraggedTab {
-                                    tab_id: tab_id.clone(),
-                                    from_index: index,
-                                },
-                                {
-                                    let label = label.clone();
-                                    move |_drag_data, _, _, cx| {
-                                        // 阻止事件冒泡，防止触发窗口拖拽
-                                        cx.stop_propagation();
-                                        // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
-                                        cx.new(|_cx| DragPreview {
-                                            tab_label: label.clone(),
-                                        })
+                    .h_full()
+                    .w_full()
+                    // 使用 canvas 测量容器宽度（只在变化时更新）
+                    .child({
+                        let entity = cx.entity();
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, _, cx| {
+                                let container_width: f32 = bounds.size.width.into();
+                                entity.update(cx, |this, _cx| {
+                                    // 只在宽度变化超过 1px 时更新
+                                    if (this.measured_container_width - container_width).abs() > 1.0 {
+                                        this.measured_container_width = container_width;
                                     }
-                                },
-                            )
-                            // 拖拽悬停效果 - DraggedTab
-                            .drag_over::<DraggedTab>({
-                                let tab_id = tab_id.clone();
-                                move |tab, dragged: &DraggedTab, _, _cx| {
-                                    if dragged.tab_id != tab_id {
-                                        tab.border_color(rgb(0x6c5ce7)).border_l_2()
-                                    } else {
-                                        tab
-                                    }
-                                }
-                            })
-                            // 拖拽悬停效果 - DraggedPanel（显示放置指示器）
-                            .drag_over::<DraggedPanel>({
-                                move |tab, _dragged: &DraggedPanel, _, _cx| {
-                                    tab.border_color(rgb(0x6c5ce7)).border_l_2()
-                                }
-                            })
-                            // 放置处理 - DraggedTab 重新排序
-                            .on_drop(cx.listener({
-                                let on_tab_reorder = on_tab_reorder.clone();
-                                let tab_id = tab_id.clone();
-                                move |this, dragged: &DraggedTab, _window, cx| {
-                                    if dragged.tab_id != tab_id {
-                                        // TabBar上的拖拽只处理重新排序
-                                        if let Some(ref callback) = on_tab_reorder {
-                                            if let Some(to_index) =
-                                                this.tabs.iter().position(|t| t.id == tab_id)
-                                            {
-                                                callback(dragged.clone(), to_index, cx);
-                                            }
-                                        }
-                                    }
-                                }
-                            }))
-                            // 放置处理 - DraggedPanel，插入到当前 tab 位置
-                            .on_drop(cx.listener({
-                                let on_panel_drop_for_tab = on_panel_drop_for_tab.clone();
-                                move |_this, dragged: &DraggedPanel, _window, cx| {
-                                    cx.stop_propagation(); // 阻止事件冒泡到 TabBar 容器
-                                    if let Some(ref callback) = on_panel_drop_for_tab {
-                                        callback(dragged.clone(), Some(index), cx);
-                                    }
-                                }
-                            }))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if is_active {
-                                        rgb(0xffffff)
-                                    } else {
-                                        rgb(0x8888aa)
-                                    })
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .w(px(14.0))
-                                    .h(px(14.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .hover(|style| style.bg(rgb(0x2d2d44)))
-                                    .cursor_pointer()
-                                    .text_color(rgb(0x666688))
-                                    .text_xs()
-                                    .child(if is_modified { "●" } else { "×" })
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener({
-                                            let on_tab_close = on_tab_close.clone();
-                                            let tab_id = tab_id.clone();
-                                            move |_this, _, _, cx| {
-                                                if let Some(ref callback) = on_tab_close {
-                                                    callback(tab_id.clone(), cx);
-                                                }
-                                            }
-                                        }),
-                                    ),
-                            )
-                            .on_click(cx.listener({
-                                let on_tab_click = on_tab_click.clone();
-                                let tab_id = tab_id.clone();
-                                move |_this, _event: &gpui::ClickEvent, _window, cx| {
-                                    // 只有在没有发生拖拽的情况下才触发点击
-                                    if let Some(ref callback) = on_tab_click {
-                                        callback(tab_id.clone(), cx);
-                                    }
-                                }
-                            }))
-                            // 阻止事件冒泡到 TitleBar，防止在 macOS 上触发窗口拖拽
-                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                    }))
-                    // 新建标签按钮 - 放在最后一个tab后面
+                                });
+                            },
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    // 标签列表容器（包含所有标签和新建按钮）
                     .child(
                         div()
+                            .id("tab-list-container")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .h_full()
+                            .when(is_overflowing, |this| {
+                                // 溢出模式：水平滚动
+                                this.w_full()
+                                    .overflow_x_scroll()
+                                    .track_scroll(&self.scroll_handle)
+                            })
+                            .when(!is_overflowing, |this| {
+                                // 普通模式：flex 布局，不换行
+                                this.flex_1().overflow_x_hidden()
+                            })
+                            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                                let tab_id = tab.id.clone();
+                                let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
+                                let label = tab.label.clone();
+                                let is_modified = tab.is_modified;
+                                let on_panel_drop_for_tab = on_panel_drop.clone();
+
+                                div()
+                                    .id(tab_id.clone())
+                                    .h(px(28.0))
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(if is_active {
+                                        rgb(0x2d2d44)
+                                    } else {
+                                        rgb(0x1e1e2e)
+                                    })
+                                    .hover(|style| {
+                                        if !is_active {
+                                            style.bg(rgb(0x252538))
+                                        } else {
+                                            style
+                                        }
+                                    })
+                                    .cursor_pointer()
+                                    // 拖拽功能
+                                    .on_drag(
+                                        DraggedTab {
+                                            tab_id: tab_id.clone(),
+                                            from_index: index,
+                                        },
+                                        {
+                                            let label = label.clone();
+                                            move |_drag_data, _, _, cx| {
+                                                // 阻止事件冒泡，防止触发窗口拖拽
+                                                cx.stop_propagation();
+                                                // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
+                                                cx.new(|_cx| DragPreview {
+                                                    tab_label: label.clone(),
+                                                })
+                                            }
+                                        },
+                                    )
+                                    // 拖拽悬停效果 - DraggedTab
+                                    .drag_over::<DraggedTab>({
+                                        let tab_id = tab_id.clone();
+                                        move |tab, dragged: &DraggedTab, _, _cx| {
+                                            if dragged.tab_id != tab_id {
+                                                tab.border_color(rgb(0x6c5ce7)).border_l_2()
+                                            } else {
+                                                tab
+                                            }
+                                        }
+                                    })
+                                    // 拖拽悬停效果 - DraggedPanel（显示放置指示器）
+                                    .drag_over::<DraggedPanel>({
+                                        move |tab, _dragged: &DraggedPanel, _, _cx| {
+                                            tab.border_color(rgb(0x6c5ce7)).border_l_2()
+                                        }
+                                    })
+                                    // 放置处理 - DraggedTab 重新排序
+                                    .on_drop(cx.listener({
+                                        let on_tab_reorder = on_tab_reorder.clone();
+                                        let tab_id = tab_id.clone();
+                                        move |this, dragged: &DraggedTab, _window, cx| {
+                                            if dragged.tab_id != tab_id {
+                                                // TabBar上的拖拽只处理重新排序
+                                                if let Some(ref callback) = on_tab_reorder {
+                                                    if let Some(to_index) = this
+                                                        .tabs
+                                                        .iter()
+                                                        .position(|t| t.id == tab_id)
+                                                    {
+                                                        callback(dragged.clone(), to_index, cx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }))
+                                    // 放置处理 - DraggedPanel，插入到当前 tab 位置
+                                    .on_drop(cx.listener({
+                                        let on_panel_drop_for_tab = on_panel_drop_for_tab.clone();
+                                        move |_this, dragged: &DraggedPanel, _window, cx| {
+                                            cx.stop_propagation(); // 阻止事件冒泡到 TabBar 容器
+                                            if let Some(ref callback) = on_panel_drop_for_tab {
+                                                callback(dragged.clone(), Some(index), cx);
+                                            }
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(if is_active {
+                                                rgb(0xffffff)
+                                            } else {
+                                                rgb(0x8888aa)
+                                            })
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .hover(|style| style.bg(rgb(0x2d2d44)))
+                                            .cursor_pointer()
+                                            .text_color(rgb(0x666688))
+                                            .text_xs()
+                                            .child(if is_modified { "●" } else { "×" })
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener({
+                                                    let on_tab_close = on_tab_close.clone();
+                                                    let tab_id = tab_id.clone();
+                                                    move |_this, _, _, cx| {
+                                                        if let Some(ref callback) = on_tab_close {
+                                                            callback(tab_id.clone(), cx);
+                                                        }
+                                                    }
+                                                }),
+                                            ),
+                                    )
+                                    .on_click(cx.listener({
+                                        let on_tab_click = on_tab_click.clone();
+                                        let tab_id = tab_id.clone();
+                                        move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                                            // 只有在没有发生拖拽的情况下才触发点击
+                                            if let Some(ref callback) = on_tab_click {
+                                                callback(tab_id.clone(), cx);
+                                            }
+                                        }
+                                    }))
+                                    // 阻止事件冒泡到 TitleBar，防止在 macOS 上触发窗口拖拽
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                            })),
+                    )
+                    // 新建标签按钮 - 放在滚动区域外面，始终可见
+                    // 使用 ml_1 保持与 Tab 标签页之间的间距一致（gap_1 = 4px）
+                    .child(
+                        div()
+                            .id("new-tab-btn")
                             .w(px(28.0))
                             .h(px(28.0))
                             .flex()
+                            .flex_shrink_0()
+                            .ml_1()
+                            .mr_4()
                             .items_center()
                             .justify_center()
                             .rounded(px(6.0))
