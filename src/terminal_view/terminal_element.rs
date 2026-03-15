@@ -12,8 +12,8 @@ use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::terminal_view::TerminalView;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 
-/// 光标布局 - 参考Zed的CursorLayout简化实现
-/// 用于在prepaint阶段计算光标位置和形状，在paint阶段渲染
+/// CursorLayout - simplified implementation inspired by Zed's CursorLayout
+/// Computed during prepaint phase, rendered during paint phase
 pub struct CursorLayout {
     origin: Point<Pixels>,
     block_width: Pixels,
@@ -56,7 +56,7 @@ impl CursorLayout {
 
         window.paint_quad(cursor_quad);
 
-        // 在块光标上绘制字符（反色显示）
+        // Paint character on block cursor with inverted colors
         if let Some(block_text) = &self.block_text {
             let _ = block_text.paint(
                 self.origin,
@@ -476,19 +476,22 @@ impl Element for TerminalElement {
                 AlacCursorShape::Hidden => unreachable!(),
             };
 
-            // 为块光标创建文字（显示光标下的字符，使用背景色作为文字颜色以形成反色效果）
+            // Create text for block cursor (inverted color effect)
             let block_text = if matches!(shape, CursorShape::Block) {
                 let cursor_char = self.terminal.read(cx).last_content().cursor_char;
                 if cursor_char != '\0' && cursor_char != ' ' {
                     let char_str = cursor_char.to_string();
-                    let len = char_str.len();
+                    let len = cursor_char.len_utf8();
+                    let bg_color = convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Background,
+                    ));
                     Some(window.text_system().shape_line(
                         char_str.into(),
                         font_size,
                         &[TextRun {
                             len,
                             font: text_style.font(),
-                            color: rgb(0x1e1e2e).into(), // 使用深色背景色作为文字颜色
+                            color: bg_color,
                             ..Default::default()
                         }],
                         Some(cell_width),
@@ -500,11 +503,15 @@ impl Element for TerminalElement {
                 None
             };
 
+            let cursor_color = convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Cursor,
+            ));
+
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
                 block_width: cell_width,
                 line_height,
-                color: rgb(0xcba6f7).into(),
+                color: cursor_color,
                 shape,
                 block_text,
             })
