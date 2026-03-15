@@ -296,7 +296,7 @@ impl SshPicker {
                     div()
                         .text_color(rgb(0x5d5d7c))
                         .text_size(px(12.0))
-                        .child("⌘K"),
+                        .child("⌘+K"),
                 ),
         )
     }

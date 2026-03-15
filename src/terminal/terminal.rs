@@ -24,6 +24,7 @@ use gpui::{
     Size, Task, Window, px,
 };
 
+use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -552,8 +553,11 @@ impl Terminal {
     }
 
     /// 处理从 SSH 接收的数据
-    pub fn process_ssh_data(&mut self, data: &[u8]) {
+    pub fn process_ssh_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
         log::debug!("Terminal 处理 SSH 数据: {} 字节", data.len());
+
+        // 首先提取和处理 OSC 52 序列
+        let filtered_data = self.extract_and_handle_osc52(data, cx);
 
         use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
@@ -563,8 +567,8 @@ impl Terminal {
         // 获取终端锁并处理数据
         let mut term = self.term.lock();
 
-        // 处理数据（逐字节处理）
-        for byte in data {
+        // 处理过滤后的数据（逐字节处理）
+        for byte in filtered_data.as_ref() {
             processor.advance(&mut *term, *byte);
         }
 
@@ -573,6 +577,93 @@ impl Terminal {
         self.content_generation += 1;
 
         log::debug!("SSH 数据处理完成");
+    }
+
+    /// 提取 OSC 52 序列并处理，返回过滤后的数据
+    /// 使用 Cow 实现零拷贝快速路径 - 当没有 OSC 序列时直接返回借用数据
+    fn extract_and_handle_osc52<'a>(
+        &mut self,
+        data: &'a [u8],
+        cx: &mut Context<Self>,
+    ) -> Cow<'a, [u8]> {
+        // 快速路径: 检查是否包含 OSC 开始序列
+        if !data.windows(2).any(|w| w == &[0x1b, b']']) {
+            return Cow::Borrowed(data); // 没有 OSC 序列，零拷贝返回
+        }
+
+        // 慢速路径: 需要过滤 OSC 序列
+        let mut result = Vec::with_capacity(data.len());
+        let mut i = 0;
+
+        while i < data.len() {
+            // 查找 OSC 序列开始: ESC ] 或 \x1b ]
+            if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b']' {
+                // 找到了 OSC 开始，尝试提取完整序列
+                if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[i..]) {
+                    // 尝试解析为 OSC 52
+                    if Terminal::try_handle_osc52(cx, osc_content) {
+                        // 成功处理 OSC 52，跳过这个序列
+                        i += osc_end;
+                        continue;
+                    }
+                    // 不是 OSC 52，保留序列
+                    result.extend_from_slice(&data[i..i + osc_end]);
+                    i += osc_end;
+                    continue;
+                }
+            }
+            // 普通字节，保留
+            result.push(data[i]);
+            i += 1;
+        }
+
+        Cow::Owned(result)
+    }
+
+    /// 尝试处理 OSC 52 序列
+    /// 返回 true 如果成功处理，false 如果不是 OSC 52
+    fn try_handle_osc52(cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
+        // 快速检查 OSC 52 前缀 "52;" (避免不必要的 UTF-8 转换)
+        if osc_content.len() < 3
+            || osc_content[0] != b'5'
+            || osc_content[1] != b'2'
+            || osc_content[2] != b';'
+        {
+            return false;
+        }
+
+        // OSC 52 内容是 ASCII (base64)，可以安全地使用 from_utf8_unchecked
+        let content_str = unsafe { std::str::from_utf8_unchecked(osc_content) };
+
+        if let Some(operation) = parse_osc52(content_str) {
+            handle_osc52(cx, &operation);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 提取完整的 OSC 序列
+    /// 返回 (序列长度, 序列内容不含 OSC 前缀)
+    fn extract_osc_sequence(data: &[u8]) -> Option<(usize, &[u8])> {
+        // OSC 序列格式: ESC ] <content> BEL
+        //           或: ESC ] <content> ESC \
+        if data.len() < 2 || data[0] != 0x1b || data[1] != b']' {
+            return None;
+        }
+
+        // 查找 BEL 结束符 (0x07)
+        if let Some(pos) = data[2..].iter().position(|&b| b == 0x07) {
+            return Some((pos + 3, &data[2..pos + 2]));
+        }
+
+        // 查找 ESC \ 结束符 (0x1b 0x5c)
+        if let Some(pos) = data[2..].windows(2).position(|w| w == &[0x1b, b'\\']) {
+            return Some((pos + 4, &data[2..pos + 2]));
+        }
+
+        // 未找到结束符，序列不完整
+        None
     }
 
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {

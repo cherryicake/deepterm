@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod mappings;
 pub mod terminal;
 
