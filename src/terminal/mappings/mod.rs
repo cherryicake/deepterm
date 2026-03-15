@@ -101,5 +101,10 @@ pub fn default_terminal_env() -> HashMap<String, String> {
     let path = get_macos_system_path().to_string();
     env.insert("PATH".to_string(), path);
 
+    // Set UTF-8 locale to ensure proper Unicode/Chinese character display
+    // This fixes garbled text when the terminal is launched from Finder
+    env.insert("LANG".to_string(), "en_US.UTF-8".to_string());
+    env.insert("LC_ALL".to_string(), "en_US.UTF-8".to_string());
+
     env
 }
