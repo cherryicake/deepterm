@@ -42,7 +42,7 @@ pub struct TerminalView {
 impl TerminalView {
     /// 创建新的本地终端
     pub fn new(cx: &mut App) -> Entity<Self> {
-        let terminal = Terminal::new(cx, std::env::current_dir().ok());
+        let terminal = Terminal::new(cx, dirs::home_dir());
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
