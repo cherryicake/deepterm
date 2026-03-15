@@ -101,8 +101,8 @@ pub struct TabBar {
     id: ElementId,
     pub tabs: Vec<TabItem>,
     pub active_tab_id: Option<SharedString>,
-    on_tab_click: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
-    on_tab_close: Option<Rc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
+    on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
@@ -175,14 +175,14 @@ impl TabBar {
 
     pub fn on_tab_click<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, &mut App) + Send + Sync + 'static,
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_click = Some(Rc::new(callback));
     }
 
     pub fn on_tab_close<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, &mut App) + Send + Sync + 'static,
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_close = Some(Rc::new(callback));
     }
@@ -534,9 +534,9 @@ impl Render for TabBar {
                                                 cx.listener({
                                                     let on_tab_close = on_tab_close.clone();
                                                     let tab_id = tab_id.clone();
-                                                    move |_this, _, _, cx| {
+                                                    move |_this, _, window, cx| {
                                                         if let Some(ref callback) = on_tab_close {
-                                                            callback(tab_id.clone(), cx);
+                                                            callback(tab_id.clone(), window, cx);
                                                         }
                                                     }
                                                 }),
@@ -545,10 +545,10 @@ impl Render for TabBar {
                                     .on_click(cx.listener({
                                         let on_tab_click = on_tab_click.clone();
                                         let tab_id = tab_id.clone();
-                                        move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                                        move |_this, _event: &gpui::ClickEvent, window, cx| {
                                             // 只有在没有发生拖拽的情况下才触发点击
                                             if let Some(ref callback) = on_tab_click {
-                                                callback(tab_id.clone(), cx);
+                                                callback(tab_id.clone(), window, cx);
                                             }
                                         }
                                     }))

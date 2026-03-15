@@ -91,9 +91,9 @@ impl Render for AppWindow {
                     workspace.create_local_terminal(window, cx);
                 });
             }))
-            .on_action(cx.listener(|this, _: &CloseSelectedPanel, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
                 this.workspace.update(cx, |workspace, cx| {
-                    workspace.close_selected_panel(cx);
+                    workspace.close_selected_panel(window, cx);
                 });
             }))
             // Title bar for window management

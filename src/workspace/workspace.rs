@@ -192,7 +192,11 @@ impl Workspace {
     /// 设置初始焦点到当前活动 tab 的第一个 panel 的 terminal
     /// 需要在 window 创建完成后调用
     pub fn set_initial_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        // 使用当前活动 tab（初始启动时为第一个 tab）
+        self.focus_active_tab_panel(window, cx);
+    }
+
+    /// 将焦点设置到当前活动 tab 的第一个 panel
+    fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             if let Some(panel) = tab_info.container.get_first_panel() {
                 if let Some(handle) = panel.read(cx).terminal_focus_handle(cx) {
@@ -210,16 +214,15 @@ impl Workspace {
             // 设置tab点击事件
             tab_bar.on_tab_click({
                 let workspace = workspace.clone();
-                move |tab_id, cx| {
+                move |tab_id, window, cx| {
                     let id = tab_id.to_string();
-                    cx.defer({
-                        let workspace = workspace.clone();
-                        move |cx| {
-                            workspace.update(cx, |this, cx| {
-                                this.active_tab_id = id.clone();
-                                this.switch_to_tab(&id, cx);
-                            });
-                        }
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.active_tab_id = id.clone();
+                            this.switch_to_tab(&id, cx);
+                            // 将焦点设置到目标tab的第一个panel
+                            this.focus_active_tab_panel(window, cx);
+                        });
                     });
                 }
             });
@@ -254,15 +257,12 @@ impl Workspace {
             // 设置tab关闭事件
             tab_bar.on_tab_close({
                 let workspace = workspace.clone();
-                move |tab_id, cx| {
+                move |tab_id, window, cx| {
                     let id = tab_id.to_string();
-                    cx.defer({
-                        let workspace = workspace.clone();
-                        move |cx| {
-                            workspace.update(cx, |this, cx| {
-                                this.handle_tab_close(&id, cx);
-                            });
-                        }
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_close(&id, window, cx);
+                        });
                     });
                 }
             });
@@ -490,7 +490,7 @@ impl Workspace {
 
     /// 关闭当前选中的 panel
     /// 如果当前 Tab 下只有一个 Panel，则关闭整个 Tab
-    pub fn close_selected_panel(&mut self, cx: &mut Context<Self>) {
+    pub fn close_selected_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 获取当前活动tab
         let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
             return;
@@ -501,7 +501,7 @@ impl Workspace {
         // 如果当前 Tab 下只有一个 Panel，关闭整个 Tab
         if panel_count <= 1 {
             let active_tab_id = self.active_tab_id.clone();
-            self.handle_tab_close(&active_tab_id, cx);
+            self.handle_tab_close(&active_tab_id, window, cx);
             return;
         }
 
@@ -1008,7 +1008,12 @@ impl Workspace {
     }
 
     /// 处理关闭tab事件
-    fn handle_tab_close(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+    fn handle_tab_close(
+        &mut self,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 从tabs中移除
         self.tabs.remove(tab_id);
 
@@ -1023,6 +1028,9 @@ impl Workspace {
             if let Some(first_tab_id) = self.tabs.keys().next().cloned() {
                 self.active_tab_id = first_tab_id.clone();
                 self.switch_to_tab(&first_tab_id, cx);
+
+                // 将焦点设置到新活动tab的第一个panel
+                self.focus_active_tab_panel(window, cx);
             } else {
                 // 没有tab了，退出应用程序
                 cx.quit();
