@@ -20,6 +20,7 @@ pub struct CursorLayout {
     line_height: Pixels,
     color: gpui::Hsla,
     shape: CursorShape,
+    block_text: Option<gpui::ShapedLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,7 +32,7 @@ enum CursorShape {
 }
 
 impl CursorLayout {
-    fn paint(&self, window: &mut Window) {
+    fn paint(&self, window: &mut Window, cx: &mut gpui::App) {
         let bounds = match self.shape {
             CursorShape::Bar => Bounds {
                 origin: self.origin,
@@ -54,6 +55,18 @@ impl CursorLayout {
         };
 
         window.paint_quad(cursor_quad);
+
+        // 在块光标上绘制字符（反色显示）
+        if let Some(block_text) = &self.block_text {
+            let _ = block_text.paint(
+                self.origin,
+                self.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
     }
 }
 
@@ -463,12 +476,37 @@ impl Element for TerminalElement {
                 AlacCursorShape::Hidden => unreachable!(),
             };
 
+            // 为块光标创建文字（显示光标下的字符，使用背景色作为文字颜色以形成反色效果）
+            let block_text = if matches!(shape, CursorShape::Block) {
+                let cursor_char = self.terminal.read(cx).last_content().cursor_char;
+                if cursor_char != '\0' && cursor_char != ' ' {
+                    let char_str = cursor_char.to_string();
+                    let len = char_str.len();
+                    Some(window.text_system().shape_line(
+                        char_str.into(),
+                        font_size,
+                        &[TextRun {
+                            len,
+                            font: text_style.font(),
+                            color: rgb(0x1e1e2e).into(), // 使用深色背景色作为文字颜色
+                            ..Default::default()
+                        }],
+                        Some(cell_width),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
                 block_width: cell_width,
                 line_height,
                 color: rgb(0xcba6f7).into(),
                 shape,
+                block_text,
             })
         } else {
             None
@@ -610,7 +648,7 @@ impl Element for TerminalElement {
         // 如果cursor为None（光标形状为Hidden），则不渲染光标
         // 这实现了光标委托：当应用程序自己处理光标时，终端不渲染
         if let Some(cursor_layout) = cursor {
-            cursor_layout.paint(window);
+            cursor_layout.paint(window, cx);
         }
 
         window.handle_input(
