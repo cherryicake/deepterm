@@ -1,6 +1,5 @@
 //! Mouse input mappings for terminal
 
-use std::cmp::min;
 use std::iter::repeat;
 
 use alacritty_terminal::index::{Column as GridCol, Line as GridLine, Point as AlacPoint, Side};
@@ -178,11 +177,10 @@ pub fn grid_point_and_side(
         col = last_col;
         side = Side::Right;
     }
-    let col = min(col, last_col);
 
     // Calculate line number based on mouse position
     // The display_offset represents how many lines we've scrolled up in the scrollback buffer
-    // So we need to ADD it to get the actual line in the terminal's grid
+    // So we need to SUBTRACT it to get the actual line in the terminal's grid
     let mut line = (pos.y.as_f32() / line_height.as_f32()).floor() as i32;
     let bottommost = bounds.num_lines().saturating_sub(1) as i32;
 
@@ -195,8 +193,9 @@ pub fn grid_point_and_side(
         side = Side::Left;
     }
 
-    // Add display_offset to get the actual line in the terminal grid
-    let actual_line = line + display_offset as i32;
+    // Subtract display_offset to get the actual line in the terminal grid
+    // When scrolled up, display_offset > 0, so screen line 0 maps to grid line -display_offset
+    let actual_line = line - display_offset as i32;
 
     (AlacPoint::new(GridLine(actual_line), col), side)
 }
