@@ -864,6 +864,11 @@ impl Workspace {
             // 不在这里调用 cx.notify()，外部会统一通知
         });
 
+        // 更新 panel 的广播状态（普通 tab 不支持广播，禁用广播）
+        dragged_panel_entity.update(cx, |p, cx| {
+            p.set_broadcast_enabled(false, cx);
+        });
+
         // 订阅新panel的事件
         // 只订阅这个新panel，不需要重新订阅所有panel
         let subscription =
@@ -971,6 +976,14 @@ impl Workspace {
         let tab_id = format!("tab-{}", self.next_tab_id);
         self.next_tab_id += 1;
         self.next_panel_id += 1;
+
+        // 设置正确的 workspace_id 和广播状态
+        let workspace_id = self.workspace_id.clone();
+        let broadcast_enabled = self.get_current_broadcast_state();
+        panel.update(cx, |p, cx| {
+            p.set_workspace_id(workspace_id);
+            p.set_broadcast_enabled(broadcast_enabled, cx);
+        });
 
         self.tabs.insert(
             tab_id.clone(),

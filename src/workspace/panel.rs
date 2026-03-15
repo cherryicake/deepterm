@@ -268,6 +268,11 @@ impl Panel {
 
     /// 设置广播状态
     pub fn set_broadcast_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        // 状态未改变时跳过所有工作
+        if self.broadcast_enabled == enabled {
+            return;
+        }
+
         self.broadcast_enabled = enabled;
 
         // 根据广播状态设置或清除TerminalView的广播回调
