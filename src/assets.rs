@@ -34,6 +34,8 @@ pub enum Icon {
     Screen,
     Terminal,
     MagnifyingGlass,
+    BroadcastInput,
+    WindowClose,
 }
 
 impl Icon {
@@ -46,6 +48,8 @@ impl Icon {
             Icon::Screen => SharedString::new_static("icons/screen.svg"),
             Icon::Terminal => SharedString::new_static("icons/terminal.svg"),
             Icon::MagnifyingGlass => SharedString::new_static("icons/magnifying_glass.svg"),
+            Icon::BroadcastInput => SharedString::new_static("icons/broadcast_input.svg"),
+            Icon::WindowClose => SharedString::new_static("icons/window-close.svg"),
         }
     }
 
@@ -57,6 +61,8 @@ impl Icon {
             Icon::Screen => gpui::rgb(0xaaaaaa),
             Icon::Terminal => gpui::rgb(0xaaaaaa),
             Icon::MagnifyingGlass => gpui::rgb(0x666688),
+            Icon::BroadcastInput => gpui::rgb(0x8888aa),
+            Icon::WindowClose => gpui::rgb(0x8888aa),
         }
     }
 }

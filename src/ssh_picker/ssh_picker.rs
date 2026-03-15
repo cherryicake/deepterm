@@ -111,8 +111,8 @@ impl SshPicker {
     fn filter_items(&mut self) {
         // 检查 Local Terminal 是否匹配
         let local_terminal_text = "local terminal";
-        self.local_terminal_matches = self.query.is_empty()
-            || local_terminal_text.contains(&self.query.to_lowercase());
+        self.local_terminal_matches =
+            self.query.is_empty() || local_terminal_text.contains(&self.query.to_lowercase());
 
         // 过滤 Host 列表
         if self.query.is_empty() {
@@ -186,18 +186,15 @@ impl SshPicker {
         if let Some(&idx) = self.filtered_indices.get(host_index) {
             if let Some(config) = self.configs.get(idx) {
                 let config = config.clone();
-                workspace.update(cx, |w, cx| w.create_ssh_terminal_with_config(&config, window, cx));
+                workspace.update(cx, |w, cx| {
+                    w.create_ssh_terminal_with_config(&config, window, cx)
+                });
             }
         }
     }
 
     /// 处理键盘输入
-    fn handle_input(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_input(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // 处理特殊键
         match event.keystroke.key.as_str() {
             "down" => {
@@ -267,31 +264,28 @@ impl SshPicker {
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .bg(rgb(0x252538)) // 使用项目配色
+                .bg(rgb(0x11111b)) // 比弹窗背景更深的颜色
                 .rounded(px(8.0))
                 .child(
                     // 搜索图标 - 使用嵌入的 magnifying_glass SVG
-                    div()
-                        .w(px(16.0))
-                        .h(px(16.0))
-                        .child(
-                            svg()
-                                .size(px(16.0))
-                                .text_color(Icon::MagnifyingGlass.color())
-                                .path(Icon::MagnifyingGlass.path())
-                        ),
+                    div().w(px(16.0)).h(px(16.0)).child(
+                        svg()
+                            .size(px(16.0))
+                            .text_color(rgb(0x666688))
+                            .path(Icon::MagnifyingGlass.path()),
+                    ),
                 )
                 .child(
                     // 输入框区域
                     div().flex_1().child(if self.query.is_empty() {
                         div()
-                            .text_color(rgb(0x666688))
+                            .text_color(rgb(0x5d5d7c))
                             .text_size(px(14.0))
                             .child("Search hosts or tabs")
                             .into_any_element()
                     } else {
                         div()
-                            .text_color(rgb(0x8888aa))
+                            .text_color(rgb(0x9aa3b8)) // 终端前景色
                             .text_size(px(14.0))
                             .child(self.query.clone())
                             .into_any_element()
@@ -300,7 +294,7 @@ impl SshPicker {
                 .child(
                     // 快捷键提示
                     div()
-                        .text_color(rgb(0x666688))
+                        .text_color(rgb(0x5d5d7c))
                         .text_size(px(12.0))
                         .child("⌘K"),
                 ),
@@ -317,7 +311,7 @@ impl SshPicker {
             .gap(px(6.0))
             .child(
                 div()
-                    .text_color(rgb(0x666688))
+                    .text_color(rgb(0x5d5d7c))
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(label.to_string()),
@@ -325,15 +319,15 @@ impl SshPicker {
             .when(shortcut.is_some(), |this| {
                 this.child(
                     div()
-                        .text_color(rgb(0x5d5d7c))
+                        .text_color(rgb(0x4a4a6a))
                         .text_size(px(11.0))
                         .child(shortcut.unwrap().to_string()),
                 )
             })
     }
 
-    /// 渲染 Quick connect 项（Local Terminal）
-    fn render_quick_connect_item(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 渲染 Local connect 项（Local Terminal）
+    fn render_local_connect_item(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_selected = self.selected_index == 0;
 
         div()
@@ -345,8 +339,10 @@ impl SshPicker {
             .items_center()
             .gap(px(10.0))
             .rounded(px(8.0))
-            .when(is_selected, |this| this.bg(rgb(0x3d3d5c)))
-            .when(!is_selected, |this| this.hover(|style| style.bg(rgb(0x252538))))
+            .when(is_selected, |this| this.bg(rgb(0x313244))) // 与终端主题协调的选中色
+            .when(!is_selected, |this| {
+                this.hover(|style| style.bg(rgb(0x252538)))
+            })
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| {
                 this.selected_index = 0;
@@ -362,7 +358,7 @@ impl SshPicker {
                     .child(
                         svg()
                             .size(px(16.0))
-                            .text_color(Icon::Terminal.color())
+                            .text_color(rgb(0x9aa3b8)) // 终端前景色
                             .path(Icon::Terminal.path()),
                     ),
             )
@@ -370,7 +366,7 @@ impl SshPicker {
                 // 显示名称
                 div()
                     .flex_1()
-                    .text_color(rgb(0x8888aa))
+                    .text_color(rgb(0x9aa3b8)) // 终端前景色
                     .text_size(px(14.0))
                     .child("Local Terminal"),
             )
@@ -398,7 +394,7 @@ impl SshPicker {
             .items_center()
             .gap(px(10.0))
             .rounded(px(8.0))
-            .when(is_selected, |this| this.bg(rgb(0x3d3d5c)))
+            .when(is_selected, |this| this.bg(rgb(0x313244))) // 与终端主题协调的选中色
             .when(!is_selected, |this| {
                 this.hover(|style| style.bg(rgb(0x252538)))
             })
@@ -419,7 +415,7 @@ impl SshPicker {
                         .child(
                             svg()
                                 .size(px(16.0))
-                                .text_color(icon.color())
+                                .text_color(rgb(0x9aa3b8)) // 终端前景色
                                 .path(icon.path()),
                         )
                 },
@@ -428,7 +424,7 @@ impl SshPicker {
                 // 显示名称 - 优先使用 nickname
                 div()
                     .flex_1()
-                    .text_color(rgb(0x8888aa))
+                    .text_color(rgb(0x9aa3b8)) // 终端前景色
                     .text_size(px(14.0))
                     .child(config.display_name()),
             )
@@ -444,15 +440,15 @@ impl SshPicker {
                 div()
                     .px(px(4.0))
                     .py(px(2.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(rgb(0x11111b)) // 更深的按键背景
                     .rounded(px(4.0))
-                    .text_color(rgb(0x8888aa))
+                    .text_color(rgb(0x9aa3b8)) // 终端前景色
                     .text_size(px(11.0))
                     .child(key.to_string()),
             )
             .child(
                 div()
-                    .text_color(rgb(0x666688))
+                    .text_color(rgb(0x5d5d7c))
                     .text_size(px(11.0))
                     .child(label.to_string()),
             )
@@ -499,7 +495,7 @@ impl Render for SshPicker {
                             .w(px(520.0))
                             .flex()
                             .flex_col()
-                            .bg(rgb(0x1a1a2e)) // 使用项目配色 - sidebar 背景
+                            .bg(rgb(0x181825)) // 更深的终端 Black 色
                             .rounded(px(12.0))
                             .shadow_lg()
                             // 阻止点击事件冒泡到遮罩层
@@ -516,39 +512,35 @@ impl Render for SshPicker {
                             // 搜索栏
                             .child(self.render_search())
                             // 分隔线
-                            .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x2d2d44)))
-                            // Quick connect 区域（仅当匹配时显示）
+                            .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x313244)))
+                            // Local connect 区域（仅当匹配时显示）
                             .when(self.local_terminal_matches, |this| {
-                                this.child(Self::render_section_label("Quick connect", None))
+                                this.child(Self::render_section_label("Local connect", None))
                                     .child(
-                                        div()
-                                            .pb(px(8.0))
-                                            .child(self.render_quick_connect_item(cx)),
+                                        div().pb(px(8.0)).child(self.render_local_connect_item(cx)),
                                     )
-                                    .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x2d2d44)))
+                                    .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x313244)))
                             })
                             // Host 区域
                             .child(Self::render_section_label("Host", None))
                             // 服务器列表
-                            .child(
-                                div()
-                                    .pb(px(8.0))
-                                    .children(self.filtered_indices.iter().enumerate().map(
-                                        |(item_index, &config_index)| {
-                                            self.render_list_item(item_index, config_index, cx)
-                                                .into_any_element()
-                                        },
-                                    )),
-                            )
+                            .child(div().pb(px(8.0)).children(
+                                self.filtered_indices.iter().enumerate().map(
+                                    |(item_index, &config_index)| {
+                                        self.render_list_item(item_index, config_index, cx)
+                                            .into_any_element()
+                                    },
+                                ),
+                            ))
                             // 空列表提示（当 Quick connect 和 Host 都为空时）
                             .when(
                                 !self.local_terminal_matches && self.filtered_indices.is_empty(),
                                 |this| {
-                                    this.child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x2d2d44)))
+                                    this.child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x313244)))
                                         .child(
                                             div().px(px(16.0)).py(px(12.0)).child(
                                                 div()
-                                                    .text_color(rgb(0x666688))
+                                                    .text_color(rgb(0x5d5d7c))
                                                     .text_size(px(13.0))
                                                     .child("No matching results"),
                                             ),
@@ -556,12 +548,7 @@ impl Render for SshPicker {
                                 },
                             )
                             // 页脚 - 快捷键提示
-                            .child(
-                                div()
-                                    .h(px(1.0))
-                                    .mx(px(12.0))
-                                    .bg(rgb(0x2d2d44)),
-                            )
+                            .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(0x313244)))
                             .child(
                                 div()
                                     .px(px(12.0))

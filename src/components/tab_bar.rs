@@ -303,7 +303,8 @@ impl TabBar {
         const ESTIMATED_TAB_WIDTH: f32 = 180.0;
         const NEW_TAB_BUTTON_WIDTH: f32 = 40.0;
 
-        let estimated_content_width = self.tabs.len() as f32 * ESTIMATED_TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
+        let estimated_content_width =
+            self.tabs.len() as f32 * ESTIMATED_TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
         let would_overflow = estimated_content_width > self.measured_container_width;
 
         if self.last_overflow != Some(would_overflow) {
@@ -384,7 +385,8 @@ impl Render for TabBar {
                                 let container_width: f32 = bounds.size.width.into();
                                 entity.update(cx, |this, _cx| {
                                     // 只在宽度变化超过 1px 时更新
-                                    if (this.measured_container_width - container_width).abs() > 1.0 {
+                                    if (this.measured_container_width - container_width).abs() > 1.0
+                                    {
                                         this.measured_container_width = container_width;
                                     }
                                 });
@@ -566,7 +568,7 @@ impl Render for TabBar {
                             .flex()
                             .flex_shrink_0()
                             .ml_1()
-                            .mr_4()
+                            .mr_3()
                             .items_center()
                             .justify_center()
                             .rounded(px(6.0))

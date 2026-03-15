@@ -1,9 +1,10 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    Render, SharedString, Styled, Window, div, px, rgb,
+    Render, SharedString, Styled, Window, div, px, rgb, svg,
 };
 
+use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::terminal_view::terminal_view::TerminalView;
 
@@ -280,7 +281,9 @@ impl Panel {
                         // 将输入添加到全局队列，由Workspace的render方法处理
                         // 包含workspace_id以区分不同WorkSpace的广播
                         crate::workspace::workspace::Workspace::queue_broadcast_input(
-                            &workspace_id, &panel_id, data,
+                            &workspace_id,
+                            &panel_id,
+                            data,
                         );
                     }));
                 } else {
@@ -346,9 +349,7 @@ impl Panel {
     /// 获取内部 TerminalView 的 focus handle（如果有）
     pub fn terminal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
         match &self.content {
-            PanelContent::Terminal(terminal_view) => {
-                Some(terminal_view.read(cx).focus_handle(cx))
-            }
+            PanelContent::Terminal(terminal_view) => Some(terminal_view.read(cx).focus_handle(cx)),
             _ => None,
         }
     }
@@ -410,60 +411,67 @@ impl Panel {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap_2()
                     .child(
                         // 广播按钮 - 开启/关闭终端输入广播功能
                         div()
                             .id(format!("broadcast-btn-{}", panel_id))
-                            .w(px(16.0))
-                            .h(px(16.0))
+                            .w_5()
+                            .h_5()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(4.0))
-                            .when(broadcast_enabled, |this| {
-                                this.bg(rgb(0x4a9eff))
-                                    .text_color(rgb(0xffffff))
-                            })
+                            .when(broadcast_enabled, |this| this.bg(rgb(0x4a9eff)))
                             .when(!broadcast_enabled, |this| {
-                                this.text_color(rgb(0x666688))
-                                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                                this.hover(|style| style.bg(rgb(0x3d3d5c)))
                             })
                             .cursor_pointer()
-                            .text_xs()
-                            .child(if broadcast_enabled { "B" } else { "b" })
-                            .on_click(
-                                cx.listener(move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                            .child(
+                                svg()
+                                    .size(px(14.0))
+                                    .text_color(if broadcast_enabled {
+                                        rgb(0xffffff)
+                                    } else {
+                                        rgb(0x666688)
+                                    })
+                                    .path(Icon::BroadcastInput.path()),
+                            )
+                            .on_click(cx.listener(
+                                move |_this, _event: &gpui::ClickEvent, _window, cx| {
                                     cx.emit(PanelEvent::BroadcastToggle {
                                         panel_id: panel_id_for_broadcast.clone(),
                                     });
                                     cx.stop_propagation();
-                                }),
-                            ),
+                                },
+                            )),
                     )
                     .child(
                         // 关闭按钮
                         div()
-                            .w(px(16.0))
-                            .h(px(16.0))
+                            .id(format!("close-btn-{}", panel_id))
+                            .w_5()
+                            .h_5()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(4.0))
                             .hover(|style| style.bg(rgb(0x3d3d5c)))
                             .cursor_pointer()
-                            .text_color(rgb(0x666688))
-                            .text_xs()
-                            .child("×")
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(move |_this, _event, _window, cx| {
+                            .child(
+                                svg()
+                                    .size(px(14.0))
+                                    .text_color(rgb(0x666688))
+                                    .path(Icon::WindowClose.path()),
+                            )
+                            .on_click(cx.listener(
+                                move |_this, _event: &gpui::ClickEvent, _window, cx| {
                                     cx.emit(PanelEvent::Close {
                                         panel_id: panel_id_for_close.clone(),
                                     });
                                     cx.stop_propagation();
-                                }),
-                            ),
+                                },
+                            )),
                     ),
             )
     }
