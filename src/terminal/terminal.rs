@@ -244,15 +244,8 @@ impl Terminal {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
         };
 
-        // 设置终端环境变量 - 参考Zed的设置，确保终端应用能正确检测终端能力
-        // TERM=xterm-256color: 声明支持256色
-        // COLORTERM=truecolor: 声明支持真彩色
-        // TERM_PROGRAM/DEEPTERM: 标识终端程序
-        let mut env = std::collections::HashMap::new();
-        env.insert("DEEPTERM".to_string(), "true".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "deepterm".to_string());
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // 设置终端环境变量 - 使用共享函数
+        let env = crate::terminal::mappings::default_terminal_env();
 
         let pty_options = tty::Options {
             shell: Some(tty::Shell::new(default_shell, vec![])),

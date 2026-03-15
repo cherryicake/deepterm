@@ -560,39 +560,31 @@ impl Element for TerminalElement {
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
-        // Get terminal and content for selection checking
-        let (selection_cells, _content, mouse_mode) = {
-            let term = self.terminal.read(cx);
-            let content = term.last_content();
-            let mut selection_cells = Vec::new();
+        // Get terminal content once and cache it for reuse
+        let term = self.terminal.read(cx);
+        let content = term.last_content();
 
-            // Check if terminal is in mouse mode (e.g., neovim mouse mode)
-            let mouse_mode = content
-                .mode
-                .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
+        // Collect selection cells and check mouse mode
+        let mut selection_cells = Vec::new();
+        let mouse_mode = content
+            .mode
+            .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
 
-            // Only draw terminal selection if not in mouse mode
-            if !mouse_mode {
-                for cell in content.cells.iter() {
-                    if term.is_cell_selected(&cell.point) {
-                        selection_cells.push(cell.point);
-                    }
+        if !mouse_mode {
+            for cell in content.cells.iter() {
+                if term.is_cell_selected(&cell.point) {
+                    selection_cells.push(cell.point);
                 }
             }
-            (selection_cells, content, mouse_mode)
-        };
+        }
 
         // Build a map of cell positions to their visible row index
         let mut cell_to_visible_row: std::collections::HashMap<(i32, usize), usize> =
             std::collections::HashMap::new();
-        {
-            let term = self.terminal.read(cx);
-            let content = term.last_content();
-            let line_groups = content.cells.iter().chunk_by(|cell| cell.point.line);
-            for (visible_row, (line_idx, line_cells)) in line_groups.into_iter().enumerate() {
-                for cell in line_cells {
-                    cell_to_visible_row.insert((line_idx.0, cell.point.column.0), visible_row);
-                }
+        let line_groups = content.cells.iter().chunk_by(|cell| cell.point.line);
+        for (visible_row, (line_idx, line_cells)) in line_groups.into_iter().enumerate() {
+            for cell in line_cells {
+                cell_to_visible_row.insert((line_idx.0, cell.point.column.0), visible_row);
             }
         }
 
@@ -615,16 +607,23 @@ impl Element for TerminalElement {
         }
 
         // Paint cell backgrounds first (for cells with non-default background)
-        {
-            let term = self.terminal.read(cx);
-            let content = term.last_content();
+        for cell in content.cells.iter() {
+                // Handle INVERSE flag: when set, foreground becomes background
+                let is_inverse = cell
+                    .cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::INVERSE);
 
-            for cell in content.cells.iter() {
-                let bg_color = if cell.cell.bg
-                    != alacritty_terminal::vte::ansi::Color::Named(
-                        alacritty_terminal::vte::ansi::NamedColor::Background,
-                    ) {
-                    Some(convert_alacritty_color(&cell.cell.bg))
+                let bg = if is_inverse {
+                    &cell.cell.fg
+                } else {
+                    &cell.cell.bg
+                };
+
+                let bg_color = if bg != &alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Background,
+                ) {
+                    Some(convert_alacritty_color(bg))
                 } else {
                     None
                 };
@@ -643,7 +642,6 @@ impl Element for TerminalElement {
                         window.paint_quad(fill(cell_bounds, bg_color));
                     }
                 }
-            }
         }
 
         // Paint batched text runs (text will appear on top of backgrounds)

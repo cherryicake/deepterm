@@ -70,7 +70,9 @@ impl SshPtyTerminal {
 
         log::info!("SSH 命令: {} {:?}", ssh_program, ssh_args);
 
-        // 创建 PTY 选项
+        // 创建 PTY 选项 - 使用共享的环境变量设置
+        let env = crate::terminal::mappings::default_terminal_env();
+
         let pty_options = Options {
             shell: Some(alacritty_terminal::tty::Shell::new(
                 ssh_program.to_string(),
@@ -78,7 +80,7 @@ impl SshPtyTerminal {
             )),
             working_directory: None,
             hold: true,
-            env: std::collections::HashMap::new(),
+            env,
         };
 
         // 转换窗口大小
