@@ -62,7 +62,8 @@ impl TabInfo {
         workspace_index: usize,
     ) -> Self {
         let sizes = vec![1.0; children.len()];
-        let label = if workspace_index <= 1 {
+        // 第一个是"WorkSpace"，之后是"WorkSpace[1]", "WorkSpace[2]"...
+        let label = if workspace_index == 0 {
             "WorkSpace".to_string()
         } else {
             format!("WorkSpace[{}]", workspace_index)
@@ -95,6 +96,8 @@ pub struct Workspace {
     next_panel_id: usize,
     /// Local Terminal创建计数（用于生成标签名，只增不减）
     local_terminal_count: usize,
+    /// WorkSpace创建计数（用于生成标签名，只增不减）
+    workspace_index: usize,
     focus_handle: FocusHandle,
     /// Panel事件订阅
     panel_subscriptions: HashMap<String, Subscription>,
@@ -118,51 +121,27 @@ impl Workspace {
         }
     }
 
-    /// 生成WorkSpace标签名称
-    /// 根据当前WorkSpace类型的tab索引生成下一个不重复的索引
-    fn generate_workspace_label(&self) -> String {
-        // 收集所有现有WorkSpace的索引
-        let mut indices: Vec<usize> = self
-            .tabs
-            .values()
-            .filter(|tab| tab.tab_type == TabType::Workspace)
-            .filter_map(|tab| {
-                // 解析标签中的索引，如 "WorkSpace[2]" -> 2, "WorkSpace" -> 1
-                if tab.label == "WorkSpace" {
-                    Some(1)
-                } else if let Some(start) = tab.label.find('[') {
-                    if let Some(end) = tab.label.find(']') {
-                        tab.label[start + 1..end].parse().ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        indices.sort_unstable();
-
-        // 找到下一个可用的索引
-        let next_index = if indices.is_empty() {
-            1
+    /// 生成带序号的标签名称
+    /// 第一个是"Base"，之后是"Base[1]", "Base[2]"...
+    fn generate_indexed_name(base: &str, counter: &mut usize) -> String {
+        let current = *counter;
+        *counter += 1;
+        if current == 0 {
+            base.to_string()
         } else {
-            indices.last().unwrap() + 1
-        };
-
-        // 生成标签
-        if next_index == 1 {
-            "WorkSpace".to_string()
-        } else {
-            format!("WorkSpace[{}]", next_index)
+            format!("{}[{}]", base, current)
         }
+    }
+
+    /// 生成WorkSpace标签名称
+    fn generate_workspace_label(&mut self) -> String {
+        Self::generate_indexed_name("WorkSpace", &mut self.workspace_index)
     }
 
     pub fn new(cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
-        // 创建初始tab - 本地终端
+        // 创建初始tab - 本地终端（不显示编号）
         let initial_tab_items = vec![TabItem::new("tab-0", "Local Terminal")];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
@@ -195,7 +174,8 @@ impl Workspace {
                 active_tab_id: "tab-0".to_string(),
                 next_tab_id: 1,
                 next_panel_id: 1,
-                local_terminal_count: 0,
+                local_terminal_count: 1, // 初始已有一个Local Terminal，从1开始计数
+                workspace_index: 0,      // 从0开始计数
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
                 workspace_id,
@@ -207,6 +187,19 @@ impl Workspace {
 
             workspace
         })
+    }
+
+    /// 设置初始焦点到当前活动 tab 的第一个 panel 的 terminal
+    /// 需要在 window 创建完成后调用
+    pub fn set_initial_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // 使用当前活动 tab（初始启动时为第一个 tab）
+        if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
+            if let Some(panel) = tab_info.container.get_first_panel() {
+                if let Some(handle) = panel.read(cx).terminal_focus_handle(cx) {
+                    window.focus(&handle, cx);
+                }
+            }
+        }
     }
 
     /// 设置TabBar事件处理器
@@ -1010,20 +1003,8 @@ impl Workspace {
     }
 
     /// 生成终端类型的Tab名称
-    /// 第一个返回"Local Terminal"，之后返回"Local Terminal[编号]"
-    /// 编号根据local_terminal_count累加，不管之前的Tab是否关闭
     fn generate_terminal_tab_name(&mut self) -> String {
-        let base_name = "Local Terminal";
-
-        // 累加计数器
-        self.local_terminal_count += 1;
-
-        // 第一个是Local Terminal，之后是Local Terminal[1], Local Terminal[2], ...
-        if self.local_terminal_count == 1 {
-            base_name.to_string()
-        } else {
-            format!("{}[{}]", base_name, self.local_terminal_count - 1)
-        }
+        Self::generate_indexed_name("Local Terminal", &mut self.local_terminal_count)
     }
 
     /// 处理关闭tab事件

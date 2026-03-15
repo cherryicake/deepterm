@@ -60,6 +60,14 @@ impl AppWindow {
         }
     }
 
+    /// 设置初始焦点到工作区的第一个终端
+    /// 在窗口创建后通过 cx.defer_in 调用
+    fn setup_initial_focus(&self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.set_initial_focus(window, cx);
+        });
+    }
+
     /// 显示 SSH 选择器
     pub fn show_ssh_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
         self.ssh_picker.update(cx, |picker, cx| {
@@ -69,7 +77,7 @@ impl AppWindow {
 }
 
 impl Render for AppWindow {
-    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -145,7 +153,17 @@ fn main() {
                 is_movable: true,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_cx| AppWindow::new(_cx)),
+            |window, cx| {
+                let app_window = cx.new(|_cx| AppWindow::new(_cx));
+                // Schedule initial focus after the window is fully created
+                let window_handle = app_window.clone();
+                window.defer(cx, move |window, cx| {
+                    window_handle.update(cx, |app, cx| {
+                        app.setup_initial_focus(window, cx);
+                    });
+                });
+                app_window
+            },
         )
         .unwrap();
         cx.activate(true);

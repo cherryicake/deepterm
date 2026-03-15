@@ -20,7 +20,7 @@ use futures::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
     Size, Task, Window, px,
 };
 
@@ -29,6 +29,7 @@ use crate::terminal::mappings::mouse::{
     scroll_report,
 };
 use crate::ssh::{SshConnectionConfig, SshPtyTerminal};
+use crate::terminal_view::terminal_view::CTRL_V;
 
 /// 终端类型 - 区分本地和远程终端
 #[derive(Clone, Debug, PartialEq)]
@@ -1008,8 +1009,22 @@ impl Terminal {
     }
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            let text = item.text().unwrap_or_default();
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        // Check if clipboard contains an image
+        // If so, forward Ctrl+V to let the terminal application handle it
+        if clipboard.entries.iter().any(|entry| match entry {
+            ClipboardEntry::Image(image) => !image.bytes.is_empty(),
+            _ => false,
+        }) {
+            self.write(&[CTRL_V]);
+            return;
+        }
+
+        // Otherwise, paste text content
+        if let Some(text) = clipboard.text() {
             self.write(text.as_bytes());
         }
     }

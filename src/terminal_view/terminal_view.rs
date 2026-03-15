@@ -10,6 +10,9 @@ use gpui::{
     actions, div, px,
 };
 
+/// ASCII control character for Ctrl+V (SYN - Synchronous Idle)
+pub const CTRL_V: u8 = 0x16;
+
 /// IME state for tracking marked (pre-edit) text during composition
 pub struct ImeState {
     pub marked_text: String,
@@ -245,10 +248,30 @@ impl TerminalView {
     }
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            let text = item.text().unwrap_or_default();
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        // Check if clipboard contains an image
+        // If so, forward Ctrl+V to let the terminal application handle it
+        if clipboard.entries.iter().any(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => !image.bytes.is_empty(),
+            _ => false,
+        }) {
+            self.forward_ctrl_v(cx);
+            return;
+        }
+
+        // Otherwise, paste text content
+        if let Some(text) = clipboard.text() {
             self.write_with_broadcast(text.as_bytes(), cx);
         }
+    }
+
+    /// Forward Ctrl+V to the terminal as raw input
+    /// This lets TUI applications handle clipboard images themselves
+    fn forward_ctrl_v(&mut self, cx: &mut Context<Self>) {
+        self.write_with_broadcast(&[CTRL_V], cx);
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
