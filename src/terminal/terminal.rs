@@ -687,6 +687,10 @@ impl Terminal {
             AlacTermEvent::Exit | AlacTermEvent::ChildExit(_) => {
                 cx.emit(Event::CloseTerminal);
             }
+            AlacTermEvent::ClipboardStore(_, data) => {
+                // 处理 OSC 52 剪贴板存储请求
+                cx.write_to_clipboard(ClipboardItem::new_string(data));
+            }
             _ => {}
         }
     }
