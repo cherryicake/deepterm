@@ -6,7 +6,9 @@ use gpui::{
     SharedString, Window, canvas, div, px, rgb,
 };
 
+use crate::assets::Icon;
 use crate::workspace::panel::DraggedPanel;
+use gpui::svg;
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug)]
@@ -104,6 +106,7 @@ pub struct TabBar {
     on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
+    on_nexus_click: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
@@ -118,6 +121,8 @@ pub struct TabBar {
     last_overflow: Option<bool>,
     /// 测量到的容器宽度（通过 canvas 获取）
     measured_container_width: f32,
+    /// Nexus 标签是否激活
+    is_nexus_active: bool,
 }
 
 impl TabBar {
@@ -130,6 +135,7 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
+            on_nexus_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -139,6 +145,7 @@ impl TabBar {
             scroll_handle: ScrollHandle::new(),
             last_overflow: None,
             measured_container_width: 0.0,
+            is_nexus_active: false,
         })
     }
 
@@ -161,6 +168,7 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
+            on_nexus_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -170,6 +178,7 @@ impl TabBar {
             scroll_handle: ScrollHandle::new(),
             last_overflow: None,
             measured_container_width: 0.0,
+            is_nexus_active: false,
         })
     }
 
@@ -192,6 +201,13 @@ impl TabBar {
         F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_new_tab = Some(Rc::new(callback));
+    }
+
+    pub fn on_nexus_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_nexus_click = Some(Rc::new(callback));
     }
 
     pub fn on_tab_reorder<F>(&mut self, callback: F)
@@ -262,8 +278,22 @@ impl TabBar {
     }
 
     pub fn set_active_tab(&mut self, id: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.active_tab_id = Some(id.into());
-        cx.notify();
+        let new_id: SharedString = id.into();
+        let changed = self.active_tab_id.as_ref() != Some(&new_id) || self.is_nexus_active;
+        if changed {
+            self.active_tab_id = Some(new_id);
+            self.is_nexus_active = false;
+            cx.notify();
+        }
+    }
+
+    /// 设置 Nexus 标签为激活状态
+    pub fn set_nexus_active(&mut self, cx: &mut Context<Self>) {
+        if !self.is_nexus_active {
+            self.active_tab_id = None;
+            self.is_nexus_active = true;
+            cx.notify();
+        }
     }
 
     pub fn set_tabs(&mut self, tabs: Vec<TabItem>, cx: &mut Context<Self>) {
@@ -327,9 +357,11 @@ impl Render for TabBar {
         let on_tab_click = self.on_tab_click.clone();
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
+        let on_nexus_click = self.on_nexus_click.clone();
         let on_tab_reorder = self.on_tab_reorder.clone();
         let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
+        let is_nexus_active = self.is_nexus_active;
 
         // 根据溢出状态决定布局模式
         // 如果还没测量过，根据预估宽度预判；否则使用测量结果
@@ -395,6 +427,62 @@ impl Render for TabBar {
                         .absolute()
                         .size_full()
                     })
+                    // Nexus 按钮 - 固定在左侧，不参与滚动
+                    .child(
+                        div()
+                            .id("nexus-btn")
+                            .h(px(28.0))
+                            .px(px(12.0))
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(6.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .bg(if is_nexus_active {
+                                rgb(0x2d2d44)
+                            } else {
+                                rgb(0x1e1e2e)
+                            })
+                            .hover(|style| {
+                                if !is_nexus_active {
+                                    style.bg(rgb(0x252538))
+                                } else {
+                                    style
+                                }
+                            })
+                            .child(
+                                svg()
+                                    .size(px(14.0))
+                                    .text_color(if is_nexus_active {
+                                        rgb(0xffffff)
+                                    } else {
+                                        rgb(0x8888aa)
+                                    })
+                                    .path(Icon::Nexus.path()),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if is_nexus_active {
+                                        rgb(0xffffff)
+                                    } else {
+                                        rgb(0x8888aa)
+                                    })
+                                    .child("Nexus"),
+                            )
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                if let Some(ref callback) = on_nexus_click {
+                                    callback(window, cx);
+                                }
+                            }))
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            }),
+                    )
+                    // 分割线 - 在 Nexus 和 Tab 列表之间
+                    .child(div().h(px(20.0)).w(px(1.0)).bg(rgb(0x2a2a3c)).mx(px(4.0)))
                     // 标签列表容器（包含所有标签和新建按钮）
                     .child(
                         div()
@@ -575,7 +663,12 @@ impl Render for TabBar {
                             .cursor_pointer()
                             .bg(rgb(0x1e1e2e))
                             .hover(|style| style.bg(rgb(0x2d2d44)))
-                            .child(div().text_color(rgb(0x666688)).child("+"))
+                            .child(
+                                svg()
+                                    .size(px(14.0))
+                                    .text_color(rgb(0x666688))
+                                    .path(Icon::Plus.path()),
+                            )
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(move |_, _, window, cx| {

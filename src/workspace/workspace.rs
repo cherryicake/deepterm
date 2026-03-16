@@ -296,6 +296,19 @@ impl Workspace {
                     });
                 }
             });
+
+            // 设置 Nexus 点击事件
+            tab_bar.on_nexus_click({
+                let workspace = workspace.clone();
+                move |_window, cx| {
+                    let workspace = workspace.clone();
+                    cx.defer(move |cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.show_nexus_panel(cx);
+                        });
+                    });
+                }
+            });
         });
     }
 
@@ -908,6 +921,57 @@ impl Workspace {
         } else {
             eprintln!("[WORKSPACE] TabBar overflow resolved");
         }
+    }
+
+    /// Nexus Tab 的特殊 ID
+    const NEXUS_TAB_ID: &'static str = "__nexus__";
+
+    /// 显示 Nexus Panel
+    /// 当点击 Nexus 标签时调用，显示一个空白 Panel
+    fn show_nexus_panel(&mut self, cx: &mut Context<Self>) {
+        // 防止重复创建 Nexus Panel
+        if self.active_tab_id == Self::NEXUS_TAB_ID {
+            return;
+        }
+
+        // 清理已存在的 Nexus panel（如果有）
+        if let Some(_) = self.tabs.remove(Self::NEXUS_TAB_ID) {
+            self.panel_subscriptions.remove(Self::NEXUS_TAB_ID);
+        }
+
+        // 设置 Nexus 为激活状态
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.set_nexus_active(cx);
+        });
+
+        // 创建一个新的空白 Panel 用于 Nexus 视图
+        let nexus_panel = cx.new(|cx| {
+            Panel::new(
+                format!("nexus-panel-{}", self.next_panel_id),
+                self.workspace_id.clone(),
+                None,
+                cx,
+            )
+        });
+        self.next_panel_id += 1;
+
+        // 更新当前活动的容器为 Nexus Panel
+        self.active_tab_id = Self::NEXUS_TAB_ID.to_string();
+
+        // 存储 Nexus panel（使用特殊的 key）
+        self.tabs.insert(
+            Self::NEXUS_TAB_ID.to_string(),
+            TabInfo::new_normal(Self::NEXUS_TAB_ID, "Nexus", nexus_panel.clone()),
+        );
+
+        // 订阅 Nexus panel 的事件
+        let subscription = cx.subscribe(&nexus_panel, |this, _, event: &PanelEvent, cx| {
+            this.handle_panel_event(event, cx);
+        });
+        self.panel_subscriptions
+            .insert(Self::NEXUS_TAB_ID.to_string(), subscription);
+
+        cx.notify();
     }
 
     /// 切换到指定tab
