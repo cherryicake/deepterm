@@ -20,17 +20,20 @@ use futures::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
-    Size, Task, Window, px,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point, Size,
+    Task, Window, px,
 };
 
+use crate::ssh::{SshConnectionConfig, SshPtyTerminal};
 use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
 };
-use crate::ssh::{SshConnectionConfig, SshPtyTerminal};
 use crate::terminal_view::terminal_view::CTRL_V;
+
+/// 最大滚动缓冲区行数限制
+const MAX_SCROLLBACK_LINES: usize = 100000;
 
 /// 终端类型 - 区分本地和远程终端
 #[derive(Clone, Debug, PartialEq)]
@@ -266,8 +269,7 @@ impl Terminal {
         };
 
         let mut config = Config::default();
-        // 设置滚动缓冲区大小 - Zed使用100000行以获得更好的历史记录保留
-        config.scrolling_history = 100000;
+        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
         // 设置默认光标样式为Block（块光标）
         // 这是alacritty终端的默认光标形状，大多数终端模拟器都使用这种样式
         config.default_cursor_style = AlacCursorStyle {
@@ -374,7 +376,7 @@ impl Terminal {
         let default_bounds = TerminalBounds::default();
 
         let mut config = Config::default();
-        config.scrolling_history = 100000;
+        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
         config.default_cursor_style = AlacCursorStyle {
             shape: AlacCursorShape::Block,
             blinking: false,
@@ -437,7 +439,7 @@ impl Terminal {
         let default_bounds = TerminalBounds::default();
 
         let mut config = Config::default();
-        config.scrolling_history = 100000;
+        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
         config.default_cursor_style = AlacCursorStyle {
             shape: AlacCursorShape::Block,
             blinking: false,
@@ -464,7 +466,8 @@ impl Terminal {
         let default_bounds = TerminalBounds::default();
 
         // 创建 SshPtyTerminal - 使用传入的 listener，确保 EventLoop 的 Wakeup 事件能被正确处理
-        let ssh_pty = match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener) {
+        let ssh_pty = match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener)
+        {
             Ok(pty) => Arc::new(pty),
             Err(e) => {
                 eprintln!("Failed to create SSH PTY: {}", e);
@@ -545,9 +548,11 @@ impl Terminal {
     /// 获取远程连接信息（如果是远程终端）
     pub fn remote_info(&self) -> Option<(&str, &str, u16)> {
         match &self.terminal_type {
-            TerminalType::Remote { host, username, port } => {
-                Some((host.as_str(), username.as_str(), *port))
-            }
+            TerminalType::Remote {
+                host,
+                username,
+                port,
+            } => Some((host.as_str(), username.as_str(), *port)),
             _ => None,
         }
     }
