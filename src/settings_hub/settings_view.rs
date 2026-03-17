@@ -80,14 +80,37 @@ impl SettingsHubPage {
     }
 }
 
-/// SettingsHub 左侧边栏组件
-pub struct SettingsHubLeftSidebar {
+/// Left sidebar width in pixels
+pub const LEFT_SIDEBAR_WIDTH: f32 = 200.0;
+/// Right sidebar width in pixels
+pub const RIGHT_SIDEBAR_WIDTH: f32 = 300.0;
+
+/// Marker trait for sidebar width configuration
+pub trait SidebarWidth: 'static {
+    const WIDTH: f32;
+}
+
+/// Left sidebar width configuration
+pub struct LeftSidebarWidth;
+impl SidebarWidth for LeftSidebarWidth {
+    const WIDTH: f32 = LEFT_SIDEBAR_WIDTH;
+}
+
+/// Right sidebar width configuration
+pub struct RightSidebarWidth;
+impl SidebarWidth for RightSidebarWidth {
+    const WIDTH: f32 = RIGHT_SIDEBAR_WIDTH;
+}
+
+/// Generic SettingsHub sidebar component
+pub struct SettingsHubSidebar<W: SidebarWidth> {
     sections: Vec<SettingsHubSection>,
     on_item_click: Option<Box<dyn Fn(SharedString, &mut App) + Send + Sync>>,
     focus_handle: FocusHandle,
+    _width: std::marker::PhantomData<W>,
 }
 
-impl SettingsHubLeftSidebar {
+impl<W: SidebarWidth> SettingsHubSidebar<W> {
     pub fn new(cx: &mut App) -> Entity<Self> {
         Self::new_with_sections(cx, Vec::new())
     }
@@ -98,6 +121,7 @@ impl SettingsHubLeftSidebar {
             sections,
             on_item_click: None,
             focus_handle,
+            _width: std::marker::PhantomData,
         })
     }
 
@@ -123,7 +147,9 @@ impl SettingsHubLeftSidebar {
             cx.notify();
         }
     }
+}
 
+impl SettingsHubSidebar<LeftSidebarWidth> {
     pub fn get_first_item_id(&self) -> Option<String> {
         self.sections
             .first()
@@ -132,13 +158,13 @@ impl SettingsHubLeftSidebar {
     }
 }
 
-impl Focusable for SettingsHubLeftSidebar {
+impl<W: SidebarWidth> Focusable for SettingsHubSidebar<W> {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for SettingsHubLeftSidebar {
+impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Build the content using cx.children helper pattern
         let mut content = div().w_full().h_full().flex().flex_col().gap_3();
@@ -247,7 +273,7 @@ impl Render for SettingsHubLeftSidebar {
                         gpui::MouseButton::Left,
                         cx.listener({
                             let item_id = item_id.clone();
-                            move |this: &mut SettingsHubLeftSidebar, _, _, cx| {
+                            move |this: &mut Self, _, _, cx| {
                                 this.set_active_item(&item_id, cx);
                                 if let Some(ref callback) = this.on_item_click {
                                     callback(item_id.clone(), cx);
@@ -263,9 +289,15 @@ impl Render for SettingsHubLeftSidebar {
             content = content.child(section_div);
         }
 
-        Sidebar::new().with_width(200.0).render(content)
+        Sidebar::new().with_width(W::WIDTH).render(content)
     }
 }
+
+/// SettingsHub 左侧边栏组件 (type alias for backward compatibility)
+pub type SettingsHubLeftSidebar = SettingsHubSidebar<LeftSidebarWidth>;
+
+/// SettingsHub 右侧边栏组件 (type alias for backward compatibility)
+pub type SettingsHubRightSidebar = SettingsHubSidebar<RightSidebarWidth>;
 
 /// SettingsHub 中心内容区域 - 根据当前页面渲染不同内容
 pub struct SettingsHubCenter {
@@ -294,6 +326,16 @@ impl SettingsHubCenter {
                 focus_handle,
             }
         })
+    }
+
+    /// Setup the callback for the NEW HOST button in HostsView
+    pub fn setup_new_host_callback<F>(&self, cx: &mut Context<Self>, callback: F)
+    where
+        F: Fn(&mut App) + Send + Sync + Clone + 'static,
+    {
+        self.hosts_view.update(cx, |hosts_view, _cx| {
+            hosts_view.on_new_host_click(callback);
+        });
     }
 
     pub fn set_page(&mut self, page: SettingsHubPage, cx: &mut Context<Self>) {
@@ -353,10 +395,12 @@ impl Render for SettingsHubCenter {
     }
 }
 
-/// SettingsHub 主视图 - 组合左侧边栏和中心内容
+/// SettingsHub 主视图 - 组合左侧边栏、中心内容和右侧边栏
 pub struct SettingsHubView {
     left_sidebar: Entity<SettingsHubLeftSidebar>,
     center: Entity<SettingsHubCenter>,
+    right_sidebar: Entity<SettingsHubRightSidebar>,
+    right_sidebar_visible: bool,
     focus_handle: FocusHandle,
 }
 
@@ -376,6 +420,10 @@ impl SettingsHubView {
             let sections = create_default_settingshub_sections();
             let left_sidebar = SettingsHubLeftSidebar::new_with_sections(cx, sections);
 
+            // 创建右侧边栏
+            let right_sections = create_default_right_sidebar_sections();
+            let right_sidebar = SettingsHubRightSidebar::new_with_sections(cx, right_sections);
+
             // 创建中心内容，默认显示 Hosts 页面，传入 workspace
             let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace);
 
@@ -392,12 +440,29 @@ impl SettingsHubView {
                 });
             });
 
+            // 注意：回调会在创建 Entity 后设置
+
             Self {
                 left_sidebar,
                 center,
+                right_sidebar,
+                right_sidebar_visible: false,
                 focus_handle,
             }
         })
+    }
+
+    /// Setup callbacks after entity creation
+    pub fn setup_callbacks(&self, cx: &mut Context<Self>) {
+        // 设置 HostsView 的 NEW HOST 按钮回调
+        let view_entity = cx.entity();
+        self.center.update(cx, |center, cx| {
+            center.setup_new_host_callback(cx, move |app| {
+                view_entity.update(app, |view, cx| {
+                    view.toggle_right_sidebar(cx);
+                });
+            });
+        });
     }
 
     /// 获取左侧边栏实体
@@ -417,8 +482,18 @@ impl Focusable for SettingsHubView {
     }
 }
 
+impl SettingsHubView {
+    /// Toggle the right sidebar visibility
+    pub fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.right_sidebar_visible = !self.right_sidebar_visible;
+        cx.notify();
+    }
+}
+
 impl Render for SettingsHubView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let show_right_sidebar = self.right_sidebar_visible;
+
         div()
             .id("settings-hub-view")
             .size_full()
@@ -428,6 +503,7 @@ impl Render for SettingsHubView {
             .pt(px(10.0))
             .child(self.left_sidebar.clone())
             .child(div().flex_1().p(px(6.0)).child(self.center.clone()))
+            .when(show_right_sidebar, |this| this.child(self.right_sidebar.clone()))
     }
 }
 
@@ -441,5 +517,18 @@ pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
         ]),
         // 终端设置分组
         SettingsHubSection::new("terminal_setting", Some("偏好设置")).with_items(vec![]),
+    ]
+}
+
+/// 创建默认的右侧边栏数据
+pub fn create_default_right_sidebar_sections() -> Vec<SettingsHubSection> {
+    vec![
+        // 快捷操作分组
+        SettingsHubSection::new("quick_actions", Some("快捷操作")).with_items(vec![
+            SettingsHubItem::new("add_host", Icon::Plus, "添加主机"),
+            SettingsHubItem::new("import", Icon::Terminal, "导入配置"),
+        ]),
+        // 系统信息分组
+        SettingsHubSection::new("system_info", Some("系统信息")).with_items(vec![]),
     ]
 }

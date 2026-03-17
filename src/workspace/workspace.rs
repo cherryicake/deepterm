@@ -954,6 +954,11 @@ impl Workspace {
         let workspace_entity = cx.entity();
         let settings_hub_view = SettingsHubView::new_with_workspace(cx, Some(workspace_entity));
 
+        // 设置 HostsView 的回调
+        settings_hub_view.update(cx, |view, cx| {
+            view.setup_callbacks(cx);
+        });
+
         // 创建带有 SettingsHubView 的 Panel
         let hostshub_panel = cx.new(|cx| {
             Panel::with_hostshub_view(

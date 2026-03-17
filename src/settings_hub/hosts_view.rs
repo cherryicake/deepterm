@@ -1,10 +1,11 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
-    hsla, px, rgb, svg,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window,
+    div, hsla, px, rgb, svg,
 };
 
 use crate::assets::Icon;
+use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{SshGlobalConfig, AuthMethod, SshConnectionConfig};
 use crate::workspace::workspace::Workspace;
 
@@ -137,6 +138,7 @@ pub struct HostsView {
     focus_handle: FocusHandle,
     workspace: Option<Entity<Workspace>>,
     configs: Vec<SshConnectionConfig>,
+    on_new_host_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
 }
 
 impl HostsView {
@@ -154,6 +156,7 @@ impl HostsView {
                 focus_handle,
                 workspace: None,
                 configs,
+                on_new_host_click: None,
             }
         })
     }
@@ -179,6 +182,7 @@ impl HostsView {
                 focus_handle,
                 workspace,
                 configs,
+                on_new_host_click: None,
             }
         })
     }
@@ -277,7 +281,7 @@ impl HostsView {
     }
 
     /// Render action buttons (NEW HOST, TERMINAL, SERIAL)
-    fn render_action_buttons(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
             .h(px(20.0))
@@ -288,12 +292,18 @@ impl HostsView {
             .child(
                 // NEW HOST button with dropdown
                 div()
+                    .id("new-host-button")
                     .flex()
                     .items_center()
                     .rounded(px(6.0))
                     .bg(rgb(0x2d2d44))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(0x3d3d5c)))
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                        if let Some(ref callback) = this.on_new_host_click {
+                            callback(cx);
+                        }
+                    }))
                     .child(
                         div()
                             .px(px(8.0))
@@ -456,6 +466,14 @@ impl HostsView {
         }
     }
 
+    /// Set callback for when NEW HOST button is clicked
+    pub fn on_new_host_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut App) + Send + Sync + 'static,
+    {
+        self.on_new_host_click = Some(Box::new(callback));
+    }
+
     /// Render a host card
     fn render_host_card(&self, host: &Host, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let icon_color = host.icon_color.to_hsla();
@@ -557,9 +575,14 @@ impl HostsView {
     }
 
     /// Calculate the number of columns based on available width
+    /// Accounts for sidebars (left: ~200px, right: ~300px when visible)
     fn calculate_columns(&self, available_width: f32) -> u16 {
-        let padding = CONTENT_PADDING_PX * 2.0;
-        let effective_width = available_width - padding;
+        // Account for left sidebar, right sidebar, and padding
+        // Each sidebar has ~12px outer padding
+        let sidebar_padding = 24.0 + 24.0; // left + right outer paddings
+        let sidebar_width = LEFT_SIDEBAR_WIDTH + RIGHT_SIDEBAR_WIDTH + sidebar_padding;
+        let content_padding = CONTENT_PADDING_PX * 2.0;
+        let effective_width = available_width - sidebar_width - content_padding;
 
         // Calculate max possible columns
         let max_cols = ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
@@ -568,16 +591,12 @@ impl HostsView {
         max_cols.clamp(1, MAX_GRID_COLUMNS)
     }
 
-    /// Render the Hosts section with responsive grid layout
+    /// Render the Hosts section with responsive flex wrap layout
     fn render_hosts_section(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Get available width and calculate columns
-        let viewport_width = window.viewport_size().width.as_f32();
-        let cols = self.calculate_columns(viewport_width);
-
         div()
             .w_full()
             .flex()
@@ -592,17 +611,44 @@ impl HostsView {
                     .text_color(rgb(0x8888aa))
                     .child("Hosts"),
             )
-            .child(
-                // Hosts grid - responsive columns with equal card widths
+            .child(self.render_hosts_grid(window, cx))
+    }
+
+    /// Render hosts grid with responsive columns and placeholders
+    fn render_hosts_grid(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Get available width and calculate columns accounting for sidebars
+        let viewport_width = window.viewport_size().width.as_f32();
+        let cols = self.calculate_columns(viewport_width);
+
+        let host_count = self.hosts.len();
+
+        // Calculate how many placeholders needed to fill the last row
+        let remainder = host_count % (cols as usize);
+        let placeholder_count = if remainder == 0 {
+            0
+        } else {
+            (cols as usize) - remainder
+        };
+
+        div()
+            .w_full()
+            .grid()
+            .grid_cols(cols)
+            .gap(px(GRID_GAP_PX))
+            .children(self.hosts.iter().map(|host| {
+                self.render_host_card(host, window, cx).into_any_element()
+            }))
+            // Add invisible placeholders to maintain grid alignment
+            .children((0..placeholder_count).map(|_| {
                 div()
                     .w_full()
-                    .grid()
-                    .grid_cols(cols)
-                    .gap(px(GRID_GAP_PX))
-                    .children(self.hosts.iter().map(|host| {
-                        self.render_host_card(host, window, cx).into_any_element()
-                    })),
-            )
+                    .h(px(64.0))
+                    .into_any_element()
+            }))
     }
 }
 
