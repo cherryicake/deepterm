@@ -8,6 +8,12 @@ use crate::assets::Icon;
 use crate::ssh::config::{SshGlobalConfig, AuthMethod, SshConnectionConfig};
 use crate::workspace::workspace::Workspace;
 
+// Layout constants
+const GRID_GAP_PX: f32 = 12.0;
+const MIN_CARD_WIDTH_PX: f32 = 260.0;
+const CONTENT_PADDING_PX: f32 = 16.0;
+const MAX_GRID_COLUMNS: u16 = 5;
+
 /// Host connection type
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostType {
@@ -451,14 +457,13 @@ impl HostsView {
     }
 
     /// Render a host card
-    fn render_host_card(&self, host: &Host, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_host_card(&self, host: &Host, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let icon_color = host.icon_color.to_hsla();
         let host_id = host.id.to_string();
 
         div()
             .id(format!("host-{}", host.id))
             .w_full()
-            .min_w(px(200.0))
             .h(px(64.0))
             .px(px(12.0))
             .flex()
@@ -524,21 +529,12 @@ impl HostsView {
 
     /// Render the Groups section
     fn render_groups_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Clone data to avoid lifetime issues
-        let groups: Vec<HostGroup> = self.groups.clone();
-
-        // Pre-render all group cards to avoid lifetime issues
-        let group_cards: Vec<gpui::AnyElement> = groups
-            .iter()
-            .map(|group| self.render_group_card(group).into_any_element())
-            .collect();
-
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(12.0))
-            .px(px(16.0))
+            .gap(px(GRID_GAP_PX))
+            .px(px(CONTENT_PADDING_PX))
             .child(
                 // Section title
                 div()
@@ -553,32 +549,41 @@ impl HostsView {
                     .w_full()
                     .flex()
                     .flex_wrap()
-                    .gap(px(12.0))
-                    .children(group_cards),
+                    .gap(px(GRID_GAP_PX))
+                    .children(self.groups.iter().map(|group| {
+                        self.render_group_card(group).into_any_element()
+                    })),
             )
     }
 
-    /// Render the Hosts section with grid
+    /// Calculate the number of columns based on available width
+    fn calculate_columns(&self, available_width: f32) -> u16 {
+        let padding = CONTENT_PADDING_PX * 2.0;
+        let effective_width = available_width - padding;
+
+        // Calculate max possible columns
+        let max_cols = ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
+
+        // Clamp between 1 and MAX_GRID_COLUMNS
+        max_cols.clamp(1, MAX_GRID_COLUMNS)
+    }
+
+    /// Render the Hosts section with responsive grid layout
     fn render_hosts_section(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Clone data to avoid lifetime issues
-        let hosts: Vec<Host> = self.hosts.clone();
-
-        // Pre-render all host cards to avoid lifetime issues
-        let host_cards: Vec<gpui::AnyElement> = hosts
-            .iter()
-            .map(|host| self.render_host_card(host, window, cx).into_any_element())
-            .collect();
+        // Get available width and calculate columns
+        let viewport_width = window.viewport_size().width.as_f32();
+        let cols = self.calculate_columns(viewport_width);
 
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(12.0))
-            .px(px(16.0))
+            .gap(px(GRID_GAP_PX))
+            .px(px(CONTENT_PADDING_PX))
             .child(
                 // Section title
                 div()
@@ -588,13 +593,15 @@ impl HostsView {
                     .child("Hosts"),
             )
             .child(
-                // Hosts grid - 5 columns like the screenshot
+                // Hosts grid - responsive columns with equal card widths
                 div()
                     .w_full()
                     .grid()
-                    .grid_cols(5)
-                    .gap(px(12.0))
-                    .children(host_cards),
+                    .grid_cols(cols)
+                    .gap(px(GRID_GAP_PX))
+                    .children(self.hosts.iter().map(|host| {
+                        self.render_host_card(host, window, cx).into_any_element()
+                    })),
             )
     }
 }
