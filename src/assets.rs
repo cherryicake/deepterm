@@ -36,8 +36,10 @@ pub enum Icon {
     MagnifyingGlass,
     BroadcastInput,
     WindowClose,
-    Nexus,
+    SettingsHub,
     Plus,
+    Host,
+    KeyShield,
 }
 
 impl Icon {
@@ -52,8 +54,10 @@ impl Icon {
             Icon::MagnifyingGlass => SharedString::new_static("icons/magnifying_glass.svg"),
             Icon::BroadcastInput => SharedString::new_static("icons/broadcast_input.svg"),
             Icon::WindowClose => SharedString::new_static("icons/window-close.svg"),
-            Icon::Nexus => SharedString::new_static("icons/nexus.svg"),
+            Icon::SettingsHub => SharedString::new_static("icons/settingshub.svg"),
             Icon::Plus => SharedString::new_static("icons/plus.svg"),
+            Icon::Host => SharedString::new_static("icons/host.svg"),
+            Icon::KeyShield => SharedString::new_static("icons/key_shield.svg"),
         }
     }
 
@@ -67,8 +71,10 @@ impl Icon {
             Icon::MagnifyingGlass => gpui::rgb(0x666688),
             Icon::BroadcastInput => gpui::rgb(0x8888aa),
             Icon::WindowClose => gpui::rgb(0x8888aa),
-            Icon::Nexus => gpui::rgb(0x8888aa),
+            Icon::SettingsHub => gpui::rgb(0x8888aa),
             Icon::Plus => gpui::rgb(0x666688),
+            Icon::Host => gpui::rgb(0x8888aa),
+            Icon::KeyShield => gpui::rgb(0x8888aa),
         }
     }
 }

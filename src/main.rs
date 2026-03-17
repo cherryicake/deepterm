@@ -2,7 +2,7 @@
 
 pub mod assets;
 pub mod components;
-pub mod layout;
+mod settings_hub;
 pub mod ssh;
 pub mod ssh_picker;
 pub mod terminal;
@@ -11,8 +11,8 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, WindowOptions,
-    actions, div, size,
+    App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
+    WindowBackgroundAppearance, WindowOptions, actions, div, size,
 };
 
 use crate::components::title_bar::TitleBar;
@@ -127,45 +127,47 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
-        // Bind keyboard shortcuts
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-c", Copy, None),
-            KeyBinding::new("cmd-v", Paste, None),
-            KeyBinding::new("cmd-l", NewLocalTerminal, None),
-            KeyBinding::new("cmd-k", ShowSshPicker, None),
-            KeyBinding::new("cmd-w", CloseSelectedPanel, None),
-        ]);
+            // Bind keyboard shortcuts
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-c", Copy, None),
+                KeyBinding::new("cmd-v", Paste, None),
+                KeyBinding::new("cmd-l", NewLocalTerminal, None),
+                KeyBinding::new("cmd-k", ShowSshPicker, None),
+                KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+            ]);
 
-        // Register global action handlers
-        cx.on_action(|_: &Quit, cx| cx.quit());
+            // Register global action handlers
+            cx.on_action(|_: &Quit, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitleBar::title_bar_options()),
-                // macOS: 禁用原生窗口拖拽，改用 GPUI 手动实现
-                // 这样可以避免透明标题栏导致整个区域都可拖拽的问题
-                #[cfg(target_os = "macos")]
-                is_movable: false,
-                #[cfg(not(target_os = "macos"))]
-                is_movable: true,
-                ..Default::default()
-            },
-            |window, cx| {
-                let app_window = cx.new(|_cx| AppWindow::new(_cx));
-                // Schedule initial focus after the window is fully created
-                let window_handle = app_window.clone();
-                window.defer(cx, move |window, cx| {
-                    window_handle.update(cx, |app, cx| {
-                        app.setup_initial_focus(window, cx);
+            let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitleBar::title_bar_options()),
+                    // macOS: 禁用原生窗口拖拽，改用 GPUI 手动实现
+                    // 这样可以避免透明标题栏导致整个区域都可拖拽的问题
+                    #[cfg(target_os = "macos")]
+                    is_movable: false,
+                    #[cfg(not(target_os = "macos"))]
+                    is_movable: true,
+                    // 窗口背景使用毛玻璃效果
+                    window_background: WindowBackgroundAppearance::Blurred,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let app_window = cx.new(|_cx| AppWindow::new(_cx));
+                    // Schedule initial focus after the window is fully created
+                    let window_handle = app_window.clone();
+                    window.defer(cx, move |window, cx| {
+                        window_handle.update(cx, |app, cx| {
+                            app.setup_initial_focus(window, cx);
+                        });
                     });
-                });
-                app_window
-            },
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+                    app_window
+                },
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }

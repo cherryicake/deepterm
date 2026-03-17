@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription, Window,
-    div, px, rgb,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
+    Window, div, px, rgb,
 };
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
@@ -14,11 +14,12 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
-use crate::ssh::SshConnectionConfig;
-use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 use crate::GlobalSshPicker;
+use crate::settings_hub::settings_menu::{SettingsHubSidebar, create_default_settingshub_sections};
+use crate::components::tab_bar::{DraggedTab, TabBar, TabItem, SETTINGS_HUB_TAB_ID};
+use crate::ssh::SshConnectionConfig;
+use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
+use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 /// Tab类型
 #[derive(Clone, Debug, PartialEq)]
@@ -297,14 +298,14 @@ impl Workspace {
                 }
             });
 
-            // 设置 Nexus 点击事件
-            tab_bar.on_nexus_click({
+            // 设置 SettingsHub 点击事件
+            tab_bar.on_settingshub_click({
                 let workspace = workspace.clone();
                 move |_window, cx| {
                     let workspace = workspace.clone();
                     cx.defer(move |cx| {
                         workspace.update(cx, |this, cx| {
-                            this.show_nexus_panel(cx);
+                            this.show_settingshub_panel(cx);
                         });
                     });
                 }
@@ -393,7 +394,11 @@ impl Workspace {
             for panel in panels {
                 let panel_id = panel.read(cx).panel_id().to_string();
                 panel.update(cx, |p, cx| {
-                    log::info!("Setting panel {} broadcast_enabled to {}", panel_id, new_state);
+                    log::info!(
+                        "Setting panel {} broadcast_enabled to {}",
+                        panel_id,
+                        new_state
+                    );
                     p.set_broadcast_enabled(new_state, cx);
                 });
             }
@@ -403,7 +408,12 @@ impl Workspace {
     }
 
     /// 处理终端输入广播 - 将输入发送给当前Workspace中的所有其他终端
-    fn handle_broadcast_input(&mut self, source_panel_id: &str, data: &[u8], cx: &mut Context<Self>) {
+    fn handle_broadcast_input(
+        &mut self,
+        source_panel_id: &str,
+        data: &[u8],
+        cx: &mut Context<Self>,
+    ) {
         // 获取当前活动tab的广播状态
         if !self.get_current_broadcast_state() {
             return;
@@ -475,7 +485,11 @@ impl Workspace {
     /// 添加输入到广播队列（由TerminalView调用）
     pub fn queue_broadcast_input(workspace_id: &str, panel_id: &str, data: &[u8]) {
         let mut queue = get_broadcast_queue().lock().unwrap();
-        queue.push((workspace_id.to_string(), panel_id.to_string(), data.to_vec()));
+        queue.push((
+            workspace_id.to_string(),
+            panel_id.to_string(),
+            data.to_vec(),
+        ));
     }
 
     /// 处理panel选中事件 - 确保同一组只有一个panel被选中
@@ -697,8 +711,7 @@ impl Workspace {
         };
 
         // 从container中提取出被拖拽的panel（同时检查是否存在）
-        let Some(dragged_panel_entity) =
-            tab_info.container.find_panel(&dragged_panel.panel_id, cx)
+        let Some(dragged_panel_entity) = tab_info.container.find_panel(&dragged_panel.panel_id, cx)
         else {
             // 被拖拽的panel不在当前tab中，不处理
             // （未来可以扩展为支持跨Tab拖拽）
@@ -786,8 +799,7 @@ impl Workspace {
         };
 
         // 从container中提取出被拖拽的panel（同时检查是否存在）
-        let Some(dragged_panel_entity) =
-            tab_info.container.find_panel(&dragged_panel.panel_id, cx)
+        let Some(dragged_panel_entity) = tab_info.container.find_panel(&dragged_panel.panel_id, cx)
         else {
             // 被拖拽的panel不在当前tab中，不处理跨Tab拖拽
             return;
@@ -843,11 +855,8 @@ impl Workspace {
         self.next_tab_id += 1;
 
         // 创建新的tab信息，使用被拖拽panel的标签名
-        let new_tab_info = TabInfo::new_normal(
-            &new_tab_id,
-            &panel_label,
-            dragged_panel_entity.clone(),
-        );
+        let new_tab_info =
+            TabInfo::new_normal(&new_tab_id, &panel_label, dragged_panel_entity.clone());
         self.tabs.insert(new_tab_id.clone(), new_tab_info);
 
         // 添加到TabBar的指定位置
@@ -877,12 +886,12 @@ impl Workspace {
 
         // 订阅新panel的事件
         // 只订阅这个新panel，不需要重新订阅所有panel
-        let subscription =
-            cx.subscribe(&dragged_panel_entity,
-                |this, _panel, event: &PanelEvent, cx| {
-                    this.handle_panel_event(event, cx);
-                },
-            );
+        let subscription = cx.subscribe(
+            &dragged_panel_entity,
+            |this, _panel, event: &PanelEvent, cx| {
+                this.handle_panel_event(event, cx);
+            },
+        );
         self.panel_subscriptions
             .insert(dragged_panel.panel_id.clone(), subscription);
 
@@ -923,53 +932,55 @@ impl Workspace {
         }
     }
 
-    /// Nexus Tab 的特殊 ID
-    const NEXUS_TAB_ID: &'static str = "__nexus__";
-
-    /// 显示 Nexus Panel
-    /// 当点击 Nexus 标签时调用，显示一个空白 Panel
-    fn show_nexus_panel(&mut self, cx: &mut Context<Self>) {
-        // 防止重复创建 Nexus Panel
-        if self.active_tab_id == Self::NEXUS_TAB_ID {
+    /// 显示 SettingsHub Panel
+    /// 当点击 SettingsHub 标签时调用，显示带有侧边栏的 SettingsHub Panel
+    fn show_settingshub_panel(&mut self, cx: &mut Context<Self>) {
+        // 防止重复创建 SettingsHub Panel
+        if self.active_tab_id == SETTINGS_HUB_TAB_ID {
             return;
         }
 
-        // 清理已存在的 Nexus panel（如果有）
-        if let Some(_) = self.tabs.remove(Self::NEXUS_TAB_ID) {
-            self.panel_subscriptions.remove(Self::NEXUS_TAB_ID);
+        // 清理已存在的 SettingsHub panel（如果有）
+        if self.tabs.remove(SETTINGS_HUB_TAB_ID).is_some() {
+            self.panel_subscriptions.remove(SETTINGS_HUB_TAB_ID);
         }
 
-        // 设置 Nexus 为激活状态
+        // 设置 SettingsHub 为激活状态
         self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.set_nexus_active(cx);
+            tab_bar.set_settingshub_active(cx);
         });
 
-        // 创建一个新的空白 Panel 用于 Nexus 视图
-        let nexus_panel = cx.new(|cx| {
-            Panel::new(
-                format!("nexus-panel-{}", self.next_panel_id),
+        // 创建 SettingsHub 侧边栏
+        let sidebar_sections = create_default_settingshub_sections();
+        let hosthub_sidebar = SettingsHubSidebar::new_with_sections(cx, sidebar_sections);
+
+        // 创建带有 SettingsHub 侧边栏的 Panel
+        let hosthub_panel = cx.new(|cx| {
+            Panel::with_settingshub(
+                format!("hosthub-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
-                None,
+                Some(SETTINGS_HUB_TAB_ID.into()),
+                hosthub_sidebar,
                 cx,
             )
         });
         self.next_panel_id += 1;
 
-        // 更新当前活动的容器为 Nexus Panel
-        self.active_tab_id = Self::NEXUS_TAB_ID.to_string();
+        // 更新当前活动的容器为 SettingsHub Panel
+        self.active_tab_id = SETTINGS_HUB_TAB_ID.to_string();
 
-        // 存储 Nexus panel（使用特殊的 key）
+        // 存储 SettingsHub panel（使用特殊的 key）
         self.tabs.insert(
-            Self::NEXUS_TAB_ID.to_string(),
-            TabInfo::new_normal(Self::NEXUS_TAB_ID, "Nexus", nexus_panel.clone()),
+            SETTINGS_HUB_TAB_ID.to_string(),
+            TabInfo::new_normal(SETTINGS_HUB_TAB_ID, "SettingsHub", hosthub_panel.clone()),
         );
 
-        // 订阅 Nexus panel 的事件
-        let subscription = cx.subscribe(&nexus_panel, |this, _, event: &PanelEvent, cx| {
+        // 订阅 SettingsHub panel 的事件
+        let subscription = cx.subscribe(&hosthub_panel, |this, _, event: &PanelEvent, cx| {
             this.handle_panel_event(event, cx);
         });
         self.panel_subscriptions
-            .insert(Self::NEXUS_TAB_ID.to_string(), subscription);
+            .insert(SETTINGS_HUB_TAB_ID.to_string(), subscription);
 
         cx.notify();
     }
@@ -1047,8 +1058,9 @@ impl Workspace {
             TabInfo::new_normal(&tab_id, &label, panel.clone()),
         );
 
-        self.tab_bar
-            .update(cx, |tab_bar, cx| tab_bar.add_tab(TabItem::new(&tab_id, &label), cx));
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(TabItem::new(&tab_id, &label), cx)
+        });
 
         let subscription = cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
             this.handle_panel_event(event, cx);
@@ -1072,12 +1084,7 @@ impl Workspace {
     }
 
     /// 处理关闭tab事件
-    fn handle_tab_close(
-        &mut self,
-        tab_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // 从tabs中移除
         self.tabs.remove(tab_id);
 
@@ -1121,7 +1128,7 @@ impl Workspace {
                 div()
                     .size_full()
                     .flex()
-                    .gap(px(4.0))
+                    .gap(px(6.0))
                     .when(is_horizontal, |this| this.flex_row())
                     .when(!is_horizontal, |this| this.flex_col())
                     .children(children.iter().enumerate().map(|(i, child)| {
@@ -1173,9 +1180,9 @@ impl Render for Workspace {
             .child(
                 div()
                     .flex_1()
-                    .pl(px(4.0))
-                    .pr(px(4.0))
-                    .pb(px(4.0))
+                    .pl(px(6.0))
+                    .pr(px(6.0))
+                    .pb(px(6.0))
                     .when_some(active_container, |this, container| {
                         this.child(self.render_split_container(container, cx))
                     }),

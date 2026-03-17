@@ -10,6 +10,9 @@ use crate::assets::Icon;
 use crate::workspace::panel::DraggedPanel;
 use gpui::svg;
 
+/// 特殊标签页ID常量
+pub const SETTINGS_HUB_TAB_ID: &str = "__settingshub__";
+
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug)]
 pub struct DraggedTab {
@@ -106,7 +109,7 @@ pub struct TabBar {
     on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
-    on_nexus_click: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
+    on_settingshub_click: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
@@ -121,8 +124,6 @@ pub struct TabBar {
     last_overflow: Option<bool>,
     /// 测量到的容器宽度（通过 canvas 获取）
     measured_container_width: f32,
-    /// Nexus 标签是否激活
-    is_nexus_active: bool,
 }
 
 impl TabBar {
@@ -135,7 +136,7 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
-            on_nexus_click: None,
+            on_settingshub_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -145,7 +146,6 @@ impl TabBar {
             scroll_handle: ScrollHandle::new(),
             last_overflow: None,
             measured_container_width: 0.0,
-            is_nexus_active: false,
         })
     }
 
@@ -168,7 +168,7 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
-            on_nexus_click: None,
+            on_settingshub_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -178,7 +178,6 @@ impl TabBar {
             scroll_handle: ScrollHandle::new(),
             last_overflow: None,
             measured_container_width: 0.0,
-            is_nexus_active: false,
         })
     }
 
@@ -203,11 +202,11 @@ impl TabBar {
         self.on_new_tab = Some(Rc::new(callback));
     }
 
-    pub fn on_nexus_click<F>(&mut self, callback: F)
+    pub fn on_settingshub_click<F>(&mut self, callback: F)
     where
         F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
     {
-        self.on_nexus_click = Some(Rc::new(callback));
+        self.on_settingshub_click = Some(Rc::new(callback));
     }
 
     pub fn on_tab_reorder<F>(&mut self, callback: F)
@@ -279,19 +278,18 @@ impl TabBar {
 
     pub fn set_active_tab(&mut self, id: impl Into<SharedString>, cx: &mut Context<Self>) {
         let new_id: SharedString = id.into();
-        let changed = self.active_tab_id.as_ref() != Some(&new_id) || self.is_nexus_active;
+        let changed = self.active_tab_id.as_ref() != Some(&new_id);
         if changed {
             self.active_tab_id = Some(new_id);
-            self.is_nexus_active = false;
             cx.notify();
         }
     }
 
-    /// 设置 Nexus 标签为激活状态
-    pub fn set_nexus_active(&mut self, cx: &mut Context<Self>) {
-        if !self.is_nexus_active {
-            self.active_tab_id = None;
-            self.is_nexus_active = true;
+    /// 设置 SettingsHub 标签为激活状态
+    pub fn set_settingshub_active(&mut self, cx: &mut Context<Self>) {
+        let settings_id = SharedString::from(SETTINGS_HUB_TAB_ID);
+        if self.active_tab_id.as_ref() != Some(&settings_id) {
+            self.active_tab_id = Some(settings_id);
             cx.notify();
         }
     }
@@ -357,11 +355,11 @@ impl Render for TabBar {
         let on_tab_click = self.on_tab_click.clone();
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
-        let on_nexus_click = self.on_nexus_click.clone();
+        let on_settingshub_click = self.on_settingshub_click.clone();
         let on_tab_reorder = self.on_tab_reorder.clone();
         let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
-        let is_nexus_active = self.is_nexus_active;
+        let is_settingshub_active = self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(SETTINGS_HUB_TAB_ID);
 
         // 根据溢出状态决定布局模式
         // 如果还没测量过，根据预估宽度预判；否则使用测量结果
@@ -427,10 +425,10 @@ impl Render for TabBar {
                         .absolute()
                         .size_full()
                     })
-                    // Nexus 按钮 - 固定在左侧，不参与滚动
+                    // SettingsHub 按钮 - 固定在左侧，不参与滚动
                     .child(
                         div()
-                            .id("nexus-btn")
+                            .id("hostshub-btn")
                             .h(px(28.0))
                             .px(px(12.0))
                             .flex()
@@ -440,13 +438,13 @@ impl Render for TabBar {
                             .gap(px(6.0))
                             .rounded(px(6.0))
                             .cursor_pointer()
-                            .bg(if is_nexus_active {
+                            .bg(if is_settingshub_active {
                                 rgb(0x2d2d44)
                             } else {
                                 rgb(0x1e1e2e)
                             })
                             .hover(|style| {
-                                if !is_nexus_active {
+                                if !is_settingshub_active {
                                     style.bg(rgb(0x252538))
                                 } else {
                                     style
@@ -455,25 +453,25 @@ impl Render for TabBar {
                             .child(
                                 svg()
                                     .size(px(14.0))
-                                    .text_color(if is_nexus_active {
+                                    .text_color(if is_settingshub_active {
                                         rgb(0xffffff)
                                     } else {
                                         rgb(0x8888aa)
                                     })
-                                    .path(Icon::Nexus.path()),
+                                    .path(Icon::SettingsHub.path()),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(if is_nexus_active {
+                                    .text_color(if is_settingshub_active {
                                         rgb(0xffffff)
                                     } else {
                                         rgb(0x8888aa)
                                     })
-                                    .child("Nexus"),
+                                    .child("HostsHub"),
                             )
                             .on_click(cx.listener(move |_, _, window, cx| {
-                                if let Some(ref callback) = on_nexus_click {
+                                if let Some(ref callback) = on_settingshub_click {
                                     callback(window, cx);
                                 }
                             }))
@@ -481,7 +479,7 @@ impl Render for TabBar {
                                 cx.stop_propagation();
                             }),
                     )
-                    // 分割线 - 在 Nexus 和 Tab 列表之间
+                    // 分割线 - 在 SettingsHub 和 Tab 列表之间
                     .child(div().h(px(20.0)).w(px(1.0)).bg(rgb(0x2a2a3c)).mx(px(4.0)))
                     // 标签列表容器（包含所有标签和新建按钮）
                     .child(

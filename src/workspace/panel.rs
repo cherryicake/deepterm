@@ -5,7 +5,9 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::sidebar::Sidebar;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
+use crate::settings_hub::settings_menu::SettingsHubSidebar;
 use crate::terminal_view::terminal_view::TerminalView;
 
 // Re-export for convenience
@@ -72,6 +74,8 @@ pub enum PanelContent {
     Text(String),
     /// Terminal panel
     Terminal(Entity<TerminalView>),
+    /// SettingsHub sidebar panel
+    SettingsHubSidebar(Entity<SettingsHubSidebar>),
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -200,6 +204,28 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            broadcast_enabled: false,
+        }
+    }
+
+    /// Creates a new panel with a SettingsHub Panel.
+    pub fn with_settingshub(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        settingshub_sidebar: Entity<SettingsHubSidebar>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label: Some("SettingsHub".into()),
+            is_solo: false,
+            is_selected: false,
+            content: PanelContent::SettingsHubSidebar(settingshub_sidebar),
             broadcast_enabled: false,
         }
     }
@@ -493,6 +519,16 @@ impl Panel {
                 )
             }
             PanelContent::Terminal(terminal_view) => div().flex_1().child(terminal_view.clone()),
+            PanelContent::SettingsHubSidebar(settingshub_sidebar) => {
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .p(px(6.0))
+                    .child(settingshub_sidebar.clone())
+                    // 右侧填充区域（可放置其他内容）
+                    .child(div().flex_1())
+            }
         }
     }
 
@@ -502,7 +538,7 @@ impl Panel {
             div()
                 .absolute()
                 .bg(rgb(0x6c5ce7))
-                .rounded(px(8.0))
+                .rounded(px(10.0))
                 .map(|div| match preview {
                     PanelPlacement::Left => div
                         .left_0()
@@ -669,8 +705,11 @@ impl Render for Panel {
         div()
             .id(format!("panel-{}", self.panel_id))
             .size_full()
-            // 所有Panel使用一致的背景色
-            .bg(rgb(0x0f0f1a))
+            // SettingsHub Panel 使用透明背景以显示毛玻璃效果
+            .when(
+                !matches!(self.content, PanelContent::SettingsHubSidebar(_)),
+                |this| this.bg(rgb(0x0f0f1a)),
+            )
             .when(!is_solo, |this| {
                 // 选中时边框颜色加深，未选中时使用浅色边框
                 let border_color = if is_selected {
@@ -678,9 +717,12 @@ impl Render for Panel {
                 } else {
                     rgb(0x2d2d44) // 深色边框（未选中状态）
                 };
-                this.border_1().border_color(border_color)
+                this.border_1()
+                    .border_color(border_color)
+                    // 阴影 - 复用 Sidebar 的默认阴影配置
+                    .shadow(Sidebar::default_box_shadow())
             })
-            .rounded(px(8.0))
+            .rounded(px(12.0))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -725,7 +767,7 @@ impl Render for Panel {
                 }),
             )
             // 添加一个通用的on_drop来捕获任何类型的拖拽
-            .on_drop(cx.listener(move |this, _dragged: &(), _window, _cx| {
+            .on_drop(cx.listener(move |_this, _dragged: &(), _window, _cx| {
                 // Generic drop handler
             }))
     }
