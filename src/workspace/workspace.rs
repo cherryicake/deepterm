@@ -951,7 +951,8 @@ impl Workspace {
         });
 
         // 创建完整的 SettingsHubView（包含左侧边栏和中心内容）
-        let settings_hub_view = SettingsHubView::new(cx);
+        let workspace_entity = cx.entity();
+        let settings_hub_view = SettingsHubView::new_with_workspace(cx, Some(workspace_entity));
 
         // 创建带有 SettingsHubView 的 Panel
         let hostshub_panel = cx.new(|cx| {

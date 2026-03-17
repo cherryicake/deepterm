@@ -7,6 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
 use crate::settings_hub::hosts_view::HostsView;
+use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
 #[derive(Clone)]
@@ -275,22 +276,17 @@ pub struct SettingsHubCenter {
 
 impl SettingsHubCenter {
     pub fn new(cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| {
-            let focus_handle = cx.focus_handle();
-            let hosts_view = HostsView::new(cx);
-
-            Self {
-                current_page: SettingsHubPage::Hosts,
-                hosts_view,
-                focus_handle,
-            }
-        })
+        Self::with_page(cx, SettingsHubPage::Hosts, None)
     }
 
-    pub fn with_page(cx: &mut App, page: SettingsHubPage) -> Entity<Self> {
+    pub fn with_page(
+        cx: &mut App,
+        page: SettingsHubPage,
+        workspace: Option<Entity<Workspace>>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-            let hosts_view = HostsView::new(cx);
+            let hosts_view = HostsView::new_with_workspace(cx, workspace);
 
             Self {
                 current_page: page,
@@ -366,6 +362,13 @@ pub struct SettingsHubView {
 
 impl SettingsHubView {
     pub fn new(cx: &mut App) -> Entity<Self> {
+        Self::new_with_workspace(cx, None)
+    }
+
+    pub fn new_with_workspace(
+        cx: &mut App,
+        workspace: Option<Entity<Workspace>>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
@@ -373,8 +376,8 @@ impl SettingsHubView {
             let sections = create_default_settingshub_sections();
             let left_sidebar = SettingsHubLeftSidebar::new_with_sections(cx, sections);
 
-            // 创建中心内容，默认显示 Hosts 页面
-            let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts);
+            // 创建中心内容，默认显示 Hosts 页面，传入 workspace
+            let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace);
 
             // 设置左侧边栏点击回调
             let center_for_callback = center.clone();

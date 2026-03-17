@@ -5,6 +5,8 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::ssh::config::{SshGlobalConfig, AuthMethod, SshConnectionConfig};
+use crate::workspace::workspace::Workspace;
 
 /// Host connection type
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +129,8 @@ pub struct HostsView {
     hosts: Vec<Host>,
     groups: Vec<HostGroup>,
     focus_handle: FocusHandle,
+    workspace: Option<Entity<Workspace>>,
+    configs: Vec<SshConnectionConfig>,
 }
 
 impl HostsView {
@@ -134,103 +138,80 @@ impl HostsView {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
-            // Sample groups matching the screenshot
-            let groups = vec![
-                HostGroup::new("sn2-workers", "sn2-workers", 5)
-                    .with_icon_color(HostIconColor::Blue),
-            ];
-
-            // Sample hosts matching the screenshot
-            let hosts = vec![
-                Host::new("host1", "2.webNX-69-9950x | 5090 | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host2", "2.webNX-70-9950x | 4090 | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host3", "2.webNX-71-9950x | 5090 | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host4", "2.Webnx-76| 9950X| 5090 | 96...", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host5", "34.134.161.69", HostType::Ssh)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host6", "34.134.161.69", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host7", "34.172.25.233", HostType::Ssh)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host8", "34.31.75.139", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host9", "34.45.123.231", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host10", "34.45.123.231", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host11", "34.69.228.237", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host12", "34.87.167.138", HostType::Ssh)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host13", "34.9.147.31", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host14", "34.9.147.31", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host15", "35.226.233.134", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host16", "35.226.233.134", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host17", "173.231.14.170", HostType::Ssh)
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host18", "192.168.194.116", HostType::Ssh)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Blue),
-                Host::new("host19", "lingsi-ubuntu-server", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host20", "sn2-gateway", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host21", "sn2-miner", HostType::Telnet)
-                    .with_username("zhousong")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host22", "webNX-c01-9950x | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host23", "webNX-c02-9900x | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host24", "webNX-c03-9950x-96G | UT:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host25", "webNX-c04-9950x-96G | UT...", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host26", "webNX-c05-9700x-128G | NY:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-                Host::new("host27", "webNX-c06-9700x-128G | LA:", HostType::Ssh)
-                    .with_username("root")
-                    .with_icon_color(HostIconColor::Orange),
-            ];
+            // Try to load SSH config from file
+            let (hosts, groups, configs) = Self::load_hosts_from_config();
 
             Self {
                 search_query: SharedString::new_static(""),
                 hosts,
                 groups,
                 focus_handle,
+                workspace: None,
+                configs,
             }
         })
+    }
+
+    /// Set the workspace for terminal operations
+    pub fn with_workspace(mut self, workspace: Entity<Workspace>) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// Create a new HostsView with optional workspace
+    pub fn new_with_workspace(cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
+        cx.new(|cx| {
+            let focus_handle = cx.focus_handle();
+
+            // Try to load SSH config from file
+            let (hosts, groups, configs) = Self::load_hosts_from_config();
+
+            Self {
+                search_query: SharedString::new_static(""),
+                hosts,
+                groups,
+                focus_handle,
+                workspace,
+                configs,
+            }
+        })
+    }
+
+    /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
+    fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
+        let config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
+
+        // Convert saved connections to Host structs
+        let hosts: Vec<Host> = config
+            .saved_connections
+            .iter()
+            .map(|conn| {
+                let display_name = conn.nickname.clone().unwrap_or_else(|| conn.display_name());
+
+                // Determine icon color based on auth method
+                let icon_color = match conn.auth_method {
+                    AuthMethod::Agent => HostIconColor::Blue,
+                    AuthMethod::PrivateKey { .. } => HostIconColor::Green,
+                    AuthMethod::Password { .. } => HostIconColor::Orange,
+                    _ => HostIconColor::Orange,
+                };
+
+                Host::new(conn.id(), display_name, HostType::Ssh)
+                    .with_username(&conn.username)
+                    .with_hostname(&conn.host)
+                    .with_icon_color(icon_color)
+            })
+            .collect();
+
+        // Create a default group containing all hosts
+        let host_count = hosts.len() as u32;
+        let groups = if host_count > 0 {
+            vec![HostGroup::new("all-hosts", "All Hosts", host_count).with_icon_color(HostIconColor::Blue)]
+        } else {
+            vec![]
+        };
+
+        (hosts, groups, config.saved_connections)
     }
 
     /// Render the search bar
@@ -453,9 +434,26 @@ impl HostsView {
             )
     }
 
+    /// Connect to a host by its ID
+    fn connect_to_host(&self, host_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = match self.workspace.clone() {
+            Some(w) => w,
+            None => return,
+        };
+
+        // Find the config matching this host ID
+        if let Some(config) = self.configs.iter().find(|c| c.id() == host_id) {
+            let config = config.clone();
+            workspace.update(cx, |w, cx| {
+                w.create_ssh_terminal_with_config(&config, window, cx);
+            });
+        }
+    }
+
     /// Render a host card
-    fn render_host_card(&self, host: &Host) -> impl IntoElement {
+    fn render_host_card(&self, host: &Host, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let icon_color = host.icon_color.to_hsla();
+        let host_id = host.id.to_string();
 
         div()
             .id(format!("host-{}", host.id))
@@ -472,6 +470,16 @@ impl HostsView {
             .border_color(rgb(0x2d2d44))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(0x252538)))
+            // Double click to connect
+            .on_click(cx.listener({
+                let host_id = host_id.clone();
+                move |this, event: &gpui::ClickEvent, window, cx| {
+                    // Connect on double click
+                    if event.click_count() == 2 {
+                        this.connect_to_host(&host_id, window, cx);
+                    }
+                }
+            }))
             .child(
                 // Host icon
                 div()
@@ -551,14 +559,18 @@ impl HostsView {
     }
 
     /// Render the Hosts section with grid
-    fn render_hosts_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_hosts_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Clone data to avoid lifetime issues
         let hosts: Vec<Host> = self.hosts.clone();
 
         // Pre-render all host cards to avoid lifetime issues
         let host_cards: Vec<gpui::AnyElement> = hosts
             .iter()
-            .map(|host| self.render_host_card(host).into_any_element())
+            .map(|host| self.render_host_card(host, window, cx).into_any_element())
             .collect();
 
         div()
@@ -594,7 +606,7 @@ impl Focusable for HostsView {
 }
 
 impl Render for HostsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("hosts-view")
             .size_full()
@@ -620,7 +632,7 @@ impl Render for HostsView {
                     // Groups section
                     .child(self.render_groups_section(cx))
                     // Hosts section
-                    .child(self.render_hosts_section(cx)),
+                    .child(self.render_hosts_section(window, cx)),
             )
     }
 }
