@@ -187,6 +187,15 @@ impl HostsView {
         })
     }
 
+    /// Refresh hosts and groups from SSH config file
+    pub fn refresh_hosts(&mut self, cx: &mut Context<Self>) {
+        let (hosts, groups, configs) = Self::load_hosts_from_config();
+        self.hosts = hosts;
+        self.groups = groups;
+        self.configs = configs;
+        cx.notify();
+    }
+
     /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
     fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
         let config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);

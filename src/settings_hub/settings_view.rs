@@ -7,6 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
 use crate::settings_hub::hosts_view::HostsView;
+use crate::settings_hub::new_host_form::NewHostForm;
 use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
@@ -343,6 +344,13 @@ impl SettingsHubCenter {
         cx.notify();
     }
 
+    /// Refresh hosts list from config
+    pub fn refresh_hosts(&self, cx: &mut Context<Self>) {
+        self.hosts_view.update(cx, |hosts_view, cx| {
+            hosts_view.refresh_hosts(cx);
+        });
+    }
+
     fn render_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.current_page {
             SettingsHubPage::Hosts => div().size_full().child(self.hosts_view.clone()),
@@ -399,7 +407,7 @@ impl Render for SettingsHubCenter {
 pub struct SettingsHubView {
     left_sidebar: Entity<SettingsHubLeftSidebar>,
     center: Entity<SettingsHubCenter>,
-    right_sidebar: Entity<SettingsHubRightSidebar>,
+    new_host_form: Entity<NewHostForm>,
     right_sidebar_visible: bool,
     focus_handle: FocusHandle,
 }
@@ -420,12 +428,11 @@ impl SettingsHubView {
             let sections = create_default_settingshub_sections();
             let left_sidebar = SettingsHubLeftSidebar::new_with_sections(cx, sections);
 
-            // 创建右侧边栏
-            let right_sections = create_default_right_sidebar_sections();
-            let right_sidebar = SettingsHubRightSidebar::new_with_sections(cx, right_sections);
-
             // 创建中心内容，默认显示 Hosts 页面，传入 workspace
-            let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace);
+            let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace.clone());
+
+            // 创建新主机表单
+            let new_host_form = NewHostForm::new(cx);
 
             // 设置左侧边栏点击回调
             let center_for_callback = center.clone();
@@ -445,7 +452,7 @@ impl SettingsHubView {
             Self {
                 left_sidebar,
                 center,
-                right_sidebar,
+                new_host_form,
                 right_sidebar_visible: false,
                 focus_handle,
             }
@@ -460,6 +467,36 @@ impl SettingsHubView {
             center.setup_new_host_callback(cx, move |app| {
                 view_entity.update(app, |view, cx| {
                     view.toggle_right_sidebar(cx);
+                });
+            });
+        });
+
+        // 设置 NewHostForm 的回调
+        let view_entity_for_cancel = cx.entity();
+        let view_entity_for_save = cx.entity();
+        let center_for_refresh = self.center.clone();
+
+        self.new_host_form.update(cx, |form, _cx| {
+            // 取消回调 - 关闭侧边栏
+            form.on_cancel(move |app| {
+                view_entity_for_cancel.update(app, |view, cx| {
+                    view.right_sidebar_visible = false;
+                    cx.notify();
+                });
+            });
+
+            // 保存成功回调 - 刷新列表并关闭侧边栏
+            form.on_saved(move |app| {
+                // 刷新 HostsView 的列表
+                center_for_refresh.update(app, |center, cx| {
+                    // 重新加载 HostsView
+                    center.refresh_hosts(cx);
+                });
+
+                // 延迟关闭侧边栏
+                view_entity_for_save.update(app, |view, cx| {
+                    view.right_sidebar_visible = false;
+                    cx.notify();
                 });
             });
         });
@@ -503,7 +540,11 @@ impl Render for SettingsHubView {
             .pt(px(10.0))
             .child(self.left_sidebar.clone())
             .child(div().flex_1().p(px(6.0)).child(self.center.clone()))
-            .when(show_right_sidebar, |this| this.child(self.right_sidebar.clone()))
+            .when(show_right_sidebar, |this| {
+                this.child(Sidebar::new().with_width(RIGHT_SIDEBAR_WIDTH).render(
+                    div().w_full().h_full().child(self.new_host_form.clone()),
+                ))
+            })
     }
 }
 

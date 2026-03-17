@@ -7,8 +7,12 @@ use std::path::PathBuf;
 
 use crate::ssh::parse_ssh_target;
 
-fn generate_id(username: &str, host: &str, port: u16) -> String {
-    format!("{}@{}:{}", username, host, port)
+fn generate_id(username: &str, host: &str, port: u16, nickname: Option<&str>) -> String {
+    if let Some(nick) = nickname {
+        format!("{}@{}:{}:{}", username, host, port, nick)
+    } else {
+        format!("{}@{}:{}", username, host, port)
+    }
 }
 
 /// SSH 连接配置
@@ -37,9 +41,9 @@ pub struct SshConnectionConfig {
 }
 
 impl SshConnectionConfig {
-    /// 获取连接唯一标识符（基于用户名、主机和端口自动生成）
+    /// 获取连接唯一标识符（基于用户名、主机、端口和昵称生成）
     pub fn id(&self) -> String {
-        generate_id(&self.username, &self.host, self.port)
+        generate_id(&self.username, &self.host, self.port, self.nickname.as_deref())
     }
 }
 
@@ -333,9 +337,7 @@ impl SshGlobalConfig {
 
     /// 添加保存的连接
     pub fn add_connection(&mut self, config: SshConnectionConfig) {
-        // 如果已存在，先移除旧的
-        let id = config.id();
-        self.saved_connections.retain(|c| c.id() != id);
+        // 不再根据 ID 去重，允许相同 IP/用户名/端口的多个配置
         self.saved_connections.push(config);
     }
 
@@ -369,10 +371,32 @@ impl SshGlobalConfig {
     /// 从配置文件加载
     /// 配置文件路径: ~/.config/deepterm/ssh.json
     pub fn load() -> Option<Self> {
-        let config_path = dirs::home_dir()?.join(".config/deepterm/ssh.json");
+        let config_path = Self::config_path()?;
 
         let content = std::fs::read_to_string(&config_path).ok()?;
         serde_json::from_str(&content).ok()
+    }
+
+    /// 保存配置到文件
+    /// 配置文件路径: ~/.config/deepterm/ssh.json
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let config_path = Self::config_path()
+            .ok_or("Failed to get config path")?;
+
+        // 确保配置目录存在
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(&config_path, content)?;
+        Ok(())
+    }
+
+    /// 获取配置文件路径
+    fn config_path() -> Option<std::path::PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(home.join(".config").join("deepterm").join("ssh.json"))
     }
 }
 

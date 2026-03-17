@@ -200,6 +200,16 @@ pub fn find_default_ssh_keys() -> Vec<std::path::PathBuf> {
     keys
 }
 
+/// Get the current system username
+///
+/// Tries the `USER` environment variable first, then `USERNAME` (for Windows).
+/// Returns `None` if neither is set.
+pub fn get_current_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+}
+
 /// 解析 SSH 连接字符串
 ///
 /// 支持格式:
@@ -244,9 +254,7 @@ pub fn parse_ssh_target(target: &str) -> (String, String, u16) {
         (user, host)
     } else {
         // 没有用户名，使用当前系统用户名
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "root".to_string());
+        let user = get_current_username().unwrap_or_else(|| "root".to_string());
         (user, user_host.to_string())
     };
 

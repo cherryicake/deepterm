@@ -15,6 +15,7 @@ use gpui::{
     WindowBackgroundAppearance, WindowOptions, actions, div, size,
 };
 
+use crate::components::input::{Backspace, Delete, Left, Right, SelectAll, Home, End};
 use crate::components::title_bar::TitleBar;
 use crate::ssh_picker::ssh_picker::SshPicker;
 use crate::terminal_view::terminal_view::{Copy, Paste};
@@ -135,6 +136,14 @@ fn main() {
                 KeyBinding::new("cmd-l", NewLocalTerminal, None),
                 KeyBinding::new("cmd-k", ShowSshPicker, None),
                 KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+                // Input component key bindings
+                KeyBinding::new("backspace", Backspace, Some("Input")),
+                KeyBinding::new("delete", Delete, Some("Input")),
+                KeyBinding::new("left", Left, Some("Input")),
+                KeyBinding::new("right", Right, Some("Input")),
+                KeyBinding::new("cmd-a", SelectAll, Some("Input")),
+                KeyBinding::new("home", Home, Some("Input")),
+                KeyBinding::new("end", End, Some("Input")),
             ]);
 
             // Register global action handlers
