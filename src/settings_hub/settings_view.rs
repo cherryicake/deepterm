@@ -409,6 +409,8 @@ pub struct SettingsHubView {
     center: Entity<SettingsHubCenter>,
     new_host_form: Entity<NewHostForm>,
     right_sidebar_visible: bool,
+    /// 侧边栏是否应该被渲染（包括退出动画期间）
+    right_sidebar_rendered: bool,
     focus_handle: FocusHandle,
 }
 
@@ -454,6 +456,7 @@ impl SettingsHubView {
                 center,
                 new_host_form,
                 right_sidebar_visible: false,
+                right_sidebar_rendered: false,
                 focus_handle,
             }
         })
@@ -477,15 +480,14 @@ impl SettingsHubView {
         let center_for_refresh = self.center.clone();
 
         self.new_host_form.update(cx, |form, _cx| {
-            // 取消回调 - 关闭侧边栏
+            // 取消回调 - 关闭侧边栏（带动画）
             form.on_cancel(move |app| {
                 view_entity_for_cancel.update(app, |view, cx| {
-                    view.right_sidebar_visible = false;
-                    cx.notify();
+                    view.close_right_sidebar(cx);
                 });
             });
 
-            // 保存成功回调 - 刷新列表并关闭侧边栏
+            // 保存成功回调 - 刷新列表并关闭侧边栏（带动画）
             form.on_saved(move |app| {
                 // 刷新 HostsView 的列表
                 center_for_refresh.update(app, |center, cx| {
@@ -493,10 +495,9 @@ impl SettingsHubView {
                     center.refresh_hosts(cx);
                 });
 
-                // 延迟关闭侧边栏
+                // 关闭侧边栏（带动画）
                 view_entity_for_save.update(app, |view, cx| {
-                    view.right_sidebar_visible = false;
-                    cx.notify();
+                    view.close_right_sidebar(cx);
                 });
             });
         });
@@ -520,16 +521,44 @@ impl Focusable for SettingsHubView {
 }
 
 impl SettingsHubView {
-    /// Toggle the right sidebar visibility
+    /// Toggle the right sidebar visibility with animation
     pub fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.right_sidebar_visible = !self.right_sidebar_visible;
-        cx.notify();
+        if self.right_sidebar_visible {
+            // 关闭侧边栏：先播放退出动画，然后隐藏
+            self.right_sidebar_visible = false;
+            cx.notify();
+
+            // 延迟后停止渲染侧边栏（与退出动画时长 ANIMATION_DURATION_EXIT_MS 一致）
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let _ = this.update(cx, |view, cx| {
+                    view.right_sidebar_rendered = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            // 打开侧边栏：立即渲染并播放入场动画
+            self.right_sidebar_visible = true;
+            self.right_sidebar_rendered = true;
+            cx.notify();
+        }
+    }
+
+    /// 直接关闭侧边栏（用于取消/保存回调）
+    fn close_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.right_sidebar_visible {
+            self.toggle_right_sidebar(cx);
+        }
     }
 }
 
 impl Render for SettingsHubView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let show_right_sidebar = self.right_sidebar_visible;
+        let render_sidebar = self.right_sidebar_rendered;
 
         div()
             .id("settings-hub-view")
@@ -540,10 +569,16 @@ impl Render for SettingsHubView {
             .pt(px(10.0))
             .child(self.left_sidebar.clone())
             .child(div().flex_1().p(px(6.0)).child(self.center.clone()))
-            .when(show_right_sidebar, |this| {
-                this.child(Sidebar::new().with_width(RIGHT_SIDEBAR_WIDTH).render(
-                    div().w_full().h_full().child(self.new_host_form.clone()),
-                ))
+            .when(render_sidebar, |this| {
+                this.child(
+                    Sidebar::new()
+                        .with_width(RIGHT_SIDEBAR_WIDTH)
+                        .render_with_toggle_animation(
+                            "right-sidebar-animation",
+                            show_right_sidebar,
+                            self.new_host_form.clone(),
+                        ),
+                )
             })
     }
 }

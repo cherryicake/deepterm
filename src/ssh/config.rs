@@ -292,7 +292,7 @@ pub struct SshGlobalConfig {
     #[serde(default = "default_true")]
     pub strict_host_key_checking: bool,
     /// 默认私钥路径列表
-    #[serde(default)]
+    #[serde(default = "default_identity_files")]
     pub default_identity_files: Vec<PathBuf>,
     /// 已保存的连接配置
     pub saved_connections: Vec<SshConnectionConfig>,
@@ -308,30 +308,29 @@ fn default_true() -> bool {
     true
 }
 
+fn default_identity_files() -> Vec<PathBuf> {
+    if let Some(home_dir) = dirs::home_dir() {
+        let ssh_dir = home_dir.join(".ssh");
+        vec![
+            ssh_dir.join("id_ed25519"),
+            ssh_dir.join("id_rsa"),
+            ssh_dir.join("id_ecdsa"),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 impl SshGlobalConfig {
     /// 创建默认配置
     pub fn new() -> Self {
         Self {
             default_timeout: default_timeout(),
             strict_host_key_checking: true,
-            default_identity_files: Self::default_identity_files(),
+            default_identity_files: default_identity_files(),
             saved_connections: Vec::new(),
             known_hosts: Vec::new(),
             use_agent: true,
-        }
-    }
-
-    /// 获取默认的私钥文件路径
-    fn default_identity_files() -> Vec<PathBuf> {
-        if let Some(home_dir) = dirs::home_dir() {
-            let ssh_dir = home_dir.join(".ssh");
-            vec![
-                ssh_dir.join("id_ed25519"),
-                ssh_dir.join("id_rsa"),
-                ssh_dir.join("id_ecdsa"),
-            ]
-        } else {
-            Vec::new()
         }
     }
 
@@ -370,11 +369,34 @@ impl SshGlobalConfig {
 
     /// 从配置文件加载
     /// 配置文件路径: ~/.config/deepterm/ssh.json
+    /// 如果文件不存在，返回默认配置（不自动创建文件）
     pub fn load() -> Option<Self> {
         let config_path = Self::config_path()?;
 
-        let content = std::fs::read_to_string(&config_path).ok()?;
-        serde_json::from_str(&content).ok()
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(_) => return Some(Self::new()),
+        };
+
+        serde_json::from_str(&content).ok().or_else(|| Some(Self::new()))
+    }
+
+    /// 加载配置，如果不存在则创建默认配置文件
+    pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = Self::config_path()
+            .ok_or("Failed to get config path")?;
+
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                serde_json::from_str(&content)
+                    .map_err(|e| e.into())
+            }
+            Err(_) => {
+                let default_config = Self::new();
+                default_config.save()?;
+                Ok(default_config)
+            }
+        }
     }
 
     /// 保存配置到文件
