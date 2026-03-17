@@ -15,8 +15,8 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 }
 
 use crate::GlobalSshPicker;
-use crate::settings_hub::settings_menu::{SettingsHubSidebar, create_default_settingshub_sections};
-use crate::components::tab_bar::{DraggedTab, TabBar, TabItem, SETTINGS_HUB_TAB_ID};
+use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
@@ -305,7 +305,7 @@ impl Workspace {
                     let workspace = workspace.clone();
                     cx.defer(move |cx| {
                         workspace.update(cx, |this, cx| {
-                            this.show_settingshub_panel(cx);
+                            this.show_hostshub_panel(cx);
                         });
                     });
                 }
@@ -932,55 +932,54 @@ impl Workspace {
         }
     }
 
-    /// 显示 SettingsHub Panel
-    /// 当点击 SettingsHub 标签时调用，显示带有侧边栏的 SettingsHub Panel
-    fn show_settingshub_panel(&mut self, cx: &mut Context<Self>) {
+    /// 显示 hostshub panel
+    /// 当点击 HostsHub 标签时调用，显示SettingsHubView（包含左侧边栏和中心内容）中的Host配置内容
+    fn show_hostshub_panel(&mut self, cx: &mut Context<Self>) {
         // 防止重复创建 SettingsHub Panel
-        if self.active_tab_id == SETTINGS_HUB_TAB_ID {
+        if self.active_tab_id == HOSTS_HUB_TAB_ID {
             return;
         }
 
         // 清理已存在的 SettingsHub panel（如果有）
-        if self.tabs.remove(SETTINGS_HUB_TAB_ID).is_some() {
-            self.panel_subscriptions.remove(SETTINGS_HUB_TAB_ID);
+        if self.tabs.remove(HOSTS_HUB_TAB_ID).is_some() {
+            self.panel_subscriptions.remove(HOSTS_HUB_TAB_ID);
         }
 
-        // 设置 SettingsHub 为激活状态
+        // 设置 HostsHub 为激活状态
         self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.set_settingshub_active(cx);
+            tab_bar.set_hostshub_active(cx);
         });
 
-        // 创建 SettingsHub 侧边栏
-        let sidebar_sections = create_default_settingshub_sections();
-        let hosthub_sidebar = SettingsHubSidebar::new_with_sections(cx, sidebar_sections);
+        // 创建完整的 SettingsHubView（包含左侧边栏和中心内容）
+        let settings_hub_view = SettingsHubView::new(cx);
 
-        // 创建带有 SettingsHub 侧边栏的 Panel
-        let hosthub_panel = cx.new(|cx| {
-            Panel::with_settingshub(
+        // 创建带有 SettingsHubView 的 Panel
+        let hostshub_panel = cx.new(|cx| {
+            Panel::with_hostshub_view(
                 format!("hosthub-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
-                Some(SETTINGS_HUB_TAB_ID.into()),
-                hosthub_sidebar,
+                Some(HOSTS_HUB_TAB_ID.into()),
+                settings_hub_view,
                 cx,
             )
         });
         self.next_panel_id += 1;
 
         // 更新当前活动的容器为 SettingsHub Panel
-        self.active_tab_id = SETTINGS_HUB_TAB_ID.to_string();
+        self.active_tab_id = HOSTS_HUB_TAB_ID.to_string();
 
         // 存储 SettingsHub panel（使用特殊的 key）
         self.tabs.insert(
-            SETTINGS_HUB_TAB_ID.to_string(),
-            TabInfo::new_normal(SETTINGS_HUB_TAB_ID, "SettingsHub", hosthub_panel.clone()),
+            HOSTS_HUB_TAB_ID.to_string(),
+            TabInfo::new_normal(HOSTS_HUB_TAB_ID, "Hosts", hostshub_panel.clone()),
         );
 
         // 订阅 SettingsHub panel 的事件
-        let subscription = cx.subscribe(&hosthub_panel, |this, _, event: &PanelEvent, cx| {
+        let subscription = cx.subscribe(&hostshub_panel, |this, _, event: &PanelEvent, cx| {
             this.handle_panel_event(event, cx);
         });
         self.panel_subscriptions
-            .insert(SETTINGS_HUB_TAB_ID.to_string(), subscription);
+            .insert(HOSTS_HUB_TAB_ID.to_string(), subscription);
 
         cx.notify();
     }

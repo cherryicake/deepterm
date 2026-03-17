@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{BoxShadow, IntoElement, div, hsla, point, px};
+use gpui::{BoxShadow, IntoElement, div, hsla, point, px, rgb};
 
 /// 侧边栏容器组件 - 只负责渲染侧边栏面板本身
 /// 内部内容由调用方通过 children 传入
@@ -49,29 +49,29 @@ impl Sidebar {
         self.render(div())
     }
 
-    // 颜色定义 - 公开供外部使用
+    // 颜色定义 - 完全复刻 Hosts 卡片样式
+    /// 侧边栏背景 - 复刻 Hosts 卡片: rgb(0x1a1a2e)
     pub fn sidebar_background() -> gpui::Hsla {
-        hsla(240.0 / 360.0, 0.33, 0.08, 0.85)
+        rgb(0x1a1a2e).into()
     }
 
+    /// 侧边栏边框 - 复刻 Hosts 卡片: rgb(0x2d2d44)
     pub fn border_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.05)
+        rgb(0x2d2d44).into()
     }
 
-    pub fn shadow_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 0.0, 0.15)
+    /// 侧边栏悬停背景 - 复刻 Hosts 卡片 hover: rgb(0x252538)
+    pub fn hover_background() -> gpui::Hsla {
+        rgb(0x252538).into()
     }
 
     pub fn selected_background() -> gpui::Hsla {
-        hsla(210.0 / 360.0, 0.80, 0.55, 0.35)
+        // 选中背景 - 类似 macOS 蓝色但适配深色主题
+        hsla(211.0 / 360.0, 1.0, 0.5, 0.25)
     }
 
     pub fn selected_text_color() -> gpui::Hsla {
         hsla(0.0 / 360.0, 0.0, 1.0, 1.0)
-    }
-
-    pub fn hover_background() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.08)
     }
 
     pub fn section_title_color() -> gpui::Hsla {
@@ -92,6 +92,10 @@ impl Sidebar {
 
     pub fn badge_text_color() -> gpui::Hsla {
         hsla(0.0 / 360.0, 0.0, 1.0, 0.70)
+    }
+
+    pub fn shadow_color() -> gpui::Hsla {
+        hsla(0.0 / 360.0, 0.0, 0.0, 0.15)
     }
 
     /// 默认阴影配置 - 供外部组件复用

@@ -1,13 +1,12 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    Render, SharedString, Styled, Window, div, px, rgb, svg,
+    App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, Render, SharedString, Styled, Window, div, point, px, rgb, svg,
 };
 
 use crate::assets::Icon;
-use crate::components::sidebar::Sidebar;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
-use crate::settings_hub::settings_menu::SettingsHubSidebar;
+use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::TerminalView;
 
 // Re-export for convenience
@@ -75,7 +74,9 @@ pub enum PanelContent {
     /// Terminal panel
     Terminal(Entity<TerminalView>),
     /// SettingsHub sidebar panel
-    SettingsHubSidebar(Entity<SettingsHubSidebar>),
+    SettingsHubSidebar(Entity<SettingsHubLeftSidebar>),
+    /// SettingsHub full view (sidebar + center content)
+    SettingsHubView(Entity<SettingsHubView>),
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -208,12 +209,12 @@ impl Panel {
         }
     }
 
-    /// Creates a new panel with a SettingsHub Panel.
-    pub fn with_settingshub(
+    /// Creates a new panel with a HostsHubView (sidebar + center content).
+    pub fn with_hostshub_view(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
         active_tab_id: Option<SharedString>,
-        settingshub_sidebar: Entity<SettingsHubSidebar>,
+        settings_hub_view: Entity<SettingsHubView>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -222,10 +223,10 @@ impl Panel {
             focus_handle: cx.focus_handle(),
             drag_preview: None,
             active_tab_id,
-            active_tab_label: Some("SettingsHub".into()),
+            active_tab_label: Some("Hosts".into()),
             is_solo: false,
             is_selected: false,
-            content: PanelContent::SettingsHubSidebar(settingshub_sidebar),
+            content: PanelContent::SettingsHubView(settings_hub_view),
             broadcast_enabled: false,
         }
     }
@@ -529,6 +530,9 @@ impl Panel {
                     // 右侧填充区域（可放置其他内容）
                     .child(div().flex_1())
             }
+            PanelContent::SettingsHubView(settings_hub_view) => {
+                div().flex_1().child(settings_hub_view.clone())
+            }
         }
     }
 
@@ -719,8 +723,13 @@ impl Render for Panel {
                 };
                 this.border_1()
                     .border_color(border_color)
-                    // 阴影 - 复用 Sidebar 的默认阴影配置
-                    .shadow(Sidebar::default_box_shadow())
+                    // 阴影 - 复刻 Hosts 卡片风格
+                    .shadow(vec![BoxShadow {
+                        color: rgb(0x1a1a2e).into(),
+                        offset: point(px(2.), px(4.)),
+                        blur_radius: px(20.),
+                        spread_radius: px(-4.),
+                    }])
             })
             .rounded(px(12.0))
             .flex()

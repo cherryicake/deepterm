@@ -40,6 +40,7 @@ pub enum Icon {
     Plus,
     Host,
     KeyShield,
+    ChevronDown,
 }
 
 impl Icon {
@@ -58,6 +59,7 @@ impl Icon {
             Icon::Plus => SharedString::new_static("icons/plus.svg"),
             Icon::Host => SharedString::new_static("icons/host.svg"),
             Icon::KeyShield => SharedString::new_static("icons/key_shield.svg"),
+            Icon::ChevronDown => SharedString::new_static("icons/chevron_down.svg"),
         }
     }
 
@@ -75,6 +77,7 @@ impl Icon {
             Icon::Plus => gpui::rgb(0x666688),
             Icon::Host => gpui::rgb(0x8888aa),
             Icon::KeyShield => gpui::rgb(0x8888aa),
+            Icon::ChevronDown => gpui::rgb(0x8888aa),
         }
     }
 }

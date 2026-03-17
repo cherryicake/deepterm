@@ -1,3 +1,3 @@
 pub mod hosts_view;
-pub mod keychain;
-pub mod settings_menu;
+pub mod keychain_view;
+pub mod settings_view;

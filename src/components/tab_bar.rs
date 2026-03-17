@@ -11,7 +11,7 @@ use crate::workspace::panel::DraggedPanel;
 use gpui::svg;
 
 /// 特殊标签页ID常量
-pub const SETTINGS_HUB_TAB_ID: &str = "__settingshub__";
+pub const HOSTS_HUB_TAB_ID: &str = "__hostshub__";
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug)]
@@ -285,9 +285,9 @@ impl TabBar {
         }
     }
 
-    /// 设置 SettingsHub 标签为激活状态
-    pub fn set_settingshub_active(&mut self, cx: &mut Context<Self>) {
-        let settings_id = SharedString::from(SETTINGS_HUB_TAB_ID);
+    /// 设置 HostsHub 标签为激活状态
+    pub fn set_hostshub_active(&mut self, cx: &mut Context<Self>) {
+        let settings_id = SharedString::from(HOSTS_HUB_TAB_ID);
         if self.active_tab_id.as_ref() != Some(&settings_id) {
             self.active_tab_id = Some(settings_id);
             cx.notify();
@@ -359,7 +359,8 @@ impl Render for TabBar {
         let on_tab_reorder = self.on_tab_reorder.clone();
         let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
-        let is_settingshub_active = self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(SETTINGS_HUB_TAB_ID);
+        let is_settingshub_active =
+            self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(HOSTS_HUB_TAB_ID);
 
         // 根据溢出状态决定布局模式
         // 如果还没测量过，根据预估宽度预判；否则使用测量结果
