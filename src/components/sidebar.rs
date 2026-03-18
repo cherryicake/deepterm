@@ -137,11 +137,12 @@ impl Sidebar {
 
     /// macOS 风格的弹性缓动函数
     /// 模拟弹簧效果：快速开始，稍微超过目标，然后回弹稳定
+    /// 注意：返回值必须严格在 [0, 1] 范围内（GPUI 要求）
     fn spring_easing() -> impl Fn(f32) -> f32 {
         move |t| {
             // 简化的弹簧效果 - 轻微回弹
             // 使用 ease-out 基础上添加轻微回弹
-            if t < 0.8 {
+            let result = if t < 0.8 {
                 // 主展开阶段 - 快速加速 (0-80%)
                 let normalized = t / 0.8;
                 normalized.powi(2) * (3.0 - 2.0 * normalized)
@@ -153,7 +154,9 @@ impl Sidebar {
                 // 稳定阶段 - 回弹到 1.0 (92-100%)
                 let normalized = (t - 0.92) / 0.08;
                 1.0 + 0.015 * (1.0 - normalized) * (std::f32::consts::PI * 0.25).sin()
-            }
+            };
+            // 确保返回值严格在 [0, 1] 范围内
+            result.clamp(0.0, 1.0)
         }
     }
 
