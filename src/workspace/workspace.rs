@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
     Window, div, px, rgb,
 };
+use gpui::{KeyBinding, actions, prelude::*};
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
 /// (workspace_id, panel_id, input_data)
@@ -20,6 +20,17 @@ use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
+
+// Define workspace actions
+actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
+pub(crate) fn init(cx: &mut App) {
+    // Bind keyboard shortcuts
+    // 使用 None 作为 context，让这些快捷键全局有效
+    cx.bind_keys([
+        KeyBinding::new("cmd-l", NewLocalTerminal, None),
+        KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+    ]);
+}
 
 /// Tab类型
 #[derive(Clone, Debug, PartialEq)]
@@ -1192,5 +1203,11 @@ impl Render for Workspace {
                         this.child(self.render_split_container(container, cx))
                     }),
             )
+            .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
+                this.create_local_terminal(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
+                this.close_selected_panel(window, cx);
+            }))
     }
 }

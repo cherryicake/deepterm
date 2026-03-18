@@ -1,23 +1,50 @@
 //! Input 文本输入组件
 //!
 //! 参考 Zed GPUI 的 input 示例实现，支持光标定位和选择。
-
-use gpui::prelude::*;
+use crate::assets::Icon;
 use gpui::{
-    actions, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
-    px, rgb, rgba, CursorStyle, MouseButton, MouseDownEvent, ElementId,
-    ShapedLine, TextRun, TextAlign, Bounds, Point, size, fill, hsla, Pixels,
-    Element, GlobalElementId, LayoutId, Style, relative, PaintQuad,
-    ElementInputHandler, EntityInputHandler, UTF16Selection,
+    App, Bounds, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, LayoutId,
+    MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style,
+    TextAlign, TextRun, UTF16Selection, Window, actions, div, fill, hsla, px, relative, rgb, rgba,
+    size, svg,
 };
-use unicode_segmentation::UnicodeSegmentation;
+use gpui::{KeyBinding, prelude::*};
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
+pub(super) const CONTEXT: &str = "Input";
 // Action 定义
 actions!(
     input,
-    [Backspace, Delete, Left, Right, SelectAll, Home, End]
+    [
+        Backspace, Delete, Left, Right, SelectAll, Home, End, Copy, Cut, Paste
+    ]
 );
+pub(crate) fn init(cx: &mut App) {
+    cx.bind_keys([
+        // Input component key bindings
+        KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
+        KeyBinding::new("delete", Delete, Some(CONTEXT)),
+        KeyBinding::new("left", Left, Some(CONTEXT)),
+        KeyBinding::new("right", Right, Some(CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("home", Home, Some(CONTEXT)),
+        KeyBinding::new("end", End, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-x", Cut, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
+    ]);
+}
 
 /// 光标闪烁间隔（毫秒）
 const CURSOR_BLINK_INTERVAL: u64 = 530;
@@ -35,6 +62,8 @@ pub struct Input {
     marked_range: Option<Range<usize>>,
     /// 密码模式
     masked: bool,
+    /// 是否显示密码可见性切换按钮
+    mask_toggle: bool,
     /// 是否禁用
     disabled: bool,
     /// 回调：内容变化
@@ -49,6 +78,8 @@ pub struct Input {
     cursor_visible: bool,
     /// 是否已经开始闪烁（避免重复启动任务）
     blinking_started: bool,
+    /// 水平滚动偏移量（用于处理文本溢出）
+    scroll_offset: Pixels,
 }
 
 impl Input {
@@ -62,6 +93,7 @@ impl Input {
             selection_reversed: false,
             marked_range: None,
             masked: false,
+            mask_toggle: false,
             disabled: false,
             on_change: None,
             last_layout: None,
@@ -69,6 +101,7 @@ impl Input {
             is_selecting: false,
             cursor_visible: true,
             blinking_started: false,
+            scroll_offset: px(0.0),
         }
     }
 
@@ -141,6 +174,18 @@ impl Input {
     pub fn masked(mut self, masked: bool) -> Self {
         self.masked = masked;
         self
+    }
+
+    /// 设置是否显示密码可见性切换按钮
+    pub fn mask_toggle(mut self, toggle: bool) -> Self {
+        self.mask_toggle = toggle;
+        self
+    }
+
+    /// 设置密码掩码状态
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.masked = masked;
+        cx.notify();
     }
 
     /// 设置禁用状态
@@ -244,7 +289,9 @@ impl Input {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        // 考虑滚动偏移：鼠标位置需要加上滚动偏移量才能得到文本中的实际位置
+        let x = position.x - bounds.left() + self.scroll_offset;
+        line.closest_index_for_x(x)
     }
 
     /// UTF-16 偏移量转 UTF-8
@@ -313,6 +360,19 @@ impl Input {
         }
     }
 
+    /// 触发变更回调
+    fn notify_change(&self, cx: &mut Context<Self>) {
+        if let Some(ref callback) = self.on_change {
+            callback(&self.content, cx);
+        }
+    }
+
+    /// 完成编辑操作（重置闪烁并触发回调）
+    fn finish_edit(&mut self, cx: &mut Context<Self>) {
+        self.reset_blinking(cx);
+        self.notify_change(cx);
+    }
+
     /// 处理退格键
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled {
@@ -322,15 +382,7 @@ impl Input {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx);
         }
         self.replace_text_in_range(None, "", window, cx);
-
-        // 重置闪烁
-        self.reset_blinking(cx);
-
-        // 触发回调
-        if let Some(ref callback) = self.on_change {
-            let text = self.content.to_string();
-            callback(&text, cx);
-        }
+        self.finish_edit(cx);
     }
 
     /// 处理删除键
@@ -342,14 +394,52 @@ impl Input {
             self.select_to(self.next_boundary(self.cursor_offset()), cx);
         }
         self.replace_text_in_range(None, "", window, cx);
+        self.finish_edit(cx);
+    }
 
-        // 重置闪烁
-        self.reset_blinking(cx);
+    /// 将当前选中文本复制到剪贴板
+    fn copy_to_clipboard(&self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let selected_text = &self.content[self.selected_range.clone()];
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected_text.to_string()));
+        }
+    }
 
-        // 触发回调
-        if let Some(ref callback) = self.on_change {
-            let text = self.content.to_string();
-            callback(&text, cx);
+    /// 处理复制
+    fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+        self.copy_to_clipboard(cx);
+    }
+
+    /// 处理剪切
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled || self.selected_range.is_empty() {
+            return;
+        }
+
+        self.copy_to_clipboard(cx);
+        self.replace_text_in_range(None, "", window, cx);
+        self.finish_edit(cx);
+    }
+
+    /// 处理粘贴
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+
+        if let Some(clipboard) = cx.read_from_clipboard() {
+            if let Some(mut text) = clipboard.text() {
+                // 单行模式：移除换行符
+                text.retain(|c| c != '\n' && c != '\r');
+
+                if !text.is_empty() {
+                    self.replace_text_in_range(None, &text, window, cx);
+                    self.finish_edit(cx);
+                }
+            }
         }
     }
 
@@ -573,6 +663,8 @@ struct InputPrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// 输入框边界（应用滚动后的）
+    text_bounds: Bounds<Pixels>,
 }
 
 impl IntoElement for InputTextElement {
@@ -642,9 +734,12 @@ impl Element for InputTextElement {
                 underline: None,
                 strikethrough: None,
             };
-            let placeholder_line = window
-                .text_system()
-                .shape_line(placeholder.clone(), font_size, &[placeholder_run], None);
+            let placeholder_line = window.text_system().shape_line(
+                placeholder.clone(),
+                font_size,
+                &[placeholder_run],
+                None,
+            );
 
             if placeholder_line.width() > max_width {
                 // 需要截断，尝试找到合适的截断位置
@@ -660,9 +755,12 @@ impl Element for InputTextElement {
                         underline: None,
                         strikethrough: None,
                     };
-                    let test_line = window
-                        .text_system()
-                        .shape_line(test_text.clone().into(), font_size, &[test_run], None);
+                    let test_line = window.text_system().shape_line(
+                        test_text.clone().into(),
+                        font_size,
+                        &[test_run],
+                        None,
+                    );
                     if test_line.width() <= max_width {
                         truncated.push_str(ellipsis);
                         break;
@@ -680,7 +778,9 @@ impl Element for InputTextElement {
         let (display_text, _text_color): (SharedString, _) = if is_empty {
             (placeholder_text, hsla(0., 0., 0., 0.4))
         } else if masked {
-            ("•".repeat(content.len()).into(), style.color)
+            // Use ASCII `*` for password mask: 1 char = 1 byte
+            // This ensures cursor byte offset matches character index
+            ("*".repeat(content.len()).into(), style.color)
         } else {
             (content.clone(), style.color)
         };
@@ -726,12 +826,64 @@ impl Element for InputTextElement {
 
         let line = window
             .text_system()
-            .shape_line(display_text, font_size, &runs, None);
+            .shape_line(display_text.clone(), font_size, &runs, None);
 
         // 读取 cursor_visible 状态
         let cursor_visible = input.cursor_visible;
 
+        // 计算文本总宽度和光标位置
+        let text_width = line.width();
         let cursor_pos = line.x_for_index(cursor);
+
+        // 计算可视区域宽度（留出边距以便光标显示）
+        let visible_width = bounds.size.width - px(8.0); // 8px 边距
+
+        // 计算滚动偏移量，确保光标始终在可视区域内
+        // scroll_offset: 文本向左滚动的距离（正数表示文本向左移动）
+        let mut scroll_offset: Pixels;
+
+        if !is_empty && text_width > visible_width {
+            // 文本超出可视区域，需要滚动
+            // 计算光标相对于可视区域的右侧位置
+            let cursor_right = cursor_pos + px(2.0); // 2px 光标宽度
+
+            // 基础滚动量：让光标位置在可视区域内
+            // 我们希望：cursor_pos - scroll_offset 在 [0, visible_width] 范围内
+            if cursor_right > visible_width {
+                // 光标超出右边界，需要向左滚动（增大 scroll_offset）
+                scroll_offset = (cursor_right - visible_width + px(4.0)).max(px(0.0));
+            } else {
+                scroll_offset = px(0.0);
+            }
+
+            // 同时检查左边界
+            if cursor_pos < scroll_offset {
+                // 光标超出左边界，需要向右滚动（减小 scroll_offset）
+                scroll_offset = cursor_pos.max(px(0.0));
+            }
+
+            // 限制最大滚动量，确保不显示空白
+            let max_scroll = (text_width - visible_width).max(px(0.0));
+            scroll_offset = scroll_offset.min(max_scroll);
+        } else {
+            // 文本未超出区域，不需要滚动
+            scroll_offset = px(0.0);
+        }
+
+        // 仅在 scroll_offset 变化时更新，避免不必要的重绘
+        if input.scroll_offset != scroll_offset {
+            self.input.update(cx, |input, _cx| {
+                input.scroll_offset = scroll_offset;
+            });
+        }
+
+        // 计算应用滚动后的文本边界
+        // scroll_offset 是文本向左滚动的距离，所以文本原点是向左偏移
+        let text_bounds = Bounds::new(
+            Point::new(bounds.left() - scroll_offset, bounds.top()),
+            bounds.size,
+        );
+
         let (selection, cursor_quad) = if selected_range.is_empty() {
             (
                 None,
@@ -739,10 +891,11 @@ impl Element for InputTextElement {
                     // 计算光标高度（基于字体大小，与字符高度相近）
                     let font_size = style.font_size.to_pixels(window.rem_size());
                     let cursor_height = font_size * 1.2; // 略大于字体大小
-                    let cursor_y = bounds.top() + (bounds.bottom() - bounds.top() - cursor_height) / 2.0; // 垂直居中
+                    let cursor_y =
+                        bounds.top() + (bounds.bottom() - bounds.top() - cursor_height) / 2.0; // 垂直居中
                     Some(fill(
                         Bounds::new(
-                            Point::new(bounds.left() + cursor_pos, cursor_y),
+                            Point::new(text_bounds.left() + cursor_pos, cursor_y),
                             size(px(2.), cursor_height),
                         ),
                         rgb(0x3b82f6), // 蓝色光标
@@ -756,11 +909,11 @@ impl Element for InputTextElement {
                 Some(fill(
                     Bounds::from_corners(
                         Point::new(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            text_bounds.left() + line.x_for_index(selected_range.start),
                             bounds.top(),
                         ),
                         Point::new(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            text_bounds.left() + line.x_for_index(selected_range.end),
                             bounds.bottom(),
                         ),
                     ),
@@ -774,6 +927,7 @@ impl Element for InputTextElement {
             line: Some(line),
             cursor: cursor_quad,
             selection,
+            text_bounds,
         }
     }
 
@@ -796,29 +950,42 @@ impl Element for InputTextElement {
             cx,
         );
 
+        // 使用 text_bounds 绘制文本（应用滚动偏移）
+        let text_bounds = prepaint.text_bounds;
+
         // 绘制选择背景
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
 
-        // 绘制文本
+        // 从 prepaint 获取 line 以便后续保存
         let line = prepaint.line.take().unwrap();
-        line.paint(
-            bounds.origin,
-            window.line_height(),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .unwrap();
 
-        // 绘制光标
+        // 使用 content mask 裁剪文本，防止溢出到输入框外
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // 绘制文本（在 text_bounds 位置，即应用了滚动偏移）
+            line.paint(
+                text_bounds.origin,
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .unwrap();
+        });
+
+        // 绘制光标（在 content mask 外绘制，确保光标不会被裁剪）
         if let Some(cursor) = prepaint.cursor.take() {
-            window.paint_quad(cursor);
+            // 确保光标在可视区域内才绘制
+            let cursor_right = cursor.bounds.right();
+            let cursor_left = cursor.bounds.left();
+            if cursor_left >= bounds.left() - px(2.0) && cursor_right <= bounds.right() + px(2.0) {
+                window.paint_quad(cursor);
+            }
         }
 
-        // 保存布局信息用于鼠标点击定位
+        // 保存布局信息用于鼠标点击定位（使用原始 bounds，不包含滚动偏移）
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
@@ -843,9 +1010,10 @@ impl Render for Input {
 
         div()
             .flex()
-            .key_context("Input")
+            .key_context(CONTEXT)
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
+            // Input 内部 actions
             .on_action(cx.listener(Input::backspace))
             .on_action(cx.listener(Input::delete))
             .on_action(cx.listener(Input::left))
@@ -853,16 +1021,21 @@ impl Render for Input {
             .on_action(cx.listener(Input::select_all))
             .on_action(cx.listener(Input::home))
             .on_action(cx.listener(Input::end))
+            .on_action(cx.listener(Input::copy))
+            .on_action(cx.listener(Input::cut))
+            .on_action(cx.listener(Input::paste))
             .on_mouse_down(MouseButton::Left, cx.listener(Input::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Input::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Input::on_mouse_up))
             .child(
                 div()
                     .w_full()
+                    .min_w(px(0.0))
                     .h(px(36.0))
                     .px(px(10.0))
                     .flex()
                     .items_center()
+                    .gap(px(8.0))
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(if is_focused {
@@ -871,7 +1044,38 @@ impl Render for Input {
                         rgb(0x2d2d44)
                     })
                     .bg(rgb(0x13131f))
-                    .child(InputTextElement { input: cx.entity() }),
+                    .overflow_hidden()
+                    .child(InputTextElement { input: cx.entity() })
+                    .when(self.mask_toggle, |this| {
+                        let input_entity = cx.entity();
+                        let input1 = input_entity.clone();
+                        let input2 = input_entity.clone();
+                        this.child(
+                            div()
+                                .id("toggle-mask")
+                                .cursor(CursorStyle::Arrow)
+                                .child(
+                                    svg()
+                                        .size(px(16.0))
+                                        .path(if self.masked {
+                                            Icon::Eye.path()
+                                        } else {
+                                            Icon::EyeOff.path()
+                                        })
+                                        .text_color(rgb(0x8888aa)),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    input1.update(cx, |state, cx| {
+                                        state.set_masked(false, cx);
+                                    })
+                                })
+                                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                                    input2.update(cx, |state, cx| {
+                                        state.set_masked(true, cx);
+                                    })
+                                }),
+                        )
+                    }),
             )
     }
 }

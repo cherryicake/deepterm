@@ -1,5 +1,8 @@
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div, px, rgb, svg};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
+    px, rgb, svg,
+};
 
 use crate::assets::Icon;
 use crate::components::input::Input;
@@ -57,31 +60,23 @@ impl NewHostForm {
             let default_username = get_current_username().unwrap_or_default();
 
             // 创建输入框
-            let nickname_input = cx.new(|cx| {
-                Input::new(cx).placeholder("My Server")
-            });
+            let nickname_input = cx.new(|cx| Input::new(cx).placeholder("My Server"));
 
-            let hostname_input = cx.new(|cx| {
-                Input::new(cx).placeholder("192.168.1.100 or example.com")
-            });
+            let hostname_input =
+                cx.new(|cx| Input::new(cx).placeholder("192.168.1.100 or example.com"));
 
-            let port_input = cx.new(|cx| {
-                Input::new(cx).value("22")
-            });
+            let port_input = cx.new(|cx| Input::new(cx).value("22"));
 
-            let username_input = cx.new(|cx| {
-                Input::new(cx).value(&default_username)
-            });
+            let username_input = cx.new(|cx| Input::new(cx).value(&default_username));
 
             let password_input = cx.new(|cx| {
                 Input::new(cx)
                     .placeholder("Leave empty to prompt on connect")
                     .masked(true)
+                    .mask_toggle(true)
             });
 
-            let key_path_input = cx.new(|cx| {
-                Input::new(cx).placeholder("~/.ssh/id_rsa")
-            });
+            let key_path_input = cx.new(|cx| Input::new(cx).placeholder("~/.ssh/id_rsa"));
 
             Self {
                 focus_handle,
@@ -211,11 +206,7 @@ impl NewHostForm {
         };
 
         // 创建配置
-        let mut config = SshConnectionConfig::new(
-            hostname.trim(),
-            username.trim(),
-            auth_method,
-        );
+        let mut config = SshConnectionConfig::new(hostname.trim(), username.trim(), auth_method);
 
         // 设置端口
         config = config.with_port(port);
@@ -263,11 +254,7 @@ impl NewHostForm {
     }
 
     /// 渲染带标签的输入框
-    fn render_labeled_input(
-        &self,
-        label: &str,
-        input: &Entity<Input>,
-    ) -> impl IntoElement {
+    fn render_labeled_input(&self, label: &str, input: &Entity<Input>) -> impl IntoElement {
         div()
             .w_full()
             .flex()
@@ -318,10 +305,13 @@ impl NewHostForm {
                             .border_color(rgb(0x2d2d44))
                             .bg(rgb(0x13131f))
                             .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                this.show_auth_dropdown = !this.show_auth_dropdown;
-                                cx.notify();
-                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_auth_dropdown = !this.show_auth_dropdown;
+                                    cx.notify();
+                                }),
+                            )
                             .child(
                                 div()
                                     .text_sm()
@@ -357,12 +347,13 @@ impl NewHostForm {
                                         .items_center()
                                         .cursor_pointer()
                                         .when(is_selected, |d| d.bg(rgb(0x252538)))
-                                        .when(!is_selected, |d| {
-                                            d.hover(|s| s.bg(rgb(0x252538)))
-                                        })
-                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                            this.set_auth_type(auth_clone.clone(), cx);
-                                        }))
+                                        .when(!is_selected, |d| d.hover(|s| s.bg(rgb(0x252538))))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_auth_type(auth_clone.clone(), cx);
+                                            }),
+                                        )
                                         .child(
                                             div()
                                                 .text_sm()
@@ -383,32 +374,22 @@ impl NewHostForm {
     /// 渲染认证方式的额外字段
     fn render_auth_extra_field(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.auth_type {
-            AuthType::Password => {
-                self.render_labeled_input(
-                    "Password (optional)",
-                    &self.password_input,
+            AuthType::Password => self
+                .render_labeled_input("Password (optional)", &self.password_input)
+                .into_any_element(),
+            AuthType::PrivateKey => self
+                .render_labeled_input("Key Path (optional)", &self.key_path_input)
+                .into_any_element(),
+            AuthType::Agent => div()
+                .w_full()
+                .py(px(8.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x666688))
+                        .child("Uses SSH agent for authentication"),
                 )
-                .into_any_element()
-            }
-            AuthType::PrivateKey => {
-                self.render_labeled_input(
-                    "Key Path (optional)",
-                    &self.key_path_input,
-                )
-                .into_any_element()
-            }
-            AuthType::Agent => {
-                div()
-                    .w_full()
-                    .py(px(8.0))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x666688))
-                            .child("Uses SSH agent for authentication"),
-                    )
-                    .into_any_element()
-            }
+                .into_any_element(),
         }
     }
 
@@ -497,9 +478,12 @@ impl NewHostForm {
                     .bg(rgb(0x2d2d44))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x3d3d5c)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                        this.handle_cancel(cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.handle_cancel(cx);
+                        }),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -520,9 +504,12 @@ impl NewHostForm {
                     .bg(rgb(0x3d5c3d))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x4a6a4a)))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                        this.save_config(cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.save_config(cx);
+                        }),
+                    )
                     .child(
                         div()
                             .text_sm()
@@ -544,6 +531,7 @@ impl Render for NewHostForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("new-host-form")
+            .track_focus(&self.focus_handle)
             .w_full()
             .h_full()
             .p(px(16.0))
@@ -559,15 +547,9 @@ impl Render for NewHostForm {
                     .flex_col()
                     .gap(px(12.0))
                     // Nickname
-                    .child(self.render_labeled_input(
-                        "Nickname (optional)",
-                        &self.nickname_input,
-                    ))
+                    .child(self.render_labeled_input("Nickname (optional)", &self.nickname_input))
                     // Hostname
-                    .child(self.render_labeled_input(
-                        "Host Address *",
-                        &self.hostname_input,
-                    ))
+                    .child(self.render_labeled_input("Host Address *", &self.hostname_input))
                     // Port and Username row
                     .child(
                         div()
@@ -578,19 +560,11 @@ impl Render for NewHostForm {
                             .child(
                                 div()
                                     .w(px(80.0))
-                                    .child(self.render_labeled_input(
-                                        "Port",
-                                        &self.port_input,
-                                    )),
+                                    .child(self.render_labeled_input("Port", &self.port_input)),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(self.render_labeled_input(
-                                        "Username *",
-                                        &self.username_input,
-                                    )),
-                            ),
+                            .child(div().flex_1().child(
+                                self.render_labeled_input("Username *", &self.username_input),
+                            )),
                     )
                     // Authentication type
                     .child(self.render_auth_type_selector(cx))

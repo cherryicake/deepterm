@@ -41,6 +41,8 @@ pub enum Icon {
     Host,
     KeyShield,
     ChevronDown,
+    Eye,
+    EyeOff,
 }
 
 impl Icon {
@@ -60,6 +62,8 @@ impl Icon {
             Icon::Host => SharedString::new_static("icons/host.svg"),
             Icon::KeyShield => SharedString::new_static("icons/key_shield.svg"),
             Icon::ChevronDown => SharedString::new_static("icons/chevron_down.svg"),
+            Icon::Eye => SharedString::new_static("icons/eye.svg"),
+            Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
         }
     }
 
@@ -78,6 +82,8 @@ impl Icon {
             Icon::Host => gpui::rgb(0x8888aa),
             Icon::KeyShield => gpui::rgb(0x8888aa),
             Icon::ChevronDown => gpui::rgb(0x8888aa),
+            Icon::Eye => gpui::rgb(0x8888aa),
+            Icon::EyeOff => gpui::rgb(0x8888aa),
         }
     }
 }

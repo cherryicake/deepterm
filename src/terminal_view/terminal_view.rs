@@ -2,13 +2,12 @@
 
 use std::time::Duration;
 
-use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
-    actions, div, px,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window, actions, div, px,
 };
+use gpui::{KeyBinding, prelude::*};
 
 /// ASCII control character for Ctrl+V (SYN - Synchronous Idle)
 pub const CTRL_V: u8 = 0x16;
@@ -18,14 +17,24 @@ pub struct ImeState {
     pub marked_text: String,
 }
 
+use crate::ShowSshPicker;
+use crate::ssh::SshConnectionConfig;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::TerminalElement;
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
-use crate::ssh::SshConnectionConfig;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
+const CONTEXT: &str = "Terminal";
+pub(crate) fn init(cx: &mut App) {
+    // Bind keyboard shortcuts
+    cx.bind_keys([
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
+    ]);
+}
 
 /// 广播输入回调类型 - 用于将输入广播给其他终端
 pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
@@ -90,7 +99,12 @@ impl TerminalView {
     /// * `ssh_config` - SSH 连接配置
     pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
         log::info!("=== 创建 SSH 远程终端（优先 russh，失败回退到 ssh 命令）===");
-        log::info!("目标: {}@{}:{}", ssh_config.username, ssh_config.host, ssh_config.port);
+        log::info!(
+            "目标: {}@{}:{}",
+            ssh_config.username,
+            ssh_config.host,
+            ssh_config.port
+        );
 
         let focus_handle = cx.focus_handle();
         let ssh_config_clone = ssh_config.clone();
@@ -484,17 +498,21 @@ impl Render for TerminalView {
         // Schedule a refresh to hide the scrollbar after 2 seconds
         if show_scrollbar {
             cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
                 this.update(cx, |_this, cx| {
                     cx.notify();
                 })
-            }).detach();
+            })
+            .detach();
         }
 
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
+            .key_context(CONTEXT)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 this.copy(cx);
@@ -561,7 +579,7 @@ impl Render for TerminalView {
                             is_focused,
                             self.cursor_visible,
                             view_entity,
-                        )
+                        ),
                     )
                     .when(show_scrollbar, |this| {
                         // Scrollbar positioned absolutely on the right
@@ -573,9 +591,9 @@ impl Render for TerminalView {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(8.0))
-                                .child(TerminalScrollbar::new(terminal, cx))
+                                .child(TerminalScrollbar::new(terminal, cx)),
                         )
-                    })
+                    }),
             )
     }
 }

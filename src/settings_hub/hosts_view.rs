@@ -1,12 +1,12 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window,
-    div, hsla, px, rgb, svg,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    hsla, px, rgb, svg,
 };
 
 use crate::assets::Icon;
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
-use crate::ssh::config::{SshGlobalConfig, AuthMethod, SshConnectionConfig};
+use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::workspace::workspace::Workspace;
 
 // Layout constants
@@ -225,7 +225,10 @@ impl HostsView {
         // Create a default group containing all hosts
         let host_count = hosts.len() as u32;
         let groups = if host_count > 0 {
-            vec![HostGroup::new("all-hosts", "All Hosts", host_count).with_icon_color(HostIconColor::Blue)]
+            vec![
+                HostGroup::new("all-hosts", "All Hosts", host_count)
+                    .with_icon_color(HostIconColor::Blue),
+            ]
         } else {
             vec![]
         };
@@ -484,7 +487,12 @@ impl HostsView {
     }
 
     /// Render a host card
-    fn render_host_card(&self, host: &Host, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_host_card(
+        &self,
+        host: &Host,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let icon_color = host.icon_color.to_hsla();
         let host_id = host.id.to_string();
 
@@ -577,9 +585,11 @@ impl HostsView {
                     .flex()
                     .flex_wrap()
                     .gap(px(GRID_GAP_PX))
-                    .children(self.groups.iter().map(|group| {
-                        self.render_group_card(group).into_any_element()
-                    })),
+                    .children(
+                        self.groups
+                            .iter()
+                            .map(|group| self.render_group_card(group).into_any_element()),
+                    ),
             )
     }
 
@@ -594,7 +604,8 @@ impl HostsView {
         let effective_width = available_width - sidebar_width - content_padding;
 
         // Calculate max possible columns
-        let max_cols = ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
+        let max_cols =
+            ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
 
         // Clamp between 1 and MAX_GRID_COLUMNS
         max_cols.clamp(1, MAX_GRID_COLUMNS)
@@ -624,11 +635,7 @@ impl HostsView {
     }
 
     /// Render hosts grid with responsive columns and placeholders
-    fn render_hosts_grid(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_hosts_grid(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Get available width and calculate columns accounting for sidebars
         let viewport_width = window.viewport_size().width.as_f32();
         let cols = self.calculate_columns(viewport_width);
@@ -648,16 +655,13 @@ impl HostsView {
             .grid()
             .grid_cols(cols)
             .gap(px(GRID_GAP_PX))
-            .children(self.hosts.iter().map(|host| {
-                self.render_host_card(host, window, cx).into_any_element()
-            }))
+            .children(
+                self.hosts
+                    .iter()
+                    .map(|host| self.render_host_card(host, window, cx).into_any_element()),
+            )
             // Add invisible placeholders to maintain grid alignment
-            .children((0..placeholder_count).map(|_| {
-                div()
-                    .w_full()
-                    .h(px(64.0))
-                    .into_any_element()
-            }))
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(64.0)).into_any_element()))
     }
 }
 
@@ -671,6 +675,7 @@ impl Render for HostsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("hosts-view")
+            .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()

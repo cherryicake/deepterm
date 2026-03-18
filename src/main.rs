@@ -15,17 +15,13 @@ use gpui::{
     WindowBackgroundAppearance, WindowOptions, actions, div, size,
 };
 
-use crate::components::input::{Backspace, Delete, Left, Right, SelectAll, Home, End};
 use crate::components::title_bar::TitleBar;
 use crate::ssh_picker::ssh_picker::SshPicker;
-use crate::terminal_view::terminal_view::{Copy, Paste};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(
-    app,
-    [Quit, NewLocalTerminal, ShowSshPicker, CloseSelectedPanel]
-);
+actions!(app, [Quit, ShowSshPicker]);
+const CONTEXT: &str = "AppWindow";
 
 /// 全局 SSH picker 引用，用于从 Workspace 触发显示
 struct GlobalSshPicker(Entity<SshPicker>);
@@ -83,19 +79,9 @@ impl Render for AppWindow {
             .size_full()
             .flex()
             .flex_col()
-            .key_context("AppWindow")
+            .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ShowSshPicker, window, cx| {
                 this.show_ssh_picker(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
-                this.workspace.update(cx, |workspace, cx| {
-                    workspace.create_local_terminal(window, cx);
-                });
-            }))
-            .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
-                this.workspace.update(cx, |workspace, cx| {
-                    workspace.close_selected_panel(window, cx);
-                });
             }))
             // Title bar for window management
             .child(self.title_bar.clone())
@@ -128,22 +114,14 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
+            components::init(cx);
+            terminal_view::init(cx);
+            workspace::init(cx);
             // Bind keyboard shortcuts
+            // 使用 None 作为 context，让这些快捷键全局有效
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("cmd-c", Copy, None),
-                KeyBinding::new("cmd-v", Paste, None),
-                KeyBinding::new("cmd-l", NewLocalTerminal, None),
                 KeyBinding::new("cmd-k", ShowSshPicker, None),
-                KeyBinding::new("cmd-w", CloseSelectedPanel, None),
-                // Input component key bindings
-                KeyBinding::new("backspace", Backspace, Some("Input")),
-                KeyBinding::new("delete", Delete, Some("Input")),
-                KeyBinding::new("left", Left, Some("Input")),
-                KeyBinding::new("right", Right, Some("Input")),
-                KeyBinding::new("cmd-a", SelectAll, Some("Input")),
-                KeyBinding::new("home", Home, Some("Input")),
-                KeyBinding::new("end", End, Some("Input")),
             ]);
 
             // Register global action handlers

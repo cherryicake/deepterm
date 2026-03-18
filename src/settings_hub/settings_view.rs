@@ -398,6 +398,7 @@ impl Render for SettingsHubCenter {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("settings-hub-center")
+            .track_focus(&self.focus_handle)
             .size_full()
             .child(self.render_page(cx))
     }
@@ -419,10 +420,7 @@ impl SettingsHubView {
         Self::new_with_workspace(cx, None)
     }
 
-    pub fn new_with_workspace(
-        cx: &mut App,
-        workspace: Option<Entity<Workspace>>,
-    ) -> Entity<Self> {
+    pub fn new_with_workspace(cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
@@ -431,7 +429,8 @@ impl SettingsHubView {
             let left_sidebar = SettingsHubLeftSidebar::new_with_sections(cx, sections);
 
             // 创建中心内容，默认显示 Hosts 页面，传入 workspace
-            let center = SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace.clone());
+            let center =
+                SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace.clone());
 
             // 创建新主机表单
             let new_host_form = NewHostForm::new(cx);
@@ -562,6 +561,7 @@ impl Render for SettingsHubView {
 
         div()
             .id("settings-hub-view")
+            .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_row()
@@ -583,7 +583,7 @@ impl Render for SettingsHubView {
     }
 }
 
-/// 创建默认的侧边栏数据（主机管理风格）
+/// 创建默认的侧边栏数据
 pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
     vec![
         // 个人收藏分组
@@ -593,18 +593,5 @@ pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
         ]),
         // 终端设置分组
         SettingsHubSection::new("terminal_setting", Some("偏好设置")).with_items(vec![]),
-    ]
-}
-
-/// 创建默认的右侧边栏数据
-pub fn create_default_right_sidebar_sections() -> Vec<SettingsHubSection> {
-    vec![
-        // 快捷操作分组
-        SettingsHubSection::new("quick_actions", Some("快捷操作")).with_items(vec![
-            SettingsHubItem::new("add_host", Icon::Plus, "添加主机"),
-            SettingsHubItem::new("import", Icon::Terminal, "导入配置"),
-        ]),
-        // 系统信息分组
-        SettingsHubSection::new("system_info", Some("系统信息")).with_items(vec![]),
     ]
 }
