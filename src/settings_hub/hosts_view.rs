@@ -13,7 +13,6 @@ use crate::workspace::workspace::Workspace;
 const GRID_GAP_PX: f32 = 12.0;
 const MIN_CARD_WIDTH_PX: f32 = 260.0;
 const CONTENT_PADDING_PX: f32 = 16.0;
-const MAX_GRID_COLUMNS: u16 = 5;
 
 /// Host connection type
 #[derive(Clone, Debug, PartialEq)]
@@ -607,8 +606,8 @@ impl HostsView {
         let max_cols =
             ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
 
-        // Clamp between 1 and MAX_GRID_COLUMNS
-        max_cols.clamp(1, MAX_GRID_COLUMNS)
+        // Clamp to at least 1 column
+        max_cols.max(1)
     }
 
     /// Render the Hosts section with responsive flex wrap layout
