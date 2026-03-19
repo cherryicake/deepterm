@@ -7,7 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
 use crate::settings_hub::hosts_view::HostsView;
-use crate::settings_hub::new_host_form::NewHostForm;
+use crate::settings_hub::host_form::HostForm;
 use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
@@ -408,7 +408,7 @@ impl Render for SettingsHubCenter {
 pub struct SettingsHubView {
     left_sidebar: Entity<SettingsHubLeftSidebar>,
     center: Entity<SettingsHubCenter>,
-    new_host_form: Entity<NewHostForm>,
+    host_form: Entity<HostForm>,
     right_sidebar_visible: bool,
     /// 侧边栏是否应该被渲染（包括退出动画期间）
     right_sidebar_rendered: bool,
@@ -433,7 +433,7 @@ impl SettingsHubView {
                 SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace.clone());
 
             // 创建新主机表单
-            let new_host_form = NewHostForm::new(cx);
+            let host_form = HostForm::new(cx);
 
             // 设置左侧边栏点击回调
             let center_for_callback = center.clone();
@@ -453,7 +453,7 @@ impl SettingsHubView {
             Self {
                 left_sidebar,
                 center,
-                new_host_form,
+                host_form,
                 right_sidebar_visible: false,
                 right_sidebar_rendered: false,
                 focus_handle,
@@ -473,12 +473,12 @@ impl SettingsHubView {
             });
         });
 
-        // 设置 NewHostForm 的回调
+        // 设置 HostForm 的回调
         let view_entity_for_cancel = cx.entity();
         let view_entity_for_save = cx.entity();
         let center_for_refresh = self.center.clone();
 
-        self.new_host_form.update(cx, |form, _cx| {
+        self.host_form.update(cx, |form, _cx| {
             // 取消回调 - 关闭侧边栏（带动画）
             form.on_cancel(move |app| {
                 view_entity_for_cancel.update(app, |view, cx| {
@@ -576,7 +576,7 @@ impl Render for SettingsHubView {
                         .render_with_toggle_animation(
                             "right-sidebar-animation",
                             show_right_sidebar,
-                            self.new_host_form.clone(),
+                            self.host_form.clone(),
                         ),
                 )
             })

@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
-    px, rgb, svg,
+    div, px, rgb, svg, App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton,
+    Render, Window,
 };
 
 use crate::assets::Icon;
@@ -31,8 +31,8 @@ impl AuthType {
     }
 }
 
-/// New Host Form 组件 - 用于创建新的 SSH 主机配置
-pub struct NewHostForm {
+/// Host Form 组件 - 用于创建和编辑 SSH 主机配置
+pub struct HostForm {
     focus_handle: FocusHandle,
     // 输入框实体
     nickname_input: Entity<Input>,
@@ -51,7 +51,7 @@ pub struct NewHostForm {
     on_saved: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
 }
 
-impl NewHostForm {
+impl HostForm {
     pub fn new(cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
@@ -521,13 +521,13 @@ impl NewHostForm {
     }
 }
 
-impl Focusable for NewHostForm {
+impl Focusable for HostForm {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for NewHostForm {
+impl Render for HostForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("new-host-form")
