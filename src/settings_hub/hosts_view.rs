@@ -138,6 +138,9 @@ pub struct HostsView {
     workspace: Option<Entity<Workspace>>,
     configs: Vec<SshConnectionConfig>,
     on_new_host_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
+    on_edit_host_click: Option<Box<dyn Fn(&mut App, SshConnectionConfig) + Send + Sync>>,
+    pending_edit_host: Option<SharedString>,
+    selected_host_id: Option<SharedString>,
 }
 
 impl HostsView {
@@ -156,6 +159,9 @@ impl HostsView {
                 workspace: None,
                 configs,
                 on_new_host_click: None,
+                on_edit_host_click: None,
+                pending_edit_host: None,
+                selected_host_id: None,
             }
         })
     }
@@ -182,6 +188,9 @@ impl HostsView {
                 workspace,
                 configs,
                 on_new_host_click: None,
+                on_edit_host_click: None,
+                pending_edit_host: None,
+                selected_host_id: None,
             }
         })
     }
@@ -485,6 +494,14 @@ impl HostsView {
         self.on_new_host_click = Some(Box::new(callback));
     }
 
+    /// Set callback for when a host card is clicked (single click to edit)
+    pub fn on_edit_host_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut App, SshConnectionConfig) + Send + Sync + 'static,
+    {
+        self.on_edit_host_click = Some(Box::new(callback));
+    }
+
     /// Render a host card
     fn render_host_card(
         &self,
@@ -493,7 +510,18 @@ impl HostsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let icon_color = host.icon_color.to_hsla();
-        let host_id = host.id.to_string();
+        let host_id = host.id.clone();
+        let is_selected = self.selected_host_id.as_ref() == Some(&host_id);
+        let bg_color = if is_selected {
+            rgb(0x2a2a4a)
+        } else {
+            rgb(0x1a1a2e)
+        };
+        let border_color = if is_selected {
+            rgb(0x4d4d6a)
+        } else {
+            rgb(0x2d2d44)
+        };
 
         div()
             .id(format!("host-{}", host.id))
@@ -504,17 +532,72 @@ impl HostsView {
             .items_center()
             .gap(px(12.0))
             .rounded(px(10.0))
-            .bg(rgb(0x1a1a2e))
+            .bg(bg_color)
             .border_1()
-            .border_color(rgb(0x2d2d44))
+            .border_color(border_color)
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x252538)))
-            // Double click to connect
+            .hover(|style| {
+                if is_selected {
+                    style
+                } else {
+                    style.bg(rgb(0x252538))
+                }
+            })
             .on_click(cx.listener({
                 let host_id = host_id.clone();
                 move |this, event: &gpui::ClickEvent, window, cx| {
-                    // Connect on double click
-                    if event.click_count() == 2 {
+                    if event.click_count() == 1 {
+                        // Set selected host
+                        this.selected_host_id = Some(host_id.clone());
+
+                        // Single click - schedule edit with delay to detect double click
+                        // Clone configs to avoid borrow conflict with async block
+                        let configs = this.configs.clone();
+                        let config = configs.iter().find(|c| c.id() == host_id).cloned();
+
+                        if let Some(config) = config {
+                            if let Some(ref callback) = this.on_edit_host_click {
+                                // Set pending flag
+                                this.pending_edit_host = Some(host_id.clone());
+
+                                let host_id_clone = host_id.clone();
+                                let config_clone = config.clone();
+                                cx.spawn(async move |view, cx| {
+                                    // Wait to see if double click comes
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(100))
+                                        .await;
+
+                                    // Check if this was cancelled (by double click)
+                                    let should_execute = view
+                                        .update(cx, |this, _| {
+                                            this.pending_edit_host
+                                                .as_ref()
+                                                .map(|id| id == &host_id_clone)
+                                                .unwrap_or(false)
+                                        })
+                                        .ok()
+                                        .unwrap_or(false);
+
+                                    if should_execute {
+                                        view.update(cx, |this, cx| {
+                                            this.pending_edit_host = None;
+                                            if let Some(ref callback) = this.on_edit_host_click {
+                                                callback(cx, config_clone);
+                                            }
+                                        })
+                                        .ok();
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                    } else if event.click_count() == 2 {
+                        // Double click - cancel pending single click and connect
+                        if this.pending_edit_host.as_ref() == Some(&host_id) {
+                            this.pending_edit_host = None;
+                        }
+                        this.selected_host_id = Some(host_id.clone());
                         this.connect_to_host(&host_id, window, cx);
                     }
                 }

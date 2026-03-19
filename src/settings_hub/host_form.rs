@@ -46,6 +46,7 @@ pub struct HostForm {
     show_auth_dropdown: bool,
     error_message: Option<String>,
     success_message: Option<String>,
+    editing_config_id: Option<String>,
     // 回调
     on_cancel: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
     on_saved: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
@@ -90,6 +91,7 @@ impl HostForm {
                 show_auth_dropdown: false,
                 error_message: None,
                 success_message: None,
+                editing_config_id: None,
                 on_cancel: None,
                 on_saved: None,
             }
@@ -112,8 +114,57 @@ impl HostForm {
         self.on_saved = Some(Box::new(callback));
     }
 
+    /// 加载配置到表单（用于编辑）
+    pub fn load_config(&mut self, config: &SshConnectionConfig, cx: &mut Context<Self>) {
+        self.editing_config_id = Some(config.id());
+        self.nickname_input.update(cx, |input, cx| {
+            if let Some(ref nick) = config.nickname {
+                input.set_text(nick, cx);
+            } else {
+                input.clear(cx);
+            }
+        });
+        self.hostname_input.update(cx, |input, cx| {
+            input.set_text(&config.host, cx);
+        });
+        self.port_input.update(cx, |input, cx| {
+            input.set_text(&config.port.to_string(), cx);
+        });
+        self.username_input.update(cx, |input, cx| {
+            input.set_text(&config.username, cx);
+        });
+
+        // Set auth type based on auth method
+        match config.auth_method {
+            AuthMethod::Password { ref password } => {
+                self.auth_type = AuthType::Password;
+                self.password_input.update(cx, |input, cx| {
+                    input.set_text(password, cx);
+                });
+            }
+            AuthMethod::PrivateKey { ref path, .. } => {
+                self.auth_type = AuthType::PrivateKey;
+                self.key_path_input.update(cx, |input, cx| {
+                    let path_str = path.to_string_lossy().to_string();
+                    input.set_text(path_str, cx);
+                });
+            }
+            AuthMethod::Agent => {
+                self.auth_type = AuthType::Agent;
+            }
+            AuthMethod::Auto => {
+                self.auth_type = AuthType::Password;
+            }
+        }
+
+        self.error_message = None;
+        self.success_message = None;
+        cx.notify();
+    }
+
     /// 重置表单
-    fn reset_form(&mut self, cx: &mut Context<Self>) {
+    pub fn reset_form(&mut self, cx: &mut Context<Self>) {
+        self.editing_config_id = None;
         self.nickname_input.update(cx, |input, cx| {
             input.clear(cx);
         });
@@ -216,8 +267,15 @@ impl HostForm {
             config = config.with_nickname(nickname.trim());
         }
 
-        // 加载现有配置并添加新配置
+        // 加载现有配置
         let mut global_config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
+
+        // 如果是编辑模式，先删除旧配置
+        if let Some(ref editing_id) = self.editing_config_id {
+            global_config.remove_connection(editing_id);
+        }
+
+        // 添加新/更新配置
         global_config.add_connection(config);
 
         // 保存配置
@@ -395,6 +453,13 @@ impl HostForm {
 
     /// 渲染表单头部
     fn render_header(&self) -> impl IntoElement {
+        let is_editing = self.editing_config_id.is_some();
+        let (title, subtitle) = if is_editing {
+            ("Edit Host", "Modify SSH host configuration")
+        } else {
+            ("New Host", "Add a new SSH host configuration")
+        };
+
         div()
             .w_full()
             .pb(px(16.0))
@@ -405,14 +470,9 @@ impl HostForm {
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(rgb(0xffffff))
-                    .child("New Host"),
+                    .child(title),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8888aa))
-                    .child("Add a new SSH host configuration"),
-            )
+            .child(div().text_xs().text_color(rgb(0x8888aa)).child(subtitle))
     }
 
     /// 渲染错误/成功消息

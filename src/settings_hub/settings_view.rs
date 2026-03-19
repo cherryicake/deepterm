@@ -8,6 +8,7 @@ use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
 use crate::settings_hub::hosts_view::HostsView;
 use crate::settings_hub::host_form::HostForm;
+use crate::ssh::config::SshConnectionConfig;
 use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
@@ -339,6 +340,16 @@ impl SettingsHubCenter {
         });
     }
 
+    /// Setup the callback for editing a host in HostsView
+    pub fn setup_edit_host_callback<F>(&self, cx: &mut Context<Self>, callback: F)
+    where
+        F: Fn(&mut App, SshConnectionConfig) + Send + Sync + Clone + 'static,
+    {
+        self.hosts_view.update(cx, |hosts_view, _cx| {
+            hosts_view.on_edit_host_click(callback);
+        });
+    }
+
     pub fn set_page(&mut self, page: SettingsHubPage, cx: &mut Context<Self>) {
         self.current_page = page;
         cx.notify();
@@ -468,7 +479,21 @@ impl SettingsHubView {
         self.center.update(cx, |center, cx| {
             center.setup_new_host_callback(cx, move |app| {
                 view_entity.update(app, |view, cx| {
+                    // Reset form before opening for new host
+                    view.host_form.update(cx, |form, cx| {
+                        form.reset_form(cx);
+                    });
                     view.toggle_right_sidebar(cx);
+                });
+            });
+        });
+
+        // 设置 HostsView 的编辑主机回调
+        let view_entity_for_edit = cx.entity();
+        self.center.update(cx, |center, cx| {
+            center.setup_edit_host_callback(cx, move |app, config| {
+                view_entity_for_edit.update(app, |view, cx| {
+                    view.edit_host(&config, cx);
                 });
             });
         });
@@ -551,6 +576,20 @@ impl SettingsHubView {
         if self.right_sidebar_visible {
             self.toggle_right_sidebar(cx);
         }
+    }
+
+    /// Open sidebar for editing a host
+    pub fn edit_host(&mut self, config: &SshConnectionConfig, cx: &mut Context<Self>) {
+        // Reset form first to clear any previous state
+        self.host_form.update(cx, |form, cx| {
+            form.reset_form(cx);
+            form.load_config(config, cx);
+        });
+
+        // Open sidebar
+        self.right_sidebar_visible = true;
+        self.right_sidebar_rendered = true;
+        cx.notify();
     }
 }
 
