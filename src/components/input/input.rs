@@ -55,6 +55,9 @@ const CURSOR_BLINK_INTERVAL: u64 = 530;
 /// 光标宽度
 const CURSOR_WIDTH: Pixels = px(2.);
 
+/// 光标可见性判断的容差
+const CURSOR_VISIBILITY_PADDING: Pixels = px(2.);
+
 /// 文本输入组件
 pub struct Input {
     focus_handle: FocusHandle,
@@ -558,21 +561,24 @@ impl Input {
         let line_height = window.line_height();
         let delta = event.delta.pixel_delta(line_height);
 
-        // 直接使用 delta 来设置新的偏移量，而不是累加
-        let mut new_offset = self.scroll_handle.offset() + delta;
+        let new_offset = self.scroll_handle.offset() + delta;
+        let clamped_offset = self.clamp_scroll_offset(new_offset, self.scroll_size.width, self.input_bounds.size.width);
 
-        // 限制滚动范围：x 永远是负数或 0（负数表示向左滚动）
-        // 只有当内容宽度大于可视区域时才允许滚动
-        let max_scroll = if self.scroll_size.width > self.input_bounds.size.width {
-            self.input_bounds.size.width - self.scroll_size.width  // 负数
+        self.scroll_handle.set_offset(clamped_offset);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    /// 限制滚动偏移量在安全范围内
+    fn clamp_scroll_offset(&self, scroll_offset: Point<Pixels>, content_width: Pixels, visible_width: Pixels) -> Point<Pixels> {
+        let mut offset = scroll_offset;
+        let max_scroll = if content_width > visible_width {
+            visible_width - content_width
         } else {
             px(0.)
         };
-        new_offset.x = new_offset.x.clamp(max_scroll, px(0.));
-
-        self.scroll_handle.set_offset(new_offset);
-        cx.notify();
-        cx.stop_propagation();
+        offset.x = offset.x.clamp(max_scroll, px(0.));
+        offset
     }
 
     /// 选中光标位置的单词
@@ -956,16 +962,12 @@ impl Element for InputTextElement {
             let cursor_y = bounds.top() + (bounds.size.height - cursor_height) / 2.0;
             let visible_width = bounds.size.width;
 
-            // 获取滚动偏移
-            let mut scroll_offset = input.scroll_handle.offset();
-
-            // 限制滚动范围：确保 scroll_offset.x 永远是负数或 0
-            let max_scroll = if text_width > visible_width {
-                visible_width - text_width
-            } else {
-                px(0.)
-            };
-            scroll_offset.x = scroll_offset.x.clamp(max_scroll, px(0.));
+            // 获取滚动偏移并限制在安全范围内
+            let scroll_offset = input.clamp_scroll_offset(
+                input.scroll_handle.offset(),
+                text_width,
+                visible_width,
+            );
 
             // 计算光标边界
             // 光标位置 = 文本原点 + 光标在文本中的位置
@@ -1061,7 +1063,9 @@ impl Element for InputTextElement {
         if let Some(cursor) = prepaint.cursor.take() {
             let cursor_right = cursor.bounds.right();
             let cursor_left = cursor.bounds.left();
-            if cursor_left >= bounds.left() - px(2.0) && cursor_right <= bounds.right() + px(2.0) {
+            if cursor_left >= bounds.left() - CURSOR_VISIBILITY_PADDING
+                && cursor_right <= bounds.right() + CURSOR_VISIBILITY_PADDING
+            {
                 window.paint_quad(cursor);
             }
         }
