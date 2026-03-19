@@ -4,12 +4,12 @@
 use crate::assets::Icon;
 use gpui::{
     App, Bounds, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style,
-    TextAlign, TextRun, UTF16Selection, Window, actions, div, fill, hsla, px, relative, rgb, rgba,
-    size, svg,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Style, TextAlign, TextRun,
+    UTF16Selection, Window, actions, div, fill, px, point, rgb, rgba, size, svg,
 };
-use gpui::{KeyBinding, prelude::*};
+use gpui::prelude::*;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -18,7 +18,8 @@ pub(super) const CONTEXT: &str = "Input";
 actions!(
     input,
     [
-        Backspace, Delete, Left, Right, SelectAll, Home, End, Copy, Cut, Paste
+        Backspace, Delete, Left, Right, SelectAll, Home, End, Copy, Cut, Paste,
+        SelectLeft, SelectRight,
     ]
 );
 pub(crate) fn init(cx: &mut App) {
@@ -28,6 +29,8 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("left", Left, Some(CONTEXT)),
         KeyBinding::new("right", Right, Some(CONTEXT)),
+        KeyBinding::new("shift-left", SelectLeft, Some(CONTEXT)),
+        KeyBinding::new("shift-right", SelectRight, Some(CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
@@ -48,6 +51,9 @@ pub(crate) fn init(cx: &mut App) {
 
 /// 光标闪烁间隔（毫秒）
 const CURSOR_BLINK_INTERVAL: u64 = 530;
+
+/// 光标宽度
+const CURSOR_WIDTH: Pixels = px(2.);
 
 /// 文本输入组件
 pub struct Input {
@@ -78,8 +84,12 @@ pub struct Input {
     cursor_visible: bool,
     /// 是否已经开始闪烁（避免重复启动任务）
     blinking_started: bool,
-    /// 水平滚动偏移量（用于处理文本溢出）
-    scroll_offset: Pixels,
+    /// 滚动句柄
+    scroll_handle: ScrollHandle,
+    /// 可滚动内容的尺寸
+    scroll_size: gpui::Size<Pixels>,
+    /// 输入框边界
+    input_bounds: Bounds<Pixels>,
 }
 
 impl Input {
@@ -101,7 +111,9 @@ impl Input {
             is_selecting: false,
             cursor_visible: true,
             blinking_started: false,
-            scroll_offset: px(0.0),
+            scroll_handle: ScrollHandle::new(),
+            scroll_size: gpui::size(px(0.), px(0.)),
+            input_bounds: Bounds::default(),
         }
     }
 
@@ -110,10 +122,8 @@ impl Input {
         if self.disabled || self.blinking_started {
             return;
         }
-        // 标记闪烁已启动
         self.blinking_started = true;
         self.cursor_visible = true;
-        // 开始闪烁循环
         self.blink_cursors(cx);
     }
 
@@ -126,16 +136,13 @@ impl Input {
 
     /// 闪烁光标（递归调用）
     fn blink_cursors(&mut self, cx: &mut Context<Self>) {
-        // 如果不再处于闪烁状态，停止递归
         if !self.blinking_started {
             return;
         }
 
-        // 切换光标可见性
         self.cursor_visible = !self.cursor_visible;
         cx.notify();
 
-        // 安排下一次闪烁
         let interval = std::time::Duration::from_millis(CURSOR_BLINK_INTERVAL);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(interval).await;
@@ -212,9 +219,9 @@ impl Input {
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         let text = text.into();
         self.content = text.clone();
-        // 光标移到末尾
         self.selected_range = text.len()..text.len();
         self.selection_reversed = false;
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -223,6 +230,7 @@ impl Input {
         self.content = SharedString::default();
         self.selected_range = 0..0;
         self.selection_reversed = false;
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -289,8 +297,9 @@ impl Input {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        // 考虑滚动偏移：鼠标位置需要加上滚动偏移量才能得到文本中的实际位置
-        let x = position.x - bounds.left() + self.scroll_offset;
+        // 考虑滚动偏移：鼠标位置需要加上滚动偏移量（scroll_offset.x 是负数）
+        let scroll_offset = self.scroll_handle.offset();
+        let x = position.x - bounds.left() - scroll_offset.x;
         line.closest_index_for_x(x)
     }
 
@@ -358,6 +367,22 @@ impl Input {
         } else {
             self.move_to(self.selected_range.end, cx);
         }
+    }
+
+    /// 处理选择向左移动
+    fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+    }
+
+    /// 处理选择向右移动
+    fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+        self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
     /// 触发变更回调
@@ -432,7 +457,6 @@ impl Input {
 
         if let Some(clipboard) = cx.read_from_clipboard() {
             if let Some(mut text) = clipboard.text() {
-                // 单行模式：移除换行符
                 text.retain(|c| c != '\n' && c != '\r');
 
                 if !text.is_empty() {
@@ -480,47 +504,137 @@ impl Input {
         }
         self.is_selecting = true;
 
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+        let offset = self.index_for_mouse_position(event.position);
+
+        // 三击选中整行（全部文本）
+        if event.button == MouseButton::Left && event.click_count >= 3 {
+            self.select_all_line(cx);
+            self.start_blinking(cx);
+            return;
         }
 
-        // 启动光标闪烁
+        // 双击选中单词
+        if event.button == MouseButton::Left && event.click_count == 2 {
+            self.select_word_at(offset, cx);
+            self.start_blinking(cx);
+            return;
+        }
+
+        if event.modifiers.shift {
+            self.select_to(offset, cx);
+        } else {
+            self.move_to(offset, cx);
+        }
+
         self.start_blinking(cx);
+    }
+
+    /// 处理鼠标移动（拖拽选择）
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled || !self.is_selecting {
+            return;
+        }
+
+        let offset = self.index_for_mouse_position(event.position);
+        self.select_to(offset, cx);
+    }
+
+    /// 处理滚轮事件（水平滚动）
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled {
+            return;
+        }
+
+        let line_height = window.line_height();
+        let delta = event.delta.pixel_delta(line_height);
+
+        // 直接使用 delta 来设置新的偏移量，而不是累加
+        let mut new_offset = self.scroll_handle.offset() + delta;
+
+        // 限制滚动范围：x 永远是负数或 0（负数表示向左滚动）
+        // 只有当内容宽度大于可视区域时才允许滚动
+        let max_scroll = if self.scroll_size.width > self.input_bounds.size.width {
+            self.input_bounds.size.width - self.scroll_size.width  // 负数
+        } else {
+            px(0.)
+        };
+        new_offset.x = new_offset.x.clamp(max_scroll, px(0.));
+
+        self.scroll_handle.set_offset(new_offset);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    /// 选中光标位置的单词
+    fn select_word_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let word_range = self.word_range_at(offset);
+        self.selected_range = word_range.clone();
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// 获取指定位置所在单词的范围
+    fn word_range_at(&self, offset: usize) -> Range<usize> {
+        if self.content.is_empty() {
+            return 0..0;
+        }
+
+        let offset = offset.min(self.content.len());
+
+        let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+
+        let chars: Vec<(usize, char)> = self.content.char_indices().collect();
+        if let Some(pos) = chars.iter().position(|(idx, _)| *idx == offset) {
+            let char_type = chars.get(pos).map(|(_, c)| is_word_char(*c));
+
+            let mut start = offset;
+            for i in (0..pos).rev() {
+                if let Some((idx, c)) = chars.get(i) {
+                    if is_word_char(*c) == char_type.unwrap_or(false) {
+                        start = *idx;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let mut end = offset;
+            for i in pos..chars.len() {
+                if let Some((idx, c)) = chars.get(i) {
+                    if is_word_char(*c) == char_type.unwrap_or(false) {
+                        end = idx + c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            start..end
+        } else {
+            offset..offset
+        }
+    }
+
+    /// 选中整行（对于单行输入框就是全部文本）
+    fn select_all_line(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     /// 处理鼠标释放
     fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
-    }
-
-    /// 处理输入的字符（用于程序化插入文本）
-    #[allow(dead_code)]
-    fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
-        if self.disabled || text.is_empty() {
-            return;
-        }
-
-        // 在光标位置插入文本
-        let cursor = self.cursor_offset();
-        let new_text = format!(
-            "{}{}{}",
-            &self.content[..cursor],
-            text,
-            &self.content[cursor..]
-        );
-        self.content = new_text.into();
-        self.selected_range = cursor + text.len()..cursor + text.len();
-        self.marked_range = None;
-
-        // 触发回调
-        if let Some(ref callback) = self.on_change {
-            let text = self.content.to_string();
-            callback(&text, cx);
-        }
-
-        cx.notify();
     }
 }
 
@@ -582,7 +696,6 @@ impl EntityInputHandler for Input {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
 
-        // 重置闪烁
         self.reset_blinking(cx);
 
         cx.notify();
@@ -663,8 +776,9 @@ struct InputPrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
-    /// 输入框边界（应用滚动后的）
     text_bounds: Bounds<Pixels>,
+    scroll_size: gpui::Size<Pixels>,
+    cursor_scroll_offset: Point<Pixels>,
 }
 
 impl IntoElement for InputTextElement {
@@ -695,7 +809,7 @@ impl Element for InputTextElement {
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
-        style.size.width = relative(1.).into();
+        style.size.width = gpui::relative(1.).into();
         style.size.height = window.line_height().into();
         (window.request_layout(style, [], _cx), ())
     }
@@ -718,14 +832,14 @@ impl Element for InputTextElement {
         let placeholder = input.placeholder.clone();
         let is_focused = input.focus_handle.is_focused(window);
 
-        // 显示文本（密码模式显示圆点）
         let is_empty = content.is_empty();
 
-        // 处理 placeholder：截断并添加省略号
-        let max_width = bounds.size.width - px(20.0); // 留出 padding
-        let font_size = style.font_size.to_pixels(window.rem_size());
+        // 处理 placeholder
         let placeholder_text = if is_empty {
-            // 测量 placeholder 宽度，如果超出则截断
+            let ellipsis = "...";
+            let max_width = bounds.size.width - px(20.0);
+            let font_size = style.font_size.to_pixels(window.rem_size());
+
             let placeholder_run = TextRun {
                 len: placeholder.len(),
                 font: style.font(),
@@ -742,8 +856,6 @@ impl Element for InputTextElement {
             );
 
             if placeholder_line.width() > max_width {
-                // 需要截断，尝试找到合适的截断位置
-                let ellipsis = "...";
                 let mut truncated = placeholder.to_string();
                 while !truncated.is_empty() {
                     let test_text = format!("{}{}", truncated, ellipsis);
@@ -775,24 +887,24 @@ impl Element for InputTextElement {
             placeholder
         };
 
-        let (display_text, _text_color): (SharedString, _) = if is_empty {
-            (placeholder_text, hsla(0., 0., 0., 0.4))
+        let display_text: SharedString = if is_empty {
+            placeholder_text
         } else if masked {
-            // Use ASCII `*` for password mask: 1 char = 1 byte
-            // This ensures cursor byte offset matches character index
-            ("*".repeat(content.len()).into(), style.color)
+            "*".repeat(content.len()).into()
         } else {
-            (content.clone(), style.color)
+            content.clone()
+        };
+
+        let text_color = if is_empty {
+            rgb(0x666688).into()
+        } else {
+            rgb(0xcccccc).into()
         };
 
         let run = TextRun {
             len: display_text.len(),
             font: style.font(),
-            color: if is_empty {
-                rgb(0x666688).into() // placeholder 颜色 - 更浅更淡
-            } else {
-                rgb(0xcccccc).into() // 正常文本颜色
-            },
+            color: text_color,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -824,110 +936,86 @@ impl Element for InputTextElement {
             vec![run]
         };
 
+        let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
             .shape_line(display_text.clone(), font_size, &runs, None);
 
-        // 读取 cursor_visible 状态
+        let text_width = line.width();
+        let scroll_size = gpui::Size {
+            width: text_width,
+            height: window.line_height(),
+        };
+
         let cursor_visible = input.cursor_visible;
 
-        // 计算文本总宽度和光标位置
-        let text_width = line.width();
-        let cursor_pos = line.x_for_index(cursor);
+        // 计算光标位置和滚动偏移
+        let (cursor_bounds, cursor_scroll_offset) = if selected_range.is_empty() && is_focused && cursor_visible {
+            let cursor_x = line.x_for_index(cursor);
+            let cursor_height = font_size * 0.85;
+            let cursor_y = bounds.top() + (bounds.size.height - cursor_height) / 2.0;
+            let visible_width = bounds.size.width;
 
-        // 计算可视区域宽度（留出边距以便光标显示）
-        let visible_width = bounds.size.width - px(8.0); // 8px 边距
+            // 获取滚动偏移
+            let mut scroll_offset = input.scroll_handle.offset();
 
-        // 计算滚动偏移量，确保光标始终在可视区域内
-        // scroll_offset: 文本向左滚动的距离（正数表示文本向左移动）
-        let mut scroll_offset: Pixels;
-
-        if !is_empty && text_width > visible_width {
-            // 文本超出可视区域，需要滚动
-            // 计算光标相对于可视区域的右侧位置
-            let cursor_right = cursor_pos + px(2.0); // 2px 光标宽度
-
-            // 基础滚动量：让光标位置在可视区域内
-            // 我们希望：cursor_pos - scroll_offset 在 [0, visible_width] 范围内
-            if cursor_right > visible_width {
-                // 光标超出右边界，需要向左滚动（增大 scroll_offset）
-                scroll_offset = (cursor_right - visible_width + px(4.0)).max(px(0.0));
+            // 限制滚动范围：确保 scroll_offset.x 永远是负数或 0
+            let max_scroll = if text_width > visible_width {
+                visible_width - text_width
             } else {
-                scroll_offset = px(0.0);
-            }
+                px(0.)
+            };
+            scroll_offset.x = scroll_offset.x.clamp(max_scroll, px(0.));
 
-            // 同时检查左边界
-            if cursor_pos < scroll_offset {
-                // 光标超出左边界，需要向右滚动（减小 scroll_offset）
-                scroll_offset = cursor_pos.max(px(0.0));
-            }
-
-            // 限制最大滚动量，确保不显示空白
-            let max_scroll = (text_width - visible_width).max(px(0.0));
-            scroll_offset = scroll_offset.min(max_scroll);
+            // 计算光标边界
+            // 光标位置 = 文本原点 + 光标在文本中的位置
+            // 文本原点 = bounds.left() + scroll_offset.x (scroll_offset.x 是负数)
+            // 光标在文本中的位置 = cursor_x
+            let quad = fill(
+                Bounds::new(
+                    point(bounds.left() + scroll_offset.x + cursor_x, cursor_y),
+                    size(CURSOR_WIDTH, cursor_height),
+                ),
+                rgb(0x3b82f6),
+            );
+            (Some(quad), scroll_offset)
         } else {
-            // 文本未超出区域，不需要滚动
-            scroll_offset = px(0.0);
-        }
+            (None, input.scroll_handle.offset())
+        };
 
-        // 仅在 scroll_offset 变化时更新，避免不必要的重绘
-        if input.scroll_offset != scroll_offset {
-            self.input.update(cx, |input, _cx| {
-                input.scroll_offset = scroll_offset;
-            });
-        }
+        // 计算选择区域
+        // 选择区域也在同样的坐标系中
+        let selection = if !selected_range.is_empty() {
+            Some(fill(
+                Bounds::from_corners(
+                    Point::new(
+                        bounds.left() + cursor_scroll_offset.x + line.x_for_index(selected_range.start),
+                        bounds.top(),
+                    ),
+                    Point::new(
+                        bounds.left() + cursor_scroll_offset.x + line.x_for_index(selected_range.end),
+                        bounds.bottom(),
+                    ),
+                ),
+                rgba(0x3b82f640),
+            ))
+        } else {
+            None
+        };
 
-        // 计算应用滚动后的文本边界
-        // scroll_offset 是文本向左滚动的距离，所以文本原点是向左偏移
+        // 计算文本边界（应用滚动后的）
         let text_bounds = Bounds::new(
-            Point::new(bounds.left() - scroll_offset, bounds.top()),
+            Point::new(bounds.left() + cursor_scroll_offset.x, bounds.top()),
             bounds.size,
         );
 
-        let (selection, cursor_quad) = if selected_range.is_empty() {
-            (
-                None,
-                if is_focused && cursor_visible {
-                    // 计算光标高度（基于字体大小，与字符高度相近）
-                    let font_size = style.font_size.to_pixels(window.rem_size());
-                    let cursor_height = font_size * 1.2; // 略大于字体大小
-                    let cursor_y =
-                        bounds.top() + (bounds.bottom() - bounds.top() - cursor_height) / 2.0; // 垂直居中
-                    Some(fill(
-                        Bounds::new(
-                            Point::new(text_bounds.left() + cursor_pos, cursor_y),
-                            size(px(2.), cursor_height),
-                        ),
-                        rgb(0x3b82f6), // 蓝色光标
-                    ))
-                } else {
-                    None
-                },
-            )
-        } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        Point::new(
-                            text_bounds.left() + line.x_for_index(selected_range.start),
-                            bounds.top(),
-                        ),
-                        Point::new(
-                            text_bounds.left() + line.x_for_index(selected_range.end),
-                            bounds.bottom(),
-                        ),
-                    ),
-                    rgba(0x3b82f640), // 半透明蓝色选择背景
-                )),
-                None,
-            )
-        };
-
         InputPrepaintState {
             line: Some(line),
-            cursor: cursor_quad,
+            cursor: cursor_bounds,
             selection,
             text_bounds,
+            scroll_size,
+            cursor_scroll_offset,
         }
     }
 
@@ -943,29 +1031,23 @@ impl Element for InputTextElement {
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
 
-        // 注册输入处理
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
 
-        // 使用 text_bounds 绘制文本（应用滚动偏移）
-        let text_bounds = prepaint.text_bounds;
-
         // 绘制选择背景
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
 
-        // 从 prepaint 获取 line 以便后续保存
         let line = prepaint.line.take().unwrap();
 
-        // 使用 content mask 裁剪文本，防止溢出到输入框外
+        // 使用 content mask 裁剪文本
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            // 绘制文本（在 text_bounds 位置，即应用了滚动偏移）
             line.paint(
-                text_bounds.origin,
+                prepaint.text_bounds.origin,
                 window.line_height(),
                 TextAlign::Left,
                 None,
@@ -977,7 +1059,6 @@ impl Element for InputTextElement {
 
         // 绘制光标（在 content mask 外绘制，确保光标不会被裁剪）
         if let Some(cursor) = prepaint.cursor.take() {
-            // 确保光标在可视区域内才绘制
             let cursor_right = cursor.bounds.right();
             let cursor_left = cursor.bounds.left();
             if cursor_left >= bounds.left() - px(2.0) && cursor_right <= bounds.right() + px(2.0) {
@@ -985,10 +1066,14 @@ impl Element for InputTextElement {
             }
         }
 
-        // 保存布局信息用于鼠标点击定位（使用原始 bounds，不包含滚动偏移）
+        // 保存布局信息
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_size = prepaint.scroll_size;
+            input.input_bounds = bounds;
+            // 直接使用 prepaint 中计算出的滚动偏移来更新 scroll_handle
+            input.scroll_handle.set_offset(prepaint.cursor_scroll_offset);
         });
     }
 }
@@ -1003,21 +1088,22 @@ impl Render for Input {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_focused = self.focus_handle.is_focused(_window);
 
-        // 失焦时停止光标闪烁
         if !is_focused && self.blinking_started {
             self.stop_blinking(cx);
         }
 
         div()
+            .w_full()
             .flex()
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
-            // Input 内部 actions
             .on_action(cx.listener(Input::backspace))
             .on_action(cx.listener(Input::delete))
             .on_action(cx.listener(Input::left))
             .on_action(cx.listener(Input::right))
+            .on_action(cx.listener(Input::select_left))
+            .on_action(cx.listener(Input::select_right))
             .on_action(cx.listener(Input::select_all))
             .on_action(cx.listener(Input::home))
             .on_action(cx.listener(Input::end))
@@ -1027,6 +1113,7 @@ impl Render for Input {
             .on_mouse_down(MouseButton::Left, cx.listener(Input::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Input::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Input::on_mouse_up))
+            .on_mouse_move(cx.listener(Input::on_mouse_move))
             .child(
                 div()
                     .w_full()
@@ -1045,6 +1132,7 @@ impl Render for Input {
                     })
                     .bg(rgb(0x13131f))
                     .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(Input::on_scroll_wheel))
                     .child(InputTextElement { input: cx.entity() })
                     .when(self.mask_toggle, |this| {
                         let input_entity = cx.entity();
