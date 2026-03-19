@@ -546,6 +546,12 @@ impl Focusable for SettingsHubView {
 
 impl SettingsHubView {
     /// Toggle the right sidebar visibility with animation
+    fn open_right_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.right_sidebar_visible = true;
+        self.right_sidebar_rendered = true;
+        cx.notify();
+    }
+
     pub fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
         if self.right_sidebar_visible {
             // 关闭侧边栏：先播放退出动画，然后隐藏
@@ -564,10 +570,7 @@ impl SettingsHubView {
             })
             .detach();
         } else {
-            // 打开侧边栏：立即渲染并播放入场动画
-            self.right_sidebar_visible = true;
-            self.right_sidebar_rendered = true;
-            cx.notify();
+            self.open_right_sidebar(cx);
         }
     }
 
@@ -580,16 +583,10 @@ impl SettingsHubView {
 
     /// Open sidebar for editing a host
     pub fn edit_host(&mut self, config: &SshConnectionConfig, cx: &mut Context<Self>) {
-        // Reset form first to clear any previous state
         self.host_form.update(cx, |form, cx| {
-            form.reset_form(cx);
             form.load_config(config, cx);
         });
-
-        // Open sidebar
-        self.right_sidebar_visible = true;
-        self.right_sidebar_rendered = true;
-        cx.notify();
+        self.open_right_sidebar(cx);
     }
 }
 

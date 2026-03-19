@@ -134,7 +134,9 @@ impl HostForm {
             input.set_text(&config.username, cx);
         });
 
-        // Set auth type based on auth method
+        // Clear auth fields first, then set based on auth method
+        self.password_input.update(cx, |input, cx| input.clear(cx));
+        self.key_path_input.update(cx, |input, cx| input.clear(cx));
         match config.auth_method {
             AuthMethod::Password { ref password } => {
                 self.auth_type = AuthType::Password;
@@ -145,7 +147,7 @@ impl HostForm {
             AuthMethod::PrivateKey { ref path, .. } => {
                 self.auth_type = AuthType::PrivateKey;
                 self.key_path_input.update(cx, |input, cx| {
-                    let path_str = path.to_string_lossy().to_string();
+                    let path_str = path.to_string_lossy().into_owned();
                     input.set_text(path_str, cx);
                 });
             }
@@ -175,10 +177,7 @@ impl HostForm {
             input.set_text("22", cx);
         });
         self.username_input.update(cx, |input, cx| {
-            let default_username = std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| String::new());
-            input.set_text(&default_username, cx);
+            input.set_text(&get_current_username().unwrap_or_default(), cx);
         });
         self.password_input.update(cx, |input, cx| {
             input.clear(cx);
