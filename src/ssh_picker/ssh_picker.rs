@@ -5,8 +5,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Render, Styled, Window, actions, div, px, rgb, svg,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Render, Styled, Window, actions, div, px, rems, rgb, svg,
 };
 
 use crate::assets::Icon;
@@ -523,15 +523,20 @@ impl Render for SshPicker {
                             })
                             // Host 区域
                             .child(Self::render_section_label("Host", None))
-                            // 服务器列表
-                            .child(div().pb(px(8.0)).children(
-                                self.filtered_indices.iter().enumerate().map(
-                                    |(item_index, &config_index)| {
-                                        self.render_list_item(item_index, config_index, cx)
-                                            .into_any_element()
-                                    },
-                                ),
-                            ))
+                            // 服务器列表 - 限制最大高度并启用滚动
+                            .child(
+                                div()
+                                    .pb(px(8.0))
+                                    .id("ssh-hosts-list")
+                                    .max_h(rems(16.))
+                                    .overflow_y_scroll()
+                                    .children(self.filtered_indices.iter().enumerate().map(
+                                        |(item_index, &config_index)| {
+                                            self.render_list_item(item_index, config_index, cx)
+                                                .into_any_element()
+                                        },
+                                    )),
+                            )
                             // 空列表提示（当 Quick connect 和 Host 都为空时）
                             .when(
                                 !self.local_terminal_matches && self.filtered_indices.is_empty(),
