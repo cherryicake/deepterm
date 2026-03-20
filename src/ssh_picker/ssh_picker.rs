@@ -166,7 +166,8 @@ fn scan_unix_terminals() -> Vec<LocalTerminalOption> {
         if let Ok(output) = std::process::Command::new("which").arg(shell).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
+                // 避免重复添加已存在的 shell
+                if !path.is_empty() && !options.iter().any(|opt| opt.command == path) {
                     options.push(LocalTerminalOption::new(
                         shell.to_string(),
                         path,
