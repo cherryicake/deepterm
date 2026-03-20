@@ -746,10 +746,19 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
+        let cols = bounds.num_columns();
+        let rows = bounds.num_lines();
+
+        // Guard against invalid resize dimensions
+        if cols == 0 || rows == 0 {
+            log::warn!("Skipping resize with invalid dimensions: {}x{}", cols, rows);
+            return;
+        }
+
         self.terminal_bounds = bounds;
 
-        let cols = bounds.num_columns() as u16;
-        let rows = bounds.num_lines() as u16;
+        let cols_u16 = cols as u16;
+        let rows_u16 = rows as u16;
 
         // 本地终端：通过 sender 发送 resize 消息
         if let Some(ref sender) = self.sender {
@@ -759,13 +768,13 @@ impl Terminal {
 
         // 远程终端：通过回调通知 SSH 通道调整窗口大小
         if let Some(ref callback) = self.remote_resize_callback {
-            callback(cols, rows);
+            callback(cols_u16, rows_u16);
         }
 
         let mut term = self.term.lock();
         term.resize(alacritty_terminal::term::test::TermSize::new(
-            bounds.num_columns(),
-            bounds.num_lines(),
+            cols,
+            rows,
         ));
 
         drop(term);

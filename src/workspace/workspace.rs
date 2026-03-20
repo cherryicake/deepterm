@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use gpui::{actions, prelude::*, KeyBinding};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Subscription,
-    Window, div, px, rgb,
+    div, px, rgb, App, Context, Element, Entity, FocusHandle, Focusable, GlobalElementId,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
+    Styled, Subscription, Window,
 };
-use gpui::{KeyBinding, actions, prelude::*};
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
 /// (workspace_id, panel_id, input_data)
@@ -14,12 +15,12 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::GlobalSshPicker;
-use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::components::tab_bar::{DraggedTab, TabBar, TabItem, HOSTS_HUB_TAB_ID};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
+use crate::GlobalSshPicker;
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
@@ -115,6 +116,17 @@ pub struct Workspace {
     panel_subscriptions: HashMap<String, Subscription>,
     /// Workspace唯一标识
     workspace_id: String,
+    /// Resize拖拽状态
+    resize_drag: Option<ResizeDragState>,
+}
+
+/// Resize拖拽状态
+#[derive(Clone)]
+struct ResizeDragState {
+    handle_path: Vec<usize>,
+    handle_index: usize,
+    start_pos: Pixels,
+    is_horizontal: bool,
 }
 
 impl Workspace {
@@ -191,6 +203,7 @@ impl Workspace {
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
                 workspace_id,
+                resize_drag: None,
             };
 
             // 在创建时完成所有初始化
@@ -1127,13 +1140,32 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 递归渲染分割容器
-    fn render_split_container(&self, container: &SplitContainer, cx: &Context<Self>) -> gpui::Div {
+    fn start_resize(
+        &mut self,
+        handle_path: Vec<usize>,
+        handle_index: usize,
+        start_pos: Pixels,
+        is_horizontal: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.resize_drag = Some(ResizeDragState {
+            handle_path,
+            handle_index,
+            start_pos,
+            is_horizontal,
+        });
+    }
+
+    /// 递归渲染分割容器，支持 resize handle
+    fn render_split_container(
+        &self,
+        container: &SplitContainer,
+        path: &[usize],
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         match container {
-            SplitContainer::Panel(panel) => {
-                // 为每个panel添加padding和圆角容器
-                div().size_full().child(panel.clone())
-            }
+            SplitContainer::Panel(panel) => div().size_full().child(panel.clone()),
             SplitContainer::Split {
                 direction,
                 children,
@@ -1141,16 +1173,76 @@ impl Workspace {
             } => {
                 let is_horizontal = *direction == SplitDirection::Horizontal;
 
+                let mut elements: Vec<gpui::AnyElement> = Vec::new();
+
+                for (i, child) in children.iter().enumerate() {
+                    let size = sizes.get(i).copied().unwrap_or(1.0);
+                    let child_path: Vec<usize> =
+                        path.iter().copied().chain(std::iter::once(i)).collect();
+
+                    let child_element = div()
+                        .flex_basis(gpui::DefiniteLength::Fraction(size.into()))
+                        .flex_shrink()
+                        .child(self.render_split_container(child, &child_path, cx))
+                        .into_any_element();
+
+                    elements.push(child_element);
+
+                    if i < children.len() - 1 {
+                        let handle_path = path.to_vec();
+                        let handle_index = i;
+                        let is_horizontal_for_handler = is_horizontal;
+
+                        let resize_div = div()
+                            .when(is_horizontal, |this| {
+                                this.w(px(8.0)).h_full().cursor_col_resize()
+                            })
+                            .when(!is_horizontal, |this| {
+                                this.h(px(8.0)).w_full().cursor_row_resize()
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .when(is_horizontal, |this| this.w(px(1.0)).h(px(24.0)))
+                                    .when(!is_horizontal, |this| this.h(px(1.0)).w(px(24.0)))
+                                    .bg(rgb(0x3d3d5c))
+                                    .rounded_sm(),
+                            )
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(
+                                    move |this: &mut Self,
+                                          event: &gpui::MouseDownEvent,
+                                          window,
+                                          cx| {
+                                        this.start_resize(
+                                            handle_path.clone(),
+                                            handle_index,
+                                            if is_horizontal_for_handler {
+                                                event.position.x
+                                            } else {
+                                                event.position.y
+                                            },
+                                            is_horizontal_for_handler,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ),
+                            );
+
+                        elements.push(resize_div.into_any_element());
+                    }
+                }
+
                 div()
                     .size_full()
                     .flex()
-                    .gap(px(6.0))
                     .when(is_horizontal, |this| this.flex_row())
                     .when(!is_horizontal, |this| this.flex_col())
-                    .children(children.iter().enumerate().map(|(i, child)| {
-                        let _size = sizes.get(i).copied().unwrap_or(1.0);
-                        div().flex_1().child(self.render_split_container(child, cx))
-                    }))
+                    .children(elements)
             }
         }
     }
@@ -1186,12 +1278,18 @@ impl Render for Workspace {
             }
         }
 
+        // 自定义 Element 用于全局鼠标事件捕获
+        let resize_handler = ResizeHandlerElement {
+            workspace: cx.entity().downgrade(),
+        };
+
         div()
             .id("workspace")
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(0x0f0f1a))
+            .child(resize_handler)
             // 内容区域 - 只渲染当前活动tab对应的panel(s)
             .child(
                 div()
@@ -1200,7 +1298,7 @@ impl Render for Workspace {
                     .pr(px(6.0))
                     .pb(px(6.0))
                     .when_some(active_container, |this, container| {
-                        this.child(self.render_split_container(container, cx))
+                        this.child(self.render_split_container(container, &[], cx))
                     }),
             )
             .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
@@ -1209,5 +1307,115 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
                 this.close_selected_panel(window, cx);
             }))
+    }
+}
+
+/// 全局 resize 处理元素 - 在 paint 阶段注册全局鼠标事件
+struct ResizeHandlerElement {
+    workspace: gpui::WeakEntity<Workspace>,
+}
+
+impl Element for ResizeHandlerElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (window.request_layout(Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> () {
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint_state: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        // 全局鼠标移动事件 - 处理 resize 拖拽
+        window.on_mouse_event({
+            let workspace = workspace.clone();
+            move |event: &MouseMoveEvent, _phase, _window, cx: &mut App| {
+                workspace.update(cx, |this, cx| {
+                    if let Some(ref mut drag_state) = this.resize_drag {
+                        let current_pos = if drag_state.is_horizontal {
+                            event.position.x
+                        } else {
+                            event.position.y
+                        };
+                        let delta = current_pos - drag_state.start_pos;
+                        let delta_f32: f32 = delta.into();
+                        let delta_ratio = if drag_state.is_horizontal {
+                            delta_f32 / 800.0
+                        } else {
+                            delta_f32 / 600.0
+                        };
+
+                        if let Some(tab_info) = this.tabs.get_mut(&this.active_tab_id) {
+                            let resized = tab_info.container.resize_at_path(
+                                &drag_state.handle_path,
+                                drag_state.handle_index,
+                                delta_ratio,
+                                0.1,
+                            );
+                            if resized {
+                                drag_state.start_pos = current_pos;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // 全局鼠标释放事件 - 结束 resize 拖拽
+        window.on_mouse_event({
+            let workspace = workspace.clone();
+            move |_: &MouseUpEvent, _phase, _window, cx: &mut App| {
+                workspace.update(cx, |this, cx| {
+                    if this.resize_drag.is_some() {
+                        this.resize_drag = None;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+    }
+}
+
+impl IntoElement for ResizeHandlerElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
     }
 }

@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Window,
-    div,
+    div, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
+    Window,
 };
 
 use crate::workspace::panel::{Panel, PanelPlacement};
@@ -289,6 +289,59 @@ impl SplitContainer {
             SplitContainer::Panel(panel) => panel.read(cx).panel_id() == panel_id,
             SplitContainer::Split { children, .. } => {
                 children.iter().any(|c| c.contains_panel(panel_id, cx))
+            }
+        }
+    }
+
+    /// 调整子容器的尺寸比例
+    pub fn resize_child(&mut self, child_index: usize, delta: f32, min_size: f32) -> bool {
+        match self {
+            SplitContainer::Panel(_) => false,
+            SplitContainer::Split {
+                sizes, children, ..
+            } => {
+                if children.len() < 2 || child_index >= children.len() - 1 {
+                    return false;
+                }
+
+                let current_left = sizes.get(child_index).copied().unwrap_or(1.0);
+                let current_right = sizes.get(child_index + 1).copied().unwrap_or(1.0);
+
+                let new_left = current_left + delta;
+                let new_right = current_right - delta;
+
+                if new_left < min_size || new_right < min_size {
+                    return false;
+                }
+
+                sizes[child_index] = new_left;
+                sizes[child_index + 1] = new_right;
+
+                true
+            }
+        }
+    }
+
+    /// 通过路径递归调整子容器尺寸
+    pub fn resize_at_path(
+        &mut self,
+        path: &[usize],
+        child_index: usize,
+        delta: f32,
+        min_size: f32,
+    ) -> bool {
+        if path.is_empty() {
+            return self.resize_child(child_index, delta, min_size);
+        }
+
+        match self {
+            SplitContainer::Panel(_) => false,
+            SplitContainer::Split { children, .. } => {
+                let idx = path[0];
+                if idx >= children.len() {
+                    return false;
+                }
+                children[idx].resize_at_path(&path[1..], child_index, delta, min_size)
             }
         }
     }
