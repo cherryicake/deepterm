@@ -94,12 +94,18 @@ impl Render for AppWindow {
 
 fn main() {
     // 初始化文件日志
-    let _ = std::fs::remove_file("/tmp/deepterm.log");
+    let log_path = if cfg!(windows) {
+        std::env::temp_dir().join("deepterm.log")
+    } else {
+        std::path::PathBuf::from("/tmp/deepterm.log")
+    };
+    
+    let _ = std::fs::remove_file(&log_path);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("/tmp/deepterm.log")
+        .open(&log_path)
         .expect("无法创建日志文件");
 
     env_logger::Builder::from_default_env()

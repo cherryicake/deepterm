@@ -119,8 +119,16 @@ impl Render for TitleBar {
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
                 this.child(
                     div()
-                        .flex_shrink_0()
-                        .max_w_full()
+                        .flex_shrink()
+                        .min_w_0() // 允许收缩到 0 宽度
+                        // 让 TabBar 可以收缩，但不会挤压窗口控制按钮
+                        .when(!is_macos && !is_web, |div| {
+                            div.mr(px(0.)) // 右边距留出窗口控制按钮空间
+                        })
+                        // macOS: 不需要留出空间，使用系统控制按钮
+                        .when(is_macos || is_web, |div| {
+                            div.max_w_full()
+                        })
                         // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
                         .on_mouse_down(
                             MouseButton::Left,
@@ -192,26 +200,87 @@ impl Render for TitleBar {
                         )
                     }),
             )
-            // 关闭窗口按钮 (仅 Windows/Linux)
+            // 窗口控制按钮组 (仅 Windows/Linux)
             .when(!is_macos && !is_web, |this| {
                 this.child(
                     div()
-                        .id("close-btn")
                         .flex()
-                        .w(TITLE_BAR_HEIGHT)
+                        .flex_row()
                         .h_full()
                         .flex_shrink_0()
-                        .justify_center()
-                        .items_center()
-                        .text_color(gpui::rgb(0xcccccc))
-                        .hover(|style| style.bg(gpui::rgb(0xe74c3c)))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.quit();
-                        }))
-                        .child("×"),
+                        // 最小化按钮
+                        .child(
+                            div()
+                                .id("minimize-btn")
+                                .flex()
+                                .w(TITLE_BAR_HEIGHT)
+                                .h_full()
+                                .justify_center()
+                                .items_center()
+                                .hover(|style| style.bg(gpui::rgb(0x3d3d5c)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|_, _, window, _| {
+                                    window.minimize_window();
+                                }))
+                                .child(
+                                    gpui::svg()
+                                        .size(px(16.))
+                                        .text_color(gpui::rgb(0x8888aa))
+                                        .path(crate::assets::Icon::WindowMinimize.path()),
+                                ),
+                        )
+                        // 最大化/恢复按钮
+                        .child(
+                            div()
+                                .id("maximize-btn")
+                                .flex()
+                                .w(TITLE_BAR_HEIGHT)
+                                .h_full()
+                                .justify_center()
+                                .items_center()
+                                .hover(|style| style.bg(gpui::rgb(0x3d3d5c)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|_, _, window, _| {
+                                    window.zoom_window();
+                                }))
+                                .child(
+                                    gpui::svg()
+                                        .size(px(16.))
+                                        .text_color(gpui::rgb(0x8888aa))
+                                        .path(if window.is_maximized() {
+                                            crate::assets::Icon::WindowRestore.path()
+                                        } else {
+                                            crate::assets::Icon::WindowMaximize.path()
+                                        }),
+                                ),
+                        )
+                        // 关闭按钮
+                        .child(
+                            div()
+                                .id("close-btn")
+                                .flex()
+                                .w(TITLE_BAR_HEIGHT)
+                                .h_full()
+                                .justify_center()
+                                .items_center()
+                                .hover(|style| style.bg(gpui::rgb(0xe74c3c)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.quit();
+                                }))
+                                .child(
+                                    gpui::svg()
+                                        .size(px(16.))
+                                        .text_color(gpui::rgb(0x8888aa))
+                                        .path(crate::assets::Icon::WindowClose.path()),
+                                ),
+                        ),
                 )
             })
     }

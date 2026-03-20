@@ -1,4 +1,3 @@
-use gpui::prelude::*;
 use gpui::{
     div, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
     Window,
@@ -53,7 +52,7 @@ impl SplitContainer {
     }
 
     /// 获取Panel实体
-    pub fn get_panel_entity(&self, cx: &App) -> Option<Entity<Panel>> {
+    pub fn get_panel_entity(&self, _cx: &App) -> Option<Entity<Panel>> {
         match self {
             SplitContainer::Panel(panel) => Some(panel.clone()),
             _ => None,

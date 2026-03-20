@@ -861,7 +861,7 @@ impl Element for InputTextElement {
                 None,
             );
 
-            if placeholder_line.width() > max_width {
+            if placeholder_line.width > max_width {
                 let mut truncated = placeholder.to_string();
                 while !truncated.is_empty() {
                     let test_text = format!("{}{}", truncated, ellipsis);
@@ -879,7 +879,7 @@ impl Element for InputTextElement {
                         &[test_run],
                         None,
                     );
-                    if test_line.width() <= max_width {
+                    if test_line.width <= max_width {
                         truncated.push_str(ellipsis);
                         break;
                     }
@@ -947,7 +947,7 @@ impl Element for InputTextElement {
             .text_system()
             .shape_line(display_text.clone(), font_size, &runs, None);
 
-        let text_width = line.width();
+        let text_width = line.width;
         let scroll_size = gpui::Size {
             width: text_width,
             height: window.line_height(),
