@@ -127,6 +127,8 @@ struct ResizeDragState {
     handle_index: usize,
     start_pos: Pixels,
     is_horizontal: bool,
+    /// 拖拽开始时该层容器 sizes 的总和，用于正确换算像素→flex 比例
+    sizes_sum: f32,
 }
 
 impl Workspace {
@@ -1146,14 +1148,14 @@ impl Workspace {
         handle_index: usize,
         start_pos: Pixels,
         is_horizontal: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        sizes_sum: f32,
     ) {
         self.resize_drag = Some(ResizeDragState {
             handle_path,
             handle_index,
             start_pos,
             is_horizontal,
+            sizes_sum,
         });
     }
 
@@ -1191,7 +1193,7 @@ impl Workspace {
                     if i < children.len() - 1 {
                         let handle_path = path.to_vec();
                         let handle_index = i;
-                        let is_horizontal_for_handler = is_horizontal;
+                        let sizes_sum: f32 = sizes.iter().sum();
 
                         let resize_div = div()
                             .when(is_horizontal, |this| {
@@ -1215,19 +1217,18 @@ impl Workspace {
                                 cx.listener(
                                     move |this: &mut Self,
                                           event: &gpui::MouseDownEvent,
-                                          window,
-                                          cx| {
+                                          _window,
+                                          _cx| {
                                         this.start_resize(
                                             handle_path.clone(),
                                             handle_index,
-                                            if is_horizontal_for_handler {
+                                            if is_horizontal {
                                                 event.position.x
                                             } else {
                                                 event.position.y
                                             },
-                                            is_horizontal_for_handler,
-                                            window,
-                                            cx,
+                                            is_horizontal,
+                                            sizes_sum,
                                         );
                                     },
                                 ),
@@ -1366,7 +1367,7 @@ impl Element for ResizeHandlerElement {
         // 全局鼠标移动事件 - 处理 resize 拖拽
         window.on_mouse_event({
             let workspace = workspace.clone();
-            move |event: &MouseMoveEvent, _phase, _window, cx: &mut App| {
+            move |event: &MouseMoveEvent, _phase, window, cx: &mut App| {
                 workspace.update(cx, |this, cx| {
                     if let Some(ref mut drag_state) = this.resize_drag {
                         let current_pos = if drag_state.is_horizontal {
@@ -1376,11 +1377,15 @@ impl Element for ResizeHandlerElement {
                         };
                         let delta = current_pos - drag_state.start_pos;
                         let delta_f32: f32 = delta.into();
-                        let delta_ratio = if drag_state.is_horizontal {
-                            delta_f32 / 800.0
+                        let viewport = window.viewport_size();
+                        let container_size: f32 = if drag_state.is_horizontal {
+                            viewport.width.into()
                         } else {
-                            delta_f32 / 600.0
+                            viewport.height.into()
                         };
+                        // 正确换算：delta_ratio × (container_size / sizes_sum) = delta_pixels
+                        // 即 panel 实际像素变化 = delta_pixels，分割条与光标完全同步
+                        let delta_ratio = delta_f32 * drag_state.sizes_sum / container_size;
 
                         if let Some(tab_info) = this.tabs.get_mut(&this.active_tab_id) {
                             let resized = tab_info.container.resize_at_path(
@@ -1391,6 +1396,7 @@ impl Element for ResizeHandlerElement {
                             );
                             if resized {
                                 drag_state.start_pos = current_pos;
+                                cx.notify();
                             }
                         }
                     }
