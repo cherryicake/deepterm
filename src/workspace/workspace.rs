@@ -3,9 +3,9 @@ use std::sync::{Mutex, OnceLock};
 
 use gpui::{actions, prelude::*, KeyBinding};
 use gpui::{
-    div, px, rgb, App, Context, Element, Entity, FocusHandle, Focusable, GlobalElementId,
-    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
-    Styled, Subscription, Window,
+    div, px, rgb, App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable,
+    GlobalElementId, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, Style, Styled, Subscription, Window,
 };
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
@@ -1363,6 +1363,16 @@ impl Element for ResizeHandlerElement {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+
+        // 拖拽中全局覆盖光标样式，保持 resize 光标不变
+        if let Some(drag_state) = workspace.read(cx).resize_drag.as_ref() {
+            let cursor = if drag_state.is_horizontal {
+                CursorStyle::ResizeColumn
+            } else {
+                CursorStyle::ResizeRow
+            };
+            window.set_window_cursor_style(cursor);
+        }
 
         // 全局鼠标移动事件 - 处理 resize 拖拽
         window.on_mouse_event({
