@@ -2,15 +2,28 @@
 
 use gpui::{
     BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, IntoElement, LayoutId, Pixels, Point,
-    Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels,
+    Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 use itertools::Itertools;
 
 use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
+use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::TerminalView;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
+
+/// 盒子绘制字符 / 块元素单元格。
+///
+/// 对于 U+2500–U+259F 范围内的字符，不走字体光栅化流程，
+/// 而是在 `paint` 阶段用 GPUI 矩形图元直接绘制，
+/// 以保证相邻单元格的线条精确对齐（不受字体字形影响）。
+pub struct BoxDrawingCell {
+    pub col: usize,
+    pub row: usize,
+    pub c: char,
+    pub color: Hsla, // 该字符的前景色（已处理 INVERSE 反色标志）
+}
 
 /// CursorLayout - simplified implementation inspired by Zed's CursorLayout
 /// Computed during prepaint phase, rendered during paint phase
@@ -166,14 +179,15 @@ impl TerminalElement {
         font_size: Pixels,
         _visible_line_start: usize,
         _visible_line_count: usize,
-    ) -> Vec<BatchedTextRun> {
+    ) -> (Vec<BatchedTextRun>, Vec<BoxDrawingCell>) {
         let estimated_cells = grid.size_hint().0;
         if estimated_cells == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let estimated_runs = (estimated_cells / 10).max(16);
         let mut batched_runs = Vec::with_capacity(estimated_runs);
+        let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
         let mut current_batch: Option<BatchedTextRun> = None;
 
         let line_groups = grid.into_iter().chunk_by(|cell| cell.point.line);
@@ -207,6 +221,22 @@ impl TerminalElement {
                 } else {
                     (&cell.cell.fg, &cell.cell.bg)
                 };
+
+                // 盒子绘制字符 / 块元素（U+2500–U+259F）：
+                // 跳过字体渲染，收集到 box_cells 中，稍后在 paint 阶段
+                // 用 GPUI 矩形图元直接绘制，确保相邻单元格边框线条无缝对接。
+                if box_drawing::is_box_drawing_char(ch) {
+                    if let Some(batch) = current_batch.take() {
+                        batched_runs.push(batch);
+                    }
+                    box_cells.push(BoxDrawingCell {
+                        col: cell.point.column.0,
+                        row,
+                        c: ch,
+                        color: convert_alacritty_color(fg),
+                    });
+                    continue;
+                }
 
                 let cell_style = TextRun {
                     len: ch.len_utf8(),
@@ -284,7 +314,7 @@ impl TerminalElement {
             batched_runs.push(batch);
         }
 
-        batched_runs
+        (batched_runs, box_cells)
     }
 }
 
@@ -300,6 +330,7 @@ impl Element for TerminalElement {
     type RequestLayoutState = ();
     type PrepaintState = (
         Vec<BatchedTextRun>,
+        Vec<BoxDrawingCell>,
         TextStyle,
         Pixels,
         Pixels,
@@ -433,7 +464,7 @@ impl Element for TerminalElement {
         let viewport_lines = terminal_bounds.num_lines();
 
         let content = self.terminal.read(cx).last_content();
-        let batched_runs = Self::layout_grid(
+        let (batched_runs, box_cells) = Self::layout_grid(
             content.cells.iter().cloned(),
             display_offset,
             &text_style,
@@ -521,6 +552,7 @@ impl Element for TerminalElement {
 
         (
             batched_runs,
+            box_cells,
             text_style,
             cell_width,
             line_height,
@@ -546,6 +578,7 @@ impl Element for TerminalElement {
     ) {
         let (
             batched_runs,
+            box_cells,
             _text_style,
             cell_width,
             line_height,
@@ -647,6 +680,26 @@ impl Element for TerminalElement {
         // Paint batched text runs (text will appear on top of backgrounds)
         for batch in batched_runs.iter() {
             batch.paint(origin, *cell_width, *line_height, window, cx);
+        }
+
+        // 绘制内置盒子绘制字符 / 块元素。
+        // 这些字符在 layout_grid 阶段已从文本批次中分离出来，
+        // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
+        // 效果等同于 Alacritty 的 builtin_box_drawing = true：
+        // 相邻格的边框线条精确对齐，不依赖字体字形，不会出现间隙。
+        for cell in box_cells.iter() {
+            let cell_origin = point(
+                origin.x + *cell_width * cell.col as f32,
+                origin.y + *line_height * cell.row as f32,
+            );
+            box_drawing::paint_box_drawing(
+                cell.c,
+                cell_origin,
+                *cell_width,
+                *line_height,
+                cell.color,
+                window,
+            );
         }
 
         // 使用prepaint阶段计算的光标布局进行渲染
