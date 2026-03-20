@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, Render, SharedString, Styled, Window, div, point, px, rgb, svg,
+    div, point, px, rgb, svg, App, BoxShadow, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, Render, SharedString, Styled, Window,
 };
 
 use crate::assets::Icon;
@@ -158,6 +158,42 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let terminal_view = TerminalView::new(cx);
+
+        Self {
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label,
+            is_solo: false,
+            is_selected: false,
+            content: PanelContent::Terminal(terminal_view),
+            broadcast_enabled: false,
+        }
+    }
+
+    /// Creates a new panel with a terminal view using a specific command.
+    ///
+    /// # Arguments
+    ///
+    /// * `panel_id` - Unique identifier for this panel
+    /// * `workspace_id` - ID of the workspace this panel belongs to
+    /// * `active_tab_id` - ID of the currently active tab
+    /// * `active_tab_label` - Label shown in the title bar
+    /// * `command` - The command to run in the terminal
+    /// * `args` - Arguments for the command
+    /// * `cx` - The context for entity creation
+    pub fn with_terminal_command(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        command: &str,
+        args: &[String],
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let terminal_view = TerminalView::new_with_command(cx, command, args);
 
         Self {
             panel_id: panel_id.into(),

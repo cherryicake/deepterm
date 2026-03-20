@@ -1043,6 +1043,29 @@ impl Workspace {
         self.add_terminal_tab(label, panel, window, cx);
     }
 
+    /// 使用指定命令创建本地终端Tab
+    pub fn create_local_terminal_with_command(
+        &mut self,
+        command: &str,
+        args: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = self.generate_terminal_tab_name();
+        let panel = cx.new(|cx| {
+            Panel::with_terminal_command(
+                format!("panel-{}", self.next_panel_id),
+                "group-0",
+                Some(format!("tab-{}", self.next_tab_id).into()),
+                Some(label.clone().into()),
+                command,
+                args,
+                cx,
+            )
+        });
+        self.add_terminal_tab(label, panel, window, cx);
+    }
+
     /// 使用指定配置创建 SSH 终端
     pub fn create_ssh_terminal_with_config(
         &mut self,

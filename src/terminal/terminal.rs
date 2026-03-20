@@ -326,6 +326,99 @@ impl Terminal {
         })
     }
 
+    /// 使用指定命令创建新的本地终端
+    ///
+    /// # 参数
+    ///
+    /// * `cx` - GPUI 上下文
+    /// * `working_directory` - 工作目录
+    /// * `command` - 要执行的命令（如 "powershell.exe", "cmd.exe", "wsl.exe"）
+    /// * `args` - 命令参数
+    pub fn new_with_command(
+        cx: &mut App,
+        working_directory: Option<PathBuf>,
+        command: &str,
+        args: &[String],
+    ) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
+
+        let env = crate::terminal::mappings::default_terminal_env();
+
+        let pty_options = tty::Options {
+            shell: Some(tty::Shell::new(command.to_string(), args.to_vec())),
+            working_directory,
+            env,
+            ..Default::default()
+        };
+
+        let default_bounds = TerminalBounds::default();
+        let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
+            Ok(pty) => pty,
+            Err(e) => {
+                log::error!("Failed to create PTY for command '{}': {}", command, e);
+                return cx.new(|_cx| Self::create_error_terminal());
+            }
+        };
+
+        let mut config = Config::default();
+        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
+        // 设置默认光标样式为Block（块光标）
+        // 这是alacritty终端的默认光标形状，大多数终端模拟器都使用这种样式
+        config.default_cursor_style = AlacCursorStyle {
+            shape: AlacCursorShape::Block,
+            blinking: false,
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            config,
+            &default_bounds,
+            listener.clone(),
+        )));
+
+        let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
+            Ok(event_loop) => event_loop,
+            Err(e) => {
+                eprintln!("Failed to create EventLoop: {}", e);
+                return cx.new(|_cx| Self::create_error_terminal());
+            }
+        };
+
+        let notifier = event_loop.channel();
+        let _ = event_loop.spawn();
+
+        cx.new(|cx| {
+            let term_clone = term.clone();
+
+            let event_loop_task = cx.spawn(async move |this, cx| {
+                let mut events_rx = events_rx;
+                while let Some(event) = events_rx.next().await {
+                    let _ = this.update(cx, |terminal: &mut Self, cx| {
+                        terminal.process_event(event, cx);
+                    });
+                    smol::future::yield_now().await;
+                }
+            });
+
+            Self {
+                term: term_clone,
+                sender: Some(notifier),
+                last_content: TerminalContent::default(),
+                content_generation: 0,
+                content_dirty: false,
+                event_loop_task: Some(event_loop_task),
+                terminal_bounds: default_bounds,
+                selection_phase: SelectionPhase::Ended,
+                last_mouse_position: None,
+                scroll_px: px(0.0),
+                scrollbar_drag_offset: Rc::new(Cell::new(None)),
+                last_scroll_time: Cell::new(Instant::now()),
+                terminal_type: TerminalType::Local,
+                remote_input_callback: None,
+                remote_resize_callback: None,
+            }
+        })
+    }
+
     fn create_error_terminal() -> Self {
         let term = Arc::new(FairMutex::new(Term::new(
             Config::default(),

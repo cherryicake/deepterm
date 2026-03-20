@@ -89,6 +89,57 @@ impl TerminalView {
         })
     }
 
+    /// 使用指定命令创建新的本地终端
+    ///
+    /// # 参数
+    ///
+    /// * `cx` - GPUI 上下文
+    /// * `command` - 要执行的命令（如 "powershell.exe", "cmd.exe", "wsl.exe"）
+    /// * `args` - 命令参数
+    pub fn new_with_command(cx: &mut App, command: &str, args: &[String]) -> Entity<Self> {
+        let command_string = command.to_string();
+        let args_vec: Vec<String> = args.to_vec();
+        // WSL 不传递工作目录，让它默认进入 home 目录
+        let working_dir = if command.contains("wsl") {
+            None
+        } else {
+            dirs::home_dir()
+        };
+        let terminal = Terminal::new_with_command(cx, working_dir, &command_string, &args_vec);
+        let focus_handle = cx.focus_handle();
+
+        cx.new(|cx| {
+            let terminal_clone = terminal.clone();
+
+            cx.subscribe(
+                &terminal_clone,
+                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
+                    TerminalEvent::TitleChanged => {
+                        this.update_title(cx);
+                    }
+                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                        cx.notify();
+                    }
+                    TerminalEvent::Bell => {}
+                    TerminalEvent::CloseTerminal => {}
+                },
+            )
+            .detach();
+
+            let mut this = Self {
+                terminal: terminal_clone,
+                focus_handle,
+                cursor_visible: true,
+                title: command_string.into(),
+                selecting: false,
+                ime_state: None,
+                broadcast_callback: None,
+            };
+            this.update_title(cx);
+            this
+        })
+    }
+
     /// 创建新的 SSH 远程终端
     ///
     /// 优先使用 russh 连接，如果失败则回退到 PTY + ssh 命令方式
