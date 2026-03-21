@@ -5,8 +5,8 @@ use std::time::Duration;
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
-    actions, div, px,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Task, UTF16Selection,
+    Window, actions, div, px,
 };
 use gpui::{KeyBinding, prelude::*};
 
@@ -59,6 +59,8 @@ pub struct TerminalView {
     ime_state: Option<ImeState>,
     /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
     broadcast_callback: Option<BroadcastInputCallback>,
+    /// Pending scrollbar hide task - prevents spawning a new timer every render frame
+    scrollbar_hide_task: Option<Task<()>>,
 }
 
 impl TerminalView {
@@ -95,6 +97,7 @@ impl TerminalView {
                 selecting: false,
                 ime_state: None,
                 broadcast_callback: None,
+                scrollbar_hide_task: None,
             };
             this.update_title(cx);
             this
@@ -148,6 +151,7 @@ impl TerminalView {
                 selecting: false,
                 ime_state: None,
                 broadcast_callback: None,
+                scrollbar_hide_task: None,
             };
             this.update_title(cx);
             this
@@ -204,6 +208,7 @@ impl TerminalView {
                 selecting: false,
                 ime_state: None,
                 broadcast_callback: None,
+                scrollbar_hide_task: None,
             };
             this.update_title(cx);
             this
@@ -255,8 +260,9 @@ impl TerminalView {
     /// 3. Less than 2 seconds have passed since the last scroll
     pub fn should_show_scrollbar(&self, cx: &App) -> bool {
         let term = self.terminal.read(cx);
-        let total_lines = term.total_lines();
-        let viewport_lines = term.viewport_lines();
+        let content = term.last_content();
+        let total_lines = content.total_lines;
+        let viewport_lines = content.viewport_lines;
 
         // No scrollbar if no scrollable content
         if total_lines <= viewport_lines {
@@ -562,17 +568,20 @@ impl Render for TerminalView {
         let is_focused = focus_handle.is_focused(window);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
-        // Schedule a refresh to hide the scrollbar after 2 seconds
-        if show_scrollbar {
-            cx.spawn(async move |this, cx| {
+        // Schedule a refresh to hide the scrollbar after it fades out.
+        // Only spawn a new timer task if one isn't already running, to avoid
+        // accumulating one task per frame (~60/s) while the scrollbar is visible.
+        if show_scrollbar && self.scrollbar_hide_task.is_none() {
+            self.scrollbar_hide_task = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
-                this.update(cx, |_this, cx| {
+                this.update(cx, |this, cx| {
+                    this.scrollbar_hide_task = None;
                     cx.notify();
                 })
-            })
-            .detach();
+                .ok();
+            }));
         }
 
         div()

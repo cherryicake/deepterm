@@ -175,6 +175,10 @@ pub struct TerminalContent {
     pub mode: alacritty_terminal::term::TermMode,
     pub cols: usize,
     pub rows: usize,
+    /// Total lines including scrollback history (cached to avoid extra mutex lock)
+    pub total_lines: usize,
+    /// Visible viewport lines (cached to avoid extra mutex lock)
+    pub viewport_lines: usize,
 }
 
 impl Default for TerminalContent {
@@ -191,6 +195,8 @@ impl Default for TerminalContent {
             mode: alacritty_terminal::term::TermMode::default(),
             cols: 80,
             rows: 24,
+            total_lines: 24,
+            viewport_lines: 24,
         }
     }
 }
@@ -859,6 +865,9 @@ impl Terminal {
         self.last_content.mode = content.mode;
         self.last_content.cols = self.terminal_bounds.num_columns();
         self.last_content.rows = self.terminal_bounds.num_lines();
+        // Cache line counts while we already hold the lock (avoids extra mutex grabs per frame)
+        self.last_content.total_lines = term.total_lines();
+        self.last_content.viewport_lines = term.screen_lines();
     }
 
     pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {

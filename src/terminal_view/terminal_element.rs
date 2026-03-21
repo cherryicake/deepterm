@@ -11,7 +11,38 @@ use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::TerminalView;
+use alacritty_terminal::index::Point as AlacPoint;
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
+
+/// Pure helper: check if a grid point falls within the given selection range.
+/// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
+#[inline]
+fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
+    let Some(range) = range else { return false };
+    let point_line = point.line.0;
+    let point_col = point.column.0;
+
+    let (start, end) = if range.start.line <= range.end.line {
+        (range.start, range.end)
+    } else {
+        (range.end, range.start)
+    };
+
+    if point_line < start.line.0 || point_line > end.line.0 {
+        return false;
+    }
+
+    if start.line == end.line {
+        return point_col >= start.column.0 && point_col <= end.column.0;
+    }
+
+    match point_line.cmp(&start.line.0) {
+        std::cmp::Ordering::Equal => point_col >= start.column.0,
+        std::cmp::Ordering::Greater if point_line == end.line.0 => point_col <= end.column.0,
+        _ => true,
+    }
+}
 
 /// 盒子绘制字符 / 块元素单元格。
 ///
@@ -187,7 +218,9 @@ impl TerminalElement {
 
         let estimated_runs = (estimated_cells / 10).max(16);
         let mut batched_runs = Vec::with_capacity(estimated_runs);
-        let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
+        // Small initial capacity avoids realloc for typical terminal output
+        // that uses box-drawing (htop, vim, etc.) without over-allocating for plain text.
+        let mut box_cells: Vec<BoxDrawingCell> = Vec::with_capacity(32);
         let mut current_batch: Option<BatchedTextRun> = None;
 
         let line_groups = grid.into_iter().chunk_by(|cell| cell.point.line);
@@ -593,88 +626,59 @@ impl Element for TerminalElement {
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
 
-        // Get terminal content once and cache it for reuse
+        // Get terminal content and selection range once.
+        // Previously: selection_range() was called once per cell inside the loop (O(N) mutex locks).
+        // Now: one lock for the whole frame; is_point_selected() is a pure function.
         let term = self.terminal.read(cx);
         let content = term.last_content();
-
-        // Collect selection cells and check mouse mode
-        let mut selection_cells = Vec::new();
         let mouse_mode = content
             .mode
             .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
+        let selection_range = if !mouse_mode {
+            term.selection_range()
+        } else {
+            None
+        };
 
-        if !mouse_mode {
-            for cell in content.cells.iter() {
-                if term.is_cell_selected(&cell.point) {
-                    selection_cells.push(cell.point);
-                }
-            }
-        }
+        // Single pass over cells (previously 3 separate iterations + a HashMap):
+        // For each display line we compute the y-offset from the enumerate index, then
+        // in one scan handle both selection backgrounds and non-default cell backgrounds.
+        {
+            let line_groups = content.cells.iter().chunk_by(|cell| cell.point.line);
+            for (visible_row, (_, line_cells)) in line_groups.into_iter().enumerate() {
+                let cell_y = bounds.top() + *line_height * visible_row as f32;
 
-        // Build a map of cell positions to their visible row index
-        let mut cell_to_visible_row: std::collections::HashMap<(i32, usize), usize> =
-            std::collections::HashMap::new();
-        let line_groups = content.cells.iter().chunk_by(|cell| cell.point.line);
-        for (visible_row, (line_idx, line_cells)) in line_groups.into_iter().enumerate() {
-            for cell in line_cells {
-                cell_to_visible_row.insert((line_idx.0, cell.point.column.0), visible_row);
-            }
-        }
+                for cell in line_cells {
+                    // Selection background
+                    if is_point_selected(&cell.point, &selection_range) {
+                        let cell_x =
+                            bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
+                        window.paint_quad(fill(
+                            Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height)),
+                            gpui::rgb(0x4a4a6a),
+                        ));
+                    }
 
-        // Paint selection backgrounds first (only if not in mouse mode)
-        if !mouse_mode {
-            for cell_point in &selection_cells {
-                if let Some(&visible_row) = cell_to_visible_row
-                    .get(&(cell_point.line.0, cell_point.column.0))
-                {
-                    let cell_x =
-                        bounds.left() + px(4.0) + *cell_width * cell_point.column.0 as f32;
-                    let cell_y = bounds.top() + *line_height * visible_row as f32;
-
-                    let cell_bounds =
-                        Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
-
-                    window.paint_quad(fill(cell_bounds, gpui::rgb(0x4a4a6a)));
-                }
-            }
-        }
-
-        // Paint cell backgrounds first (for cells with non-default background)
-        for cell in content.cells.iter() {
-                // Handle INVERSE flag: when set, foreground becomes background
-                let is_inverse = cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::INVERSE);
-
-                let bg = if is_inverse {
-                    &cell.cell.fg
-                } else {
-                    &cell.cell.bg
-                };
-
-                let bg_color = if bg != &alacritty_terminal::vte::ansi::Color::Named(
-                    alacritty_terminal::vte::ansi::NamedColor::Background,
-                ) {
-                    Some(convert_alacritty_color(bg))
-                } else {
-                    None
-                };
-
-                if let Some(bg_color) = bg_color {
-                    if let Some(&visible_row) = cell_to_visible_row
-                        .get(&(cell.point.line.0, cell.point.column.0))
+                    // Non-default cell background (handle INVERSE flag)
+                    let is_inverse = cell
+                        .cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::INVERSE);
+                    let bg = if is_inverse { &cell.cell.fg } else { &cell.cell.bg };
+                    if bg
+                        != &alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Background,
+                        )
                     {
                         let cell_x =
                             bounds.left() + px(4.0) + *cell_width * cell.point.column.0 as f32;
-                        let cell_y = bounds.top() + *line_height * visible_row as f32;
-
-                        let cell_bounds =
-                            Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height));
-
-                        window.paint_quad(fill(cell_bounds, bg_color));
+                        window.paint_quad(fill(
+                            Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height)),
+                            convert_alacritty_color(bg),
+                        ));
                     }
                 }
+            }
         }
 
         // Paint batched text runs (text will appear on top of backgrounds)
