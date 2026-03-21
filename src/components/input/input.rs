@@ -58,6 +58,9 @@ const CURSOR_WIDTH: Pixels = px(2.);
 /// 光标可见性判断的容差
 const CURSOR_VISIBILITY_PADDING: Pixels = px(2.);
 
+/// Placeholder 文字颜色
+const PLACEHOLDER_COLOR: u32 = 0x3a3a55;
+
 /// 文本输入组件
 pub struct Input {
     focus_handle: FocusHandle,
@@ -93,6 +96,12 @@ pub struct Input {
     scroll_size: gpui::Size<Pixels>,
     /// 输入框边界
     input_bounds: Bounds<Pixels>,
+    /// 透明模式（无边框/背景，嵌入自定义容器时使用）
+    transparent: bool,
+    /// placeholder 字体大小（不设置则与正文相同）
+    placeholder_font_size: Option<Pixels>,
+    /// 上一帧是否聚焦（用于检测焦点获得事件）
+    was_focused: bool,
 }
 
 impl Input {
@@ -117,6 +126,9 @@ impl Input {
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
             input_bounds: Bounds::default(),
+            transparent: false,
+            placeholder_font_size: None,
+            was_focused: false,
         }
     }
 
@@ -201,6 +213,18 @@ impl Input {
     /// 设置禁用状态
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// 透明模式：无边框/背景，嵌入自定义容器时使用
+    pub fn transparent(mut self) -> Self {
+        self.transparent = true;
+        self
+    }
+
+    /// 设置 placeholder 字体大小
+    pub fn placeholder_font_size(mut self, size: Pixels) -> Self {
+        self.placeholder_font_size = Some(size);
         self
     }
 
@@ -395,10 +419,9 @@ impl Input {
         }
     }
 
-    /// 完成编辑操作（重置闪烁并触发回调）
+    /// 完成编辑操作（重置闪烁）
     fn finish_edit(&mut self, cx: &mut Context<Self>) {
         self.reset_blinking(cx);
-        self.notify_change(cx);
     }
 
     /// 处理退格键
@@ -703,6 +726,7 @@ impl EntityInputHandler for Input {
         self.marked_range.take();
 
         self.reset_blinking(cx);
+        self.notify_change(cx);
 
         cx.notify();
     }
@@ -836,20 +860,26 @@ impl Element for InputTextElement {
         let style = window.text_style();
         let masked = input.masked;
         let placeholder = input.placeholder.clone();
+        let placeholder_font_size = input.placeholder_font_size;
         let is_focused = input.focus_handle.is_focused(window);
 
         let is_empty = content.is_empty();
+        let style_font_size = style.font_size.to_pixels(window.rem_size());
+        let font_size = if is_empty {
+            placeholder_font_size.unwrap_or(style_font_size)
+        } else {
+            style_font_size
+        };
 
         // 处理 placeholder
         let placeholder_text = if is_empty {
             let ellipsis = "...";
             let max_width = bounds.size.width - px(20.0);
-            let font_size = style.font_size.to_pixels(window.rem_size());
 
             let placeholder_run = TextRun {
                 len: placeholder.len(),
                 font: style.font(),
-                color: rgb(0x666688).into(),
+                color: rgb(PLACEHOLDER_COLOR).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -868,7 +898,7 @@ impl Element for InputTextElement {
                     let test_run = TextRun {
                         len: test_text.len(),
                         font: style.font(),
-                        color: rgb(0x666688).into(),
+                        color: rgb(PLACEHOLDER_COLOR).into(),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -902,7 +932,7 @@ impl Element for InputTextElement {
         };
 
         let text_color = if is_empty {
-            rgb(0x666688).into()
+            rgb(PLACEHOLDER_COLOR).into()
         } else {
             rgb(0xcccccc).into()
         };
@@ -942,7 +972,6 @@ impl Element for InputTextElement {
             vec![run]
         };
 
-        let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
             .shape_line(display_text.clone(), font_size, &runs, None);
@@ -1092,9 +1121,12 @@ impl Render for Input {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_focused = self.focus_handle.is_focused(_window);
 
-        if !is_focused && self.blinking_started {
+        if is_focused && !self.was_focused {
+            self.start_blinking(cx);
+        } else if !is_focused && self.blinking_started {
             self.stop_blinking(cx);
         }
+        self.was_focused = is_focused;
 
         div()
             .w_full()
@@ -1122,19 +1154,22 @@ impl Render for Input {
                 div()
                     .w_full()
                     .min_w(px(0.0))
-                    .h(px(36.0))
-                    .px(px(10.0))
+                    .when(!self.transparent, |this| {
+                        this.h(px(36.0))
+                            .px(px(10.0))
+                            .gap(px(8.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if is_focused {
+                                rgb(0x4a4a6a)
+                            } else {
+                                rgb(0x2d2d44)
+                            })
+                            .bg(rgb(0x13131f))
+                    })
+                    .when(self.transparent, |this| this.h_full())
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .rounded(px(6.0))
-                    .border_1()
-                    .border_color(if is_focused {
-                        rgb(0x4a4a6a)
-                    } else {
-                        rgb(0x2d2d44)
-                    })
-                    .bg(rgb(0x13131f))
                     .overflow_hidden()
                     .on_scroll_wheel(cx.listener(Input::on_scroll_wheel))
                     .child(InputTextElement { input: cx.entity() })

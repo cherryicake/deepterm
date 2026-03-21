@@ -5,12 +5,12 @@
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, rems, rgb, svg, App, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Styled,
-    Window,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, Render, Styled, Window, actions, div, px, rems, rgb, svg,
 };
 
 use crate::assets::Icon;
+use crate::components::input::Input;
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
 use crate::workspace::workspace::Workspace;
 
@@ -28,7 +28,7 @@ const COLOR_TEXT_SHORTCUT: u32 = 0x4a4a6a;
 
 // 尺寸常量
 const ITEM_HEIGHT: f32 = 30.0;
-const PANEL_WIDTH: f32 = 520.0;
+const PANEL_WIDTH: f32 = 600.0;
 const SEARCH_HEIGHT: f32 = 36.0;
 
 /// 本地终端选项
@@ -185,6 +185,7 @@ fn scan_unix_terminals() -> Vec<LocalTerminalOption> {
 /// SSH 连接选择器
 pub struct SshPicker {
     focus_handle: FocusHandle,
+    search_input: Entity<Input>,
     query: String,
     configs: Vec<SshConnectionConfig>,
     filtered_indices: Vec<usize>,
@@ -196,15 +197,30 @@ pub struct SshPicker {
 }
 
 impl SshPicker {
-    pub fn new(cx: &mut App) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let configs = Self::load_configs();
         let filtered_indices = (0..configs.len()).collect();
         let local_terminal_options = Self::scan_local_terminals();
         let filtered_local_indices = (0..local_terminal_options.len()).collect();
 
+        let picker_entity = cx.entity();
+        let search_input = cx.new(|cx| {
+            Input::new(cx)
+                .placeholder("Search hosts or tabs...")
+                .placeholder_font_size(px(14.0))
+                .transparent()
+                .on_change(move |text, cx| {
+                    let text = text.to_string();
+                    picker_entity.update(cx, |this, cx| {
+                        this.update_query(text, cx);
+                    });
+                })
+        });
+
         Self {
             focus_handle,
+            search_input,
             query: String::new(),
             configs,
             filtered_indices,
@@ -247,8 +263,11 @@ impl SshPicker {
         self.local_terminal_options = Self::scan_local_terminals();
         self.filtered_local_indices = (0..self.local_terminal_options.len()).collect();
 
-        cx.defer_in(window, |this, window, cx| {
-            window.focus(&this.focus_handle, cx);
+        self.search_input.update(cx, |input, cx| input.clear(cx));
+
+        let input_focus = self.search_input.read(cx).focus_handle(cx);
+        cx.defer_in(window, move |_, window, cx| {
+            window.focus(&input_focus, cx);
         });
         cx.notify();
     }
@@ -369,18 +388,7 @@ impl SshPicker {
             "up" => self.select_previous(cx),
             "enter" | "return" => self.confirm_selection(window, cx),
             "escape" => self.hide(cx),
-            "backspace" => {
-                if !self.query.is_empty() {
-                    let new_query = self.query[..self.query.len() - 1].to_string();
-                    self.update_query(new_query, cx);
-                }
-            }
-            _ => {
-                if let Some(ref text) = event.keystroke.key_char {
-                    let new_query = format!("{}{}", self.query, text);
-                    self.update_query(new_query, cx);
-                }
-            }
+            _ => {}
         }
     }
 
@@ -425,19 +433,7 @@ impl SshPicker {
                             .path(Icon::MagnifyingGlass.path()),
                     ),
                 )
-                .child(div().flex_1().child(if self.query.is_empty() {
-                    div()
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                        .text_size(px(14.0))
-                        .child("Search hosts or tabs")
-                        .into_any_element()
-                } else {
-                    div()
-                        .text_color(rgb(COLOR_TEXT_PRIMARY))
-                        .text_size(px(14.0))
-                        .child(self.query.clone())
-                        .into_any_element()
-                }))
+                .child(div().flex_1().child(self.search_input.clone()))
                 .child(
                     div()
                         .text_color(rgb(COLOR_TEXT_SECONDARY))
