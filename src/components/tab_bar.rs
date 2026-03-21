@@ -253,6 +253,9 @@ impl TabBar {
         // 提前检查溢出状态，避免 UI 上出现溢出后再切换
         self.update_overflow_state(cx);
         cx.notify();
+        // 滚动到最新添加的标签（最右边）
+        let last_index = self.tabs.len().saturating_sub(1);
+        self.scroll_handle.scroll_to_item(last_index);
     }
 
     pub fn remove_tab(&mut self, id: &str, cx: &mut Context<Self>) {
