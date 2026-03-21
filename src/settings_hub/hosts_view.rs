@@ -338,6 +338,7 @@ impl HostsView {
             .child(
                 // TERMINAL button
                 div()
+                    .id("terminal-button")
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(6.0))
@@ -347,6 +348,13 @@ impl HostsView {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                        if let Some(ref workspace) = this.workspace {
+                            workspace.update(cx, |w, cx| {
+                                w.create_local_terminal(window, cx);
+                            });
+                        }
+                    }))
                     .child(
                         svg()
                             .size(px(10.0))
