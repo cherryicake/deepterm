@@ -312,8 +312,8 @@ impl Workspace {
                 move |tab_id, window, cx| {
                     let id = tab_id.to_string();
                     workspace.update(cx, |_this, cx| {
-                        cx.defer_in(window, move |this, _window, cx| {
-                            this.handle_tab_close(&id, cx);
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_close(&id, window, cx);
                         });
                     });
                 }
@@ -568,7 +568,7 @@ impl Workspace {
 
     /// 关闭当前选中的 panel
     /// 如果当前 Tab 下只有一个 Panel，则关闭整个 Tab
-    pub fn close_selected_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_selected_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 获取当前活动tab
         let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
             return;
@@ -579,7 +579,7 @@ impl Workspace {
         // 如果当前 Tab 下只有一个 Panel，关闭整个 Tab
         if panel_count <= 1 {
             let active_tab_id = self.active_tab_id.clone();
-            self.handle_tab_close(&active_tab_id, cx);
+            self.handle_tab_close(&active_tab_id, window, cx);
             return;
         }
 
@@ -1192,7 +1192,7 @@ impl Workspace {
     }
 
     /// 处理关闭tab事件
-    fn handle_tab_close(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+    fn handle_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.remove(tab_id);
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(tab_id, cx);
@@ -1200,7 +1200,14 @@ impl Workspace {
 
         // 如果关闭的是当前活动tab，切换到相邻 tab（以渲染顺序为准：优先下一个，否则上一个）
         if self.active_tab_id == tab_id {
-            self.activate_next_tab(cx);
+            let next_tab_id = self.tab_bar.read(cx).active_tab_id().map(|s| s.to_string());
+            if let Some(next_tab_id) = next_tab_id {
+                self.active_tab_id = next_tab_id.clone();
+                self.switch_to_tab(&next_tab_id, cx);
+                self.focus_active_tab_panel(window, cx);
+            } else {
+                cx.quit();
+            }
         }
 
         cx.notify();
