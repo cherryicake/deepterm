@@ -807,7 +807,28 @@ impl Terminal {
                 // 直接写入 PTY
                 self.write(text.as_bytes());
             }
-            _ => {}
+            AlacTermEvent::MouseCursorDirty => {
+                // 鼠标光标形状可能需要变化，触发刷新
+                cx.emit(Event::Wakeup);
+            }
+            AlacTermEvent::ResetTitle => {
+                // 重置为默认标题
+                cx.emit(Event::TitleChanged);
+            }
+            AlacTermEvent::ColorRequest(index, format) => {
+                // 响应颜色查询请求
+                let term = self.term.lock();
+                let color = term.colors()[index]
+                    .map(|rgb| rgb)
+                    .unwrap_or_else(|| alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 });
+                drop(term);
+                let response = format(color);
+                self.write(response.as_bytes());
+            }
+            AlacTermEvent::CursorBlinkingChange => {
+                // 光标闪烁状态变化，触发刷新
+                cx.emit(Event::Wakeup);
+            }
         }
     }
 
