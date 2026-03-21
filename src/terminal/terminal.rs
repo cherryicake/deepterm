@@ -784,6 +784,29 @@ impl Terminal {
                 // 处理 OSC 52 剪贴板存储请求
                 cx.write_to_clipboard(ClipboardItem::new_string(data));
             }
+            AlacTermEvent::ClipboardLoad(_clipboard_type, format) => {
+                // 响应剪贴板查询请求 (XTGETTCAP Ms)
+                let clipboard_content = cx.read_from_clipboard()
+                    .and_then(|item| item.text().map(|t| t.to_string()))
+                    .unwrap_or_default();
+                let response = format(&clipboard_content);
+                self.write(response.as_bytes());
+            }
+            AlacTermEvent::TextAreaSizeRequest(format) => {
+                // 响应窗口大小查询 (CSI t)
+                let window_size = alacritty_terminal::event::WindowSize {
+                    num_lines: self.terminal_bounds.num_lines() as u16,
+                    num_cols: self.terminal_bounds.num_columns() as u16,
+                    cell_width: self.terminal_bounds.cell_width.as_f32() as u16,
+                    cell_height: self.terminal_bounds.line_height.as_f32() as u16,
+                };
+                let response = format(window_size);
+                self.write(response.as_bytes());
+            }
+            AlacTermEvent::PtyWrite(text) => {
+                // 直接写入 PTY
+                self.write(text.as_bytes());
+            }
             _ => {}
         }
     }
