@@ -370,7 +370,7 @@ impl HostsView {
                     ),
             )
             .child(
-                // SERIAL button
+                // CONNECT HOST button
                 div()
                     .px(px(8.0))
                     .py(px(4.0))
@@ -397,7 +397,7 @@ impl HostsView {
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(0xaaaaaa))
-                            .child("SERIAL"),
+                            .child("CONNECT HOSTS"),
                     )
                     .child(Self::render_dropdown_arrow()),
             )

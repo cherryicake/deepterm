@@ -200,7 +200,7 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
             }
 
             // Items container
-            let mut items_div = div().w_full().flex().flex_col().gap(px(2.0));
+            let mut items_div = div().w_full().flex().flex_col().gap(px(6.0));
 
             // Add each item using cx.child pattern
             for item in &section.items {
