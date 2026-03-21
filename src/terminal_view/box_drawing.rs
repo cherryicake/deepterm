@@ -7,7 +7,7 @@
 //! 不会出现字体字形带来的间隙或粗细不一致问题。
 //! 对应 Alacritty 的 `builtin_box_drawing = true` 配置项。
 
-use gpui::{Bounds, Hsla, Pixels, Point, Window, fill, point, px, size};
+use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px, size, Background};
 
 // ─── 线段编码方案 ─────────────────────────────────────────────────────────────
 // 每个盒子绘制字符用一个 u8 位域描述其四个方向的线段粗细：
@@ -158,6 +158,10 @@ pub fn paint_box_drawing(
     let mut paint = |quad: Bounds<Pixels>| window.paint_quad(fill(quad, color));
     let code = c as u32;
     match code {
+        // U+256D–U+2570：圆角字符，用 PathBuilder 绘制真实圆弧
+        0x256D..=0x2570 => {
+            paint_rounded_corner(code, origin, cell_w, cell_h, color, window);
+        }
         // U+2500–U+257F：盒子绘制字符，通过线段表查找各方向线段并合成矩形
         0x2500..=0x257F => {
             let segs = BOX_SEGS[(code - 0x2500) as usize];
@@ -353,6 +357,89 @@ fn paint_block_element(
         0x259F => quadrant(origin, w, h, false, true, true, true, f),     // ▟ 右上 + 左下 + 右下
 
         _ => {}
+    }
+}
+
+// ─── 圆角绘制实现 ──────────────────────────────────────────────────────────────
+
+/// 绘制圆角字符（╭╮╯╰，U+256D–U+2570）。
+///
+/// 每个字符由两段直线 + 一段 1/4 圆弧组成，圆弧半径等于格子短边的一半，
+/// 使用 GPUI PathBuilder（基于 lyon）生成描边路径后通过 `window.paint_path` 渲染。
+///
+/// 圆弧中心在格子中心向角落方向偏移 r 处，使弧线恰好与直线段平滑衔接：
+///
+/// ```text
+///   ╭        ╮        ╯        ╰
+/// ──┤r        r├──   ──┤r        r├──
+///   │         │        │          │
+///   ▼         ▼        ▲          ▲
+/// ```
+///
+/// sweep / large_arc 参数对照（所有弧均为 small arc）：
+/// | char | lines   | sweep | 弧心方向      |
+/// |------|---------|-------|--------------|
+/// | ╭    | right+down | false | 右下 (hc+r, vc+r) |
+/// | ╮    | left+down  | true  | 左下 (hc-r, vc+r) |
+/// | ╯    | left+up    | false | 左上 (hc-r, vc-r) |
+/// | ╰    | right+up   | true  | 右上 (hc+r, vc-r) |
+fn paint_rounded_corner(
+    code: u32,
+    origin: Point<Pixels>,
+    cell_w: Pixels,
+    cell_h: Pixels,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let s = stroke(cell_w);
+    let hc = px((cell_w.as_f32() / 2.0).floor());
+    let vc = px((cell_h.as_f32() / 2.0).floor());
+    // 圆弧半径取格子短边的一半，保证圆弧能填满角落四分之一区域
+    let r = hc.min(vc);
+    let w = cell_w;
+    let h = cell_h;
+
+    // 将格子局部坐标转换为窗口绝对坐标
+    let abs = |lx: Pixels, ly: Pixels| -> Point<Pixels> {
+        point(origin.x + lx, origin.y + ly)
+    };
+
+    let mut builder = PathBuilder::stroke(s);
+
+    match code {
+        // ╭ (256D)：right + down，弧心在右下 (hc+r, vc+r)
+        0x256D => {
+            builder.move_to(abs(w, vc));
+            builder.line_to(abs(hc + r, vc));
+            builder.arc_to(point(r, r), px(0.0), false, false, abs(hc, vc + r));
+            builder.line_to(abs(hc, h));
+        }
+        // ╮ (256E)：left + down，弧心在左下 (hc-r, vc+r)
+        0x256E => {
+            builder.move_to(abs(px(0.0), vc));
+            builder.line_to(abs(hc - r, vc));
+            builder.arc_to(point(r, r), px(0.0), false, true, abs(hc, vc + r));
+            builder.line_to(abs(hc, h));
+        }
+        // ╯ (256F)：left + up，弧心在左上 (hc-r, vc-r)
+        0x256F => {
+            builder.move_to(abs(px(0.0), vc));
+            builder.line_to(abs(hc - r, vc));
+            builder.arc_to(point(r, r), px(0.0), false, false, abs(hc, vc - r));
+            builder.line_to(abs(hc, px(0.0)));
+        }
+        // ╰ (2570)：right + up，弧心在右上 (hc+r, vc-r)
+        0x2570 => {
+            builder.move_to(abs(w, vc));
+            builder.line_to(abs(hc + r, vc));
+            builder.arc_to(point(r, r), px(0.0), false, true, abs(hc, vc - r));
+            builder.line_to(abs(hc, px(0.0)));
+        }
+        _ => return,
+    }
+
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, Background::from(color));
     }
 }
 
