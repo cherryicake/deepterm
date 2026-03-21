@@ -3,11 +3,21 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window, actions, div, px,
+    App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, UTF16Selection, Window,
+    actions, div, px,
 };
 use gpui::{KeyBinding, prelude::*};
+
+/// Events emitted by TerminalView
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Terminal process exited - container should close this view
+    CloseTerminal,
+}
+
+impl EventEmitter<Event> for TerminalView {}
 
 /// ASCII control character for Ctrl+V (SYN - Synchronous Idle)
 pub const CTRL_V: u8 = 0x16;
@@ -70,7 +80,9 @@ impl TerminalView {
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
-                    TerminalEvent::CloseTerminal => {}
+                    TerminalEvent::CloseTerminal => {
+                        cx.emit(Event::CloseTerminal);
+                    }
                 },
             )
             .detach();
@@ -121,7 +133,9 @@ impl TerminalView {
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
-                    TerminalEvent::CloseTerminal => {}
+                    TerminalEvent::CloseTerminal => {
+                        cx.emit(Event::CloseTerminal);
+                    }
                 },
             )
             .detach();
@@ -175,7 +189,9 @@ impl TerminalView {
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
-                    TerminalEvent::CloseTerminal => {}
+                    TerminalEvent::CloseTerminal => {
+                        cx.emit(Event::CloseTerminal);
+                    }
                 },
             )
             .detach();

@@ -218,7 +218,7 @@ impl Workspace {
 
     /// 设置初始焦点到当前活动 tab 的第一个 panel 的 terminal
     /// 需要在 window 创建完成后调用
-    pub fn set_initial_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_initial_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active_tab_panel(window, cx);
     }
 
@@ -230,6 +230,31 @@ impl Workspace {
                     window.focus(&handle, cx);
                 }
             }
+        }
+    }
+
+    /// tab 关闭后激活下一个 tab 并聚焦其第一个 panel。
+    /// 若无剩余 tab 则退出应用。
+    fn activate_next_tab(&mut self, cx: &mut Context<Self>) {
+        // tab_bar.remove_tab 已按渲染顺序选好了下一个/上一个 tab
+        let next_tab_id = self.tab_bar.read(cx).active_tab_id().map(|s| s.to_string());
+        if let Some(next_tab_id) = next_tab_id {
+            self.active_tab_id = next_tab_id.clone();
+            self.switch_to_tab(&next_tab_id, cx);
+
+            let focus_handle = self
+                .tabs
+                .get(&next_tab_id)
+                .and_then(|t| t.container.get_first_panel())
+                .and_then(|panel| panel.read(cx).terminal_focus_handle(cx));
+
+            if let (Some(fh), Some(wh)) = (focus_handle, cx.active_window()) {
+                let _ = cx.update_window(wh, |_, window, cx| {
+                    window.focus(&fh, cx);
+                });
+            }
+        } else {
+            cx.quit();
         }
     }
 
@@ -287,8 +312,8 @@ impl Workspace {
                 move |tab_id, window, cx| {
                     let id = tab_id.to_string();
                     workspace.update(cx, |_this, cx| {
-                        cx.defer_in(window, move |this, window, cx| {
-                            this.handle_tab_close(&id, window, cx);
+                        cx.defer_in(window, move |this, _window, cx| {
+                            this.handle_tab_close(&id, cx);
                         });
                     });
                 }
@@ -543,7 +568,7 @@ impl Workspace {
 
     /// 关闭当前选中的 panel
     /// 如果当前 Tab 下只有一个 Panel，则关闭整个 Tab
-    pub fn close_selected_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_selected_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // 获取当前活动tab
         let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
             return;
@@ -554,7 +579,7 @@ impl Workspace {
         // 如果当前 Tab 下只有一个 Panel，关闭整个 Tab
         if panel_count <= 1 {
             let active_tab_id = self.active_tab_id.clone();
-            self.handle_tab_close(&active_tab_id, window, cx);
+            self.handle_tab_close(&active_tab_id, cx);
             return;
         }
 
@@ -577,32 +602,61 @@ impl Workspace {
 
     /// 处理关闭panel事件
     fn handle_panel_close(&mut self, panel_id: &str, cx: &mut Context<Self>) {
-        let active_tab_id = self.active_tab_id.clone();
-
-        // 获取当前活动的tab信息
-        let Some(tab_info) = self.tabs.get_mut(&active_tab_id) else {
+        // 在所有 tab 中搜索包含该 panel 的 tab
+        let Some(target_tab_id) = self
+            .tabs
+            .iter()
+            .find(|(_, tab_info)| tab_info.container.contains_panel(panel_id, cx))
+            .map(|(tab_id, _)| tab_id.clone())
+        else {
             return;
         };
 
-        // 从container中移除指定的panel
-        let new_container = tab_info.container.remove_panel(panel_id, cx);
+        // 获取移除前的 panel 数量
+        let panel_count_before = self
+            .tabs
+            .get(&target_tab_id)
+            .map(|t| t.container.panel_count())
+            .unwrap_or(0);
 
+        if panel_count_before <= 1 {
+            // 这是 tab 中唯一的 panel，关闭整个 tab
+            self.tabs.remove(&target_tab_id);
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.remove_tab(&target_tab_id, cx);
+            });
+
+            if self.active_tab_id == target_tab_id {
+                self.activate_next_tab(cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        // 从container中移除指定的panel
+        let new_container = {
+            let tab_info = self.tabs.get_mut(&target_tab_id).unwrap();
+            tab_info.container.remove_panel(panel_id, cx)
+        };
+
+        let panel_count = new_container.panel_count();
         // 更新container
+        let tab_info = self.tabs.get_mut(&target_tab_id).unwrap();
         tab_info.container = new_container;
 
         // 如果移除后只剩一个panel，更新tab类型为Normal
-        let panel_count = tab_info.container.panel_count();
         if panel_count == 1 && tab_info.tab_type == TabType::Workspace {
             tab_info.tab_type = TabType::Normal;
 
             // 更新TabBar显示
+            let label = tab_info.label.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
-                        if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &tab_info.label)
+                        if t.id == target_tab_id {
+                            TabItem::new(&target_tab_id, &label)
                         } else {
                             t.clone()
                         }
@@ -1138,28 +1192,15 @@ impl Workspace {
     }
 
     /// 处理关闭tab事件
-    fn handle_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // 从tabs中移除
+    fn handle_tab_close(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         self.tabs.remove(tab_id);
-
-        // 从TabBar中移除
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(tab_id, cx);
         });
 
-        // 如果关闭的是当前活动tab，切换到其他tab
+        // 如果关闭的是当前活动tab，切换到相邻 tab（以渲染顺序为准：优先下一个，否则上一个）
         if self.active_tab_id == tab_id {
-            // 尝试切换到第一个可用的tab
-            if let Some(first_tab_id) = self.tabs.keys().next().cloned() {
-                self.active_tab_id = first_tab_id.clone();
-                self.switch_to_tab(&first_tab_id, cx);
-
-                // 将焦点设置到新活动tab的第一个panel
-                self.focus_active_tab_panel(window, cx);
-            } else {
-                // 没有tab了，退出应用程序
-                cx.quit();
-            }
+            self.activate_next_tab(cx);
         }
 
         cx.notify();

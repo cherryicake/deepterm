@@ -7,7 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
-use crate::terminal_view::terminal_view::TerminalView;
+use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 
 // Re-export for convenience
 pub use crate::ssh::SshConnectionConfig;
@@ -150,6 +150,23 @@ impl Panel {
     /// * `active_tab_id` - ID of the currently active tab
     /// * `active_tab_label` - Label shown in the title bar
     /// * `cx` - The context for entity creation
+    /// Subscribes to TerminalView close events and emits PanelEvent::Close when the terminal exits.
+    fn subscribe_terminal_close(
+        panel_id: &str,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let close_panel_id = panel_id.to_string();
+        cx.subscribe(terminal_view, move |_this, _view, event: &TerminalViewEvent, cx| {
+            match event {
+                TerminalViewEvent::CloseTerminal => {
+                    cx.emit(PanelEvent::Close { panel_id: close_panel_id.clone() });
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn with_terminal(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -157,10 +174,11 @@ impl Panel {
         active_tab_label: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let panel_id = panel_id.into();
         let terminal_view = TerminalView::new(cx);
-
+        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
         Self {
-            panel_id: panel_id.into(),
+            panel_id,
             workspace_id: workspace_id.into(),
             focus_handle: cx.focus_handle(),
             drag_preview: None,
@@ -174,16 +192,6 @@ impl Panel {
     }
 
     /// Creates a new panel with a terminal view using a specific command.
-    ///
-    /// # Arguments
-    ///
-    /// * `panel_id` - Unique identifier for this panel
-    /// * `workspace_id` - ID of the workspace this panel belongs to
-    /// * `active_tab_id` - ID of the currently active tab
-    /// * `active_tab_label` - Label shown in the title bar
-    /// * `command` - The command to run in the terminal
-    /// * `args` - Arguments for the command
-    /// * `cx` - The context for entity creation
     pub fn with_terminal_command(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -193,10 +201,11 @@ impl Panel {
         args: &[String],
         cx: &mut Context<Self>,
     ) -> Self {
+        let panel_id = panel_id.into();
         let terminal_view = TerminalView::new_with_command(cx, command, args);
-
+        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
         Self {
-            panel_id: panel_id.into(),
+            panel_id,
             workspace_id: workspace_id.into(),
             focus_handle: cx.focus_handle(),
             drag_preview: None,
@@ -210,17 +219,6 @@ impl Panel {
     }
 
     /// Creates a new panel with an SSH remote terminal view.
-    ///
-    /// # Arguments
-    ///
-    /// * `panel_id` - Unique identifier for this panel
-    /// * `workspace_id` - ID of the workspace this panel belongs to
-    /// * `active_tab_id` - ID of the currently active tab
-    /// * `active_tab_label` - Label shown in the title bar
-    /// * `ssh_config` - SSH connection configuration
-    /// * `on_data` - Callback for sending data to SSH
-    /// * `on_resize` - Callback for resizing SSH terminal
-    /// * `cx` - The context for entity creation
     pub fn with_ssh_terminal(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -229,10 +227,11 @@ impl Panel {
         ssh_config: &crate::ssh::SshConnectionConfig,
         cx: &mut Context<Self>,
     ) -> Self {
+        let panel_id = panel_id.into();
         let terminal_view = TerminalView::new_ssh(cx, ssh_config);
-
+        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
         Self {
-            panel_id: panel_id.into(),
+            panel_id,
             workspace_id: workspace_id.into(),
             focus_handle: cx.focus_handle(),
             drag_preview: None,
