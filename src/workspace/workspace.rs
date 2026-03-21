@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use gpui::{actions, prelude::*, KeyBinding};
 use gpui::{
-    div, px, rgb, App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable,
-    GlobalElementId, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, Style, Styled, Subscription, Window,
+    App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable, GlobalElementId,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
+    Styled, Subscription, Window, div, px, rgb,
 };
+use gpui::{KeyBinding, actions, prelude::*};
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
 /// (workspace_id, panel_id, input_data)
@@ -15,12 +15,12 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::components::tab_bar::{DraggedTab, TabBar, TabItem, HOSTS_HUB_TAB_ID};
+use crate::GlobalSshPicker;
+use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
-use crate::GlobalSshPicker;
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
@@ -1318,6 +1318,8 @@ impl Render for Workspace {
             .child(
                 div()
                     .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
                     .pl(px(6.0))
                     .pr(px(6.0))
                     .pb(px(6.0))

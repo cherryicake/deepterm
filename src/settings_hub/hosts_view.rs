@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Task, Window,
-    div, hsla, px, rgb, svg,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
+    Task, Window, div, hsla, px, rgb, svg,
 };
 
 use crate::assets::Icon;
@@ -135,6 +135,7 @@ pub struct HostsView {
     hosts: Vec<Host>,
     groups: Vec<HostGroup>,
     focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
     workspace: Option<Entity<Workspace>>,
     configs: Vec<SshConnectionConfig>,
     on_new_host_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
@@ -158,12 +159,14 @@ impl HostsView {
     pub fn new_with_workspace(cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
+            let scroll_handle = ScrollHandle::new();
             let (hosts, groups, configs) = Self::load_hosts_from_config();
             Self {
                 search_query: SharedString::new_static(""),
                 hosts,
                 groups,
                 focus_handle,
+                scroll_handle,
                 workspace,
                 configs,
                 on_new_host_click: None,
@@ -532,21 +535,23 @@ impl HostsView {
                         if let Some(config) = config {
                             if this.on_edit_host_click.is_some() {
                                 // Store task handle — dropping it on double-click cancels the timer
-                                this.pending_single_click = Some(cx.spawn(async move |view, cx| {
-                                    cx.background_executor()
-                                        .timer(std::time::Duration::from_millis(250))
-                                        .await;
-                                    view.update(cx, |this, cx| {
-                                        // Still pending means no double-click arrived
-                                        if this.pending_single_click.is_some() {
-                                            this.pending_single_click = None;
-                                            if let Some(ref callback) = this.on_edit_host_click {
-                                                callback(cx, config);
+                                this.pending_single_click =
+                                    Some(cx.spawn(async move |view, cx| {
+                                        cx.background_executor()
+                                            .timer(std::time::Duration::from_millis(250))
+                                            .await;
+                                        view.update(cx, |this, cx| {
+                                            // Still pending means no double-click arrived
+                                            if this.pending_single_click.is_some() {
+                                                this.pending_single_click = None;
+                                                if let Some(ref callback) = this.on_edit_host_click
+                                                {
+                                                    callback(cx, config);
+                                                }
                                             }
-                                        }
-                                    })
-                                    .ok();
-                                }));
+                                        })
+                                        .ok();
+                                    }));
                             }
                         }
                     } else if event.click_count() == 2 {
@@ -710,33 +715,55 @@ impl Focusable for HostsView {
 
 impl Render for HostsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Header height: search bar (40) + spacer (20) + action buttons (20) = 80px
+        const HEADER_HEIGHT: f32 = 80.0;
+        // Persistent gap between action buttons bottom and scroll content
+        const CONTENT_TOP_GAP: f32 = 16.0;
+        // Total height the fixed header occupies (includes the gap)
+        const TOTAL_HEADER_HEIGHT: f32 = HEADER_HEIGHT + CONTENT_TOP_GAP;
+
         div()
             .id("hosts-view")
             .track_focus(&self.focus_handle)
             .size_full()
-            .flex()
-            .flex_col()
+            .relative()
             .bg(rgb(0x0f0f1a))
-            // Search bar
-            .child(self.render_search_bar(cx))
-            // Spacer between search bar and action buttons
-            .child(div().h_5())
-            // Action buttons
-            .child(self.render_action_buttons(cx))
-            // Scrollable content
+            // Scrollable content (rendered first = lower z-order)
+            // Fills the entire parent; top-padding reserves space for the fixed header
             .child(
                 div()
                     .id("hosts-content")
-                    .flex_1()
+                    .track_scroll(&self.scroll_handle)
+                    .size_full()
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap(px(24.0))
-                    .py(px(16.0))
+                    // Top padding = total header area (header + gap), so content always starts below
+                    .pt(px(TOTAL_HEADER_HEIGHT))
+                    .pb(px(16.0))
                     // Groups section
                     .child(self.render_groups_section(cx))
                     // Hosts section
                     .child(self.render_hosts_section(window, cx)),
+            )
+            // Fixed header (rendered last = highest z-order, covers scrolled content)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(TOTAL_HEADER_HEIGHT))
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(0x0f0f1a))
+                    // Search bar
+                    .child(self.render_search_bar(cx))
+                    // Spacer between search bar and action buttons
+                    .child(div().h(px(20.0)))
+                    // Action buttons
+                    .child(self.render_action_buttons(cx)),
             )
     }
 }

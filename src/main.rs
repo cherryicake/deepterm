@@ -86,7 +86,7 @@ impl Render for AppWindow {
             // Title bar for window management
             .child(self.title_bar.clone())
             // Workspace content
-            .child(div().flex().flex_1().child(self.workspace.clone()))
+            .child(div().flex().flex_1().min_h_0().overflow_hidden().child(self.workspace.clone()))
             // SSH picker overlay
             .child(self.ssh_picker.clone())
     }

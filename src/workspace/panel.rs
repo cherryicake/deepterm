@@ -567,7 +567,7 @@ impl Panel {
                     .child(div().flex_1())
             }
             PanelContent::SettingsHubView(settings_hub_view) => {
-                div().flex_1().child(settings_hub_view.clone())
+                div().flex_1().min_h_0().overflow_hidden().child(settings_hub_view.clone())
             }
         }
     }

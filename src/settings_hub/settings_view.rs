@@ -604,7 +604,7 @@ impl Render for SettingsHubView {
             .p(px(6.0))
             .pt(px(10.0))
             .child(self.left_sidebar.clone())
-            .child(div().flex_1().p(px(6.0)).child(self.center.clone()))
+            .child(div().flex_1().min_h_0().overflow_hidden().p(px(6.0)).child(self.center.clone()))
             .when(render_sidebar, |this| {
                 this.child(
                     Sidebar::new()
