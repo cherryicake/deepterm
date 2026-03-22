@@ -47,11 +47,7 @@ impl fmt::Display for SshError {
                 write!(f, "用户 '{}' 认证失败 (方法: {})", username, method)
             }
             SshError::HostKeyVerificationFailed { host, fingerprint } => {
-                write!(
-                    f,
-                    "主机 '{}' 的密钥验证失败。指纹: {}",
-                    host, fingerprint
-                )
+                write!(f, "主机 '{}' 的密钥验证失败。指纹: {}", host, fingerprint)
             }
             SshError::ChannelCreationFailed { reason } => {
                 write!(f, "创建 SSH 通道失败: {}", reason)
@@ -71,7 +67,10 @@ impl fmt::Display for SshError {
             SshError::KeyError { path, reason } => {
                 write!(f, "密钥文件 '{}' 错误: {}", path, reason)
             }
-            SshError::Timeout { operation, duration } => {
+            SshError::Timeout {
+                operation,
+                duration,
+            } => {
                 write!(f, "操作 '{}' 超时 ({} 秒)", operation, duration)
             }
             SshError::ConnectionClosed => {
@@ -110,8 +109,8 @@ impl From<russh::Error> for SshError {
     }
 }
 
-impl From<russh_keys::Error> for SshError {
-    fn from(err: russh_keys::Error) -> Self {
+impl From<russh::keys::Error> for SshError {
+    fn from(err: russh::keys::Error) -> Self {
         SshError::KeyError {
             path: "unknown".to_string(),
             reason: format!("{:?}", err),

@@ -1,3 +1,3 @@
-pub mod ssh_picker;
+pub mod picker;
 
-pub use ssh_picker::SshPicker;
+pub use picker::SshPicker;

@@ -24,7 +24,7 @@ use gpui::{
     Task, Window, px,
 };
 
-use crate::ssh::{SshConnectionConfig, SshPtyTerminal};
+use crate::ssh::{RusshTerminal, SshConnectionConfig};
 use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -526,11 +526,11 @@ impl Terminal {
 
     /// 创建新的 SSH 远程终端
     ///
-    /// 使用 PTY + 系统 ssh 命令方式创建连接。
-    /// 这是性能和兼容性最佳的方案：
-    /// - 数据路径短：PTY → EventLoop → Terminal
-    /// - 自动支持所有 SSH 功能（密钥、代理、配置等）
-    /// - 使用 alacritty 优化的事件循环处理刷新
+    /// 优先使用 russh 库进行原生 SSH 连接，采用异步初始化：
+    /// - 立即返回终端面板，不阻塞 GPUI 渲染线程
+    /// - 在后台建立 SSH 连接
+    /// - 连接期间缓存输入数据，连接成功后自动转发
+    /// - 若 russh 连接失败，自动回退到 PTY + 系统 ssh 命令方式
     pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -549,31 +549,45 @@ impl Terminal {
             listener.clone(),
         )));
 
-        // 使用 PTY + 系统 ssh 命令方式创建 SSH 终端
-        // 这是性能和兼容性最佳的方案
-        Self::create_ssh_pty_terminal(cx, ssh_config, term, listener, events_rx)
+        // 优先尝试 russh 原生连接（使用与 Term 初始化的 default_bounds 一致的大小）
+        log::info!("SSH: 启动 russh 异步连接...");
+        let initial_cols = default_bounds.num_columns() as u32;
+        let initial_rows = default_bounds.num_lines() as u32;
+
+        // 创建异步 russh 终端（立即返回，后台连接）
+        let russh_term = RusshTerminal::new(
+            ssh_config,
+            initial_cols,
+            initial_rows,
+            term.clone(),
+            listener.clone(),
+        );
+
+        // 创建终端实体（立即返回，不阻塞 GPUI）
+        let russh_for_input = russh_term.clone();
+        let russh_for_resize = russh_term.clone();
+        let entity = Self::create_remote_terminal(
+            cx,
+            ssh_config,
+            term.clone(),
+            events_rx,
+            move |data| russh_for_input.write(data),
+            move |cols, rows| russh_for_resize.resize(cols, rows),
+        );
+
+        entity
     }
 
-    /// 创建 SSH PTY 终端（内部方法）
-    fn create_ssh_pty_terminal(
+    /// 通用远程终端实体创建（抽取 create_russh_terminal 和 create_ssh_pty_terminal 的公共部分）
+    fn create_remote_terminal(
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
         term: Arc<FairMutex<Term<ZedListener>>>,
-        listener: ZedListener,
         events_rx: UnboundedReceiver<AlacTermEvent>,
+        input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
+        resize_handler: impl Fn(u16, u16) + Send + Sync + 'static,
     ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
-
-        // 创建 SshPtyTerminal - 使用传入的 listener，确保 EventLoop 的 Wakeup 事件能被正确处理
-        let ssh_pty = match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener)
-        {
-            Ok(pty) => Arc::new(pty),
-            Err(e) => {
-                eprintln!("Failed to create SSH PTY: {}", e);
-                return cx.new(|_cx| Self::create_error_terminal());
-            }
-        };
-
         let ssh_config_clone = ssh_config.clone();
 
         cx.new(|cx| {
@@ -588,10 +602,6 @@ impl Terminal {
                     smol::future::yield_now().await;
                 }
             });
-
-            // 克隆 Arc 指针用于闭包
-            let ssh_pty_for_input = ssh_pty.clone();
-            let ssh_pty_for_resize = ssh_pty.clone();
 
             Self {
                 term: term_clone,
@@ -611,25 +621,8 @@ impl Terminal {
                     username: ssh_config_clone.username.clone(),
                     port: ssh_config_clone.port,
                 },
-                remote_input_callback: Some(Box::new(move |data: &[u8]| {
-                    ssh_pty_for_input.write(data);
-                })),
-                remote_resize_callback: Some(Box::new(move |cols: u16, rows: u16| {
-                    let cell_width = px(9.0);
-                    let line_height = px(16.0);
-                    let new_bounds = TerminalBounds {
-                        cell_width,
-                        line_height,
-                        bounds: Bounds {
-                            origin: Point::default(),
-                            size: Size {
-                                width: px(cols as f32 * cell_width.as_f32()),
-                                height: px(rows as f32 * line_height.as_f32()),
-                            },
-                        },
-                    };
-                    ssh_pty_for_resize.resize(new_bounds);
-                })),
+                remote_input_callback: Some(Box::new(input_handler)),
+                remote_resize_callback: Some(Box::new(resize_handler)),
             }
         })
     }

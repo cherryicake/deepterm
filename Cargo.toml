@@ -21,15 +21,14 @@ futures = "0.3"
 smol = "2.0"
 
 # SSH dependencies
-russh = "0.48"
-russh-keys = "0.48"
+russh = { path = "../russh/russh" }
 async-trait = "0.1"
 
 # Credential storage (for secure password/key storage)
 keyring = "3.6"
 
 # Async runtime compatibility
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "fs", "net", "sync", "time"] }
 async-process = "2.3"
 async-io = "2.4"
 
