@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Task, Window, div, hsla, px, rgb, svg,
+    Window, div, hsla, px, rgb, svg,
 };
 
 use crate::assets::Icon;
@@ -140,7 +140,6 @@ pub struct HostsView {
     configs: Vec<SshConnectionConfig>,
     on_new_host_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
     on_edit_host_click: Option<Box<dyn Fn(&mut App, SshConnectionConfig) + Send + Sync>>,
-    pending_single_click: Option<Task<()>>,
     selected_host_id: Option<SharedString>,
 }
 
@@ -171,7 +170,6 @@ impl HostsView {
                 configs,
                 on_new_host_click: None,
                 on_edit_host_click: None,
-                pending_single_click: None,
                 selected_host_id: None,
             }
         })
@@ -541,30 +539,11 @@ impl HostsView {
 
                         let config = this.configs.iter().find(|c| c.id() == host_id).cloned();
                         if let Some(config) = config {
-                            if this.on_edit_host_click.is_some() {
-                                // Store task handle — dropping it on double-click cancels the timer
-                                this.pending_single_click =
-                                    Some(cx.spawn(async move |view, cx| {
-                                        cx.background_executor()
-                                            .timer(std::time::Duration::from_millis(250))
-                                            .await;
-                                        view.update(cx, |this, cx| {
-                                            // Still pending means no double-click arrived
-                                            if this.pending_single_click.is_some() {
-                                                this.pending_single_click = None;
-                                                if let Some(ref callback) = this.on_edit_host_click
-                                                {
-                                                    callback(cx, config);
-                                                }
-                                            }
-                                        })
-                                        .ok();
-                                    }));
+                            if let Some(ref callback) = this.on_edit_host_click {
+                                callback(cx, config);
                             }
                         }
                     } else if event.click_count() == 2 {
-                        // Drop the task to cancel the pending single-click edit
-                        this.pending_single_click = None;
                         this.selected_host_id = Some(host_id.clone());
                         this.connect_to_host(&host_id, window, cx);
                     }
