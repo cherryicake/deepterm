@@ -240,6 +240,8 @@ pub struct Terminal {
     remote_input_callback: Option<RemoteInputCallback>,
     /// 远程终端调整大小回调
     remote_resize_callback: Option<RemoteResizeCallback>,
+    /// russh 句柄（用于查询 SSH 连接状态）
+    russh_handle: Option<RusshTerminal>,
 }
 
 impl Terminal {
@@ -328,6 +330,7 @@ impl Terminal {
                 terminal_type: TerminalType::Local,
                 remote_input_callback: None,
                 remote_resize_callback: None,
+                russh_handle: None,
             }
         })
     }
@@ -421,6 +424,7 @@ impl Terminal {
                 terminal_type: TerminalType::Local,
                 remote_input_callback: None,
                 remote_resize_callback: None,
+                russh_handle: None,
             }
         })
     }
@@ -448,6 +452,7 @@ impl Terminal {
             terminal_type: TerminalType::Local,
             remote_input_callback: None,
             remote_resize_callback: None,
+            russh_handle: None,
         }
     }
 
@@ -520,6 +525,7 @@ impl Terminal {
                 },
                 remote_input_callback: Some(Box::new(on_data)),
                 remote_resize_callback: Some(Box::new(on_resize)),
+                russh_handle: None,
             }
         })
     }
@@ -566,6 +572,7 @@ impl Terminal {
         // 创建终端实体（立即返回，不阻塞 GPUI）
         let russh_for_input = russh_term.clone();
         let russh_for_resize = russh_term.clone();
+        let russh_for_status = russh_term.clone();
         let entity = Self::create_remote_terminal(
             cx,
             ssh_config,
@@ -573,6 +580,7 @@ impl Terminal {
             events_rx,
             move |data| russh_for_input.write(data),
             move |cols, rows| russh_for_resize.resize(cols, rows),
+            Some(russh_for_status),
         );
 
         entity
@@ -586,6 +594,7 @@ impl Terminal {
         events_rx: UnboundedReceiver<AlacTermEvent>,
         input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
         resize_handler: impl Fn(u16, u16) + Send + Sync + 'static,
+        russh_handle: Option<RusshTerminal>,
     ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
         let ssh_config_clone = ssh_config.clone();
@@ -623,6 +632,7 @@ impl Terminal {
                 },
                 remote_input_callback: Some(Box::new(input_handler)),
                 remote_resize_callback: Some(Box::new(resize_handler)),
+                russh_handle,
             }
         })
     }
@@ -647,6 +657,21 @@ impl Terminal {
             } => Some((host.as_str(), username.as_str(), *port)),
             _ => None,
         }
+    }
+
+    /// 检查 SSH 连接是否已就绪（russh 已连接）
+    pub fn is_ssh_connected(&self) -> bool {
+        self.russh_handle.as_ref().map_or(false, |h| h.is_ready())
+    }
+
+    /// 检查 SSH 连接是否已失败
+    pub fn is_ssh_failed(&self) -> bool {
+        self.russh_handle.as_ref().map_or(false, |h| h.is_failed())
+    }
+
+    /// 获取 SSH 连接错误信息（如果连接失败）
+    pub fn ssh_error_message(&self) -> Option<String> {
+        self.russh_handle.as_ref()?.error_message()
     }
 
     /// 处理从 SSH 接收的数据

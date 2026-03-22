@@ -29,6 +29,7 @@ pub struct ImeState {
 
 use crate::ShowSshPicker;
 use crate::ssh::SshConnectionConfig;
+use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::TerminalElement;
@@ -61,6 +62,8 @@ pub struct TerminalView {
     broadcast_callback: Option<BroadcastInputCallback>,
     /// Pending scrollbar hide task - prevents spawning a new timer every render frame
     scrollbar_hide_task: Option<Task<()>>,
+    /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
+    ssh_connect_view: Option<Entity<SshConnectView>>,
 }
 
 impl TerminalView {
@@ -98,6 +101,7 @@ impl TerminalView {
                 ime_state: None,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                ssh_connect_view: None,
             };
             this.update_title(cx);
             this
@@ -152,6 +156,7 @@ impl TerminalView {
                 ime_state: None,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                ssh_connect_view: None,
             };
             this.update_title(cx);
             this
@@ -183,13 +188,44 @@ impl TerminalView {
             let terminal = Terminal::new_ssh(cx, &ssh_config_clone);
             let terminal_clone = terminal.clone();
 
+            // 创建 SSH 连接进度视图（在连接成功前覆盖在终端上方）
+            let connect_view = cx.new(|cx| SshConnectView::new(ssh_config_clone.clone(), cx));
+
             cx.subscribe(
                 &terminal_clone,
-                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
+                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
                     TerminalEvent::TitleChanged => {
                         this.update_title(cx);
                     }
                     TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                        // 当 SSH 连接完成时更新进度视图
+                        if let Some(connect_view) = this.ssh_connect_view.clone() {
+                            enum SshOutcome {
+                                Connected,
+                                Failed(String),
+                                Pending,
+                            }
+                            let outcome = {
+                                let term = terminal.read(cx);
+                                if term.is_ssh_connected() {
+                                    SshOutcome::Connected
+                                } else if term.is_ssh_failed() {
+                                    SshOutcome::Failed(
+                                        term.ssh_error_message()
+                                            .unwrap_or_else(|| "Unknown error".to_string()),
+                                    )
+                                } else {
+                                    SshOutcome::Pending
+                                }
+                            };
+                            match outcome {
+                                SshOutcome::Connected => this.ssh_connect_view = None,
+                                SshOutcome::Failed(msg) => {
+                                    connect_view.update(cx, |view, cx| view.set_failed(msg, cx));
+                                }
+                                SshOutcome::Pending => {}
+                            }
+                        }
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
@@ -204,11 +240,12 @@ impl TerminalView {
                 terminal: terminal_clone,
                 focus_handle,
                 cursor_visible: true,
-                title: format!("{}@{}", ssh_config_clone.username, ssh_config_clone.host).into(),
+                title: ssh_config_clone.host_label().into(),
                 selecting: false,
                 ime_state: None,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                ssh_connect_view: Some(connect_view),
             };
             this.update_title(cx);
             this
@@ -221,10 +258,11 @@ impl TerminalView {
             || "Terminal".into(),
             |(host, username, port)| {
                 if port == 22 {
-                    format!("{}@{}", username, host).into()
+                    format!("{}@{}", username, host)
                 } else {
-                    format!("{}@{}:{}", username, host, port).into()
+                    format!("{}@{}:{}", username, host, port)
                 }
+                .into()
             },
         );
     }
@@ -669,6 +707,10 @@ impl Render for TerminalView {
                                 .w(px(8.0))
                                 .child(TerminalScrollbar::new(terminal, cx)),
                         )
+                    })
+                    // SSH 连接进度视图覆盖层 - 在连接建立期间覆盖终端内容
+                    .when_some(self.ssh_connect_view.clone(), |this, connect_view| {
+                        this.child(div().absolute().inset_0().child(connect_view))
                     }),
             )
     }

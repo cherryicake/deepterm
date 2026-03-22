@@ -133,6 +133,16 @@ impl SshConnectionConfig {
             .unwrap_or_else(|| format!("{}@{}", self.username, self.host))
     }
 
+    /// 获取主机标签（用于 Tab 标题和连接视图）
+    /// 格式：`username@host`，非标准端口时为 `username@host:port`
+    pub fn host_label(&self) -> String {
+        if self.port == 22 {
+            format!("{}@{}", self.username, self.host)
+        } else {
+            format!("{}@{}:{}", self.username, self.host, self.port)
+        }
+    }
+
     /// 获取完整的连接标识符
     pub fn connection_string(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)

@@ -144,9 +144,13 @@ impl RusshTerminal {
                         }
                         Err(e) => {
                             log::warn!("russh: 连接失败: {}", e);
-                            let mut state = state_for_task.lock().unwrap();
-                            state.failed = true;
-                            state.error_message = Some(e.to_string());
+                            {
+                                let mut state = state_for_task.lock().unwrap();
+                                state.failed = true;
+                                state.error_message = Some(e.to_string());
+                            }
+                            // 通知 GPUI 连接状态已变更
+                            listener.send_event(AlacTermEvent::Wakeup);
                         }
                     }
                 });
