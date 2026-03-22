@@ -597,6 +597,7 @@ impl Render for SshPicker {
                 MouseButton::Left,
                 cx.listener(|this, _, _cx, cx| this.hide(cx)),
             )
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .absolute()

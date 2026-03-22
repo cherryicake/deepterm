@@ -4,7 +4,7 @@ pub mod assets;
 pub mod components;
 mod settings_hub;
 pub mod ssh;
-pub mod ssh_picker;
+pub mod ssh_view;
 pub mod terminal;
 pub mod terminal_view;
 pub mod workspace;
@@ -16,7 +16,7 @@ use gpui::{
 };
 
 use crate::components::title_bar::TitleBar;
-use crate::ssh_picker::ssh_picker::SshPicker;
+use crate::ssh_view::ssh_picker::SshPicker;
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
@@ -86,7 +86,14 @@ impl Render for AppWindow {
             // Title bar for window management
             .child(self.title_bar.clone())
             // Workspace content
-            .child(div().flex().flex_1().min_h_0().overflow_hidden().child(self.workspace.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.workspace.clone()),
+            )
             // SSH picker overlay
             .child(self.ssh_picker.clone())
     }
@@ -99,7 +106,7 @@ fn main() {
     } else {
         std::path::PathBuf::from("/tmp/deepterm.log")
     };
-    
+
     let _ = std::fs::remove_file(&log_path);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
