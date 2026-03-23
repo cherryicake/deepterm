@@ -6,7 +6,7 @@ use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Task, UTF16Selection,
-    Window, actions, div, px,
+    Window, actions, div, point, px,
 };
 use gpui::{KeyBinding, prelude::*};
 
@@ -343,6 +343,18 @@ impl TerminalView {
             .map(|state| 0..state.marked_text.encode_utf16().count())
     }
 
+    /// Returns true if IME composition is currently active.
+    pub fn has_ime_composition(&self) -> bool {
+        self.ime_state
+            .as_ref()
+            .map_or(false, |s| !s.marked_text.is_empty())
+    }
+
+    /// Returns a reference to the current IME state, if any.
+    pub fn ime_state(&self) -> Option<&ImeState> {
+        self.ime_state.as_ref()
+    }
+
     /// Clears the marked (pre-edit) text state.
     /// Called when composition is cancelled or completed.
     pub fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
@@ -583,11 +595,40 @@ impl EntityInputHandler for TerminalView {
     fn bounds_for_range(
         &mut self,
         _range_utf16: std::ops::Range<usize>,
-        _element_bounds: Bounds<Pixels>,
+        element_bounds: Bounds<Pixels>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // Only return bounds during active IME composition
+        if self.ime_state.is_none() {
+            return None;
+        }
+        self.terminal.update(cx, |terminal, _cx| {
+            let content = terminal.last_content();
+            let bounds = terminal.terminal_bounds();
+
+            let cursor_line_in_viewport =
+                content.cursor.line.0 + content.display_offset as i32;
+
+            let viewport_lines = bounds.num_lines() as i32;
+            if cursor_line_in_viewport < 0 || cursor_line_in_viewport >= viewport_lines {
+                return None;
+            }
+
+            let cursor_x = element_bounds.left()
+                + px(4.0)
+                + px((content.cursor.column.0 as f32 * bounds.cell_width.as_f32()).floor());
+            let cursor_y = element_bounds.top()
+                + px(cursor_line_in_viewport as f32 * bounds.line_height.as_f32());
+
+            Some(Bounds {
+                origin: point(cursor_x, cursor_y),
+                size: gpui::Size {
+                    width: bounds.cell_width,
+                    height: bounds.line_height,
+                },
+            })
+        })
     }
 
     fn character_index_for_point(

@@ -1,9 +1,10 @@
 //! Terminal element for rendering
 
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels,
-    Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
+    GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle,
+    WhiteSpace, Window,
 };
 use itertools::Itertools;
 
@@ -389,6 +390,7 @@ impl Element for TerminalElement {
         Option<String>,
         TerminalBounds,
         Option<CursorLayout>,
+        Option<(gpui::ShapedLine, Point<Pixels>)>,
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -486,11 +488,7 @@ impl Element for TerminalElement {
                 terminal.set_terminal_bounds(terminal_bounds);
 
                 let content = terminal.last_content();
-                (
-                    content.display_offset,
-                    content.cursor,
-                    content.cursor_shape,
-                )
+                (content.display_offset, content.cursor, content.cursor_shape)
             });
 
         // Calculate visible viewport
@@ -529,8 +527,9 @@ impl Element for TerminalElement {
 
         // Take the row layout cache out of the view so we can mutate it here
         // without a borrow conflict, then write it back after processing.
-        let mut row_cache: Vec<Option<RowLayoutEntry>> =
-            self.view.update(cx, |view, _cx| std::mem::take(&mut view.row_layout_cache));
+        let mut row_cache: Vec<Option<RowLayoutEntry>> = self
+            .view
+            .update(cx, |view, _cx| std::mem::take(&mut view.row_layout_cache));
 
         // Grow or shrink cache to match the current viewport height.
         row_cache.resize_with(viewport_lines, || None);
@@ -546,8 +545,7 @@ impl Element for TerminalElement {
             if is_dirty || row_cache[row_idx].is_none() {
                 dirty_count += 1;
                 let row_cells = cells_by_row.get(row_idx).cloned().unwrap_or_default();
-                let (runs, boxes) =
-                    Self::layout_row(row_idx, row_cells, &text_style, font_size);
+                let (runs, boxes) = Self::layout_row(row_idx, row_cells, &text_style, font_size);
                 batched_runs.extend_from_slice(&runs);
                 box_cells.extend_from_slice(&boxes);
                 row_cache[row_idx] = Some((runs, boxes));
@@ -559,9 +557,7 @@ impl Element for TerminalElement {
             }
         }
 
-        log::trace!(
-            "row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed"
-        );
+        log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
 
         // Write the (potentially updated) cache back into the view.
         self.view.update(cx, |view, _cx| {
@@ -578,20 +574,24 @@ impl Element for TerminalElement {
 
         let selection = self.terminal.read(cx).selection_text();
 
+        let cursor_display_col = cursor_point.column.0;
+
+        // Check if IME composition is active — hide terminal cursor during input
+        let has_ime_composition = self.view.read(cx).has_ime_composition();
+
         // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
         // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
         // 终端不渲染光标，让应用程序自己处理
+        // IME 输入时也隐藏光标，由 preedit overlay 替代显示
         let cursor = if self.cursor_visible
             && cursor_in_viewport
             && cursor_shape != AlacCursorShape::Hidden
+            && !has_ime_composition
         {
-            let cursor_display_line = cursor_point.line.0 + display_offset as i32;
-            let cursor_display_col = cursor_point.column.0;
-
             let cursor_x =
                 bounds.left() + px(4.0) + (cursor_display_col as f32 * cell_width).floor();
             let cursor_y =
-                bounds.top() + (cursor_display_line as f32 * line_height).floor() + px(1.0);
+                bounds.top() + (cursor_line_in_viewport as f32 * line_height).floor() + px(1.0);
 
             let shape = match cursor_shape {
                 AlacCursorShape::Block if !self.focused => CursorShape::Hollow,
@@ -605,16 +605,21 @@ impl Element for TerminalElement {
             // Get cursor character and check if it's a wide character
             let cursor_char = self.terminal.read(cx).last_content().cursor_char;
             let cursor_is_wide = cursor_char != '\0' && is_wide_char(cursor_char);
-            let cursor_block_width = if cursor_is_wide { cell_width * 2.0 } else { cell_width };
+            let cursor_block_width = if cursor_is_wide {
+                cell_width * 2.0
+            } else {
+                cell_width
+            };
 
             // Create text for block cursor (inverted color effect)
             let block_text = if matches!(shape, CursorShape::Block) {
                 if cursor_char != '\0' && cursor_char != ' ' {
                     let char_str = cursor_char.to_string();
                     let len = cursor_char.len_utf8();
-                    let bg_color = convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
-                        alacritty_terminal::vte::ansi::NamedColor::Background,
-                    ));
+                    let bg_color =
+                        convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Background,
+                        ));
                     Some(window.text_system().shape_line(
                         char_str.into(),
                         font_size,
@@ -633,9 +638,10 @@ impl Element for TerminalElement {
                 None
             };
 
-            let cursor_color = convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
-                alacritty_terminal::vte::ansi::NamedColor::Cursor,
-            ));
+            let cursor_color =
+                convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Cursor,
+                ));
 
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
@@ -645,6 +651,42 @@ impl Element for TerminalElement {
                 shape,
                 block_text,
             })
+        } else {
+            None
+        };
+
+        // Shape IME preedit (marked) text for overlay rendering.
+        let ime_overlay: Option<(gpui::ShapedLine, Point<Pixels>)> = if cursor_in_viewport {
+            let ime_text = self
+                .view
+                .read(cx)
+                .ime_state()
+                .map(|s| s.marked_text.clone());
+            if let Some(text) = ime_text {
+                if !text.is_empty() {
+                    let ime_x =
+                        bounds.left() + px(4.0) + (cursor_display_col as f32 * cell_width).floor();
+                    let ime_y =
+                        bounds.top() + (cursor_line_in_viewport as f32 * line_height).floor();
+                    let len = text.len();
+                    let shaped = window.text_system().shape_line(
+                        text.into(),
+                        font_size,
+                        &[TextRun {
+                            len,
+                            font: text_style.font(),
+                            color: gpui::white(),
+                            ..Default::default()
+                        }],
+                        None,
+                    );
+                    Some((shaped, point(ime_x, ime_y)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -662,6 +704,7 @@ impl Element for TerminalElement {
             selection,
             terminal_bounds,
             cursor,
+            ime_overlay,
         )
     }
 
@@ -688,6 +731,7 @@ impl Element for TerminalElement {
             _selection,
             _terminal_bounds,
             cursor,
+            ime_overlay,
         ) = prepaint_state;
 
         let origin = point(bounds.left() + px(4.0), bounds.top());
@@ -730,7 +774,11 @@ impl Element for TerminalElement {
                         .cell
                         .flags
                         .contains(alacritty_terminal::term::cell::Flags::INVERSE);
-                    let bg = if is_inverse { &cell.cell.fg } else { &cell.cell.bg };
+                    let bg = if is_inverse {
+                        &cell.cell.fg
+                    } else {
+                        &cell.cell.bg
+                    };
                     if bg
                         != &alacritty_terminal::vte::ansi::Color::Named(
                             alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -777,6 +825,32 @@ impl Element for TerminalElement {
         // 这实现了光标委托：当应用程序自己处理光标时，终端不渲染
         if let Some(cursor_layout) = cursor {
             cursor_layout.paint(window, cx);
+        }
+
+        // Render IME preedit (marked) text overlay at cursor position.
+        if let Some((ime_shaped, ime_origin)) = ime_overlay {
+            let ime_background_bounds =
+                Bounds::new(*ime_origin, size(ime_shaped.width, *line_height));
+            window.paint_quad(fill(ime_background_bounds, gpui::rgb(0x1a1a2e)));
+
+            let _ = ime_shaped.paint(
+                *ime_origin,
+                *line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+
+            // Draw underline below preedit text to indicate IME composition
+            let underline_y = ime_origin.y + *line_height - px(1.0);
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(ime_origin.x, underline_y),
+                    size(ime_shaped.width, px(1.0)),
+                ),
+                gpui::rgb(0xccccff),
+            ));
         }
 
         window.handle_input(
