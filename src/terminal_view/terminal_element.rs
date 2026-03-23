@@ -15,6 +15,37 @@ use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 
+/// Check if a character is a wide (CJK/double-width) character.
+/// In terminals, wide characters occupy 2 cells instead of 1.
+#[inline]
+fn is_wide_char(c: char) -> bool {
+    // CJK and other East Asian Wide characters
+    matches!(c,
+        '\u{1100}'..='\u{11FF}' |    // Hangul Jamo
+        '\u{2E80}'..='\u{2EFF}' |    // CJK Radicals Supplement
+        '\u{2F00}'..='\u{2FDF}' |    // Kangxi Radicals
+        '\u{3000}'..='\u{303F}' |    // CJK Punctuation
+        '\u{3040}'..='\u{309F}' |    // Hiragana
+        '\u{30A0}'..='\u{30FF}' |    // Katakana
+        '\u{3100}'..='\u{312F}' |    // Bopomofo
+        '\u{3130}'..='\u{318F}' |    // Hangul Compatibility Jamo
+        '\u{3190}'..='\u{319F}' |    // Kanbun
+        '\u{31A0}'..='\u{31BF}' |    // Bopomofo Extended
+        '\u{31C0}'..='\u{31EF}' |    // CJK Strokes
+        '\u{31F0}'..='\u{31FF}' |    // Katakana Phonetic Extensions
+        '\u{3200}'..='\u{32FF}' |    // Enclosed CJK Letters and Months
+        '\u{3300}'..='\u{33FF}' |    // CJK Compatibility
+        '\u{3400}'..='\u{4DBF}' |    // CJK Ideographs Extension A
+        '\u{4E00}'..='\u{9FFF}' |    // CJK Ideographs
+        '\u{A960}'..='\u{A97F}' |    // Hangul Jamo Extended-A
+        '\u{AC00}'..='\u{D7AF}' |    // Hangul Syllables
+        '\u{D7B0}'..='\u{D7FF}' |    // Hangul Jamo Extended-B
+        '\u{F900}'..='\u{FAFF}' |    // CJK Compatibility Ideographs
+        '\u{FF01}'..='\u{FF5E}' |    // Fullwidth ASCII variants
+        '\u{FFE0}'..='\u{FFE6}'      // Fullwidth symbols
+    )
+}
+
 /// Pure helper: check if a grid point falls within the given selection range.
 /// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
 #[inline]
@@ -571,9 +602,13 @@ impl Element for TerminalElement {
                 AlacCursorShape::Hidden => unreachable!(),
             };
 
+            // Get cursor character and check if it's a wide character
+            let cursor_char = self.terminal.read(cx).last_content().cursor_char;
+            let cursor_is_wide = cursor_char != '\0' && is_wide_char(cursor_char);
+            let cursor_block_width = if cursor_is_wide { cell_width * 2.0 } else { cell_width };
+
             // Create text for block cursor (inverted color effect)
             let block_text = if matches!(shape, CursorShape::Block) {
-                let cursor_char = self.terminal.read(cx).last_content().cursor_char;
                 if cursor_char != '\0' && cursor_char != ' ' {
                     let char_str = cursor_char.to_string();
                     let len = cursor_char.len_utf8();
@@ -589,7 +624,7 @@ impl Element for TerminalElement {
                             color: bg_color,
                             ..Default::default()
                         }],
-                        Some(cell_width),
+                        Some(cursor_block_width),
                     ))
                 } else {
                     None
@@ -604,7 +639,7 @@ impl Element for TerminalElement {
 
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
-                block_width: cell_width,
+                block_width: cursor_block_width,
                 line_height,
                 color: cursor_color,
                 shape,
