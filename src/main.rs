@@ -118,6 +118,7 @@ fn main() {
     env_logger::Builder::from_default_env()
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .filter_level(log::LevelFilter::Debug)
+        .filter_module("russh", log::LevelFilter::Warn)
         .init();
 
     log::info!("=== DeepTerm 启动 ===");
