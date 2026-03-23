@@ -32,7 +32,7 @@ use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
-use crate::terminal_view::terminal_element::TerminalElement;
+use crate::terminal_view::terminal_element::{RowLayoutEntry, TerminalElement};
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
 // Define terminal actions
@@ -64,6 +64,9 @@ pub struct TerminalView {
     scrollbar_hide_task: Option<Task<()>>,
     /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
     ssh_connect_view: Option<Entity<SshConnectView>>,
+    /// Per-row layout cache: indexed by viewport row (0 = top).
+    /// Clean rows are reused across frames; dirty rows are recomputed and the cache is updated.
+    pub row_layout_cache: Vec<Option<RowLayoutEntry>>,
 }
 
 impl TerminalView {
@@ -102,6 +105,7 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
+                row_layout_cache: Vec::new(),
             };
             this.update_title(cx);
             this
@@ -157,6 +161,7 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
+                row_layout_cache: Vec::new(),
             };
             this.update_title(cx);
             this
@@ -246,6 +251,7 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: Some(connect_view),
+                row_layout_cache: Vec::new(),
             };
             this.update_title(cx);
             this

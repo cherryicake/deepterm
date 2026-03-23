@@ -44,11 +44,16 @@ fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool 
     }
 }
 
+/// Cached per-row layout: (text runs, box-drawing cells) for one visible row.
+/// Stored in `TerminalView::row_layout_cache` and reused across frames when the row is clean.
+pub type RowLayoutEntry = (Vec<BatchedTextRun>, Vec<BoxDrawingCell>);
+
 /// 盒子绘制字符 / 块元素单元格。
 ///
 /// 对于 U+2500–U+259F 范围内的字符，不走字体光栅化流程，
 /// 而是在 `paint` 阶段用 GPUI 矩形图元直接绘制，
 /// 以保证相邻单元格的线条精确对齐（不受字体字形影响）。
+#[derive(Clone)]
 pub struct BoxDrawingCell {
     pub col: usize,
     pub row: usize,
@@ -203,142 +208,121 @@ impl TerminalElement {
         }
     }
 
-    fn layout_grid(
-        grid: impl Iterator<Item = IndexedCell>,
-        _display_offset: usize,
+    /// Compute the layout for a single visible row.
+    /// `row_idx` is 0-based from the top of the visible viewport.
+    fn layout_row(
+        row_idx: usize,
+        cells: impl IntoIterator<Item = IndexedCell>,
         text_style: &TextStyle,
         font_size: Pixels,
-        _visible_line_start: usize,
-        _visible_line_count: usize,
-    ) -> (Vec<BatchedTextRun>, Vec<BoxDrawingCell>) {
-        let estimated_cells = grid.size_hint().0;
-        if estimated_cells == 0 {
-            return (Vec::new(), Vec::new());
-        }
-
-        let estimated_runs = (estimated_cells / 10).max(16);
-        let mut batched_runs = Vec::with_capacity(estimated_runs);
-        // Small initial capacity avoids realloc for typical terminal output
-        // that uses box-drawing (htop, vim, etc.) without over-allocating for plain text.
-        let mut box_cells: Vec<BoxDrawingCell> = Vec::with_capacity(32);
+    ) -> RowLayoutEntry {
+        let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
+        let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
         let mut current_batch: Option<BatchedTextRun> = None;
 
-        let line_groups = grid.into_iter().chunk_by(|cell| cell.point.line);
+        for cell in cells {
+            let ch = cell.cell.c;
 
-        for (line_index, (_, line_cells)) in line_groups.into_iter().enumerate() {
-            // Use line_index directly as the row number for rendering
-            // The cells from display_iter() are already adjusted for display_offset
-            let row = line_index;
-
-            if let Some(batch) = current_batch.take() {
-                batched_runs.push(batch);
+            if ch == '\0' || ch == ' ' {
+                if let Some(batch) = current_batch.take() {
+                    batched_runs.push(batch);
+                }
+                continue;
             }
 
-            for cell in line_cells {
-                let ch = cell.cell.c;
+            // Handle INVERSE flag: swap foreground and background colors
+            let (fg, bg) = if cell
+                .cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::INVERSE)
+            {
+                (&cell.cell.bg, &cell.cell.fg)
+            } else {
+                (&cell.cell.fg, &cell.cell.bg)
+            };
 
-                if ch == '\0' || ch == ' ' {
-                    if let Some(batch) = current_batch.take() {
-                        batched_runs.push(batch);
-                    }
-                    continue;
+            // 盒子绘制字符 / 块元素（U+2500–U+259F）：
+            // 跳过字体渲染，收集到 box_cells 中，稍后在 paint 阶段
+            // 用 GPUI 矩形图元直接绘制，确保相邻单元格边框线条无缝对接。
+            if box_drawing::is_box_drawing_char(ch) {
+                if let Some(batch) = current_batch.take() {
+                    batched_runs.push(batch);
                 }
-
-                // Handle INVERSE flag: swap foreground and background colors
-                let (fg, bg) = if cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::INVERSE)
-                {
-                    (&cell.cell.bg, &cell.cell.fg)
-                } else {
-                    (&cell.cell.fg, &cell.cell.bg)
-                };
-
-                // 盒子绘制字符 / 块元素（U+2500–U+259F）：
-                // 跳过字体渲染，收集到 box_cells 中，稍后在 paint 阶段
-                // 用 GPUI 矩形图元直接绘制，确保相邻单元格边框线条无缝对接。
-                if box_drawing::is_box_drawing_char(ch) {
-                    if let Some(batch) = current_batch.take() {
-                        batched_runs.push(batch);
-                    }
-                    box_cells.push(BoxDrawingCell {
-                        col: cell.point.column.0,
-                        row,
-                        c: ch,
-                        color: convert_alacritty_color(fg),
-                    });
-                    continue;
-                }
-
-                let cell_style = TextRun {
-                    len: ch.len_utf8(),
-                    font: Font {
-                        weight: if cell
-                            .cell
-                            .flags
-                            .contains(alacritty_terminal::term::cell::Flags::BOLD)
-                        {
-                            FontWeight::BOLD
-                        } else {
-                            text_style.font_weight
-                        },
-                        style: if cell
-                            .cell
-                            .flags
-                            .contains(alacritty_terminal::term::cell::Flags::ITALIC)
-                        {
-                            FontStyle::Italic
-                        } else {
-                            FontStyle::Normal
-                        },
-                        ..text_style.font()
-                    },
+                box_cells.push(BoxDrawingCell {
+                    col: cell.point.column.0,
+                    row: row_idx,
+                    c: ch,
                     color: convert_alacritty_color(fg),
-                    background_color: if bg
-                        == &alacritty_terminal::vte::ansi::Color::Named(
-                            alacritty_terminal::vte::ansi::NamedColor::Background,
-                        ) {
-                        None
-                    } else {
-                        Some(convert_alacritty_color(bg))
-                    },
-                    underline: if cell
+                });
+                continue;
+            }
+
+            let cell_style = TextRun {
+                len: ch.len_utf8(),
+                font: Font {
+                    weight: if cell
                         .cell
                         .flags
-                        .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+                        .contains(alacritty_terminal::term::cell::Flags::BOLD)
                     {
-                        Some(gpui::UnderlineStyle {
-                            color: Some(convert_alacritty_color(&cell.cell.fg)),
-                            thickness: px(1.0),
-                            wavy: false,
-                        })
+                        FontWeight::BOLD
                     } else {
-                        None
+                        text_style.font_weight
                     },
-                    strikethrough: None,
-                };
-
-                match current_batch.as_mut() {
-                    Some(batch)
-                        if batch.can_append(&cell_style)
-                            && batch.start_row == row
-                            && batch.start_col + batch.cell_count == cell.point.column.0 =>
+                    style: if cell
+                        .cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::ITALIC)
                     {
-                        batch.append_char(ch);
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    },
+                    ..text_style.font()
+                },
+                color: convert_alacritty_color(fg),
+                background_color: if bg
+                    == &alacritty_terminal::vte::ansi::Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Background,
+                    ) {
+                    None
+                } else {
+                    Some(convert_alacritty_color(bg))
+                },
+                underline: if cell
+                    .cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+                {
+                    Some(gpui::UnderlineStyle {
+                        color: Some(convert_alacritty_color(&cell.cell.fg)),
+                        thickness: px(1.0),
+                        wavy: false,
+                    })
+                } else {
+                    None
+                },
+                strikethrough: None,
+            };
+
+            match current_batch.as_mut() {
+                Some(batch)
+                    if batch.can_append(&cell_style)
+                        && batch.start_col + batch.cell_count == cell.point.column.0 =>
+                {
+                    batch.append_char(ch);
+                }
+                _ => {
+                    if let Some(batch) = current_batch.take() {
+                        batched_runs.push(batch);
                     }
-                    _ => {
-                        if let Some(batch) = current_batch.take() {
-                            batched_runs.push(batch);
-                        }
-                        current_batch = Some(BatchedTextRun::new_from_char(
-                            row,
-                            cell.point.column.0,
-                            ch,
-                            cell_style,
-                            font_size,
-                        ));
-                    }
+                    current_batch = Some(BatchedTextRun::new_from_char(
+                        row_idx,
+                        cell.point.column.0,
+                        ch,
+                        cell_style,
+                        font_size,
+                    ));
                 }
             }
         }
@@ -482,12 +466,12 @@ impl Element for TerminalElement {
         let visible_bounds = window.content_mask().bounds;
         let intersection = visible_bounds.intersect(&bounds);
 
-        let visible_line_start = if intersection.size.height > px(0.0) {
+        let _visible_line_start = if intersection.size.height > px(0.0) {
             ((intersection.top() - bounds.top()).max(px(0.0)) / line_height).floor() as usize
         } else {
             0
         };
-        let visible_line_count = if intersection.size.height > px(0.0) {
+        let _visible_line_count = if intersection.size.height > px(0.0) {
             ((intersection.size.height / line_height).ceil() as usize).max(1)
         } else {
             terminal_bounds.num_lines()
@@ -496,15 +480,62 @@ impl Element for TerminalElement {
         // Get viewport info for cursor calculation
         let viewport_lines = terminal_bounds.num_lines();
 
-        let content = self.terminal.read(cx).last_content();
-        let (batched_runs, box_cells) = Self::layout_grid(
-            content.cells.iter().cloned(),
-            display_offset,
-            &text_style,
-            font_size,
-            visible_line_start,
-            visible_line_count,
+        // --- Row dirty tracking + per-row layout cache ---
+        // dirty_rows is populated by Terminal::sync() via alacritty's damage API.
+        let dirty_rows = self.terminal.read(cx).dirty_rows().to_vec();
+
+        // Collect cells grouped by sequential row (0 = topmost visible row).
+        // The borrow on terminal content ends when this block exits.
+        let cells_by_row: Vec<Vec<IndexedCell>> = {
+            let content = self.terminal.read(cx).last_content();
+            let line_groups = content.cells.iter().cloned().chunk_by(|c| c.point.line);
+            let mut by_row: Vec<Vec<IndexedCell>> = Vec::with_capacity(viewport_lines);
+            for (_, (_, row_cells)) in line_groups.into_iter().enumerate() {
+                by_row.push(row_cells.collect());
+            }
+            by_row
+        };
+
+        // Take the row layout cache out of the view so we can mutate it here
+        // without a borrow conflict, then write it back after processing.
+        let mut row_cache: Vec<Option<RowLayoutEntry>> =
+            self.view.update(cx, |view, _cx| std::mem::take(&mut view.row_layout_cache));
+
+        // Grow or shrink cache to match the current viewport height.
+        row_cache.resize_with(viewport_lines, || None);
+
+        let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
+        let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
+        let mut dirty_count = 0usize;
+        let mut cache_hit_count = 0usize;
+
+        for row_idx in 0..viewport_lines {
+            let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
+
+            if is_dirty || row_cache[row_idx].is_none() {
+                dirty_count += 1;
+                let row_cells = cells_by_row.get(row_idx).cloned().unwrap_or_default();
+                let (runs, boxes) =
+                    Self::layout_row(row_idx, row_cells, &text_style, font_size);
+                batched_runs.extend_from_slice(&runs);
+                box_cells.extend_from_slice(&boxes);
+                row_cache[row_idx] = Some((runs, boxes));
+            } else {
+                cache_hit_count += 1;
+                let (cached_runs, cached_boxes) = row_cache[row_idx].as_ref().unwrap();
+                batched_runs.extend_from_slice(cached_runs);
+                box_cells.extend_from_slice(cached_boxes);
+            }
+        }
+
+        log::trace!(
+            "row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed"
         );
+
+        // Write the (potentially updated) cache back into the view.
+        self.view.update(cx, |view, _cx| {
+            view.row_layout_cache = row_cache;
+        });
 
         // Calculate cursor position relative to viewport
         let cursor_line_in_viewport = cursor_point.line.0 + display_offset as i32;
@@ -687,7 +718,7 @@ impl Element for TerminalElement {
         }
 
         // 绘制内置盒子绘制字符 / 块元素。
-        // 这些字符在 layout_grid 阶段已从文本批次中分离出来，
+        // 这些字符在 layout_row 阶段已从文本批次中分离出来，
         // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
         // 效果等同于 Alacritty 的 builtin_box_drawing = true：
         // 相邻格的边框线条精确对齐，不依赖字体字形，不会出现间隙。

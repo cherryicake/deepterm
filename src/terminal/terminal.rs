@@ -10,7 +10,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point as AlacPoint, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, TermMode},
+    term::{Config, TermDamage, TermMode},
     tty::{self},
     vte::ansi::{CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler},
 };
@@ -220,6 +220,8 @@ pub struct Terminal {
     last_content: TerminalContent,
     content_generation: u64,
     content_dirty: bool,
+    /// 每次 update_last_content 后，标记哪些 viewport 行（0 = 顶行）发生了变化
+    dirty_rows: Vec<bool>,
     /// 事件循环任务（保持任务存活，防止被drop）
     #[allow(dead_code)]
     event_loop_task: Option<Task<()>>,
@@ -320,6 +322,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                dirty_rows: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -414,6 +417,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                dirty_rows: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -442,6 +446,7 @@ impl Terminal {
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
+            dirty_rows: Vec::new(),
             event_loop_task: None,
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
@@ -511,6 +516,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                dirty_rows: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -618,6 +624,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                dirty_rows: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -857,7 +864,28 @@ impl Terminal {
     }
 
     fn update_last_content(&mut self) {
-        let term = self.term.lock();
+        let mut term = self.term.lock();
+
+        // Collect damage info while we hold the lock, before resetting.
+        let num_rows = self.terminal_bounds.num_lines();
+        let damage = term.damage();
+        self.dirty_rows.clear();
+        match damage {
+            TermDamage::Full => {
+                self.dirty_rows.resize(num_rows, true);
+            }
+            TermDamage::Partial(iter) => {
+                self.dirty_rows.resize(num_rows, false);
+                for line_damage in iter {
+                    let row = line_damage.line;
+                    if row < num_rows {
+                        self.dirty_rows[row] = true;
+                    }
+                }
+            }
+        }
+        term.reset_damage();
+
         let content = term.renderable_content();
 
         let estimated_size = content.display_iter.size_hint().0;
@@ -892,7 +920,15 @@ impl Terminal {
         if self.content_dirty {
             self.update_last_content();
             self.content_dirty = false;
+        } else {
+            // Nothing changed this frame – tell the element all rows are clean.
+            self.dirty_rows.fill(false);
         }
+    }
+
+    /// Returns which viewport rows (0 = top) changed since the last `sync()`.
+    pub fn dirty_rows(&self) -> &[bool] {
+        &self.dirty_rows
     }
 
     pub fn write(&mut self, data: &[u8]) {
