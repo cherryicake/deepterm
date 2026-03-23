@@ -174,7 +174,7 @@ pub fn paint_box_drawing(
             }
         }
         // U+2580–U+259F：块元素字符，按比例填充单元格的指定区域
-        0x2580..=0x259F => paint_block_element(c, origin, cell_w, cell_h, &mut paint),
+        0x2580..=0x259F => paint_block_element(c, origin, cell_w, cell_h, color, window),
         _ => {}
     }
 }
@@ -284,7 +284,7 @@ fn paint_segments(
 
 // ─── 块元素绘制实现 ────────────────────────────────────────────────────────────
 
-/// 将块元素字符（U+2580–U+259F）通过回调 `f` 输出填充矩形。
+/// 将块元素字符（U+2580–U+259F）直接绘制到 `window` 上。
 /// 每个块元素字符表示对单元格某个区域的像素填充，例如：
 ///   ▀ = 上半格  ▄ = 下半格  █ = 整格  ▌ = 左半格  ░ = 浅阴影
 fn paint_block_element(
@@ -292,71 +292,116 @@ fn paint_block_element(
     origin: Point<Pixels>,
     w: Pixels,
     h: Pixels,
-    f: &mut impl FnMut(Bounds<Pixels>),
+    color: Hsla,
+    window: &mut Window,
 ) {
     let code = c as u32;
 
     // 辅助闭包：计算单元格宽/高的 n/d 比例对应的像素数
     let frac_w = |n: f32, d: f32| px((w.as_f32() * n / d).round());
     let frac_h = |n: f32, d: f32| px((h.as_f32() * n / d).round());
+    // 辅助闭包：绘制填充矩形
+    let mut paint = |bounds: Bounds<Pixels>, quad_color: Hsla| {
+        window.paint_quad(fill(bounds, quad_color));
+    };
 
     match code {
         // ▀ 上半块：填充单元格上半部分
-        0x2580 => f(Bounds { origin, size: size(w, frac_h(1.0, 2.0)) }),
+        0x2580 => paint(Bounds { origin, size: size(w, frac_h(1.0, 2.0)) }, color),
 
         // ▁▂▃▄▅▆▇ 下 N/8 块：从单元格底部向上填充 N/8 高度
         0x2581..=0x2587 => {
             let n = (code - 0x2580) as f32; // N 取值 1–7
             let bh = frac_h(n, 8.0);
-            f(Bounds { origin: point(origin.x, origin.y + h - bh), size: size(w, bh) });
+            paint(Bounds { origin: point(origin.x, origin.y + h - bh), size: size(w, bh) }, color);
         }
 
         // █ 全块：填充整个单元格
-        0x2588 => f(Bounds { origin, size: size(w, h) }),
+        0x2588 => paint(Bounds { origin, size: size(w, h) }, color),
 
         // ▉▊▋▌▍▎▏ 左 N/8 块：从单元格左侧向右填充 N/8 宽度（7→1 递减）
         0x2589..=0x258F => {
             let n = (0x2590 - code) as f32; // N 从 7 递减到 1
-            f(Bounds { origin, size: size(frac_w(n, 8.0), h) });
+            paint(Bounds { origin, size: size(frac_w(n, 8.0), h) }, color);
         }
 
         // ▐ 右半块：填充单元格右半部分
         0x2590 => {
             let half = frac_w(1.0, 2.0);
-            f(Bounds { origin: point(origin.x + w - half, origin.y), size: size(half, h) });
+            paint(Bounds { origin: point(origin.x + w - half, origin.y), size: size(half, h) }, color);
         }
 
-        // ░ 浅阴影：约 25% 覆盖率，用棋盘格小矩形近似
-        0x2591 => shade_quads(origin, w, h, 1, 4, f),
+        // ░ 浅阴影：约 25% 覆盖率
+        0x2591 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.25)),
 
         // ▒ 中阴影：约 50% 覆盖率
-        0x2592 => shade_quads(origin, w, h, 1, 2, f),
+        0x2592 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.5)),
 
         // ▓ 深阴影：约 75% 覆盖率
-        0x2593 => shade_quads(origin, w, h, 3, 4, f),
+        0x2593 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.75)),
 
         // ▔ 上 1/8 块：填充单元格顶部 1/8 高度的细条
-        0x2594 => f(Bounds { origin, size: size(w, frac_h(1.0, 8.0)) }),
+        0x2594 => paint(Bounds { origin, size: size(w, frac_h(1.0, 8.0)) }, color),
 
         // ▕ 右 1/8 块：填充单元格最右侧 1/8 宽度的细条
         0x2595 => {
             let bw = frac_w(1.0, 8.0);
-            f(Bounds { origin: point(origin.x + w - bw, origin.y), size: size(bw, h) });
+            paint(Bounds { origin: point(origin.x + w - bw, origin.y), size: size(bw, h) }, color);
         }
 
         // ▖▗▘▙▚▛▜▝▞▟ 四分之一块组合：每个字符是若干象限的填充组合
-        0x2596 => quadrant(origin, w, h, false, false, true, false, f),   // ▖ 左下象限
-        0x2597 => quadrant(origin, w, h, false, false, false, true, f),   // ▗ 右下象限
-        0x2598 => quadrant(origin, w, h, true, false, false, false, f),   // ▘ 左上象限
-        0x2599 => quadrant(origin, w, h, true, false, true, true, f),     // ▙ 左上 + 左下 + 右下
-        0x259A => quadrant(origin, w, h, true, false, false, true, f),    // ▚ 左上 + 右下（对角）
-        0x259B => quadrant(origin, w, h, true, true, true, false, f),     // ▛ 左上 + 右上 + 左下
-        0x259C => quadrant(origin, w, h, true, true, false, true, f),     // ▜ 左上 + 右上 + 右下
-        0x259D => quadrant(origin, w, h, false, true, false, false, f),   // ▝ 右上象限
-        0x259E => quadrant(origin, w, h, false, true, true, false, f),    // ▞ 右上 + 左下（对角）
-        0x259F => quadrant(origin, w, h, false, true, true, true, f),     // ▟ 右上 + 左下 + 右下
+        0x2596 => quadrant_paint(origin, w, h, false, false, true, false, color, &mut paint),   // ▖ 左下象限
+        0x2597 => quadrant_paint(origin, w, h, false, false, false, true, color, &mut paint),   // ▗ 右下象限
+        0x2598 => quadrant_paint(origin, w, h, true, false, false, false, color, &mut paint),   // ▘ 左上象限
+        0x2599 => quadrant_paint(origin, w, h, true, false, true, true, color, &mut paint),     // ▙ 左上 + 左下 + 右下
+        0x259A => quadrant_paint(origin, w, h, true, false, false, true, color, &mut paint),    // ▚ 左上 + 右下（对角）
+        0x259B => quadrant_paint(origin, w, h, true, true, true, false, color, &mut paint),     // ▛ 左上 + 右上 + 左下
+        0x259C => quadrant_paint(origin, w, h, true, true, false, true, color, &mut paint),     // ▜ 左上 + 右上 + 右下
+        0x259D => quadrant_paint(origin, w, h, false, true, false, false, color, &mut paint),   // ▝ 右上象限
+        0x259E => quadrant_paint(origin, w, h, false, true, true, false, color, &mut paint),    // ▞ 右上 + 左下（对角）
+        0x259F => quadrant_paint(origin, w, h, false, true, true, true, color, &mut paint),     // ▟ 右上 + 左下 + 右下
 
         _ => {}
+    }
+}
+
+/// 象限块渲染（直接绘制版本）：将单元格均分为四个象限，按参数填充指定象限。
+/// 用于渲染 ▖▗▘▙▚▛▜▝▞▟ 等四分之一块组合字符。
+fn quadrant_paint(
+    origin: Point<Pixels>,
+    w: Pixels,
+    h: Pixels,
+    upper_left: bool,
+    upper_right: bool,
+    lower_left: bool,
+    lower_right: bool,
+    color: Hsla,
+    paint: &mut impl FnMut(Bounds<Pixels>, Hsla),
+) {
+    // 象限宽/高 = 单元格宽/高的一半（取整）
+    let hw = px((w.as_f32() / 2.0).round());
+    let hh = px((h.as_f32() / 2.0).round());
+
+    if upper_left {
+        paint(Bounds { origin, size: size(hw, hh) }, color);
+    }
+    if upper_right {
+        paint(Bounds {
+            origin: point(origin.x + w - hw, origin.y),
+            size: size(hw, hh),
+        }, color);
+    }
+    if lower_left {
+        paint(Bounds {
+            origin: point(origin.x, origin.y + h - hh),
+            size: size(hw, hh),
+        }, color);
+    }
+    if lower_right {
+        paint(Bounds {
+            origin: point(origin.x + w - hw, origin.y + h - hh),
+            size: size(hw, hh),
+        }, color);
     }
 }
 
@@ -440,76 +485,5 @@ fn paint_rounded_corner(
 
     if let Ok(path) = builder.build() {
         window.paint_path(path, Background::from(color));
-    }
-}
-
-/// 阴影字符（░▒▓）近似渲染：用棋盘格小矩形模拟指定覆盖率。
-/// `num/den` 表示覆盖率，例如 1/4 = 25%（浅阴影），3/4 = 75%（深阴影）。
-fn shade_quads(
-    origin: Point<Pixels>,
-    w: Pixels,
-    h: Pixels,
-    num: u32,
-    den: u32,
-    f: &mut impl FnMut(Bounds<Pixels>),
-) {
-    // 将单元格划分为小网格，每个格子大小约 2×2 px
-    let cols = (w.as_f32() / 2.0).max(1.0) as u32;
-    let rows = (h.as_f32() / 2.0).max(1.0) as u32;
-    let dot_w = px(w.as_f32() / cols as f32);
-    let dot_h = px(h.as_f32() / rows as f32);
-
-    for row in 0..rows {
-        for col in 0..cols {
-            // 取模棋盘格模式控制覆盖密度（比线性分布更均匀）
-            if (row + col) % den < num {
-                f(Bounds {
-                    origin: point(
-                        origin.x + dot_w * col as f32,
-                        origin.y + dot_h * row as f32,
-                    ),
-                    size: size(dot_w, dot_h),
-                });
-            }
-        }
-    }
-}
-
-/// 象限块渲染：将单元格均分为四个象限，按参数填充指定象限。
-/// 用于渲染 ▖▗▘▙▚▛▜▝▞▟ 等四分之一块组合字符。
-fn quadrant(
-    origin: Point<Pixels>,
-    w: Pixels,
-    h: Pixels,
-    upper_left: bool,
-    upper_right: bool,
-    lower_left: bool,
-    lower_right: bool,
-    f: &mut impl FnMut(Bounds<Pixels>),
-) {
-    // 象限宽/高 = 单元格宽/高的一半（取整）
-    let hw = px((w.as_f32() / 2.0).round());
-    let hh = px((h.as_f32() / 2.0).round());
-
-    if upper_left {
-        f(Bounds { origin, size: size(hw, hh) });
-    }
-    if upper_right {
-        f(Bounds {
-            origin: point(origin.x + w - hw, origin.y),
-            size: size(hw, hh),
-        });
-    }
-    if lower_left {
-        f(Bounds {
-            origin: point(origin.x, origin.y + h - hh),
-            size: size(hw, hh),
-        });
-    }
-    if lower_right {
-        f(Bounds {
-            origin: point(origin.x + w - hw, origin.y + h - hh),
-            size: size(hw, hh),
-        });
     }
 }
