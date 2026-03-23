@@ -677,11 +677,9 @@ impl Render for TerminalView {
                 });
                 cx.notify();
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                this.terminal.update(cx, |terminal, cx| {
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                this.terminal.update(cx, |terminal, _cx| {
                     terminal.scroll_wheel(event, 3.0);
-                    // Sync immediately to update display_offset after scrolling
-                    terminal.sync(window, cx);
                 });
                 cx.stop_propagation();
                 cx.notify();
