@@ -457,9 +457,26 @@ impl TerminalView {
             return;
         }
 
-        // Otherwise, paste text content
+        // Otherwise, paste text content with bracketed paste mode support
         if let Some(text) = clipboard.text() {
-            self.write_with_broadcast(text.as_bytes(), cx);
+            let bracketed = self.terminal.update(cx, |terminal, _| {
+                terminal
+                    .last_content()
+                    .mode
+                    .contains(TermMode::BRACKETED_PASTE)
+            });
+
+            if bracketed {
+                // Use bracketed paste mode to preserve whitespace
+                let mut data = Vec::new();
+                data.extend_from_slice(b"\x1b[200~");
+                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                self.write_with_broadcast(&data, cx);
+            } else {
+                // Normal mode
+                self.write_with_broadcast(text.as_bytes(), cx);
+            }
         }
     }
 

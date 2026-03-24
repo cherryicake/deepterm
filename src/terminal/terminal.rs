@@ -1330,9 +1330,21 @@ impl Terminal {
             return;
         }
 
-        // Otherwise, paste text content
+        // Otherwise, paste text content with bracketed paste mode support
         if let Some(text) = clipboard.text() {
-            self.write(text.as_bytes());
+            let term = self.term.lock();
+            let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
+            drop(term);
+
+            if bracketed {
+                // Use bracketed paste mode to preserve whitespace
+                self.write(b"\x1b[200~");
+                self.write(text.as_bytes());
+                self.write(b"\x1b[201~");
+            } else {
+                // Normal mode
+                self.write(text.as_bytes());
+            }
         }
     }
 
