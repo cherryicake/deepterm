@@ -272,6 +272,13 @@ impl Render for SshConnectView {
                             .size(crate::components::stepper::StepperSize::Large)
                             .text_center(true)
                             .selected_index(selected_index)
+                            .status(if is_failed {
+                                crate::components::stepper::StepperStatus::Failed
+                            } else if is_connected {
+                                crate::components::stepper::StepperStatus::Success
+                            } else {
+                                crate::components::stepper::StepperStatus::Normal
+                            })
                             .items([
                                 StepperItem::new().child(
                                     div()

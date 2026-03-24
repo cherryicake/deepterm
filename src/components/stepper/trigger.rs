@@ -166,7 +166,10 @@ impl RenderOnce for StepperTrigger {
                             .when(is_completed, |this| {
                                 this.bg(gpui::rgb(0x22c55e)).text_color(gpui::rgb(0xffffff))
                             })
-                            .when(is_current, |this| {
+                            .when(is_current && self.status == StepperStatus::Failed, |this| {
+                                this.bg(gpui::rgb(0xf87171)).text_color(gpui::rgb(0xffffff))
+                            })
+                            .when(is_current && self.status != StepperStatus::Failed, |this| {
                                 this.bg(gpui::rgb(0x3b82f6)).text_color(gpui::rgb(0xffffff))
                             })
                             .child(div().child(format!("{}", self.step + 1))),
