@@ -133,14 +133,7 @@ impl RusshTerminal {
                             }
 
                             // 启动 I/O 循环
-                            Self::io_loop(
-                                handle,
-                                channel,
-                                input_rx,
-                                term,
-                                listener,
-                            )
-                            .await;
+                            Self::io_loop(handle, channel, input_rx, term, listener).await;
                         }
                         Err(e) => {
                             log::warn!("russh: 连接失败: {}", e);
@@ -202,7 +195,8 @@ impl RusshTerminal {
 
         if let Some(ref terminal) = state.terminal {
             // 连接已就绪，直接发送
-            terminal.input_tx
+            terminal
+                .input_tx
                 .send(InputMsg::Resize(cols as u32, rows as u32))
                 .ok();
         } else if !state.failed {
@@ -321,9 +315,7 @@ impl RusshTerminal {
                 let default_keys = crate::ssh::find_default_ssh_keys();
 
                 if default_keys.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "自动认证失败：~/.ssh 中未找到密钥文件"
-                    ));
+                    return Err(anyhow::anyhow!("自动认证失败：~/.ssh 中未找到密钥文件"));
                 }
 
                 // 服务器 RSA hash 偏好在整个连接中不变，只需协商一次
@@ -373,8 +365,7 @@ impl RusshTerminal {
                 log::info!("russh: SSH Agent 认证 (SSH_AUTH_SOCK)");
 
                 // 尝试连接 SSH Agent
-                let agent_result =
-                    russh::keys::agent::client::AgentClient::connect_env().await;
+                let agent_result = russh::keys::agent::client::AgentClient::connect_env().await;
 
                 match agent_result {
                     Ok(mut agent) => {
@@ -415,9 +406,7 @@ impl RusshTerminal {
                                         return Ok(result);
                                     }
                                     Ok(_) => {
-                                        log::debug!(
-                                            "russh: 该 Agent 密钥未成功，继续尝试下一个"
-                                        );
+                                        log::debug!("russh: 该 Agent 密钥未成功，继续尝试下一个");
                                     }
                                     Err(e) => {
                                         log::debug!("russh: Agent 密钥认证错误: {}", e);

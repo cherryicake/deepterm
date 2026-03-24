@@ -1,10 +1,9 @@
 //! Terminal element for rendering
 
 use gpui::{
-    fill, outline, point, px, rgb, size, BorderStyle, Bounds, Element, ElementId,
-    ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks, FontStyle, FontWeight,
-    GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style, TextRun, TextStyle,
-    WhiteSpace, Window,
+    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
+    FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels,
+    Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
 };
 use itertools::Itertools;
 

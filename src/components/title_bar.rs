@@ -126,9 +126,7 @@ impl Render for TitleBar {
                             div.mr(px(0.)) // 右边距留出窗口控制按钮空间
                         })
                         // macOS: 不需要留出空间，使用系统控制按钮
-                        .when(is_macos || is_web, |div| {
-                            div.max_w_full()
-                        })
+                        .when(is_macos || is_web, |div| div.max_w_full())
                         // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
                         .on_mouse_down(
                             MouseButton::Left,

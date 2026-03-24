@@ -38,8 +38,8 @@ pub use error::{SshError, SshResult};
 pub use russh_terminal::RusshTerminal;
 pub use ssh_pty::SshPtyTerminal;
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// SSH 客户端配置
 #[derive(Clone, Debug)]
@@ -86,7 +86,9 @@ impl SshGlobalState {
     }
 
     /// 获取连接管理器的引用
-    pub fn manager(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, SshConnectionManager>> {
+    pub fn manager(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, SshConnectionManager>> {
         // Note: parking_lot::Mutex doesn't return a Result, it returns the guard directly
         // We keep this signature for compatibility with standard Mutex API
         panic!("Use manager_lock() for parking_lot Mutex")
@@ -120,9 +122,15 @@ pub enum ConnectionEvent {
     /// 连接已建立
     Connected { connection_id: String },
     /// 连接已断开
-    Disconnected { connection_id: String, reason: Option<String> },
+    Disconnected {
+        connection_id: String,
+        reason: Option<String>,
+    },
     /// 连接失败
-    ConnectionFailed { connection_id: String, error: String },
+    ConnectionFailed {
+        connection_id: String,
+        error: String,
+    },
     /// 正在连接
     Connecting { connection_id: String },
     /// 正在重连

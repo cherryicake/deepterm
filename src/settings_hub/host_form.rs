@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, svg, App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton,
-    Render, Window,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
+    px, rgb, svg,
 };
 
 use crate::assets::Icon;

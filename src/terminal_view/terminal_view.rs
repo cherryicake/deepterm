@@ -224,7 +224,22 @@ impl TerminalView {
                                 }
                             };
                             match outcome {
-                                SshOutcome::Connected => this.ssh_connect_view = None,
+                                SshOutcome::Connected => {
+                                    // 先标记为已连接，然后移除视图
+                                    connect_view.update(cx, |view, cx| view.set_connected(cx));
+                                    // 延迟移除连接视图，让用户看到完成状态
+                                    cx.spawn(async move |this, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(500))
+                                            .await;
+                                        this.update(cx, |this, cx| {
+                                            this.ssh_connect_view = None;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    })
+                                    .detach();
+                                }
                                 SshOutcome::Failed(msg) => {
                                     connect_view.update(cx, |view, cx| view.set_failed(msg, cx));
                                 }
@@ -607,8 +622,7 @@ impl EntityInputHandler for TerminalView {
             let content = terminal.last_content();
             let bounds = terminal.terminal_bounds();
 
-            let cursor_line_in_viewport =
-                content.cursor.line.0 + content.display_offset as i32;
+            let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
 
             let viewport_lines = bounds.num_lines() as i32;
             if cursor_line_in_viewport < 0 || cursor_line_in_viewport >= viewport_lines {

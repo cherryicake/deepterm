@@ -144,19 +144,27 @@ mod tests {
     #[test]
     fn test_parse_osc52_set() {
         let result = parse_osc52("52;c;SGVsbG8=");
-        assert!(matches!(result, Some(Osc52Operation::Set { clipboard: 'c', data }) if data == "Hello"));
+        assert!(
+            matches!(result, Some(Osc52Operation::Set { clipboard: 'c', data }) if data == "Hello")
+        );
     }
 
     #[test]
     fn test_parse_osc52_query() {
         let result = parse_osc52("52;c;?");
-        assert!(matches!(result, Some(Osc52Operation::Query { clipboard: 'c' })));
+        assert!(matches!(
+            result,
+            Some(Osc52Operation::Query { clipboard: 'c' })
+        ));
     }
 
     #[test]
     fn test_parse_osc52_clear() {
         let result = parse_osc52("52;c;");
-        assert!(matches!(result, Some(Osc52Operation::Clear { clipboard: 'c' })));
+        assert!(matches!(
+            result,
+            Some(Osc52Operation::Clear { clipboard: 'c' })
+        ));
     }
 
     #[test]

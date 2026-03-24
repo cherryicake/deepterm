@@ -1,6 +1,6 @@
 use gpui::{
-    div, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled,
-    Window,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Window,
+    div,
 };
 
 use crate::workspace::panel::{Panel, PanelPlacement};

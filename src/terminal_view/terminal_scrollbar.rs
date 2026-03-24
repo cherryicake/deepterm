@@ -145,7 +145,8 @@ impl gpui::Element for ScrollbarElement {
         let current_offset = px(scroll_offset as f32 * line_height.as_f32());
 
         let start_offset = if max_offset.as_f32() > 0.0 {
-            px((current_offset.as_f32() / max_offset.as_f32()) * (viewport_size - thumb_size).as_f32())
+            px((current_offset.as_f32() / max_offset.as_f32())
+                * (viewport_size - thumb_size).as_f32())
         } else {
             px(0.0)
         };
@@ -226,7 +227,8 @@ impl gpui::Element for ScrollbarElement {
                 // Convert percentage to display_offset
                 // percentage 0.0 -> display_offset = max_scroll_lines (at top)
                 // percentage 1.0 -> display_offset = 0 (at bottom)
-                let new_display_offset = ((1.0 - percentage) * max_scroll_lines as f32).round() as usize;
+                let new_display_offset =
+                    ((1.0 - percentage) * max_scroll_lines as f32).round() as usize;
                 let clamped_offset = new_display_offset.min(max_scroll_lines);
 
                 terminal.update(cx, |t, cx| {

@@ -11,8 +11,8 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
-use crate::terminal::terminal::ZedListener;
 use crate::terminal::TerminalBounds;
+use crate::terminal::terminal::ZedListener;
 
 /// SSH 终端 - 使用 Zellij 方式（PTY）
 pub struct SshPtyTerminal {
@@ -34,12 +34,18 @@ impl SshPtyTerminal {
         // 构建 SSH 命令
         let mut ssh_program = "ssh";
         let mut ssh_args = vec![
-            "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
-            "-o".to_string(), "ServerAliveInterval=60".to_string(),
-            "-o".to_string(), "ServerAliveCountMax=3".to_string(),
-            "-p".to_string(), config.port.to_string(),
-            "-l".to_string(), config.username.clone(),
-            "-t".to_string(), "-t".to_string(), // 强制分配 TTY
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+            "-o".to_string(),
+            "ServerAliveInterval=60".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
+            "-p".to_string(),
+            config.port.to_string(),
+            "-l".to_string(),
+            config.username.clone(),
+            "-t".to_string(),
+            "-t".to_string(), // 强制分配 TTY
         ];
 
         // 添加认证方式
@@ -53,11 +59,7 @@ impl SshPtyTerminal {
                 log::info!("使用密码认证 (通过 sshpass)");
                 // 使用 sshpass 自动输入密码
                 // 命令格式: sshpass -p 'password' ssh [options] user@host
-                let mut sshpass_args = vec![
-                    "-p".to_string(),
-                    password.clone(),
-                    "ssh".to_string(),
-                ];
+                let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
                 sshpass_args.append(&mut ssh_args);
                 ssh_args = sshpass_args;
                 ssh_program = "sshpass";
@@ -88,19 +90,16 @@ impl SshPtyTerminal {
 
         // 创建 PTY
         log::debug!("创建 PTY...");
-        let pty = tty::new(
-            &pty_options, window_size, 0)
+        let pty = tty::new(&pty_options, window_size, 0)
             .map_err(|e| anyhow::anyhow!("创建 PTY 失败: {}", e))?;
 
         // 创建事件循环
         log::debug!("创建事件循环...");
         let event_loop = EventLoop::new(
-            term,
-            listener,
-            pty,
-            true, // hold
+            term, listener, pty, true,  // hold
             false, // ref_test
-        ).map_err(|e| anyhow::anyhow!("创建事件循环失败: {}", e))?;
+        )
+        .map_err(|e| anyhow::anyhow!("创建事件循环失败: {}", e))?;
 
         // 获取发送器
         let sender = event_loop.channel();
@@ -111,9 +110,7 @@ impl SshPtyTerminal {
 
         log::info!("SSH PTY 终端创建成功");
 
-        Ok(Self {
-            sender,
-        })
+        Ok(Self { sender })
     }
 
     /// 写入数据到 SSH（键盘输入）
@@ -126,7 +123,11 @@ impl SshPtyTerminal {
     /// 调整窗口大小
     pub fn resize(&self, bounds: TerminalBounds) {
         let window_size = bounds_to_window_size(bounds);
-        log::debug!("调整 SSH 窗口大小: {}x{}", window_size.num_cols, window_size.num_lines);
+        log::debug!(
+            "调整 SSH 窗口大小: {}x{}",
+            window_size.num_cols,
+            window_size.num_lines
+        );
         let _ = self.sender.send(Msg::Resize(window_size));
     }
 

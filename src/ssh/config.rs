@@ -43,7 +43,12 @@ pub struct SshConnectionConfig {
 impl SshConnectionConfig {
     /// 获取连接唯一标识符（基于用户名、主机、端口和昵称生成）
     pub fn id(&self) -> String {
-        generate_id(&self.username, &self.host, self.port, self.nickname.as_deref())
+        generate_id(
+            &self.username,
+            &self.host,
+            self.port,
+            self.nickname.as_deref(),
+        )
     }
 }
 
@@ -235,10 +240,7 @@ impl AuthMethod {
     }
 
     /// 创建密钥认证（有密码）
-    pub fn key_with_passphrase(
-        path: impl Into<PathBuf>,
-        passphrase: impl Into<String>,
-    ) -> Self {
+    pub fn key_with_passphrase(path: impl Into<PathBuf>, passphrase: impl Into<String>) -> Self {
         AuthMethod::PrivateKey {
             path: path.into(),
             passphrase: Some(passphrase.into()),
@@ -271,7 +273,11 @@ pub struct KnownHost {
 
 impl KnownHost {
     /// 创建新的已知主机记录
-    pub fn new(host: impl Into<String>, fingerprint: impl Into<String>, key_type: impl Into<String>) -> Self {
+    pub fn new(
+        host: impl Into<String>,
+        fingerprint: impl Into<String>,
+        key_type: impl Into<String>,
+    ) -> Self {
         Self {
             host: host.into(),
             port: default_port(),
@@ -368,7 +374,8 @@ impl SshGlobalConfig {
 
     /// 添加或更新已知主机
     pub fn add_known_host(&mut self, host: KnownHost) {
-        self.known_hosts.retain(|h| !(h.host == host.host && h.port == host.port));
+        self.known_hosts
+            .retain(|h| !(h.host == host.host && h.port == host.port));
         self.known_hosts.push(host);
     }
 
@@ -388,19 +395,17 @@ impl SshGlobalConfig {
             Err(_) => return Some(Self::new()),
         };
 
-        serde_json::from_str(&content).ok().or_else(|| Some(Self::new()))
+        serde_json::from_str(&content)
+            .ok()
+            .or_else(|| Some(Self::new()))
     }
 
     /// 加载配置，如果不存在则创建默认配置文件
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
-        let config_path = Self::config_path()
-            .ok_or("Failed to get config path")?;
+        let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
         match std::fs::read_to_string(&config_path) {
-            Ok(content) => {
-                serde_json::from_str(&content)
-                    .map_err(|e| e.into())
-            }
+            Ok(content) => serde_json::from_str(&content).map_err(|e| e.into()),
             Err(_) => {
                 let default_config = Self::new();
                 default_config.save()?;
@@ -412,8 +417,7 @@ impl SshGlobalConfig {
     /// 保存配置到文件
     /// 配置文件路径: ~/.config/deepterm/ssh.json
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let config_path = Self::config_path()
-            .ok_or("Failed to get config path")?;
+        let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
         // 确保配置目录存在
         if let Some(parent) = config_path.parent() {
@@ -444,11 +448,8 @@ mod tests {
 
     #[test]
     fn test_ssh_connection_config() {
-        let config = SshConnectionConfig::new(
-            "example.com",
-            "admin",
-            AuthMethod::password("secret"),
-        );
+        let config =
+            SshConnectionConfig::new("example.com", "admin", AuthMethod::password("secret"));
 
         assert_eq!(config.host, "example.com");
         assert_eq!(config.username, "admin");
@@ -459,12 +460,9 @@ mod tests {
 
     #[test]
     fn test_ssh_connection_with_nickname() {
-        let config = SshConnectionConfig::new(
-            "192.168.1.100",
-            "root",
-            AuthMethod::key("~/.ssh/id_rsa"),
-        )
-        .with_nickname("My Server");
+        let config =
+            SshConnectionConfig::new("192.168.1.100", "root", AuthMethod::key("~/.ssh/id_rsa"))
+                .with_nickname("My Server");
 
         assert_eq!(config.display_name(), "My Server");
     }

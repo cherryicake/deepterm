@@ -817,7 +817,8 @@ impl Terminal {
             }
             AlacTermEvent::ClipboardLoad(_clipboard_type, format) => {
                 // 响应剪贴板查询请求 (XTGETTCAP Ms)
-                let clipboard_content = cx.read_from_clipboard()
+                let clipboard_content = cx
+                    .read_from_clipboard()
                     .and_then(|item| item.text().map(|t| t.to_string()))
                     .unwrap_or_default();
                 let response = format(&clipboard_content);
@@ -972,10 +973,7 @@ impl Terminal {
         }
 
         let mut term = self.term.lock();
-        term.resize(alacritty_terminal::term::test::TermSize::new(
-            cols,
-            rows,
-        ));
+        term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
 
         drop(term);
         self.update_last_content();

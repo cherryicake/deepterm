@@ -2,4 +2,6 @@ pub mod clipboard;
 pub mod mappings;
 pub mod terminal;
 
-pub use terminal::{Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent, TerminalType};
+pub use terminal::{
+    Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent, TerminalType,
+};

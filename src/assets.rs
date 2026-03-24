@@ -46,6 +46,7 @@ pub enum Icon {
     ChevronDown,
     Eye,
     EyeOff,
+    Loader,
 }
 
 impl Icon {
@@ -70,6 +71,7 @@ impl Icon {
             Icon::ChevronDown => SharedString::new_static("icons/chevron_down.svg"),
             Icon::Eye => SharedString::new_static("icons/eye.svg"),
             Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
+            Icon::Loader => SharedString::new_static("icons/loader.svg"),
         }
     }
 
@@ -93,6 +95,7 @@ impl Icon {
             Icon::ChevronDown => gpui::rgb(0x8888aa),
             Icon::Eye => gpui::rgb(0x8888aa),
             Icon::EyeOff => gpui::rgb(0x8888aa),
+            Icon::Loader => gpui::rgb(0x8888aa),
         }
     }
 }

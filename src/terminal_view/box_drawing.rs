@@ -7,7 +7,7 @@
 //! 不会出现字体字形带来的间隙或粗细不一致问题。
 //! 对应 Alacritty 的 `builtin_box_drawing = true` 配置项。
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px, size, Background};
+use gpui::{Background, Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px, size};
 
 // ─── 线段编码方案 ─────────────────────────────────────────────────────────────
 // 每个盒子绘制字符用一个 u8 位域描述其四个方向的线段粗细：
@@ -238,8 +238,14 @@ fn paint_segments(
             THIN => f(h_seg(0.0, hcf, s)),
             HEAVY => f(h_seg(0.0, hcf, s * 2.0)),
             DBL => {
-                f(Bounds { origin: point(origin.x, origin.y + vc - dbl_off - s * 0.5), size: size(px(hcf), s) });
-                f(Bounds { origin: point(origin.x, origin.y + vc + dbl_off - s * 0.5), size: size(px(hcf), s) });
+                f(Bounds {
+                    origin: point(origin.x, origin.y + vc - dbl_off - s * 0.5),
+                    size: size(px(hcf), s),
+                });
+                f(Bounds {
+                    origin: point(origin.x, origin.y + vc + dbl_off - s * 0.5),
+                    size: size(px(hcf), s),
+                });
             }
             _ => {}
         }
@@ -250,8 +256,14 @@ fn paint_segments(
             THIN => f(h_seg(hcf, wf, s)),
             HEAVY => f(h_seg(hcf, wf, s * 2.0)),
             DBL => {
-                f(Bounds { origin: point(origin.x + hc, origin.y + vc - dbl_off - s * 0.5), size: size(px(wf - hcf), s) });
-                f(Bounds { origin: point(origin.x + hc, origin.y + vc + dbl_off - s * 0.5), size: size(px(wf - hcf), s) });
+                f(Bounds {
+                    origin: point(origin.x + hc, origin.y + vc - dbl_off - s * 0.5),
+                    size: size(px(wf - hcf), s),
+                });
+                f(Bounds {
+                    origin: point(origin.x + hc, origin.y + vc + dbl_off - s * 0.5),
+                    size: size(px(wf - hcf), s),
+                });
             }
             _ => {}
         }
@@ -262,8 +274,14 @@ fn paint_segments(
             THIN => f(v_seg(0.0, vcf, s)),
             HEAVY => f(v_seg(0.0, vcf, s * 2.0)),
             DBL => {
-                f(Bounds { origin: point(origin.x + hc - dbl_off - s * 0.5, origin.y), size: size(s, px(vcf)) });
-                f(Bounds { origin: point(origin.x + hc + dbl_off - s * 0.5, origin.y), size: size(s, px(vcf)) });
+                f(Bounds {
+                    origin: point(origin.x + hc - dbl_off - s * 0.5, origin.y),
+                    size: size(s, px(vcf)),
+                });
+                f(Bounds {
+                    origin: point(origin.x + hc + dbl_off - s * 0.5, origin.y),
+                    size: size(s, px(vcf)),
+                });
             }
             _ => {}
         }
@@ -274,8 +292,14 @@ fn paint_segments(
             THIN => f(v_seg(vcf, hf, s)),
             HEAVY => f(v_seg(vcf, hf, s * 2.0)),
             DBL => {
-                f(Bounds { origin: point(origin.x + hc - dbl_off - s * 0.5, origin.y + vc), size: size(s, px(hf - vcf)) });
-                f(Bounds { origin: point(origin.x + hc + dbl_off - s * 0.5, origin.y + vc), size: size(s, px(hf - vcf)) });
+                f(Bounds {
+                    origin: point(origin.x + hc - dbl_off - s * 0.5, origin.y + vc),
+                    size: size(s, px(hf - vcf)),
+                });
+                f(Bounds {
+                    origin: point(origin.x + hc + dbl_off - s * 0.5, origin.y + vc),
+                    size: size(s, px(hf - vcf)),
+                });
             }
             _ => {}
         }
@@ -307,59 +331,119 @@ fn paint_block_element(
 
     match code {
         // ▀ 上半块：填充单元格上半部分
-        0x2580 => paint(Bounds { origin, size: size(w, frac_h(1.0, 2.0)) }, color),
+        0x2580 => paint(
+            Bounds {
+                origin,
+                size: size(w, frac_h(1.0, 2.0)),
+            },
+            color,
+        ),
 
         // ▁▂▃▄▅▆▇ 下 N/8 块：从单元格底部向上填充 N/8 高度
         0x2581..=0x2587 => {
             let n = (code - 0x2580) as f32; // N 取值 1–7
             let bh = frac_h(n, 8.0);
-            paint(Bounds { origin: point(origin.x, origin.y + h - bh), size: size(w, bh) }, color);
+            paint(
+                Bounds {
+                    origin: point(origin.x, origin.y + h - bh),
+                    size: size(w, bh),
+                },
+                color,
+            );
         }
 
         // █ 全块：填充整个单元格
-        0x2588 => paint(Bounds { origin, size: size(w, h) }, color),
+        0x2588 => paint(
+            Bounds {
+                origin,
+                size: size(w, h),
+            },
+            color,
+        ),
 
         // ▉▊▋▌▍▎▏ 左 N/8 块：从单元格左侧向右填充 N/8 宽度（7→1 递减）
         0x2589..=0x258F => {
             let n = (0x2590 - code) as f32; // N 从 7 递减到 1
-            paint(Bounds { origin, size: size(frac_w(n, 8.0), h) }, color);
+            paint(
+                Bounds {
+                    origin,
+                    size: size(frac_w(n, 8.0), h),
+                },
+                color,
+            );
         }
 
         // ▐ 右半块：填充单元格右半部分
         0x2590 => {
             let half = frac_w(1.0, 2.0);
-            paint(Bounds { origin: point(origin.x + w - half, origin.y), size: size(half, h) }, color);
+            paint(
+                Bounds {
+                    origin: point(origin.x + w - half, origin.y),
+                    size: size(half, h),
+                },
+                color,
+            );
         }
 
         // ░ 浅阴影：约 25% 覆盖率
-        0x2591 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.25)),
+        0x2591 => paint(
+            Bounds {
+                origin,
+                size: size(w, h),
+            },
+            color.opacity(0.25),
+        ),
 
         // ▒ 中阴影：约 50% 覆盖率
-        0x2592 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.5)),
+        0x2592 => paint(
+            Bounds {
+                origin,
+                size: size(w, h),
+            },
+            color.opacity(0.5),
+        ),
 
         // ▓ 深阴影：约 75% 覆盖率
-        0x2593 => paint(Bounds { origin, size: size(w, h) }, color.opacity(0.75)),
+        0x2593 => paint(
+            Bounds {
+                origin,
+                size: size(w, h),
+            },
+            color.opacity(0.75),
+        ),
 
         // ▔ 上 1/8 块：填充单元格顶部 1/8 高度的细条
-        0x2594 => paint(Bounds { origin, size: size(w, frac_h(1.0, 8.0)) }, color),
+        0x2594 => paint(
+            Bounds {
+                origin,
+                size: size(w, frac_h(1.0, 8.0)),
+            },
+            color,
+        ),
 
         // ▕ 右 1/8 块：填充单元格最右侧 1/8 宽度的细条
         0x2595 => {
             let bw = frac_w(1.0, 8.0);
-            paint(Bounds { origin: point(origin.x + w - bw, origin.y), size: size(bw, h) }, color);
+            paint(
+                Bounds {
+                    origin: point(origin.x + w - bw, origin.y),
+                    size: size(bw, h),
+                },
+                color,
+            );
         }
 
         // ▖▗▘▙▚▛▜▝▞▟ 四分之一块组合：每个字符是若干象限的填充组合
-        0x2596 => quadrant_paint(origin, w, h, false, false, true, false, color, &mut paint),   // ▖ 左下象限
-        0x2597 => quadrant_paint(origin, w, h, false, false, false, true, color, &mut paint),   // ▗ 右下象限
-        0x2598 => quadrant_paint(origin, w, h, true, false, false, false, color, &mut paint),   // ▘ 左上象限
-        0x2599 => quadrant_paint(origin, w, h, true, false, true, true, color, &mut paint),     // ▙ 左上 + 左下 + 右下
-        0x259A => quadrant_paint(origin, w, h, true, false, false, true, color, &mut paint),    // ▚ 左上 + 右下（对角）
-        0x259B => quadrant_paint(origin, w, h, true, true, true, false, color, &mut paint),     // ▛ 左上 + 右上 + 左下
-        0x259C => quadrant_paint(origin, w, h, true, true, false, true, color, &mut paint),     // ▜ 左上 + 右上 + 右下
-        0x259D => quadrant_paint(origin, w, h, false, true, false, false, color, &mut paint),   // ▝ 右上象限
-        0x259E => quadrant_paint(origin, w, h, false, true, true, false, color, &mut paint),    // ▞ 右上 + 左下（对角）
-        0x259F => quadrant_paint(origin, w, h, false, true, true, true, color, &mut paint),     // ▟ 右上 + 左下 + 右下
+        0x2596 => quadrant_paint(origin, w, h, false, false, true, false, color, &mut paint), // ▖ 左下象限
+        0x2597 => quadrant_paint(origin, w, h, false, false, false, true, color, &mut paint), // ▗ 右下象限
+        0x2598 => quadrant_paint(origin, w, h, true, false, false, false, color, &mut paint), // ▘ 左上象限
+        0x2599 => quadrant_paint(origin, w, h, true, false, true, true, color, &mut paint), // ▙ 左上 + 左下 + 右下
+        0x259A => quadrant_paint(origin, w, h, true, false, false, true, color, &mut paint), // ▚ 左上 + 右下（对角）
+        0x259B => quadrant_paint(origin, w, h, true, true, true, false, color, &mut paint), // ▛ 左上 + 右上 + 左下
+        0x259C => quadrant_paint(origin, w, h, true, true, false, true, color, &mut paint), // ▜ 左上 + 右上 + 右下
+        0x259D => quadrant_paint(origin, w, h, false, true, false, false, color, &mut paint), // ▝ 右上象限
+        0x259E => quadrant_paint(origin, w, h, false, true, true, false, color, &mut paint), // ▞ 右上 + 左下（对角）
+        0x259F => quadrant_paint(origin, w, h, false, true, true, true, color, &mut paint), // ▟ 右上 + 左下 + 右下
 
         _ => {}
     }
@@ -383,25 +467,40 @@ fn quadrant_paint(
     let hh = px((h.as_f32() / 2.0).round());
 
     if upper_left {
-        paint(Bounds { origin, size: size(hw, hh) }, color);
+        paint(
+            Bounds {
+                origin,
+                size: size(hw, hh),
+            },
+            color,
+        );
     }
     if upper_right {
-        paint(Bounds {
-            origin: point(origin.x + w - hw, origin.y),
-            size: size(hw, hh),
-        }, color);
+        paint(
+            Bounds {
+                origin: point(origin.x + w - hw, origin.y),
+                size: size(hw, hh),
+            },
+            color,
+        );
     }
     if lower_left {
-        paint(Bounds {
-            origin: point(origin.x, origin.y + h - hh),
-            size: size(hw, hh),
-        }, color);
+        paint(
+            Bounds {
+                origin: point(origin.x, origin.y + h - hh),
+                size: size(hw, hh),
+            },
+            color,
+        );
     }
     if lower_right {
-        paint(Bounds {
-            origin: point(origin.x + w - hw, origin.y + h - hh),
-            size: size(hw, hh),
-        }, color);
+        paint(
+            Bounds {
+                origin: point(origin.x + w - hw, origin.y + h - hh),
+                size: size(hw, hh),
+            },
+            color,
+        );
     }
 }
 
@@ -445,9 +544,7 @@ fn paint_rounded_corner(
     let h = cell_h;
 
     // 将格子局部坐标转换为窗口绝对坐标
-    let abs = |lx: Pixels, ly: Pixels| -> Point<Pixels> {
-        point(origin.x + lx, origin.y + ly)
-    };
+    let abs = |lx: Pixels, ly: Pixels| -> Point<Pixels> { point(origin.x + lx, origin.y + ly) };
 
     let mut builder = PathBuilder::stroke(s);
 

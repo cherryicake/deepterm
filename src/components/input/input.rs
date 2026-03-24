@@ -2,14 +2,14 @@
 //!
 //! 参考 Zed GPUI 的 input 示例实现，支持光标定位和选择。
 use crate::assets::Icon;
+use gpui::prelude::*;
 use gpui::{
     App, Bounds, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
     ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Style, TextAlign, TextRun,
-    UTF16Selection, Window, actions, div, fill, px, point, rgb, rgba, size, svg,
+    UTF16Selection, Window, actions, div, fill, point, px, rgb, rgba, size, svg,
 };
-use gpui::prelude::*;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -18,8 +18,18 @@ pub(super) const CONTEXT: &str = "Input";
 actions!(
     input,
     [
-        Backspace, Delete, Left, Right, SelectAll, Home, End, Copy, Cut, Paste,
-        SelectLeft, SelectRight,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        SelectAll,
+        Home,
+        End,
+        Copy,
+        Cut,
+        Paste,
+        SelectLeft,
+        SelectRight,
     ]
 );
 pub(crate) fn init(cx: &mut App) {
@@ -585,7 +595,11 @@ impl Input {
         let delta = event.delta.pixel_delta(line_height);
 
         let new_offset = self.scroll_handle.offset() + delta;
-        let clamped_offset = self.clamp_scroll_offset(new_offset, self.scroll_size.width, self.input_bounds.size.width);
+        let clamped_offset = self.clamp_scroll_offset(
+            new_offset,
+            self.scroll_size.width,
+            self.input_bounds.size.width,
+        );
 
         self.scroll_handle.set_offset(clamped_offset);
         cx.notify();
@@ -593,7 +607,12 @@ impl Input {
     }
 
     /// 限制滚动偏移量在安全范围内
-    fn clamp_scroll_offset(&self, scroll_offset: Point<Pixels>, content_width: Pixels, visible_width: Pixels) -> Point<Pixels> {
+    fn clamp_scroll_offset(
+        &self,
+        scroll_offset: Point<Pixels>,
+        content_width: Pixels,
+        visible_width: Pixels,
+    ) -> Point<Pixels> {
         let mut offset = scroll_offset;
         let max_scroll = if content_width > visible_width {
             visible_width - content_width
@@ -985,18 +1004,18 @@ impl Element for InputTextElement {
         let cursor_visible = input.cursor_visible;
 
         // 计算光标位置和滚动偏移
-        let (cursor_bounds, cursor_scroll_offset) = if selected_range.is_empty() && is_focused && cursor_visible {
+        let (cursor_bounds, cursor_scroll_offset) = if selected_range.is_empty()
+            && is_focused
+            && cursor_visible
+        {
             let cursor_x = line.x_for_index(cursor);
             let cursor_height = font_size * 0.85;
             let cursor_y = bounds.top() + (bounds.size.height - cursor_height) / 2.0;
             let visible_width = bounds.size.width;
 
             // 获取滚动偏移并限制在安全范围内
-            let scroll_offset = input.clamp_scroll_offset(
-                input.scroll_handle.offset(),
-                text_width,
-                visible_width,
-            );
+            let scroll_offset =
+                input.clamp_scroll_offset(input.scroll_handle.offset(), text_width, visible_width);
 
             // 计算光标边界
             // 光标位置 = 文本原点 + 光标在文本中的位置
@@ -1020,11 +1039,15 @@ impl Element for InputTextElement {
             Some(fill(
                 Bounds::from_corners(
                     Point::new(
-                        bounds.left() + cursor_scroll_offset.x + line.x_for_index(selected_range.start),
+                        bounds.left()
+                            + cursor_scroll_offset.x
+                            + line.x_for_index(selected_range.start),
                         bounds.top(),
                     ),
                     Point::new(
-                        bounds.left() + cursor_scroll_offset.x + line.x_for_index(selected_range.end),
+                        bounds.left()
+                            + cursor_scroll_offset.x
+                            + line.x_for_index(selected_range.end),
                         bounds.bottom(),
                     ),
                 ),
@@ -1106,7 +1129,9 @@ impl Element for InputTextElement {
             input.scroll_size = prepaint.scroll_size;
             input.input_bounds = bounds;
             // 直接使用 prepaint 中计算出的滚动偏移来更新 scroll_handle
-            input.scroll_handle.set_offset(prepaint.cursor_scroll_offset);
+            input
+                .scroll_handle
+                .set_offset(prepaint.cursor_scroll_offset);
         });
     }
 }

@@ -9,9 +9,10 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::ssh::{
+    ConnectionEvent,
     config::SshConnectionConfig,
     error::{SshError, SshResult},
-    ConnectionEvent, generate_connection_id,
+    generate_connection_id,
 };
 
 /// 连接状态
@@ -323,18 +324,13 @@ impl SshConnectionManager {
     /// 获取连接信息
     pub fn get_connection_info(&self, connection_id: &str) -> Option<ConnectionInfo> {
         let connections = self.connections.lock();
-        connections
-            .get(connection_id)
-            .map(|conn| conn.info.clone())
+        connections.get(connection_id).map(|conn| conn.info.clone())
     }
 
     /// 获取所有连接信息
     pub fn get_all_connections(&self) -> Vec<ConnectionInfo> {
         let connections = self.connections.lock();
-        connections
-            .values()
-            .map(|conn| conn.info.clone())
-            .collect()
+        connections.values().map(|conn| conn.info.clone()).collect()
     }
 
     /// 获取活动连接数量
@@ -377,7 +373,11 @@ impl SshConnectionManager {
     }
 
     /// 启动断开连接监控任务
-    fn spawn_disconnect_monitor(&self, _connection_id: String, _disconnect_tx: async_channel::Sender<()>) {
+    fn spawn_disconnect_monitor(
+        &self,
+        _connection_id: String,
+        _disconnect_tx: async_channel::Sender<()>,
+    ) {
         // TODO: 实现断开监控
         // 当连接断开时，需要更新状态并发送事件
     }
@@ -459,11 +459,7 @@ mod tests {
 
     #[test]
     fn test_connection_info() {
-        let config = SshConnectionConfig::new(
-            "test.com",
-            "user",
-            AuthMethod::Agent,
-        );
+        let config = SshConnectionConfig::new("test.com", "user", AuthMethod::Agent);
 
         let mut info = ConnectionInfo::new(config);
         assert_eq!(info.state, ConnectionState::Idle);

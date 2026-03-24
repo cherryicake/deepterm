@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, rgb, svg, App, BoxShadow, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, Render, SharedString, Styled, Window,
+    App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, Render, SharedString, Styled, Window, div, point, px, rgb, svg,
 };
 
 use crate::assets::Icon;
@@ -157,13 +157,16 @@ impl Panel {
         cx: &mut Context<Self>,
     ) {
         let close_panel_id = panel_id.to_string();
-        cx.subscribe(terminal_view, move |_this, _view, event: &TerminalViewEvent, cx| {
-            match event {
+        cx.subscribe(
+            terminal_view,
+            move |_this, _view, event: &TerminalViewEvent, cx| match event {
                 TerminalViewEvent::CloseTerminal => {
-                    cx.emit(PanelEvent::Close { panel_id: close_panel_id.clone() });
+                    cx.emit(PanelEvent::Close {
+                        panel_id: close_panel_id.clone(),
+                    });
                 }
-            }
-        })
+            },
+        )
         .detach();
     }
 
@@ -565,9 +568,11 @@ impl Panel {
                     // 右侧填充区域（可放置其他内容）
                     .child(div().flex_1())
             }
-            PanelContent::SettingsHubView(settings_hub_view) => {
-                div().flex_1().min_h_0().overflow_hidden().child(settings_hub_view.clone())
-            }
+            PanelContent::SettingsHubView(settings_hub_view) => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(settings_hub_view.clone()),
         }
     }
 
