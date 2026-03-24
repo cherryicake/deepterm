@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Task, UTF16Selection,
     Window, actions, div, point, px,
 };
@@ -26,6 +26,8 @@ pub const CTRL_V: u8 = 0x16;
 pub struct ImeState {
     pub marked_text: String,
 }
+
+use alacritty_terminal::term::TermMode;
 
 use crate::ShowSshPicker;
 use crate::ssh::SshConnectionConfig;
@@ -398,6 +400,41 @@ impl TerminalView {
         }
     }
 
+    /// 将拖拽的文件路径写入终端
+    /// 参考 alacritty 的实现，将路径格式化后粘贴到终端
+    fn add_paths_to_terminal(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        use itertools::Itertools;
+
+        // 构建路径字符串，参考 alacritty 的实现：path + " "
+        let text = paths
+            .iter()
+            .map(|path| {
+                let path_str = path.to_string_lossy().into_owned();
+                format!("{path_str} ")
+            })
+            .join("");
+
+        // 过滤掉 \x1b 和 \x03，防止恶意输入破坏终端转义序列
+        let filtered = text.replace(['\x1b', '\x03'], "");
+
+        self.terminal.update(cx, |terminal, _| {
+            let bracketed = terminal
+                .last_content()
+                .mode
+                .contains(TermMode::BRACKETED_PASTE);
+
+            if bracketed {
+                // 使用 bracketed paste 模式
+                terminal.write(b"\x1b[200~");
+                terminal.write(filtered.as_bytes());
+                terminal.write(b"\x1b[201~");
+            } else {
+                // 普通模式
+                terminal.write(filtered.as_bytes());
+            }
+        });
+    }
+
     // Actions
     pub fn copy(&mut self, cx: &mut Context<Self>) {
         self.terminal.update(cx, |terminal, cx| {
@@ -738,6 +775,9 @@ impl Render for TerminalView {
                 });
                 cx.stop_propagation();
                 cx.notify();
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.add_paths_to_terminal(paths.paths(), cx);
             }))
             .child(
                 // Use relative positioning: terminal fills container, scrollbar floats on top

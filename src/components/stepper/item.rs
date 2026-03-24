@@ -1,12 +1,11 @@
 use gpui::{
-    div, prelude::FluentBuilder as _, px, relative, AnyElement, App, Axis, ClickEvent,
-    InteractiveElement as _, IntoElement, ParentElement, RenderOnce, StyleRefinement, Styled,
-    Window,
+    AnyElement, App, Axis, ClickEvent, InteractiveElement as _, IntoElement, ParentElement,
+    RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
 };
 
+use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
 use crate::components::stepper::trigger::StepperTrigger;
-use crate::components::stepper::StepperSize;
 
 /// A step item within a [`Stepper`].
 #[derive(IntoElement)]

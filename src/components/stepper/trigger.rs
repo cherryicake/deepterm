@@ -1,12 +1,12 @@
 use gpui::{
-    div, prelude::FluentBuilder as _, AnyElement, App, Axis, ClickEvent, InteractiveElement as _,
-    IntoElement, ParentElement, RenderOnce, StatefulInteractiveElement as _, StyleRefinement,
-    Styled, Window,
+    AnyElement, App, Axis, ClickEvent, InteractiveElement as _, IntoElement, ParentElement,
+    RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
 
 use crate::components::spinner::Spinner;
-use crate::components::stepper::stepper::StepperStatus;
 use crate::components::stepper::StepperSize;
+use crate::components::stepper::stepper::StepperStatus;
 
 /// The trigger part of a stepper item.
 #[derive(IntoElement)]
