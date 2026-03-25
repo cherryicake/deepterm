@@ -27,6 +27,7 @@ pub struct ImeState {
     pub marked_text: String,
 }
 
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
 use crate::ShowSshPicker;
@@ -34,7 +35,7 @@ use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
-use crate::terminal_view::terminal_element::{RowLayoutEntry, TerminalElement};
+use crate::terminal_view::terminal_element::{RowRenderCache, TerminalElement};
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 
 // Define terminal actions
@@ -66,9 +67,12 @@ pub struct TerminalView {
     scrollbar_hide_task: Option<Task<()>>,
     /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
     ssh_connect_view: Option<Entity<SshConnectView>>,
-    /// Per-row layout cache: indexed by viewport row (0 = top).
-    /// Clean rows are reused across frames; dirty rows are recomputed and the cache is updated.
-    pub row_layout_cache: Vec<Option<RowLayoutEntry>>,
+    /// Per-row render cache, indexed by viewport row (0 = top).
+    pub row_render_cache: Vec<RowRenderCache>,
+    /// Last selection range used to build row cache.
+    pub cached_selection_range: Option<SelectionRange>,
+    /// Last mouse mode state used to build row cache.
+    pub cached_selection_mouse_mode: bool,
 }
 
 impl TerminalView {
@@ -107,7 +111,9 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
-                row_layout_cache: Vec::new(),
+                row_render_cache: Vec::new(),
+                cached_selection_range: None,
+                cached_selection_mouse_mode: false,
             };
             this.update_title(cx);
             this
@@ -163,7 +169,9 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
-                row_layout_cache: Vec::new(),
+                row_render_cache: Vec::new(),
+                cached_selection_range: None,
+                cached_selection_mouse_mode: false,
             };
             this.update_title(cx);
             this
@@ -268,7 +276,9 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: Some(connect_view),
-                row_layout_cache: Vec::new(),
+                row_render_cache: Vec::new(),
+                cached_selection_range: None,
+                cached_selection_mouse_mode: false,
             };
             this.update_title(cx);
             this

@@ -164,6 +164,9 @@ pub enum SelectionPhase {
 #[derive(Clone, Debug)]
 pub struct TerminalContent {
     pub cells: Vec<IndexedCell>,
+    /// Contiguous row ranges into `cells`, in visible row order.
+    /// Each tuple is `(start, end)` where `cells[start..end]` belongs to one visible row.
+    pub row_ranges: Vec<(usize, usize)>,
     pub cursor: AlacPoint,
     pub cursor_char: char,
     /// 光标形状 - 用于光标委托机制
@@ -185,6 +188,7 @@ impl Default for TerminalContent {
     fn default() -> Self {
         Self {
             cells: Vec::new(),
+            row_ranges: Vec::new(),
             cursor: AlacPoint::new(Line(0), Column(0)),
             cursor_char: ' ',
             cursor_shape: AlacCursorShape::Block,
@@ -222,6 +226,9 @@ pub struct Terminal {
     content_dirty: bool,
     /// 每次 update_last_content 后，标记哪些 viewport 行（0 = 顶行）发生了变化
     dirty_rows: Vec<bool>,
+    /// 每次 update_last_content 后，记录 viewport 行的脏区列范围 `(left, right)`。
+    /// 若该行无变更则为 `None`；全量刷新时所有行为 `Some((0, cols-1))`。
+    dirty_row_bounds: Vec<Option<(usize, usize)>>,
     /// 事件循环任务（保持任务存活，防止被drop）
     #[allow(dead_code)]
     event_loop_task: Option<Task<()>>,
@@ -323,6 +330,7 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 dirty_rows: Vec::new(),
+                dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -418,6 +426,7 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 dirty_rows: Vec::new(),
+                dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -447,6 +456,7 @@ impl Terminal {
             content_generation: 0,
             content_dirty: false,
             dirty_rows: Vec::new(),
+            dirty_row_bounds: Vec::new(),
             event_loop_task: None,
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
@@ -517,6 +527,7 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 dirty_rows: Vec::new(),
+                dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -625,6 +636,7 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 dirty_rows: Vec::new(),
+                dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
@@ -869,18 +881,28 @@ impl Terminal {
 
         // Collect damage info while we hold the lock, before resetting.
         let num_rows = self.terminal_bounds.num_lines();
+        let num_cols = self.terminal_bounds.num_columns();
         let damage = term.damage();
         self.dirty_rows.clear();
+        self.dirty_row_bounds.clear();
         match damage {
             TermDamage::Full => {
                 self.dirty_rows.resize(num_rows, true);
+                if num_cols == 0 {
+                    self.dirty_row_bounds.resize(num_rows, None);
+                } else {
+                    self.dirty_row_bounds
+                        .resize(num_rows, Some((0, num_cols.saturating_sub(1))));
+                }
             }
             TermDamage::Partial(iter) => {
                 self.dirty_rows.resize(num_rows, false);
+                self.dirty_row_bounds.resize(num_rows, None);
                 for line_damage in iter {
                     let row = line_damage.line;
                     if row < num_rows {
                         self.dirty_rows[row] = true;
+                        self.dirty_row_bounds[row] = Some((line_damage.left, line_damage.right));
                     }
                 }
             }
@@ -900,6 +922,20 @@ impl Terminal {
             point: ic.point,
             cell: ic.cell.clone(),
         }));
+
+        let row_ranges = &mut self.last_content.row_ranges;
+        row_ranges.clear();
+        row_ranges.reserve(num_rows.max(cells.len() / 4));
+        let mut start = 0usize;
+        while start < cells.len() {
+            let line = cells[start].point.line;
+            let mut end = start + 1;
+            while end < cells.len() && cells[end].point.line == line {
+                end += 1;
+            }
+            row_ranges.push((start, end));
+            start = end;
+        }
 
         self.last_content.cursor = content.cursor.point;
         self.last_content.cursor_char = term.grid()[content.cursor.point].c;
@@ -924,12 +960,18 @@ impl Terminal {
         } else {
             // Nothing changed this frame – tell the element all rows are clean.
             self.dirty_rows.fill(false);
+            self.dirty_row_bounds.fill(None);
         }
     }
 
     /// Returns which viewport rows (0 = top) changed since the last `sync()`.
     pub fn dirty_rows(&self) -> &[bool] {
         &self.dirty_rows
+    }
+
+    /// Returns viewport-row damage bounds `(left, right)` for the last `sync()`.
+    pub fn dirty_row_bounds(&self) -> &[Option<(usize, usize)>] {
+        &self.dirty_row_bounds
     }
 
     pub fn write(&mut self, data: &[u8]) {
