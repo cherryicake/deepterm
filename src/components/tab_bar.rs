@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle,
-    SharedString, Window, canvas, div, px, rgb,
+    App, Context, ElementId, Entity, FocusHandle, Focusable, IntoElement, Pixels, Point, Render,
+    ScrollHandle, SharedString, Window, canvas, div, px, rgb,
 };
 
 use crate::assets::Icon;
@@ -45,23 +45,34 @@ pub struct TabSplitEvent {
 /// 拖拽预览视图
 pub struct DragPreview {
     pub tab_label: SharedString,
+    pub drag_offset: Point<Pixels>,
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let preview_width = px(140.0);
+        let preview_height = px(28.0);
+
         div()
-            .h(px(28.0))
-            .px(px(12.0))
-            .flex()
-            .items_center()
-            .rounded(px(6.0))
-            .bg(rgb(0x3d3d5c))
-            .shadow_md()
+            // 将预览中心对齐到鼠标位置
+            .pl(self.drag_offset.x - preview_width / 2.0)
+            .pt(self.drag_offset.y - preview_height / 2.0)
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0x8888aa))
-                    .child(self.tab_label.clone()),
+                    .w(preview_width)
+                    .h(preview_height)
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .bg(rgb(0x3d3d5c))
+                    .shadow_md()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8888aa))
+                            .child(self.tab_label.clone()),
+                    ),
             )
     }
 }
@@ -540,12 +551,13 @@ impl Render for TabBar {
                                         },
                                         {
                                             let label = label.clone();
-                                            move |_drag_data, _, _, cx| {
+                                            move |_drag_data, position, _, cx| {
                                                 // 阻止事件冒泡，防止触发窗口拖拽
                                                 cx.stop_propagation();
                                                 // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
                                                 cx.new(|_cx| DragPreview {
                                                     tab_label: label.clone(),
+                                                    drag_offset: position,
                                                 })
                                             }
                                         },

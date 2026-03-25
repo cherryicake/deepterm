@@ -457,24 +457,28 @@ impl Panel {
             .justify_between()
             .cursor_move()
             .child(
-                // 标题 - 显示Tab标签名（使用更小的字体）
-                // 将on_drag绑定到标题元素上，确保拖拽位置计算正确
+                // 标题栏左侧主区域都可拖拽（排除右侧控制按钮区域）
                 div()
-                    .text_xs()
-                    .text_color(rgb(0x8888aa))
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
                     .id(format!("panel-title-{}", panel_id))
                     .on_drag(
                         DraggedPanel {
                             panel_id: panel_id.clone(),
                             source_tab_id,
                         },
-                        move |_drag_data, _position, _window, cx| {
+                        move |_drag_data, position, _window, cx| {
+                            // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步
+                            cx.stop_propagation();
                             cx.new(|_cx| DragPreview {
                                 tab_label: drag_title.clone().into(),
+                                drag_offset: position,
                             })
                         },
                     )
-                    .child(title),
+                    .child(div().text_xs().text_color(rgb(0x8888aa)).child(title)),
             )
             .child(
                 // 右侧按钮组：广播按钮 + 关闭按钮
