@@ -8,18 +8,61 @@ use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
-    BorderStyle, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels,
-    Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, outline, point, px, rgb, size,
+    Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks,
+    FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
+    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
+const CURSOR_THICKNESS_RATIO: f32 = 0.15;
 
 /// Returns how many terminal cells this Unicode scalar usually occupies.
 /// This is used for cursor width and run-splitting math.
 #[inline]
 fn char_cell_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(1).max(1)
+}
+
+#[inline]
+fn terminal_content_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let horizontal_padding = px(TERMINAL_HORIZONTAL_PADDING);
+    let padded_width = horizontal_padding * 2.0;
+    let width = if bounds.size.width > padded_width {
+        bounds.size.width - padded_width
+    } else {
+        Pixels::ZERO
+    };
+
+    Bounds {
+        origin: point(bounds.left() + horizontal_padding, bounds.top()),
+        size: size(width, bounds.size.height),
+    }
+}
+
+#[inline]
+fn cursor_thickness(cell_width: Pixels) -> Pixels {
+    px((cell_width.as_f32() * CURSOR_THICKNESS_RATIO)
+        .round()
+        .max(1.0))
+}
+
+#[inline]
+fn rendered_cell_colors(
+    cell: &alacritty_terminal::term::cell::Cell,
+) -> (
+    &alacritty_terminal::vte::ansi::Color,
+    &alacritty_terminal::vte::ansi::Color,
+) {
+    if cell
+        .flags
+        .contains(alacritty_terminal::term::cell::Flags::INVERSE)
+    {
+        (&cell.bg, &cell.fg)
+    } else {
+        (&cell.fg, &cell.bg)
+    }
 }
 
 /// Pure helper: check if a grid point falls within the given selection range.
@@ -92,6 +135,7 @@ pub struct CursorLayout {
     origin: Point<Pixels>,
     block_width: Pixels,
     line_height: Pixels,
+    thickness: Pixels,
     color: gpui::Hsla,
     shape: CursorShape,
     block_text: Option<gpui::ShapedLine>,
@@ -107,28 +151,66 @@ enum CursorShape {
 
 impl CursorLayout {
     fn paint(&self, window: &mut Window, cx: &mut gpui::App) {
-        let bounds = match self.shape {
-            CursorShape::Bar => Bounds {
-                origin: self.origin,
-                size: size(px(2.0), self.line_height),
-            },
-            CursorShape::Block | CursorShape::Hollow => Bounds {
-                origin: self.origin,
-                size: size(self.block_width, self.line_height),
-            },
-            CursorShape::Underline => Bounds {
-                origin: self.origin + point(px(0.0), self.line_height - px(2.0)),
-                size: size(self.block_width, px(2.0)),
-            },
-        };
+        match self.shape {
+            CursorShape::Bar => {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: self.origin,
+                        size: size(self.thickness, self.line_height),
+                    },
+                    self.color,
+                ));
+            }
+            CursorShape::Block => {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: self.origin,
+                        size: size(self.block_width, self.line_height),
+                    },
+                    self.color,
+                ));
+            }
+            CursorShape::Underline => {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: self.origin + point(px(0.0), self.line_height - self.thickness),
+                        size: size(self.block_width, self.thickness),
+                    },
+                    self.color,
+                ));
+            }
+            CursorShape::Hollow => {
+                let vertical_height = if self.line_height > self.thickness * 2.0 {
+                    self.line_height - self.thickness * 2.0
+                } else {
+                    Pixels::ZERO
+                };
 
-        let cursor_quad = if matches!(self.shape, CursorShape::Hollow) {
-            outline(bounds, self.color, BorderStyle::Solid)
-        } else {
-            fill(bounds, self.color)
-        };
+                let quads = [
+                    Bounds {
+                        origin: self.origin,
+                        size: size(self.block_width, self.thickness),
+                    },
+                    Bounds {
+                        origin: self.origin + point(px(0.0), self.line_height - self.thickness),
+                        size: size(self.block_width, self.thickness),
+                    },
+                    Bounds {
+                        origin: self.origin + point(px(0.0), self.thickness),
+                        size: size(self.thickness, vertical_height),
+                    },
+                    Bounds {
+                        origin: self.origin
+                            + point(self.block_width - self.thickness, self.thickness),
+                        size: size(self.thickness, vertical_height),
+                    },
+                ];
 
-        window.paint_quad(cursor_quad);
+                for quad in quads {
+                    window.paint_quad(fill(quad, self.color));
+                }
+            }
+        }
 
         // Paint character on block cursor with inverted colors
         if let Some(block_text) = &self.block_text {
@@ -286,15 +368,7 @@ impl TerminalElement {
             let ch = cell.cell.c;
 
             // Handle INVERSE flag: swap foreground and background colors
-            let (fg, bg) = if cell
-                .cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::INVERSE)
-            {
-                (&cell.cell.bg, &cell.cell.fg)
-            } else {
-                (&cell.cell.fg, &cell.cell.bg)
-            };
+            let (fg, bg) = rendered_cell_colors(&cell.cell);
 
             if ch == '\0' || ch == ' ' {
                 if let Some((start_col, text, style, cell_count)) = current_batch.take() {
@@ -436,15 +510,7 @@ impl TerminalElement {
         if !box_drawing::is_box_drawing_char(ch) {
             return None;
         }
-        let is_inverse = cell
-            .cell
-            .flags
-            .contains(alacritty_terminal::term::cell::Flags::INVERSE);
-        let fg = if is_inverse {
-            &cell.cell.bg
-        } else {
-            &cell.cell.fg
-        };
+        let (fg, _) = rendered_cell_colors(&cell.cell);
         Some(BoxDrawingCell {
             col: cell.point.column.0,
             row: row_idx,
@@ -496,15 +562,7 @@ impl TerminalElement {
     fn background_cells_for_row(row_idx: usize, cells: &[IndexedCell]) -> Vec<BackgroundCell> {
         let mut backgrounds = Vec::new();
         for cell in cells {
-            let is_inverse = cell
-                .cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::INVERSE);
-            let bg = if is_inverse {
-                &cell.cell.fg
-            } else {
-                &cell.cell.bg
-            };
+            let (_, bg) = rendered_cell_colors(&cell.cell);
             if bg
                 != &alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -538,15 +596,7 @@ impl TerminalElement {
             if col < left || col > right {
                 continue;
             }
-            let is_inverse = cell
-                .cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::INVERSE);
-            let bg = if is_inverse {
-                &cell.cell.fg
-            } else {
-                &cell.cell.bg
-            };
+            let (_, bg) = rendered_cell_colors(&cell.cell);
             if bg
                 != &alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -844,7 +894,8 @@ impl Element for TerminalElement {
             .map(|a| a.width)
             .unwrap_or(px(9.0));
 
-        let terminal_bounds = TerminalBounds::new(line_height, cell_width, bounds);
+        let content_bounds = terminal_content_bounds(bounds);
+        let terminal_bounds = TerminalBounds::new(line_height, cell_width, content_bounds);
 
         // Sync terminal and handle resize
         let (display_offset, cursor_point, cursor_shape) =
@@ -883,7 +934,7 @@ impl Element for TerminalElement {
 
         // --- Row dirty tracking + per-row layout cache ---
         // dirty_rows is populated by Terminal::sync() via alacritty's damage API.
-        let (dirty_rows, dirty_row_bounds, mouse_mode, selection_range) = {
+        let (dirty_rows, dirty_row_bounds, mouse_mode, selection_range, cursor_cell) = {
             let terminal_snapshot = self.terminal.read(cx);
             let dirty_rows = terminal_snapshot.dirty_rows().to_vec();
             let dirty_row_bounds = terminal_snapshot.dirty_row_bounds().to_vec();
@@ -896,7 +947,14 @@ impl Element for TerminalElement {
             } else {
                 None
             };
-            (dirty_rows, dirty_row_bounds, mouse_mode, selection_range)
+            let cursor_cell = terminal_snapshot.last_content().cursor_cell.clone();
+            (
+                dirty_rows,
+                dirty_row_bounds,
+                mouse_mode,
+                selection_range,
+                cursor_cell,
+            )
         };
 
         // Selection changes only invalidate selection slices inside row caches.
@@ -1118,10 +1176,10 @@ impl Element for TerminalElement {
             && cursor_shape != AlacCursorShape::Hidden
             && !has_ime_composition
         {
-            let cursor_x =
-                bounds.left() + px(4.0) + (cursor_display_col as f32 * cell_width).floor();
-            let cursor_y =
-                bounds.top() + (cursor_line_in_viewport as f32 * line_height).floor() + px(1.0);
+            let cursor_x = terminal_bounds.bounds.left()
+                + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
+            let cursor_y = terminal_bounds.bounds.top()
+                + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
 
             let shape = match cursor_shape {
                 AlacCursorShape::Block if !self.focused => CursorShape::Hollow,
@@ -1132,31 +1190,31 @@ impl Element for TerminalElement {
                 AlacCursorShape::Hidden => unreachable!(),
             };
 
-            // Get cursor character and check if it's a wide character
-            let cursor_char = self.terminal.read(cx).last_content().cursor_char;
-            let cursor_is_wide = cursor_char != '\0' && char_cell_width(cursor_char) == 2;
-            let cursor_block_width = if cursor_is_wide {
-                cell_width * 2.0
+            let cursor_char = cursor_cell.c;
+            let cursor_cells_wide = if cursor_cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
+            {
+                2.0
             } else {
-                cell_width
+                char_cell_width(cursor_char) as f32
             };
+            let cursor_block_width = cell_width * cursor_cells_wide;
+            let (_, cursor_bg) = rendered_cell_colors(&cursor_cell);
+            let block_text_color = convert_alacritty_color(cursor_bg);
 
             // Create text for block cursor (inverted color effect)
             let block_text = if matches!(shape, CursorShape::Block) {
                 if cursor_char != '\0' && cursor_char != ' ' {
                     let char_str = cursor_char.to_string();
                     let len = cursor_char.len_utf8();
-                    let bg_color =
-                        convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
-                            alacritty_terminal::vte::ansi::NamedColor::Background,
-                        ));
                     Some(window.text_system().shape_line(
                         char_str.into(),
                         font_size,
                         &[TextRun {
                             len,
                             font: text_style.font(),
-                            color: bg_color,
+                            color: block_text_color,
                             ..Default::default()
                         }],
                         Some(cursor_block_width),
@@ -1177,6 +1235,7 @@ impl Element for TerminalElement {
                 origin: point(cursor_x, cursor_y),
                 block_width: cursor_block_width,
                 line_height,
+                thickness: cursor_thickness(cell_width),
                 color: cursor_color,
                 shape,
                 block_text,
@@ -1194,10 +1253,10 @@ impl Element for TerminalElement {
                 .map(|s| s.marked_text.clone());
             if let Some(text) = ime_text {
                 if !text.is_empty() {
-                    let ime_x =
-                        bounds.left() + px(4.0) + (cursor_display_col as f32 * cell_width).floor();
-                    let ime_y =
-                        bounds.top() + (cursor_line_in_viewport as f32 * line_height).floor();
+                    let ime_x = terminal_bounds.bounds.left()
+                        + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
+                    let ime_y = terminal_bounds.bounds.top()
+                        + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
                     let len = text.len();
                     let shaped = window.text_system().shape_line(
                         text.into(),
@@ -1257,16 +1316,16 @@ impl Element for TerminalElement {
             _cursor_col,
             _cursor_row,
             _cursor_in_viewport,
-            _terminal_bounds,
+            terminal_bounds,
             cursor,
             ime_overlay,
         ) = prepaint_state;
 
-        let origin = point(bounds.left() + px(4.0), bounds.top());
+        let origin = terminal_bounds.bounds.origin;
 
         for (row, col) in selection_cells.iter() {
-            let cell_x = bounds.left() + px(4.0) + *cell_width * *col as f32;
-            let cell_y = bounds.top() + *line_height * *row as f32;
+            let cell_x = origin.x + *cell_width * *col as f32;
+            let cell_y = origin.y + *line_height * *row as f32;
             window.paint_quad(fill(
                 Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height)),
                 gpui::rgb(0x4a4a6a),
@@ -1347,5 +1406,27 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_bounds_reserve_padding_on_both_sides() {
+        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(120.0), px(50.0)));
+        let content_bounds = terminal_content_bounds(bounds);
+
+        assert_eq!(content_bounds.origin.x, px(14.0));
+        assert_eq!(content_bounds.origin.y, px(20.0));
+        assert_eq!(content_bounds.size.width, px(112.0));
+        assert_eq!(content_bounds.size.height, px(50.0));
+    }
+
+    #[test]
+    fn cursor_thickness_matches_alacritty_scaling() {
+        assert_eq!(cursor_thickness(px(9.0)), px(1.0));
+        assert_eq!(cursor_thickness(px(20.0)), px(3.0));
     }
 }

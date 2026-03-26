@@ -674,7 +674,7 @@ impl EntityInputHandler for TerminalView {
     fn bounds_for_range(
         &mut self,
         _range_utf16: std::ops::Range<usize>,
-        element_bounds: Bounds<Pixels>,
+        _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
@@ -693,10 +693,9 @@ impl EntityInputHandler for TerminalView {
                 return None;
             }
 
-            let cursor_x = element_bounds.left()
-                + px(4.0)
+            let cursor_x = bounds.bounds.left()
                 + px((content.cursor.column.0 as f32 * bounds.cell_width.as_f32()).floor());
-            let cursor_y = element_bounds.top()
+            let cursor_y = bounds.bounds.top()
                 + px(cursor_line_in_viewport as f32 * bounds.line_height.as_f32());
 
             Some(Bounds {

@@ -169,12 +169,10 @@ pub struct TerminalContent {
     /// Each tuple is `(start, end)` where `cells[start..end]` belongs to one visible row.
     pub row_ranges: Vec<(usize, usize)>,
     pub cursor: AlacPoint,
-    pub cursor_char: char,
+    pub cursor_cell: alacritty_terminal::term::cell::Cell,
     /// 光标形状 - 用于光标委托机制
     /// 当光标形状为Hidden时，终端不渲染光标，由应用程序（如Claude Code）自己处理
     pub cursor_shape: AlacCursorShape,
-    /// 光标所在单元格的背景色 - 用于块光标模式下的字符颜色
-    pub cursor_cell_bg: alacritty_terminal::vte::ansi::Color,
     pub display_offset: usize,
     pub mode: alacritty_terminal::term::TermMode,
     pub cols: usize,
@@ -191,11 +189,8 @@ impl Default for TerminalContent {
             cells: Vec::new(),
             row_ranges: Vec::new(),
             cursor: AlacPoint::new(Line(0), Column(0)),
-            cursor_char: ' ',
+            cursor_cell: alacritty_terminal::term::cell::Cell::default(),
             cursor_shape: AlacCursorShape::Block,
-            cursor_cell_bg: alacritty_terminal::vte::ansi::Color::Named(
-                alacritty_terminal::vte::ansi::NamedColor::Background,
-            ),
             display_offset: 0,
             mode: alacritty_terminal::term::TermMode::default(),
             cols: 80,
@@ -1000,12 +995,10 @@ impl Terminal {
         }
 
         self.last_content.cursor = content.cursor.point;
-        self.last_content.cursor_char = term.grid()[content.cursor.point].c;
+        self.last_content.cursor_cell = term.grid()[content.cursor.point].clone();
         // 获取光标形状 - 用于光标委托机制
         // 当光标形状为Hidden时，终端不渲染光标，由应用程序自己处理
         self.last_content.cursor_shape = content.cursor.shape;
-        // 获取光标所在单元格的背景色 - 用于块光标模式下的字符颜色
-        self.last_content.cursor_cell_bg = term.grid()[content.cursor.point].bg;
         self.last_content.display_offset = content.display_offset;
         self.last_content.mode = content.mode;
         self.last_content.cols = self.terminal_bounds.num_columns();
