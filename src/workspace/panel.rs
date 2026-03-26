@@ -1,13 +1,14 @@
 use gpui::prelude::*;
 use gpui::{
     App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, Render, SharedString, Styled, Window, div, point, px, rgb, svg,
+    IntoElement, Render, SharedString, Styled, Window, div, point, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
+use crate::theme::ActiveTheme;
 
 // Re-export for convenience
 pub use crate::ssh::SshConnectionConfig;
@@ -430,6 +431,7 @@ impl EventEmitter<PanelEvent> for Panel {}
 impl Panel {
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         // 使用Tab标签名作为标题，如果没有则使用Tab ID，最后使用Panel ID
         let title = self
             .active_tab_label
@@ -478,7 +480,7 @@ impl Panel {
                             })
                         },
                     )
-                    .child(div().text_xs().text_color(rgb(0x8888aa)).child(title)),
+                    .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
             .child(
                 // 右侧按钮组：广播按钮 + 关闭按钮
@@ -496,18 +498,18 @@ impl Panel {
                             .items_center()
                             .justify_center()
                             .rounded(px(4.0))
-                            .when(broadcast_enabled, |this| this.bg(rgb(0x4a9eff)))
+                            .when(broadcast_enabled, |this| this.bg(theme.accent))
                             .when(!broadcast_enabled, |this| {
-                                this.hover(|style| style.bg(rgb(0x3d3d5c)))
+                                this.hover(move |style| style.bg(theme.title_bar_hover))
                             })
                             .cursor_pointer()
                             .child(
                                 svg()
                                     .size(px(14.0))
                                     .text_color(if broadcast_enabled {
-                                        rgb(0xffffff)
+                                        theme.accent_foreground
                                     } else {
-                                        rgb(0x666688)
+                                        theme.icon_muted
                                     })
                                     .path(Icon::BroadcastInput.path()),
                             )
@@ -530,12 +532,12 @@ impl Panel {
                             .items_center()
                             .justify_center()
                             .rounded(px(4.0))
-                            .hover(|style| style.bg(rgb(0x3d3d5c)))
+                            .hover(move |style| style.bg(theme.title_bar_hover))
                             .cursor_pointer()
                             .child(
                                 svg()
                                     .size(px(14.0))
-                                    .text_color(rgb(0x666688))
+                                    .text_color(theme.icon_muted)
                                     .path(Icon::WindowClose.path()),
                             )
                             .on_click(cx.listener(
@@ -581,11 +583,12 @@ impl Panel {
     }
 
     /// 渲染拖拽预览层
-    fn render_drag_preview(&self) -> Option<impl IntoElement> {
+    fn render_drag_preview(&self, cx: &App) -> Option<impl IntoElement> {
+        let theme = cx.theme().ui;
         self.drag_preview.map(|preview| {
             div()
                 .absolute()
-                .bg(rgb(0x6c5ce7))
+                .bg(theme.drop_target)
                 .rounded(px(10.0))
                 .map(|div| match preview {
                     PanelPlacement::Left => div
@@ -747,6 +750,7 @@ impl Panel {
 
 impl Render for Panel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_solo = self.is_solo;
         let is_selected = self.is_selected;
 
@@ -756,20 +760,24 @@ impl Render for Panel {
             // SettingsHub Panel 使用透明背景以显示毛玻璃效果
             .when(
                 !matches!(self.content, PanelContent::SettingsHubSidebar(_)),
-                |this| this.bg(rgb(0x0f0f1a)),
+                |this| this.bg(theme.panel_background),
             )
             .when(!is_solo, |this| {
                 // 选中时边框颜色加深，未选中时使用浅色边框
                 let border_color = if is_selected {
-                    rgb(0x5d5d7c) // 浅色边框（选中状态）
+                    theme.border_strong
                 } else {
-                    rgb(0x2d2d44) // 深色边框（未选中状态）
+                    theme.border
                 };
                 this.border_1()
                     .border_color(border_color)
                     // 阴影 - 复刻 Hosts 卡片风格
                     .shadow(vec![BoxShadow {
-                        color: rgb(0x1a1a2e).into(),
+                        color: theme.shadow.opacity(if cx.theme().appearance.is_dark() {
+                            0.32
+                        } else {
+                            0.18
+                        }),
                         offset: point(px(2.), px(4.)),
                         blur_radius: px(20.),
                         spread_radius: px(-4.),
@@ -795,7 +803,7 @@ impl Render for Panel {
             .child(self.render_content())
             // 渲染拖拽预览层
             .when(self.drag_preview.is_some(), |this| {
-                if let Some(preview) = self.render_drag_preview() {
+                if let Some(preview) = self.render_drag_preview(cx) {
                     this.child(preview)
                 } else {
                     this

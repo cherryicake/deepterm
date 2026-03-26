@@ -1,6 +1,8 @@
 use gpui::prelude::*;
-use gpui::{AnimationExt, BoxShadow, IntoElement, div, hsla, point, px, rgb};
+use gpui::{AnimationExt, BoxShadow, IntoElement, div, point, px};
 use std::time::Duration;
+
+use crate::theme::ActiveTheme;
 
 /// 动画时长常量
 const ANIMATION_DURATION_ENTER_MS: u64 = 450;
@@ -26,19 +28,24 @@ impl Sidebar {
     }
 
     /// 渲染侧边栏容器，内容由调用方提供
-    pub fn render<E: IntoElement>(self, children: E) -> impl IntoElement {
+    pub fn render<E: IntoElement>(self, children: E, cx: &gpui::App) -> impl IntoElement {
         let width = self.width;
+        let theme = cx.theme().ui;
 
         div()
             .id("sidebar")
             .w(px(width))
             .h_full()
             .rounded(px(12.0))
-            .bg(Self::sidebar_background())
+            .bg(theme.panel_background)
             .border_1()
-            .border_color(Self::border_color())
+            .border_color(theme.border)
             .shadow(vec![BoxShadow {
-                color: Self::shadow_color(),
+                color: theme.shadow.opacity(if cx.theme().appearance.is_dark() {
+                    0.32
+                } else {
+                    0.18
+                }),
                 offset: point(px(2.), px(4.)),
                 blur_radius: px(20.),
                 spread_radius: px(-4.),
@@ -50,8 +57,8 @@ impl Sidebar {
     }
 
     /// 渲染空的侧边栏容器
-    pub fn render_empty(self) -> impl IntoElement {
-        self.render(div())
+    pub fn render_empty(self, cx: &gpui::App) -> impl IntoElement {
+        self.render(div(), cx)
     }
 
     /// 渲染带入场/退出动画的侧边栏容器
@@ -61,8 +68,10 @@ impl Sidebar {
         animation_id: impl Into<gpui::ElementId>,
         visible: bool,
         children: E,
+        cx: &gpui::App,
     ) -> impl IntoElement {
         let target_width = self.width;
+        let theme = cx.theme().ui;
 
         if visible {
             // 入场动画：弹性效果，带边框和阴影
@@ -70,11 +79,15 @@ impl Sidebar {
                 .id("sidebar-toggle-enter")
                 .h_full()
                 .rounded(px(12.0))
-                .bg(Self::sidebar_background())
+                .bg(theme.panel_background)
                 .border_1()
-                .border_color(Self::border_color())
+                .border_color(theme.border)
                 .shadow(vec![BoxShadow {
-                    color: Self::shadow_color(),
+                    color: theme.shadow.opacity(if cx.theme().appearance.is_dark() {
+                        0.32
+                    } else {
+                        0.18
+                    }),
                     offset: point(px(2.), px(4.)),
                     blur_radius: px(20.),
                     spread_radius: px(-4.),
@@ -109,7 +122,7 @@ impl Sidebar {
                 .id("sidebar-toggle-exit")
                 .h_full()
                 .rounded(px(12.0))
-                .bg(Self::sidebar_background())
+                .bg(theme.panel_background)
                 .overflow_hidden()
                 .child(
                     div()
@@ -161,58 +174,68 @@ impl Sidebar {
     }
 
     // 颜色定义 - 完全复刻 Hosts 卡片样式
-    /// 侧边栏背景 - 复刻 Hosts 卡片: rgb(0x1a1a2e)
-    pub fn sidebar_background() -> gpui::Hsla {
-        rgb(0x1a1a2e).into()
+    pub fn sidebar_background(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.panel_background
     }
 
-    /// 侧边栏边框 - 复刻 Hosts 卡片: rgb(0x2d2d44)
-    pub fn border_color() -> gpui::Hsla {
-        rgb(0x2d2d44).into()
+    pub fn border_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.border
     }
 
-    /// 侧边栏悬停背景 - 复刻 Hosts 卡片 hover: rgb(0x252538)
-    pub fn hover_background() -> gpui::Hsla {
-        rgb(0x252538).into()
+    pub fn hover_background(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.tab_hover_background
     }
 
-    pub fn selected_background() -> gpui::Hsla {
-        // 选中背景 - 类似 macOS 蓝色但适配深色主题
-        hsla(211.0 / 360.0, 1.0, 0.5, 0.25)
+    pub fn selected_background(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme()
+            .ui
+            .accent
+            .opacity(if cx.theme().appearance.is_dark() {
+                0.24
+            } else {
+                0.16
+            })
     }
 
-    pub fn selected_text_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 1.0)
+    pub fn selected_text_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.text
     }
 
-    pub fn section_title_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.40)
+    pub fn section_title_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.text_subtle
     }
 
-    pub fn text_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.92)
+    pub fn text_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.text
     }
 
-    pub fn text_color_secondary() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.55)
+    pub fn text_color_secondary(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.text_muted
     }
 
-    pub fn badge_background() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.15)
+    pub fn badge_background(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.elevated_background
     }
 
-    pub fn badge_text_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 1.0, 0.70)
+    pub fn badge_text_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme().ui.text_muted
     }
 
-    pub fn shadow_color() -> gpui::Hsla {
-        hsla(0.0 / 360.0, 0.0, 0.0, 0.15)
+    pub fn shadow_color(cx: &gpui::App) -> gpui::Hsla {
+        cx.theme()
+            .ui
+            .shadow
+            .opacity(if cx.theme().appearance.is_dark() {
+                0.32
+            } else {
+                0.18
+            })
     }
 
     /// 默认阴影配置 - 供外部组件复用
-    pub fn default_box_shadow() -> Vec<BoxShadow> {
+    pub fn default_box_shadow(cx: &gpui::App) -> Vec<BoxShadow> {
         vec![BoxShadow {
-            color: Self::shadow_color(),
+            color: Self::shadow_color(cx),
             offset: point(px(2.), px(4.)),
             blur_radius: px(20.),
             spread_radius: px(-4.),

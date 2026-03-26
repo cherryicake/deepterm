@@ -4,13 +4,14 @@ use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::TerminalView;
+use crate::theme::{ActiveTheme, TerminalTheme};
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
     Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks,
     FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
-    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, rgb, size,
+    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -298,6 +299,7 @@ impl TerminalElement {
         text_style: &TextStyle,
         font_size: Pixels,
         cell_width: Pixels,
+        terminal_theme: &TerminalTheme,
         selection_range: &Option<SelectionRange>,
     ) {
         let full_entry = Self::layout_row(
@@ -307,9 +309,10 @@ impl TerminalElement {
             text_style,
             font_size,
             cell_width,
+            terminal_theme,
         );
-        let full_boxes = Self::box_cells_for_row(row_idx, row_cells);
-        let full_backgrounds = Self::background_cells_for_row(row_idx, row_cells);
+        let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme);
+        let full_backgrounds = Self::background_cells_for_row(row_idx, row_cells, terminal_theme);
         let full_selection_cols = Self::selected_cols_for_row(row_cells, selection_range);
 
         debug_assert_eq!(
@@ -359,6 +362,7 @@ impl TerminalElement {
         text_style: &TextStyle,
         font_size: Pixels,
         cell_width: Pixels,
+        terminal_theme: &TerminalTheme,
     ) -> RowLayoutEntry {
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
         let mut current_batch: Option<(usize, String, TextRun, usize)> = None;
@@ -428,14 +432,14 @@ impl TerminalElement {
                     },
                     ..text_style.font()
                 },
-                color: convert_alacritty_color(fg),
+                color: convert_alacritty_color(fg, terminal_theme),
                 background_color: if bg
                     == &alacritty_terminal::vte::ansi::Color::Named(
                         alacritty_terminal::vte::ansi::NamedColor::Background,
                     ) {
                     None
                 } else {
-                    Some(convert_alacritty_color(bg))
+                    Some(convert_alacritty_color(bg, terminal_theme))
                 },
                 underline: if cell
                     .cell
@@ -443,7 +447,7 @@ impl TerminalElement {
                     .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
                 {
                     Some(gpui::UnderlineStyle {
-                        color: Some(convert_alacritty_color(&cell.cell.fg)),
+                        color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
                         thickness: px(1.0),
                         wavy: false,
                     })
@@ -504,7 +508,11 @@ impl TerminalElement {
         RowLayoutEntry { runs: batched_runs }
     }
 
-    fn box_cell_for_cell(row_idx: usize, cell: &IndexedCell) -> Option<BoxDrawingCell> {
+    fn box_cell_for_cell(
+        row_idx: usize,
+        cell: &IndexedCell,
+        terminal_theme: &TerminalTheme,
+    ) -> Option<BoxDrawingCell> {
         let ch = cell.cell.c;
         if !box_drawing::is_box_drawing_char(ch) {
             return None;
@@ -514,7 +522,7 @@ impl TerminalElement {
             col: cell.point.column.0,
             row: row_idx,
             c: ch,
-            color: convert_alacritty_color(fg),
+            color: convert_alacritty_color(fg, terminal_theme),
         })
     }
 
@@ -558,7 +566,11 @@ impl TerminalElement {
         cols
     }
 
-    fn background_cells_for_row(row_idx: usize, cells: &[IndexedCell]) -> Vec<BackgroundCell> {
+    fn background_cells_for_row(
+        row_idx: usize,
+        cells: &[IndexedCell],
+        terminal_theme: &TerminalTheme,
+    ) -> Vec<BackgroundCell> {
         let mut backgrounds = Vec::new();
         for cell in cells {
             let (_, bg) = rendered_cell_colors(&cell.cell);
@@ -570,7 +582,7 @@ impl TerminalElement {
                 backgrounds.push(BackgroundCell {
                     col: cell.point.column.0,
                     row: row_idx,
-                    color: convert_alacritty_color(bg),
+                    color: convert_alacritty_color(bg, terminal_theme),
                 });
             }
         }
@@ -582,6 +594,7 @@ impl TerminalElement {
         cached_backgrounds: &[BackgroundCell],
         cells: &[IndexedCell],
         range: (usize, usize),
+        terminal_theme: &TerminalTheme,
     ) -> Vec<BackgroundCell> {
         let (left, right) = range;
         let mut backgrounds: Vec<BackgroundCell> = cached_backgrounds
@@ -604,7 +617,7 @@ impl TerminalElement {
                 backgrounds.push(BackgroundCell {
                     col,
                     row: row_idx,
-                    color: convert_alacritty_color(bg),
+                    color: convert_alacritty_color(bg, terminal_theme),
                 });
             }
         }
@@ -613,10 +626,14 @@ impl TerminalElement {
         backgrounds
     }
 
-    fn box_cells_for_row(row_idx: usize, cells: &[IndexedCell]) -> Vec<BoxDrawingCell> {
+    fn box_cells_for_row(
+        row_idx: usize,
+        cells: &[IndexedCell],
+        terminal_theme: &TerminalTheme,
+    ) -> Vec<BoxDrawingCell> {
         let mut box_cells = Vec::new();
         for cell in cells {
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell) {
+            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme) {
                 box_cells.push(box_cell);
             }
         }
@@ -628,6 +645,7 @@ impl TerminalElement {
         cached_box_cells: &[BoxDrawingCell],
         cells: &[IndexedCell],
         range: (usize, usize),
+        terminal_theme: &TerminalTheme,
     ) -> Vec<BoxDrawingCell> {
         let (left, right) = range;
         let mut box_cells: Vec<BoxDrawingCell> = cached_box_cells
@@ -641,7 +659,7 @@ impl TerminalElement {
             if col < left || col > right {
                 continue;
             }
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell) {
+            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme) {
                 box_cells.push(box_cell);
             }
         }
@@ -659,6 +677,7 @@ impl TerminalElement {
         text_style: &TextStyle,
         font_size: Pixels,
         cell_width: Pixels,
+        terminal_theme: &TerminalTheme,
     ) -> Option<Vec<BatchedTextRun>> {
         let (mut rebuild_left, mut rebuild_right) = range;
 
@@ -712,6 +731,7 @@ impl TerminalElement {
             text_style,
             font_size,
             cell_width,
+            terminal_theme,
         );
 
         merged_runs.extend(dirty_entry.runs);
@@ -776,6 +796,8 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
+        let app_theme = cx.theme();
+        let terminal_theme = app_theme.terminal;
         let font_size = px(18.0);
         let line_height = font_size * 1.25;
 
@@ -813,7 +835,7 @@ impl Element for TerminalElement {
             line_height: line_height.into(),
             background_color: None,
             white_space: WhiteSpace::Normal,
-            color: rgb(0x9aa3b8).into(),
+            color: terminal_theme.foreground,
             ..Default::default()
         };
 
@@ -949,6 +971,7 @@ impl Element for TerminalElement {
                         &text_style,
                         font_size,
                         cell_width,
+                        &terminal_theme,
                     ) {
                         partial_run_update_count += 1;
                         let mut entry = cached_entry;
@@ -962,6 +985,7 @@ impl Element for TerminalElement {
                             &text_style,
                             font_size,
                             cell_width,
+                            &terminal_theme,
                         )
                     }
                 } else {
@@ -972,6 +996,7 @@ impl Element for TerminalElement {
                         &text_style,
                         font_size,
                         cell_width,
+                        &terminal_theme,
                     )
                 };
                 batched_runs.extend_from_slice(&entry.runs);
@@ -983,7 +1008,7 @@ impl Element for TerminalElement {
             }
 
             if row_cache.box_cells.is_none() {
-                let row_boxes = Self::box_cells_for_row(row_idx, row_cells);
+                let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
                 box_cells.extend_from_slice(&row_boxes);
                 row_cache.box_cells = Some(row_boxes);
             } else if is_dirty {
@@ -994,6 +1019,7 @@ impl Element for TerminalElement {
                         cached_row_boxes,
                         row_cells,
                         range,
+                        &terminal_theme,
                     );
                     box_cells.extend_from_slice(&row_boxes);
                     row_cache.box_cells = Some(row_boxes);
@@ -1007,7 +1033,8 @@ impl Element for TerminalElement {
             }
 
             if row_cache.background_cells.is_none() {
-                let backgrounds = Self::background_cells_for_row(row_idx, row_cells);
+                let backgrounds =
+                    Self::background_cells_for_row(row_idx, row_cells, &terminal_theme);
                 background_cells.extend_from_slice(&backgrounds);
                 row_cache.background_cells = Some(backgrounds);
             } else if is_dirty {
@@ -1018,6 +1045,7 @@ impl Element for TerminalElement {
                         cached_backgrounds,
                         row_cells,
                         range,
+                        &terminal_theme,
                     );
                     background_cells.extend_from_slice(&backgrounds);
                     row_cache.background_cells = Some(backgrounds);
@@ -1071,6 +1099,7 @@ impl Element for TerminalElement {
                     &text_style,
                     font_size,
                     cell_width,
+                    &terminal_theme,
                     &selection_range,
                 );
             }
@@ -1130,8 +1159,7 @@ impl Element for TerminalElement {
                 char_cell_width(cursor_char) as f32
             };
             let cursor_block_width = cell_width * cursor_cells_wide;
-            let (_, cursor_bg) = rendered_cell_colors(&cursor_cell);
-            let block_text_color = convert_alacritty_color(cursor_bg);
+            let block_text_color = terminal_theme.background;
 
             // Create text for block cursor (inverted color effect)
             let block_text = if matches!(shape, CursorShape::Block) {
@@ -1156,10 +1184,12 @@ impl Element for TerminalElement {
                 None
             };
 
-            let cursor_color =
-                convert_alacritty_color(&alacritty_terminal::vte::ansi::Color::Named(
+            let cursor_color = convert_alacritty_color(
+                &alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Cursor,
-                ));
+                ),
+                &terminal_theme,
+            );
 
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
@@ -1194,7 +1224,7 @@ impl Element for TerminalElement {
                         &[TextRun {
                             len,
                             font: text_style.font(),
-                            color: gpui::white(),
+                            color: terminal_theme.bright_foreground,
                             ..Default::default()
                         }],
                         None,
@@ -1236,6 +1266,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
+        let terminal_theme = cx.theme().terminal;
         let (
             batched_runs,
             box_cells,
@@ -1252,13 +1283,14 @@ impl Element for TerminalElement {
         ) = prepaint_state;
 
         let origin = terminal_bounds.bounds.origin;
+        window.paint_quad(fill(bounds, terminal_theme.background));
 
         for (row, col) in selection_cells.iter() {
             let cell_x = origin.x + *cell_width * *col as f32;
             let cell_y = origin.y + *line_height * *row as f32;
             window.paint_quad(fill(
                 Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height)),
-                gpui::rgb(0x4a4a6a),
+                terminal_theme.selection_background,
             ));
         }
 
@@ -1309,7 +1341,7 @@ impl Element for TerminalElement {
         if let Some((ime_shaped, ime_origin)) = ime_overlay {
             let ime_background_bounds =
                 Bounds::new(*ime_origin, size(ime_shaped.width, *line_height));
-            window.paint_quad(fill(ime_background_bounds, gpui::rgb(0x1a1a2e)));
+            window.paint_quad(fill(ime_background_bounds, terminal_theme.ime_background));
 
             let _ = ime_shaped.paint(
                 *ime_origin,
@@ -1327,7 +1359,7 @@ impl Element for TerminalElement {
                     point(ime_origin.x, underline_y),
                     size(ime_shaped.width, px(1.0)),
                 ),
-                gpui::rgb(0xccccff),
+                terminal_theme.ime_underline,
             ));
         }
 

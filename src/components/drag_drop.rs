@@ -1,6 +1,7 @@
+use crate::theme::ActiveTheme;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div, px, rgb,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div, px,
 };
 
 /// 拖拽状态
@@ -209,7 +210,8 @@ impl Focusable for DropZoneIndicator {
 }
 
 impl Render for DropZoneIndicator {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let zone = self.zone;
         let is_active = self.is_active;
 
@@ -217,9 +219,9 @@ impl Render for DropZoneIndicator {
             .id(format!("drop-zone-{:?}", zone))
             .absolute()
             .bg(if is_active {
-                rgb(0x6c5ce7)
+                theme.drop_target
             } else {
-                rgb(0x2d2d44)
+                theme.border
             })
             .opacity(if is_active { 0.5 } else { 0.0 })
             .when(zone == DropZone::Left, |this| {

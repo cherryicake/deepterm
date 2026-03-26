@@ -6,6 +6,7 @@ use gpui::{
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
 use crate::components::stepper::trigger::StepperTrigger;
+use crate::theme::ActiveTheme;
 
 /// A step item within a [`Stepper`].
 #[derive(IntoElement)]
@@ -211,7 +212,8 @@ impl Styled for StepperSeparator {
 }
 
 impl RenderOnce for StepperSeparator {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let icon_size = self.icon_size;
         let text_center = self.text_center;
         let separator_wide = px(2.);
@@ -242,7 +244,7 @@ impl RenderOnce for StepperSeparator {
                     }
                 })
             })
-            .bg(gpui::rgb(0x4a4a6a))
-            .when(self.checked, |this| this.bg(gpui::rgb(0x22c55e)))
+            .bg(theme.border_strong)
+            .when(self.checked, |this| this.bg(theme.success))
     }
 }

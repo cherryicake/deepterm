@@ -7,8 +7,7 @@ use anyhow::anyhow;
 use gpui::prelude::*;
 use gpui::{
     App, Context, CursorStyle, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, hsla, px, rgb,
-    svg,
+    KeyDownEvent, MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, px, svg,
 };
 
 use crate::assets::Icon;
@@ -17,26 +16,7 @@ use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
     sibling_certificate_path,
 };
-
-const BG_PAGE: u32 = 0x0f0f1a;
-const BG_CARD: u32 = 0x1a1a2e;
-const BG_CARD_HOVER: u32 = 0x252538;
-const BG_CARD_SELECTED: u32 = 0x2a2a4a;
-const BORDER: u32 = 0x2d2d44;
-const BORDER_SELECTED: u32 = 0x4d4d6a;
-const TEXT_PRIMARY: u32 = 0xcccccc;
-const TEXT_SECONDARY: u32 = 0x8888aa;
-const TEXT_MUTED: u32 = 0x666688;
-const SUCCESS_BG: u32 = 0x1f3d1f;
-const SUCCESS_BORDER: u32 = 0x2f5d2f;
-const SUCCESS_TEXT: u32 = 0x66ff66;
-const ERROR_BG: u32 = 0x3d1f1f;
-const ERROR_BORDER: u32 = 0x5d2f2f;
-const ERROR_TEXT: u32 = 0xff8888;
-const ACTION_BG: u32 = 0x2d2d44;
-const ACTION_BG_HOVER: u32 = 0x3d3d5c;
-const ACCENT_BG: u32 = 0x3d5c3d;
-const ACCENT_BG_HOVER: u32 = 0x4a6a4a;
+use crate::theme::ActiveTheme;
 const GRID_GAP_PX: f32 = 12.0;
 const CONTENT_PADDING_PX: f32 = 0.0;
 
@@ -145,6 +125,7 @@ impl Focusable for MultilineTextArea {
 
 impl Render for MultilineTextArea {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_focused = self.focus_handle.is_focused(window);
         let lines: Vec<String> = if self.text.is_empty() {
             vec![if is_focused {
@@ -174,11 +155,11 @@ impl Render for MultilineTextArea {
             .rounded(px(8.0))
             .border_1()
             .border_color(if is_focused {
-                rgb(0x4a4a6a)
+                theme.border_strong
             } else {
-                rgb(BORDER)
+                theme.border
             })
-            .bg(rgb(BG_CARD))
+            .bg(theme.elevated_background)
             .px(px(12.0))
             .py(px(10.0))
             .overflow_y_scroll()
@@ -198,9 +179,9 @@ impl Render for MultilineTextArea {
                     div()
                         .text_sm()
                         .text_color(if self.text.is_empty() && !is_focused {
-                            rgb(TEXT_MUTED)
+                            theme.text_subtle
                         } else {
-                            rgb(TEXT_PRIMARY)
+                            theme.text
                         })
                         .child(if line.is_empty() {
                             " ".to_string()
@@ -285,6 +266,7 @@ impl KeychainView {
         icon_color: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_selected = self.selected_item_id.as_ref() == Some(&item.id);
         let item_id = item.id.clone();
         let item_for_callback = item.clone();
@@ -299,22 +281,26 @@ impl KeychainView {
             .gap(px(12.0))
             .rounded(px(10.0))
             .bg(if is_selected {
-                rgb(BG_CARD_SELECTED)
+                theme.accent.opacity(if cx.theme().appearance.is_dark() {
+                    0.18
+                } else {
+                    0.10
+                })
             } else {
-                rgb(BG_CARD)
+                theme.elevated_background
             })
             .border_1()
             .border_color(if is_selected {
-                rgb(BORDER_SELECTED)
+                theme.accent
             } else {
-                rgb(BORDER)
+                theme.border
             })
             .cursor_pointer()
             .hover(|style| {
                 if is_selected {
                     style
                 } else {
-                    style.bg(rgb(BG_CARD_HOVER))
+                    style.bg(theme.tab_hover_background)
                 }
             })
             .on_mouse_down(
@@ -340,7 +326,7 @@ impl KeychainView {
                         svg()
                             .size(px(20.0))
                             .path(icon.path())
-                            .text_color(rgb(0xffffff)),
+                            .text_color(theme.accent_foreground),
                     ),
             )
             .child(
@@ -354,30 +340,31 @@ impl KeychainView {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(theme.text)
                             .truncate()
                             .child(item.label.clone()),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
+                            .text_color(theme.text_subtle)
                             .child(item.subtitle()),
                     ),
             )
     }
 
-    fn render_section_header(&self, title: &str, _count: usize) -> impl IntoElement {
+    fn render_section_header(&self, title: &str, _count: usize, cx: &App) -> impl IntoElement {
         div().flex().items_center().child(
             div()
                 .text_sm()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT_SECONDARY))
+                .text_color(cx.theme().ui.text_muted)
                 .child(title.to_string()),
         )
     }
 
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .h(px(20.0))
@@ -389,9 +376,9 @@ impl KeychainView {
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(6.0))
-                    .bg(rgb(ACTION_BG))
+                    .bg(theme.elevated_background)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(ACTION_BG_HOVER)))
+                    .hover(move |style| style.bg(theme.tab_hover_background))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -407,13 +394,13 @@ impl KeychainView {
                         svg()
                             .size(px(10.0))
                             .path(Icon::Plus.path())
-                            .text_color(rgb(TEXT_SECONDARY)),
+                            .text_color(theme.icon),
                     )
                     .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(theme.text)
                             .child("NEW KEY"),
                     ),
             )
@@ -422,9 +409,9 @@ impl KeychainView {
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(6.0))
-                    .bg(rgb(ACTION_BG))
+                    .bg(theme.elevated_background)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(ACTION_BG_HOVER)))
+                    .hover(move |style| style.bg(theme.tab_hover_background))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -440,13 +427,13 @@ impl KeychainView {
                         svg()
                             .size(px(10.0))
                             .path(Icon::Plus.path())
-                            .text_color(rgb(TEXT_SECONDARY)),
+                            .text_color(theme.icon),
                     )
                     .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(theme.text)
                             .child("NEW IDENTITY"),
                     ),
             )
@@ -479,6 +466,7 @@ impl Focusable for KeychainView {
 
 impl Render for KeychainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let keys = self.keys();
         let identities = self.identities();
 
@@ -486,7 +474,7 @@ impl Render for KeychainView {
             .id("keychain-view")
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(rgb(BG_PAGE))
+            .bg(theme.panel_background)
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 if let Some(path) = paths.paths().first() {
                     this.selected_item_id = None;
@@ -506,14 +494,14 @@ impl Render for KeychainView {
                     .pt(px(8.0))
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT_PRIMARY))
+                    .text_color(theme.text)
                     .child("Keychain"),
             )
             .child(
                 div()
                     .px(px(16.0))
                     .text_sm()
-                    .text_color(rgb(TEXT_MUTED))
+                    .text_color(theme.text_subtle)
                     .child("Create and reuse SSH keys and password identities."),
             )
             .child(div().px(px(16.0)).child(self.render_action_buttons(cx)))
@@ -523,13 +511,8 @@ impl Render for KeychainView {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
-                    .child(self.render_section_header("Keys", keys.len()))
-                    .child(self.render_list_grid(
-                        &keys,
-                        Icon::KeyShield,
-                        hsla(210.0 / 360.0, 0.80, 0.55, 1.0),
-                        cx,
-                    )),
+                    .child(self.render_section_header("Keys", keys.len(), cx))
+                    .child(self.render_list_grid(&keys, Icon::KeyShield, theme.accent, cx)),
             )
             .child(
                 div()
@@ -537,13 +520,8 @@ impl Render for KeychainView {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
-                    .child(self.render_section_header("Identities", identities.len()))
-                    .child(self.render_list_grid(
-                        &identities,
-                        Icon::Host,
-                        hsla(145.0 / 360.0, 0.70, 0.45, 1.0),
-                        cx,
-                    )),
+                    .child(self.render_section_header("Identities", identities.len(), cx))
+                    .child(self.render_list_grid(&identities, Icon::Host, theme.success, cx)),
             )
     }
 }
@@ -899,7 +877,13 @@ impl KeychainEditor {
         Ok(file_path)
     }
 
-    fn render_labeled_input(&self, label: &str, input: &Entity<Input>) -> impl IntoElement {
+    fn render_labeled_input(
+        &self,
+        label: &str,
+        input: &Entity<Input>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -908,7 +892,7 @@ impl KeychainEditor {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(TEXT_SECONDARY))
+                    .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
             .child(input.clone())
@@ -918,7 +902,9 @@ impl KeychainEditor {
         &self,
         label: &str,
         input: &Entity<MultilineTextArea>,
+        cx: &App,
     ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -927,13 +913,14 @@ impl KeychainEditor {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x5ecf7f))
+                    .text_color(theme.success)
                     .child(label.to_string()),
             )
             .child(input.clone())
     }
 
-    fn render_message(&self) -> Option<impl IntoElement> {
+    fn render_message(&self, cx: &App) -> Option<impl IntoElement> {
+        let theme = cx.theme().ui;
         if let Some(error) = &self.error_message {
             Some(
                 div()
@@ -941,13 +928,13 @@ impl KeychainEditor {
                     .px(px(12.0))
                     .py(px(8.0))
                     .rounded(px(8.0))
-                    .bg(rgb(ERROR_BG))
+                    .bg(theme.error_background)
                     .border_1()
-                    .border_color(rgb(ERROR_BORDER))
+                    .border_color(theme.error)
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(ERROR_TEXT))
+                            .text_color(theme.error_foreground)
                             .child(error.clone()),
                     )
                     .into_any_element(),
@@ -959,13 +946,13 @@ impl KeychainEditor {
                     .px(px(12.0))
                     .py(px(8.0))
                     .rounded(px(8.0))
-                    .bg(rgb(SUCCESS_BG))
+                    .bg(theme.success_background)
                     .border_1()
-                    .border_color(rgb(SUCCESS_BORDER))
+                    .border_color(theme.success)
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(SUCCESS_TEXT))
+                            .text_color(theme.success_foreground)
                             .child(success.clone()),
                     )
                     .into_any_element(),
@@ -984,6 +971,7 @@ impl Focusable for KeychainEditor {
 
 impl Render for KeychainEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let title = if self.editing_item_id.is_some() {
             if self.draft_kind == KeychainItemKind::Key {
                 "Edit Key"
@@ -1015,40 +1003,37 @@ impl Render for KeychainEditor {
                 div()
                     .pb(px(12.0))
                     .border_b_1()
-                    .border_color(rgb(BORDER))
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_base()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT_PRIMARY))
+                            .text_color(theme.text)
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_SECONDARY))
-                            .child(subtitle),
-                    ),
+                    .child(div().text_xs().text_color(theme.text_muted).child(subtitle)),
             )
-            .children(self.render_message().into_iter())
-            .child(self.render_labeled_input("Label", &self.label_input))
+            .children(self.render_message(cx).into_iter())
+            .child(self.render_labeled_input("Label", &self.label_input, cx))
             .when(self.draft_kind == KeychainItemKind::Identity, |this| {
-                this.child(self.render_labeled_input("Username", &self.username_input))
-                    .child(self.render_labeled_input("Password", &self.password_input))
+                this.child(self.render_labeled_input("Username", &self.username_input, cx))
+                    .child(self.render_labeled_input("Password", &self.password_input, cx))
             })
             .when(self.draft_kind == KeychainItemKind::Key, |this| {
-                this.child(div().pt(px(4.0)).child(
-                    self.render_labeled_multiline_input("Private key *", &self.private_key_input),
-                ))
+                this.child(div().pt(px(4.0)).child(self.render_labeled_multiline_input(
+                    "Private key *",
+                    &self.private_key_input,
+                    cx,
+                )))
                 .child(
                     div()
                         .mt(px(10.0))
                         .w_full()
                         .h(px(36.0))
                         .rounded(px(8.0))
-                        .bg(rgb(ACCENT_BG))
+                        .bg(theme.success)
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(ACCENT_BG_HOVER)))
+                        .hover(move |style| style.bg(theme.success.opacity(0.85)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| {
@@ -1063,7 +1048,7 @@ impl Render for KeychainEditor {
                                 .justify_center()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(0xffffff))
+                                .text_color(theme.success_foreground)
                                 .child("Import from key file"),
                         ),
                 )
@@ -1078,9 +1063,9 @@ impl Render for KeychainEditor {
                             .flex_1()
                             .h(px(36.0))
                             .rounded(px(8.0))
-                            .bg(rgb(ACTION_BG))
+                            .bg(theme.elevated_background)
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(ACTION_BG_HOVER)))
+                            .hover(move |style| style.bg(theme.tab_hover_background))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -1095,7 +1080,7 @@ impl Render for KeychainEditor {
                                     .justify_center()
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .text_color(theme.text)
                                     .child("Cancel"),
                             ),
                     )
@@ -1104,9 +1089,9 @@ impl Render for KeychainEditor {
                             .flex_1()
                             .h(px(36.0))
                             .rounded(px(8.0))
-                            .bg(rgb(ACCENT_BG))
+                            .bg(theme.success)
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(ACCENT_BG_HOVER)))
+                            .hover(move |style| style.bg(theme.success.opacity(0.85)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -1121,7 +1106,7 @@ impl Render for KeychainEditor {
                                     .justify_center()
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(0xffffff))
+                                    .text_color(theme.success_foreground)
                                     .child("Save"),
                             ),
                     ),

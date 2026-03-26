@@ -6,25 +6,16 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Styled, Window, actions, div, px, rems, rgb, svg,
+    MouseButton, ParentElement, Render, Styled, Window, actions, div, px, rems, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::input::Input;
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
+use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
 actions!(ssh_picker, [Dismiss, SelectNext, SelectPrevious, Confirm]);
-
-// 颜色常量
-const COLOR_BG_DEEP: u32 = 0x11111b;
-const COLOR_BG_SELECTED: u32 = 0x313244;
-const COLOR_BG_HOVER: u32 = 0x252538;
-const COLOR_BG_PANEL: u32 = 0x181825;
-const COLOR_TEXT_PRIMARY: u32 = 0x9aa3b8;
-const COLOR_TEXT_SECONDARY: u32 = 0x5d5d7c;
-const COLOR_TEXT_TERTIARY: u32 = 0x666688;
-const COLOR_TEXT_SHORTCUT: u32 = 0x4a4a6a;
 
 // 尺寸常量
 const ITEM_HEIGHT: f32 = 30.0;
@@ -415,7 +406,8 @@ impl SshPicker {
         }
     }
 
-    fn render_search(&self) -> impl IntoElement {
+    fn render_search(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div().px(px(12.0)).py(px(12.0)).child(
             div()
                 .h(px(SEARCH_HEIGHT))
@@ -423,27 +415,30 @@ impl SshPicker {
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .bg(rgb(COLOR_BG_DEEP))
+                .bg(theme.app_background)
+                .border_1()
+                .border_color(theme.border)
                 .rounded(px(8.0))
                 .child(
                     div().w(px(16.0)).h(px(16.0)).child(
                         svg()
                             .size(px(16.0))
-                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .text_color(theme.icon_muted)
                             .path(Icon::MagnifyingGlass.path()),
                     ),
                 )
                 .child(div().flex_1().child(self.search_input.clone()))
                 .child(
                     div()
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .text_color(theme.text_subtle)
                         .text_size(px(12.0))
                         .child("⌘+K"),
                 ),
         )
     }
 
-    fn render_section_label(label: &str, shortcut: Option<&str>) -> impl IntoElement {
+    fn render_section_label(label: &str, shortcut: Option<&str>, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .px(px(16.0))
             .py(px(8.0))
@@ -452,7 +447,7 @@ impl SshPicker {
             .gap(px(6.0))
             .child(
                 div()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .text_color(theme.text_muted)
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(label.to_string()),
@@ -460,7 +455,7 @@ impl SshPicker {
             .when_some(shortcut, |this, s| {
                 this.child(
                     div()
-                        .text_color(rgb(COLOR_TEXT_SHORTCUT))
+                        .text_color(theme.text_subtle)
                         .text_size(px(11.0))
                         .child(s.to_string()),
                 )
@@ -475,6 +470,7 @@ impl SshPicker {
         item_index: usize,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .id(id.into())
             .mx(px(8.0))
@@ -484,9 +480,15 @@ impl SshPicker {
             .items_center()
             .gap(px(10.0))
             .rounded(px(8.0))
-            .when(is_selected, |this| this.bg(rgb(COLOR_BG_SELECTED)))
+            .when(is_selected, |this| {
+                this.bg(theme.accent.opacity(if cx.theme().appearance.is_dark() {
+                    0.18
+                } else {
+                    0.10
+                }))
+            })
             .when(!is_selected, |this| {
-                this.hover(|s| s.bg(rgb(COLOR_BG_HOVER)))
+                this.hover(move |s| s.bg(theme.tab_hover_background))
             })
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -502,14 +504,14 @@ impl SshPicker {
                     .child(
                         svg()
                             .size(px(16.0))
-                            .text_color(rgb(COLOR_TEXT_PRIMARY))
+                            .text_color(theme.icon)
                             .path(icon.path()),
                     ),
             )
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(COLOR_TEXT_PRIMARY))
+                    .text_color(theme.text)
                     .text_size(px(14.0))
                     .child(name.into()),
             )
@@ -553,7 +555,8 @@ impl SshPicker {
         )
     }
 
-    fn render_key_hint(key: &str, label: &str) -> impl IntoElement {
+    fn render_key_hint(key: &str, label: &str, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .flex()
             .items_center()
@@ -562,15 +565,15 @@ impl SshPicker {
                 div()
                     .px(px(4.0))
                     .py(px(2.0))
-                    .bg(rgb(COLOR_BG_DEEP))
+                    .bg(theme.app_background)
                     .rounded(px(4.0))
-                    .text_color(rgb(COLOR_TEXT_PRIMARY))
+                    .text_color(theme.text)
                     .text_size(px(11.0))
                     .child(key.to_string()),
             )
             .child(
                 div()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .text_color(theme.text_muted)
                     .text_size(px(11.0))
                     .child(label.to_string()),
             )
@@ -588,11 +591,19 @@ impl Render for SshPicker {
         if !self.visible {
             return div().into_any_element();
         }
+        let theme = cx.theme().ui;
+        let overlay = theme
+            .overlay_background
+            .opacity(if cx.theme().appearance.is_dark() {
+                0.5
+            } else {
+                0.2
+            });
 
         div()
             .absolute()
             .inset_0()
-            .bg(gpui::rgba(0x00000080))
+            .bg(overlay)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _cx, cx| this.hide(cx)),
@@ -611,7 +622,9 @@ impl Render for SshPicker {
                             .w(px(PANEL_WIDTH))
                             .flex()
                             .flex_col()
-                            .bg(rgb(COLOR_BG_PANEL))
+                            .bg(theme.panel_background)
+                            .border_1()
+                            .border_color(theme.border)
                             .rounded(px(12.0))
                             .shadow_lg()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -620,11 +633,11 @@ impl Render for SshPicker {
                                 this.handle_input(event, window, cx);
                             }))
                             .track_focus(&self.focus_handle)
-                            .child(self.render_search())
-                            .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(COLOR_BG_SELECTED)))
+                            .child(self.render_search(cx))
+                            .child(div().h(px(1.0)).mx(px(12.0)).bg(theme.border))
                             // Local connect 区域
                             .when(!self.filtered_local_indices.is_empty(), |this| {
-                                this.child(Self::render_section_label("Local connect", None))
+                                this.child(Self::render_section_label("Local connect", None, cx))
                                     .child(div().pb(px(8.0)).children(
                                         self.filtered_local_indices.iter().enumerate().map(
                                             |(item_index, &option_index)| {
@@ -637,10 +650,10 @@ impl Render for SshPicker {
                                             },
                                         ),
                                     ))
-                                    .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(COLOR_BG_SELECTED)))
+                                    .child(div().h(px(1.0)).mx(px(12.0)).bg(theme.border))
                             })
                             // Host 区域
-                            .child(Self::render_section_label("Host", None))
+                            .child(Self::render_section_label("Host", None, cx))
                             .child(
                                 div()
                                     .pb(px(8.0))
@@ -659,21 +672,19 @@ impl Render for SshPicker {
                                 self.filtered_local_indices.is_empty()
                                     && self.filtered_indices.is_empty(),
                                 |this| {
-                                    this.child(
-                                        div().h(px(1.0)).mx(px(12.0)).bg(rgb(COLOR_BG_SELECTED)),
-                                    )
-                                    .child(
-                                        div().px(px(16.0)).py(px(12.0)).child(
-                                            div()
-                                                .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                                .text_size(px(13.0))
-                                                .child("No matching results"),
-                                        ),
-                                    )
+                                    this.child(div().h(px(1.0)).mx(px(12.0)).bg(theme.border))
+                                        .child(
+                                            div().px(px(16.0)).py(px(12.0)).child(
+                                                div()
+                                                    .text_color(theme.text_muted)
+                                                    .text_size(px(13.0))
+                                                    .child("No matching results"),
+                                            ),
+                                        )
                                 },
                             )
                             // 页脚
-                            .child(div().h(px(1.0)).mx(px(12.0)).bg(rgb(COLOR_BG_SELECTED)))
+                            .child(div().h(px(1.0)).mx(px(12.0)).bg(theme.border))
                             .child(
                                 div()
                                     .px(px(12.0))
@@ -686,10 +697,10 @@ impl Render for SshPicker {
                                             .flex()
                                             .items_center()
                                             .gap(px(12.0))
-                                            .child(Self::render_key_hint("↑↓", "Navigate"))
-                                            .child(Self::render_key_hint("⏎", "Open")),
+                                            .child(Self::render_key_hint("↑↓", "Navigate", cx))
+                                            .child(Self::render_key_hint("⏎", "Open", cx)),
                                     )
-                                    .child(Self::render_key_hint("Esc", "Close")),
+                                    .child(Self::render_key_hint("Esc", "Close", cx)),
                             ),
                     ),
             )

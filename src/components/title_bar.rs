@@ -13,6 +13,7 @@ use gpui::{
 };
 
 use crate::components::tab_bar::TabBar;
+use crate::theme::ActiveTheme;
 
 pub const TITLE_BAR_HEIGHT: Pixels = px(38.);
 
@@ -97,6 +98,7 @@ impl Render for TitleBar {
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
         let is_fullscreen = window.is_fullscreen();
+        let theme = cx.theme().ui;
 
         // 注意：TabBar 现在使用 ScrollHandle.max_offset() 自动检测溢出
         // 不需要从外部传入可用宽度
@@ -114,7 +116,7 @@ impl Render for TitleBar {
             })
             .when(is_macos && is_fullscreen, |this| this.pl_3())
             .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
-            .bg(gpui::rgb(0x0f0f1a))
+            .bg(theme.app_background)
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
                 this.child(
@@ -215,7 +217,7 @@ impl Render for TitleBar {
                                 .h_full()
                                 .justify_center()
                                 .items_center()
-                                .hover(|style| style.bg(gpui::rgb(0x3d3d5c)))
+                                .hover(move |style| style.bg(theme.title_bar_hover))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
@@ -225,7 +227,7 @@ impl Render for TitleBar {
                                 .child(
                                     gpui::svg()
                                         .size(px(16.))
-                                        .text_color(gpui::rgb(0x8888aa))
+                                        .text_color(theme.icon)
                                         .path(crate::assets::Icon::WindowMinimize.path()),
                                 ),
                         )
@@ -238,23 +240,20 @@ impl Render for TitleBar {
                                 .h_full()
                                 .justify_center()
                                 .items_center()
-                                .hover(|style| style.bg(gpui::rgb(0x3d3d5c)))
+                                .hover(move |style| style.bg(theme.title_bar_hover))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
                                 .on_click(cx.listener(|_, _, window, _| {
                                     window.zoom_window();
                                 }))
-                                .child(
-                                    gpui::svg()
-                                        .size(px(16.))
-                                        .text_color(gpui::rgb(0x8888aa))
-                                        .path(if window.is_maximized() {
-                                            crate::assets::Icon::WindowRestore.path()
-                                        } else {
-                                            crate::assets::Icon::WindowMaximize.path()
-                                        }),
-                                ),
+                                .child(gpui::svg().size(px(16.)).text_color(theme.icon).path(
+                                    if window.is_maximized() {
+                                        crate::assets::Icon::WindowRestore.path()
+                                    } else {
+                                        crate::assets::Icon::WindowMaximize.path()
+                                    },
+                                )),
                         )
                         // 关闭按钮
                         .child(
@@ -265,7 +264,7 @@ impl Render for TitleBar {
                                 .h_full()
                                 .justify_center()
                                 .items_center()
-                                .hover(|style| style.bg(gpui::rgb(0xe74c3c)))
+                                .hover(move |style| style.bg(theme.error))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
@@ -275,7 +274,7 @@ impl Render for TitleBar {
                                 .child(
                                     gpui::svg()
                                         .size(px(16.))
-                                        .text_color(gpui::rgb(0x8888aa))
+                                        .text_color(theme.icon)
                                         .path(crate::assets::Icon::WindowClose.path()),
                                 ),
                         ),

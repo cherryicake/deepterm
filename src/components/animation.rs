@@ -1,9 +1,8 @@
 use std::time::Duration;
 
+use crate::theme::ActiveTheme;
 use gpui::prelude::*;
-use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, px, rgb,
-};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, px};
 
 /// 动画配置
 #[derive(Clone, Debug)]
@@ -213,17 +212,18 @@ impl Focusable for DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_dragging {
             return div().into_any_element();
         }
+        let theme = cx.theme().ui;
 
         div()
             .id("drag-preview")
             .absolute()
             .w(px(200.0))
             .h(px(150.0))
-            .bg(rgb(0x6c5ce7))
+            .bg(theme.drop_target)
             .opacity(self.opacity)
             .rounded_md()
             .shadow_md()

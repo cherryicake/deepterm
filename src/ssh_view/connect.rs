@@ -6,28 +6,12 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Context, IntoElement, Render, Styled, Task, Window, div, px, rgb, svg};
+use gpui::{Context, IntoElement, Render, Styled, Task, Window, div, px, svg};
 
 use crate::assets::Icon;
 use crate::components::stepper::{Stepper, StepperItem};
 use crate::ssh::config::SshConnectionConfig;
-
-// 颜色常量 - 现代化协调配色方案
-// 背景色系 - 保持原有暗色主题
-const COLOR_BG: u32 = 0x0f0f1a;
-const COLOR_CARD_BG: u32 = 0x181825;
-const COLOR_BORDER: u32 = 0x313244;
-const COLOR_ICON_BG: u32 = 0x1a1a2e;
-
-// 文字色系 - 提高对比度
-const COLOR_TEXT_PRIMARY: u32 = 0xe4e4e7;
-const COLOR_TEXT_SECONDARY: u32 = 0xa1a1aa;
-const COLOR_TEXT_MUTED: u32 = 0x71717a;
-
-// 状态色系 - 协调的色调
-const COLOR_ACCENT: u32 = 0x60a5fa; // 柔和的蓝色
-const COLOR_SUCCESS: u32 = 0x4ade80; // 清新的绿色
-const COLOR_ERROR: u32 = 0xf87171; // 柔和的红色
+use crate::theme::ActiveTheme;
 
 /// 连接阶段总数
 const NUM_STAGES: usize = 3;
@@ -184,15 +168,16 @@ impl SshConnectView {
 }
 
 impl Render for SshConnectView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_failed = matches!(self.status, ConnectStatus::Failed { .. });
         let is_connected = matches!(self.status, ConnectStatus::Connected);
         let icon_color = if is_failed {
-            COLOR_ERROR
+            theme.error
         } else if is_connected {
-            COLOR_SUCCESS
+            theme.success
         } else {
-            COLOR_ACCENT
+            theme.accent
         };
 
         // 确定当前选中的步骤索引
@@ -206,7 +191,7 @@ impl Render for SshConnectView {
 
         div()
             .size_full()
-            .bg(rgb(COLOR_BG))
+            .bg(theme.panel_background)
             .flex()
             .items_start()
             .justify_center()
@@ -220,10 +205,10 @@ impl Render for SshConnectView {
                     .w(px(420.0))
                     .px(px(32.0))
                     .py(px(36.0))
-                    .bg(rgb(COLOR_CARD_BG))
+                    .bg(theme.elevated_background)
                     .rounded(px(12.0))
                     .border_1()
-                    .border_color(rgb(COLOR_BORDER))
+                    .border_color(theme.border)
                     .child(
                         // 图标
                         div()
@@ -233,13 +218,13 @@ impl Render for SshConnectView {
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .bg(rgb(COLOR_ICON_BG))
+                            .bg(theme.app_background)
                             .border_1()
-                            .border_color(rgb(COLOR_BORDER))
+                            .border_color(theme.border)
                             .child(
                                 svg()
                                     .size(px(28.0))
-                                    .text_color(rgb(icon_color))
+                                    .text_color(icon_color)
                                     .path(Icon::Server.path()),
                             ),
                     )
@@ -252,7 +237,7 @@ impl Render for SshConnectView {
                             .gap(px(6.0))
                             .child(
                                 div()
-                                    .text_color(rgb(COLOR_TEXT_PRIMARY))
+                                    .text_color(theme.text)
                                     .text_size(px(15.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .child(self.config.host_label()),
@@ -260,7 +245,7 @@ impl Render for SshConnectView {
                             .when_some(nickname, |this, n| {
                                 this.child(
                                     div()
-                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                        .text_color(theme.text_muted)
                                         .text_size(px(12.0))
                                         .child(n),
                                 )
@@ -283,19 +268,19 @@ impl Render for SshConnectView {
                                 StepperItem::new().child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(COLOR_TEXT_MUTED))
+                                        .text_color(theme.text_subtle)
                                         .child("SSH"),
                                 ),
                                 StepperItem::new().child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(COLOR_TEXT_MUTED))
+                                        .text_color(theme.text_subtle)
                                         .child("Auth"),
                                 ),
                                 StepperItem::new().child(
                                     div()
                                         .text_size(px(11.0))
-                                        .text_color(rgb(COLOR_TEXT_MUTED))
+                                        .text_color(theme.text_subtle)
                                         .child("Session"),
                                 ),
                             ]),
@@ -303,7 +288,7 @@ impl Render for SshConnectView {
                     .when(is_failed, |this| match &self.status {
                         ConnectStatus::Failed { message, .. } => this.child(
                             div()
-                                .text_color(rgb(COLOR_ERROR))
+                                .text_color(theme.error)
                                 .text_size(px(13.0))
                                 .child(format!("Failed: {}", message)),
                         ),

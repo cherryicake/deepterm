@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use gpui::{
     App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable, GlobalElementId,
     IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
-    Styled, Subscription, Window, div, px, rgb,
+    Styled, Subscription, Window, div, px,
 };
 use gpui::{KeyBinding, actions, prelude::*};
 
@@ -19,6 +19,7 @@ use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
+use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
@@ -1280,6 +1281,7 @@ impl Workspace {
         path: &[usize],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let theme = cx.theme().ui;
         match container {
             SplitContainer::Panel(panel) => div().size_full().child(panel.clone()),
             SplitContainer::Split {
@@ -1323,7 +1325,7 @@ impl Workspace {
                                 div()
                                     .when(is_horizontal, |this| this.w(px(1.0)).h(px(24.0)))
                                     .when(!is_horizontal, |this| this.h(px(1.0)).w(px(24.0)))
-                                    .bg(rgb(0x3d3d5c))
+                                    .bg(theme.border_strong)
                                     .rounded_sm(),
                             )
                             .on_mouse_down(
@@ -1371,6 +1373,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         // 只在广播开启时处理队列
         if self.get_current_broadcast_state() {
             self.process_broadcast_queue(cx);
@@ -1403,7 +1406,7 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x0f0f1a))
+            .bg(theme.app_background)
             .child(resize_handler)
             // 内容区域 - 只渲染当前活动tab对应的panel(s)
             .child(

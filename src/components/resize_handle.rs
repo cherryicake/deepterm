@@ -1,7 +1,8 @@
+use crate::theme::ActiveTheme;
 use gpui::prelude::*;
 use gpui::{
     App, Axis, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels, Render, Window, div,
-    px, rgb,
+    px,
 };
 
 /// 可调整大小的拖拽句柄
@@ -91,15 +92,16 @@ impl Focusable for ResizeHandle {
 
 impl Render for ResizeHandle {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let axis = self.axis;
         let is_dragging = self.is_dragging;
 
         div()
             .id("resize-handle")
             .bg(if is_dragging {
-                rgb(0x6c5ce7)
+                theme.drop_target
             } else {
-                rgb(0x2d2d44)
+                theme.border
             })
             .when(axis == Axis::Horizontal, |this| {
                 this.w(px(4.0)).h_full().cursor_col_resize()
@@ -107,7 +109,7 @@ impl Render for ResizeHandle {
             .when(axis == Axis::Vertical, |this| {
                 this.h(px(4.0)).w_full().cursor_row_resize()
             })
-            .hover(|style| style.bg(rgb(0x6c5ce7)))
+            .hover(move |style| style.bg(theme.drop_target))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(Self::handle_mouse_down),

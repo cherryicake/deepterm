@@ -74,30 +74,6 @@ impl Icon {
             Icon::Loader => SharedString::new_static("icons/loader.svg"),
         }
     }
-
-    /// Get the icon color based on icon type
-    pub fn color(&self) -> gpui::Rgba {
-        match self {
-            Icon::Linux => gpui::rgb(0xaaaaaa),
-            Icon::Server => gpui::rgb(0x8888aa),
-            Icon::Screen => gpui::rgb(0xaaaaaa),
-            Icon::Terminal => gpui::rgb(0xaaaaaa),
-            Icon::MagnifyingGlass => gpui::rgb(0x666688),
-            Icon::BroadcastInput => gpui::rgb(0x8888aa),
-            Icon::WindowClose => gpui::rgb(0x8888aa),
-            Icon::WindowMinimize => gpui::rgb(0x8888aa),
-            Icon::WindowMaximize => gpui::rgb(0x8888aa),
-            Icon::WindowRestore => gpui::rgb(0x8888aa),
-            Icon::SettingsHub => gpui::rgb(0x8888aa),
-            Icon::Plus => gpui::rgb(0x666688),
-            Icon::Host => gpui::rgb(0x8888aa),
-            Icon::KeyShield => gpui::rgb(0x8888aa),
-            Icon::ChevronDown => gpui::rgb(0x8888aa),
-            Icon::Eye => gpui::rgb(0x8888aa),
-            Icon::EyeOff => gpui::rgb(0x8888aa),
-            Icon::Loader => gpui::rgb(0x8888aa),
-        }
-    }
 }
 
 impl From<Icon> for SharedString {

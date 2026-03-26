@@ -1,13 +1,14 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Window, div, hsla, px, rgb, svg,
+    Window, div, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
+use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
 // Layout constants
@@ -100,13 +101,14 @@ pub enum HostIconColor {
 }
 
 impl HostIconColor {
-    pub fn to_hsla(&self) -> gpui::Hsla {
+    pub fn to_hsla(&self, cx: &App) -> gpui::Hsla {
+        let theme = cx.theme().ui;
         match self {
-            HostIconColor::Orange => hsla(25.0 / 360.0, 0.85, 0.55, 1.0),
-            HostIconColor::Blue => hsla(210.0 / 360.0, 0.80, 0.55, 1.0),
-            HostIconColor::Green => hsla(145.0 / 360.0, 0.70, 0.45, 1.0),
-            HostIconColor::Purple => hsla(270.0 / 360.0, 0.70, 0.60, 1.0),
-            HostIconColor::Red => hsla(0.0 / 360.0, 0.75, 0.55, 1.0),
+            HostIconColor::Orange => theme.warning,
+            HostIconColor::Blue => theme.accent,
+            HostIconColor::Green => theme.success,
+            HostIconColor::Purple => theme.accent_hover,
+            HostIconColor::Red => theme.error,
         }
     }
 }
@@ -265,7 +267,8 @@ impl HostsView {
     }
 
     /// Render the search bar
-    fn render_search_bar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .h(px(40.0))
@@ -280,16 +283,16 @@ impl HostsView {
                     .pl(px(12.0))
                     .pr(px(6.0))
                     .rounded(px(8.0))
-                    .bg(rgb(0x1a1a2e))
+                    .bg(theme.elevated_background)
                     .border_1()
-                    .border_color(rgb(0x2d2d44))
+                    .border_color(theme.border)
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x666688))
+                            .text_color(theme.text_subtle)
                             .child("Find a host or ssh user@hostname..."),
                     )
                     .child(
@@ -298,14 +301,14 @@ impl HostsView {
                             .px(px(10.0))
                             .py(px(2.0))
                             .rounded(px(4.0))
-                            .bg(rgb(0x252538))
+                            .bg(theme.tab_inactive_background)
                             .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x2d2d44)))
+                            .hover(move |style| style.bg(theme.tab_hover_background))
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(0x666688))
+                                    .text_color(theme.text_subtle)
                                     .child("CONNECT"),
                             ),
                     ),
@@ -313,15 +316,16 @@ impl HostsView {
     }
 
     /// Render dropdown arrow using ChevronDown icon
-    fn render_dropdown_arrow() -> impl IntoElement {
+    fn render_dropdown_arrow(cx: &App) -> impl IntoElement {
         svg()
             .size(px(8.0))
             .path(Icon::ChevronDown.path())
-            .text_color(rgb(0x8888aa))
+            .text_color(cx.theme().ui.icon)
     }
 
     /// Render action buttons (NEW HOST, TERMINAL, SERIAL)
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .h(px(20.0))
@@ -336,9 +340,9 @@ impl HostsView {
                     .flex()
                     .items_center()
                     .rounded(px(6.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(theme.tab_inactive_background)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                    .hover(move |style| style.bg(theme.tab_hover_background))
                     .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
                         if let Some(ref callback) = this.on_new_host_click {
                             callback(cx);
@@ -355,22 +359,22 @@ impl HostsView {
                                 svg()
                                     .size(px(10.0))
                                     .path(Icon::Plus.path())
-                                    .text_color(rgb(0x8888aa)),
+                                    .text_color(theme.icon),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(0xaaaaaa))
+                                    .text_color(theme.text)
                                     .child("NEW HOST"),
                             ),
                     )
-                    .child(div().w(px(1.0)).h(px(14.0)).bg(rgb(0x3d3d5c)))
+                    .child(div().w(px(1.0)).h(px(14.0)).bg(theme.border_strong))
                     .child(
                         div()
                             .px(px(6.0))
                             .py(px(4.0))
-                            .child(Self::render_dropdown_arrow()),
+                            .child(Self::render_dropdown_arrow(cx)),
                     ),
             )
             .child(
@@ -380,9 +384,9 @@ impl HostsView {
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(theme.tab_inactive_background)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                    .hover(move |style| style.bg(theme.tab_hover_background))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -397,13 +401,13 @@ impl HostsView {
                         svg()
                             .size(px(10.0))
                             .path(Icon::Terminal.path())
-                            .text_color(rgb(0x8888aa)),
+                            .text_color(theme.icon),
                     )
                     .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xaaaaaa))
+                            .text_color(theme.text)
                             .child("TERMINAL"),
                     ),
             )
@@ -413,9 +417,9 @@ impl HostsView {
                     .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(theme.tab_inactive_background)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x3d3d5c)))
+                    .hover(move |style| style.bg(theme.tab_hover_background))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -424,26 +428,32 @@ impl HostsView {
                             .w(px(10.0))
                             .h(px(10.0))
                             .rounded_sm()
-                            .bg(rgb(0x8888aa))
+                            .bg(theme.icon)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().w(px(6.0)).h(px(2.0)).bg(rgb(0x2d2d44))),
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(2.0))
+                                    .bg(theme.tab_inactive_background),
+                            ),
                     )
                     .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xaaaaaa))
+                            .text_color(theme.text)
                             .child("CONNECT HOSTS"),
                     )
-                    .child(Self::render_dropdown_arrow()),
+                    .child(Self::render_dropdown_arrow(cx)),
             )
     }
 
     /// Render a group card
-    fn render_group_card(&self, group: &HostGroup) -> impl IntoElement {
-        let icon_color = group.icon_color.to_hsla();
+    fn render_group_card(&self, group: &HostGroup, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let icon_color = group.icon_color.to_hsla(cx);
 
         div()
             .id(format!("group-{}", group.id))
@@ -454,11 +464,11 @@ impl HostsView {
             .items_center()
             .gap(px(12.0))
             .rounded(px(10.0))
-            .bg(rgb(0x1a1a2e))
+            .bg(theme.elevated_background)
             .border_1()
-            .border_color(rgb(0x2d2d44))
+            .border_color(theme.border)
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x252538)))
+            .hover(move |style| style.bg(theme.tab_hover_background))
             .child(
                 // Group icon
                 div()
@@ -473,7 +483,7 @@ impl HostsView {
                         svg()
                             .size(px(20.0))
                             .path(Icon::Server.path())
-                            .text_color(rgb(0xffffff)),
+                            .text_color(theme.accent_foreground),
                     ),
             )
             .child(
@@ -486,13 +496,13 @@ impl HostsView {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xcccccc))
+                            .text_color(theme.text)
                             .child(group.name.to_string()),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x666688))
+                            .text_color(theme.text_subtle)
                             .child(format!("{} Hosts", group.host_count)),
                     ),
             )
@@ -537,18 +547,23 @@ impl HostsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let icon_color = host.icon_color.to_hsla();
+        let theme = cx.theme().ui;
+        let icon_color = host.icon_color.to_hsla(cx);
         let host_id = host.id.clone();
         let is_selected = self.selected_host_id.as_ref() == Some(&host_id);
         let bg_color = if is_selected {
-            rgb(0x2a2a4a)
+            theme.accent.opacity(if cx.theme().appearance.is_dark() {
+                0.18
+            } else {
+                0.10
+            })
         } else {
-            rgb(0x1a1a2e)
+            theme.elevated_background
         };
         let border_color = if is_selected {
-            rgb(0x4d4d6a)
+            theme.accent
         } else {
-            rgb(0x2d2d44)
+            theme.border
         };
 
         div()
@@ -568,7 +583,7 @@ impl HostsView {
                 if is_selected {
                     style
                 } else {
-                    style.bg(rgb(0x252538))
+                    style.bg(theme.tab_hover_background)
                 }
             })
             .on_click(cx.listener({
@@ -603,7 +618,7 @@ impl HostsView {
                         svg()
                             .size(px(22.0))
                             .path(Icon::Linux.path())
-                            .text_color(rgb(0xffffff)),
+                            .text_color(theme.accent_foreground),
                     ),
             )
             .child(
@@ -618,21 +633,22 @@ impl HostsView {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xcccccc))
+                            .text_color(theme.text)
                             .truncate()
                             .child(host.name.to_string()),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x666688))
+                            .text_color(theme.text_subtle)
                             .child(host.subtitle()),
                     ),
             )
     }
 
     /// Render the Groups section
-    fn render_groups_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_groups_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -644,7 +660,7 @@ impl HostsView {
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x8888aa))
+                    .text_color(theme.text_muted)
                     .child("Groups"),
             )
             .child(
@@ -657,7 +673,7 @@ impl HostsView {
                     .children(
                         self.groups
                             .iter()
-                            .map(|group| self.render_group_card(group).into_any_element()),
+                            .map(|group| self.render_group_card(group, cx).into_any_element()),
                     ),
             )
     }
@@ -686,6 +702,7 @@ impl HostsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -697,7 +714,7 @@ impl HostsView {
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x8888aa))
+                    .text_color(theme.text_muted)
                     .child("Hosts"),
             )
             .child(self.render_hosts_grid(window, cx))
@@ -742,6 +759,7 @@ impl Focusable for HostsView {
 
 impl Render for HostsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         // Header height: search bar (40) + spacer (20) + action buttons (20) = 80px
         const HEADER_HEIGHT: f32 = 80.0;
         // Persistent gap between action buttons bottom and scroll content
@@ -754,7 +772,7 @@ impl Render for HostsView {
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
-            .bg(rgb(0x0f0f1a))
+            .bg(theme.panel_background)
             // Scrollable content (rendered first = lower z-order)
             // Fills the entire parent; top-padding reserves space for the fixed header
             .child(
@@ -784,7 +802,7 @@ impl Render for HostsView {
                     .h(px(TOTAL_HEADER_HEIGHT))
                     .flex()
                     .flex_col()
-                    .bg(rgb(0x0f0f1a))
+                    .bg(theme.panel_background)
                     // Search bar
                     .child(self.render_search_bar(cx))
                     // Spacer between search bar and action buttons

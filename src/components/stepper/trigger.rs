@@ -7,6 +7,7 @@ use gpui::{
 use crate::components::spinner::Spinner;
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
+use crate::theme::ActiveTheme;
 
 /// The trigger part of a stepper item.
 #[derive(IntoElement)]
@@ -103,7 +104,8 @@ impl ParentElement for StepperTrigger {
 }
 
 impl RenderOnce for StepperTrigger {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_checked = self.step <= self.checked_step;
         let is_current = self.step == self.checked_step;
         let is_completed = self.step < self.checked_step;
@@ -142,9 +144,7 @@ impl RenderOnce for StepperTrigger {
                                 .items_center()
                                 .justify_center()
                                 .child(
-                                    Spinner::new()
-                                        .size(size.spinner_size())
-                                        .color(gpui::rgb(0x93c5fd).into()),
+                                    Spinner::new().size(size.spinner_size()).color(theme.accent),
                                 ),
                         )
                     })
@@ -157,20 +157,20 @@ impl RenderOnce for StepperTrigger {
                             .rounded_full()
                             .items_center()
                             .justify_center()
-                            .bg(gpui::rgb(0x3f3f46))
+                            .bg(theme.border)
                             .when(!disabled && !is_checked, |this| {
-                                this.hover(|this| this.bg(gpui::rgb(0x52525b)))
-                                    .active(|this| this.bg(gpui::rgb(0x27272a)))
+                                this.hover(|this| this.bg(theme.border_strong))
+                                    .active(|this| this.bg(theme.app_background))
                             })
-                            .text_color(gpui::rgb(0xa1a1aa))
+                            .text_color(theme.text_muted)
                             .when(is_completed, |this| {
-                                this.bg(gpui::rgb(0x22c55e)).text_color(gpui::rgb(0xffffff))
+                                this.bg(theme.success).text_color(theme.success_foreground)
                             })
                             .when(is_current && self.status == StepperStatus::Failed, |this| {
-                                this.bg(gpui::rgb(0xf87171)).text_color(gpui::rgb(0xffffff))
+                                this.bg(theme.error).text_color(theme.error_foreground)
                             })
                             .when(is_current && self.status != StepperStatus::Failed, |this| {
-                                this.bg(gpui::rgb(0x3b82f6)).text_color(gpui::rgb(0xffffff))
+                                this.bg(theme.accent).text_color(theme.accent_foreground)
                             })
                             .child(div().child(format!("{}", self.step + 1))),
                     ),

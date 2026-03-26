@@ -2,13 +2,14 @@
 //!
 //! 参考 Zed GPUI 的 input 示例实现，支持光标定位和选择。
 use crate::assets::Icon;
+use crate::theme::ActiveTheme;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render,
     ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Style, TextAlign, TextRun,
-    UTF16Selection, Window, actions, div, fill, point, px, rgb, rgba, size, svg,
+    UTF16Selection, Window, actions, div, fill, point, px, size, svg,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -67,9 +68,6 @@ const CURSOR_WIDTH: Pixels = px(2.);
 
 /// 光标可见性判断的容差
 const CURSOR_VISIBILITY_PADDING: Pixels = px(2.);
-
-/// Placeholder 文字颜色
-const PLACEHOLDER_COLOR: u32 = 0x3a3a55;
 
 /// 文本输入组件
 pub struct Input {
@@ -872,6 +870,7 @@ impl Element for InputTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let theme = cx.theme().ui;
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -898,7 +897,7 @@ impl Element for InputTextElement {
             let placeholder_run = TextRun {
                 len: placeholder.len(),
                 font: style.font(),
-                color: rgb(PLACEHOLDER_COLOR).into(),
+                color: theme.text_subtle,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -917,7 +916,7 @@ impl Element for InputTextElement {
                     let test_run = TextRun {
                         len: test_text.len(),
                         font: style.font(),
-                        color: rgb(PLACEHOLDER_COLOR).into(),
+                        color: theme.text_subtle,
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -951,9 +950,9 @@ impl Element for InputTextElement {
         };
 
         let text_color = if is_empty {
-            rgb(PLACEHOLDER_COLOR).into()
+            theme.text_subtle
         } else {
-            rgb(0xcccccc).into()
+            theme.text
         };
 
         let run = TextRun {
@@ -1026,7 +1025,7 @@ impl Element for InputTextElement {
                     point(bounds.left() + scroll_offset.x + cursor_x, cursor_y),
                     size(CURSOR_WIDTH, cursor_height),
                 ),
-                rgb(0x3b82f6),
+                theme.accent,
             );
             (Some(quad), scroll_offset)
         } else {
@@ -1051,7 +1050,11 @@ impl Element for InputTextElement {
                         bounds.bottom(),
                     ),
                 ),
-                rgba(0x3b82f640),
+                theme.accent.opacity(if cx.theme().appearance.is_dark() {
+                    0.24
+                } else {
+                    0.18
+                }),
             ))
         } else {
             None
@@ -1144,6 +1147,7 @@ impl Focusable for Input {
 
 impl Render for Input {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_focused = self.focus_handle.is_focused(_window);
 
         if is_focused && !self.was_focused {
@@ -1186,11 +1190,11 @@ impl Render for Input {
                             .rounded(px(6.0))
                             .border_1()
                             .border_color(if is_focused {
-                                rgb(0x4a4a6a)
+                                theme.border_strong
                             } else {
-                                rgb(0x2d2d44)
+                                theme.border
                             })
-                            .bg(rgb(0x13131f))
+                            .bg(theme.app_background)
                     })
                     .when(self.transparent, |this| this.h_full())
                     .flex()
@@ -1214,7 +1218,7 @@ impl Render for Input {
                                         } else {
                                             Icon::EyeOff.path()
                                         })
-                                        .text_color(rgb(0x8888aa)),
+                                        .text_color(theme.icon),
                                 )
                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                     input1.update(cx, |state, cx| {
@@ -1229,66 +1233,5 @@ impl Render for Input {
                         )
                     }),
             )
-    }
-}
-
-/// 带标签的输入框组件
-pub struct LabeledInput {
-    input: Entity<Input>,
-    label: Option<SharedString>,
-}
-
-impl LabeledInput {
-    pub fn new(cx: &mut App) -> Self {
-        let input = cx.new(|cx| Input::new(cx));
-        Self { input, label: None }
-    }
-
-    pub fn label(mut self, text: impl Into<SharedString>) -> Self {
-        self.label = Some(text.into());
-        self
-    }
-
-    pub fn entity(self) -> Entity<Input> {
-        self.input
-    }
-}
-
-impl IntoElement for LabeledInput {
-    type Element = gpui::AnyElement;
-    fn into_element(self) -> Self::Element {
-        use gpui::ParentElement;
-
-        let Self { input, label } = self;
-
-        let mut container = div().w_full().flex().flex_col().gap(px(4.0));
-
-        if let Some(label_text) = label {
-            container = container.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8888aa))
-                    .child(label_text.to_string()),
-            );
-        }
-
-        container.child(input).into_any_element()
-    }
-}
-
-/// 简化的文本输入构造器
-pub struct TextInput;
-
-impl TextInput {
-    pub fn new(cx: &mut App) -> Entity<Input> {
-        cx.new(|cx| Input::new(cx))
-    }
-
-    pub fn with_placeholder(cx: &mut App, text: impl Into<SharedString>) -> Entity<Input> {
-        cx.new(|cx| Input::new(cx).placeholder(text))
-    }
-
-    pub fn with_value(cx: &mut App, text: impl Into<SharedString>) -> Entity<Input> {
-        cx.new(|cx| Input::new(cx).value(text))
     }
 }

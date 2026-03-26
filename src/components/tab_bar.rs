@@ -5,10 +5,11 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
     IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, Window, canvas, div,
-    ease_out_quint, px, rgb,
+    ease_out_quint, px,
 };
 
 use crate::assets::Icon;
+use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
 use gpui::svg;
 
@@ -67,9 +68,10 @@ pub struct DragPreview {
 }
 
 impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview_width = px(152.0);
         let preview_height = px(30.0);
+        let theme = cx.theme().ui;
 
         div()
             // 将预览中心对齐到鼠标位置
@@ -83,15 +85,15 @@ impl Render for DragPreview {
                     .flex()
                     .items_center()
                     .rounded(px(7.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(theme.elevated_background)
                     .border_1()
-                    .border_color(rgb(0x4a4a68))
+                    .border_color(theme.border_strong)
                     .opacity(0.96)
                     .shadow_md()
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0xffffff))
+                            .text_color(theme.text)
                             .child(self.tab_label.clone()),
                     ),
             )
@@ -684,6 +686,7 @@ impl Focusable for TabBar {
 
 impl Render for TabBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let on_tab_click = self.on_tab_click.clone();
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
@@ -712,6 +715,7 @@ impl Render for TabBar {
             .w_full()
             .flex()
             .items_center()
+            .bg(theme.tab_bar_background)
             .overflow_hidden()
             .pt_1()
             .pb(px(2.))
@@ -773,15 +777,21 @@ impl Render for TabBar {
                             .justify_center()
                             .gap(px(6.0))
                             .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if is_settingshub_active {
+                                theme.border_strong
+                            } else {
+                                theme.border.opacity(0.0)
+                            })
                             .cursor_pointer()
                             .bg(if is_settingshub_active {
-                                rgb(0x2d2d44)
+                                theme.tab_active_background
                             } else {
-                                rgb(0x1e1e2e)
+                                theme.tab_inactive_background
                             })
-                            .hover(|style| {
+                            .hover(move |style| {
                                 if !is_settingshub_active {
-                                    style.bg(rgb(0x252538))
+                                    style.bg(theme.tab_hover_background)
                                 } else {
                                     style
                                 }
@@ -790,19 +800,24 @@ impl Render for TabBar {
                                 svg()
                                     .size(px(14.0))
                                     .text_color(if is_settingshub_active {
-                                        rgb(0xffffff)
+                                        theme.text
                                     } else {
-                                        rgb(0x8888aa)
+                                        theme.icon
                                     })
                                     .path(Icon::SettingsHub.path()),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(if is_settingshub_active {
-                                        rgb(0xffffff)
+                                    .font_weight(if is_settingshub_active {
+                                        gpui::FontWeight::SEMIBOLD
                                     } else {
-                                        rgb(0x8888aa)
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if is_settingshub_active {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
                                     })
                                     .child("HostsHub"),
                             )
@@ -816,7 +831,7 @@ impl Render for TabBar {
                             }),
                     )
                     // 分割线 - 在 SettingsHub 和 Tab 列表之间
-                    .child(div().h(px(20.0)).w(px(1.0)).bg(rgb(0x2a2a3c)).mx(px(4.0)))
+                    .child(div().h(px(20.0)).w(px(1.0)).bg(theme.border).mx(px(4.0)))
                     // 标签列表容器（包含所有标签和新建按钮）
                     .child(
                         div()
@@ -940,14 +955,20 @@ impl Render for TabBar {
                                             .items_center()
                                             .gap(px(6.0))
                                             .rounded(px(6.0))
-                                            .bg(if is_active {
-                                                rgb(0x2d2d44)
+                                            .border_1()
+                                            .border_color(if is_active {
+                                                theme.border_strong
                                             } else {
-                                                rgb(0x1e1e2e)
+                                                theme.border.opacity(0.0)
                                             })
-                                            .hover(|style| {
+                                            .bg(if is_active {
+                                                theme.tab_active_background
+                                            } else {
+                                                theme.tab_inactive_background
+                                            })
+                                            .hover(move |style| {
                                                 if !is_active {
-                                                    style.bg(rgb(0x252538))
+                                                    style.bg(theme.tab_hover_background)
                                                 } else {
                                                     style
                                                 }
@@ -1051,10 +1072,15 @@ impl Render for TabBar {
                                             .child(
                                                 div()
                                                     .text_sm()
-                                                    .text_color(if is_active {
-                                                        rgb(0xffffff)
+                                                    .font_weight(if is_active {
+                                                        gpui::FontWeight::SEMIBOLD
                                                     } else {
-                                                        rgb(0x8888aa)
+                                                        gpui::FontWeight::NORMAL
+                                                    })
+                                                    .text_color(if is_active {
+                                                        theme.text
+                                                    } else {
+                                                        theme.text_muted
                                                     })
                                                     .child(label),
                                             )
@@ -1066,9 +1092,11 @@ impl Render for TabBar {
                                                     .items_center()
                                                     .justify_center()
                                                     .rounded_full()
-                                                    .hover(|style| style.bg(rgb(0x2d2d44)))
+                                                    .hover(move |style| {
+                                                        style.bg(theme.tab_hover_background)
+                                                    })
                                                     .cursor_pointer()
-                                                    .text_color(rgb(0x666688))
+                                                    .text_color(theme.icon_muted)
                                                     .text_xs()
                                                     .child(if is_modified { "●" } else { "×" })
                                                     .on_mouse_down(
@@ -1130,12 +1158,12 @@ impl Render for TabBar {
                             .justify_center()
                             .rounded(px(6.0))
                             .cursor_pointer()
-                            .bg(rgb(0x1e1e2e))
-                            .hover(|style| style.bg(rgb(0x2d2d44)))
+                            .bg(theme.tab_inactive_background)
+                            .hover(move |style| style.bg(theme.tab_hover_background))
                             .child(
                                 svg()
                                     .size(px(14.0))
-                                    .text_color(rgb(0x666688))
+                                    .text_color(theme.icon_muted)
                                     .path(Icon::Plus.path()),
                             )
                             .on_mouse_down(

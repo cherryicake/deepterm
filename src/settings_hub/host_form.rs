@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
-    px, rgb, svg,
+    px, svg,
 };
 
 use crate::assets::Icon;
@@ -11,6 +11,7 @@ use crate::components::input::Input;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
+use crate::theme::ActiveTheme;
 
 /// 认证方式类型
 #[derive(Clone, Debug, PartialEq)]
@@ -462,7 +463,13 @@ impl HostForm {
         }
     }
 
-    fn render_labeled_input(&self, label: &str, input: &Entity<Input>) -> impl IntoElement {
+    fn render_labeled_input(
+        &self,
+        label: &str,
+        input: &Entity<Input>,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -471,13 +478,14 @@ impl HostForm {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x8888aa))
+                    .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
             .child(input.clone())
     }
 
     fn render_auth_type_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let current_auth = self.auth_type.clone();
         let show_dropdown = self.show_auth_dropdown;
 
@@ -489,7 +497,7 @@ impl HostForm {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x8888aa))
+                    .text_color(theme.text_muted)
                     .child("Authentication"),
             )
             .child(
@@ -508,8 +516,8 @@ impl HostForm {
                             .justify_between()
                             .rounded(px(6.0))
                             .border_1()
-                            .border_color(rgb(0x2d2d44))
-                            .bg(rgb(0x13131f))
+                            .border_color(theme.border)
+                            .bg(theme.app_background)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -521,14 +529,14 @@ impl HostForm {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(rgb(0xcccccc))
+                                    .text_color(theme.text)
                                     .child(current_auth.display_name()),
                             )
                             .child(
                                 svg()
                                     .size(px(12.0))
                                     .path(Icon::ChevronDown.path())
-                                    .text_color(rgb(0x8888aa)),
+                                    .text_color(theme.icon),
                             ),
                     )
                     .when(show_dropdown, |this| {
@@ -539,8 +547,8 @@ impl HostForm {
                                 .flex_col()
                                 .rounded(px(6.0))
                                 .border_1()
-                                .border_color(rgb(0x2d2d44))
-                                .bg(rgb(0x1a1a2e))
+                                .border_color(theme.border)
+                                .bg(theme.elevated_background)
                                 .children(AuthType::all().into_iter().map(|auth| {
                                     let is_selected = auth == current_auth;
                                     let auth_clone = auth.clone();
@@ -551,8 +559,18 @@ impl HostForm {
                                         .flex()
                                         .items_center()
                                         .cursor_pointer()
-                                        .when(is_selected, |d| d.bg(rgb(0x252538)))
-                                        .when(!is_selected, |d| d.hover(|s| s.bg(rgb(0x252538))))
+                                        .when(is_selected, |d| {
+                                            d.bg(theme.accent.opacity(
+                                                if cx.theme().appearance.is_dark() {
+                                                    0.18
+                                                } else {
+                                                    0.10
+                                                },
+                                            ))
+                                        })
+                                        .when(!is_selected, |d| {
+                                            d.hover(|s| s.bg(theme.tab_hover_background))
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -563,9 +581,9 @@ impl HostForm {
                                             div()
                                                 .text_sm()
                                                 .text_color(if is_selected {
-                                                    rgb(0xffffff)
+                                                    theme.text
                                                 } else {
-                                                    rgb(0xcccccc)
+                                                    theme.text_muted
                                                 })
                                                 .child(auth.display_name()),
                                         )
@@ -577,6 +595,7 @@ impl HostForm {
     }
 
     fn render_keychain_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let items = self.available_items();
         let selected_label = self
             .selected_item()
@@ -598,7 +617,7 @@ impl HostForm {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .child(div().text_xs().text_color(rgb(0x8888aa)).child(title))
+            .child(div().text_xs().text_color(theme.text_muted).child(title))
             .child(
                 div()
                     .w_full()
@@ -615,8 +634,8 @@ impl HostForm {
                             .justify_between()
                             .rounded(px(6.0))
                             .border_1()
-                            .border_color(rgb(0x2d2d44))
-                            .bg(rgb(0x13131f))
+                            .border_color(theme.border)
+                            .bg(theme.app_background)
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -625,17 +644,12 @@ impl HostForm {
                                     cx.notify();
                                 }),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xcccccc))
-                                    .child(selected_label),
-                            )
+                            .child(div().text_sm().text_color(theme.text).child(selected_label))
                             .child(
                                 svg()
                                     .size(px(12.0))
                                     .path(Icon::ChevronDown.path())
-                                    .text_color(rgb(0x8888aa)),
+                                    .text_color(theme.icon),
                             ),
                     )
                     .when(self.show_credential_dropdown, |this| {
@@ -646,8 +660,8 @@ impl HostForm {
                                 .flex_col()
                                 .rounded(px(6.0))
                                 .border_1()
-                                .border_color(rgb(0x2d2d44))
-                                .bg(rgb(0x1a1a2e))
+                                .border_color(theme.border)
+                                .bg(theme.elevated_background)
                                 .child(
                                     div()
                                         .w_full()
@@ -657,10 +671,16 @@ impl HostForm {
                                         .items_center()
                                         .cursor_pointer()
                                         .when(self.selected_keychain_id.is_none(), |d| {
-                                            d.bg(rgb(0x252538))
+                                            d.bg(theme.accent.opacity(
+                                                if cx.theme().appearance.is_dark() {
+                                                    0.18
+                                                } else {
+                                                    0.10
+                                                },
+                                            ))
                                         })
                                         .when(self.selected_keychain_id.is_some(), |d| {
-                                            d.hover(|s| s.bg(rgb(0x252538)))
+                                            d.hover(|s| s.bg(theme.tab_hover_background))
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -671,7 +691,7 @@ impl HostForm {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .text_color(rgb(0xcccccc))
+                                                .text_color(theme.text)
                                                 .child("Create new"),
                                         ),
                                 )
@@ -687,8 +707,18 @@ impl HostForm {
                                         .flex_col()
                                         .gap(px(2.0))
                                         .cursor_pointer()
-                                        .when(is_selected, |d| d.bg(rgb(0x252538)))
-                                        .when(!is_selected, |d| d.hover(|s| s.bg(rgb(0x252538))))
+                                        .when(is_selected, |d| {
+                                            d.bg(theme.accent.opacity(
+                                                if cx.theme().appearance.is_dark() {
+                                                    0.18
+                                                } else {
+                                                    0.10
+                                                },
+                                            ))
+                                        })
+                                        .when(!is_selected, |d| {
+                                            d.hover(|s| s.bg(theme.tab_hover_background))
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -701,13 +731,13 @@ impl HostForm {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .text_color(rgb(0xffffff))
+                                                .text_color(theme.text)
                                                 .child(item.label.clone()),
                                         )
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(rgb(0x7f86a3))
+                                                .text_color(theme.text_subtle)
                                                 .child(item.subtitle()),
                                         )
                                         .into_any_element()
@@ -717,58 +747,61 @@ impl HostForm {
             )
     }
 
-    fn render_new_identity_fields(&self) -> impl IntoElement {
+    fn render_new_identity_fields(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(self.render_labeled_input("Identity Label", &self.credential_label_input))
-            .child(self.render_labeled_input("Password", &self.password_input))
+            .child(self.render_labeled_input("Identity Label", &self.credential_label_input, cx))
+            .child(self.render_labeled_input("Password", &self.password_input, cx))
             .child(
                 div()
                     .px(px(10.0))
                     .py(px(8.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x171726))
+                    .bg(theme.elevated_background)
                     .border_1()
-                    .border_color(rgb(0x2b2d40))
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x7f86a3))
+                            .text_color(theme.text_subtle)
                             .child("Password is stored in the system keychain and only the reference is written into ssh.json."),
                     ),
             )
     }
 
-    fn render_new_key_fields(&self) -> impl IntoElement {
+    fn render_new_key_fields(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(self.render_labeled_input("Key Label", &self.credential_label_input))
-            .child(self.render_labeled_input("Private Key Path", &self.key_path_input))
-            .child(self.render_labeled_input("Passphrase (optional)", &self.key_passphrase_input))
+            .child(self.render_labeled_input("Key Label", &self.credential_label_input, cx))
+            .child(self.render_labeled_input("Private Key Path", &self.key_path_input, cx))
+            .child(self.render_labeled_input("Passphrase (optional)", &self.key_passphrase_input, cx))
             .child(
                 div()
                     .px(px(10.0))
                     .py(px(8.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x171726))
+                    .bg(theme.elevated_background)
                     .border_1()
-                    .border_color(rgb(0x2b2d40))
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x7f86a3))
+                            .text_color(theme.text_subtle)
                             .child("DeepTerm stores the key metadata here and keeps the optional passphrase in the system keychain."),
                     ),
             )
     }
 
-    fn render_selected_item_hint(&self) -> impl IntoElement {
+    fn render_selected_item_hint(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let subtitle = self
             .selected_item()
             .map(|item| item.subtitle())
@@ -779,9 +812,9 @@ impl HostForm {
             .px(px(10.0))
             .py(px(10.0))
             .rounded(px(6.0))
-            .bg(rgb(0x171726))
+            .bg(theme.elevated_background)
             .border_1()
-            .border_color(rgb(0x2b2d40))
+            .border_color(theme.border)
             .child(
                 div()
                     .flex()
@@ -790,14 +823,20 @@ impl HostForm {
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0xe2e5f4))
+                            .text_color(theme.text)
                             .child("Using existing keychain item"),
                     )
-                    .child(div().text_xs().text_color(rgb(0x7f86a3)).child(subtitle)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_subtle)
+                            .child(subtitle),
+                    ),
             )
     }
 
     fn render_auth_extra_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         match self.auth_type {
             AuthType::Password => div()
                 .w_full()
@@ -806,10 +845,10 @@ impl HostForm {
                 .gap(px(12.0))
                 .child(self.render_keychain_selector(cx))
                 .when(self.selected_keychain_id.is_some(), |this| {
-                    this.child(self.render_selected_item_hint())
+                    this.child(self.render_selected_item_hint(cx))
                 })
                 .when(self.selected_keychain_id.is_none(), |this| {
-                    this.child(self.render_new_identity_fields())
+                    this.child(self.render_new_identity_fields(cx))
                 })
                 .into_any_element(),
             AuthType::PrivateKey => div()
@@ -819,10 +858,10 @@ impl HostForm {
                 .gap(px(12.0))
                 .child(self.render_keychain_selector(cx))
                 .when(self.selected_keychain_id.is_some(), |this| {
-                    this.child(self.render_selected_item_hint())
+                    this.child(self.render_selected_item_hint(cx))
                 })
                 .when(self.selected_keychain_id.is_none(), |this| {
-                    this.child(self.render_new_key_fields())
+                    this.child(self.render_new_key_fields(cx))
                 })
                 .into_any_element(),
             AuthType::Agent => div()
@@ -831,14 +870,15 @@ impl HostForm {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x666688))
+                        .text_color(theme.text_subtle)
                         .child("Uses SSH agent for authentication."),
                 )
                 .into_any_element(),
         }
     }
 
-    fn render_header(&self) -> impl IntoElement {
+    fn render_header(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme().ui;
         let is_editing = self.editing_config_id.is_some();
         let (title, subtitle) = if is_editing {
             ("Edit Host", "Modify SSH host configuration")
@@ -850,18 +890,19 @@ impl HostForm {
             .w_full()
             .pb(px(16.0))
             .border_b_1()
-            .border_color(rgb(0x2d2d44))
+            .border_color(theme.border)
             .child(
                 div()
                     .text_base()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xffffff))
+                    .text_color(theme.text)
                     .child(title),
             )
-            .child(div().text_xs().text_color(rgb(0x8888aa)).child(subtitle))
+            .child(div().text_xs().text_color(theme.text_muted).child(subtitle))
     }
 
-    fn render_message(&self) -> Option<impl IntoElement> {
+    fn render_message(&self, cx: &App) -> Option<impl IntoElement> {
+        let theme = cx.theme().ui;
         if let Some(ref error) = self.error_message {
             Some(
                 div()
@@ -869,13 +910,13 @@ impl HostForm {
                     .px(px(12.0))
                     .py(px(8.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x3d1f1f))
+                    .bg(theme.error_background)
                     .border_1()
-                    .border_color(rgb(0x5d2f2f))
+                    .border_color(theme.error)
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0xff6666))
+                            .text_color(theme.error_foreground)
                             .child(error.clone()),
                     )
                     .into_any_element(),
@@ -887,13 +928,13 @@ impl HostForm {
                     .px(px(12.0))
                     .py(px(8.0))
                     .rounded(px(6.0))
-                    .bg(rgb(0x1f3d1f))
+                    .bg(theme.success_background)
                     .border_1()
-                    .border_color(rgb(0x2f5d2f))
+                    .border_color(theme.success)
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x66ff66))
+                            .text_color(theme.success_foreground)
                             .child(success.clone()),
                     )
                     .into_any_element(),
@@ -904,6 +945,7 @@ impl HostForm {
     }
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -918,9 +960,9 @@ impl HostForm {
                     .items_center()
                     .justify_center()
                     .rounded(px(6.0))
-                    .bg(rgb(0x2d2d44))
+                    .bg(theme.elevated_background)
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3d3d5c)))
+                    .hover(move |s| s.bg(theme.tab_hover_background))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -931,7 +973,7 @@ impl HostForm {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xcccccc))
+                            .text_color(theme.text)
                             .child("Cancel"),
                     ),
             )
@@ -943,9 +985,9 @@ impl HostForm {
                     .items_center()
                     .justify_center()
                     .rounded(px(6.0))
-                    .bg(rgb(0x3d5c3d))
+                    .bg(theme.success)
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x4a6a4a)))
+                    .hover(move |s| s.bg(theme.success.opacity(0.85)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
@@ -956,7 +998,7 @@ impl HostForm {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xffffff))
+                            .text_color(theme.success_foreground)
                             .child("Save"),
                     ),
             )
@@ -980,30 +1022,36 @@ impl Render for HostForm {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(self.render_header())
-            .children(self.render_message().into_iter())
+            .child(self.render_header(cx))
+            .children(self.render_message(cx).into_iter())
             .child(
                 div()
                     .w_full()
                     .flex()
                     .flex_col()
                     .gap(px(12.0))
-                    .child(self.render_labeled_input("Nickname (optional)", &self.nickname_input))
-                    .child(self.render_labeled_input("Host Address *", &self.hostname_input))
+                    .child(self.render_labeled_input(
+                        "Nickname (optional)",
+                        &self.nickname_input,
+                        cx,
+                    ))
+                    .child(self.render_labeled_input("Host Address *", &self.hostname_input, cx))
                     .child(
                         div()
                             .w_full()
                             .flex()
                             .flex_row()
                             .gap(px(12.0))
-                            .child(
-                                div()
-                                    .w(px(80.0))
-                                    .child(self.render_labeled_input("Port", &self.port_input)),
-                            )
-                            .child(div().flex_1().child(
-                                self.render_labeled_input("Username *", &self.username_input),
-                            )),
+                            .child(div().w(px(80.0)).child(self.render_labeled_input(
+                                "Port",
+                                &self.port_input,
+                                cx,
+                            )))
+                            .child(div().flex_1().child(self.render_labeled_input(
+                                "Username *",
+                                &self.username_input,
+                                cx,
+                            ))),
                     )
                     .child(self.render_auth_type_selector(cx))
                     .child(self.render_auth_extra_field(cx)),
