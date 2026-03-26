@@ -16,7 +16,10 @@ use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect, client};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+use crate::ssh::config::SshConnectionConfig;
+use crate::ssh::keychain::{
+    ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
+};
 use crate::terminal::terminal::ZedListener;
 
 /// 发送到 SSH 通道的消息
@@ -281,8 +284,10 @@ impl RusshTerminal {
         handle: &mut client::Handle<SshClientHandler>,
         config: &SshConnectionConfig,
     ) -> anyhow::Result<AuthResult> {
-        match &config.auth_method {
-            AuthMethod::Password { password } => {
+        let resolved_auth = resolve_auth_method(&config.auth_method)?;
+
+        match &resolved_auth {
+            ResolvedAuthMethod::Password { password } => {
                 log::info!("russh: 密码认证");
                 handle
                     .authenticate_password(&config.username, password.as_str())
@@ -290,27 +295,38 @@ impl RusshTerminal {
                     .map_err(|e| anyhow::anyhow!("密码认证失败: {}", e))
             }
 
-            AuthMethod::PrivateKey { path, passphrase } => {
+            ResolvedAuthMethod::PrivateKey {
+                path,
+                passphrase,
+                certificate_path,
+                ..
+            } => {
                 log::info!("russh: 私钥认证 ({:?})", path);
-                let key = russh::keys::load_secret_key(path, passphrase.as_deref())
-                    .map_err(|e| anyhow::anyhow!("加载私钥失败 ({:?}): {}", path, e))?;
-                // best_supported_rsa_hash 返回 Result<Option<Option<HashAlg>>, Error>
-                let hash_alg = handle
-                    .best_supported_rsa_hash()
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-                handle
-                    .authenticate_publickey(
-                        &config.username,
-                        PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("公钥认证失败: {}", e))
+                let key = load_key_material(path, passphrase.as_deref())?;
+                if let Some(certificate_path) = certificate_path {
+                    let cert = load_certificate(certificate_path)?;
+                    handle
+                        .authenticate_openssh_cert(&config.username, key, cert)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("OpenSSH 证书认证失败: {}", e))
+                } else {
+                    let hash_alg = handle
+                        .best_supported_rsa_hash()
+                        .await
+                        .ok()
+                        .flatten()
+                        .flatten();
+                    handle
+                        .authenticate_publickey(
+                            &config.username,
+                            PrivateKeyWithHashAlg::new(key, hash_alg),
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("公钥认证失败: {}", e))
+                }
             }
 
-            AuthMethod::Auto => {
+            ResolvedAuthMethod::Auto => {
                 log::info!("russh: 自动认证模式（依次尝试默认密钥）");
                 let default_keys = crate::ssh::find_default_ssh_keys();
 
@@ -361,7 +377,7 @@ impl RusshTerminal {
                 ))
             }
 
-            AuthMethod::Agent => {
+            ResolvedAuthMethod::Agent => {
                 log::info!("russh: SSH Agent 认证 (SSH_AUTH_SOCK)");
 
                 // 尝试连接 SSH Agent

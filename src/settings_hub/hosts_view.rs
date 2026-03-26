@@ -7,6 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
+use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
 use crate::workspace::workspace::Workspace;
 
 // Layout constants
@@ -29,6 +30,7 @@ pub struct Host {
     pub host_type: HostType,
     pub username: Option<SharedString>,
     pub hostname: Option<SharedString>,
+    pub auth_label: Option<SharedString>,
     pub icon_color: HostIconColor,
 }
 
@@ -44,6 +46,7 @@ impl Host {
             host_type,
             username: None,
             hostname: None,
+            auth_label: None,
             icon_color: HostIconColor::Orange,
         }
     }
@@ -55,6 +58,11 @@ impl Host {
 
     pub fn with_hostname(mut self, hostname: impl Into<SharedString>) -> Self {
         self.hostname = Some(hostname.into());
+        self
+    }
+
+    pub fn with_auth_label(mut self, auth_label: impl Into<SharedString>) -> Self {
+        self.auth_label = Some(auth_label.into());
         self
     }
 
@@ -70,10 +78,13 @@ impl Host {
             HostType::Telnet => "telnet",
         };
 
-        if let Some(ref username) = self.username {
-            format!("{}, {}", protocol, username)
-        } else {
-            protocol.to_string()
+        match (&self.username, &self.auth_label) {
+            (Some(username), Some(auth_label)) => {
+                format!("{}, {}, {}", protocol, username, auth_label)
+            }
+            (Some(username), None) => format!("{}, {}", protocol, username),
+            (None, Some(auth_label)) => format!("{}, {}", protocol, auth_label),
+            (None, None) => protocol.to_string(),
         }
     }
 }
@@ -187,6 +198,7 @@ impl HostsView {
     /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
     fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
         let config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
+        let keychain = KeychainStore::load_or_default();
 
         // Convert saved connections to Host structs
         let hosts: Vec<Host> = config
@@ -196,16 +208,44 @@ impl HostsView {
                 let display_name = conn.nickname.clone().unwrap_or_else(|| conn.display_name());
 
                 // Determine icon color based on auth method
-                let icon_color = match conn.auth_method {
-                    AuthMethod::Agent => HostIconColor::Blue,
-                    AuthMethod::PrivateKey { .. } => HostIconColor::Green,
-                    AuthMethod::Password { .. } => HostIconColor::Orange,
-                    _ => HostIconColor::Orange,
+                let (icon_color, auth_label) = match &conn.auth_method {
+                    AuthMethod::PasswordRef { keychain_id } => {
+                        if keychain.find_item(keychain_id).is_some() {
+                            (HostIconColor::Orange, "identity".to_string())
+                        } else {
+                            (HostIconColor::Red, "missing identity".to_string())
+                        }
+                    }
+                    AuthMethod::PrivateKeyRef { keychain_id } => {
+                        match keychain.find_item(keychain_id) {
+                            Some(item) => {
+                                let label = match item.key_flavor {
+                                    KeychainKeyFlavor::Key => "key",
+                                    KeychainKeyFlavor::Certificate => "certificate",
+                                    KeychainKeyFlavor::TouchId => "touch id",
+                                    KeychainKeyFlavor::Fido2 => "fido2",
+                                };
+                                let color = match item.key_flavor {
+                                    KeychainKeyFlavor::Key => HostIconColor::Green,
+                                    KeychainKeyFlavor::Certificate => HostIconColor::Blue,
+                                    KeychainKeyFlavor::TouchId => HostIconColor::Purple,
+                                    KeychainKeyFlavor::Fido2 => HostIconColor::Blue,
+                                };
+                                (color, label.to_string())
+                            }
+                            None => (HostIconColor::Red, "missing key".to_string()),
+                        }
+                    }
+                    AuthMethod::Agent => (HostIconColor::Blue, "agent".to_string()),
+                    AuthMethod::PrivateKey { .. } => (HostIconColor::Green, "key".to_string()),
+                    AuthMethod::Password { .. } => (HostIconColor::Orange, "password".to_string()),
+                    _ => (HostIconColor::Orange, "auto".to_string()),
                 };
 
                 Host::new(conn.id(), display_name, HostType::Ssh)
                     .with_username(&conn.username)
                     .with_hostname(&conn.host)
+                    .with_auth_label(auth_label)
                     .with_icon_color(icon_color)
             })
             .collect();

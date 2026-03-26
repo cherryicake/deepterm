@@ -11,10 +11,12 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
+use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
 use crate::terminal::TerminalBounds;
 use crate::terminal::terminal::ZedListener;
 
 /// SSH 终端 - 使用 Zellij 方式（PTY）
+#[derive(Clone)]
 pub struct SshPtyTerminal {
     /// PTY 事件循环发送器
     sender: EventLoopSender,
@@ -30,6 +32,8 @@ impl SshPtyTerminal {
     ) -> anyhow::Result<Self> {
         log::info!("=== 创建 SSH PTY 终端 ===");
         log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
+
+        let resolved_auth = resolve_auth_method(&config.auth_method)?;
 
         // 构建 SSH 命令
         let mut ssh_program = "ssh";
@@ -49,13 +53,24 @@ impl SshPtyTerminal {
         ];
 
         // 添加认证方式
-        match &config.auth_method {
-            crate::ssh::config::AuthMethod::PrivateKey { path, .. } => {
+        match &resolved_auth {
+            ResolvedAuthMethod::PrivateKey {
+                path,
+                certificate_path,
+                ..
+            } => {
                 log::info!("使用密钥: {:?}", path);
                 ssh_args.push("-i".to_string());
                 ssh_args.push(path.to_string_lossy().to_string());
+                if let Some(certificate_path) = certificate_path {
+                    ssh_args.push("-o".to_string());
+                    ssh_args.push(format!(
+                        "CertificateFile={}",
+                        certificate_path.to_string_lossy()
+                    ));
+                }
             }
-            crate::ssh::config::AuthMethod::Password { password } => {
+            ResolvedAuthMethod::Password { password } => {
                 log::info!("使用密码认证 (通过 sshpass)");
                 // 使用 sshpass 自动输入密码
                 // 命令格式: sshpass -p 'password' ssh [options] user@host
@@ -64,7 +79,7 @@ impl SshPtyTerminal {
                 ssh_args = sshpass_args;
                 ssh_program = "sshpass";
             }
-            _ => {}
+            ResolvedAuthMethod::Agent | ResolvedAuthMethod::Auto => {}
         }
 
         // 目标主机

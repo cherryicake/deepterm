@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::ssh::keychain::{KeychainStore, migrate_auth_method};
 use crate::ssh::parse_ssh_target;
 
 fn generate_id(username: &str, host: &str, port: u16, nickname: Option<&str>) -> String {
@@ -182,9 +183,13 @@ impl SshConnectionConfig {
 #[serde(tag = "auth_type", content = "auth_data")]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
-    /// 密码认证
+    /// 密码认证（引用 Keychain 项）
+    PasswordRef { keychain_id: String },
+    /// 私钥认证（引用 Keychain 项）
+    PrivateKeyRef { keychain_id: String },
+    /// 密码认证（旧版内联存储，加载时迁移）
     Password { password: String },
-    /// 私钥认证
+    /// 私钥认证（旧版内联存储，加载时迁移）
     PrivateKey {
         /// 密钥文件路径
         path: PathBuf,
@@ -202,8 +207,8 @@ impl AuthMethod {
     /// 获取认证方式的显示名称
     pub fn display_name(&self) -> &'static str {
         match self {
-            AuthMethod::Password { .. } => "密码",
-            AuthMethod::PrivateKey { .. } => "密钥",
+            AuthMethod::PasswordRef { .. } | AuthMethod::Password { .. } => "密码",
+            AuthMethod::PrivateKeyRef { .. } | AuthMethod::PrivateKey { .. } => "密钥",
             AuthMethod::Agent => "SSH Agent",
             AuthMethod::Auto => "自动",
         }
@@ -211,12 +216,18 @@ impl AuthMethod {
 
     /// 是否是密码认证
     pub fn is_password(&self) -> bool {
-        matches!(self, AuthMethod::Password { .. })
+        matches!(
+            self,
+            AuthMethod::PasswordRef { .. } | AuthMethod::Password { .. }
+        )
     }
 
     /// 是否是密钥认证
     pub fn is_key(&self) -> bool {
-        matches!(self, AuthMethod::PrivateKey { .. })
+        matches!(
+            self,
+            AuthMethod::PrivateKeyRef { .. } | AuthMethod::PrivateKey { .. }
+        )
     }
 
     /// 是否是 Agent 认证
@@ -224,14 +235,31 @@ impl AuthMethod {
         matches!(self, AuthMethod::Agent)
     }
 
-    /// 创建密码认证
+    /// 返回引用的 keychain id
+    pub fn keychain_id(&self) -> Option<&str> {
+        match self {
+            AuthMethod::PasswordRef { keychain_id } | AuthMethod::PrivateKeyRef { keychain_id } => {
+                Some(keychain_id.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// 创建密码认证（旧版内联配置，用于兼容测试和迁移）
     pub fn password(password: impl Into<String>) -> Self {
         AuthMethod::Password {
             password: password.into(),
         }
     }
 
-    /// 创建密钥认证（无密码）
+    /// 创建密码引用认证
+    pub fn password_ref(keychain_id: impl Into<String>) -> Self {
+        AuthMethod::PasswordRef {
+            keychain_id: keychain_id.into(),
+        }
+    }
+
+    /// 创建密钥认证（旧版内联配置，用于兼容测试和迁移）
     pub fn key(path: impl Into<PathBuf>) -> Self {
         AuthMethod::PrivateKey {
             path: path.into(),
@@ -244,6 +272,13 @@ impl AuthMethod {
         AuthMethod::PrivateKey {
             path: path.into(),
             passphrase: Some(passphrase.into()),
+        }
+    }
+
+    /// 创建密钥引用认证
+    pub fn key_ref(keychain_id: impl Into<String>) -> Self {
+        AuthMethod::PrivateKeyRef {
+            keychain_id: keychain_id.into(),
         }
     }
 }
@@ -311,6 +346,7 @@ pub struct SshGlobalConfig {
     #[serde(default = "default_identity_files")]
     pub default_identity_files: Vec<PathBuf>,
     /// 已保存的连接配置
+    #[serde(default)]
     pub saved_connections: Vec<SshConnectionConfig>,
     /// 已知主机列表
     #[serde(default)]
@@ -352,7 +388,6 @@ impl SshGlobalConfig {
 
     /// 添加保存的连接
     pub fn add_connection(&mut self, config: SshConnectionConfig) {
-        // 不再根据 ID 去重，允许相同 IP/用户名/端口的多个配置
         self.saved_connections.push(config);
     }
 
@@ -395,23 +430,32 @@ impl SshGlobalConfig {
             Err(_) => return Some(Self::new()),
         };
 
-        serde_json::from_str(&content)
+        let mut config = serde_json::from_str(&content)
             .ok()
-            .or_else(|| Some(Self::new()))
+            .unwrap_or_else(Self::new);
+        if let Err(err) = config.migrate_keychain_refs() {
+            log::warn!("SSH 凭据迁移失败: {}", err);
+        }
+        Some(config)
     }
 
     /// 加载配置，如果不存在则创建默认配置文件
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => serde_json::from_str(&content).map_err(|e| e.into()),
+        let mut config = match std::fs::read_to_string(&config_path) {
+            Ok(content) => serde_json::from_str(&content)?,
             Err(_) => {
                 let default_config = Self::new();
                 default_config.save()?;
-                Ok(default_config)
+                default_config
             }
-        }
+        };
+
+        config
+            .migrate_keychain_refs()
+            .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+        Ok(config)
     }
 
     /// 保存配置到文件
@@ -419,7 +463,6 @@ impl SshGlobalConfig {
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
-        // 确保配置目录存在
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -433,6 +476,22 @@ impl SshGlobalConfig {
     fn config_path() -> Option<std::path::PathBuf> {
         let home = dirs::home_dir()?;
         Some(home.join(".config").join("deepterm").join("ssh.json"))
+    }
+
+    fn migrate_keychain_refs(&mut self) -> anyhow::Result<bool> {
+        let mut store = KeychainStore::load_or_default();
+        let mut changed = false;
+
+        for connection in &mut self.saved_connections {
+            changed |= migrate_auth_method(connection, &mut store)?;
+        }
+
+        if changed {
+            self.save()
+                .map_err(|err| anyhow::anyhow!("保存迁移后的 SSH 配置失败: {}", err))?;
+        }
+
+        Ok(changed)
     }
 }
 

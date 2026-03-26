@@ -1,0 +1,576 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use chrono::{DateTime, Utc};
+use keyring::{Entry, Error as KeyringError};
+use russh::keys::{PrivateKey, load_openssh_certificate, load_secret_key};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::ssh::KeyType;
+use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+
+const KEYCHAIN_SERVICE: &str = "com.deepterm.app.credentials";
+const PASSWORD_ACCOUNT_PREFIX: &str = "identity-password";
+const PASSPHRASE_ACCOUNT_PREFIX: &str = "key-passphrase";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainItemKind {
+    Identity,
+    Key,
+}
+
+impl KeychainItemKind {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            KeychainItemKind::Identity => "Identity",
+            KeychainItemKind::Key => "Key",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainKeyFlavor {
+    Key,
+    Certificate,
+    TouchId,
+    Fido2,
+}
+
+impl KeychainKeyFlavor {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            KeychainKeyFlavor::Key => "Key",
+            KeychainKeyFlavor::Certificate => "Certificate",
+            KeychainKeyFlavor::TouchId => "Touch ID",
+            KeychainKeyFlavor::Fido2 => "FIDO2",
+        }
+    }
+
+    pub fn requires_pty(&self) -> bool {
+        matches!(self, KeychainKeyFlavor::TouchId | KeychainKeyFlavor::Fido2)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeychainItem {
+    pub id: String,
+    pub label: String,
+    pub kind: KeychainItemKind,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub certificate_path: Option<PathBuf>,
+    #[serde(default = "default_key_flavor")]
+    pub key_flavor: KeychainKeyFlavor,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default)]
+    pub has_secret: bool,
+    #[serde(default)]
+    pub has_passphrase: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn default_key_flavor() -> KeychainKeyFlavor {
+    KeychainKeyFlavor::Key
+}
+
+impl KeychainItem {
+    pub fn subtitle(&self) -> String {
+        match self.kind {
+            KeychainItemKind::Identity => self
+                .username
+                .clone()
+                .map(|username| format!("Auth password, {}", username))
+                .unwrap_or_else(|| "Auth password".to_string()),
+            KeychainItemKind::Key => {
+                let algorithm = self
+                    .algorithm
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
+                match self.key_flavor {
+                    KeychainKeyFlavor::Key => format!("Type {}", algorithm),
+                    KeychainKeyFlavor::Certificate => {
+                        format!("Type {}, certificate", algorithm)
+                    }
+                    KeychainKeyFlavor::TouchId => format!("Type {}, Touch ID", algorithm),
+                    KeychainKeyFlavor::Fido2 => format!("Type {}, FIDO2", algorithm),
+                }
+            }
+        }
+    }
+
+    pub fn identity(label: impl Into<String>, username: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            label: label.into(),
+            kind: KeychainItemKind::Identity,
+            username,
+            key_path: None,
+            certificate_path: None,
+            key_flavor: KeychainKeyFlavor::Key,
+            algorithm: None,
+            has_secret: true,
+            has_passphrase: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn key(
+        label: impl Into<String>,
+        key_path: impl Into<PathBuf>,
+        certificate_path: Option<PathBuf>,
+        key_flavor: KeychainKeyFlavor,
+        algorithm: Option<String>,
+        has_passphrase: bool,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            label: label.into(),
+            kind: KeychainItemKind::Key,
+            username: None,
+            key_path: Some(key_path.into()),
+            certificate_path,
+            key_flavor,
+            algorithm,
+            has_secret: false,
+            has_passphrase,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct KeychainStore {
+    #[serde(default)]
+    pub items: Vec<KeychainItem>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ResolvedAuthMethod {
+    Password {
+        password: String,
+    },
+    PrivateKey {
+        path: PathBuf,
+        passphrase: Option<String>,
+        certificate_path: Option<PathBuf>,
+        key_flavor: KeychainKeyFlavor,
+    },
+    Agent,
+    Auto,
+}
+
+#[derive(Clone, Debug)]
+pub enum PreferredSshTransport {
+    Russh,
+    Pty,
+}
+
+impl KeychainStore {
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    pub fn load_or_default() -> Self {
+        Self::load().unwrap_or_default()
+    }
+
+    pub fn load() -> Option<Self> {
+        let path = Self::config_path()?;
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content)
+                .ok()
+                .or_else(|| Some(Self::new())),
+            Err(_) => Some(Self::new()),
+        }
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::config_path().ok_or_else(|| anyhow!("无法定位 keychain 配置路径"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn identities(&self) -> Vec<&KeychainItem> {
+        self.items
+            .iter()
+            .filter(|item| item.kind == KeychainItemKind::Identity)
+            .collect()
+    }
+
+    pub fn keys(&self) -> Vec<&KeychainItem> {
+        self.items
+            .iter()
+            .filter(|item| item.kind == KeychainItemKind::Key)
+            .collect()
+    }
+
+    pub fn find_item(&self, id: &str) -> Option<&KeychainItem> {
+        self.items.iter().find(|item| item.id == id)
+    }
+
+    pub fn create_identity(
+        &mut self,
+        label: &str,
+        username: Option<String>,
+        password: &str,
+    ) -> anyhow::Result<String> {
+        let item = KeychainItem::identity(label, username);
+        let id = item.id.clone();
+        self.set_password_secret(&id, password)?;
+        self.items.push(item);
+        self.save()?;
+        Ok(id)
+    }
+
+    pub fn upsert_identity(
+        &mut self,
+        existing_id: Option<&str>,
+        label: &str,
+        username: Option<String>,
+        password: &str,
+    ) -> anyhow::Result<String> {
+        match existing_id {
+            Some(id) => {
+                let item = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                    .ok_or_else(|| anyhow!("未找到对应的 identity"))?;
+                item.label = label.to_string();
+                item.username = username;
+                item.updated_at = Utc::now();
+                item.has_secret = true;
+                self.set_password_secret(id, password)?;
+                self.save()?;
+                Ok(id.to_string())
+            }
+            None => self.create_identity(label, username, password),
+        }
+    }
+
+    pub fn create_key(
+        &mut self,
+        label: &str,
+        key_path: PathBuf,
+        certificate_path: Option<PathBuf>,
+        key_flavor: KeychainKeyFlavor,
+        passphrase: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let algorithm = infer_key_algorithm(&key_path);
+        let mut item = KeychainItem::key(
+            label,
+            key_path,
+            certificate_path,
+            key_flavor,
+            algorithm,
+            passphrase.is_some(),
+        );
+        let id = item.id.clone();
+        if let Some(passphrase) = passphrase.filter(|value| !value.trim().is_empty()) {
+            self.set_key_passphrase_secret(&id, passphrase)?;
+            item.has_passphrase = true;
+        }
+        self.items.push(item);
+        self.save()?;
+        Ok(id)
+    }
+
+    pub fn upsert_key(
+        &mut self,
+        existing_id: Option<&str>,
+        label: &str,
+        key_path: PathBuf,
+        certificate_path: Option<PathBuf>,
+        key_flavor: KeychainKeyFlavor,
+        passphrase: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let normalized_passphrase = passphrase
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        match existing_id {
+            Some(id) => {
+                let item = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                    .ok_or_else(|| anyhow!("未找到对应的 key"))?;
+                item.label = label.to_string();
+                item.key_path = Some(key_path.clone());
+                item.certificate_path = certificate_path;
+                item.key_flavor = key_flavor;
+                item.algorithm = infer_key_algorithm(&key_path);
+                item.updated_at = Utc::now();
+                item.has_passphrase = normalized_passphrase.is_some();
+
+                if let Some(passphrase) = normalized_passphrase {
+                    self.set_key_passphrase_secret(id, &passphrase)?;
+                } else {
+                    self.delete_secret(PASSPHRASE_ACCOUNT_PREFIX, id)?;
+                }
+
+                self.save()?;
+                Ok(id.to_string())
+            }
+            None => self.create_key(
+                label,
+                key_path,
+                certificate_path,
+                key_flavor,
+                normalized_passphrase.as_deref(),
+            ),
+        }
+    }
+
+    pub fn delete_item(&mut self, id: &str) -> anyhow::Result<()> {
+        self.items.retain(|item| item.id != id);
+        self.delete_secret(PASSWORD_ACCOUNT_PREFIX, id)?;
+        self.delete_secret(PASSPHRASE_ACCOUNT_PREFIX, id)?;
+        self.save()?;
+        Ok(())
+    }
+
+    pub fn get_password_secret(&self, id: &str) -> anyhow::Result<Option<String>> {
+        self.get_secret(PASSWORD_ACCOUNT_PREFIX, id)
+    }
+
+    pub fn get_key_passphrase_secret(&self, id: &str) -> anyhow::Result<Option<String>> {
+        self.get_secret(PASSPHRASE_ACCOUNT_PREFIX, id)
+    }
+
+    fn set_password_secret(&self, id: &str, password: &str) -> anyhow::Result<()> {
+        self.set_secret(PASSWORD_ACCOUNT_PREFIX, id, password)
+    }
+
+    fn set_key_passphrase_secret(&self, id: &str, passphrase: &str) -> anyhow::Result<()> {
+        self.set_secret(PASSPHRASE_ACCOUNT_PREFIX, id, passphrase)
+    }
+
+    fn set_secret(&self, prefix: &str, id: &str, value: &str) -> anyhow::Result<()> {
+        let entry = Self::entry(prefix, id)?;
+        entry
+            .set_password(value)
+            .with_context(|| format!("写入系统 Keychain 失败: {}:{}", prefix, id))?;
+        match entry.get_password() {
+            Ok(saved) if saved == value => Ok(()),
+            Ok(_) => Err(anyhow!("系统 Keychain 回读结果不一致: {}:{}", prefix, id)),
+            Err(KeyringError::NoEntry) => {
+                Err(anyhow!("系统 Keychain 未保存凭据: {}:{}", prefix, id))
+            }
+            Err(err) => Err(anyhow!(
+                "系统 Keychain 回读失败: {}: {}:{}",
+                err,
+                prefix,
+                id
+            )),
+        }
+    }
+
+    fn get_secret(&self, prefix: &str, id: &str) -> anyhow::Result<Option<String>> {
+        let entry = Self::entry(prefix, id)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(err) => Err(anyhow!(
+                "读取系统 Keychain 失败: {}: {}:{}",
+                err,
+                prefix,
+                id
+            )),
+        }
+    }
+
+    fn delete_secret(&self, prefix: &str, id: &str) -> anyhow::Result<()> {
+        let entry = Self::entry(prefix, id)?;
+        match entry.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(err) => Err(anyhow!(
+                "删除系统 Keychain 凭据失败: {}: {}:{}",
+                err,
+                prefix,
+                id
+            )),
+        }
+    }
+
+    fn entry(prefix: &str, id: &str) -> anyhow::Result<Entry> {
+        Entry::new(KEYCHAIN_SERVICE, &format!("{}:{}", prefix, id))
+            .map_err(|err| anyhow!("创建 Keychain 入口失败: {}", err))
+    }
+
+    fn config_path() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(home.join(".config").join("deepterm").join("keychain.json"))
+    }
+}
+
+pub fn migrate_auth_method(
+    connection: &mut SshConnectionConfig,
+    store: &mut KeychainStore,
+) -> anyhow::Result<bool> {
+    match &connection.auth_method {
+        AuthMethod::Password { password } => {
+            if password.trim().is_empty() {
+                connection.auth_method = AuthMethod::Auto;
+                return Ok(true);
+            }
+
+            let label = connection
+                .nickname
+                .clone()
+                .unwrap_or_else(|| format!("{} password", connection.host_label()));
+            let keychain_id =
+                store.create_identity(&label, Some(connection.username.clone()), password)?;
+            connection.auth_method = AuthMethod::password_ref(keychain_id);
+            Ok(true)
+        }
+        AuthMethod::PrivateKey { path, passphrase } => {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("{} key", connection.host_label()));
+            let keychain_id = store.create_key(
+                &label,
+                path.clone(),
+                None,
+                classify_key_flavor(path, None),
+                passphrase.as_deref(),
+            )?;
+            connection.auth_method = AuthMethod::key_ref(keychain_id);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedAuthMethod> {
+    match auth_method {
+        AuthMethod::PasswordRef { keychain_id } => {
+            let store = KeychainStore::load_or_default();
+            let item = store
+                .find_item(keychain_id)
+                .ok_or_else(|| anyhow!("未找到关联的身份条目: {}", keychain_id))?;
+            if item.kind != KeychainItemKind::Identity {
+                return Err(anyhow!("认证引用不是有效的 identity: {}", keychain_id));
+            }
+            let password = store
+                .get_password_secret(keychain_id)?
+                .ok_or_else(|| anyhow!("系统 Keychain 中缺少身份密码: {}", keychain_id))?;
+            Ok(ResolvedAuthMethod::Password { password })
+        }
+        AuthMethod::PrivateKeyRef { keychain_id } => {
+            let store = KeychainStore::load_or_default();
+            let item = store
+                .find_item(keychain_id)
+                .ok_or_else(|| anyhow!("未找到关联的私钥条目: {}", keychain_id))?;
+            if item.kind != KeychainItemKind::Key {
+                return Err(anyhow!("认证引用不是有效的 key: {}", keychain_id));
+            }
+            let path = item
+                .key_path
+                .clone()
+                .ok_or_else(|| anyhow!("Keychain 私钥缺少路径配置: {}", keychain_id))?;
+            let passphrase = store.get_key_passphrase_secret(keychain_id)?;
+            Ok(ResolvedAuthMethod::PrivateKey {
+                path,
+                passphrase,
+                certificate_path: item.certificate_path.clone(),
+                key_flavor: item.key_flavor,
+            })
+        }
+        AuthMethod::Password { password } => Ok(ResolvedAuthMethod::Password {
+            password: password.clone(),
+        }),
+        AuthMethod::PrivateKey { path, passphrase } => Ok(ResolvedAuthMethod::PrivateKey {
+            path: path.clone(),
+            passphrase: passphrase.clone(),
+            certificate_path: None,
+            key_flavor: classify_key_flavor(path, None),
+        }),
+        AuthMethod::Agent => Ok(ResolvedAuthMethod::Agent),
+        AuthMethod::Auto => Ok(ResolvedAuthMethod::Auto),
+    }
+}
+
+pub fn preferred_ssh_transport(auth_method: &AuthMethod) -> anyhow::Result<PreferredSshTransport> {
+    match resolve_auth_method(auth_method)? {
+        ResolvedAuthMethod::PrivateKey {
+            key_flavor,
+            certificate_path,
+            ..
+        } => {
+            if key_flavor.requires_pty() {
+                Ok(PreferredSshTransport::Pty)
+            } else if certificate_path.is_some() {
+                Ok(PreferredSshTransport::Russh)
+            } else {
+                Ok(PreferredSshTransport::Russh)
+            }
+        }
+        ResolvedAuthMethod::Agent
+        | ResolvedAuthMethod::Password { .. }
+        | ResolvedAuthMethod::Auto => Ok(PreferredSshTransport::Russh),
+    }
+}
+
+pub fn load_key_material(path: &Path, passphrase: Option<&str>) -> anyhow::Result<Arc<PrivateKey>> {
+    let key = load_secret_key(path, passphrase)
+        .map_err(|err| anyhow!("加载私钥失败 ({:?}): {}", path, err))?;
+    Ok(Arc::new(key))
+}
+
+pub fn load_certificate(path: &Path) -> anyhow::Result<russh::keys::ssh_key::Certificate> {
+    load_openssh_certificate(path)
+        .map_err(|err| anyhow!("加载 OpenSSH 证书失败 ({:?}): {}", path, err))
+}
+
+pub fn classify_key_flavor(key_path: &Path, certificate_path: Option<&Path>) -> KeychainKeyFlavor {
+    if certificate_path.is_some() {
+        return KeychainKeyFlavor::Certificate;
+    }
+
+    let filename = key_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if filename.contains("fido") || filename.ends_with("_sk") {
+        return KeychainKeyFlavor::Fido2;
+    }
+
+    if filename.contains("touchid") || filename.contains("secure_enclave") {
+        return KeychainKeyFlavor::TouchId;
+    }
+
+    KeychainKeyFlavor::Key
+}
+
+fn infer_key_algorithm(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_string_lossy();
+    KeyType::from_filename(&filename).map(|key_type| match key_type {
+        KeyType::Rsa => "RSA".to_string(),
+        KeyType::Ecdsa => "ECDSA".to_string(),
+        KeyType::Ed25519 => "ED25519".to_string(),
+        KeyType::Dss => "DSS".to_string(),
+    })
+}

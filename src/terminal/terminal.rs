@@ -24,7 +24,8 @@ use gpui::{
     Task, Window, px,
 };
 
-use crate::ssh::{RusshTerminal, SshConnectionConfig};
+use crate::ssh::keychain::{PreferredSshTransport, preferred_ssh_transport};
+use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal};
 use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -555,6 +556,16 @@ impl Terminal {
     /// - 连接期间缓存输入数据，连接成功后自动转发
     /// - 若 russh 连接失败，自动回退到 PTY + 系统 ssh 命令方式
     pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        match preferred_ssh_transport(&ssh_config.auth_method) {
+            Ok(PreferredSshTransport::Pty) => {
+                log::info!("SSH: 该凭据类型使用系统 ssh PTY 模式");
+                Self::new_ssh_pty(cx, ssh_config)
+            }
+            Ok(PreferredSshTransport::Russh) | Err(_) => Self::new_ssh_russh(cx, ssh_config),
+        }
+    }
+
+    fn new_ssh_russh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
 
@@ -590,7 +601,7 @@ impl Terminal {
         let russh_for_input = russh_term.clone();
         let russh_for_resize = russh_term.clone();
         let russh_for_status = russh_term.clone();
-        let entity = Self::create_remote_terminal(
+        Self::create_remote_terminal(
             cx,
             ssh_config,
             term.clone(),
@@ -598,9 +609,60 @@ impl Terminal {
             move |data| russh_for_input.write(data),
             move |cols, rows| russh_for_resize.resize(cols, rows),
             Some(russh_for_status),
-        );
+        )
+    }
 
-        entity
+    fn new_ssh_pty(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
+        let default_bounds = TerminalBounds::default();
+
+        let mut config = Config::default();
+        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
+        config.default_cursor_style = AlacCursorStyle {
+            shape: AlacCursorShape::Block,
+            blinking: false,
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            config,
+            &default_bounds,
+            listener.clone(),
+        )));
+
+        let pty_terminal =
+            match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener) {
+                Ok(pty_terminal) => pty_terminal,
+                Err(err) => {
+                    log::error!("SSH PTY 初始化失败: {}", err);
+                    return cx.new(|_cx| Self::create_error_terminal());
+                }
+            };
+
+        let pty_input = pty_terminal.clone();
+        let pty_resize = pty_terminal.clone();
+
+        Self::create_remote_terminal(
+            cx,
+            ssh_config,
+            term,
+            events_rx,
+            move |data| pty_input.write(data),
+            move |cols, rows| {
+                let bounds = TerminalBounds::new(
+                    default_bounds.line_height,
+                    default_bounds.cell_width,
+                    Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(cols as f32 * default_bounds.cell_width.as_f32()),
+                            height: px(rows as f32 * default_bounds.line_height.as_f32()),
+                        },
+                    },
+                );
+                pty_resize.resize(bounds);
+            },
+            None,
+        )
     }
 
     /// 通用远程终端实体创建（抽取 create_russh_terminal 和 create_ssh_pty_terminal 的公共部分）
@@ -680,12 +742,12 @@ impl Terminal {
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
     pub fn is_ssh_connected(&self) -> bool {
-        self.russh_handle.as_ref().map_or(false, |h| h.is_ready())
+        self.russh_handle.as_ref().map_or(true, |h| h.is_ready())
     }
 
     /// 检查 SSH 连接是否已失败
     pub fn is_ssh_failed(&self) -> bool {
-        self.russh_handle.as_ref().map_or(false, |h| h.is_failed())
+        self.russh_handle.as_ref().is_some_and(|h| h.is_failed())
     }
 
     /// 获取 SSH 连接错误信息（如果连接失败）

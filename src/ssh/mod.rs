@@ -29,12 +29,14 @@
 pub mod config;
 pub mod connection_manager;
 pub mod error;
+pub mod keychain;
 pub mod russh_terminal;
 pub mod ssh_pty;
 
 pub use config::{AuthMethod, SshConnectionConfig};
 pub use connection_manager::{ConnectionState, SshConnectionManager};
 pub use error::{SshError, SshResult};
+pub use keychain::{KeychainItem, KeychainItemKind, KeychainStore};
 pub use russh_terminal::RusshTerminal;
 pub use ssh_pty::SshPtyTerminal;
 

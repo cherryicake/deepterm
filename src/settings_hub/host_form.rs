@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
@@ -8,6 +10,7 @@ use crate::assets::Icon;
 use crate::components::input::Input;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
+use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
 
 /// 认证方式类型
 #[derive(Clone, Debug, PartialEq)]
@@ -34,20 +37,22 @@ impl AuthType {
 /// Host Form 组件 - 用于创建和编辑 SSH 主机配置
 pub struct HostForm {
     focus_handle: FocusHandle,
-    // 输入框实体
     nickname_input: Entity<Input>,
     hostname_input: Entity<Input>,
     port_input: Entity<Input>,
     username_input: Entity<Input>,
     password_input: Entity<Input>,
     key_path_input: Entity<Input>,
-    // 状态
+    key_passphrase_input: Entity<Input>,
+    credential_label_input: Entity<Input>,
     auth_type: AuthType,
     show_auth_dropdown: bool,
+    show_credential_dropdown: bool,
+    selected_keychain_id: Option<String>,
+    keychain_items: Vec<KeychainItem>,
     error_message: Option<String>,
     success_message: Option<String>,
     editing_config_id: Option<String>,
-    // 回调
     on_cancel: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
     on_saved: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
 }
@@ -56,28 +61,28 @@ impl HostForm {
     pub fn new(cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-
-            // 获取当前系统用户名作为默认值
             let default_username = get_current_username().unwrap_or_default();
 
-            // 创建输入框
             let nickname_input = cx.new(|cx| Input::new(cx).placeholder("My Server"));
-
             let hostname_input =
                 cx.new(|cx| Input::new(cx).placeholder("192.168.1.100 or example.com"));
-
             let port_input = cx.new(|cx| Input::new(cx).value("22"));
-
             let username_input = cx.new(|cx| Input::new(cx).value(&default_username));
-
             let password_input = cx.new(|cx| {
                 Input::new(cx)
-                    .placeholder("Leave empty to prompt on connect")
+                    .placeholder("Save into system keychain")
                     .masked(true)
                     .mask_toggle(true)
             });
-
-            let key_path_input = cx.new(|cx| Input::new(cx).placeholder("~/.ssh/id_rsa"));
+            let key_path_input = cx.new(|cx| Input::new(cx).placeholder("~/.ssh/id_ed25519"));
+            let key_passphrase_input = cx.new(|cx| {
+                Input::new(cx)
+                    .placeholder("Optional passphrase")
+                    .masked(true)
+                    .mask_toggle(true)
+            });
+            let credential_label_input =
+                cx.new(|cx| Input::new(cx).placeholder("DeepTerm generated label"));
 
             Self {
                 focus_handle,
@@ -87,8 +92,13 @@ impl HostForm {
                 username_input,
                 password_input,
                 key_path_input,
+                key_passphrase_input,
+                credential_label_input,
                 auth_type: AuthType::Password,
                 show_auth_dropdown: false,
+                show_credential_dropdown: false,
+                selected_keychain_id: None,
+                keychain_items: Self::load_keychain_items(),
                 error_message: None,
                 success_message: None,
                 editing_config_id: None,
@@ -98,7 +108,6 @@ impl HostForm {
         })
     }
 
-    /// 设置取消回调
     pub fn on_cancel<F>(&mut self, callback: F)
     where
         F: Fn(&mut App) + Send + Sync + 'static,
@@ -106,7 +115,6 @@ impl HostForm {
         self.on_cancel = Some(Box::new(callback));
     }
 
-    /// 设置保存成功回调
     pub fn on_saved<F>(&mut self, callback: F)
     where
         F: Fn(&mut App) + Send + Sync + 'static,
@@ -114,8 +122,8 @@ impl HostForm {
         self.on_saved = Some(Box::new(callback));
     }
 
-    /// 加载配置到表单（用于编辑）
     pub fn load_config(&mut self, config: &SshConnectionConfig, cx: &mut Context<Self>) {
+        self.reload_keychain_items();
         self.editing_config_id = Some(config.id());
         self.nickname_input.update(cx, |input, cx| {
             if let Some(ref nick) = config.nickname {
@@ -134,28 +142,42 @@ impl HostForm {
             input.set_text(&config.username, cx);
         });
 
-        // Clear auth fields first, then set based on auth method
-        self.password_input.update(cx, |input, cx| input.clear(cx));
-        self.key_path_input.update(cx, |input, cx| input.clear(cx));
-        match config.auth_method {
-            AuthMethod::Password { ref password } => {
+        self.clear_auth_inputs(cx);
+        match &config.auth_method {
+            AuthMethod::PasswordRef { keychain_id } => {
                 self.auth_type = AuthType::Password;
+                self.selected_keychain_id = Some(keychain_id.clone());
+            }
+            AuthMethod::PrivateKeyRef { keychain_id } => {
+                self.auth_type = AuthType::PrivateKey;
+                self.selected_keychain_id = Some(keychain_id.clone());
+            }
+            AuthMethod::Password { password } => {
+                self.auth_type = AuthType::Password;
+                self.selected_keychain_id = None;
                 self.password_input.update(cx, |input, cx| {
                     input.set_text(password, cx);
                 });
             }
-            AuthMethod::PrivateKey { ref path, .. } => {
+            AuthMethod::PrivateKey { path, passphrase } => {
                 self.auth_type = AuthType::PrivateKey;
+                self.selected_keychain_id = None;
                 self.key_path_input.update(cx, |input, cx| {
-                    let path_str = path.to_string_lossy().into_owned();
-                    input.set_text(path_str, cx);
+                    input.set_text(path.to_string_lossy().to_string(), cx);
                 });
+                if let Some(passphrase) = passphrase {
+                    self.key_passphrase_input.update(cx, |input, cx| {
+                        input.set_text(passphrase, cx);
+                    });
+                }
             }
             AuthMethod::Agent => {
                 self.auth_type = AuthType::Agent;
+                self.selected_keychain_id = None;
             }
             AuthMethod::Auto => {
                 self.auth_type = AuthType::Password;
+                self.selected_keychain_id = None;
             }
         }
 
@@ -164,34 +186,63 @@ impl HostForm {
         cx.notify();
     }
 
-    /// 重置表单
     pub fn reset_form(&mut self, cx: &mut Context<Self>) {
+        self.reload_keychain_items();
         self.editing_config_id = None;
-        self.nickname_input.update(cx, |input, cx| {
-            input.clear(cx);
-        });
-        self.hostname_input.update(cx, |input, cx| {
-            input.clear(cx);
-        });
-        self.port_input.update(cx, |input, cx| {
-            input.set_text("22", cx);
-        });
+        self.nickname_input.update(cx, |input, cx| input.clear(cx));
+        self.hostname_input.update(cx, |input, cx| input.clear(cx));
+        self.port_input
+            .update(cx, |input, cx| input.set_text("22", cx));
         self.username_input.update(cx, |input, cx| {
             input.set_text(&get_current_username().unwrap_or_default(), cx);
         });
-        self.password_input.update(cx, |input, cx| {
-            input.clear(cx);
-        });
-        self.key_path_input.update(cx, |input, cx| {
-            input.clear(cx);
-        });
+        self.clear_auth_inputs(cx);
         self.auth_type = AuthType::Password;
+        self.selected_keychain_id = None;
         self.error_message = None;
         self.success_message = None;
         cx.notify();
     }
 
-    /// 验证表单
+    fn load_keychain_items() -> Vec<KeychainItem> {
+        KeychainStore::load_or_default().items
+    }
+
+    fn reload_keychain_items(&mut self) {
+        self.keychain_items = Self::load_keychain_items();
+    }
+
+    fn clear_auth_inputs(&mut self, cx: &mut Context<Self>) {
+        self.password_input.update(cx, |input, cx| input.clear(cx));
+        self.key_path_input.update(cx, |input, cx| input.clear(cx));
+        self.key_passphrase_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.credential_label_input
+            .update(cx, |input, cx| input.clear(cx));
+    }
+
+    fn available_items(&self) -> Vec<&KeychainItem> {
+        let expected_kind = match self.auth_type {
+            AuthType::Password => Some(KeychainItemKind::Identity),
+            AuthType::PrivateKey => Some(KeychainItemKind::Key),
+            AuthType::Agent => None,
+        };
+
+        self.keychain_items
+            .iter()
+            .filter(|item| {
+                expected_kind
+                    .as_ref()
+                    .is_some_and(|kind| item.kind == *kind)
+            })
+            .collect()
+    }
+
+    fn selected_item(&self) -> Option<&KeychainItem> {
+        let selected = self.selected_keychain_id.as_ref()?;
+        self.keychain_items.iter().find(|item| item.id == *selected)
+    }
+
     fn validate_form(&self, cx: &Context<Self>) -> Result<(), String> {
         let hostname = self.hostname_input.read(cx).text().to_string();
         let username = self.username_input.read(cx).text().to_string();
@@ -205,7 +256,6 @@ impl HostForm {
             return Err("Username is required".to_string());
         }
 
-        // 验证端口号
         if port.parse::<u16>().is_err() {
             return Err("Invalid port number".to_string());
         }
@@ -213,77 +263,159 @@ impl HostForm {
         Ok(())
     }
 
-    /// 保存配置
+    fn create_auth_method(
+        &self,
+        username: &str,
+        host_label: &str,
+        cx: &Context<Self>,
+    ) -> Result<AuthMethod, String> {
+        let selected_keychain_id = self.selected_keychain_id.clone();
+        let credential_label = self.credential_label_input.read(cx).text().to_string();
+        let password = self.password_input.read(cx).text().to_string();
+        let key_path = self.key_path_input.read(cx).text().to_string();
+        let key_passphrase = self.key_passphrase_input.read(cx).text().to_string();
+
+        let mut store = KeychainStore::load_or_default();
+        let fallback_label = if credential_label.trim().is_empty() {
+            host_label.to_string()
+        } else {
+            credential_label.trim().to_string()
+        };
+
+        match self.auth_type {
+            AuthType::Password => {
+                if let Some(id) = selected_keychain_id {
+                    let item = store
+                        .find_item(&id)
+                        .ok_or_else(|| "Selected identity no longer exists".to_string())?;
+                    if item.kind != KeychainItemKind::Identity {
+                        return Err("Selected keychain item is not an identity".to_string());
+                    }
+                    let identity_label = item.label.clone();
+                    if !password.trim().is_empty() {
+                        store
+                            .upsert_identity(
+                                Some(&id),
+                                &identity_label,
+                                Some(username.to_string()),
+                                password.trim(),
+                            )
+                            .map_err(|err| {
+                                format!("Failed to update identity in keychain: {}", err)
+                            })?;
+                        Ok(AuthMethod::password_ref(id))
+                    } else if store
+                        .get_password_secret(&id)
+                        .map_err(|err| format!("Failed to read identity from keychain: {}", err))?
+                        .is_some()
+                    {
+                        Ok(AuthMethod::password_ref(id))
+                    } else {
+                        Err("Selected identity has no stored password. Re-enter the password or create a new identity.".to_string())
+                    }
+                } else if !password.trim().is_empty() {
+                    let keychain_id = store
+                        .create_identity(&fallback_label, Some(username.to_string()), &password)
+                        .map_err(|err| format!("Failed to save identity into keychain: {}", err))?;
+                    Ok(AuthMethod::password_ref(keychain_id))
+                } else {
+                    Ok(AuthMethod::Auto)
+                }
+            }
+            AuthType::PrivateKey => {
+                if let Some(id) = selected_keychain_id {
+                    let item = store
+                        .find_item(&id)
+                        .ok_or_else(|| "Selected key no longer exists".to_string())?;
+                    if item.kind != KeychainItemKind::Key {
+                        return Err("Selected keychain item is not a key".to_string());
+                    }
+                    let key_label = item.label.clone();
+                    let key_path = item.key_path.clone();
+                    let certificate_path = item.certificate_path.clone();
+                    let key_flavor = item.key_flavor;
+                    if !key_passphrase.trim().is_empty() {
+                        let key_path = key_path
+                            .ok_or_else(|| "Selected key is missing its path".to_string())?;
+                        store
+                            .upsert_key(
+                                Some(&id),
+                                &key_label,
+                                key_path,
+                                certificate_path,
+                                key_flavor,
+                                Some(key_passphrase.trim()),
+                            )
+                            .map_err(|err| format!("Failed to update keychain key: {}", err))?;
+                    }
+                    Ok(AuthMethod::key_ref(id))
+                } else if !key_path.trim().is_empty() {
+                    let keychain_id = store
+                        .create_key(
+                            &fallback_label,
+                            PathBuf::from(key_path.trim()),
+                            None,
+                            classify_key_flavor(PathBuf::from(key_path.trim()).as_path(), None),
+                            (!key_passphrase.trim().is_empty()).then_some(key_passphrase.as_str()),
+                        )
+                        .map_err(|err| format!("Failed to save key into keychain: {}", err))?;
+                    Ok(AuthMethod::key_ref(keychain_id))
+                } else {
+                    Ok(AuthMethod::Auto)
+                }
+            }
+            AuthType::Agent => Ok(AuthMethod::Agent),
+        }
+    }
+
     fn save_config(&mut self, cx: &mut Context<Self>) {
         self.error_message = None;
         self.success_message = None;
 
-        // 验证表单
         if let Err(e) = self.validate_form(cx) {
             self.error_message = Some(e);
             cx.notify();
             return;
         }
 
-        // 获取输入值
         let nickname = self.nickname_input.read(cx).text().to_string();
         let hostname = self.hostname_input.read(cx).text().to_string();
         let username = self.username_input.read(cx).text().to_string();
         let port = self.port_input.read(cx).text().parse::<u16>().unwrap_or(22);
-        let password = self.password_input.read(cx).text().to_string();
-        let key_path = self.key_path_input.read(cx).text().to_string();
 
-        // 创建认证方式
-        let auth_method = match self.auth_type {
-            AuthType::Password => {
-                if password.is_empty() {
-                    AuthMethod::Auto
-                } else {
-                    AuthMethod::Password { password }
-                }
-            }
-            AuthType::PrivateKey => {
-                if key_path.is_empty() {
-                    AuthMethod::Auto
-                } else {
-                    AuthMethod::PrivateKey {
-                        path: std::path::PathBuf::from(&key_path),
-                        passphrase: None,
-                    }
-                }
-            }
-            AuthType::Agent => AuthMethod::Agent,
+        let host_label = if nickname.trim().is_empty() {
+            format!("{}@{}", username.trim(), hostname.trim())
+        } else {
+            nickname.trim().to_string()
         };
 
-        // 创建配置
+        let auth_method = match self.create_auth_method(username.trim(), &host_label, cx) {
+            Ok(auth_method) => auth_method,
+            Err(err) => {
+                self.error_message = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+
         let mut config = SshConnectionConfig::new(hostname.trim(), username.trim(), auth_method);
-
-        // 设置端口
         config = config.with_port(port);
-
-        // 设置昵称
         if !nickname.trim().is_empty() {
             config = config.with_nickname(nickname.trim());
         }
 
-        // 加载现有配置
         let mut global_config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
-
-        // 如果是编辑模式，先删除旧配置
         if let Some(ref editing_id) = self.editing_config_id {
             global_config.remove_connection(editing_id);
         }
-
-        // 添加新/更新配置
         global_config.add_connection(config);
 
-        // 保存配置
         match global_config.save() {
             Ok(()) => {
+                self.reload_keychain_items();
                 self.success_message = Some("Host saved successfully".to_string());
                 cx.notify();
 
-                // 触发回调
                 if let Some(ref callback) = self.on_saved {
                     callback(cx);
                 }
@@ -295,14 +427,34 @@ impl HostForm {
         }
     }
 
-    /// 设置认证类型
     fn set_auth_type(&mut self, auth_type: AuthType, cx: &mut Context<Self>) {
         self.auth_type = auth_type;
         self.show_auth_dropdown = false;
+        self.show_credential_dropdown = false;
+        self.selected_keychain_id = None;
+        self.reload_keychain_items();
         cx.notify();
     }
 
-    /// 取消按钮处理
+    fn set_selected_keychain_item(&mut self, keychain_id: Option<String>, cx: &mut Context<Self>) {
+        self.selected_keychain_id = keychain_id.clone();
+        self.show_credential_dropdown = false;
+
+        if let Some(item) = keychain_id
+            .as_ref()
+            .and_then(|id| self.keychain_items.iter().find(|item| item.id == *id))
+            && item.kind == KeychainItemKind::Identity
+            && item.username.as_ref().is_some()
+        {
+            let username = item.username.clone().unwrap_or_default();
+            self.username_input.update(cx, |input, cx| {
+                input.set_text(&username, cx);
+            });
+        }
+
+        cx.notify();
+    }
+
     fn handle_cancel(&mut self, cx: &mut Context<Self>) {
         self.reset_form(cx);
         if let Some(ref callback) = self.on_cancel {
@@ -310,7 +462,6 @@ impl HostForm {
         }
     }
 
-    /// 渲染带标签的输入框
     fn render_labeled_input(&self, label: &str, input: &Entity<Input>) -> impl IntoElement {
         div()
             .w_full()
@@ -326,7 +477,6 @@ impl HostForm {
             .child(input.clone())
     }
 
-    /// 渲染认证方式选择器
     fn render_auth_type_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current_auth = self.auth_type.clone();
         let show_dropdown = self.show_auth_dropdown;
@@ -348,7 +498,6 @@ impl HostForm {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    // 当前选择
                     .child(
                         div()
                             .w_full()
@@ -382,7 +531,6 @@ impl HostForm {
                                     .text_color(rgb(0x8888aa)),
                             ),
                     )
-                    // 下拉选项
                     .when(show_dropdown, |this| {
                         this.child(
                             div()
@@ -428,14 +576,254 @@ impl HostForm {
             )
     }
 
-    /// 渲染认证方式的额外字段
-    fn render_auth_extra_field(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_keychain_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = self.available_items();
+        let selected_label = self
+            .selected_item()
+            .map(|item| item.label.clone())
+            .unwrap_or_else(|| match self.auth_type {
+                AuthType::Password => "Create new identity".to_string(),
+                AuthType::PrivateKey => "Create new key".to_string(),
+                AuthType::Agent => String::new(),
+            });
+
+        let title = match self.auth_type {
+            AuthType::Password => "Keychain Identity",
+            AuthType::PrivateKey => "Keychain Key",
+            AuthType::Agent => "",
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(div().text_xs().text_color(rgb(0x8888aa)).child(title))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(36.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(rgb(0x2d2d44))
+                            .bg(rgb(0x13131f))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_credential_dropdown = !this.show_credential_dropdown;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xcccccc))
+                                    .child(selected_label),
+                            )
+                            .child(
+                                svg()
+                                    .size(px(12.0))
+                                    .path(Icon::ChevronDown.path())
+                                    .text_color(rgb(0x8888aa)),
+                            ),
+                    )
+                    .when(self.show_credential_dropdown, |this| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(rgb(0x2d2d44))
+                                .bg(rgb(0x1a1a2e))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(32.0))
+                                        .px(px(10.0))
+                                        .flex()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .when(self.selected_keychain_id.is_none(), |d| {
+                                            d.bg(rgb(0x252538))
+                                        })
+                                        .when(self.selected_keychain_id.is_some(), |d| {
+                                            d.hover(|s| s.bg(rgb(0x252538)))
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.set_selected_keychain_item(None, cx);
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0xcccccc))
+                                                .child("Create new"),
+                                        ),
+                                )
+                                .children(items.into_iter().map(|item| {
+                                    let item_id = item.id.clone();
+                                    let is_selected =
+                                        self.selected_keychain_id.as_ref() == Some(&item.id);
+                                    div()
+                                        .w_full()
+                                        .px(px(10.0))
+                                        .py(px(8.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .cursor_pointer()
+                                        .when(is_selected, |d| d.bg(rgb(0x252538)))
+                                        .when(!is_selected, |d| d.hover(|s| s.bg(rgb(0x252538))))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_selected_keychain_item(
+                                                    Some(item_id.clone()),
+                                                    cx,
+                                                );
+                                            }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(0xffffff))
+                                                .child(item.label.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x7f86a3))
+                                                .child(item.subtitle()),
+                                        )
+                                        .into_any_element()
+                                })),
+                        )
+                    }),
+            )
+    }
+
+    fn render_new_identity_fields(&self) -> impl IntoElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(self.render_labeled_input("Identity Label", &self.credential_label_input))
+            .child(self.render_labeled_input("Password", &self.password_input))
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(0x171726))
+                    .border_1()
+                    .border_color(rgb(0x2b2d40))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x7f86a3))
+                            .child("Password is stored in the system keychain and only the reference is written into ssh.json."),
+                    ),
+            )
+    }
+
+    fn render_new_key_fields(&self) -> impl IntoElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(self.render_labeled_input("Key Label", &self.credential_label_input))
+            .child(self.render_labeled_input("Private Key Path", &self.key_path_input))
+            .child(self.render_labeled_input("Passphrase (optional)", &self.key_passphrase_input))
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(0x171726))
+                    .border_1()
+                    .border_color(rgb(0x2b2d40))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x7f86a3))
+                            .child("DeepTerm stores the key metadata here and keeps the optional passphrase in the system keychain."),
+                    ),
+            )
+    }
+
+    fn render_selected_item_hint(&self) -> impl IntoElement {
+        let subtitle = self
+            .selected_item()
+            .map(|item| item.subtitle())
+            .unwrap_or_default();
+
+        div()
+            .w_full()
+            .px(px(10.0))
+            .py(px(10.0))
+            .rounded(px(6.0))
+            .bg(rgb(0x171726))
+            .border_1()
+            .border_color(rgb(0x2b2d40))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xe2e5f4))
+                            .child("Using existing keychain item"),
+                    )
+                    .child(div().text_xs().text_color(rgb(0x7f86a3)).child(subtitle)),
+            )
+    }
+
+    fn render_auth_extra_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match self.auth_type {
-            AuthType::Password => self
-                .render_labeled_input("Password (optional)", &self.password_input)
+            AuthType::Password => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(self.render_keychain_selector(cx))
+                .when(self.selected_keychain_id.is_some(), |this| {
+                    this.child(self.render_selected_item_hint())
+                })
+                .when(self.selected_keychain_id.is_none(), |this| {
+                    this.child(self.render_new_identity_fields())
+                })
                 .into_any_element(),
-            AuthType::PrivateKey => self
-                .render_labeled_input("Key Path (optional)", &self.key_path_input)
+            AuthType::PrivateKey => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(self.render_keychain_selector(cx))
+                .when(self.selected_keychain_id.is_some(), |this| {
+                    this.child(self.render_selected_item_hint())
+                })
+                .when(self.selected_keychain_id.is_none(), |this| {
+                    this.child(self.render_new_key_fields())
+                })
                 .into_any_element(),
             AuthType::Agent => div()
                 .w_full()
@@ -444,13 +832,12 @@ impl HostForm {
                     div()
                         .text_xs()
                         .text_color(rgb(0x666688))
-                        .child("Uses SSH agent for authentication"),
+                        .child("Uses SSH agent for authentication."),
                 )
                 .into_any_element(),
         }
     }
 
-    /// 渲染表单头部
     fn render_header(&self) -> impl IntoElement {
         let is_editing = self.editing_config_id.is_some();
         let (title, subtitle) = if is_editing {
@@ -474,7 +861,6 @@ impl HostForm {
             .child(div().text_xs().text_color(rgb(0x8888aa)).child(subtitle))
     }
 
-    /// 渲染错误/成功消息
     fn render_message(&self) -> Option<impl IntoElement> {
         if let Some(ref error) = self.error_message {
             Some(
@@ -517,7 +903,6 @@ impl HostForm {
         }
     }
 
-    /// 渲染操作按钮
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
@@ -526,7 +911,6 @@ impl HostForm {
             .gap(px(8.0))
             .pt(px(16.0))
             .child(
-                // Cancel button
                 div()
                     .flex_1()
                     .h(px(36.0))
@@ -552,7 +936,6 @@ impl HostForm {
                     ),
             )
             .child(
-                // Save button
                 div()
                     .flex_1()
                     .h(px(36.0))
@@ -605,11 +988,8 @@ impl Render for HostForm {
                     .flex()
                     .flex_col()
                     .gap(px(12.0))
-                    // Nickname
                     .child(self.render_labeled_input("Nickname (optional)", &self.nickname_input))
-                    // Hostname
                     .child(self.render_labeled_input("Host Address *", &self.hostname_input))
-                    // Port and Username row
                     .child(
                         div()
                             .w_full()
@@ -625,9 +1005,7 @@ impl Render for HostForm {
                                 self.render_labeled_input("Username *", &self.username_input),
                             )),
                     )
-                    // Authentication type
                     .child(self.render_auth_type_selector(cx))
-                    // Extra field based on auth type
                     .child(self.render_auth_extra_field(cx)),
             )
             .child(self.render_buttons(cx))

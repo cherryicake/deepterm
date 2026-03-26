@@ -3,12 +3,15 @@ use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
     px, svg,
 };
+use std::path::PathBuf;
 
 use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
 use crate::settings_hub::host_form::HostForm;
 use crate::settings_hub::hosts_view::HostsView;
+use crate::settings_hub::keychain_view::{KeychainEditor, KeychainView};
 use crate::ssh::config::SshConnectionConfig;
+use crate::ssh::keychain::KeychainItem;
 use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
@@ -85,7 +88,7 @@ impl SettingsHubPage {
 /// Left sidebar width in pixels
 pub const LEFT_SIDEBAR_WIDTH: f32 = 200.0;
 /// Right sidebar width in pixels
-pub const RIGHT_SIDEBAR_WIDTH: f32 = 300.0;
+pub const RIGHT_SIDEBAR_WIDTH: f32 = 360.0;
 
 /// Marker trait for sidebar width configuration
 pub trait SidebarWidth: 'static {
@@ -301,10 +304,17 @@ pub type SettingsHubLeftSidebar = SettingsHubSidebar<LeftSidebarWidth>;
 /// SettingsHub 右侧边栏组件 (type alias for backward compatibility)
 pub type SettingsHubRightSidebar = SettingsHubSidebar<RightSidebarWidth>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightSidebarContent {
+    HostForm,
+    KeychainEditor,
+}
+
 /// SettingsHub 中心内容区域 - 根据当前页面渲染不同内容
 pub struct SettingsHubCenter {
     current_page: SettingsHubPage,
     hosts_view: Entity<HostsView>,
+    keychain_view: Entity<KeychainView>,
     focus_handle: FocusHandle,
 }
 
@@ -321,10 +331,12 @@ impl SettingsHubCenter {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let hosts_view = HostsView::new_with_workspace(cx, workspace);
+            let keychain_view = KeychainView::new(cx);
 
             Self {
                 current_page: page,
                 hosts_view,
+                keychain_view,
                 focus_handle,
             }
         })
@@ -350,6 +362,33 @@ impl SettingsHubCenter {
         });
     }
 
+    pub fn setup_new_key_callback<F>(&self, cx: &mut Context<Self>, callback: F)
+    where
+        F: Fn(&mut App, Option<PathBuf>) + Send + Sync + Clone + 'static,
+    {
+        self.keychain_view.update(cx, |keychain_view, _cx| {
+            keychain_view.on_new_key_click(callback);
+        });
+    }
+
+    pub fn setup_new_identity_callback<F>(&self, cx: &mut Context<Self>, callback: F)
+    where
+        F: Fn(&mut App) + Send + Sync + Clone + 'static,
+    {
+        self.keychain_view.update(cx, |keychain_view, _cx| {
+            keychain_view.on_new_identity_click(callback);
+        });
+    }
+
+    pub fn setup_edit_keychain_item_callback<F>(&self, cx: &mut Context<Self>, callback: F)
+    where
+        F: Fn(&mut App, KeychainItem) + Send + Sync + Clone + 'static,
+    {
+        self.keychain_view.update(cx, |keychain_view, _cx| {
+            keychain_view.on_edit_item_click(callback);
+        });
+    }
+
     pub fn set_page(&mut self, page: SettingsHubPage, cx: &mut Context<Self>) {
         self.current_page = page;
         cx.notify();
@@ -362,19 +401,16 @@ impl SettingsHubCenter {
         });
     }
 
+    pub fn refresh_keychain(&self, cx: &mut Context<Self>) {
+        self.keychain_view.update(cx, |keychain_view, cx| {
+            keychain_view.refresh_items(cx);
+        });
+    }
+
     fn render_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         match self.current_page {
             SettingsHubPage::Hosts => div().size_full().child(self.hosts_view.clone()),
-            SettingsHubPage::Keychain => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_color(gpui::rgb(0x8888aa))
-                        .child("Keychain settings coming soon..."),
-                ),
+            SettingsHubPage::Keychain => div().size_full().child(self.keychain_view.clone()),
             SettingsHubPage::Agent => div()
                 .size_full()
                 .flex()
@@ -420,9 +456,11 @@ pub struct SettingsHubView {
     left_sidebar: Entity<SettingsHubLeftSidebar>,
     center: Entity<SettingsHubCenter>,
     host_form: Entity<HostForm>,
+    keychain_editor: Entity<KeychainEditor>,
     right_sidebar_visible: bool,
     /// 侧边栏是否应该被渲染（包括退出动画期间）
     right_sidebar_rendered: bool,
+    right_sidebar_content: RightSidebarContent,
     focus_handle: FocusHandle,
 }
 
@@ -445,18 +483,10 @@ impl SettingsHubView {
 
             // 创建新主机表单
             let host_form = HostForm::new(cx);
+            let keychain_editor = KeychainEditor::new(cx);
 
-            // 设置左侧边栏点击回调
-            let center_for_callback = center.clone();
             left_sidebar.update(cx, |sidebar, _cx| {
                 sidebar.set_active_item("hosts", _cx);
-                sidebar.on_item_click(move |item_id, _app| {
-                    if let Some(page) = SettingsHubPage::from_item_id(&item_id) {
-                        center_for_callback.update(_app, |center, cx| {
-                            center.set_page(page, cx);
-                        });
-                    }
-                });
             });
 
             // 注意：回调会在创建 Entity 后设置
@@ -465,8 +495,10 @@ impl SettingsHubView {
                 left_sidebar,
                 center,
                 host_form,
+                keychain_editor,
                 right_sidebar_visible: false,
                 right_sidebar_rendered: false,
+                right_sidebar_content: RightSidebarContent::HostForm,
                 focus_handle,
             }
         })
@@ -474,6 +506,21 @@ impl SettingsHubView {
 
     /// Setup callbacks after entity creation
     pub fn setup_callbacks(&self, cx: &mut Context<Self>) {
+        let view_entity_for_sidebar = cx.entity();
+        let center_for_sidebar = self.center.clone();
+        self.left_sidebar.update(cx, |sidebar, _cx| {
+            sidebar.on_item_click(move |item_id, app| {
+                if let Some(page) = SettingsHubPage::from_item_id(&item_id) {
+                    center_for_sidebar.update(app, |center, cx| {
+                        center.set_page(page, cx);
+                    });
+                    view_entity_for_sidebar.update(app, |view, cx| {
+                        view.close_right_sidebar(cx);
+                    });
+                }
+            });
+        });
+
         // 设置 HostsView 的 NEW HOST 按钮回调
         let view_entity = cx.entity();
         self.center.update(cx, |center, cx| {
@@ -483,7 +530,7 @@ impl SettingsHubView {
                     view.host_form.update(cx, |form, cx| {
                         form.reset_form(cx);
                     });
-                    view.toggle_right_sidebar(cx);
+                    view.open_right_sidebar_with(RightSidebarContent::HostForm, cx);
                 });
             });
         });
@@ -494,6 +541,46 @@ impl SettingsHubView {
             center.setup_edit_host_callback(cx, move |app, config| {
                 view_entity_for_edit.update(app, |view, cx| {
                     view.edit_host(&config, cx);
+                });
+            });
+        });
+
+        let view_entity_for_new_key = cx.entity();
+        self.center.update(cx, |center, cx| {
+            center.setup_new_key_callback(cx, move |app, path| {
+                view_entity_for_new_key.update(app, |view, cx| {
+                    view.keychain_editor.update(cx, |editor, cx| {
+                        if let Some(path) = path.clone() {
+                            editor.import_dropped_key_path(path, cx);
+                        } else {
+                            editor.start_new_key(cx);
+                        }
+                    });
+                    view.open_right_sidebar_with(RightSidebarContent::KeychainEditor, cx);
+                });
+            });
+        });
+
+        let view_entity_for_new_identity = cx.entity();
+        self.center.update(cx, |center, cx| {
+            center.setup_new_identity_callback(cx, move |app| {
+                view_entity_for_new_identity.update(app, |view, cx| {
+                    view.keychain_editor.update(cx, |editor, cx| {
+                        editor.start_new_identity(cx);
+                    });
+                    view.open_right_sidebar_with(RightSidebarContent::KeychainEditor, cx);
+                });
+            });
+        });
+
+        let view_entity_for_edit_keychain = cx.entity();
+        self.center.update(cx, |center, cx| {
+            center.setup_edit_keychain_item_callback(cx, move |app, item| {
+                view_entity_for_edit_keychain.update(app, |view, cx| {
+                    view.keychain_editor.update(cx, |editor, cx| {
+                        editor.load_item(&item, cx);
+                    });
+                    view.open_right_sidebar_with(RightSidebarContent::KeychainEditor, cx);
                 });
             });
         });
@@ -525,6 +612,26 @@ impl SettingsHubView {
                 });
             });
         });
+
+        let view_entity_for_keychain_cancel = cx.entity();
+        let view_entity_for_keychain_save = cx.entity();
+        let center_for_keychain_refresh = self.center.clone();
+        self.keychain_editor.update(cx, |editor, _cx| {
+            editor.on_cancel(move |app| {
+                view_entity_for_keychain_cancel.update(app, |view, cx| {
+                    view.close_right_sidebar(cx);
+                });
+            });
+
+            editor.on_saved(move |app| {
+                center_for_keychain_refresh.update(app, |center, cx| {
+                    center.refresh_keychain(cx);
+                });
+                view_entity_for_keychain_save.update(app, |view, cx| {
+                    view.close_right_sidebar(cx);
+                });
+            });
+        });
     }
 
     /// 获取左侧边栏实体
@@ -550,6 +657,11 @@ impl SettingsHubView {
         self.right_sidebar_visible = true;
         self.right_sidebar_rendered = true;
         cx.notify();
+    }
+
+    fn open_right_sidebar_with(&mut self, content: RightSidebarContent, cx: &mut Context<Self>) {
+        self.right_sidebar_content = content;
+        self.open_right_sidebar(cx);
     }
 
     pub fn toggle_right_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -586,7 +698,7 @@ impl SettingsHubView {
         self.host_form.update(cx, |form, cx| {
             form.load_config(config, cx);
         });
-        self.open_right_sidebar(cx);
+        self.open_right_sidebar_with(RightSidebarContent::HostForm, cx);
     }
 }
 
@@ -594,6 +706,10 @@ impl Render for SettingsHubView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let show_right_sidebar = self.right_sidebar_visible;
         let render_sidebar = self.right_sidebar_rendered;
+        let sidebar_content = match self.right_sidebar_content {
+            RightSidebarContent::HostForm => self.host_form.clone().into_any_element(),
+            RightSidebarContent::KeychainEditor => self.keychain_editor.clone().into_any_element(),
+        };
 
         div()
             .id("settings-hub-view")
@@ -619,7 +735,7 @@ impl Render for SettingsHubView {
                         .render_with_toggle_animation(
                             "right-sidebar-animation",
                             show_right_sidebar,
-                            self.host_form.clone(),
+                            sidebar_content,
                         ),
                 )
             })
