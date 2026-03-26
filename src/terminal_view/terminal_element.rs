@@ -12,8 +12,7 @@ use gpui::{
     FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
     TextRun, TextStyle, WhiteSpace, Window, fill, point, px, rgb, size,
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
 const CURSOR_THICKNESS_RATIO: f32 = 0.15;
@@ -661,53 +660,51 @@ impl TerminalElement {
         font_size: Pixels,
         cell_width: Pixels,
     ) -> Option<Vec<BatchedTextRun>> {
-        let (left, right) = range;
+        let (mut rebuild_left, mut rebuild_right) = range;
+
+        // Expand the rebuild window to cover the whole contiguous cached run segment
+        // around the dirty range. This prevents incremental updates from leaving
+        // adjacent compatible runs split across the cache boundary.
+        loop {
+            let mut changed = false;
+            for run in cached_runs {
+                let run_start = run.start_col;
+                let run_end = run.start_col + run.cell_count.saturating_sub(1);
+
+                if run_end.saturating_add(1) < rebuild_left
+                    || run_start > rebuild_right.saturating_add(1)
+                {
+                    continue;
+                }
+
+                let next_left = rebuild_left.min(run_start);
+                let next_right = rebuild_right.max(run_end);
+                if next_left != rebuild_left || next_right != rebuild_right {
+                    rebuild_left = next_left;
+                    rebuild_right = next_right;
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
         let mut merged_runs: Vec<BatchedTextRun> = Vec::new();
 
         for run in cached_runs {
             let run_start = run.start_col;
             let run_end = run.start_col + run.cell_count.saturating_sub(1);
 
-            if run_end < left || run_start > right {
+            if run_end < rebuild_left || run_start > rebuild_right {
                 merged_runs.push(run.clone());
-                continue;
             }
-
-            if run_start < left {
-                let (left_part, right_part) = Self::split_run_at_col(run, left)?;
-                if let Some(left_part) = left_part {
-                    merged_runs.push(left_part);
-                }
-
-                // If there is no right part, the dirty range fully covered the run tail.
-                let Some(right_part) = right_part else {
-                    continue;
-                };
-
-                let right_end = right_part.start_col + right_part.cell_count.saturating_sub(1);
-                if right_end > right {
-                    let (_, right_tail) = Self::split_run_at_col(&right_part, right + 1)?;
-                    if let Some(right_tail) = right_tail {
-                        merged_runs.push(right_tail);
-                    }
-                }
-                continue;
-            }
-
-            if run_end > right {
-                let (_, right_tail) = Self::split_run_at_col(run, right + 1)?;
-                if let Some(right_tail) = right_tail {
-                    merged_runs.push(right_tail);
-                }
-                continue;
-            }
-
-            // Fully covered runs are dropped and rebuilt from dirty-range cells.
         }
 
         let dirty_cells = cells
             .iter()
-            .filter(|cell| (left..=right).contains(&cell.point.column.0));
+            .filter(|cell| (rebuild_left..=rebuild_right).contains(&cell.point.column.0));
         let dirty_entry = Self::layout_row(
             row_idx,
             dirty_cells,
@@ -720,73 +717,6 @@ impl TerminalElement {
         merged_runs.extend(dirty_entry.runs);
         merged_runs.sort_by_key(|run| run.start_col);
         Some(merged_runs)
-    }
-
-    fn split_run_at_col(
-        run: &BatchedTextRun,
-        split_col: usize,
-    ) -> Option<(Option<BatchedTextRun>, Option<BatchedTextRun>)> {
-        let run_start = run.start_col;
-        let run_end_exclusive = run.start_col + run.cell_count;
-
-        if split_col <= run_start {
-            return Some((None, Some(run.clone())));
-        }
-        if split_col >= run_end_exclusive {
-            return Some((Some(run.clone()), None));
-        }
-
-        let cell_offset = split_col - run_start;
-        let byte_offset =
-            Self::byte_offset_for_cell_offset(run.shaped_line.text.as_ref(), cell_offset)?;
-
-        if byte_offset == 0 {
-            return Some((None, Some(run.clone())));
-        }
-        if byte_offset >= run.shaped_line.len() {
-            return Some((Some(run.clone()), None));
-        }
-
-        let (left_line, right_line) = run.shaped_line.split_at(byte_offset);
-        let left_cells = cell_offset;
-        let right_cells = run.cell_count.saturating_sub(left_cells);
-
-        let left_run = (left_cells > 0)
-            .then(|| BatchedTextRun::new(run.start_row, run.start_col, left_cells, left_line));
-        let right_run = (right_cells > 0)
-            .then(|| BatchedTextRun::new(run.start_row, split_col, right_cells, right_line));
-
-        Some((left_run, right_run))
-    }
-
-    fn byte_offset_for_cell_offset(text: &str, cell_offset: usize) -> Option<usize> {
-        if cell_offset == 0 {
-            return Some(0);
-        }
-
-        let mut consumed_cells = 0usize;
-        for (idx, grapheme) in text.grapheme_indices(true) {
-            let width = UnicodeWidthStr::width(grapheme);
-            if width == 0 {
-                continue;
-            }
-
-            if consumed_cells == cell_offset {
-                return Some(idx);
-            }
-
-            if consumed_cells + width > cell_offset {
-                // Split point falls in the middle of a wide character.
-                return None;
-            }
-
-            consumed_cells += width;
-            if consumed_cells == cell_offset {
-                return Some(idx + grapheme.len());
-            }
-        }
-
-        (consumed_cells == cell_offset).then_some(text.len())
     }
 }
 

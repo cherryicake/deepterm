@@ -132,12 +132,18 @@ struct ResizeDragState {
 }
 
 impl Workspace {
+    /// 计算指定 tab 的有效广播状态。
+    /// 只有 WorkSpace 类型的 tab 才允许真正开启广播。
+    fn get_tab_broadcast_state(&self, tab_id: &str) -> bool {
+        self.tabs
+            .get(tab_id)
+            .map(|tab| tab.tab_type == TabType::Workspace && tab.broadcast_enabled)
+            .unwrap_or(false)
+    }
+
     /// 获取当前活动tab的广播状态
     fn get_current_broadcast_state(&self) -> bool {
-        self.tabs
-            .get(&self.active_tab_id)
-            .map(|tab| tab.broadcast_enabled)
-            .unwrap_or(false)
+        self.get_tab_broadcast_state(&self.active_tab_id)
     }
 
     /// 设置当前活动tab的广播状态
@@ -145,6 +151,29 @@ impl Workspace {
         if let Some(tab) = self.tabs.get_mut(&self.active_tab_id) {
             tab.broadcast_enabled = enabled;
         }
+    }
+
+    /// 将指定 tab 下所有 panel 的广播回调与 tab 状态同步。
+    fn sync_tab_broadcast_to_panels(&self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            return;
+        };
+
+        let broadcast_enabled = self.get_tab_broadcast_state(tab_id);
+        for panel in tab_info.container.collect_panels_vec() {
+            panel.update(cx, |p, cx| {
+                p.set_broadcast_enabled(broadcast_enabled, cx);
+            });
+        }
+    }
+
+    /// 普通 tab 不支持广播；在退化为普通 tab 时需要清空其广播状态与回调。
+    fn disable_tab_broadcast(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.broadcast_enabled = false;
+        }
+
+        self.sync_tab_broadcast_to_panels(tab_id, cx);
     }
 
     /// 生成带序号的标签名称
@@ -434,6 +463,15 @@ impl Workspace {
 
     /// 处理广播状态切换
     fn handle_broadcast_toggle(&mut self, cx: &mut Context<Self>) {
+        let is_workspace_tab = self
+            .tabs
+            .get(&self.active_tab_id)
+            .map(|tab| tab.tab_type == TabType::Workspace)
+            .unwrap_or(false);
+        if !is_workspace_tab {
+            return;
+        }
+
         // 切换当前tab的广播状态
         let new_state = !self.get_current_broadcast_state();
         self.set_current_broadcast_state(new_state);
@@ -669,6 +707,10 @@ impl Workspace {
         // 重新订阅所有panel
         self.subscribe_to_panels(cx);
 
+        if panel_count == 1 {
+            self.disable_tab_broadcast(&target_tab_id, cx);
+        }
+
         cx.notify();
     }
 
@@ -902,6 +944,7 @@ impl Workspace {
         let panel_count = tab_info.container.panel_count();
         if panel_count == 1 && tab_info.tab_type == TabType::Workspace {
             tab_info.tab_type = TabType::Normal;
+            tab_info.broadcast_enabled = false;
 
             // 获取剩余panel的标签名
             if let Some(first_panel) = tab_info.container.get_first_panel() {
@@ -1076,8 +1119,9 @@ impl Workspace {
             // 更新TabBar的活动tab
             let tab_id = tab_id.to_string();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.set_active_tab(tab_id, cx);
+                tab_bar.set_active_tab(tab_id.clone(), cx);
             });
+            self.sync_tab_broadcast_to_panels(&tab_id, cx);
             cx.notify();
         }
     }
@@ -1155,10 +1199,9 @@ impl Workspace {
 
         // 设置正确的 workspace_id 和广播状态
         let workspace_id = self.workspace_id.clone();
-        let broadcast_enabled = self.get_current_broadcast_state();
         panel.update(cx, |p, cx| {
             p.set_workspace_id(workspace_id);
-            p.set_broadcast_enabled(broadcast_enabled, cx);
+            p.set_broadcast_enabled(false, cx);
         });
 
         self.tabs.insert(
