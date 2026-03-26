@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
-    px, svg,
+    App, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Window, div, px, svg,
 };
 use std::path::PathBuf;
 
@@ -12,6 +12,7 @@ use crate::settings_hub::hosts_view::HostsView;
 use crate::settings_hub::keychain_view::{KeychainEditor, KeychainView};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::KeychainItem;
+use crate::theme::{ActiveTheme, AppTheme, ThemeState};
 use crate::workspace::workspace::Workspace;
 
 /// SettingsHub 侧边栏项
@@ -196,7 +197,7 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                             div()
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(Sidebar::section_title_color())
+                                .text_color(Sidebar::section_title_color(cx))
                                 .child(t.to_string()),
                         ),
                 );
@@ -223,9 +224,9 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                     .gap_3()
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    .when(is_active, |this| this.bg(Sidebar::selected_background()))
+                    .when(is_active, |this| this.bg(Sidebar::selected_background(cx)))
                     .when(!is_active, |this| {
-                        this.hover(|style| style.bg(Sidebar::hover_background()))
+                        this.hover(|style| style.bg(Sidebar::hover_background(cx)))
                     })
                     .child(
                         div()
@@ -236,9 +237,9 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                             .justify_center()
                             .child(svg().size(px(18.0)).path(icon.path()).text_color(
                                 if is_active {
-                                    Sidebar::selected_text_color()
+                                    Sidebar::selected_text_color(cx)
                                 } else {
-                                    Sidebar::text_color_secondary()
+                                    Sidebar::text_color_secondary(cx)
                                 },
                             )),
                     )
@@ -247,9 +248,9 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                             div()
                                 .text_sm()
                                 .text_color(if is_active {
-                                    Sidebar::selected_text_color()
+                                    Sidebar::selected_text_color(cx)
                                 } else {
-                                    Sidebar::text_color()
+                                    Sidebar::text_color(cx)
                                 })
                                 .child(label),
                         ),
@@ -265,11 +266,11 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                                 .items_center()
                                 .justify_center()
                                 .rounded_md()
-                                .bg(Sidebar::badge_background())
+                                .bg(Sidebar::badge_background(cx))
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(Sidebar::badge_text_color())
+                                        .text_color(Sidebar::badge_text_color(cx))
                                         .child(format!("{}", count)),
                                 ),
                         )
@@ -294,7 +295,7 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
             content = content.child(section_div);
         }
 
-        Sidebar::new().with_width(W::WIDTH).render(content)
+        Sidebar::new().with_width(W::WIDTH).render(content, cx)
     }
 }
 
@@ -315,6 +316,7 @@ pub struct SettingsHubCenter {
     current_page: SettingsHubPage,
     hosts_view: Entity<HostsView>,
     keychain_view: Entity<KeychainView>,
+    theme_scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
 }
 
@@ -332,11 +334,13 @@ impl SettingsHubCenter {
             let focus_handle = cx.focus_handle();
             let hosts_view = HostsView::new_with_workspace(cx, workspace);
             let keychain_view = KeychainView::new(cx);
+            let theme_scroll_handle = ScrollHandle::new();
 
             Self {
                 current_page: page,
                 hosts_view,
                 keychain_view,
+                theme_scroll_handle,
                 focus_handle,
             }
         })
@@ -407,7 +411,222 @@ impl SettingsHubCenter {
         });
     }
 
-    fn render_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview_row(colors: &[Hsla]) -> gpui::Div {
+        div().flex().gap_1().children(
+            colors
+                .iter()
+                .copied()
+                .map(|color| div().w(px(18.0)).h(px(18.0)).rounded(px(4.0)).bg(color)),
+        )
+    }
+
+    fn render_theme_card(theme: &AppTheme, is_active: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let preview_colors = theme.terminal.preview_colors();
+        let theme_id = theme.id.to_string();
+        let appearance_label = if theme.appearance.is_dark() {
+            "Dark"
+        } else {
+            "Light"
+        };
+
+        let ansi_top = Self::render_preview_row(&preview_colors[..8]);
+        let ansi_bottom = Self::render_preview_row(&preview_colors[8..]);
+
+        div()
+            .w_full()
+            .p(px(14.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(if is_active {
+                theme.ui.accent
+            } else {
+                theme.ui.border
+            })
+            .bg(theme.ui.panel_background)
+            .cursor_pointer()
+            .hover({
+                let hover_border = theme.ui.accent_hover;
+                move |style| style.border_color(hover_border)
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.ui.text)
+                                            .child(theme.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(8.0))
+                                            .h(px(22.0))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(999.0))
+                                            .bg(theme.ui.elevated_background)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.ui.text_subtle)
+                                                    .child(appearance_label),
+                                            ),
+                                    )
+                                    .when(is_active, |this| {
+                                        this.child(
+                                            div()
+                                                .px(px(8.0))
+                                                .h(px(22.0))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(999.0))
+                                                .bg(theme.ui.accent)
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme.ui.accent_foreground)
+                                                        .child("Active"),
+                                                ),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .line_height(px(20.0))
+                                    .text_color(theme.ui.text_muted)
+                                    .child(theme.description.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .w(px(256.0))
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded(px(8.0))
+                                            .bg(theme.ui.title_bar_background),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded(px(8.0))
+                                            .bg(theme.ui.panel_background),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded(px(8.0))
+                                            .bg(theme.ui.accent),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded(px(8.0))
+                                            .bg(theme.terminal.background),
+                                    ),
+                            )
+                            .child(ansi_top)
+                            .child(ansi_bottom),
+                    ),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |_this, _event, _window, cx| {
+                    if ThemeState::set_active(&theme_id, cx) {
+                        cx.notify();
+                    }
+                }),
+            )
+    }
+
+    fn render_theme_page(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active_theme_id = ThemeState::global(cx).active_theme_id().to_string();
+        let current_theme_name = cx.theme().name.clone();
+        let themes = ThemeState::themes(cx).to_vec();
+        let mut theme_cards = div().w_full().flex().flex_col().gap_3();
+
+        for theme in themes.iter() {
+            theme_cards = theme_cards.child(Self::render_theme_card(
+                theme,
+                theme.id == active_theme_id.as_str(),
+                cx,
+            ));
+        }
+
+        div().size_full().flex().flex_col().overflow_hidden().child(
+            div()
+                .w_full()
+                .max_w(px(960.0))
+                .mx_auto()
+                .flex()
+                .flex_col()
+                .gap_5()
+                .p(px(24.0))
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(cx.theme().ui.text)
+                                .child("Theme"),
+                        )
+                        .child(div().text_sm().text_color(cx.theme().ui.text_muted).child(
+                            format!(
+                                "当前主题: {}。界面表面和终端 ANSI/selection/cursor 会一起切换。",
+                                current_theme_name
+                            ),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("theme-scroll")
+                        .track_scroll(&self.theme_scroll_handle)
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(theme_cards),
+                ),
+        )
+    }
+
+    fn render_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match self.current_page {
             SettingsHubPage::Hosts => div().size_full().child(self.hosts_view.clone()),
             SettingsHubPage::Keychain => div().size_full().child(self.keychain_view.clone()),
@@ -418,19 +637,10 @@ impl SettingsHubCenter {
                 .justify_center()
                 .child(
                     div()
-                        .text_color(gpui::rgb(0x8888aa))
+                        .text_color(cx.theme().ui.text_muted)
                         .child("Agent settings coming soon..."),
                 ),
-            SettingsHubPage::Theme => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_color(gpui::rgb(0x8888aa))
-                        .child("Theme settings coming soon..."),
-                ),
+            SettingsHubPage::Theme => self.render_theme_page(cx),
         }
     }
 }
@@ -736,6 +946,7 @@ impl Render for SettingsHubView {
                             "right-sidebar-animation",
                             show_right_sidebar,
                             sidebar_content,
+                            _cx,
                         ),
                 )
             })
@@ -751,6 +962,7 @@ pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
             SettingsHubItem::new("keychain", Icon::KeyShield, "Keychain"),
         ]),
         // 终端设置分组
-        SettingsHubSection::new("terminal_setting", Some("偏好设置")).with_items(vec![]),
+        SettingsHubSection::new("terminal_setting", Some("偏好设置"))
+            .with_items(vec![SettingsHubItem::new("theme", Icon::Screen, "Theme")]),
     ]
 }

@@ -7,6 +7,7 @@ pub mod ssh;
 pub mod ssh_view;
 pub mod terminal;
 pub mod terminal_view;
+pub mod theme;
 pub mod workspace;
 
 use gpui::prelude::*;
@@ -128,6 +129,7 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
+            theme::init(cx);
             components::init(cx);
             terminal_view::init(cx);
             workspace::init(cx);
