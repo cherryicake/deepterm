@@ -13,7 +13,10 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::Input;
-use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore};
+use crate::ssh::keychain::{
+    KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
+    sibling_certificate_path,
+};
 
 const BG_PAGE: u32 = 0x0f0f1a;
 const BG_CARD: u32 = 0x1a1a2e;
@@ -1126,38 +1129,8 @@ impl Render for KeychainEditor {
     }
 }
 
-fn sibling_certificate_path(private_key_path: &Path) -> Option<PathBuf> {
-    let file_name = private_key_path.file_name()?.to_string_lossy();
-    Some(private_key_path.with_file_name(format!("{}-cert.pub", file_name)))
-}
-
 fn normalize_imported_key_path(path: PathBuf) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
-    let path_str = path.to_string_lossy();
-    if path_str.ends_with("-cert.pub") {
-        let private_key = PathBuf::from(path_str.trim_end_matches("-cert.pub"));
-        if private_key.exists() {
-            return Ok((private_key, Some(path)));
-        }
-        return Err(anyhow!(
-            "Selected certificate file has no matching private key рядом."
-        ));
-    }
-
-    if path_str.ends_with(".pub") {
-        let private_key = PathBuf::from(path_str.trim_end_matches(".pub"));
-        if private_key.exists() {
-            let certificate = sibling_certificate_path(&private_key).filter(|p| p.exists());
-            return Ok((private_key, certificate));
-        }
-        return Err(anyhow!(
-            "Selected file is a public key. Please choose the private key file instead."
-        ));
-    }
-
-    Ok((
-        path.clone(),
-        sibling_certificate_path(&path).filter(|p| p.exists()),
-    ))
+    normalize_private_key_path(&path)
 }
 
 fn managed_key_file_path(label: &str, existing_id: Option<&str>) -> anyhow::Result<PathBuf> {

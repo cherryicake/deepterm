@@ -274,6 +274,9 @@ impl KeychainStore {
         key_flavor: KeychainKeyFlavor,
         passphrase: Option<&str>,
     ) -> anyhow::Result<String> {
+        let (key_path, inferred_certificate_path) = normalize_private_key_path(&key_path)?;
+        let certificate_path = certificate_path.or(inferred_certificate_path);
+        let key_flavor = normalized_key_flavor(key_flavor, &key_path, certificate_path.as_deref());
         let algorithm = infer_key_algorithm(&key_path);
         let mut item = KeychainItem::key(
             label,
@@ -306,6 +309,9 @@ impl KeychainStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let (key_path, inferred_certificate_path) = normalize_private_key_path(&key_path)?;
+        let certificate_path = certificate_path.or(inferred_certificate_path);
+        let key_flavor = normalized_key_flavor(key_flavor, &key_path, certificate_path.as_deref());
 
         match existing_id {
             Some(id) => {
@@ -444,6 +450,7 @@ pub fn migrate_auth_method(
             Ok(true)
         }
         AuthMethod::PrivateKey { path, passphrase } => {
+            let (normalized_path, certificate_path) = normalize_private_key_path(path)?;
             let label = path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -451,9 +458,9 @@ pub fn migrate_auth_method(
                 .unwrap_or_else(|| format!("{} key", connection.host_label()));
             let keychain_id = store.create_key(
                 &label,
-                path.clone(),
-                None,
-                classify_key_flavor(path, None),
+                normalized_path,
+                certificate_path.clone(),
+                classify_key_flavor(path, certificate_path.as_deref()),
                 passphrase.as_deref(),
             )?;
             connection.auth_method = AuthMethod::key_ref(keychain_id);
@@ -490,23 +497,28 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
                 .key_path
                 .clone()
                 .ok_or_else(|| anyhow!("Keychain 私钥缺少路径配置: {}", keychain_id))?;
+            let (path, inferred_certificate_path) = normalize_private_key_path(&path)?;
             let passphrase = store.get_key_passphrase_secret(keychain_id)?;
             Ok(ResolvedAuthMethod::PrivateKey {
                 path,
                 passphrase,
-                certificate_path: item.certificate_path.clone(),
+                certificate_path: item.certificate_path.clone().or(inferred_certificate_path),
                 key_flavor: item.key_flavor,
             })
         }
         AuthMethod::Password { password } => Ok(ResolvedAuthMethod::Password {
             password: password.clone(),
         }),
-        AuthMethod::PrivateKey { path, passphrase } => Ok(ResolvedAuthMethod::PrivateKey {
-            path: path.clone(),
-            passphrase: passphrase.clone(),
-            certificate_path: None,
-            key_flavor: classify_key_flavor(path, None),
-        }),
+        AuthMethod::PrivateKey { path, passphrase } => {
+            let (path, certificate_path) = normalize_private_key_path(path)?;
+            let key_flavor = classify_key_flavor(&path, certificate_path.as_deref());
+            Ok(ResolvedAuthMethod::PrivateKey {
+                path,
+                passphrase: passphrase.clone(),
+                certificate_path,
+                key_flavor,
+            })
+        }
         AuthMethod::Agent => Ok(ResolvedAuthMethod::Agent),
         AuthMethod::Auto => Ok(ResolvedAuthMethod::Auto),
     }
@@ -534,7 +546,8 @@ pub fn preferred_ssh_transport(auth_method: &AuthMethod) -> anyhow::Result<Prefe
 }
 
 pub fn load_key_material(path: &Path, passphrase: Option<&str>) -> anyhow::Result<Arc<PrivateKey>> {
-    let key = load_secret_key(path, passphrase)
+    let (path, _) = normalize_private_key_path(path)?;
+    let key = load_secret_key(&path, passphrase)
         .map_err(|err| anyhow!("加载私钥失败 ({:?}): {}", path, err))?;
     Ok(Arc::new(key))
 }
@@ -565,6 +578,71 @@ pub fn classify_key_flavor(key_path: &Path, certificate_path: Option<&Path>) -> 
     KeychainKeyFlavor::Key
 }
 
+fn normalized_key_flavor(
+    requested_flavor: KeychainKeyFlavor,
+    key_path: &Path,
+    certificate_path: Option<&Path>,
+) -> KeychainKeyFlavor {
+    if certificate_path.is_some() {
+        return KeychainKeyFlavor::Certificate;
+    }
+
+    match requested_flavor {
+        KeychainKeyFlavor::TouchId | KeychainKeyFlavor::Fido2 => requested_flavor,
+        KeychainKeyFlavor::Key | KeychainKeyFlavor::Certificate => {
+            classify_key_flavor(key_path, certificate_path)
+        }
+    }
+}
+
+pub fn expand_home_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+
+    if let Some(remainder) = path_str.strip_prefix("~/")
+        && let Some(home_dir) = dirs::home_dir()
+    {
+        return home_dir.join(remainder);
+    }
+
+    path.to_path_buf()
+}
+
+pub fn sibling_certificate_path(private_key_path: &Path) -> Option<PathBuf> {
+    let file_name = private_key_path.file_name()?.to_string_lossy();
+    Some(private_key_path.with_file_name(format!("{}-cert.pub", file_name)))
+}
+
+pub fn normalize_private_key_path(path: &Path) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    let expanded_path = expand_home_path(path);
+    let path_str = expanded_path.to_string_lossy();
+
+    if path_str.ends_with("-cert.pub") {
+        let private_key = PathBuf::from(path_str.trim_end_matches("-cert.pub"));
+        if private_key.exists() {
+            return Ok((private_key, Some(expanded_path)));
+        }
+        return Err(anyhow!("选择的证书文件没有对应的私钥: {:?}", expanded_path));
+    }
+
+    if path_str.ends_with(".pub") {
+        let private_key = PathBuf::from(path_str.trim_end_matches(".pub"));
+        if private_key.exists() {
+            let certificate_path = sibling_certificate_path(&private_key).filter(|p| p.exists());
+            return Ok((private_key, certificate_path));
+        }
+        return Err(anyhow!(
+            "选中的文件是公钥，请改为选择私钥文件: {:?}",
+            expanded_path
+        ));
+    }
+
+    let certificate_path = sibling_certificate_path(&expanded_path).filter(|p| p.exists());
+    Ok((expanded_path, certificate_path))
+}
+
 fn infer_key_algorithm(path: &Path) -> Option<String> {
     let filename = path.file_name()?.to_string_lossy();
     KeyType::from_filename(&filename).map(|key_type| match key_type {
@@ -573,4 +651,55 @@ fn infer_key_algorithm(path: &Path) -> Option<String> {
         KeyType::Ed25519 => "ED25519".to_string(),
         KeyType::Dss => "DSS".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::normalize_private_key_path;
+
+    fn temp_ssh_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deepterm-keychain-test-{}-{}",
+            name,
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn normalizes_public_key_path_to_private_key() {
+        let private_key = temp_ssh_path("id_ed25519");
+        let public_key = std::path::PathBuf::from(format!("{}.pub", private_key.display()));
+        fs::write(&private_key, "dummy").expect("failed to write private key");
+        fs::write(&public_key, "dummy").expect("failed to write public key");
+
+        let (normalized_path, certificate_path) =
+            normalize_private_key_path(&public_key).expect("expected public key path to normalize");
+
+        assert_eq!(normalized_path, private_key);
+        assert!(certificate_path.is_none());
+
+        let _ = fs::remove_file(&public_key);
+        let _ = fs::remove_file(&private_key);
+    }
+
+    #[test]
+    fn keeps_matching_certificate_when_normalizing_cert_path() {
+        let private_key = temp_ssh_path("id_rsa");
+        let certificate_path =
+            std::path::PathBuf::from(format!("{}-cert.pub", private_key.display()));
+        fs::write(&private_key, "dummy").expect("failed to write private key");
+        fs::write(&certificate_path, "dummy").expect("failed to write certificate");
+
+        let (normalized_path, normalized_certificate_path) =
+            normalize_private_key_path(&certificate_path)
+                .expect("expected certificate path to normalize");
+
+        assert_eq!(normalized_path, private_key);
+        assert_eq!(normalized_certificate_path, Some(certificate_path.clone()));
+
+        let _ = fs::remove_file(&certificate_path);
+        let _ = fs::remove_file(&private_key);
+    }
 }
