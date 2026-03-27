@@ -5,6 +5,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
@@ -20,6 +21,7 @@ const CONTENT_PADDING_PX: f32 = 16.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostType {
     Ssh,
+    #[allow(dead_code)]
     Telnet,
 }
 
@@ -144,6 +146,7 @@ impl HostGroup {
 
 /// Hosts View Component - Main content for the Hosts settings page
 pub struct HostsView {
+    #[allow(dead_code)]
     search_query: SharedString,
     hosts: Vec<Host>,
     groups: Vec<HostGroup>,
@@ -296,36 +299,20 @@ impl HostsView {
                             .child("Find a host or ssh user@hostname..."),
                     )
                     .child(
-                        // Connect button inside search box
-                        div()
-                            .px(px(10.0))
-                            .py(px(2.0))
-                            .rounded(px(4.0))
-                            .bg(theme.tab_inactive_background)
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(theme.tab_hover_background))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_subtle)
-                                    .child("CONNECT"),
-                            ),
+                        // Connect button inside search box using Button component
+                        Button::new("search-connect-btn")
+                            .label("CONNECT")
+                            .small()
+                            .on_click(cx.listener(|_this, _event, _window, cx| {
+                                // Trigger SSH picker or connection
+                                cx.dispatch_action(&crate::ShowSshPicker);
+                            })),
                     ),
             )
     }
 
-    /// Render dropdown arrow using ChevronDown icon
-    fn render_dropdown_arrow(cx: &App) -> impl IntoElement {
-        svg()
-            .size(px(8.0))
-            .path(Icon::ChevronDown.path())
-            .text_color(cx.theme().ui.icon)
-    }
-
-    /// Render action buttons (NEW HOST, TERMINAL, SERIAL)
+    /// Render action buttons (NEW HOST, TERMINAL, CONNECT HOSTS)
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         div()
             .w_full()
             .h(px(20.0))
@@ -334,119 +321,42 @@ impl HostsView {
             .items_center()
             .gap(px(8.0))
             .child(
-                // NEW HOST button with dropdown
-                div()
-                    .id("new-host-button")
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.0))
-                    .bg(theme.tab_inactive_background)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.tab_hover_background))
-                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                // NEW HOST button using Button component
+                Button::new("new-host-btn")
+                    .label("NEW HOST")
+                    .icon(ButtonIconType::new("icons/plus.svg"))
+                    .small()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
                         if let Some(ref callback) = this.on_new_host_click {
                             callback(cx);
                         }
-                    }))
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                svg()
-                                    .size(px(10.0))
-                                    .path(Icon::Plus.path())
-                                    .text_color(theme.icon),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child("NEW HOST"),
-                            ),
-                    )
-                    .child(div().w(px(1.0)).h(px(14.0)).bg(theme.border_strong))
-                    .child(
-                        div()
-                            .px(px(6.0))
-                            .py(px(4.0))
-                            .child(Self::render_dropdown_arrow(cx)),
-                    ),
+                    })),
             )
             .child(
-                // TERMINAL button
-                div()
-                    .id("terminal-button")
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(theme.tab_inactive_background)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.tab_hover_background))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                // TERMINAL button using Button component
+                Button::new("terminal-btn")
+                    .label("TERMINAL")
+                    .icon(ButtonIconType::new("icons/terminal.svg"))
+                    .small()
+                    .on_click(cx.listener(|this, _event, window, cx| {
                         if let Some(ref workspace) = this.workspace {
                             workspace.update(cx, |w, cx| {
                                 w.create_local_terminal(window, cx);
                             });
                         }
-                    }))
-                    .child(
-                        svg()
-                            .size(px(10.0))
-                            .path(Icon::Terminal.path())
-                            .text_color(theme.icon),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("TERMINAL"),
-                    ),
+                    })),
             )
             .child(
-                // CONNECT HOST button
-                div()
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(theme.tab_inactive_background)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.tab_hover_background))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .rounded_sm()
-                            .bg(theme.icon)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .w(px(6.0))
-                                    .h(px(2.0))
-                                    .bg(theme.tab_inactive_background),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("CONNECT HOSTS"),
-                    )
-                    .child(Self::render_dropdown_arrow(cx)),
+                // CONNECT HOSTS button using Button component
+                Button::new("connect-hosts-btn")
+                    .label("CONNECT HOSTS")
+                    .small()
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        // Connect to selected host or show picker
+                        if let Some(ref host_id) = this.selected_host_id {
+                            this.connect_to_host(host_id, window, cx);
+                        }
+                    })),
             )
     }
 

@@ -8,6 +8,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::Input;
+use crate::components::button::{Button, ButtonVariants};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
@@ -945,7 +946,6 @@ impl HostForm {
     }
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         div()
             .w_full()
             .flex()
@@ -955,51 +955,24 @@ impl HostForm {
             .child(
                 div()
                     .flex_1()
-                    .h(px(36.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .bg(theme.elevated_background)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(theme.tab_hover_background))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.handle_cancel(cx);
-                        }),
-                    )
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("Cancel"),
+                        Button::new("cancel-btn")
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.handle_cancel(cx);
+                            })),
                     ),
             )
             .child(
                 div()
                     .flex_1()
-                    .h(px(36.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .bg(theme.success)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(theme.success.opacity(0.85)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.save_config(cx);
-                        }),
-                    )
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.success_foreground)
-                            .child("Save"),
+                        Button::new("save-btn")
+                            .label("Save")
+                            .success()
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.save_config(cx);
+                            })),
                     ),
             )
     }

@@ -11,6 +11,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::button::{Button, ButtonVariants, Icon as ButtonIconType, Sizable};
 use crate::components::input::Input;
 use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
@@ -364,78 +365,35 @@ impl KeychainView {
     }
 
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         div()
             .w_full()
-            .h(px(20.0))
+            .h(px(28.0))
             .flex()
             .items_center()
             .gap(px(8.0))
             .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(theme.elevated_background)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.tab_hover_background))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(ref callback) = this.on_new_key_click {
-                                callback(cx, None);
-                            }
-                        }),
-                    )
-                    .child(
-                        svg()
-                            .size(px(10.0))
-                            .path(Icon::Plus.path())
-                            .text_color(theme.icon),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("NEW KEY"),
-                    ),
+                // NEW KEY button using Button component
+                Button::new("new-key-btn")
+                    .label("NEW KEY")
+                    .icon(ButtonIconType::new("icons/plus.svg").small())
+                    .small()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_key_click {
+                            callback(cx, None);
+                        }
+                    })),
             )
             .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(6.0))
-                    .bg(theme.elevated_background)
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(theme.tab_hover_background))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(ref callback) = this.on_new_identity_click {
-                                callback(cx);
-                            }
-                        }),
-                    )
-                    .child(
-                        svg()
-                            .size(px(10.0))
-                            .path(Icon::Plus.path())
-                            .text_color(theme.icon),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("NEW IDENTITY"),
-                    ),
+                // NEW IDENTITY button using Button component
+                Button::new("new-identity-btn")
+                    .label("NEW IDENTITY")
+                    .icon(ButtonIconType::new("icons/plus.svg").small())
+                    .small()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_identity_click {
+                            callback(cx);
+                        }
+                    })),
             )
     }
 
@@ -1026,31 +984,15 @@ impl Render for KeychainEditor {
                     cx,
                 )))
                 .child(
-                    div()
-                        .mt(px(10.0))
-                        .w_full()
-                        .h(px(36.0))
-                        .rounded(px(8.0))
-                        .bg(theme.success)
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(theme.success.opacity(0.85)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
+                    div().pt(px(8.0)).child(
+                        // Import from key file button using Button component
+                        Button::new("import-key-btn")
+                            .label("Import from key file")
+                            .success()
+                            .on_click(cx.listener(|this, _event, window, cx| {
                                 this.import_key_from_file(window, cx);
-                            }),
-                        )
-                        .child(
-                            div()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.success_foreground)
-                                .child("Import from key file"),
-                        ),
+                            })),
+                    ),
                 )
             })
             .child(
@@ -1059,56 +1001,25 @@ impl Render for KeychainEditor {
                     .flex()
                     .gap(px(8.0))
                     .child(
+                        // Cancel button using Button component
                         div()
                             .flex_1()
-                            .h(px(36.0))
-                            .rounded(px(8.0))
-                            .bg(theme.elevated_background)
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(theme.tab_hover_background))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                            .child(Button::new("cancel-btn").label("Cancel").on_click(
+                                cx.listener(|this, _event, _window, cx| {
                                     this.handle_cancel(cx);
                                 }),
-                            )
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child("Cancel"),
-                            ),
+                            )),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .h(px(36.0))
-                            .rounded(px(8.0))
-                            .bg(theme.success)
-                            .cursor_pointer()
-                            .hover(move |style| style.bg(theme.success.opacity(0.85)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                        // Save button using Button component
+                        div().flex_1().child(
+                            Button::new("save-btn")
+                                .label("Save")
+                                .success()
+                                .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.save_item(cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.success_foreground)
-                                    .child("Save"),
-                            ),
+                                })),
+                        ),
                     ),
             )
     }

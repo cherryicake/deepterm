@@ -1,5 +1,6 @@
 use gpui::App;
 pub mod animation;
+pub mod button;
 pub mod drag_drop;
 pub mod input;
 pub mod resize_handle;
