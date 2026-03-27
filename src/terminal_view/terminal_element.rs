@@ -271,6 +271,7 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
+    cached_theme_id: Option<String>,
 }
 
 impl TerminalElement {
@@ -350,6 +351,7 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
+            cached_theme_id: None,
         }
     }
 
@@ -926,9 +928,16 @@ impl Element for TerminalElement {
 
         // Take row render cache out of the view so we can mutate it here
         // without a borrow conflict, then write it back after processing.
-        let mut row_caches: Vec<RowRenderCache> = self
-            .view
-            .update(cx, |view, _cx| std::mem::take(&mut view.row_render_cache));
+        let mut row_caches: Vec<RowRenderCache> = match &self.cached_theme_id {
+            Some(theme_id) if &cx.theme().id == theme_id => self
+                .view
+                .update(cx, |view, _cx| std::mem::take(&mut view.row_render_cache)),
+            _ => {
+                // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
+                self.cached_theme_id = Some(cx.theme().id.clone());
+                Vec::new()
+            }
+        };
 
         // Grow or shrink caches to match the current viewport height.
         row_caches.resize_with(viewport_lines, RowRenderCache::default);
