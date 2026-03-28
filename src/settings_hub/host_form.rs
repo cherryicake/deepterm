@@ -7,8 +7,8 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::Input;
 use crate::components::button::{Button, ButtonVariants};
+use crate::components::input::Input;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};

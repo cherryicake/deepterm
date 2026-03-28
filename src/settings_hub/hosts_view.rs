@@ -6,6 +6,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
+use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
@@ -460,6 +461,7 @@ impl HostsView {
         let theme = cx.theme().ui;
         let icon_color = host.icon_color.to_hsla(cx);
         let host_id = host.id.clone();
+        let host_id_for_menu = host_id.clone();
         let is_selected = self.selected_host_id.as_ref() == Some(&host_id);
         let bg_color = if is_selected {
             theme.accent.opacity(if cx.theme().appearance.is_dark() {
@@ -514,6 +516,29 @@ impl HostsView {
                     }
                 }
             }))
+            // Select host on right mouse down (before context menu shows)
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener({
+                    let host_id = host_id_for_menu.clone();
+                    move |this, _event, _window, cx| {
+                        this.selected_host_id = Some(host_id.clone());
+                        cx.notify();
+                    }
+                }),
+            )
+            // Add context menu for right-click
+            .context_menu({
+                use crate::components::button::Icon as MenuIcon;
+                move |menu: PopupMenu, _window, _cx| {
+                    menu.menu_with_icon("Connect", MenuIcon::new("icons/link.svg"), Box::new(crate::ConnectHost))
+                        .separator()
+                        .menu_with_icon("Edit", MenuIcon::new("icons/edit.svg"), Box::new(crate::EditHost))
+                        .menu("Duplicate", Box::new(crate::DuplicateHost))
+                        .separator()
+                        .menu_with_icon("Delete", MenuIcon::new("icons/trash.svg"), Box::new(crate::DeleteHost))
+                }
+            })
             .child(
                 // Host icon
                 div()
@@ -683,6 +708,34 @@ impl Render for HostsView {
             .size_full()
             .relative()
             .bg(theme.panel_background)
+            // Register context menu actions
+            .on_action(cx.listener(|this, _: &crate::ConnectHost, window, cx| {
+                if let Some(ref host_id) = this.selected_host_id {
+                    this.connect_to_host(host_id, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::EditHost, _window, cx| {
+                if let Some(ref host_id) = this.selected_host_id {
+                    if let Some(config) = this
+                        .configs
+                        .iter()
+                        .find(|c| c.id() == host_id.as_ref())
+                        .cloned()
+                    {
+                        if let Some(ref callback) = this.on_edit_host_click {
+                            callback(cx, config);
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::DuplicateHost, _window, _cx| {
+                // TODO: Implement duplicate host functionality
+                println!("Duplicate host: {:?}", this.selected_host_id);
+            }))
+            .on_action(cx.listener(|this, _: &crate::DeleteHost, _window, _cx| {
+                // TODO: Implement delete host functionality
+                println!("Delete host: {:?}", this.selected_host_id);
+            }))
             // Scrollable content (rendered first = lower z-order)
             // Fills the entire parent; top-padding reserves space for the fixed header
             .child(

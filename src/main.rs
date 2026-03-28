@@ -22,6 +22,12 @@ use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
 actions!(app, [Quit, ShowSshPicker]);
+
+// Host management actions for context menu
+actions!(
+    host_actions,
+    [ConnectHost, EditHost, DuplicateHost, DeleteHost]
+);
 const CONTEXT: &str = "AppWindow";
 
 /// 全局 SSH picker 引用，用于从 Workspace 触发显示

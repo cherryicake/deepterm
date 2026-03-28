@@ -3,6 +3,7 @@ pub mod animation;
 pub mod button;
 pub mod drag_drop;
 pub mod input;
+pub mod menu;
 pub mod resize_handle;
 pub mod sidebar;
 pub mod spinner;
@@ -16,4 +17,5 @@ pub mod title_bar;
 /// You must initialize the components at your application's entry point.
 pub fn init(cx: &mut App) {
     input::init(cx);
+    menu::init(cx);
 }
