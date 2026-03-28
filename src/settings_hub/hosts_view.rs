@@ -435,6 +435,19 @@ impl HostsView {
         }
     }
 
+    /// Delete a host by its ID
+    fn delete_host(&mut self, host_id: &str, cx: &mut Context<Self>) {
+        // Remove from SSH config
+        if let Ok(mut config) = SshGlobalConfig::load_or_create() {
+            if config.remove_connection(host_id).is_some() {
+                // Save the updated config
+                let _ = config.save();
+            }
+        }
+        // Refresh the view
+        self.refresh_hosts(cx);
+    }
+
     /// Set callback for when NEW HOST button is clicked
     pub fn on_new_host_click<F>(&mut self, callback: F)
     where
@@ -732,9 +745,32 @@ impl Render for HostsView {
                 // TODO: Implement duplicate host functionality
                 println!("Duplicate host: {:?}", this.selected_host_id);
             }))
-            .on_action(cx.listener(|this, _: &crate::DeleteHost, _window, _cx| {
-                // TODO: Implement delete host functionality
-                println!("Delete host: {:?}", this.selected_host_id);
+            .on_action(cx.listener(|this, _: &crate::DeleteHost, window, cx| {
+                if let Some(ref host_id) = this.selected_host_id.clone() {
+                    // Find the host name for the confirmation message
+                    if let Some(host) = this.hosts.iter().find(|h| h.id == host_id.as_ref()) {
+                        let host_name = host.name.clone();
+                        let host_id = host_id.clone();
+                        let weak = cx.weak_entity();
+                        let answer = window.prompt(
+                            gpui::PromptLevel::Warning,
+                            "确认删除",
+                            Some(&format!("确定要删除主机 '{}' 吗？此操作不可撤销。", host_name)),
+                            &["删除", "取消"],
+                            cx,
+                        );
+                        cx.spawn(async move |_, cx| {
+                            if let Ok(0) = answer.await {
+                                // User confirmed deletion (button index 0)
+                                if let Some(entity) = weak.upgrade() {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.delete_host(&host_id, cx);
+                                    });
+                                }
+                            }
+                        }).detach();
+                    }
+                }
             }))
             // Scrollable content (rendered first = lower z-order)
             // Fills the entire parent; top-padding reserves space for the fixed header
