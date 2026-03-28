@@ -1,8 +1,10 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Window, div, px, svg,
+    Window, div, px, svg, Modifiers,
 };
+
+use std::collections::HashSet;
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
@@ -157,7 +159,8 @@ pub struct HostsView {
     configs: Vec<SshConnectionConfig>,
     on_new_host_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
     on_edit_host_click: Option<Box<dyn Fn(&mut App, SshConnectionConfig) + Send + Sync>>,
-    selected_host_id: Option<SharedString>,
+    selected_host_ids: HashSet<SharedString>,
+    context_menu_host_id: Option<SharedString>, // Track which host was right-clicked
 }
 
 impl HostsView {
@@ -187,7 +190,8 @@ impl HostsView {
                 configs,
                 on_new_host_click: None,
                 on_edit_host_click: None,
-                selected_host_id: None,
+                selected_host_ids: HashSet::new(),
+                context_menu_host_id: None,
             }
         })
     }
@@ -198,6 +202,9 @@ impl HostsView {
         self.hosts = hosts;
         self.groups = groups;
         self.configs = configs;
+        // Clean up selected hosts that no longer exist
+        let valid_ids: HashSet<_> = self.hosts.iter().map(|h| h.id.clone()).collect();
+        self.selected_host_ids.retain(|id| valid_ids.contains(id));
         cx.notify();
     }
 
@@ -353,9 +360,10 @@ impl HostsView {
                     .label("CONNECT HOSTS")
                     .small()
                     .on_click(cx.listener(|this, _event, window, cx| {
-                        // Connect to selected host or show picker
-                        if let Some(ref host_id) = this.selected_host_id {
-                            this.connect_to_host(host_id, window, cx);
+                        // Connect to selected hosts or show picker
+                        let selected_ids: Vec<_> = this.selected_host_ids.iter().cloned().collect();
+                        for host_id in selected_ids {
+                            this.connect_to_host(&host_id, window, cx);
                         }
                     })),
             )
@@ -475,7 +483,7 @@ impl HostsView {
         let icon_color = host.icon_color.to_hsla(cx);
         let host_id = host.id.clone();
         let host_id_for_menu = host_id.clone();
-        let is_selected = self.selected_host_id.as_ref() == Some(&host_id);
+        let is_selected = self.selected_host_ids.contains(&host_id);
         let bg_color = if is_selected {
             theme.accent.opacity(if cx.theme().appearance.is_dark() {
                 0.18
@@ -514,17 +522,35 @@ impl HostsView {
             .on_click(cx.listener({
                 let host_id = host_id.clone();
                 move |this, event: &gpui::ClickEvent, window, cx| {
-                    if event.click_count() == 1 {
-                        this.selected_host_id = Some(host_id.clone());
+                    let is_cmd_pressed = event.modifiers().secondary(); // Cmd on macOS, Ctrl on other platforms
 
-                        let config = this.configs.iter().find(|c| c.id() == host_id).cloned();
-                        if let Some(config) = config {
-                            if let Some(ref callback) = this.on_edit_host_click {
-                                callback(cx, config);
+                    if event.click_count() == 1 {
+                        if is_cmd_pressed {
+                            // Cmd+click: toggle selection
+                            if this.selected_host_ids.contains(&host_id) {
+                                this.selected_host_ids.remove(&host_id);
+                            } else {
+                                this.selected_host_ids.insert(host_id.clone());
+                            }
+                        } else {
+                            // Normal click: clear all and select only this one
+                            this.selected_host_ids.clear();
+                            this.selected_host_ids.insert(host_id.clone());
+
+                            // Trigger edit callback for single selection
+                            let config = this.configs.iter().find(|c| c.id() == host_id).cloned();
+                            if let Some(config) = config {
+                                if let Some(ref callback) = this.on_edit_host_click {
+                                    callback(cx, config);
+                                }
                             }
                         }
+                        cx.notify();
                     } else if event.click_count() == 2 {
-                        this.selected_host_id = Some(host_id.clone());
+                        // Double click: connect to host (clear selection first for single connection)
+                        this.selected_host_ids.clear();
+                        this.selected_host_ids.insert(host_id.clone());
+                        cx.notify();
                         this.connect_to_host(&host_id, window, cx);
                     }
                 }
@@ -535,7 +561,13 @@ impl HostsView {
                 cx.listener({
                     let host_id = host_id_for_menu.clone();
                     move |this, _event, _window, cx| {
-                        this.selected_host_id = Some(host_id.clone());
+                        // Track which host was right-clicked for context menu operations
+                        this.context_menu_host_id = Some(host_id.clone());
+                        // If right-clicked host is not already selected, select only this one
+                        if !this.selected_host_ids.contains(&host_id) {
+                            this.selected_host_ids.clear();
+                            this.selected_host_ids.insert(host_id.clone());
+                        }
                         cx.notify();
                     }
                 }),
@@ -723,12 +755,18 @@ impl Render for HostsView {
             .bg(theme.panel_background)
             // Register context menu actions
             .on_action(cx.listener(|this, _: &crate::ConnectHost, window, cx| {
-                if let Some(ref host_id) = this.selected_host_id {
-                    this.connect_to_host(host_id, window, cx);
+                // Connect to all selected hosts
+                let selected_ids: Vec<_> = this.selected_host_ids.iter().cloned().collect();
+                for host_id in selected_ids {
+                    this.connect_to_host(&host_id, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &crate::EditHost, _window, cx| {
-                if let Some(ref host_id) = this.selected_host_id {
+                // Edit the host that was right-clicked, or the first selected host
+                let host_id_to_edit = this.context_menu_host_id.clone()
+                    .or_else(|| this.selected_host_ids.iter().next().cloned());
+
+                if let Some(host_id) = host_id_to_edit {
                     if let Some(config) = this
                         .configs
                         .iter()
@@ -742,35 +780,47 @@ impl Render for HostsView {
                 }
             }))
             .on_action(cx.listener(|this, _: &crate::DuplicateHost, _window, _cx| {
-                // TODO: Implement duplicate host functionality
-                println!("Duplicate host: {:?}", this.selected_host_id);
+                // TODO: Implement duplicate host functionality for multiple hosts
+                println!("Duplicate hosts: {:?}", this.selected_host_ids);
             }))
             .on_action(cx.listener(|this, _: &crate::DeleteHost, window, cx| {
-                if let Some(ref host_id) = this.selected_host_id.clone() {
-                    // Find the host name for the confirmation message
-                    if let Some(host) = this.hosts.iter().find(|h| h.id == host_id.as_ref()) {
-                        let host_name = host.name.clone();
-                        let host_id = host_id.clone();
-                        let weak = cx.weak_entity();
-                        let answer = window.prompt(
-                            gpui::PromptLevel::Warning,
-                            "确认删除",
-                            Some(&format!("确定要删除主机 '{}' 吗？此操作不可撤销。", host_name)),
-                            &["删除", "取消"],
-                            cx,
-                        );
-                        cx.spawn(async move |_, cx| {
-                            if let Ok(0) = answer.await {
-                                // User confirmed deletion (button index 0)
-                                if let Some(entity) = weak.upgrade() {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        this.delete_host(&host_id, cx);
-                                    });
-                                }
-                            }
-                        }).detach();
-                    }
+                // Delete all selected hosts
+                let host_ids_to_delete: Vec<_> = this.selected_host_ids.iter().cloned().collect();
+                if host_ids_to_delete.is_empty() {
+                    return;
                 }
+
+                let host_count = host_ids_to_delete.len();
+                let message = if host_count == 1 {
+                    if let Some(host) = this.hosts.iter().find(|h| h.id == host_ids_to_delete[0]) {
+                        format!("确定要删除主机 '{}' 吗？此操作不可撤销。", host.name)
+                    } else {
+                        "确定要删除选中的主机吗？此操作不可撤销。".to_string()
+                    }
+                } else {
+                    format!("确定要删除选中的 {} 个主机吗？此操作不可撤销。", host_count)
+                };
+
+                let weak = cx.weak_entity();
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    "确认删除",
+                    Some(&message),
+                    &["删除", "取消"],
+                    cx,
+                );
+                cx.spawn(async move |_, cx| {
+                    if let Ok(0) = answer.await {
+                        // User confirmed deletion (button index 0)
+                        if let Some(entity) = weak.upgrade() {
+                            let _ = entity.update(cx, |this, cx| {
+                                for host_id in &host_ids_to_delete {
+                                    this.delete_host(host_id, cx);
+                                }
+                            });
+                        }
+                    }
+                }).detach();
             }))
             // Scrollable content (rendered first = lower z-order)
             // Fills the entire parent; top-padding reserves space for the fixed header
