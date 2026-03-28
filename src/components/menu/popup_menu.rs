@@ -1101,11 +1101,18 @@ impl PopupMenu {
                     .disabled(*disabled);
 
                 // Icon slot width for alignment
-                let icon_slot = div().w(px(18.)).h(px(18.)).flex().items_center().justify_center();
+                let icon_slot = div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center();
 
                 // Render icon if present, otherwise empty placeholder
                 let icon_element: gpui::AnyElement = if let Some(icon) = icon {
-                    Icon::new(icon.path()).with_size(Size::XSmall).into_any_element()
+                    Icon::new(icon.path())
+                        .with_size(Size::XSmall)
+                        .into_any_element()
                 } else {
                     div().into_any_element()
                 };
@@ -1140,11 +1147,18 @@ impl PopupMenu {
                 let this = this.disabled(*disabled);
 
                 // Icon slot width for alignment
-                let icon_slot = div().w(px(18.)).h(px(18.)).flex().items_center().justify_center();
+                let icon_slot = div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center();
 
                 // Render icon if present, otherwise empty placeholder
                 let icon_element: gpui::AnyElement = if let Some(icon) = icon {
-                    Icon::new(icon.path()).with_size(Size::XSmall).into_any_element()
+                    Icon::new(icon.path())
+                        .with_size(Size::XSmall)
+                        .into_any_element()
                 } else {
                     div().into_any_element()
                 };
@@ -1237,7 +1251,7 @@ impl Render for PopupMenu {
             .child(
                 div()
                     .id("menu-container")
-                    .bg(theme.elevated_background)
+                    .bg(theme.panel_background.opacity(0.25))
                     .text_color(theme.text)
                     .border_1()
                     .border_color(theme.border)
@@ -1251,7 +1265,7 @@ impl Render for PopupMenu {
                             .id("items")
                             .flex()
                             .flex_col()
-                            .gap_y(px(0.))
+                            .gap_y(px(2.))
                             .min_w(rems(10.))
                             .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                             .max_w(max_width)
@@ -1271,7 +1285,7 @@ impl Render for PopupMenu {
                                         // Render separator as standalone div, not wrapped in MenuItemElement
                                         if item.is_separator() {
                                             div()
-                                                .h(px(9.))
+                                                .h(px(8.))
                                                 .py(px(4.))
                                                 .flex()
                                                 .items_center()
@@ -1284,7 +1298,8 @@ impl Render for PopupMenu {
                                                 )
                                                 .into_any_element()
                                         } else {
-                                            self.render_item(ix, item, options, window, cx).into_any_element()
+                                            self.render_item(ix, item, options, window, cx)
+                                                .into_any_element()
                                         }
                                     }),
                             ),
