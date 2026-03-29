@@ -736,10 +736,15 @@ impl EntityInputHandler for Input {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Clamp range to valid bounds to prevent panics
+        let content_len = self.content.len();
+        let start = range.start.min(content_len);
+        let end = range.end.min(content_len);
+
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..start].to_owned() + new_text + &self.content[end..])
                 .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selected_range = start + new_text.len()..start + new_text.len();
         self.marked_range.take();
 
         self.reset_blinking(cx);
@@ -762,19 +767,24 @@ impl EntityInputHandler for Input {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Clamp range to valid bounds to prevent panics
+        let content_len = self.content.len();
+        let start = range.start.min(content_len);
+        let end = range.end.min(content_len);
+
         self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+            (self.content[0..start].to_owned() + new_text + &self.content[end..])
                 .into();
         if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
+            self.marked_range = Some(start..start + new_text.len());
         } else {
             self.marked_range = None;
         }
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            .map(|new_range| new_range.start + start..new_range.end + end)
+            .unwrap_or_else(|| start + new_text.len()..start + new_text.len());
 
         cx.notify();
     }

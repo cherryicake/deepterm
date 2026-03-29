@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
+use crate::components::input::Input;
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -149,9 +150,10 @@ impl HostGroup {
 
 /// Hosts View Component - Main content for the Hosts settings page
 pub struct HostsView {
-    #[allow(dead_code)]
+    search_input: Entity<Input>,
     search_query: SharedString,
     hosts: Vec<Host>,
+    filtered_hosts: Vec<Host>, // Filtered hosts based on search query
     groups: Vec<HostGroup>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
@@ -180,9 +182,27 @@ impl HostsView {
             let focus_handle = cx.focus_handle();
             let scroll_handle = ScrollHandle::new();
             let (hosts, groups, configs) = Self::load_hosts_from_config();
+            let filtered_hosts = hosts.clone();
+
+            let view_entity = cx.entity();
+            let search_input = cx.new(|cx| {
+                Input::new(cx)
+                    .placeholder("Find a host or ssh user@hostname...")
+                    .placeholder_font_size(px(14.0))
+                    .transparent()
+                    .on_change(move |text, cx| {
+                        let text = text.to_string();
+                        view_entity.update(cx, |this: &mut Self, cx| {
+                            this.update_search_query(text, cx);
+                        });
+                    })
+            });
+
             Self {
+                search_input,
                 search_query: SharedString::new_static(""),
                 hosts,
+                filtered_hosts,
                 groups,
                 focus_handle,
                 scroll_handle,
@@ -200,12 +220,43 @@ impl HostsView {
     pub fn refresh_hosts(&mut self, cx: &mut Context<Self>) {
         let (hosts, groups, configs) = Self::load_hosts_from_config();
         self.hosts = hosts;
+        self.filtered_hosts = self.hosts.clone();
         self.groups = groups;
         self.configs = configs;
         // Clean up selected hosts that no longer exist
         let valid_ids: HashSet<_> = self.hosts.iter().map(|h| h.id.clone()).collect();
         self.selected_host_ids.retain(|id| valid_ids.contains(id));
+        // Clear search query
+        self.search_query = SharedString::new_static("");
+        self.search_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
+    }
+
+    /// Update search query and filter hosts
+    fn update_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_query = query.to_lowercase().into();
+        self.filter_hosts();
+        cx.notify();
+    }
+
+    /// Filter hosts based on search query
+    fn filter_hosts(&mut self) {
+        let query = self.search_query.as_ref();
+        if query.is_empty() {
+            self.filtered_hosts = self.hosts.clone();
+        } else {
+            self.filtered_hosts = self
+                .hosts
+                .iter()
+                .filter(|host| {
+                    host.name.to_lowercase().contains(query)
+                        || host.hostname.as_ref().map_or(false, |h| h.to_lowercase().contains(query))
+                        || host.username.as_ref().map_or(false, |u| u.to_lowercase().contains(query))
+                        || host.auth_label.as_ref().map_or(false, |a| a.to_lowercase().contains(query))
+                })
+                .cloned()
+                .collect();
+        }
     }
 
     /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
@@ -290,7 +341,7 @@ impl HostsView {
                 // Search input with background - CONNECT button inside
                 div()
                     .flex_1()
-                    .h_10()
+                    .h(px(36.0))
                     .pl(px(12.0))
                     .pr(px(6.0))
                     .rounded(px(8.0))
@@ -300,11 +351,24 @@ impl HostsView {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.0))
                     .child(
+                        // Search icon
                         div()
-                            .text_sm()
-                            .text_color(theme.text_subtle)
-                            .child("Find a host or ssh user@hostname..."),
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .child(
+                                svg()
+                                    .size(px(16.0))
+                                    .text_color(theme.icon_muted)
+                                    .path(Icon::MagnifyingGlass.path()),
+                            ),
+                    )
+                    .child(
+                        // Input component
+                        div()
+                            .flex_1()
+                            .child(self.search_input.clone()),
                     )
                     .child(
                         // Connect button inside search box using Button component
@@ -536,14 +600,6 @@ impl HostsView {
                             // Normal click: clear all and select only this one
                             this.selected_host_ids.clear();
                             this.selected_host_ids.insert(host_id.clone());
-
-                            // Trigger edit callback for single selection
-                            let config = this.configs.iter().find(|c| c.id() == host_id).cloned();
-                            if let Some(config) = config {
-                                if let Some(ref callback) = this.on_edit_host_click {
-                                    callback(cx, config);
-                                }
-                            }
                         }
                         cx.notify();
                     } else if event.click_count() == 2 {
@@ -690,12 +746,12 @@ impl HostsView {
             .gap(px(GRID_GAP_PX))
             .px(px(CONTENT_PADDING_PX))
             .child(
-                // Section title
+                // Section title with host count
                 div()
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
-                    .child("Hosts"),
+                    .child(format!("Hosts ({})", self.filtered_hosts.len())),
             )
             .child(self.render_hosts_grid(window, cx))
     }
@@ -706,7 +762,7 @@ impl HostsView {
         let viewport_width = window.viewport_size().width.as_f32();
         let cols = self.calculate_columns(viewport_width);
 
-        let host_count = self.hosts.len();
+        let host_count = self.filtered_hosts.len();
 
         // Calculate how many placeholders needed to fill the last row
         let remainder = host_count % (cols as usize);
@@ -722,7 +778,7 @@ impl HostsView {
             .grid_cols(cols)
             .gap(px(GRID_GAP_PX))
             .children(
-                self.hosts
+                self.filtered_hosts
                     .iter()
                     .map(|host| self.render_host_card(host, window, cx).into_any_element()),
             )

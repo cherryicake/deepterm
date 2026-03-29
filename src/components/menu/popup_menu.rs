@@ -1251,7 +1251,7 @@ impl Render for PopupMenu {
             .child(
                 div()
                     .id("menu-container")
-                    .bg(theme.panel_background.opacity(0.25))
+                    .bg(theme.elevated_background.opacity(0.25))
                     .text_color(theme.text)
                     .border_1()
                     .border_color(theme.border)
