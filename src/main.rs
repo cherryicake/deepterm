@@ -13,7 +13,7 @@ pub mod workspace;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
-    WindowBackgroundAppearance, WindowOptions, actions, div, size,
+    WindowBackgroundAppearance, WindowDecorations, WindowOptions, actions, div, size,
 };
 
 use crate::components::title_bar::TitleBar;
@@ -154,6 +154,8 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitleBar::title_bar_options()),
+                    // 使用客户端装饰，隐藏系统标题栏
+                    window_decorations: Some(WindowDecorations::Client),
                     // macOS: 禁用原生窗口拖拽，改用 GPUI 手动实现
                     // 这样可以避免透明标题栏导致整个区域都可拖拽的问题
                     #[cfg(target_os = "macos")]

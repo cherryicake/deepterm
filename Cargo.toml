@@ -58,6 +58,7 @@ windows = { version = "0.52", features = [
 git = "https://github.com/zed-industries/zed.git"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+fontconfig = "0.10"
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = [
     "wayland",
     "x11",

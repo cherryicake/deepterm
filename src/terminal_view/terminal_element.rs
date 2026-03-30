@@ -9,14 +9,32 @@ use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
-    Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks,
-    FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
-    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
+    fill, point, px, size, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
+    Font, FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId,
+    Pixels, Point, Style, TextRun, TextStyle, WhiteSpace, Window,
 };
 use unicode_width::UnicodeWidthChar;
 
 const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
 const CURSOR_THICKNESS_RATIO: f32 = 0.15;
+
+/// 获取 Linux 系统默认等宽字体名称（带缓存）
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_system_monospace_font() -> &'static str {
+    use fontconfig::Fontconfig;
+    use std::sync::OnceLock;
+
+    static SYSTEM_MONO_FONT: OnceLock<String> = OnceLock::new();
+    SYSTEM_MONO_FONT.get_or_init(|| {
+        if let Some(fc) = Fontconfig::new() {
+            if let Some(font) = fc.find("monospace", None) {
+                return font.name;
+            }
+        }
+        // Fallback to common Linux monospace fonts
+        "DejaVu Sans Mono".to_string()
+    })
+}
 
 /// Returns how many terminal cells this Unicode scalar usually occupies.
 /// This is used for cursor width and run-splitting math.
@@ -819,13 +837,15 @@ impl Element for TerminalElement {
         );
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let (font_family, font_fallbacks) = (
-            "monospace".into(),
-            Some(FontFallbacks::from_fonts(vec![
+        let (font_family, font_fallbacks) = {
+            let font_name = get_system_monospace_font();
+            let fallbacks = Some(FontFallbacks::from_fonts(vec![
                 "Noto Sans Mono".to_string(),
                 "Source Code Pro".to_string(),
-            ])),
-        );
+                "DejaVu Sans Mono".to_string(),
+            ]));
+            (font_name.into(), fallbacks)
+        };
 
         let text_style = TextStyle {
             font_family,
