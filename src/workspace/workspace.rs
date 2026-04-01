@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use gpui::{
@@ -17,6 +18,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::file_browser::FileBrowserView;
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
@@ -25,6 +27,7 @@ use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
+const FILE_BROWSER_TAB_ID: &str = "__file_browser__";
 pub(crate) fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     // 使用 None 作为 context，让这些快捷键全局有效
@@ -256,7 +259,7 @@ impl Workspace {
     fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             if let Some(panel) = tab_info.container.get_first_panel() {
-                if let Some(handle) = panel.read(cx).terminal_focus_handle(cx) {
+                if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
                     window.focus(&handle, cx);
                 }
             }
@@ -276,7 +279,7 @@ impl Workspace {
                 .tabs
                 .get(&next_tab_id)
                 .and_then(|t| t.container.get_first_panel())
-                .and_then(|panel| panel.read(cx).terminal_focus_handle(cx));
+                .and_then(|panel| panel.read(cx).content_focus_handle(cx));
 
             if let (Some(fh), Some(wh)) = (focus_handle, cx.active_window()) {
                 let _ = cx.update_window(wh, |_, window, cx| {
@@ -449,6 +452,9 @@ impl Workspace {
             }
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
+            }
+            PanelEvent::OpenFileBrowser { requested_path, .. } => {
+                self.show_file_browser_panel(requested_path.clone(), cx);
             }
             PanelEvent::Close { panel_id } => {
                 self.handle_panel_close(panel_id, cx);
@@ -1114,6 +1120,62 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_file_browser_panel(&mut self, requested_path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
+            if let Some(panel) = tab_info.container.get_first_panel() {
+                let file_browser_view = match panel.read(cx).content() {
+                    PanelContent::FileBrowser(file_browser_view) => Some(file_browser_view.clone()),
+                    _ => None,
+                };
+
+                if let (Some(file_browser_view), Some(requested_path)) =
+                    (file_browser_view, requested_path)
+                {
+                    file_browser_view.update(cx, |file_browser, cx| {
+                        file_browser.open_requested_path(Some(requested_path.clone()), cx);
+                    });
+                }
+            }
+
+            self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
+            self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
+            return;
+        }
+
+        let file_browser_view = FileBrowserView::new_with_path(cx, requested_path);
+        let file_browser_panel = cx.new(|cx| {
+            Panel::with_file_browser_view(
+                format!("file-browser-panel-{}", self.next_panel_id),
+                self.workspace_id.clone(),
+                Some(FILE_BROWSER_TAB_ID.into()),
+                file_browser_view,
+                cx,
+            )
+        });
+        self.next_panel_id += 1;
+
+        self.tabs.insert(
+            FILE_BROWSER_TAB_ID.to_string(),
+            TabInfo::new_normal(FILE_BROWSER_TAB_ID, "Files", file_browser_panel.clone()),
+        );
+
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(TabItem::new(FILE_BROWSER_TAB_ID, "Files"), cx);
+        });
+
+        let subscription = cx.subscribe(&file_browser_panel, |this, _, event: &PanelEvent, cx| {
+            this.handle_panel_event(event, cx);
+        });
+        self.panel_subscriptions.insert(
+            file_browser_panel.read(cx).panel_id().to_string(),
+            subscription,
+        );
+
+        self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
+        self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
+        cx.notify();
+    }
+
     /// 切换到指定tab
     fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.tabs.get(tab_id).is_some() {
@@ -1224,7 +1286,7 @@ impl Workspace {
         self.switch_to_tab(&tab_id, cx);
 
         cx.defer_in(window, move |_, window, cx| {
-            if let Some(handle) = panel.read(cx).terminal_focus_handle(cx) {
+            if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
                 window.focus(&handle, cx);
             }
         });

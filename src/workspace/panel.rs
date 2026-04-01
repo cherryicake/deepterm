@@ -6,6 +6,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
+use crate::file_browser::FileBrowserView;
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
@@ -59,6 +60,11 @@ pub enum PanelEvent {
         panel_id: String,
         tab_id: SharedString,
     },
+    /// 打开文件浏览器
+    OpenFileBrowser {
+        panel_id: String,
+        requested_path: Option<std::path::PathBuf>,
+    },
     /// 关闭panel事件
     Close { panel_id: String },
     /// 选中状态变更事件
@@ -78,6 +84,8 @@ pub enum PanelContent {
     SettingsHubSidebar(Entity<SettingsHubLeftSidebar>),
     /// SettingsHub full view (sidebar + center content)
     SettingsHubView(Entity<SettingsHubView>),
+    /// Local file browser
+    FileBrowser(Entity<FileBrowserView>),
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -152,7 +160,7 @@ impl Panel {
     /// * `active_tab_label` - Label shown in the title bar
     /// * `cx` - The context for entity creation
     /// Subscribes to TerminalView close events and emits PanelEvent::Close when the terminal exits.
-    fn subscribe_terminal_close(
+    fn subscribe_terminal_events(
         panel_id: &str,
         terminal_view: &Entity<TerminalView>,
         cx: &mut Context<Self>,
@@ -164,6 +172,12 @@ impl Panel {
                 TerminalViewEvent::CloseTerminal => {
                     cx.emit(PanelEvent::Close {
                         panel_id: close_panel_id.clone(),
+                    });
+                }
+                TerminalViewEvent::OpenFileBrowser { requested_path } => {
+                    cx.emit(PanelEvent::OpenFileBrowser {
+                        panel_id: close_panel_id.clone(),
+                        requested_path: requested_path.clone(),
                     });
                 }
             },
@@ -180,7 +194,7 @@ impl Panel {
     ) -> Self {
         let panel_id = panel_id.into();
         let terminal_view = TerminalView::new(cx);
-        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
+        Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
             workspace_id: workspace_id.into(),
@@ -207,7 +221,7 @@ impl Panel {
     ) -> Self {
         let panel_id = panel_id.into();
         let terminal_view = TerminalView::new_with_command(cx, command, args);
-        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
+        Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
             workspace_id: workspace_id.into(),
@@ -233,7 +247,7 @@ impl Panel {
     ) -> Self {
         let panel_id = panel_id.into();
         let terminal_view = TerminalView::new_ssh(cx, ssh_config);
-        Self::subscribe_terminal_close(&panel_id, &terminal_view, cx);
+        Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
             workspace_id: workspace_id.into(),
@@ -244,6 +258,27 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            broadcast_enabled: false,
+        }
+    }
+
+    pub fn with_file_browser_view(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        file_browser_view: Entity<FileBrowserView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label: Some("Files".into()),
+            is_solo: false,
+            is_selected: false,
+            content: PanelContent::FileBrowser(file_browser_view),
             broadcast_enabled: false,
         }
     }
@@ -418,9 +453,14 @@ impl Focusable for Panel {
 
 impl Panel {
     /// 获取内部 TerminalView 的 focus handle（如果有）
-    pub fn terminal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+    pub fn content_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
         match &self.content {
             PanelContent::Terminal(terminal_view) => Some(terminal_view.read(cx).focus_handle(cx)),
+            PanelContent::FileBrowser(file_browser) => Some(file_browser.read(cx).focus_handle(cx)),
+            PanelContent::SettingsHubSidebar(sidebar) => Some(sidebar.read(cx).focus_handle(cx)),
+            PanelContent::SettingsHubView(settings_hub_view) => {
+                Some(settings_hub_view.read(cx).focus_handle(cx))
+            }
             _ => None,
         }
     }
@@ -579,6 +619,11 @@ impl Panel {
                 .min_h_0()
                 .overflow_hidden()
                 .child(settings_hub_view.clone()),
+            PanelContent::FileBrowser(file_browser_view) => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(file_browser_view.clone()),
         }
     }
 

@@ -254,7 +254,7 @@ pub const BUILTIN_COMMAND_SPECS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         name: "/open",
         description: "Open DeepTerm's File Browser.",
-        icon: Icon::Terminal,
+        icon: Icon::Folder,
         handler: BuiltinCommandHandler::OpenFileBrowser,
     },
     BuiltinCommandSpec {

@@ -215,6 +215,7 @@ pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
+    child_process_id: Option<u32>,
     /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
     last_content: TerminalContent,
@@ -250,6 +251,16 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    #[cfg(not(windows))]
+    fn pty_child_process_id(pty: &tty::Pty) -> Option<u32> {
+        Some(pty.child().id())
+    }
+
+    #[cfg(windows)]
+    fn pty_child_process_id(_pty: &tty::Pty) -> Option<u32> {
+        None
+    }
+
     pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -295,6 +306,7 @@ impl Terminal {
             listener.clone(),
         )));
 
+        let child_process_id = Self::pty_child_process_id(&pty);
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
@@ -321,6 +333,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                child_process_id,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -391,6 +404,7 @@ impl Terminal {
             listener.clone(),
         )));
 
+        let child_process_id = Self::pty_child_process_id(&pty);
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
@@ -417,6 +431,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                child_process_id,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -447,6 +462,7 @@ impl Terminal {
 
         Self {
             term,
+            child_process_id: None,
             sender: None,
             last_content: TerminalContent::default(),
             content_generation: 0,
@@ -518,6 +534,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                child_process_id: None,
                 sender: None, // 远程终端不使用本地 sender
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -688,6 +705,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                child_process_id: None,
                 sender: None,
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -733,6 +751,10 @@ impl Terminal {
             } => Some((host.as_str(), username.as_str(), *port)),
             _ => None,
         }
+    }
+
+    pub fn child_process_id(&self) -> Option<u32> {
+        self.child_process_id
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）

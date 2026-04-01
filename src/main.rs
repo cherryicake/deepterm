@@ -3,6 +3,7 @@
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
+pub mod file_browser;
 mod settings_hub;
 pub mod ssh;
 pub mod ssh_view;

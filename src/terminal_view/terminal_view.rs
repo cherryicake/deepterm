@@ -1,5 +1,7 @@
 //! Terminal view component - Full featured
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use gpui::{
@@ -15,6 +17,8 @@ use gpui::{KeyBinding, prelude::*};
 pub enum Event {
     /// Terminal process exited - container should close this view
     CloseTerminal,
+    /// Open the local file browser view
+    OpenFileBrowser { requested_path: Option<PathBuf> },
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -59,6 +63,7 @@ pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
 
 pub struct TerminalView {
     terminal: Entity<Terminal>,
+    working_directory: Option<PathBuf>,
     focus_handle: FocusHandle,
     cursor_visible: bool,
     title: SharedString,
@@ -86,7 +91,8 @@ pub struct TerminalView {
 impl TerminalView {
     /// 创建新的本地终端
     pub fn new(cx: &mut App) -> Entity<Self> {
-        let terminal = Terminal::new(cx, dirs::home_dir());
+        let working_directory = dirs::home_dir();
+        let terminal = Terminal::new(cx, working_directory.clone());
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
@@ -111,6 +117,7 @@ impl TerminalView {
 
             let mut this = Self {
                 terminal: terminal_clone,
+                working_directory,
                 focus_handle,
                 cursor_visible: true,
                 title: "Terminal".into(),
@@ -146,7 +153,8 @@ impl TerminalView {
         } else {
             dirs::home_dir()
         };
-        let terminal = Terminal::new_with_command(cx, working_dir, &command_string, &args_vec);
+        let terminal =
+            Terminal::new_with_command(cx, working_dir.clone(), &command_string, &args_vec);
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
@@ -171,6 +179,7 @@ impl TerminalView {
 
             let mut this = Self {
                 terminal: terminal_clone,
+                working_directory: working_dir,
                 focus_handle,
                 cursor_visible: true,
                 title: command_string.into(),
@@ -280,6 +289,7 @@ impl TerminalView {
 
             let mut this = Self {
                 terminal: terminal_clone,
+                working_directory: None,
                 focus_handle,
                 cursor_visible: true,
                 title: ssh_config_clone.host_label().into(),
@@ -547,10 +557,93 @@ impl TerminalView {
         match find_builtin_command(command_line) {
             Some(spec) => {
                 log::info!("builtin command {}: {}", spec.name, spec.description);
-                if spec.handler == BuiltinCommandHandler::OpenFileBrowser {}
+                if spec.handler == BuiltinCommandHandler::OpenFileBrowser {
+                    _cx.emit(Event::OpenFileBrowser {
+                        requested_path: self.parse_open_file_browser_path(command_line, _cx),
+                    });
+                }
                 true
             }
             None => false,
+        }
+    }
+
+    fn parse_open_file_browser_path(&self, command_line: &str, cx: &App) -> Option<PathBuf> {
+        let command = find_builtin_command(command_line)?;
+        if command.handler != BuiltinCommandHandler::OpenFileBrowser {
+            return None;
+        }
+
+        let raw_path = command_line
+            .strip_prefix(command.name)
+            .unwrap_or_default()
+            .trim();
+        if raw_path.is_empty() {
+            return self
+                .current_working_directory(cx)
+                .or_else(dirs::home_dir)
+                .or(Some(PathBuf::from("/")));
+        }
+
+        Some(self.resolve_open_target(raw_path, cx))
+    }
+
+    fn current_working_directory(&self, cx: &App) -> Option<PathBuf> {
+        let process_cwd = self
+            .terminal
+            .read(cx)
+            .child_process_id()
+            .and_then(Self::query_process_working_directory);
+
+        process_cwd.or_else(|| self.working_directory.clone())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
+        let output = Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn query_process_working_directory(_pid: u32) -> Option<PathBuf> {
+        None
+    }
+
+    fn resolve_open_target(&self, raw_path: &str, cx: &App) -> PathBuf {
+        let trimmed = raw_path.trim().trim_matches(|c| matches!(c, '"' | '\''));
+        let expanded = if trimmed == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed))
+        } else if let Some(stripped) = trimmed.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|home| home.join(stripped))
+                .unwrap_or_else(|| PathBuf::from(trimmed))
+        } else {
+            PathBuf::from(trimmed)
+        };
+
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.current_working_directory(cx)
+                .or_else(|| self.working_directory.clone())
+                .or_else(dirs::home_dir)
+                .map(|cwd| cwd.join(&expanded))
+                .unwrap_or(expanded)
         }
     }
 

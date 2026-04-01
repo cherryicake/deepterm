@@ -29,6 +29,8 @@ impl AssetSource for Assets {
 /// Icon names for embedded SVG assets
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
+    Folder,
+    File,
     Linux,
     Server,
     Screen,
@@ -54,6 +56,8 @@ impl Icon {
     pub fn path(&self) -> SharedString {
         // Use new_static to avoid allocation - these are compile-time constants
         match self {
+            Icon::Folder => SharedString::new_static("icons/folder.svg"),
+            Icon::File => SharedString::new_static("icons/file.svg"),
             Icon::Linux => SharedString::new_static("icons/linux.svg"),
             Icon::Server => SharedString::new_static("icons/server.svg"),
             Icon::Screen => SharedString::new_static("icons/screen.svg"),
