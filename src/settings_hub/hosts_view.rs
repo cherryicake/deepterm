@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Window, div, px, svg, Modifiers,
+    Window, div, px, svg,
 };
 
 use std::collections::HashSet;
@@ -250,9 +250,18 @@ impl HostsView {
                 .iter()
                 .filter(|host| {
                     host.name.to_lowercase().contains(query)
-                        || host.hostname.as_ref().map_or(false, |h| h.to_lowercase().contains(query))
-                        || host.username.as_ref().map_or(false, |u| u.to_lowercase().contains(query))
-                        || host.auth_label.as_ref().map_or(false, |a| a.to_lowercase().contains(query))
+                        || host
+                            .hostname
+                            .as_ref()
+                            .map_or(false, |h| h.to_lowercase().contains(query))
+                        || host
+                            .username
+                            .as_ref()
+                            .map_or(false, |u| u.to_lowercase().contains(query))
+                        || host
+                            .auth_label
+                            .as_ref()
+                            .map_or(false, |a| a.to_lowercase().contains(query))
                 })
                 .cloned()
                 .collect();
@@ -354,21 +363,16 @@ impl HostsView {
                     .gap(px(8.0))
                     .child(
                         // Search icon
-                        div()
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .child(
-                                svg()
-                                    .size(px(16.0))
-                                    .text_color(theme.icon_muted)
-                                    .path(Icon::MagnifyingGlass.path()),
-                            ),
+                        div().w(px(16.0)).h(px(16.0)).child(
+                            svg()
+                                .size(px(16.0))
+                                .text_color(theme.icon_muted)
+                                .path(Icon::MagnifyingGlass.path()),
+                        ),
                     )
                     .child(
                         // Input component
-                        div()
-                            .flex_1()
-                            .child(self.search_input.clone()),
+                        div().flex_1().child(self.search_input.clone()),
                     )
                     .child(
                         // Connect button inside search box using Button component
@@ -632,12 +636,24 @@ impl HostsView {
             .context_menu({
                 use crate::components::button::Icon as MenuIcon;
                 move |menu: PopupMenu, _window, _cx| {
-                    menu.menu_with_icon("Connect", MenuIcon::new("icons/link.svg"), Box::new(crate::ConnectHost))
-                        .separator()
-                        .menu_with_icon("Edit", MenuIcon::new("icons/edit.svg"), Box::new(crate::EditHost))
-                        .menu("Duplicate", Box::new(crate::DuplicateHost))
-                        .separator()
-                        .menu_with_icon("Delete", MenuIcon::new("icons/trash.svg"), Box::new(crate::DeleteHost))
+                    menu.menu_with_icon(
+                        "Connect",
+                        MenuIcon::new("icons/link.svg"),
+                        Box::new(crate::ConnectHost),
+                    )
+                    .separator()
+                    .menu_with_icon(
+                        "Edit",
+                        MenuIcon::new("icons/edit.svg"),
+                        Box::new(crate::EditHost),
+                    )
+                    .menu("Duplicate", Box::new(crate::DuplicateHost))
+                    .separator()
+                    .menu_with_icon(
+                        "Delete",
+                        MenuIcon::new("icons/trash.svg"),
+                        Box::new(crate::DeleteHost),
+                    )
                 }
             })
             .child(
@@ -819,7 +835,9 @@ impl Render for HostsView {
             }))
             .on_action(cx.listener(|this, _: &crate::EditHost, _window, cx| {
                 // Edit the host that was right-clicked, or the first selected host
-                let host_id_to_edit = this.context_menu_host_id.clone()
+                let host_id_to_edit = this
+                    .context_menu_host_id
+                    .clone()
                     .or_else(|| this.selected_host_ids.iter().next().cloned());
 
                 if let Some(host_id) = host_id_to_edit {
@@ -876,7 +894,8 @@ impl Render for HostsView {
                             });
                         }
                     }
-                }).detach();
+                })
+                .detach();
             }))
             // Scrollable content (rendered first = lower z-order)
             // Fills the entire parent; top-padding reserves space for the fixed header

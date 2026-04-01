@@ -741,9 +741,7 @@ impl EntityInputHandler for Input {
         let start = range.start.min(content_len);
         let end = range.end.min(content_len);
 
-        self.content =
-            (self.content[0..start].to_owned() + new_text + &self.content[end..])
-                .into();
+        self.content = (self.content[0..start].to_owned() + new_text + &self.content[end..]).into();
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.marked_range.take();
 
@@ -772,9 +770,7 @@ impl EntityInputHandler for Input {
         let start = range.start.min(content_len);
         let end = range.end.min(content_len);
 
-        self.content =
-            (self.content[0..start].to_owned() + new_text + &self.content[end..])
-                .into();
+        self.content = (self.content[0..start].to_owned() + new_text + &self.content[end..]).into();
         if !new_text.is_empty() {
             self.marked_range = Some(start..start + new_text.len());
         } else {
