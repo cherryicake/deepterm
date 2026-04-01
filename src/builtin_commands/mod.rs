@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gpui::prelude::*;
 use gpui::{IntoElement, ParentElement, Styled};
 use gpui::{MouseButton, Pixels, div, px, svg};
@@ -9,6 +11,8 @@ use crate::theme::UiTheme;
 pub struct BuiltinCommandManager {
     /// 命令输入缓冲区
     state: Option<BuiltinCommandState>,
+    /// 当前查询对应的建议缓存，避免每次读取都重新匹配和排序
+    suggestions: Rc<[&'static BuiltinCommandSpec]>,
     /// 当前选中的命令索引
     selected_index: usize,
     /// 用户是否已取消提示（ESC）
@@ -16,9 +20,11 @@ pub struct BuiltinCommandManager {
 }
 
 impl BuiltinCommandManager {
+    /// 创建一个空闲的内建命令管理器。
     pub fn new() -> Self {
         Self {
             state: None,
+            suggestions: Rc::from(Vec::new()),
             selected_index: 0,
             dismissed: false,
         }
@@ -39,22 +45,22 @@ impl BuiltinCommandManager {
         self.dismissed
     }
 
-    /// 获取建议列表
-    pub fn suggestions(&self) -> Vec<&'static BuiltinCommandSpec> {
-        let Some(query) = self.query() else {
-            return Vec::new();
-        };
-        command_suggestions(query)
+    /// 获取建议列表缓存的共享引用。
+    ///
+    /// 返回 `Rc` 仅复制句柄，不会复制底层建议数组。
+    pub fn suggestions(&self) -> Rc<[&'static BuiltinCommandSpec]> {
+        self.suggestions.clone()
     }
 
     /// 获取当前选中的命令
     pub fn selected_command(&self) -> Option<&'static BuiltinCommandSpec> {
-        let suggestions = self.suggestions();
-        let index = self.selected_index.min(suggestions.len().saturating_sub(1));
-        suggestions.get(index).copied()
+        let index = self.selected_index();
+        self.suggestions.get(index).copied()
     }
 
-    /// 更新输入内容
+    /// 追加输入内容。
+    ///
+    /// 一旦有新输入，就重新展示建议列表，并把选中项回到第一条。
     pub fn update(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -67,9 +73,12 @@ impl BuiltinCommandManager {
         // 重置取消状态和选择
         self.dismissed = false;
         self.selected_index = 0;
+        self.refresh_suggestions();
     }
 
-    /// 删除最后一个字符
+    /// 删除最后一个字符。
+    ///
+    /// 当缓冲区删空时，同时结束当前内建命令输入状态。
     pub fn pop(&mut self) {
         let mut should_clear = false;
         if let Some(state) = self.state.as_mut() {
@@ -81,31 +90,35 @@ impl BuiltinCommandManager {
         }
         self.dismissed = false;
         self.selected_index = 0;
+        self.refresh_suggestions();
     }
 
-    /// 清空命令状态
+    /// 清空命令状态，完全退出内建命令模式。
     pub fn clear(&mut self) {
         self.state = None;
+        self.suggestions = Rc::from(Vec::new());
         self.selected_index = 0;
     }
 
-    /// 标记为已取消（ESC）
+    /// 标记为已取消（ESC）。
+    ///
+    /// 取消后保留缓冲区内容，后续回车会把文本原样发给 shell。
     pub fn dismiss(&mut self) {
         self.dismissed = true;
         self.selected_index = 0;
     }
 
-    /// 选择下一个命令
+    /// 在建议列表中循环选择下一项。
     pub fn select_next(&mut self) {
-        let total = self.suggestions().len();
+        let total = self.suggestions.len();
         if total > 0 {
             self.selected_index = (self.selected_index + 1) % total;
         }
     }
 
-    /// 选择上一个命令
+    /// 在建议列表中循环选择上一项。
     pub fn select_previous(&mut self) {
-        let total = self.suggestions().len();
+        let total = self.suggestions.len();
         if total > 0 {
             self.selected_index = if self.selected_index == 0 {
                 total - 1
@@ -115,7 +128,7 @@ impl BuiltinCommandManager {
         }
     }
 
-    /// Tab 补全：将选中的命令替换到输入中，保留参数
+    /// 用当前选中项替换命令名前缀，同时保留已经输入的参数部分。
     pub fn complete(&mut self) {
         let Some(selected) = self.selected_command() else {
             return;
@@ -139,16 +152,44 @@ impl BuiltinCommandManager {
         state.set_buffer(new_input);
         // 重置取消状态
         self.dismissed = false;
+        self.selected_index = 0;
+        self.refresh_suggestions();
     }
 
-    /// 获取当前选中的索引
+    /// 按外部交互（如鼠标点击）直接设置选中项。
+    pub fn set_selected_index(&mut self, index: usize) {
+        let total = self.suggestions.len();
+        self.selected_index = if total == 0 { 0 } else { index.min(total - 1) };
+    }
+
+    /// 处理一次显式选中。
+    ///
+    /// 这等价于“先选中某条建议，再执行一次 Tab 补全”。
+    pub fn pick(&mut self, index: usize) {
+        self.set_selected_index(index);
+        self.complete();
+    }
+
+    /// 获取当前有效的选中索引。
+    ///
+    /// 这里会根据当前建议数量做一次收敛，避免索引越界。
     pub fn selected_index(&self) -> usize {
-        self.selected_index
+        let total = self.suggestions.len();
+        if total == 0 {
+            0
+        } else {
+            self.selected_index.min(total - 1)
+        }
     }
 
-    /// 获取缓冲区引用（用于渲染）
-    pub fn state(&self) -> Option<&BuiltinCommandState> {
-        self.state.as_ref()
+    /// 根据当前缓冲区文本重算建议缓存，并收敛选中索引。
+    fn refresh_suggestions(&mut self) {
+        self.suggestions = self
+            .query()
+            .map(command_suggestions)
+            .unwrap_or_default()
+            .into();
+        self.selected_index = self.selected_index();
     }
 }
 
@@ -164,22 +205,27 @@ pub struct BuiltinCommandState {
 }
 
 impl BuiltinCommandState {
+    /// 用初始文本创建命令缓冲区。
     pub fn new(buffer: String) -> Self {
         Self { buffer }
     }
 
+    /// 在缓冲区末尾追加文本。
     pub fn push_str(&mut self, text: &str) {
         self.buffer.push_str(text);
     }
 
+    /// 删除缓冲区末尾的一个字符。
     pub fn pop(&mut self) {
         self.buffer.pop();
     }
 
+    /// 判断缓冲区是否为空。
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
+    /// 返回当前缓冲区文本。
     pub fn buffer(&self) -> &str {
         &self.buffer
     }
@@ -200,93 +246,82 @@ pub enum BuiltinCommandHandler {
 pub struct BuiltinCommandSpec {
     pub name: &'static str,
     pub description: &'static str,
-    pub preview: &'static str,
     pub icon: Icon,
     pub handler: BuiltinCommandHandler,
 }
-
-pub const BUILTIN_COMMAND_OVERLAY_PADDING: f32 = 4.0;
 
 pub const BUILTIN_COMMAND_SPECS: &[BuiltinCommandSpec] = &[
     BuiltinCommandSpec {
         name: "/open",
         description: "Open DeepTerm's File Browser.",
-        preview: "Open DeepTerm's File Browser",
         icon: Icon::Terminal,
         handler: BuiltinCommandHandler::OpenFileBrowser,
     },
     BuiltinCommandSpec {
         name: "/open-file",
         description: "Open a file in DeepTerm's editor.",
-        preview: "Open a file in DeepTerm's code editor",
         icon: Icon::Screen,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-repo",
         description: "Switch to another indexed repository.",
-        preview: "Switch to another indexed repository",
         icon: Icon::Host,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-skill",
         description: "Inspect an installed skill definition.",
-        preview: "Open a skill markdown file in DeepTerm",
         icon: Icon::KeyShield,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-rules",
         description: "View global and project agent rules.",
-        preview: "View all global and project rules",
         icon: Icon::SettingsHub,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-code-review",
         description: "Open the code review workspace.",
-        preview: "Open the code review workspace",
         icon: Icon::Plus,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-mcp-servers",
         description: "Inspect configured MCP servers.",
-        preview: "Open MCP servers",
         icon: Icon::Server,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/open-project-rules",
         description: "Open the project rules file (AGENTS.md).",
-        preview: "Open the project rules file (AGENTS.md)",
         icon: Icon::Host,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/new-component",
         description: "Create new GPUI components. Use when building components or UI elements.",
-        preview: "Create new GPUI components",
         icon: Icon::Plus,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/generate-component-story",
         description: "Create story examples for components.",
-        preview: "Create story examples for components",
         icon: Icon::Loader,
         handler: BuiltinCommandHandler::LogOnly,
     },
     BuiltinCommandSpec {
         name: "/generate-component-documentation",
         description: "Generate documentation for new components.",
-        preview: "Generate documentation for new components",
         icon: Icon::Loader,
         handler: BuiltinCommandHandler::LogOnly,
     },
 ];
 
+/// 根据命令行首个 token 查找内建命令定义。
+///
+/// 只匹配命令名本身，后续参数不会参与查找。
 pub fn find_builtin_command(input: &str) -> Option<&'static BuiltinCommandSpec> {
     let command_name = input.split_whitespace().next()?;
     BUILTIN_COMMAND_SPECS
@@ -294,6 +329,9 @@ pub fn find_builtin_command(input: &str) -> Option<&'static BuiltinCommandSpec> 
         .find(|spec| spec.name == command_name)
 }
 
+/// 根据当前查询生成建议列表，并按匹配分数从高到低排序。
+///
+/// 优先级依次是：精确匹配、前缀匹配、名称子串匹配、描述子串匹配。
 pub fn command_suggestions(query: &str) -> Vec<&'static BuiltinCommandSpec> {
     let command_prefix = query.split_whitespace().next().unwrap_or(query);
     // 去掉前导 '/' 用于子串匹配
@@ -334,6 +372,9 @@ pub fn command_suggestions(query: &str) -> Vec<&'static BuiltinCommandSpec> {
     scored.into_iter().map(|(_, spec)| spec).collect()
 }
 
+/// 根据当前输入和选中项，生成最终要提交的命令行。
+///
+/// `force_selected = true` 用于显式选择场景（如鼠标点击），允许直接用选中项覆盖当前前缀。
 pub fn resolve_command_line(
     query: &str,
     selected: Option<&BuiltinCommandSpec>,
@@ -380,14 +421,22 @@ fn render_key_hint(key: &str, label: Option<&str>, theme: UiTheme) -> impl IntoE
         })
 }
 
-/// Renders the builtin command overlay with interactive selection
-pub fn render_overlay(
-    suggestions: Vec<&'static BuiltinCommandSpec>,
+/// 渲染内建命令建议浮层。
+///
+/// `on_pick` 由外层提供，用来响应鼠标选中某一条建议。
+pub fn render_overlay<F>(
+    suggestions: Rc<[&'static BuiltinCommandSpec]>,
     selected_index: usize,
     top: Pixels,
     theme: UiTheme,
     is_dark: bool,
-) -> impl IntoElement {
+    on_pick: F,
+) -> impl IntoElement
+where
+    F: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+{
+    let on_pick = Rc::new(on_pick);
+
     div()
         .absolute()
         .left(px(0.0))
@@ -415,9 +464,11 @@ pub fn render_overlay(
                 .max_h(px(420.0))
                 .children(
                     suggestions
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .enumerate()
                         .map(move |(index, spec)| {
+                            let on_pick = on_pick.clone();
                             let is_selected = index == selected_index;
                             div()
                                 .w_full()
@@ -435,6 +486,10 @@ pub fn render_overlay(
                                 })
                                 .when(!is_selected, |this| {
                                     this.hover(move |style| style.bg(theme.tab_hover_background))
+                                })
+                                .on_mouse_up(MouseButton::Left, move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    on_pick(index, window, cx);
                                 })
                                 .child(
                                     div()
@@ -472,7 +527,9 @@ pub fn render_overlay(
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_COMMAND_SPECS, find_builtin_command, resolve_command_line};
+    use super::{
+        BUILTIN_COMMAND_SPECS, BuiltinCommandManager, find_builtin_command, resolve_command_line,
+    };
 
     #[test]
     fn parses_builtin_open_command() {
@@ -536,6 +593,33 @@ mod tests {
         assert_eq!(
             resolve_command_line("/unknown target", selected, true),
             "/open-file target"
+        );
+    }
+
+    #[test]
+    fn pick_completes_selected_command_and_keeps_args() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/op target");
+        manager.pick(0);
+
+        assert_eq!(manager.query(), Some("/open target"));
+        assert_eq!(
+            manager.selected_command().map(|spec| spec.name),
+            Some("/open")
+        );
+        assert!(!manager.is_dismissed());
+    }
+
+    #[test]
+    fn pick_uses_clicked_index() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/op target");
+        manager.pick(1);
+
+        assert_eq!(manager.query(), Some("/open-file target"));
+        assert_eq!(
+            manager.selected_command().map(|spec| spec.name),
+            Some("/open-file")
         );
     }
 }

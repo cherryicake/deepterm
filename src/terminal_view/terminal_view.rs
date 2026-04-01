@@ -32,8 +32,7 @@ use alacritty_terminal::term::TermMode;
 
 use crate::ShowSshPicker;
 use crate::builtin_commands::{
-    BUILTIN_COMMAND_OVERLAY_PADDING, BuiltinCommandHandler, BuiltinCommandManager,
-    BuiltinCommandSpec, find_builtin_command, resolve_command_line,
+    BuiltinCommandHandler, BuiltinCommandManager, find_builtin_command, resolve_command_line,
 };
 use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
@@ -392,6 +391,9 @@ impl TerminalView {
             .map_or(false, |s| !s.marked_text.is_empty())
     }
 
+    /// 是否存在本地覆盖输入。
+    ///
+    /// 这里包括 IME 预编辑文本和内建命令缓冲；只要存在其一，就由覆盖层负责显示输入。
     pub fn has_local_overlay_input(&self) -> bool {
         self.builtin_command_manager.is_active() || self.has_ime_composition()
     }
@@ -401,11 +403,11 @@ impl TerminalView {
         self.ime_state.as_ref()
     }
 
+    /// 组合覆盖层要显示的文本。
+    ///
+    /// 内建命令缓冲显示在前，IME 预编辑文本追加在后，保持用户当前看到的输入顺序。
     pub fn local_overlay_text(&self) -> Option<String> {
-        let builtin_text = self
-            .builtin_command_manager
-            .query()
-            .unwrap_or_default();
+        let builtin_text = self.builtin_command_manager.query().unwrap_or_default();
         let ime_text = self
             .ime_state
             .as_ref()
@@ -419,74 +421,53 @@ impl TerminalView {
         }
     }
 
-    fn builtin_command_query(&self) -> Option<&str> {
-        self.builtin_command_manager.query()
-    }
-
-    fn builtin_command_suggestions(&self) -> Vec<&'static BuiltinCommandSpec> {
-        self.builtin_command_manager.suggestions()
-    }
-
-    fn selected_builtin_command(&self) -> Option<&'static BuiltinCommandSpec> {
-        self.builtin_command_manager.selected_command()
-    }
-
-    fn reset_builtin_command_selection(&mut self) {
-        // Now handled by manager internally, but we keep method for compatibility
-        // The manager resets selection on update/pop/clear
-    }
-
-    fn set_builtin_command_selected_index(&mut self, _index: usize, _cx: &mut Context<Self>) {
-        // Method no longer needed - manager handles selection internally
-        // Kept for API compatibility
-    }
-
-    fn select_next_builtin_command(&mut self, cx: &mut Context<Self>) {
-        self.builtin_command_manager.select_next();
-        cx.notify();
-    }
-
-    fn select_previous_builtin_command(&mut self, cx: &mut Context<Self>) {
-        self.builtin_command_manager.select_previous();
-        cx.notify();
-    }
-
-    /// Tab 补全：将当前选中的命令名替换到输入中，保留参数部分
-    fn complete_builtin_command(&mut self, cx: &mut Context<Self>) {
-        self.builtin_command_manager.complete();
-        cx.notify();
-    }
-
+    /// 生成这次提交应该使用的命令行文本。
+    ///
+    /// 当存在选中项时，会按 `force_selected` 规则决定是否用选中命令替换当前前缀。
     fn builtin_command_submission_text(&self, force_selected: bool) -> Option<String> {
-        let query = self.builtin_command_query()?;
-        let selected = self.selected_builtin_command();
+        let query = self.builtin_command_manager.query()?;
+        let selected = self.builtin_command_manager.selected_command();
         Some(resolve_command_line(query, selected, force_selected))
     }
 
-    fn builtin_command_overlay_position(&self, cx: &App) -> (Pixels, Pixels) {
+    /// 计算建议浮层在终端内的绘制位置。
+    ///
+    /// 浮层锚定在光标下一行，和命令输入所在的提示位置保持邻近。
+    fn builtin_command_overlay_position(&self, cx: &App) -> Pixels {
         let term = self.terminal.read(cx);
         let content = term.last_content();
         let bounds = term.terminal_bounds();
         let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
         let overlay_row = (cursor_line_in_viewport + 1).max(0) as f32;
 
-        let left = px((content.cursor.column.0 as f32 * bounds.cell_width.as_f32()).floor())
-            + px(BUILTIN_COMMAND_OVERLAY_PADDING);
         let top = px((overlay_row * bounds.line_height.as_f32()).floor()) + px(6.0);
 
-        (left, top)
+        top
     }
 
+    /// 渲染内建命令建议浮层，并把鼠标选择转成一次显式补全。
     fn render_builtin_command_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + 'static {
         use crate::builtin_commands::render_overlay;
 
-        let suggestions = self.builtin_command_suggestions();
-        let (_left, top) = self.builtin_command_overlay_position(cx);
+        let suggestions = self.builtin_command_manager.suggestions();
+        let top = self.builtin_command_overlay_position(cx);
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
         let selected_index = self.builtin_command_manager.selected_index();
+        let view = cx.entity().clone();
 
-        render_overlay(suggestions, selected_index, top, theme, is_dark)
+        render_overlay(
+            suggestions,
+            selected_index,
+            top,
+            theme,
+            is_dark,
+            move |index, _window, cx| {
+                view.update(cx, |this, cx| {
+                    this.mutate_builtin_command(cx, |manager| manager.pick(index));
+                });
+            },
+        )
     }
 
     /// Clears the marked (pre-edit) text state.
@@ -498,6 +479,9 @@ impl TerminalView {
         }
     }
 
+    /// 判断一段新文本是否应该开启内建命令模式。
+    ///
+    /// 只有当前行仍允许 `/` 起始命令、且输入内容不是换行时才会进入。
     fn should_start_builtin_command(&self, text: &str) -> bool {
         !self.builtin_command_manager.is_active()
             && self.can_start_builtin_command
@@ -505,15 +489,18 @@ impl TerminalView {
             && !text.contains(['\n', '\r'])
     }
 
+    /// 把文本写入内建命令缓冲，并刷新浮层。
     fn update_builtin_command(&mut self, text: &str, cx: &mut Context<Self>) {
         if text.is_empty() {
             return;
         }
 
-        self.builtin_command_manager.update(text);
-        cx.notify();
+        self.mutate_builtin_command(cx, |manager| manager.update(text));
     }
 
+    /// 清空内建命令状态。
+    ///
+    /// 只有原先处于激活状态时才触发一次通知，避免无意义刷新。
     fn clear_builtin_command(&mut self, cx: &mut Context<Self>) {
         let was_active = self.builtin_command_manager.is_active();
         self.builtin_command_manager.clear();
@@ -523,11 +510,14 @@ impl TerminalView {
         }
     }
 
+    /// 从内建命令缓冲末尾删除一个字符。
     fn pop_builtin_command(&mut self, cx: &mut Context<Self>) {
-        self.builtin_command_manager.pop();
-        cx.notify();
+        self.mutate_builtin_command(cx, BuiltinCommandManager::pop);
     }
 
+    /// 尝试把文本路由到内建命令缓冲。
+    ///
+    /// 已经在内建命令模式下时会继续追加；否则只有满足起始条件时才会新建缓冲。
     fn route_text_to_builtin_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         if text.is_empty() {
             return false;
@@ -541,6 +531,9 @@ impl TerminalView {
         false
     }
 
+    /// 执行已经解析完成的内建命令。
+    ///
+    /// 返回 `true` 表示该命令由应用接管，不应再回落到 shell。
     fn execute_builtin_command(&mut self, command_line: &str, _cx: &mut Context<Self>) -> bool {
         match find_builtin_command(command_line) {
             Some(spec) => {
@@ -552,38 +545,77 @@ impl TerminalView {
         }
     }
 
-    fn submit_builtin_command(&mut self, cx: &mut Context<Self>) {
-        let Some(command_line) = self.builtin_command_submission_text(false) else {
+    /// 提交一条已经确定好的命令行。
+    ///
+    /// 如果不是应用内建命令，就把它按普通 shell 输入发回终端。
+    fn submit_resolved_builtin_command(&mut self, command_line: String, cx: &mut Context<Self>) {
+        self.finish_builtin_command_input(cx);
+
+        if !self.execute_builtin_command(&command_line, cx) {
+            self.send_command_line_to_shell(&command_line, cx);
+        }
+    }
+
+    /// 解析并提交当前内建命令缓冲。
+    fn submit_builtin_command(&mut self, force_selected: bool, cx: &mut Context<Self>) {
+        let Some(command_line) = self.builtin_command_submission_text(force_selected) else {
             return;
         };
 
-        self.clear_marked_text(cx);
-        self.clear_builtin_command(cx);
-        self.can_start_builtin_command = true;
-
-        if !self.execute_builtin_command(&command_line, cx) {
-            let mut data = command_line.into_bytes();
-            data.push(b'\n');
-            self.write_with_broadcast(&data, cx);
-        }
+        self.submit_resolved_builtin_command(command_line, cx);
     }
 
     /// 将内置命令缓冲区的内容直接发送给 shell（不执行内置命令处理）
     fn send_builtin_command_to_shell(&mut self, cx: &mut Context<Self>) {
-        let Some(command_line) = self.builtin_command_query().map(|s| s.to_string()) else {
+        let Some(command_line) = self.builtin_command_manager.query().map(|s| s.to_string()) else {
             return;
         };
 
-        self.clear_marked_text(cx);
-        self.clear_builtin_command(cx);
-        self.can_start_builtin_command = true;
+        self.finish_builtin_command_input(cx);
 
         // 直接发送给 shell，不尝试执行内置命令
-        let mut data = command_line.into_bytes();
+        self.send_command_line_to_shell(&command_line, cx);
+    }
+
+    /// 把一整行命令作为用户输入发回 shell，并自动补一个换行。
+    fn send_command_line_to_shell(&mut self, command_line: &str, cx: &mut Context<Self>) {
+        let mut data = command_line.as_bytes().to_vec();
         data.push(b'\n');
         self.write_with_broadcast(&data, cx);
     }
 
+    /// 修改内建命令管理器状态，并统一触发一次刷新。
+    fn mutate_builtin_command(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut BuiltinCommandManager),
+    ) {
+        f(&mut self.builtin_command_manager);
+        cx.notify();
+    }
+
+    /// 结束当前内建命令输入，恢复普通终端输入状态。
+    fn finish_builtin_command_input(&mut self, cx: &mut Context<Self>) {
+        self.clear_marked_text(cx);
+        self.clear_builtin_command(cx);
+        self.can_start_builtin_command = true;
+    }
+
+    /// 判断某个按键在内建命令模式下是否应该被本地吞掉。
+    ///
+    /// 只要这个按键本来会被编码成终端输入，就不应该再透传到 PTY。
+    fn should_swallow_builtin_command_key(
+        &self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mode = self.terminal.read(cx).last_content().mode;
+        to_esc_str(&event.keystroke, &mode, false).is_some()
+    }
+
+    /// 处理内建命令模式下的按键。
+    ///
+    /// 这里优先消费导航、补全、取消、提交等按键，避免它们落到真实 shell。
     fn handle_builtin_command_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -598,19 +630,21 @@ impl TerminalView {
 
         if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
             if modifiers.control && key.eq_ignore_ascii_case("c") {
-                self.clear_marked_text(cx);
-                self.clear_builtin_command(cx);
-                self.can_start_builtin_command = true;
+                self.finish_builtin_command_input(cx);
                 return true;
             }
 
             // Ctrl+P / Ctrl+N 用于在列表中导航
             if modifiers.control && key.eq_ignore_ascii_case("p") {
-                self.select_previous_builtin_command(cx);
+                self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
                 return true;
             }
             if modifiers.control && key.eq_ignore_ascii_case("n") {
-                self.select_next_builtin_command(cx);
+                self.mutate_builtin_command(cx, BuiltinCommandManager::select_next);
+                return true;
+            }
+
+            if self.should_swallow_builtin_command_key(event, cx) {
                 return true;
             }
 
@@ -619,19 +653,19 @@ impl TerminalView {
 
         match key {
             "up" => {
-                self.select_previous_builtin_command(cx);
+                self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
                 true
             }
             "down" => {
-                self.select_next_builtin_command(cx);
+                self.mutate_builtin_command(cx, BuiltinCommandManager::select_next);
                 true
             }
             "tab" => {
                 if modifiers.shift {
-                    self.select_previous_builtin_command(cx);
+                    self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
                 } else {
                     // Tab 补全：将当前选中的命令替换到输入中
-                    self.complete_builtin_command(cx);
+                    self.mutate_builtin_command(cx, BuiltinCommandManager::complete);
                 }
                 true
             }
@@ -643,8 +677,7 @@ impl TerminalView {
             "escape" => {
                 self.clear_marked_text(cx);
                 // ESC 关闭命令列表 UI，标记 dismiss 状态，但保留输入
-                self.builtin_command_manager.dismiss();
-                cx.notify();
+                self.mutate_builtin_command(cx, BuiltinCommandManager::dismiss);
                 true
             }
             "enter" | "return" => {
@@ -652,7 +685,7 @@ impl TerminalView {
                     // 用户已取消，直接将命令发送给 shell
                     self.send_builtin_command_to_shell(cx);
                 } else {
-                    self.submit_builtin_command(cx);
+                    self.submit_builtin_command(false, cx);
                 }
                 true
             }
@@ -660,7 +693,7 @@ impl TerminalView {
                 self.update_builtin_command(" ", cx);
                 true
             }
-            _ => false,
+            _ => self.should_swallow_builtin_command_key(event, cx),
         }
     }
 
@@ -1141,10 +1174,9 @@ impl Render for TerminalView {
                         )
                     })
                     .when(
-                        self.builtin_command_manager.is_active() && !self.builtin_command_manager.is_dismissed(),
-                        |this| {
-                            this.child(self.render_builtin_command_overlay(cx))
-                        },
+                        self.builtin_command_manager.is_active()
+                            && !self.builtin_command_manager.is_dismissed(),
+                        |this| this.child(self.render_builtin_command_overlay(cx)),
                     )
                     // SSH 连接进度视图覆盖层 - 在连接建立期间覆盖终端内容
                     .when_some(self.ssh_connect_view.clone(), |this, connect_view| {
