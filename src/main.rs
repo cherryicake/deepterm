@@ -1,6 +1,7 @@
 #![cfg_attr(target_family = "wasm", no_main)]
 
 pub mod assets;
+pub mod builtin_commands;
 pub mod components;
 mod settings_hub;
 pub mod ssh;

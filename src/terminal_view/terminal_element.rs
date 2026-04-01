@@ -9,9 +9,9 @@ use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
-    fill, point, px, size, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
-    Font, FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId,
-    Pixels, Point, Style, TextRun, TextStyle, WhiteSpace, Window,
+    Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks,
+    FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
+    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -1152,8 +1152,8 @@ impl Element for TerminalElement {
 
         let cursor_display_col = cursor_point.column.0;
 
-        // Check if IME composition is active — hide terminal cursor during input
-        let has_ime_composition = self.view.read(cx).has_ime_composition();
+        // 本地覆盖输入存在时隐藏终端光标，由覆盖层负责显示
+        let has_local_overlay_input = self.view.read(cx).has_local_overlay_input();
 
         // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
         // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
@@ -1162,7 +1162,7 @@ impl Element for TerminalElement {
         let cursor = if self.cursor_visible
             && cursor_in_viewport
             && cursor_shape != AlacCursorShape::Hidden
-            && !has_ime_composition
+            && !has_local_overlay_input
         {
             let cursor_x = terminal_bounds.bounds.left()
                 + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
@@ -1233,14 +1233,10 @@ impl Element for TerminalElement {
             None
         };
 
-        // Shape IME preedit (marked) text for overlay rendering.
-        let ime_overlay: Option<(gpui::ShapedLine, Point<Pixels>)> = if cursor_in_viewport {
-            let ime_text = self
-                .view
-                .read(cx)
-                .ime_state()
-                .map(|s| s.marked_text.clone());
-            if let Some(text) = ime_text {
+        // Shape local overlay text for rendering at the shell prompt position.
+        let input_overlay: Option<(gpui::ShapedLine, Point<Pixels>)> = if cursor_in_viewport {
+            let overlay_text = self.view.read(cx).local_overlay_text();
+            if let Some(text) = overlay_text {
                 if !text.is_empty() {
                     let ime_x = terminal_bounds.bounds.left()
                         + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
@@ -1281,7 +1277,7 @@ impl Element for TerminalElement {
             cursor_in_viewport,
             terminal_bounds,
             cursor,
-            ime_overlay,
+            input_overlay,
         )
     }
 
@@ -1308,7 +1304,7 @@ impl Element for TerminalElement {
             _cursor_in_viewport,
             terminal_bounds,
             cursor,
-            ime_overlay,
+            input_overlay,
         ) = prepaint_state;
 
         let origin = terminal_bounds.bounds.origin;
@@ -1366,8 +1362,8 @@ impl Element for TerminalElement {
             cursor_layout.paint(window, cx);
         }
 
-        // Render IME preedit (marked) text overlay at cursor position.
-        if let Some((ime_shaped, ime_origin)) = ime_overlay {
+        // Render local buffered input at cursor position.
+        if let Some((ime_shaped, ime_origin)) = input_overlay {
             let ime_background_bounds =
                 Bounds::new(*ime_origin, size(ime_shaped.width, *line_height));
             window.paint_quad(fill(ime_background_bounds, terminal_theme.ime_background));

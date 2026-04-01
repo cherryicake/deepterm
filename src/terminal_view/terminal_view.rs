@@ -31,12 +31,17 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
 use crate::ShowSshPicker;
+use crate::builtin_commands::{
+    BUILTIN_COMMAND_OVERLAY_PADDING, BuiltinCommandHandler, BuiltinCommandSpec,
+    BuiltinCommandState, command_suggestions, find_builtin_command, render_overlay,
+};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::{RowRenderCache, TerminalElement};
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
+use crate::theme::ActiveTheme;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
@@ -61,6 +66,10 @@ pub struct TerminalView {
     selecting: bool,
     /// IME composition state for CJK input methods
     ime_state: Option<ImeState>,
+    /// DeepTerm 内置命令缓冲，仅在本地渲染，不发送到 shell
+    builtin_command_state: Option<BuiltinCommandState>,
+    /// 当前输入行是否仍允许由 `/` 启动内置命令
+    can_start_builtin_command: bool,
     /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
     broadcast_callback: Option<BroadcastInputCallback>,
     /// Pending scrollbar hide task - prevents spawning a new timer every render frame
@@ -108,6 +117,8 @@ impl TerminalView {
                 title: "Terminal".into(),
                 selecting: false,
                 ime_state: None,
+                builtin_command_state: None,
+                can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
@@ -166,6 +177,8 @@ impl TerminalView {
                 title: command_string.into(),
                 selecting: false,
                 ime_state: None,
+                builtin_command_state: None,
+                can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: None,
@@ -273,6 +286,8 @@ impl TerminalView {
                 title: ssh_config_clone.host_label().into(),
                 selecting: false,
                 ime_state: None,
+                builtin_command_state: None,
+                can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 ssh_connect_view: Some(connect_view),
@@ -377,9 +392,76 @@ impl TerminalView {
             .map_or(false, |s| !s.marked_text.is_empty())
     }
 
+    pub fn has_local_overlay_input(&self) -> bool {
+        self.builtin_command_state.is_some() || self.has_ime_composition()
+    }
+
     /// Returns a reference to the current IME state, if any.
     pub fn ime_state(&self) -> Option<&ImeState> {
         self.ime_state.as_ref()
+    }
+
+    pub fn local_overlay_text(&self) -> Option<String> {
+        let builtin_text = self
+            .builtin_command_state
+            .as_ref()
+            .map(BuiltinCommandState::buffer)
+            .unwrap_or_default();
+        let ime_text = self
+            .ime_state
+            .as_ref()
+            .map(|state| state.marked_text.as_str())
+            .unwrap_or_default();
+
+        if builtin_text.is_empty() && ime_text.is_empty() {
+            None
+        } else {
+            Some(format!("{builtin_text}{ime_text}"))
+        }
+    }
+
+    fn builtin_command_query(&self) -> Option<&str> {
+        self.builtin_command_state
+            .as_ref()
+            .map(BuiltinCommandState::buffer)
+    }
+
+    fn builtin_command_suggestions(&self) -> Vec<&'static BuiltinCommandSpec> {
+        let Some(query) = self.builtin_command_query() else {
+            return Vec::new();
+        };
+
+        command_suggestions(query)
+    }
+
+    fn builtin_command_overlay_position(&self, cx: &App) -> (Pixels, Pixels) {
+        let term = self.terminal.read(cx);
+        let content = term.last_content();
+        let bounds = term.terminal_bounds();
+        let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
+        let overlay_row = (cursor_line_in_viewport + 1).max(0) as f32;
+
+        let left = px((content.cursor.column.0 as f32 * bounds.cell_width.as_f32()).floor())
+            + px(BUILTIN_COMMAND_OVERLAY_PADDING);
+        let top = px((overlay_row * bounds.line_height.as_f32()).floor()) + px(6.0);
+
+        (left, top)
+    }
+
+    fn render_builtin_command_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + 'static {
+        let suggestions = self.builtin_command_suggestions();
+        let (left, top) = self.builtin_command_overlay_position(cx);
+        let theme = cx.theme().ui;
+        let query = self.builtin_command_query().unwrap_or_default();
+
+        render_overlay(
+            query,
+            &suggestions,
+            left,
+            top,
+            theme,
+            cx.theme().appearance.is_dark(),
+        )
     }
 
     /// Clears the marked (pre-edit) text state.
@@ -391,10 +473,148 @@ impl TerminalView {
         }
     }
 
+    fn should_start_builtin_command(&self, text: &str) -> bool {
+        self.builtin_command_state.is_none()
+            && self.can_start_builtin_command
+            && text.starts_with('/')
+            && !text.contains(['\n', '\r'])
+    }
+
+    fn update_builtin_command(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+
+        if let Some(state) = self.builtin_command_state.as_mut() {
+            state.push_str(text);
+        } else {
+            self.builtin_command_state = Some(BuiltinCommandState::new(text.to_string()));
+        }
+
+        cx.notify();
+    }
+
+    fn clear_builtin_command(&mut self, cx: &mut Context<Self>) {
+        if self.builtin_command_state.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn pop_builtin_command(&mut self, cx: &mut Context<Self>) {
+        let mut should_clear = false;
+
+        if let Some(state) = self.builtin_command_state.as_mut() {
+            state.pop();
+            should_clear = state.is_empty();
+        }
+
+        if should_clear {
+            self.builtin_command_state = None;
+        }
+
+        cx.notify();
+    }
+
+    fn route_text_to_builtin_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+
+        if self.builtin_command_state.is_some() || self.should_start_builtin_command(text) {
+            self.update_builtin_command(text, cx);
+            return true;
+        }
+
+        false
+    }
+
+    fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
+        match find_builtin_command(command_line) {
+            Some(spec) => {
+                log::info!("builtin command {}: {}", spec.name, spec.description);
+
+                if spec.handler == BuiltinCommandHandler::OpenPicker {
+                    cx.dispatch_action(&crate::ShowSshPicker);
+                }
+
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn submit_builtin_command(&mut self, cx: &mut Context<Self>) {
+        let Some(command_line) = self
+            .builtin_command_state
+            .as_ref()
+            .map(|state| state.buffer().to_string())
+        else {
+            return;
+        };
+
+        self.clear_marked_text(cx);
+        self.clear_builtin_command(cx);
+        self.can_start_builtin_command = true;
+
+        if !self.execute_builtin_command(&command_line, cx) {
+            let mut data = command_line.into_bytes();
+            data.push(b'\n');
+            self.write_with_broadcast(&data, cx);
+        }
+    }
+
+    fn handle_builtin_command_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.builtin_command_state.is_none() {
+            return false;
+        }
+
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            if modifiers.control && key.eq_ignore_ascii_case("c") {
+                self.clear_marked_text(cx);
+                self.clear_builtin_command(cx);
+                self.can_start_builtin_command = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        match key {
+            "backspace" => {
+                self.pop_builtin_command(cx);
+                self.can_start_builtin_command = self.builtin_command_state.is_none();
+                true
+            }
+            "escape" => {
+                self.clear_marked_text(cx);
+                self.clear_builtin_command(cx);
+                self.can_start_builtin_command = true;
+                true
+            }
+            "enter" | "return" => {
+                self.submit_builtin_command(cx);
+                true
+            }
+            "space" => {
+                self.update_builtin_command(" ", cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Commits (sends) the given text to the PTY.
     /// This is called when the user confirms the input (e.g., pressing Space to select).
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !text.is_empty() {
+            self.can_start_builtin_command = false;
             self.write_with_broadcast(text.as_bytes(), cx);
         }
     }
@@ -469,6 +689,10 @@ impl TerminalView {
 
         // Otherwise, paste text content with bracketed paste mode support
         if let Some(text) = clipboard.text() {
+            if self.route_text_to_builtin_command(&text, cx) {
+                return;
+            }
+
             let bracketed = self.terminal.update(cx, |terminal, _| {
                 terminal
                     .last_content()
@@ -574,6 +798,11 @@ impl TerminalView {
             cx.notify();
         }
 
+        if self.handle_builtin_command_key_down(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
         let mut input_bytes: Option<Vec<u8>> = None;
         let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
@@ -594,6 +823,16 @@ impl TerminalView {
         }
 
         if handled {
+            match event.keystroke.key.as_str() {
+                "enter" | "return" => {
+                    self.can_start_builtin_command = true;
+                }
+                _ if input_bytes.is_some() => {
+                    self.can_start_builtin_command = false;
+                }
+                _ => {}
+            }
+
             // Stop propagation only if we handled the key
             cx.stop_propagation();
         }
@@ -649,6 +888,9 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.clear_marked_text(cx);
+        if self.route_text_to_builtin_command(text, cx) {
+            return;
+        }
         self.commit_text(text, cx);
     }
 
@@ -832,6 +1074,9 @@ impl Render for TerminalView {
                                 .w(px(8.0))
                                 .child(TerminalScrollbar::new(terminal, cx)),
                         )
+                    })
+                    .when(self.builtin_command_state.is_some(), |this| {
+                        this.child(self.render_builtin_command_overlay(cx))
                     })
                     // SSH 连接进度视图覆盖层 - 在连接建立期间覆盖终端内容
                     .when_some(self.ssh_connect_view.clone(), |this, connect_view| {
