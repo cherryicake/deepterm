@@ -403,16 +403,25 @@ impl TerminalView {
         self.ime_state.as_ref()
     }
 
+    /// Returns the active builtin command buffer, if any.
+    pub fn builtin_command_text(&self) -> &str {
+        self.builtin_command_manager.query().unwrap_or_default()
+    }
+
+    /// Returns the current IME pre-edit text, if any.
+    pub fn ime_text(&self) -> &str {
+        self.ime_state
+            .as_ref()
+            .map(|state| state.marked_text.as_str())
+            .unwrap_or_default()
+    }
+
     /// 组合覆盖层要显示的文本。
     ///
     /// 内建命令缓冲显示在前，IME 预编辑文本追加在后，保持用户当前看到的输入顺序。
     pub fn local_overlay_text(&self) -> Option<String> {
-        let builtin_text = self.builtin_command_manager.query().unwrap_or_default();
-        let ime_text = self
-            .ime_state
-            .as_ref()
-            .map(|state| state.marked_text.as_str())
-            .unwrap_or_default();
+        let builtin_text = self.builtin_command_text();
+        let ime_text = self.ime_text();
 
         if builtin_text.is_empty() && ime_text.is_empty() {
             None

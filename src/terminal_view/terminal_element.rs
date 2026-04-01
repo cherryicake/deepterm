@@ -167,6 +167,13 @@ enum CursorShape {
     Underline,
 }
 
+pub struct LocalOverlayLayout {
+    shaped_line: gpui::ShapedLine,
+    origin: Point<Pixels>,
+    builtin_width: Pixels,
+    ime_width: Pixels,
+}
+
 impl CursorLayout {
     fn paint(&self, window: &mut Window, cx: &mut gpui::App) {
         match self.shape {
@@ -782,7 +789,7 @@ impl Element for TerminalElement {
         bool,
         TerminalBounds,
         Option<CursorLayout>,
-        Option<(gpui::ShapedLine, Point<Pixels>)>,
+        Option<LocalOverlayLayout>,
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -816,8 +823,10 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        let app_theme = cx.theme();
-        let terminal_theme = app_theme.terminal;
+        let theme = cx.theme();
+        let ui_theme = theme.ui;
+        let terminal_theme = theme.terminal;
+        let active_theme_id = theme.id.clone();
         let font_size = px(18.0);
         let line_height = font_size * 1.25;
 
@@ -949,12 +958,12 @@ impl Element for TerminalElement {
         // Take row render cache out of the view so we can mutate it here
         // without a borrow conflict, then write it back after processing.
         let mut row_caches: Vec<RowRenderCache> = match &self.cached_theme_id {
-            Some(theme_id) if &cx.theme().id == theme_id => self
+            Some(theme_id) if active_theme_id == *theme_id => self
                 .view
                 .update(cx, |view, _cx| std::mem::take(&mut view.row_render_cache)),
             _ => {
                 // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
-                self.cached_theme_id = Some(cx.theme().id.clone());
+                self.cached_theme_id = Some(active_theme_id.clone());
                 Vec::new()
             }
         };
@@ -1234,32 +1243,91 @@ impl Element for TerminalElement {
         };
 
         // Shape local overlay text for rendering at the shell prompt position.
-        let input_overlay: Option<(gpui::ShapedLine, Point<Pixels>)> = if cursor_in_viewport {
-            let overlay_text = self.view.read(cx).local_overlay_text();
-            if let Some(text) = overlay_text {
-                if !text.is_empty() {
-                    let ime_x = terminal_bounds.bounds.left()
-                        + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
-                    let ime_y = terminal_bounds.bounds.top()
-                        + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
-                    let len = text.len();
-                    let shaped = window.text_system().shape_line(
-                        text.into(),
-                        font_size,
-                        &[TextRun {
-                            len,
-                            font: text_style.font(),
-                            color: terminal_theme.bright_foreground,
-                            ..Default::default()
-                        }],
-                        None,
-                    );
-                    Some((shaped, point(ime_x, ime_y)))
-                } else {
-                    None
-                }
-            } else {
+        let input_overlay: Option<LocalOverlayLayout> = if cursor_in_viewport {
+            let (builtin_text, ime_text) = {
+                let view = self.view.read(cx);
+                (
+                    view.builtin_command_text().to_string(),
+                    view.ime_text().to_string(),
+                )
+            };
+            if builtin_text.is_empty() && ime_text.is_empty() {
                 None
+            } else {
+                let overlay_x = terminal_bounds.bounds.left()
+                    + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
+                let overlay_y = terminal_bounds.bounds.top()
+                    + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
+                let mut runs = Vec::with_capacity(2);
+
+                if !builtin_text.is_empty() {
+                    runs.push(TextRun {
+                        len: builtin_text.len(),
+                        font: text_style.font(),
+                        color: ui_theme.text,
+                        ..Default::default()
+                    });
+                }
+
+                if !ime_text.is_empty() {
+                    runs.push(TextRun {
+                        len: ime_text.len(),
+                        font: text_style.font(),
+                        color: terminal_theme.foreground,
+                        ..Default::default()
+                    });
+                }
+
+                let text = format!("{builtin_text}{ime_text}");
+                let shaped_line =
+                    window
+                        .text_system()
+                        .shape_line(text.into(), font_size, &runs, None);
+
+                let builtin_width = if builtin_text.is_empty() {
+                    Pixels::ZERO
+                } else {
+                    window
+                        .text_system()
+                        .shape_line(
+                            builtin_text.clone().into(),
+                            font_size,
+                            &[TextRun {
+                                len: builtin_text.len(),
+                                font: text_style.font(),
+                                color: ui_theme.text,
+                                ..Default::default()
+                            }],
+                            None,
+                        )
+                        .width
+                };
+
+                let ime_width = if ime_text.is_empty() {
+                    Pixels::ZERO
+                } else {
+                    window
+                        .text_system()
+                        .shape_line(
+                            ime_text.clone().into(),
+                            font_size,
+                            &[TextRun {
+                                len: ime_text.len(),
+                                font: text_style.font(),
+                                color: terminal_theme.foreground,
+                                ..Default::default()
+                            }],
+                            None,
+                        )
+                        .width
+                };
+
+                Some(LocalOverlayLayout {
+                    shaped_line,
+                    origin: point(overlay_x, overlay_y),
+                    builtin_width,
+                    ime_width,
+                })
             }
         } else {
             None
@@ -1363,13 +1431,28 @@ impl Element for TerminalElement {
         }
 
         // Render local buffered input at cursor position.
-        if let Some((ime_shaped, ime_origin)) = input_overlay {
-            let ime_background_bounds =
-                Bounds::new(*ime_origin, size(ime_shaped.width, *line_height));
-            window.paint_quad(fill(ime_background_bounds, terminal_theme.ime_background));
+        if let Some(input_overlay) = input_overlay {
+            if input_overlay.builtin_width > Pixels::ZERO {
+                let builtin_background_bounds = Bounds::new(
+                    input_overlay.origin,
+                    size(input_overlay.builtin_width, *line_height),
+                );
+                window.paint_quad(fill(
+                    builtin_background_bounds,
+                    cx.theme().ui.elevated_background,
+                ));
+            }
 
-            let _ = ime_shaped.paint(
-                *ime_origin,
+            if input_overlay.ime_width > Pixels::ZERO {
+                let ime_origin =
+                    input_overlay.origin + point(input_overlay.builtin_width, Pixels::ZERO);
+                let ime_background_bounds =
+                    Bounds::new(ime_origin, size(input_overlay.ime_width, *line_height));
+                window.paint_quad(fill(ime_background_bounds, terminal_theme.ime_background));
+            }
+
+            let _ = input_overlay.shaped_line.paint(
+                input_overlay.origin,
                 *line_height,
                 gpui::TextAlign::Left,
                 None,
@@ -1377,15 +1460,18 @@ impl Element for TerminalElement {
                 cx,
             );
 
-            // Draw underline below preedit text to indicate IME composition
-            let underline_y = ime_origin.y + *line_height - px(1.0);
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(ime_origin.x, underline_y),
-                    size(ime_shaped.width, px(1.0)),
-                ),
-                terminal_theme.ime_underline,
-            ));
+            if input_overlay.ime_width > Pixels::ZERO {
+                let ime_origin =
+                    input_overlay.origin + point(input_overlay.builtin_width, Pixels::ZERO);
+                let underline_y = ime_origin.y + *line_height - px(1.0);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(ime_origin.x, underline_y),
+                        size(input_overlay.ime_width, px(1.0)),
+                    ),
+                    terminal_theme.ime_underline,
+                ));
+            }
         }
 
         window.handle_input(
