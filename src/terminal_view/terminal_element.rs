@@ -13,6 +13,7 @@ use gpui::{
     FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
     TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
@@ -124,7 +125,7 @@ pub struct RowRenderCache {
     pub layout: Option<RowLayoutEntry>,
     pub selection_cols: Option<Vec<usize>>,
     pub box_cells: Option<Vec<BoxDrawingCell>>,
-    pub background_cells: Option<Vec<BackgroundCell>>,
+    pub background_spans: Option<Vec<BackgroundSpan>>,
 }
 
 /// 盒子绘制字符 / 块元素单元格。
@@ -141,10 +142,29 @@ pub struct BoxDrawingCell {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BackgroundCell {
-    pub col: usize,
+pub struct BackgroundSpan {
+    pub start_col: usize,
     pub row: usize,
+    pub width: usize,
     pub color: Hsla,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderMetricsSignature {
+    pub font_size: Pixels,
+    pub line_height: Pixels,
+    pub cell_width: Pixels,
+    pub viewport_lines: usize,
+    pub viewport_cols: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct FlattenedRenderCache {
+    pub runs: Arc<[BatchedTextRun]>,
+    pub box_cells: Arc<[BoxDrawingCell]>,
+    pub background_spans: Arc<[BackgroundSpan]>,
+    pub selection_cells: Arc<[(usize, usize)]>,
+    pub metrics: Option<RenderMetricsSignature>,
 }
 
 /// CursorLayout - simplified implementation inspired by Zed's CursorLayout
@@ -296,10 +316,83 @@ pub struct TerminalElement {
     focused: bool,
     cursor_visible: bool,
     view: Entity<TerminalView>,
-    cached_theme_id: Option<String>,
 }
 
 impl TerminalElement {
+    fn flush_text_batch(
+        row_idx: usize,
+        batched_runs: &mut Vec<BatchedTextRun>,
+        current_batch: &mut Option<(usize, String, TextRun, usize)>,
+        window: &mut Window,
+        font_size: Pixels,
+        cell_width: Pixels,
+    ) {
+        if let Some((start_col, text, style, cell_count)) = current_batch.take() {
+            let shaped_line = window.text_system().shape_line(
+                text.into(),
+                font_size,
+                std::slice::from_ref(&style),
+                Some(cell_width),
+            );
+            batched_runs.push(BatchedTextRun::new(
+                row_idx,
+                start_col,
+                cell_count,
+                shaped_line,
+            ));
+        }
+    }
+
+    fn text_run_for_cell(
+        cell: &IndexedCell,
+        text_style: &TextStyle,
+        terminal_theme: &TerminalTheme,
+    ) -> TextRun {
+        let (fg, _bg) = rendered_cell_colors(&cell.cell);
+        TextRun {
+            len: cell.cell.c.len_utf8(),
+            font: Font {
+                weight: if cell
+                    .cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::BOLD)
+                {
+                    FontWeight::BOLD
+                } else {
+                    text_style.font_weight
+                },
+                style: if cell
+                    .cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::ITALIC)
+                {
+                    FontStyle::Italic
+                } else {
+                    FontStyle::Normal
+                },
+                ..text_style.font()
+            },
+            color: convert_alacritty_color(fg, terminal_theme),
+            // Backgrounds are painted separately as spans; keeping this None avoids
+            // duplicate background work inside text painting.
+            background_color: None,
+            underline: if cell
+                .cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+            {
+                Some(gpui::UnderlineStyle {
+                    color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
+                    thickness: px(1.0),
+                    wavy: false,
+                })
+            } else {
+                None
+            },
+            strikethrough: None,
+        }
+    }
+
     #[cfg(debug_assertions)]
     fn run_signature(runs: &[BatchedTextRun]) -> Vec<(usize, usize, String)> {
         runs.iter()
@@ -319,7 +412,7 @@ impl TerminalElement {
         row_cells: &'a [IndexedCell],
         row_runs: &[BatchedTextRun],
         row_boxes: &[BoxDrawingCell],
-        row_backgrounds: &[BackgroundCell],
+        row_backgrounds: &[BackgroundSpan],
         row_selection_cols: &[usize],
         window: &mut Window,
         text_style: &TextStyle,
@@ -338,7 +431,7 @@ impl TerminalElement {
             terminal_theme,
         );
         let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme);
-        let full_backgrounds = Self::background_cells_for_row(row_idx, row_cells, terminal_theme);
+        let full_backgrounds = Self::background_spans_for_row(row_idx, row_cells, terminal_theme);
         let full_selection_cols = Self::selected_cols_for_row(row_cells, selection_range);
 
         debug_assert_eq!(
@@ -376,7 +469,6 @@ impl TerminalElement {
             focused,
             cursor_visible,
             view,
-            cached_theme_id: None,
         }
     }
 
@@ -397,92 +489,32 @@ impl TerminalElement {
         for cell in cells {
             let ch = cell.cell.c;
 
-            // Handle INVERSE flag: swap foreground and background colors
-            let (fg, bg) = rendered_cell_colors(&cell.cell);
-
-            if ch == '\0' || ch == ' ' {
-                if let Some((start_col, text, style, cell_count)) = current_batch.take() {
-                    let shaped_line = window.text_system().shape_line(
-                        text.into(),
-                        font_size,
-                        std::slice::from_ref(&style),
-                        Some(cell_width),
-                    );
-                    batched_runs.push(BatchedTextRun::new(
-                        row_idx,
-                        start_col,
-                        cell_count,
-                        shaped_line,
-                    ));
-                }
+            if ch == '\0' {
+                Self::flush_text_batch(
+                    row_idx,
+                    &mut batched_runs,
+                    &mut current_batch,
+                    window,
+                    font_size,
+                    cell_width,
+                );
                 continue;
             }
 
             if box_drawing::is_box_drawing_char(ch) {
-                if let Some((start_col, text, style, cell_count)) = current_batch.take() {
-                    let shaped_line = window.text_system().shape_line(
-                        text.into(),
-                        font_size,
-                        std::slice::from_ref(&style),
-                        Some(cell_width),
-                    );
-                    batched_runs.push(BatchedTextRun::new(
-                        row_idx,
-                        start_col,
-                        cell_count,
-                        shaped_line,
-                    ));
-                }
+                Self::flush_text_batch(
+                    row_idx,
+                    &mut batched_runs,
+                    &mut current_batch,
+                    window,
+                    font_size,
+                    cell_width,
+                );
                 continue;
             }
 
-            let cell_style = TextRun {
-                len: ch.len_utf8(),
-                font: Font {
-                    weight: if cell
-                        .cell
-                        .flags
-                        .contains(alacritty_terminal::term::cell::Flags::BOLD)
-                    {
-                        FontWeight::BOLD
-                    } else {
-                        text_style.font_weight
-                    },
-                    style: if cell
-                        .cell
-                        .flags
-                        .contains(alacritty_terminal::term::cell::Flags::ITALIC)
-                    {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                    ..text_style.font()
-                },
-                color: convert_alacritty_color(fg, terminal_theme),
-                background_color: if bg
-                    == &alacritty_terminal::vte::ansi::Color::Named(
-                        alacritty_terminal::vte::ansi::NamedColor::Background,
-                    ) {
-                    None
-                } else {
-                    Some(convert_alacritty_color(bg, terminal_theme))
-                },
-                underline: if cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
-                {
-                    Some(gpui::UnderlineStyle {
-                        color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
-                        thickness: px(1.0),
-                        wavy: false,
-                    })
-                } else {
-                    None
-                },
-                strikethrough: None,
-            };
+            let cell_style = Self::text_run_for_cell(cell, text_style, terminal_theme);
+            let is_space = ch == ' ';
 
             match current_batch.as_mut() {
                 Some((start_col, text, style, cell_count))
@@ -498,39 +530,30 @@ impl TerminalElement {
                     style.len += ch.len_utf8();
                 }
                 _ => {
-                    if let Some((start_col, text, style, cell_count)) = current_batch.take() {
-                        let shaped_line = window.text_system().shape_line(
-                            text.into(),
-                            font_size,
-                            std::slice::from_ref(&style),
-                            Some(cell_width),
-                        );
-                        batched_runs.push(BatchedTextRun::new(
-                            row_idx,
-                            start_col,
-                            cell_count,
-                            shaped_line,
-                        ));
+                    Self::flush_text_batch(
+                        row_idx,
+                        &mut batched_runs,
+                        &mut current_batch,
+                        window,
+                        font_size,
+                        cell_width,
+                    );
+                    if is_space {
+                        continue;
                     }
                     current_batch = Some((cell.point.column.0, ch.to_string(), cell_style, 1));
                 }
             }
         }
 
-        if let Some((start_col, text, style, cell_count)) = current_batch.take() {
-            let shaped_line = window.text_system().shape_line(
-                text.into(),
-                font_size,
-                std::slice::from_ref(&style),
-                Some(cell_width),
-            );
-            batched_runs.push(BatchedTextRun::new(
-                row_idx,
-                start_col,
-                cell_count,
-                shaped_line,
-            ));
-        }
+        Self::flush_text_batch(
+            row_idx,
+            &mut batched_runs,
+            &mut current_batch,
+            window,
+            font_size,
+            cell_width,
+        );
 
         RowLayoutEntry { runs: batched_runs }
     }
@@ -593,64 +616,67 @@ impl TerminalElement {
         cols
     }
 
-    fn background_cells_for_row(
+    fn background_spans_for_row(
         row_idx: usize,
         cells: &[IndexedCell],
         terminal_theme: &TerminalTheme,
-    ) -> Vec<BackgroundCell> {
+    ) -> Vec<BackgroundSpan> {
         let mut backgrounds = Vec::new();
+        let mut current_span: Option<BackgroundSpan> = None;
         for cell in cells {
             let (_, bg) = rendered_cell_colors(&cell.cell);
-            if bg
-                != &alacritty_terminal::vte::ansi::Color::Named(
+            let col = cell.point.column.0;
+            let color = if bg
+                == &alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Background,
-                )
-            {
-                backgrounds.push(BackgroundCell {
-                    col: cell.point.column.0,
-                    row: row_idx,
-                    color: convert_alacritty_color(bg, terminal_theme),
-                });
+                ) {
+                None
+            } else {
+                Some(convert_alacritty_color(bg, terminal_theme))
+            };
+
+            match (current_span.as_mut(), color) {
+                (Some(span), Some(color))
+                    if span.color == color && span.start_col + span.width == col =>
+                {
+                    span.width += 1;
+                }
+                (Some(span), Some(color)) => {
+                    backgrounds.push(span.clone());
+                    *span = BackgroundSpan {
+                        start_col: col,
+                        row: row_idx,
+                        width: 1,
+                        color,
+                    };
+                }
+                (None, Some(color)) => {
+                    current_span = Some(BackgroundSpan {
+                        start_col: col,
+                        row: row_idx,
+                        width: 1,
+                        color,
+                    });
+                }
+                (Some(span), None) => {
+                    backgrounds.push(span.clone());
+                    current_span = None;
+                }
+                (None, None) => {}
             }
+        }
+        if let Some(span) = current_span {
+            backgrounds.push(span);
         }
         backgrounds
     }
 
-    fn update_background_cells_in_range(
+    fn update_background_spans_in_row(
         row_idx: usize,
-        cached_backgrounds: &[BackgroundCell],
         cells: &[IndexedCell],
-        range: (usize, usize),
         terminal_theme: &TerminalTheme,
-    ) -> Vec<BackgroundCell> {
-        let (left, right) = range;
-        let mut backgrounds: Vec<BackgroundCell> = cached_backgrounds
-            .iter()
-            .filter(|bg| bg.col < left || bg.col > right)
-            .cloned()
-            .collect();
-
-        for cell in cells {
-            let col = cell.point.column.0;
-            if col < left || col > right {
-                continue;
-            }
-            let (_, bg) = rendered_cell_colors(&cell.cell);
-            if bg
-                != &alacritty_terminal::vte::ansi::Color::Named(
-                    alacritty_terminal::vte::ansi::NamedColor::Background,
-                )
-            {
-                backgrounds.push(BackgroundCell {
-                    col,
-                    row: row_idx,
-                    color: convert_alacritty_color(bg, terminal_theme),
-                });
-            }
-        }
-
-        backgrounds.sort_by_key(|bg| bg.col);
-        backgrounds
+    ) -> Vec<BackgroundSpan> {
+        Self::background_spans_for_row(row_idx, cells, terminal_theme)
     }
 
     fn box_cells_for_row(
@@ -778,10 +804,10 @@ impl IntoElement for TerminalElement {
 impl Element for TerminalElement {
     type RequestLayoutState = ();
     type PrepaintState = (
-        Vec<BatchedTextRun>,
-        Vec<BoxDrawingCell>,
-        Vec<BackgroundCell>,
-        Vec<(usize, usize)>,
+        Arc<[BatchedTextRun]>,
+        Arc<[BoxDrawingCell]>,
+        Arc<[BackgroundSpan]>,
+        Arc<[(usize, usize)]>,
         Pixels,
         Pixels,
         usize,
@@ -957,27 +983,48 @@ impl Element for TerminalElement {
 
         // Take row render cache out of the view so we can mutate it here
         // without a borrow conflict, then write it back after processing.
-        let mut row_caches: Vec<RowRenderCache> = match &self.cached_theme_id {
-            Some(theme_id) if active_theme_id == *theme_id => self
-                .view
-                .update(cx, |view, _cx| std::mem::take(&mut view.row_render_cache)),
-            _ => {
-                // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
-                self.cached_theme_id = Some(active_theme_id.clone());
-                Vec::new()
-            }
-        };
+        let (mut row_caches, theme_changed, cached_flattened) =
+            self.view.update(cx, |view, _cx| {
+                match &view.cached_theme_id {
+                    Some(theme_id) if active_theme_id == *theme_id => (
+                        std::mem::take(&mut view.row_render_cache),
+                        false,
+                        view.flattened_render_cache.clone(),
+                    ),
+                    _ => {
+                        // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
+                        view.cached_theme_id = Some(active_theme_id.clone());
+                        view.flattened_render_cache = FlattenedRenderCache::default();
+                        (Vec::new(), true, FlattenedRenderCache::default())
+                    }
+                }
+            });
 
         // Grow or shrink caches to match the current viewport height.
+        let cache_resized = row_caches.len() != viewport_lines;
         row_caches.resize_with(viewport_lines, RowRenderCache::default);
 
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
         let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
-        let mut background_cells: Vec<BackgroundCell> = Vec::new();
+        let mut background_spans: Vec<BackgroundSpan> = Vec::new();
         let mut selection_cells: Vec<(usize, usize)> = Vec::new();
         let mut dirty_count = 0usize;
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
+        let has_dirty_rows = dirty_rows.iter().any(|dirty| *dirty);
+        let metrics_signature = RenderMetricsSignature {
+            font_size,
+            line_height,
+            cell_width,
+            viewport_lines,
+            viewport_cols: terminal_bounds.num_columns(),
+        };
+        let rebuild_flattened_cache = theme_changed
+            || cache_resized
+            || selection_changed
+            || has_dirty_rows
+            || cached_flattened.metrics != Some(metrics_signature)
+            || cached_flattened.runs.is_empty();
 
         // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
         let terminal = self.terminal.read(cx);
@@ -1037,17 +1084,23 @@ impl Element for TerminalElement {
                         &terminal_theme,
                     )
                 };
-                batched_runs.extend_from_slice(&entry.runs);
+                if rebuild_flattened_cache {
+                    batched_runs.extend_from_slice(&entry.runs);
+                }
                 row_cache.layout = Some(entry);
             } else {
                 cache_hit_count += 1;
-                let cached_entry = row_cache.layout.as_ref().unwrap();
-                batched_runs.extend_from_slice(&cached_entry.runs);
+                if rebuild_flattened_cache {
+                    let cached_entry = row_cache.layout.as_ref().unwrap();
+                    batched_runs.extend_from_slice(&cached_entry.runs);
+                }
             }
 
             if row_cache.box_cells.is_none() {
                 let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
-                box_cells.extend_from_slice(&row_boxes);
+                if rebuild_flattened_cache {
+                    box_cells.extend_from_slice(&row_boxes);
+                }
                 row_cache.box_cells = Some(row_boxes);
             } else if is_dirty {
                 if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
@@ -1059,46 +1112,43 @@ impl Element for TerminalElement {
                         range,
                         &terminal_theme,
                     );
-                    box_cells.extend_from_slice(&row_boxes);
+                    if rebuild_flattened_cache {
+                        box_cells.extend_from_slice(&row_boxes);
+                    }
                     row_cache.box_cells = Some(row_boxes);
-                } else {
+                } else if rebuild_flattened_cache {
                     let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
                     box_cells.extend_from_slice(cached_row_boxes);
                 }
-            } else {
+            } else if rebuild_flattened_cache {
                 let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
                 box_cells.extend_from_slice(cached_row_boxes);
             }
 
-            if row_cache.background_cells.is_none() {
+            if row_cache.background_spans.is_none() {
                 let backgrounds =
-                    Self::background_cells_for_row(row_idx, row_cells, &terminal_theme);
-                background_cells.extend_from_slice(&backgrounds);
-                row_cache.background_cells = Some(backgrounds);
-            } else if is_dirty {
-                if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                    let cached_backgrounds = row_cache.background_cells.as_ref().unwrap();
-                    let backgrounds = Self::update_background_cells_in_range(
-                        row_idx,
-                        cached_backgrounds,
-                        row_cells,
-                        range,
-                        &terminal_theme,
-                    );
-                    background_cells.extend_from_slice(&backgrounds);
-                    row_cache.background_cells = Some(backgrounds);
-                } else {
-                    let cached_backgrounds = row_cache.background_cells.as_ref().unwrap();
-                    background_cells.extend_from_slice(cached_backgrounds);
+                    Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                if rebuild_flattened_cache {
+                    background_spans.extend_from_slice(&backgrounds);
                 }
-            } else {
-                let cached_backgrounds = row_cache.background_cells.as_ref().unwrap();
-                background_cells.extend_from_slice(cached_backgrounds);
+                row_cache.background_spans = Some(backgrounds);
+            } else if is_dirty {
+                let backgrounds =
+                    Self::update_background_spans_in_row(row_idx, row_cells, &terminal_theme);
+                if rebuild_flattened_cache {
+                    background_spans.extend_from_slice(&backgrounds);
+                }
+                row_cache.background_spans = Some(backgrounds);
+            } else if rebuild_flattened_cache {
+                let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
+                background_spans.extend_from_slice(cached_backgrounds);
             }
 
             if selection_changed || row_cache.selection_cols.is_none() {
                 let selected_cols = Self::selected_cols_for_row(row_cells, &selection_range);
-                selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                if rebuild_flattened_cache {
+                    selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                }
                 row_cache.selection_cols = Some(selected_cols);
             } else if is_dirty {
                 if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
@@ -1109,13 +1159,15 @@ impl Element for TerminalElement {
                         range,
                         &selection_range,
                     );
-                    selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                    if rebuild_flattened_cache {
+                        selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                    }
                     row_cache.selection_cols = Some(selected_cols);
-                } else {
+                } else if rebuild_flattened_cache {
                     let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
                     selection_cells.extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
                 }
-            } else {
+            } else if rebuild_flattened_cache {
                 let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
                 selection_cells.extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
             }
@@ -1124,7 +1176,7 @@ impl Element for TerminalElement {
             {
                 let row_runs = &row_cache.layout.as_ref().unwrap().runs;
                 let row_boxes = row_cache.box_cells.as_ref().unwrap();
-                let row_backgrounds = row_cache.background_cells.as_ref().unwrap();
+                let row_backgrounds = row_cache.background_spans.as_ref().unwrap();
                 let row_selection_cols = row_cache.selection_cols.as_ref().unwrap();
                 Self::assert_row_consistency(
                     row_idx,
@@ -1146,10 +1198,25 @@ impl Element for TerminalElement {
         log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
         log::trace!("row run partial updates: {partial_run_update_count}");
 
-        // Write the (potentially updated) cache back into the view.
-        self.view.update(cx, |view, _cx| {
-            view.row_render_cache = row_caches;
-        });
+        let flattened_cache = if rebuild_flattened_cache {
+            let flattened = FlattenedRenderCache {
+                runs: Arc::from(batched_runs),
+                box_cells: Arc::from(box_cells),
+                background_spans: Arc::from(background_spans),
+                selection_cells: Arc::from(selection_cells),
+                metrics: Some(metrics_signature),
+            };
+            self.view.update(cx, |view, _cx| {
+                view.row_render_cache = row_caches;
+                view.flattened_render_cache = flattened.clone();
+            });
+            flattened
+        } else {
+            self.view.update(cx, |view, _cx| {
+                view.row_render_cache = row_caches;
+            });
+            cached_flattened
+        };
 
         // Calculate cursor position relative to viewport
         let cursor_line_in_viewport = cursor_point.line.0 + display_offset as i32;
@@ -1334,10 +1401,10 @@ impl Element for TerminalElement {
         };
 
         (
-            batched_runs,
-            box_cells,
-            background_cells,
-            selection_cells,
+            flattened_cache.runs,
+            flattened_cache.box_cells,
+            flattened_cache.background_spans,
+            flattened_cache.selection_cells,
             cell_width,
             line_height,
             cursor_point.column.0,
@@ -1363,7 +1430,7 @@ impl Element for TerminalElement {
         let (
             batched_runs,
             box_cells,
-            background_cells,
+            background_spans,
             selection_cells,
             cell_width,
             line_height,
@@ -1387,14 +1454,17 @@ impl Element for TerminalElement {
             ));
         }
 
-        for cell in background_cells.iter() {
-            let cell_origin = point(
-                origin.x + *cell_width * cell.col as f32,
-                origin.y + *line_height * cell.row as f32,
+        for span in background_spans.iter() {
+            let span_origin = point(
+                origin.x + *cell_width * span.start_col as f32,
+                origin.y + *line_height * span.row as f32,
             );
             window.paint_quad(fill(
-                Bounds::new(cell_origin, size(*cell_width, *line_height)),
-                cell.color,
+                Bounds::new(
+                    span_origin,
+                    size(*cell_width * span.width as f32, *line_height),
+                ),
+                span.color,
             ));
         }
 

@@ -1044,8 +1044,9 @@ impl Terminal {
                 self.write(response.as_bytes());
             }
             AlacTermEvent::CursorBlinkingChange => {
-                // 光标闪烁状态变化，触发刷新
-                cx.emit(Event::Wakeup);
+                // Ignore cursor blinking changes for now.
+                // They can trigger frequent whole-terminal repaints with no content damage,
+                // which is disproportionately expensive in the current GPUI renderer.
             }
         }
     }
@@ -1248,31 +1249,28 @@ impl Terminal {
                 self.write(&bytes);
             }
         } else {
-            match e.button {
-                gpui::MouseButton::Left => {
-                    let (point, side) = grid_point_and_side(
-                        position,
-                        self.terminal_bounds,
-                        self.last_content.display_offset,
-                    );
+            if let gpui::MouseButton::Left = e.button {
+                let (point, side) = grid_point_and_side(
+                    position,
+                    self.terminal_bounds,
+                    self.last_content.display_offset,
+                );
 
-                    let selection_type = match e.click_count {
-                        0 => return,
-                        1 => Some(SelectionType::Simple),
-                        2 => Some(SelectionType::Semantic),
-                        3 => Some(SelectionType::Lines),
-                        _ => None,
-                    };
+                let selection_type = match e.click_count {
+                    0 => return,
+                    1 => Some(SelectionType::Simple),
+                    2 => Some(SelectionType::Semantic),
+                    3 => Some(SelectionType::Lines),
+                    _ => None,
+                };
 
-                    if let Some(sel_type) = selection_type {
-                        let mut term = self.term.lock();
-                        let selection = Selection::new(sel_type, point, side);
-                        term.selection = Some(selection);
-                        self.selection_phase = SelectionPhase::Started;
-                        cx.emit(Event::SelectionsChanged);
-                    }
+                if let Some(sel_type) = selection_type {
+                    let mut term = self.term.lock();
+                    let selection = Selection::new(sel_type, point, side);
+                    term.selection = Some(selection);
+                    self.selection_phase = SelectionPhase::Started;
+                    cx.emit(Event::SelectionsChanged);
                 }
-                _ => {}
             }
         }
     }

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, ExternalPaths,
@@ -43,13 +43,16 @@ use crate::ssh::{SshConnectionConfig, sftp_fs};
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
-use crate::terminal_view::terminal_element::{RowRenderCache, TerminalElement};
+use crate::terminal_view::terminal_element::{
+    FlattenedRenderCache, RowRenderCache, TerminalElement,
+};
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 use crate::theme::ActiveTheme;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 const CONTEXT: &str = "Terminal";
+const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
 pub(crate) fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     cx.bind_keys([
@@ -80,10 +83,16 @@ pub struct TerminalView {
     broadcast_callback: Option<BroadcastInputCallback>,
     /// Pending scrollbar hide task - prevents spawning a new timer every render frame
     scrollbar_hide_task: Option<Task<()>>,
+    /// Scroll timestamp used for the currently scheduled hide task.
+    scrollbar_hide_scheduled_at: Option<Instant>,
     /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
     ssh_connect_view: Option<Entity<SshConnectView>>,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
+    /// Flattened render data reused across frames when nothing changed.
+    pub flattened_render_cache: FlattenedRenderCache,
+    /// Last theme id used to build row cache.
+    pub cached_theme_id: Option<String>,
     /// Last selection range used to build row cache.
     pub cached_selection_range: Option<SelectionRange>,
     /// Last mouse mode state used to build row cache.
@@ -130,8 +139,11 @@ impl TerminalView {
                 can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: None,
                 row_render_cache: Vec::new(),
+                flattened_render_cache: FlattenedRenderCache::default(),
+                cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
             };
@@ -193,8 +205,11 @@ impl TerminalView {
                 can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: None,
                 row_render_cache: Vec::new(),
+                flattened_render_cache: FlattenedRenderCache::default(),
+                cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
             };
@@ -304,8 +319,11 @@ impl TerminalView {
                 can_start_builtin_command: true,
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
+                scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: Some(connect_view),
                 row_render_cache: Vec::new(),
+                flattened_render_cache: FlattenedRenderCache::default(),
+                cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
             };
@@ -377,7 +395,7 @@ impl TerminalView {
         // Show scrollbar if scrolled within the last 2 seconds
         let last_scroll = term.last_scroll_time.get();
         let elapsed = last_scroll.elapsed();
-        elapsed < Duration::from_secs(2)
+        elapsed < SCROLLBAR_VISIBLE_AFTER_SCROLL
     }
 
     // IME handling methods for CJK input methods
@@ -1271,20 +1289,35 @@ impl Render for TerminalView {
         let is_focused = focus_handle.is_focused(window);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
-        // Schedule a refresh to hide the scrollbar after it fades out.
-        // Only spawn a new timer task if one isn't already running, to avoid
-        // accumulating one task per frame (~60/s) while the scrollbar is visible.
-        if show_scrollbar && self.scrollbar_hide_task.is_none() {
-            self.scrollbar_hide_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.scrollbar_hide_task = None;
-                    cx.notify();
-                })
-                .ok();
-            }));
+        // Schedule a single refresh when the scrollbar should actually hide.
+        // Polling every 100ms keeps repainting even when terminal content is unchanged.
+        if show_scrollbar {
+            let last_scroll_time = self.terminal.read(cx).last_scroll_time.get();
+            let should_reschedule = self.scrollbar_hide_scheduled_at != Some(last_scroll_time);
+            if should_reschedule {
+                self.scrollbar_hide_task = None;
+                self.scrollbar_hide_scheduled_at = Some(last_scroll_time);
+            }
+            if should_reschedule || self.scrollbar_hide_task.is_none() {
+                let elapsed_since_scroll = last_scroll_time.elapsed();
+                let hide_delay = SCROLLBAR_VISIBLE_AFTER_SCROLL
+                    .checked_sub(elapsed_since_scroll)
+                    .unwrap_or_else(|| Duration::from_millis(1));
+                self.scrollbar_hide_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(hide_delay).await;
+                    this.update(cx, |this, cx| {
+                        if this.scrollbar_hide_scheduled_at == Some(last_scroll_time) {
+                            this.scrollbar_hide_task = None;
+                            this.scrollbar_hide_scheduled_at = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        } else {
+            self.scrollbar_hide_task = None;
+            self.scrollbar_hide_scheduled_at = None;
         }
 
         div()
