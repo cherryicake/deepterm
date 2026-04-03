@@ -521,12 +521,18 @@ impl TerminalView {
         }
     }
 
+    /// 只有本地终端且 shell 仍是前台进程组时，才允许 DeepTerm 拦截 `/`。
+    fn can_trigger_builtin_command_here(&self, cx: &App) -> bool {
+        self.terminal.read(cx).is_shell_in_foreground()
+    }
+
     /// 判断一段新文本是否应该开启内建命令模式。
     ///
-    /// 只有当前行仍允许 `/` 起始命令、且输入内容不是换行时才会进入。
-    fn should_start_builtin_command(&self, text: &str) -> bool {
+    /// 只有当前行仍允许 `/` 起始命令、当前处于 shell 提示符场景、且输入内容不是换行时才会进入。
+    fn should_start_builtin_command(&self, text: &str, cx: &App) -> bool {
         !self.builtin_command_manager.is_active()
             && self.can_start_builtin_command
+            && self.can_trigger_builtin_command_here(cx)
             && text.starts_with('/')
             && !text.contains(['\n', '\r'])
     }
@@ -565,7 +571,7 @@ impl TerminalView {
             return false;
         }
 
-        if self.builtin_command_manager.is_active() || self.should_start_builtin_command(text) {
+        if self.builtin_command_manager.is_active() || self.should_start_builtin_command(text, cx) {
             self.update_builtin_command(text, cx);
             return true;
         }

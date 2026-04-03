@@ -1,6 +1,6 @@
 //! Terminal module - simplified but functional
 
-use std::{borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
+use std::{borrow::Cow, cell::Cell, os::fd::AsRawFd, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use alacritty_terminal::{
     Term,
@@ -215,7 +215,12 @@ pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
+    /// 本地 PTY 启动出来的首个子进程 pid，通常就是 shell 进程。
     child_process_id: Option<u32>,
+    /// shell 所在的进程组 id，用来判断当前前台程序是否仍然是 shell。
+    shell_process_group_id: Option<i32>,
+    /// 本地 PTY master fd，用来读取当前 TTY 的前台进程组。
+    pty_master_fd: Option<i32>,
     remote_working_directory: Option<String>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器
@@ -253,62 +258,48 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    #[cfg(not(windows))]
-    fn pty_child_process_id(pty: &tty::Pty) -> Option<u32> {
-        Some(pty.child().id())
-    }
-
-    #[cfg(windows)]
-    fn pty_child_process_id(_pty: &tty::Pty) -> Option<u32> {
-        None
-    }
-
-    pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
-        let (events_tx, events_rx) = unbounded();
-        let listener = ZedListener(events_tx.clone());
-
-        // Choose a sensible default shell per platform. On Windows prefer `COMSPEC` or `cmd.exe`;
-        // on Unix-like systems prefer the `SHELL` env var or `/bin/sh`.
-        let default_shell = if cfg!(windows) {
-            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
-        } else {
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-        };
-
-        // 设置终端环境变量 - 使用共享函数
-        let env = crate::terminal::mappings::default_terminal_env();
-
-        let pty_options = tty::Options {
-            shell: Some(tty::Shell::new(default_shell, vec![])),
-            working_directory,
-            env,
-            ..Default::default()
-        };
-
-        let default_bounds = TerminalBounds::default();
-        let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
-            Ok(pty) => pty,
-            Err(e) => {
-                eprintln!("Failed to create PTY: {}", e);
-                return cx.new(|_cx| Self::create_error_terminal());
-            }
-        };
-
+    fn default_terminal_config() -> Config {
         let mut config = Config::default();
         config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        // 设置默认光标样式为Block（块光标）
-        // 这是alacritty终端的默认光标形状，大多数终端模拟器都使用这种样式
         config.default_cursor_style = AlacCursorStyle {
             shape: AlacCursorShape::Block,
             blinking: false,
         };
+        config
+    }
+
+    fn build_local_terminal(
+        cx: &mut App,
+        pty_options: tty::Options,
+        pty_error_message: String,
+    ) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        let listener = ZedListener(events_tx.clone());
+        let default_bounds = TerminalBounds::default();
+        let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
+            Ok(pty) => pty,
+            Err(err) => {
+                eprintln!("{}: {}", pty_error_message, err);
+                return cx.new(|_cx| Self::create_error_terminal());
+            }
+        };
         let term = Arc::new(FairMutex::new(Term::new(
-            config,
+            Self::default_terminal_config(),
             &default_bounds,
             listener.clone(),
         )));
-
-        let child_process_id = Self::pty_child_process_id(&pty);
+        let child_process_id = Some(pty.child().id());
+        #[cfg(unix)]
+        let shell_process_group_id = match unsafe { libc::getpgid(pty.child().id() as libc::pid_t) } {
+            pgid if pgid >= 0 => Some(pgid),
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let shell_process_group_id = None;
+        #[cfg(unix)]
+        let pty_master_fd = Some(pty.file().as_raw_fd());
+        #[cfg(not(unix))]
+        let pty_master_fd = None;
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
@@ -316,13 +307,11 @@ impl Terminal {
                 return cx.new(|_cx| Self::create_error_terminal());
             }
         };
-
         let notifier = event_loop.channel();
         let _ = event_loop.spawn();
 
         cx.new(|cx| {
             let term_clone = term.clone();
-
             let event_loop_task = cx.spawn(async move |this, cx| {
                 let mut events_rx = events_rx;
                 while let Some(event) = events_rx.next().await {
@@ -336,6 +325,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id,
+                shell_process_group_id,
+                pty_master_fd,
                 remote_working_directory: None,
                 window_title: None,
                 sender: Some(notifier),
@@ -357,6 +348,27 @@ impl Terminal {
                 russh_handle: None,
             }
         })
+    }
+
+    pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
+        // Choose a sensible default shell per platform. On Windows prefer `COMSPEC` or `cmd.exe`;
+        // on Unix-like systems prefer the `SHELL` env var or `/bin/sh`.
+        let default_shell = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        };
+
+        Self::build_local_terminal(
+            cx,
+            tty::Options {
+                shell: Some(tty::Shell::new(default_shell, vec![])),
+                working_directory,
+                env: crate::terminal::mappings::default_terminal_env(),
+                ..Default::default()
+            },
+            "Failed to create PTY".to_string(),
+        )
     }
 
     /// 使用指定命令创建新的本地终端
@@ -373,90 +385,16 @@ impl Terminal {
         command: &str,
         args: &[String],
     ) -> Entity<Self> {
-        let (events_tx, events_rx) = unbounded();
-        let listener = ZedListener(events_tx.clone());
-
-        let env = crate::terminal::mappings::default_terminal_env();
-
-        let pty_options = tty::Options {
-            shell: Some(tty::Shell::new(command.to_string(), args.to_vec())),
-            working_directory,
-            env,
-            ..Default::default()
-        };
-
-        let default_bounds = TerminalBounds::default();
-        let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
-            Ok(pty) => pty,
-            Err(e) => {
-                log::error!("Failed to create PTY for command '{}': {}", command, e);
-                return cx.new(|_cx| Self::create_error_terminal());
-            }
-        };
-
-        let mut config = Config::default();
-        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        // 设置默认光标样式为Block（块光标）
-        // 这是alacritty终端的默认光标形状，大多数终端模拟器都使用这种样式
-        config.default_cursor_style = AlacCursorStyle {
-            shape: AlacCursorShape::Block,
-            blinking: false,
-        };
-        let term = Arc::new(FairMutex::new(Term::new(
-            config,
-            &default_bounds,
-            listener.clone(),
-        )));
-
-        let child_process_id = Self::pty_child_process_id(&pty);
-        let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
-            Ok(event_loop) => event_loop,
-            Err(e) => {
-                eprintln!("Failed to create EventLoop: {}", e);
-                return cx.new(|_cx| Self::create_error_terminal());
-            }
-        };
-
-        let notifier = event_loop.channel();
-        let _ = event_loop.spawn();
-
-        cx.new(|cx| {
-            let term_clone = term.clone();
-
-            let event_loop_task = cx.spawn(async move |this, cx| {
-                let mut events_rx = events_rx;
-                while let Some(event) = events_rx.next().await {
-                    let _ = this.update(cx, |terminal: &mut Self, cx| {
-                        terminal.process_event(event, cx);
-                    });
-                    smol::future::yield_now().await;
-                }
-            });
-
-            Self {
-                term: term_clone,
-                child_process_id,
-                remote_working_directory: None,
-                window_title: None,
-                sender: Some(notifier),
-                last_content: TerminalContent::default(),
-                content_generation: 0,
-                content_dirty: false,
-                dirty_rows: Vec::new(),
-                dirty_row_bounds: Vec::new(),
-                event_loop_task: Some(event_loop_task),
-                terminal_bounds: default_bounds,
-                selection_phase: SelectionPhase::Ended,
-                last_mouse_position: None,
-                scroll_px: px(0.0),
-                scrollbar_drag_offset: Rc::new(Cell::new(None)),
-                last_scroll_time: Cell::new(Instant::now()),
-                terminal_type: TerminalType::Local,
-                remote_input_callback: None,
-                remote_resize_callback: None,
-                russh_handle: None,
-            }
-        })
+        Self::build_local_terminal(
+            cx,
+            tty::Options {
+                shell: Some(tty::Shell::new(command.to_string(), args.to_vec())),
+                working_directory,
+                env: crate::terminal::mappings::default_terminal_env(),
+                ..Default::default()
+            },
+            format!("Failed to create PTY for command '{command}'"),
+        )
     }
 
     fn create_error_terminal() -> Self {
@@ -469,6 +407,8 @@ impl Terminal {
         Self {
             term,
             child_process_id: None,
+            shell_process_group_id: None,
+            pty_master_fd: None,
             remote_working_directory: None,
             window_title: None,
             sender: None,
@@ -514,14 +454,8 @@ impl Terminal {
 
         let default_bounds = TerminalBounds::default();
 
-        let mut config = Config::default();
-        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        config.default_cursor_style = AlacCursorStyle {
-            shape: AlacCursorShape::Block,
-            blinking: false,
-        };
         let term = Arc::new(FairMutex::new(Term::new(
-            config,
+            Self::default_terminal_config(),
             &default_bounds,
             listener.clone(),
         )));
@@ -543,6 +477,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id: None,
+                shell_process_group_id: None,
+                pty_master_fd: None,
                 remote_working_directory: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
@@ -593,14 +529,8 @@ impl Terminal {
 
         let default_bounds = TerminalBounds::default();
 
-        let mut config = Config::default();
-        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        config.default_cursor_style = AlacCursorStyle {
-            shape: AlacCursorShape::Block,
-            blinking: false,
-        };
         let term = Arc::new(FairMutex::new(Term::new(
-            config.clone(),
+            Self::default_terminal_config(),
             &default_bounds,
             listener.clone(),
         )));
@@ -639,14 +569,8 @@ impl Terminal {
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
 
-        let mut config = Config::default();
-        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        config.default_cursor_style = AlacCursorStyle {
-            shape: AlacCursorShape::Block,
-            blinking: false,
-        };
         let term = Arc::new(FairMutex::new(Term::new(
-            config,
+            Self::default_terminal_config(),
             &default_bounds,
             listener.clone(),
         )));
@@ -716,6 +640,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id: None,
+                shell_process_group_id: None,
+                pty_master_fd: None,
                 remote_working_directory: None,
                 window_title: None,
                 sender: None,
@@ -767,6 +693,25 @@ impl Terminal {
 
     pub fn child_process_id(&self) -> Option<u32> {
         self.child_process_id
+    }
+
+    /// 判断当前 TTY 的前台进程组是否仍然是 shell。
+    /// 若不是，说明前台已有其他交互式程序接管输入。
+    pub fn is_shell_in_foreground(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match self.pty_master_fd {
+                Some(fd) => match unsafe { libc::tcgetpgrp(fd) } {
+                    pgid if pgid >= 0 => self.shell_process_group_id == Some(pgid),
+                    _ => false,
+                },
+                None => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     pub fn window_title(&self) -> Option<&str> {
