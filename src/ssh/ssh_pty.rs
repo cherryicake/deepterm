@@ -12,6 +12,7 @@ use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
+use crate::ssh::remote_cwd_tracking_init_bytes;
 use crate::terminal::TerminalBounds;
 use crate::terminal::terminal::ZedListener;
 
@@ -122,6 +123,10 @@ impl SshPtyTerminal {
         // 启动事件循环
         log::debug!("启动事件循环...");
         let _io_thread = event_loop.spawn();
+
+        let _ = sender.send(Msg::Input(std::borrow::Cow::Borrowed(
+            remote_cwd_tracking_init_bytes(),
+        )));
 
         log::info!("SSH PTY 终端创建成功");
 

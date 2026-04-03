@@ -12,13 +12,14 @@ use gpui::{
 };
 use gpui::{KeyBinding, prelude::*};
 
+use crate::file_browser::FileBrowserTarget;
 /// Events emitted by TerminalView
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Terminal process exited - container should close this view
     CloseTerminal,
-    /// Open the local file browser view
-    OpenFileBrowser { requested_path: Option<PathBuf> },
+    /// Open the file browser view
+    OpenFileBrowser { target: FileBrowserTarget },
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -38,7 +39,7 @@ use crate::ShowSshPicker;
 use crate::builtin_commands::{
     BuiltinCommandHandler, BuiltinCommandManager, find_builtin_command, resolve_command_line,
 };
-use crate::ssh::SshConnectionConfig;
+use crate::ssh::{SshConnectionConfig, sftp_fs};
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
@@ -64,6 +65,7 @@ pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     working_directory: Option<PathBuf>,
+    ssh_config: Option<SshConnectionConfig>,
     focus_handle: FocusHandle,
     cursor_visible: bool,
     title: SharedString,
@@ -118,6 +120,7 @@ impl TerminalView {
             let mut this = Self {
                 terminal: terminal_clone,
                 working_directory,
+                ssh_config: None,
                 focus_handle,
                 cursor_visible: true,
                 title: "Terminal".into(),
@@ -180,6 +183,7 @@ impl TerminalView {
             let mut this = Self {
                 terminal: terminal_clone,
                 working_directory: working_dir,
+                ssh_config: None,
                 focus_handle,
                 cursor_visible: true,
                 title: command_string.into(),
@@ -290,6 +294,7 @@ impl TerminalView {
             let mut this = Self {
                 terminal: terminal_clone,
                 working_directory: None,
+                ssh_config: Some(ssh_config_clone.clone()),
                 focus_handle,
                 cursor_visible: true,
                 title: ssh_config_clone.host_label().into(),
@@ -559,7 +564,7 @@ impl TerminalView {
                 log::info!("builtin command {}: {}", spec.name, spec.description);
                 if spec.handler == BuiltinCommandHandler::OpenFileBrowser {
                     _cx.emit(Event::OpenFileBrowser {
-                        requested_path: self.parse_open_file_browser_path(command_line, _cx),
+                        target: self.parse_open_file_browser_target(command_line, _cx),
                     });
                 }
                 true
@@ -568,24 +573,37 @@ impl TerminalView {
         }
     }
 
-    fn parse_open_file_browser_path(&self, command_line: &str, cx: &App) -> Option<PathBuf> {
-        let command = find_builtin_command(command_line)?;
-        if command.handler != BuiltinCommandHandler::OpenFileBrowser {
-            return None;
-        }
+    fn parse_open_file_browser_target(&self, command_line: &str, cx: &App) -> FileBrowserTarget {
+        let command = find_builtin_command(command_line)
+            .expect("parse_open_file_browser_target should receive a builtin /open command");
 
         let raw_path = command_line
             .strip_prefix(command.name)
             .unwrap_or_default()
             .trim();
-        if raw_path.is_empty() {
-            return self
-                .current_working_directory(cx)
-                .or_else(dirs::home_dir)
-                .or(Some(PathBuf::from("/")));
+        if self.is_remote(cx) {
+            return FileBrowserTarget::Remote {
+                ssh_config: self
+                    .ssh_config
+                    .clone()
+                    .expect("remote terminal should carry ssh config"),
+                requested_path: if raw_path.is_empty() {
+                    self.current_remote_working_directory(cx)
+                } else {
+                    self.resolve_remote_open_target(raw_path, cx)
+                },
+            };
         }
 
-        Some(self.resolve_open_target(raw_path, cx))
+        let requested_path = if raw_path.is_empty() {
+            self.current_working_directory(cx)
+                .or_else(dirs::home_dir)
+                .or(Some(PathBuf::from("/")))
+        } else {
+            Some(self.resolve_open_target(raw_path, cx))
+        };
+
+        FileBrowserTarget::Local { requested_path }
     }
 
     fn current_working_directory(&self, cx: &App) -> Option<PathBuf> {
@@ -596,6 +614,72 @@ impl TerminalView {
             .and_then(Self::query_process_working_directory);
 
         process_cwd.or_else(|| self.working_directory.clone())
+    }
+
+    fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
+        let terminal = self.terminal.read(cx);
+        terminal
+            .remote_working_directory()
+            .map(str::to_string)
+            .or_else(|| {
+                terminal
+                    .window_title()
+                    .and_then(Self::parse_remote_working_directory_from_title)
+            })
+    }
+
+    fn parse_remote_working_directory_from_title(title: &str) -> Option<String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+
+        let mut candidates = vec![title];
+        if let Some((_, suffix)) = title.rsplit_once(": ") {
+            candidates.push(suffix.trim());
+        }
+        if let Some((_, suffix)) = title.rsplit_once(':') {
+            candidates.push(suffix.trim());
+        }
+        if let Some(index) = title.rfind(" /") {
+            candidates.push(title[index + 1..].trim());
+        }
+        if let Some(index) = title.rfind("~/") {
+            candidates.push(title[index..].trim());
+        }
+        if title.ends_with('~') {
+            candidates.push("~");
+        }
+
+        for candidate in candidates {
+            if let Some(path) = Self::normalize_remote_title_path(candidate) {
+                return Some(path);
+            }
+        }
+
+        title.find('/').and_then(|index| {
+            let candidate = title[index..].trim();
+            Self::normalize_remote_title_path(candidate)
+        })
+    }
+
+    fn normalize_remote_title_path(candidate: &str) -> Option<String> {
+        let candidate = candidate.trim().trim_matches(|c| matches!(c, '"' | '\''));
+        if candidate.is_empty() {
+            return None;
+        }
+
+        if candidate.starts_with('/') {
+            return Some(candidate.to_string());
+        }
+
+        if candidate == "~" {
+            return None;
+        }
+
+        candidate
+            .strip_prefix("~/")
+            .map(|stripped| format!("./{}", stripped))
     }
 
     #[cfg(target_os = "linux")]
@@ -644,6 +728,21 @@ impl TerminalView {
                 .or_else(dirs::home_dir)
                 .map(|cwd| cwd.join(&expanded))
                 .unwrap_or(expanded)
+        }
+    }
+
+    fn resolve_remote_open_target(&self, raw_path: &str, cx: &App) -> Option<String> {
+        let trimmed = raw_path.trim().trim_matches(|c| matches!(c, '"' | '\''));
+        if trimmed.is_empty() || trimmed == "~" {
+            None
+        } else if let Some(stripped) = trimmed.strip_prefix("~/") {
+            Some(format!("./{}", stripped))
+        } else if trimmed.starts_with('/') {
+            Some(trimmed.to_string())
+        } else {
+            self.current_remote_working_directory(cx)
+                .map(|cwd| sftp_fs::join_remote_path(&cwd, trimmed))
+                .or_else(|| Some(trimmed.to_string()))
         }
     }
 

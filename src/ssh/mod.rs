@@ -31,6 +31,7 @@ pub mod connection_manager;
 pub mod error;
 pub mod keychain;
 pub mod russh_terminal;
+pub mod sftp_fs;
 pub mod ssh_pty;
 
 pub use config::{AuthMethod, SshConnectionConfig};
@@ -42,6 +43,30 @@ pub use ssh_pty::SshPtyTerminal;
 
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+const REMOTE_CWD_TRACKING_INIT: &str = r#"__deepterm_emit_cwd(){
+  host_name=$(hostname 2>/dev/null || printf '%s' localhost)
+  printf '\033]7;file://%s%s\007' "$host_name" "$PWD"
+}
+if [ -n "$ZSH_VERSION" ]; then
+  autoload -Uz add-zsh-hook >/dev/null 2>&1 || true
+  if typeset -f add-zsh-hook >/dev/null 2>&1; then
+    add-zsh-hook precmd __deepterm_emit_cwd
+  elif [ -n "${precmd_functions+set}" ]; then
+    precmd_functions+=(__deepterm_emit_cwd)
+  fi
+elif [ -n "$BASH_VERSION" ]; then
+  case ";${PROMPT_COMMAND-};" in
+    *";__deepterm_emit_cwd;"*) ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__deepterm_emit_cwd" ;;
+  esac
+fi
+__deepterm_emit_cwd
+"#;
+
+pub fn remote_cwd_tracking_init_bytes() -> &'static [u8] {
+    REMOTE_CWD_TRACKING_INIT.as_bytes()
+}
 
 /// SSH 客户端配置
 #[derive(Clone, Debug)]

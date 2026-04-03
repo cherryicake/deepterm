@@ -20,6 +20,7 @@ use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
     ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
 };
+use crate::ssh::remote_cwd_tracking_init_bytes;
 use crate::terminal::terminal::ZedListener;
 
 /// 发送到 SSH 通道的消息
@@ -274,6 +275,11 @@ impl RusshTerminal {
             .request_shell(true)
             .await
             .map_err(|e| anyhow::anyhow!("启动 Shell 失败: {}", e))?;
+
+        channel
+            .data(remote_cwd_tracking_init_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("初始化远程 cwd 跟踪失败: {}", e))?;
 
         log::info!("russh: PTY + Shell 就绪");
         Ok((handle, channel))

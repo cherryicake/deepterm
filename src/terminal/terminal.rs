@@ -216,6 +216,8 @@ pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
     child_process_id: Option<u32>,
+    remote_working_directory: Option<String>,
+    window_title: Option<String>,
     /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
     last_content: TerminalContent,
@@ -334,6 +336,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id,
+                remote_working_directory: None,
+                window_title: None,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -432,6 +436,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id,
+                remote_working_directory: None,
+                window_title: None,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -463,6 +469,8 @@ impl Terminal {
         Self {
             term,
             child_process_id: None,
+            remote_working_directory: None,
+            window_title: None,
             sender: None,
             last_content: TerminalContent::default(),
             content_generation: 0,
@@ -535,6 +543,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id: None,
+                remote_working_directory: None,
+                window_title: None,
                 sender: None, // 远程终端不使用本地 sender
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -706,6 +716,8 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id: None,
+                remote_working_directory: None,
+                window_title: None,
                 sender: None,
                 last_content: TerminalContent::default(),
                 content_generation: 0,
@@ -757,6 +769,14 @@ impl Terminal {
         self.child_process_id
     }
 
+    pub fn window_title(&self) -> Option<&str> {
+        self.window_title.as_deref()
+    }
+
+    pub fn remote_working_directory(&self) -> Option<&str> {
+        self.remote_working_directory.as_deref()
+    }
+
     /// 检查 SSH 连接是否已就绪（russh 已连接）
     pub fn is_ssh_connected(&self) -> bool {
         self.russh_handle.as_ref().map_or(true, |h| h.is_ready())
@@ -776,8 +796,8 @@ impl Terminal {
     pub fn process_ssh_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
         log::debug!("Terminal 处理 SSH 数据: {} 字节", data.len());
 
-        // 首先提取和处理 OSC 52 序列
-        let filtered_data = self.extract_and_handle_osc52(data, cx);
+        // 先拦截需要由应用层消费的 OSC 序列，比如 OSC 52 与 cwd 更新。
+        let filtered_data = self.extract_and_handle_osc_sequences(data, cx);
 
         use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
@@ -799,9 +819,9 @@ impl Terminal {
         log::debug!("SSH 数据处理完成");
     }
 
-    /// 提取 OSC 52 序列并处理，返回过滤后的数据
-    /// 使用 Cow 实现零拷贝快速路径 - 当没有 OSC 序列时直接返回借用数据
-    fn extract_and_handle_osc52<'a>(
+    /// 提取需要由应用层处理的 OSC 序列，返回过滤后的数据。
+    /// 使用 Cow 实现零拷贝快速路径 - 当没有 OSC 序列时直接返回借用数据。
+    fn extract_and_handle_osc_sequences<'a>(
         &mut self,
         data: &'a [u8],
         cx: &mut Context<Self>,
@@ -820,13 +840,12 @@ impl Terminal {
             if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b']' {
                 // 找到了 OSC 开始，尝试提取完整序列
                 if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[i..]) {
-                    // 尝试解析为 OSC 52
-                    if Terminal::try_handle_osc52(cx, osc_content) {
-                        // 成功处理 OSC 52，跳过这个序列
+                    if self.try_handle_osc_sequence(cx, osc_content) {
+                        // 已由应用层处理，跳过这个序列
                         i += osc_end;
                         continue;
                     }
-                    // 不是 OSC 52，保留序列
+                    // 不是应用层关心的 OSC，保留给 VTE 自己处理
                     result.extend_from_slice(&data[i..i + osc_end]);
                     i += osc_end;
                     continue;
@@ -838,6 +857,19 @@ impl Terminal {
         }
 
         Cow::Owned(result)
+    }
+
+    fn try_handle_osc_sequence(&mut self, cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
+        if Self::try_handle_osc52(cx, osc_content) {
+            return true;
+        }
+
+        if let Some(path) = Self::parse_remote_working_directory_osc(osc_content) {
+            self.remote_working_directory = Some(path);
+            return true;
+        }
+
+        false
     }
 
     /// 尝试处理 OSC 52 序列
@@ -861,6 +893,68 @@ impl Terminal {
         } else {
             false
         }
+    }
+
+    fn parse_remote_working_directory_osc(osc_content: &[u8]) -> Option<String> {
+        let content = std::str::from_utf8(osc_content).ok()?.trim();
+
+        if let Some(uri) = content.strip_prefix("7;") {
+            return Self::parse_osc7_file_uri(uri.trim());
+        }
+
+        if let Some(path) = content.strip_prefix("1337;CurrentDir=") {
+            return Self::normalize_remote_working_directory(path.trim());
+        }
+
+        if let Some(path) = content.strip_prefix("633;P;Cwd=") {
+            return Self::normalize_remote_working_directory(path.trim());
+        }
+
+        None
+    }
+
+    fn parse_osc7_file_uri(uri: &str) -> Option<String> {
+        let path = if let Some(path) = uri.strip_prefix("file://") {
+            let slash_index = path.find('/')?;
+            &path[slash_index..]
+        } else {
+            uri
+        };
+
+        Self::normalize_remote_working_directory(path)
+    }
+
+    fn normalize_remote_working_directory(path: &str) -> Option<String> {
+        let path = path.trim();
+        if !path.starts_with('/') {
+            return None;
+        }
+
+        Some(Self::decode_pct_path(path))
+    }
+
+    fn decode_pct_path(path: &str) -> String {
+        let bytes = path.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+
+        while index < bytes.len() {
+            if bytes[index] == b'%' && index + 2 < bytes.len() {
+                let hex = [bytes[index + 1], bytes[index + 2]];
+                if let Ok(hex) = std::str::from_utf8(&hex)
+                    && let Ok(value) = u8::from_str_radix(hex, 16)
+                {
+                    decoded.push(value);
+                    index += 3;
+                    continue;
+                }
+            }
+
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+
+        String::from_utf8(decoded).unwrap_or_else(|_| path.to_string())
     }
 
     /// 提取完整的 OSC 序列
@@ -888,7 +982,8 @@ impl Terminal {
 
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
         match event {
-            AlacTermEvent::Title(_) => {
+            AlacTermEvent::Title(title) => {
+                self.window_title = Some(title);
                 cx.emit(Event::TitleChanged);
             }
             AlacTermEvent::Wakeup => {
@@ -935,7 +1030,7 @@ impl Terminal {
                 cx.emit(Event::Wakeup);
             }
             AlacTermEvent::ResetTitle => {
-                // 重置为默认标题
+                self.window_title = None;
                 cx.emit(Event::TitleChanged);
             }
             AlacTermEvent::ColorRequest(index, format) => {

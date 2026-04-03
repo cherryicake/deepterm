@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use gpui::{
@@ -18,7 +17,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
-use crate::file_browser::FileBrowserView;
+use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
@@ -453,8 +452,8 @@ impl Workspace {
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
             }
-            PanelEvent::OpenFileBrowser { requested_path, .. } => {
-                self.show_file_browser_panel(requested_path.clone(), cx);
+            PanelEvent::OpenFileBrowser { target, .. } => {
+                self.show_file_browser_panel(target.clone(), cx);
             }
             PanelEvent::Close { panel_id } => {
                 self.handle_panel_close(panel_id, cx);
@@ -1120,21 +1119,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn show_file_browser_panel(&mut self, requested_path: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn show_file_browser_panel(&mut self, target: FileBrowserTarget, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
             if let Some(panel) = tab_info.container.get_first_panel() {
-                let file_browser_view = match panel.read(cx).content() {
-                    PanelContent::FileBrowser(file_browser_view) => Some(file_browser_view.clone()),
-                    _ => None,
-                };
-
-                if let (Some(file_browser_view), Some(requested_path)) =
-                    (file_browser_view, requested_path)
-                {
-                    file_browser_view.update(cx, |file_browser, cx| {
-                        file_browser.open_requested_path(Some(requested_path.clone()), cx);
-                    });
-                }
+                self.replace_or_update_file_browser_panel(&panel, target, cx);
             }
 
             self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
@@ -1142,16 +1130,16 @@ impl Workspace {
             return;
         }
 
-        let file_browser_view = FileBrowserView::new_with_path(cx, requested_path);
         let file_browser_panel = cx.new(|cx| {
             Panel::with_file_browser_view(
                 format!("file-browser-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
                 Some(FILE_BROWSER_TAB_ID.into()),
-                file_browser_view,
+                FileBrowserView::new_with_path(cx, None),
                 cx,
             )
         });
+        self.replace_or_update_file_browser_panel(&file_browser_panel, target, cx);
         self.next_panel_id += 1;
 
         self.tabs.insert(
@@ -1174,6 +1162,60 @@ impl Workspace {
         self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
         self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
         cx.notify();
+    }
+
+    fn replace_or_update_file_browser_panel(
+        &self,
+        panel: &Entity<Panel>,
+        target: FileBrowserTarget,
+        cx: &mut Context<Self>,
+    ) {
+        panel.update(cx, move |panel, cx| match target {
+            FileBrowserTarget::Local { requested_path } => {
+                let existing_view = match panel.content() {
+                    PanelContent::FileBrowser(file_browser_view) => Some(file_browser_view.clone()),
+                    _ => None,
+                };
+
+                if let Some(file_browser_view) = existing_view {
+                    file_browser_view.update(cx, |file_browser, cx| {
+                        file_browser.open_requested_path(requested_path.clone(), cx);
+                    });
+                } else {
+                    let file_browser_view = FileBrowserView::new_with_path(cx, requested_path);
+                    panel.set_content(PanelContent::FileBrowser(file_browser_view), cx);
+                }
+            }
+            FileBrowserTarget::Remote {
+                ssh_config,
+                requested_path,
+            } => {
+                let existing_view = match panel.content() {
+                    PanelContent::RemoteFileBrowser(file_browser_view) => {
+                        Some(file_browser_view.clone())
+                    }
+                    _ => None,
+                };
+
+                if let Some(file_browser_view) = existing_view {
+                    let should_replace = file_browser_view.read(cx).ssh_config() != &ssh_config;
+
+                    if should_replace {
+                        let file_browser_view =
+                            RemoteFileBrowserView::new(cx, ssh_config, requested_path);
+                        panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
+                    } else {
+                        file_browser_view.update(cx, |file_browser, cx| {
+                            file_browser.open_requested_path(requested_path.clone(), cx);
+                        });
+                    }
+                } else {
+                    let file_browser_view =
+                        RemoteFileBrowserView::new(cx, ssh_config, requested_path);
+                    panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
+                }
+            }
+        });
     }
 
     /// 切换到指定tab

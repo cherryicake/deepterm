@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::Input;
+use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::theme::ActiveTheme;
 
 const COLUMN_WIDTH: f32 = 208.0;
@@ -343,9 +344,7 @@ impl FileBrowserView {
     }
 
     fn read_text_preview(path: &Path) -> Option<String> {
-        const PREVIEW_BYTES: usize = 8 * 1024;
-        const PREVIEW_LINES: usize = 18;
-        const PREVIEW_COLUMNS: usize = 84;
+        const PREVIEW_BYTES: usize = 64 * 1024;
 
         let file = fs::File::open(path).ok()?;
         let mut reader = std::io::BufReader::new(file).take(PREVIEW_BYTES as u64);
@@ -354,24 +353,12 @@ impl FileBrowserView {
             return Some("Empty file".to_string());
         }
 
-        let text = String::from_utf8_lossy(&bytes);
-        let mut lines = Vec::new();
-
-        for line in text.lines().take(PREVIEW_LINES) {
-            let trimmed = line.trim_end();
-            let truncated: String = trimmed.chars().take(PREVIEW_COLUMNS).collect();
-            if trimmed.chars().count() > PREVIEW_COLUMNS {
-                lines.push(format!("{truncated}..."));
-            } else {
-                lines.push(trimmed.to_string());
-            }
-        }
-
-        if lines.is_empty() {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.is_empty() {
             return None;
         }
 
-        Some(lines.join("\n"))
+        Some(text)
     }
 
     fn entry_count_for(&self, path: &Path) -> usize {
@@ -523,6 +510,32 @@ impl FileBrowserView {
             .items_center()
             .justify_center()
             .child(content)
+    }
+
+    fn render_toolbar_directory_label(
+        &self,
+        is_loading: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = cx.theme().ui;
+
+        div()
+            .min_w(px(120.0))
+            .max_w(px(220.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(self.toolbar_directory_name()),
+            )
+            .when(is_loading, |this| {
+                this.child(Spinner::new().size(SpinnerSize::Small).color(theme.accent))
+            })
     }
 
     fn render_icon_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -759,15 +772,7 @@ impl FileBrowserView {
                                 cx,
                             )),
                     )
-                    .child(
-                        div()
-                            .min_w(px(120.0))
-                            .max_w(px(220.0))
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(self.toolbar_directory_name()),
-                    ),
+                    .child(self.render_toolbar_directory_label(false, cx)),
             )
             .child(
                 div().flex().items_center().gap(px(6.0)).child(
@@ -866,6 +871,7 @@ impl FileBrowserView {
     fn render_directory_column(&self, directory: &Path, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
         let selected_child = self.selected_child_for_directory(directory);
+        let is_directory_loaded = self.directory_cache.contains_key(directory);
         let entries = self
             .directory_cache
             .get(directory)
@@ -878,14 +884,16 @@ impl FileBrowserView {
             })
             .unwrap_or_default();
         let mut rows = div()
+            .id(format!("file-browser-column-{}", directory.display()))
             .w_full()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(1.0));
+            .gap(px(1.0))
+            .overflow_y_scroll();
 
-        if entries.is_empty() {
+        if is_directory_loaded && entries.is_empty() {
             rows = rows.child(
                 div()
                     .w_full()
@@ -1071,7 +1079,11 @@ impl FileBrowserView {
             if let Some(text_preview) = preview.text_preview.clone() {
                 content = content.child(
                     div()
+                        .id("file-browser-text-preview")
                         .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
                         .p(px(12.0))
                         .rounded(px(8.0))
                         .bg(theme.panel_background)
@@ -1079,6 +1091,7 @@ impl FileBrowserView {
                         .border_color(theme.border)
                         .child(
                             div()
+                                .w_full()
                                 .text_xs()
                                 .line_height(px(18.0))
                                 .text_color(theme.text)

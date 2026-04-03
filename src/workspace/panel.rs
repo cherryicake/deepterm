@@ -6,7 +6,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
-use crate::file_browser::FileBrowserView;
+use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
@@ -63,7 +63,7 @@ pub enum PanelEvent {
     /// 打开文件浏览器
     OpenFileBrowser {
         panel_id: String,
-        requested_path: Option<std::path::PathBuf>,
+        target: FileBrowserTarget,
     },
     /// 关闭panel事件
     Close { panel_id: String },
@@ -86,6 +86,8 @@ pub enum PanelContent {
     SettingsHubView(Entity<SettingsHubView>),
     /// Local file browser
     FileBrowser(Entity<FileBrowserView>),
+    /// Remote file browser
+    RemoteFileBrowser(Entity<RemoteFileBrowserView>),
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -174,10 +176,10 @@ impl Panel {
                         panel_id: close_panel_id.clone(),
                     });
                 }
-                TerminalViewEvent::OpenFileBrowser { requested_path } => {
+                TerminalViewEvent::OpenFileBrowser { target } => {
                     cx.emit(PanelEvent::OpenFileBrowser {
                         panel_id: close_panel_id.clone(),
-                        requested_path: requested_path.clone(),
+                        target: target.clone(),
                     });
                 }
             },
@@ -457,6 +459,9 @@ impl Panel {
         match &self.content {
             PanelContent::Terminal(terminal_view) => Some(terminal_view.read(cx).focus_handle(cx)),
             PanelContent::FileBrowser(file_browser) => Some(file_browser.read(cx).focus_handle(cx)),
+            PanelContent::RemoteFileBrowser(file_browser) => {
+                Some(file_browser.read(cx).focus_handle(cx))
+            }
             PanelContent::SettingsHubSidebar(sidebar) => Some(sidebar.read(cx).focus_handle(cx)),
             PanelContent::SettingsHubView(settings_hub_view) => {
                 Some(settings_hub_view.read(cx).focus_handle(cx))
@@ -620,6 +625,11 @@ impl Panel {
                 .overflow_hidden()
                 .child(settings_hub_view.clone()),
             PanelContent::FileBrowser(file_browser_view) => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(file_browser_view.clone()),
+            PanelContent::RemoteFileBrowser(file_browser_view) => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
