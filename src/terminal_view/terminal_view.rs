@@ -521,7 +521,7 @@ impl TerminalView {
         }
     }
 
-    /// 只有本地终端且 shell 仍是前台进程组时，才允许 DeepTerm 拦截 `/`。
+    /// 只有 本地/远程 shell 仍处于可接管输入的前台交互状态时，才允许 DeepTerm 拦截 `/`。
     fn can_trigger_builtin_command_here(&self, cx: &App) -> bool {
         self.terminal.read(cx).is_shell_in_foreground()
     }

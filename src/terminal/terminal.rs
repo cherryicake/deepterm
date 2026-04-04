@@ -1,6 +1,8 @@
 //! Terminal module - simplified but functional
 
-use std::{borrow::Cow, cell::Cell, os::fd::AsRawFd, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow, cell::Cell, os::fd::AsRawFd, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
+};
 
 use alacritty_terminal::{
     Term,
@@ -12,7 +14,10 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, TermDamage, TermMode},
     tty::{self},
-    vte::ansi::{CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler},
+    vte::ansi::{
+        CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle, Handler, Processor,
+        StdSyncHandler,
+    },
 };
 use futures::{
     StreamExt,
@@ -52,6 +57,11 @@ pub enum TerminalType {
     },
 }
 
+#[derive(Clone, Debug)]
+pub enum DriverEvent {
+    RemoteData(bytes::Bytes),
+}
+
 /// Terminal events
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -64,6 +74,9 @@ pub enum Event {
 
 #[derive(Clone)]
 pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
+
+#[derive(Clone)]
+pub struct DriverListener(pub UnboundedSender<DriverEvent>);
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
@@ -221,6 +234,8 @@ pub struct Terminal {
     shell_process_group_id: Option<i32>,
     /// 本地 PTY master fd，用来读取当前 TTY 的前台进程组。
     pty_master_fd: Option<i32>,
+    /// 远程 shell 提示符是否已准备好。
+    remote_shell_ready: bool,
     remote_working_directory: Option<String>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器
@@ -236,6 +251,11 @@ pub struct Terminal {
     /// 事件循环任务（保持任务存活，防止被drop）
     #[allow(dead_code)]
     event_loop_task: Option<Task<()>>,
+    /// 远程驱动任务（保持任务存活，防止被drop）
+    #[allow(dead_code)]
+    driver_task: Option<Task<()>>,
+    /// VTE 解析器状态（跨数据块保持，避免转义序列在 chunk 边界处被截断导致乱码）
+    vte_processor: Processor<StdSyncHandler>,
     terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
     last_mouse_position: Option<Point<Pixels>>,
@@ -290,7 +310,8 @@ impl Terminal {
         )));
         let child_process_id = Some(pty.child().id());
         #[cfg(unix)]
-        let shell_process_group_id = match unsafe { libc::getpgid(pty.child().id() as libc::pid_t) } {
+        let shell_process_group_id = match unsafe { libc::getpgid(pty.child().id() as libc::pid_t) }
+        {
             pgid if pgid >= 0 => Some(pgid),
             _ => None,
         };
@@ -327,6 +348,7 @@ impl Terminal {
                 child_process_id,
                 shell_process_group_id,
                 pty_master_fd,
+                remote_shell_ready: false,
                 remote_working_directory: None,
                 window_title: None,
                 sender: Some(notifier),
@@ -336,6 +358,8 @@ impl Terminal {
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
+                driver_task: None,
+                vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
@@ -409,6 +433,7 @@ impl Terminal {
             child_process_id: None,
             shell_process_group_id: None,
             pty_master_fd: None,
+            remote_shell_ready: false,
             remote_working_directory: None,
             window_title: None,
             sender: None,
@@ -418,6 +443,8 @@ impl Terminal {
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
             event_loop_task: None,
+            driver_task: None,
+            vte_processor: Processor::<StdSyncHandler>::new(),
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             last_mouse_position: None,
@@ -479,6 +506,7 @@ impl Terminal {
                 child_process_id: None,
                 shell_process_group_id: None,
                 pty_master_fd: None,
+                remote_shell_ready: false,
                 remote_working_directory: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
@@ -488,6 +516,8 @@ impl Terminal {
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
+                driver_task: None,
+                vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
@@ -525,7 +555,9 @@ impl Terminal {
 
     fn new_ssh_russh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
+        let (driver_tx, driver_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
+        let driver_listener = DriverListener(driver_tx);
 
         let default_bounds = TerminalBounds::default();
 
@@ -545,8 +577,8 @@ impl Terminal {
             ssh_config,
             initial_cols,
             initial_rows,
-            term.clone(),
             listener.clone(),
+            driver_listener,
         );
 
         // 创建终端实体（立即返回，不阻塞 GPUI）
@@ -558,6 +590,7 @@ impl Terminal {
             ssh_config,
             term.clone(),
             events_rx,
+            driver_rx,
             move |data| russh_for_input.write(data),
             move |cols, rows| russh_for_resize.resize(cols, rows),
             Some(russh_for_status),
@@ -566,6 +599,7 @@ impl Terminal {
 
     fn new_ssh_pty(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
+        let (_driver_tx, driver_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
 
@@ -592,6 +626,7 @@ impl Terminal {
             ssh_config,
             term,
             events_rx,
+            driver_rx,
             move |data| pty_input.write(data),
             move |cols, rows| {
                 let bounds = TerminalBounds::new(
@@ -617,6 +652,7 @@ impl Terminal {
         ssh_config: &SshConnectionConfig,
         term: Arc<FairMutex<Term<ZedListener>>>,
         events_rx: UnboundedReceiver<AlacTermEvent>,
+        driver_rx: UnboundedReceiver<DriverEvent>,
         input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
         resize_handler: impl Fn(u16, u16) + Send + Sync + 'static,
         russh_handle: Option<RusshTerminal>,
@@ -633,7 +669,15 @@ impl Terminal {
                     let _ = this.update(cx, |terminal: &mut Self, cx| {
                         terminal.process_event(event, cx);
                     });
-                    smol::future::yield_now().await;
+                }
+            });
+
+            let driver_task = cx.spawn(async move |this, cx| {
+                let mut driver_rx = driver_rx;
+                while let Some(event) = driver_rx.next().await {
+                    let _ = this.update(cx, |terminal: &mut Self, cx| match event {
+                        DriverEvent::RemoteData(data) => terminal.handle_remote_data(&data, cx),
+                    });
                 }
             });
 
@@ -642,6 +686,7 @@ impl Terminal {
                 child_process_id: None,
                 shell_process_group_id: None,
                 pty_master_fd: None,
+                remote_shell_ready: false,
                 remote_working_directory: None,
                 window_title: None,
                 sender: None,
@@ -651,6 +696,8 @@ impl Terminal {
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
+                driver_task: Some(driver_task),
+                vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 last_mouse_position: None,
@@ -695,9 +742,13 @@ impl Terminal {
         self.child_process_id
     }
 
-    /// 判断当前 TTY 的前台进程组是否仍然是 shell。
-    /// 若不是，说明前台已有其他交互式程序接管输入。
+    /// 判断当前交互上下文是否仍然是 shell 提示符。
+    /// 本地终端通过前台进程组判断，远程终端通过远程 shell 发回的提示符标记判断。
     pub fn is_shell_in_foreground(&self) -> bool {
+        if self.is_remote() {
+            return self.remote_shell_ready;
+        }
+
         #[cfg(unix)]
         {
             match self.pty_master_fd {
@@ -739,29 +790,22 @@ impl Terminal {
 
     /// 处理从 SSH 接收的数据
     pub fn process_ssh_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
-        log::debug!("Terminal 处理 SSH 数据: {} 字节", data.len());
-
         // 先拦截需要由应用层消费的 OSC 序列，比如 OSC 52 与 cwd 更新。
         let filtered_data = self.extract_and_handle_osc_sequences(data, cx);
 
-        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-
-        // 创建处理器 (使用默认的 StdSyncHandler 作为超时处理器)
-        let mut processor = Processor::<StdSyncHandler>::new();
-
-        // 获取终端锁并处理数据
         let mut term = self.term.lock();
-
-        // 处理过滤后的数据（逐字节处理）
         for byte in filtered_data.as_ref() {
-            processor.advance(&mut *term, *byte);
+            self.vte_processor.advance(&mut *term, *byte);
         }
 
         // 标记内容已更新
         self.content_dirty = true;
         self.content_generation += 1;
+    }
 
-        log::debug!("SSH 数据处理完成");
+    pub fn handle_remote_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        self.process_ssh_data(data, cx);
+        cx.emit(Event::Wakeup);
     }
 
     /// 提取需要由应用层处理的 OSC 序列，返回过滤后的数据。
@@ -809,6 +853,11 @@ impl Terminal {
             return true;
         }
 
+        if Self::is_shell_prompt_osc(osc_content) {
+            self.remote_shell_ready = true;
+            return true;
+        }
+
         if let Some(path) = Self::parse_remote_working_directory_osc(osc_content) {
             self.remote_working_directory = Some(path);
             return true;
@@ -838,6 +887,13 @@ impl Terminal {
         } else {
             false
         }
+    }
+
+    fn is_shell_prompt_osc(osc_content: &[u8]) -> bool {
+        std::str::from_utf8(osc_content)
+            .ok()
+            .map(|s| s.trim())
+            .is_some_and(|s| s.starts_with("133;A"))
     }
 
     fn parse_remote_working_directory_osc(osc_content: &[u8]) -> Option<String> {
@@ -967,7 +1023,6 @@ impl Terminal {
                 self.write(response.as_bytes());
             }
             AlacTermEvent::PtyWrite(text) => {
-                // 直接写入 PTY
                 self.write(text.as_bytes());
             }
             AlacTermEvent::MouseCursorDirty => {
@@ -1093,7 +1148,10 @@ impl Terminal {
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        // 本地终端：通过 sender 发送到 PTY
+        if self.is_remote() {
+            self.remote_shell_ready = false;
+        }
+
         if let Some(ref sender) = self.sender {
             let msg = Msg::Input(Cow::Owned(data.to_vec()));
             let _ = sender.send(msg);
@@ -1107,6 +1165,8 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
+        let previous_cols = self.terminal_bounds.num_columns();
+        let previous_rows = self.terminal_bounds.num_lines();
         let cols = bounds.num_columns();
         let rows = bounds.num_lines();
 
@@ -1117,6 +1177,10 @@ impl Terminal {
         }
 
         self.terminal_bounds = bounds;
+
+        if cols == previous_cols && rows == previous_rows {
+            return;
+        }
 
         let cols_u16 = cols as u16;
         let rows_u16 = rows as u16;

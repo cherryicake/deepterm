@@ -44,28 +44,65 @@ pub use ssh_pty::SshPtyTerminal;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-const REMOTE_CWD_TRACKING_INIT: &str = r#"__deepterm_emit_cwd(){
+const REMOTE_SHELL_TRACKING_SNIPPET: &str = r#"__deepterm_emit_prompt_state(){
+  printf '\033]133;A\007'
+}
+__deepterm_emit_cwd(){
   host_name=$(hostname 2>/dev/null || printf '%s' localhost)
   printf '\033]7;file://%s%s\007' "$host_name" "$PWD"
+}
+__deepterm_precmd(){
+  __deepterm_emit_prompt_state
+  __deepterm_emit_cwd
 }
 if [ -n "$ZSH_VERSION" ]; then
   autoload -Uz add-zsh-hook >/dev/null 2>&1 || true
   if typeset -f add-zsh-hook >/dev/null 2>&1; then
-    add-zsh-hook precmd __deepterm_emit_cwd
+    add-zsh-hook precmd __deepterm_precmd
   elif [ -n "${precmd_functions+set}" ]; then
-    precmd_functions+=(__deepterm_emit_cwd)
+    precmd_functions+=(__deepterm_precmd)
   fi
 elif [ -n "$BASH_VERSION" ]; then
   case ";${PROMPT_COMMAND-};" in
-    *";__deepterm_emit_cwd;"*) ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__deepterm_emit_cwd" ;;
+    *";__deepterm_precmd;"*) ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__deepterm_precmd" ;;
   esac
 fi
-__deepterm_emit_cwd
+__deepterm_precmd
 "#;
 
-pub fn remote_cwd_tracking_init_bytes() -> &'static [u8] {
-    REMOTE_CWD_TRACKING_INIT.as_bytes()
+pub fn remote_shell_tracking_command() -> String {
+    // Write tracking functions to a temp file and use --rcfile to source
+    // the user's normal config + tracking functions.
+    // This avoids `export -f` which is bash-specific and fails silently when
+    // the initial shell is /bin/sh (e.g. dash on Debian/Ubuntu).
+    format!(
+        "source /etc/profile >/dev/null 2>&1 || true\n\
+         export DEEPTERM_REMOTE_TRACKING=1\n\
+         export _DTF=$(mktemp /tmp/.deepterm.XXXXXX)\n\
+         cat > \"$_DTF\" << 'DEEPTERM_EOF'\n\
+         {}\
+         DEEPTERM_EOF\n\
+         export _DTRC=$(mktemp /tmp/.deepterm_rc.XXXXXX)\n\
+         cat > \"$_DTRC\" << 'DEEPTERM_RC_EOF'\n\
+         source /etc/profile 2>/dev/null\n\
+         [ -f /etc/bash.bashrc ] && source /etc/bash.bashrc 2>/dev/null\n\
+         for _f in ~/.bash_profile ~/.bash_login ~/.profile; do\n\
+           [ -f \"$_f\" ] && source \"$_f\" && break\n\
+         done\n\
+         [ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null\n\
+         source \"$_DTF\"\n\
+         unset _DTF _DTRC _f\n\
+         DEEPTERM_RC_EOF\n\
+         export PROMPT_COMMAND='__deepterm_precmd'\n\
+         exec bash --rcfile \"$_DTRC\" -i",
+        REMOTE_SHELL_TRACKING_SNIPPET
+    )
+}
+
+/// Returns just the tracking functions and hooks for injection into an already-running shell.
+pub fn remote_shell_tracking_snippet() -> &'static str {
+    REMOTE_SHELL_TRACKING_SNIPPET
 }
 
 /// SSH 客户端配置

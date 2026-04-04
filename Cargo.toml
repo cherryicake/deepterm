@@ -22,6 +22,7 @@ smol = "2.0"
 
 # SSH dependencies
 russh = { path = "../russh/russh" }
+bytes = "1"
 russh-sftp = "2.1.1"
 async-trait = "0.1"
 

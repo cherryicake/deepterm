@@ -11,10 +11,10 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
-use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
-use crate::ssh::remote_cwd_tracking_init_bytes;
-use crate::terminal::TerminalBounds;
+use crate::ssh::keychain::{resolve_auth_method, ResolvedAuthMethod};
+use crate::ssh::remote_shell_tracking_snippet;
 use crate::terminal::terminal::ZedListener;
+use crate::terminal::TerminalBounds;
 
 /// SSH 终端 - 使用 Zellij 方式（PTY）
 #[derive(Clone)]
@@ -124,8 +124,9 @@ impl SshPtyTerminal {
         log::debug!("启动事件循环...");
         let _io_thread = event_loop.spawn();
 
+        // 注入跟踪脚本到已运行的 shell
         let _ = sender.send(Msg::Input(std::borrow::Cow::Borrowed(
-            remote_cwd_tracking_init_bytes(),
+            remote_shell_tracking_snippet().as_bytes(),
         )));
 
         log::info!("SSH PTY 终端创建成功");

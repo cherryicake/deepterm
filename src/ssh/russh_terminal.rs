@@ -8,9 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use russh::client::AuthResult;
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh::{ChannelMsg, Disconnect, client};
@@ -20,8 +17,8 @@ use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
     ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
 };
-use crate::ssh::remote_cwd_tracking_init_bytes;
-use crate::terminal::terminal::ZedListener;
+use crate::ssh::remote_shell_tracking_command;
+use crate::terminal::terminal::{DriverEvent, DriverListener, ZedListener};
 
 /// 发送到 SSH 通道的消息
 enum InputMsg {
@@ -78,8 +75,8 @@ impl RusshTerminal {
         config: &SshConnectionConfig,
         initial_cols: u32,
         initial_rows: u32,
-        term: Arc<FairMutex<Term<ZedListener>>>,
         listener: ZedListener,
+        driver_listener: DriverListener,
     ) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState {
             terminal: None,
@@ -91,6 +88,7 @@ impl RusshTerminal {
 
         let state_for_task = state.clone();
         let config_clone = config.clone();
+        let driver_listener_for_task = driver_listener.clone();
 
         // 在独立线程中启动 tokio 运行时进行连接
         std::thread::Builder::new()
@@ -137,7 +135,14 @@ impl RusshTerminal {
                             }
 
                             // 启动 I/O 循环
-                            Self::io_loop(handle, channel, input_rx, term, listener).await;
+                            Self::io_loop(
+                                handle,
+                                channel,
+                                input_rx,
+                                listener,
+                                driver_listener_for_task,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             log::warn!("russh: 连接失败: {}", e);
@@ -271,15 +276,11 @@ impl RusshTerminal {
             .await
             .map_err(|e| anyhow::anyhow!("请求 PTY 失败: {}", e))?;
 
+        let shell_command = remote_shell_tracking_command();
         channel
-            .request_shell(true)
+            .exec(true, shell_command.as_str())
             .await
-            .map_err(|e| anyhow::anyhow!("启动 Shell 失败: {}", e))?;
-
-        channel
-            .data(remote_cwd_tracking_init_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("初始化远程 cwd 跟踪失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("启动带跟踪的远程 shell 失败: {}", e))?;
 
         log::info!("russh: PTY + Shell 就绪");
         Ok((handle, channel))
@@ -513,38 +514,25 @@ impl RusshTerminal {
         handle: client::Handle<SshClientHandler>,
         mut channel: russh::Channel<client::Msg>,
         mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputMsg>,
-        term: Arc<FairMutex<Term<ZedListener>>>,
         listener: ZedListener,
+        driver_listener: DriverListener,
     ) {
-        let mut processor = Processor::<StdSyncHandler>::new();
-        // 同 alacritty，避免一次性持有 mutex 超过 64KB，给 render 线程让出窗口
-        const MAX_LOCKED_BYTES: usize = 0xFFFF;
-
         loop {
             tokio::select! {
                 // 接收来自 SSH 服务器的数据
                 msg_opt = channel.wait() => {
                     match msg_opt {
-                        Some(ChannelMsg::Data { ref data }) => {
-                            // 分块处理，避免大文件 cat 时长时间占用 mutex
-                            for chunk in data.chunks(MAX_LOCKED_BYTES) {
-                                let mut term_guard = term.lock();
-                                for &byte in chunk {
-                                    processor.advance(&mut *term_guard, byte);
-                                }
-                                // chunk 结束即释放 lock，render 线程可抢占
-                            }
-                            listener.send_event(AlacTermEvent::Wakeup);
+                        Some(ChannelMsg::Data { data }) => {
+                            driver_listener
+                                .0
+                                .unbounded_send(DriverEvent::RemoteData(data))
+                                .ok();
                         }
-                        Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
-                            // stderr（ext=1）同样写入终端
-                            for chunk in data.chunks(MAX_LOCKED_BYTES) {
-                                let mut term_guard = term.lock();
-                                for &byte in chunk {
-                                    processor.advance(&mut *term_guard, byte);
-                                }
-                            }
-                            listener.send_event(AlacTermEvent::Wakeup);
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            driver_listener
+                                .0
+                                .unbounded_send(DriverEvent::RemoteData(data))
+                                .ok();
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
                             log::info!("russh: 远程进程退出，代码: {}", exit_status);
