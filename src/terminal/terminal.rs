@@ -815,35 +815,42 @@ impl Terminal {
         data: &'a [u8],
         cx: &mut Context<Self>,
     ) -> Cow<'a, [u8]> {
-        // 快速路径: 检查是否包含 OSC 开始序列
-        if !data.windows(2).any(|w| w == &[0x1b, b']']) {
-            return Cow::Borrowed(data); // 没有 OSC 序列，零拷贝返回
+        // 快速路径: 检查是否包含 OSC 开始序列 (ESC ])
+        const OSC_START: &[u8] = b"\x1b]";
+        if memchr::memmem::find(data, OSC_START).is_none() {
+            return Cow::Borrowed(data);
         }
 
         // 慢速路径: 需要过滤 OSC 序列
         let mut result = Vec::with_capacity(data.len());
-        let mut i = 0;
+        let mut pos = 0;
 
-        while i < data.len() {
-            // 查找 OSC 序列开始: ESC ] 或 \x1b ]
-            if i + 1 < data.len() && data[i] == 0x1b && data[i + 1] == b']' {
-                // 找到了 OSC 开始，尝试提取完整序列
-                if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[i..]) {
-                    if self.try_handle_osc_sequence(cx, osc_content) {
-                        // 已由应用层处理，跳过这个序列
-                        i += osc_end;
-                        continue;
-                    }
-                    // 不是应用层关心的 OSC，保留给 VTE 自己处理
-                    result.extend_from_slice(&data[i..i + osc_end]);
-                    i += osc_end;
+        while let Some(osc_offset) = memchr::memmem::find(&data[pos..], OSC_START) {
+            let osc_pos = pos + osc_offset;
+
+            // 批量拷贝 OSC 之前的普通数据
+            result.extend_from_slice(&data[pos..osc_pos]);
+
+            // 尝试提取完整 OSC 序列
+            if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[osc_pos..]) {
+                if self.try_handle_osc_sequence(cx, osc_content) {
+                    // 已由应用层处理，跳过这个序列
+                    pos = osc_pos + osc_end;
                     continue;
                 }
+                // 不是应用层关心的 OSC，保留给 VTE 自己处理
+                result.extend_from_slice(&data[osc_pos..osc_pos + osc_end]);
+                pos = osc_pos + osc_end;
+                continue;
             }
-            // 普通字节，保留
-            result.push(data[i]);
-            i += 1;
+
+            // 不完整的 OSC 序列，保留给 VTE 处理
+            result.extend_from_slice(&data[osc_pos..osc_pos + 2]);
+            pos = osc_pos + 2;
         }
+
+        // 拷贝尾部剩余数据
+        result.extend_from_slice(&data[pos..]);
 
         Cow::Owned(result)
     }
@@ -967,14 +974,16 @@ impl Terminal {
             return None;
         }
 
+        let body = &data[2..];
+
         // 查找 BEL 结束符 (0x07)
-        if let Some(pos) = data[2..].iter().position(|&b| b == 0x07) {
-            return Some((pos + 3, &data[2..pos + 2]));
+        if let Some(pos) = memchr::memchr(0x07, body) {
+            return Some((pos + 3, &body[..pos]));
         }
 
         // 查找 ESC \ 结束符 (0x1b 0x5c)
-        if let Some(pos) = data[2..].windows(2).position(|w| w == &[0x1b, b'\\']) {
-            return Some((pos + 4, &data[2..pos + 2]));
+        if let Some(pos) = memchr::memmem::find(body, b"\x1b\\") {
+            return Some((pos + 4, &body[..pos]));
         }
 
         // 未找到结束符，序列不完整
