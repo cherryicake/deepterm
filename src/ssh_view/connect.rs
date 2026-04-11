@@ -6,12 +6,24 @@
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{Context, IntoElement, Render, Styled, Task, Window, div, px, svg};
+use gpui::{Context, EventEmitter, IntoElement, Render, Styled, Task, Window, div, px, svg};
+
+use crate::components::button::{Button, ButtonVariants};
 
 use crate::assets::Icon;
 use crate::components::stepper::{Stepper, StepperItem};
 use crate::ssh::config::SshConnectionConfig;
 use crate::theme::ActiveTheme;
+
+/// SshConnectView 事件
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// 重新连接
+    Reconnect {
+        /// 连接配置
+        config: SshConnectionConfig,
+    },
+}
 
 /// 连接阶段总数
 const NUM_STAGES: usize = 3;
@@ -82,8 +94,7 @@ pub struct SshConnectView {
     /// 动画帧计数（用于 "..." 点动画）
     frame: u32,
     /// 动画任务（持有此字段使任务保持运行，drop 时自动停止）
-    #[allow(dead_code)]
-    animation_task: Task<()>,
+    animation_task: Option<Task<()>>,
 }
 
 impl SshConnectView {
@@ -94,16 +105,23 @@ impl SshConnectView {
                 cx.background_executor()
                     .timer(Duration::from_millis(400))
                     .await;
-                let cont = this
-                    .update(cx, |view, cx| {
-                        view.frame = view.frame.wrapping_add(1);
-                        cx.notify();
-                        true
+                let should_continue = this
+                    .update(cx, |view, _cx| {
+                        // 连接完成或失败后停止动画
+                        matches!(
+                            view.status,
+                            ConnectStatus::Connecting { .. }
+                        )
                     })
                     .unwrap_or(false);
-                if !cont {
+                if !should_continue {
                     break;
                 }
+                this.update(cx, |view, cx| {
+                    view.frame = view.frame.wrapping_add(1);
+                    cx.notify();
+                })
+                .ok();
             }
         });
 
@@ -113,7 +131,7 @@ impl SshConnectView {
                 stage: ConnectStage::Handshake,
             },
             frame: 0,
-            animation_task,
+            animation_task: Some(animation_task),
         }
     }
 
@@ -165,7 +183,18 @@ impl SshConnectView {
             _ => "...",
         }
     }
+
+    /// 处理重新连接
+    fn handle_reconnect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // 获取当前配置
+        let config = self.config.clone();
+
+        // 关闭当前视图并触发重新连接
+        cx.emit(Event::Reconnect { config });
+    }
 }
+
+impl EventEmitter<Event> for SshConnectView {}
 
 impl Render for SshConnectView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -286,12 +315,23 @@ impl Render for SshConnectView {
                             ]),
                     )
                     .when(is_failed, |this| match &self.status {
-                        ConnectStatus::Failed { message, .. } => this.child(
-                            div()
-                                .text_color(theme.error)
-                                .text_size(px(13.0))
-                                .child(format!("Failed: {}", message)),
-                        ),
+                        ConnectStatus::Failed { message, .. } => this
+                            .child(
+                                div()
+                                    .text_color(theme.error)
+                                    .text_size(px(13.0))
+                                    .child(format!("Failed: {}", message)),
+                            )
+                            .child(
+                                div().mt(px(16.0)).child(
+                                    Button::new("reconnect-btn")
+                                        .label("Reconnect")
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.handle_reconnect(_window, cx);
+                                        })),
+                                ),
+                            ),
                         _ => this,
                     }),
             )

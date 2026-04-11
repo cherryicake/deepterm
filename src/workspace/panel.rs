@@ -182,6 +182,15 @@ impl Panel {
                         target: target.clone(),
                     });
                 }
+                TerminalViewEvent::SshReconnect { config } => {
+                    // SSH 连接断开，创建新的终端视图进行重连
+                    log::info!("Panel {}: SSH 连接断开，创建重连视图", close_panel_id);
+                    let new_terminal_view = TerminalView::new_ssh(cx, config);
+                    // 重新订阅新 TerminalView 的事件
+                    Self::subscribe_terminal_events(&close_panel_id, &new_terminal_view, cx);
+                    // 更新 panel 内容
+                    _this.set_content(PanelContent::Terminal(new_terminal_view), cx);
+                }
             },
         )
         .detach();

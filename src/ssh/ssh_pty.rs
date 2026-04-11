@@ -11,10 +11,10 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
-use crate::ssh::keychain::{resolve_auth_method, ResolvedAuthMethod};
+use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
 use crate::ssh::remote_shell_tracking_snippet;
-use crate::terminal::terminal::ZedListener;
 use crate::terminal::TerminalBounds;
+use crate::terminal::terminal::ZedListener;
 
 /// SSH 终端 - 使用 Zellij 方式（PTY）
 #[derive(Clone)]

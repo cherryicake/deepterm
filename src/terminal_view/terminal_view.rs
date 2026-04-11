@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Task, UTF16Selection,
-    Window, actions, div, point, px,
+    MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription, Task,
+    UTF16Selection, Window, actions, div, point, px,
 };
 use gpui::{KeyBinding, prelude::*};
 
 use crate::file_browser::FileBrowserTarget;
+use crate::ssh_view::connect::Event::Reconnect;
 /// Events emitted by TerminalView
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -20,6 +21,8 @@ pub enum Event {
     CloseTerminal,
     /// Open the file browser view
     OpenFileBrowser { target: FileBrowserTarget },
+    /// SSH 重新连接请求
+    SshReconnect { config: SshConnectionConfig },
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -67,6 +70,7 @@ pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
 
 pub struct TerminalView {
     terminal: Entity<Terminal>,
+    terminal_subscription: Option<Subscription>,
     working_directory: Option<PathBuf>,
     ssh_config: Option<SshConnectionConfig>,
     focus_handle: FocusHandle,
@@ -87,6 +91,10 @@ pub struct TerminalView {
     scrollbar_hide_scheduled_at: Option<Instant>,
     /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
     ssh_connect_view: Option<Entity<SshConnectView>>,
+    /// SSH 连接视图订阅 - 用于取消订阅重新连接事件
+    ssh_connect_subscription: Option<Subscription>,
+    /// SSH 连接视图隐藏任务 - 用于取消延迟隐藏任务
+    ssh_connect_hide_task: Option<Task<()>>,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
     /// Flattened render data reused across frames when nothing changed.
@@ -99,17 +107,91 @@ pub struct TerminalView {
     pub cached_selection_mouse_mode: bool,
 }
 
+/// SSH 连接状态检查结果
+enum SshCheckOutcome {
+    Connected,
+    Failed(String),
+    Pending,
+}
+
+impl SshCheckOutcome {
+    fn check(terminal: &Entity<Terminal>, cx: &App) -> Self {
+        let term = terminal.read(cx);
+        if term.is_ssh_connected() {
+            SshCheckOutcome::Connected
+        } else if term.is_ssh_failed() {
+            SshCheckOutcome::Failed(
+                term.ssh_error_message()
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            )
+        } else {
+            SshCheckOutcome::Pending
+        }
+    }
+}
+
 impl TerminalView {
-    /// 创建新的本地终端
-    pub fn new(cx: &mut App) -> Entity<Self> {
-        let working_directory = dirs::home_dir();
-        let terminal = Terminal::new(cx, working_directory.clone());
+    /// 处理 SSH 连接异常断开事件
+    fn handle_ssh_abnormal_disconnect(&self, cx: &mut Context<Self>) {
+        if let Some(config) = self.ssh_config.as_ref() {
+            log::info!("SSH 连接异常断开，触发重连: {}", config.host_label());
+            cx.emit(Event::SshReconnect {
+                config: config.clone(),
+            });
+        } else {
+            // 这不应该发生：SSH 异常断开事件应该只由 SSH 终端触发
+            log::warn!("收到 SSH 异常断开事件，但 ssh_config 为 None");
+        }
+    }
+
+    /// 处理 SSH 连接进度视图状态更新
+    fn handle_ssh_connect_status(
+        &mut self,
+        connect_view: &Entity<SshConnectView>,
+        outcome: SshCheckOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            SshCheckOutcome::Connected => {
+                connect_view.update(cx, |view, cx| view.set_connected(cx));
+                // 取消之前的隐藏任务（如果有）
+                self.ssh_connect_hide_task.take();
+                // 延迟移除连接视图，让用户看到完成状态
+                self.ssh_connect_hide_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.ssh_connect_view = None;
+                        this.ssh_connect_hide_task = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+            SshCheckOutcome::Failed(msg) => {
+                // 直接传递 msg，避免 &str -> String 的克隆
+                connect_view.update(cx, |view, cx| view.set_failed(msg, cx));
+            }
+            SshCheckOutcome::Pending => {}
+        }
+    }
+
+    /// 创建本地终端视图的通用方法
+    fn create_terminal_view(
+        cx: &mut App,
+        terminal: Entity<Terminal>,
+        working_directory: Option<PathBuf>,
+        ssh_config: Option<SshConnectionConfig>,
+        initial_title: SharedString,
+    ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
             let terminal_clone = terminal.clone();
 
-            cx.subscribe(
+            // 本地终端只需要处理基本事件，不需要处理 SSH 相关事件
+            let subscription = cx.subscribe(
                 &terminal_clone,
                 |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
                     TerminalEvent::TitleChanged => {
@@ -122,17 +204,19 @@ impl TerminalView {
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
                     }
+                    // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
+                    TerminalEvent::SshAbnormalDisconnect => {}
                 },
-            )
-            .detach();
+            );
 
             let mut this = Self {
                 terminal: terminal_clone,
+                terminal_subscription: Some(subscription),
                 working_directory,
-                ssh_config: None,
+                ssh_config,
                 focus_handle,
                 cursor_visible: true,
-                title: "Terminal".into(),
+                title: initial_title,
                 selecting: false,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
@@ -141,6 +225,8 @@ impl TerminalView {
                 scrollbar_hide_task: None,
                 scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: None,
+                ssh_connect_subscription: None,
+                ssh_connect_hide_task: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -150,6 +236,13 @@ impl TerminalView {
             this.update_title(cx);
             this
         })
+    }
+
+    /// 创建新的本地终端
+    pub fn new(cx: &mut App) -> Entity<Self> {
+        let working_directory = dirs::home_dir();
+        let terminal = Terminal::new(cx, working_directory.clone());
+        Self::create_terminal_view(cx, terminal, working_directory, None, "Terminal".into())
     }
 
     /// 使用指定命令创建新的本地终端
@@ -170,52 +263,13 @@ impl TerminalView {
         };
         let terminal =
             Terminal::new_with_command(cx, working_dir.clone(), &command_string, &args_vec);
-        let focus_handle = cx.focus_handle();
-
-        cx.new(|cx| {
-            let terminal_clone = terminal.clone();
-
-            cx.subscribe(
-                &terminal_clone,
-                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
-                    TerminalEvent::TitleChanged => {
-                        this.update_title(cx);
-                    }
-                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                        cx.notify();
-                    }
-                    TerminalEvent::Bell => {}
-                    TerminalEvent::CloseTerminal => {
-                        cx.emit(Event::CloseTerminal);
-                    }
-                },
-            )
-            .detach();
-
-            let mut this = Self {
-                terminal: terminal_clone,
-                working_directory: working_dir,
-                ssh_config: None,
-                focus_handle,
-                cursor_visible: true,
-                title: command_string.into(),
-                selecting: false,
-                ime_state: None,
-                builtin_command_manager: BuiltinCommandManager::new(),
-                can_start_builtin_command: true,
-                broadcast_callback: None,
-                scrollbar_hide_task: None,
-                scrollbar_hide_scheduled_at: None,
-                ssh_connect_view: None,
-                row_render_cache: Vec::new(),
-                flattened_render_cache: FlattenedRenderCache::default(),
-                cached_theme_id: None,
-                cached_selection_range: None,
-                cached_selection_mouse_mode: false,
-            };
-            this.update_title(cx);
-            this
-        })
+        Self::create_terminal_view(
+            cx,
+            terminal,
+            working_dir,
+            None,
+            command_string.into(),
+        )
     }
 
     /// 创建新的 SSH 远程终端
@@ -246,55 +300,19 @@ impl TerminalView {
             // 创建 SSH 连接进度视图（在连接成功前覆盖在终端上方）
             let connect_view = cx.new(|cx| SshConnectView::new(ssh_config_clone.clone(), cx));
 
-            cx.subscribe(
+            let terminal_subscription = cx.subscribe(
                 &terminal_clone,
                 |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
                     TerminalEvent::TitleChanged => {
                         this.update_title(cx);
                     }
                     TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                        // 当 SSH 连接完成时更新进度视图
                         if let Some(connect_view) = this.ssh_connect_view.clone() {
-                            enum SshOutcome {
-                                Connected,
-                                Failed(String),
-                                Pending,
-                            }
-                            let outcome = {
-                                let term = terminal.read(cx);
-                                if term.is_ssh_connected() {
-                                    SshOutcome::Connected
-                                } else if term.is_ssh_failed() {
-                                    SshOutcome::Failed(
-                                        term.ssh_error_message()
-                                            .unwrap_or_else(|| "Unknown error".to_string()),
-                                    )
-                                } else {
-                                    SshOutcome::Pending
-                                }
-                            };
-                            match outcome {
-                                SshOutcome::Connected => {
-                                    // 先标记为已连接，然后移除视图
-                                    connect_view.update(cx, |view, cx| view.set_connected(cx));
-                                    // 延迟移除连接视图，让用户看到完成状态
-                                    cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(Duration::from_millis(500))
-                                            .await;
-                                        this.update(cx, |this, cx| {
-                                            this.ssh_connect_view = None;
-                                            cx.notify();
-                                        })
-                                        .ok();
-                                    })
-                                    .detach();
-                                }
-                                SshOutcome::Failed(msg) => {
-                                    connect_view.update(cx, |view, cx| view.set_failed(msg, cx));
-                                }
-                                SshOutcome::Pending => {}
-                            }
+                            this.handle_ssh_connect_status(
+                                &connect_view,
+                                SshCheckOutcome::check(&terminal, cx),
+                                cx,
+                            );
                         }
                         cx.notify();
                     }
@@ -302,12 +320,15 @@ impl TerminalView {
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
                     }
+                    TerminalEvent::SshAbnormalDisconnect => {
+                        this.handle_ssh_abnormal_disconnect(cx);
+                    }
                 },
-            )
-            .detach();
+            );
 
             let mut this = Self {
                 terminal: terminal_clone,
+                terminal_subscription: Some(terminal_subscription),
                 working_directory: None,
                 ssh_config: Some(ssh_config_clone.clone()),
                 focus_handle,
@@ -320,13 +341,20 @@ impl TerminalView {
                 broadcast_callback: None,
                 scrollbar_hide_task: None,
                 scrollbar_hide_scheduled_at: None,
-                ssh_connect_view: Some(connect_view),
+                ssh_connect_view: Some(connect_view.clone()),
+                ssh_connect_subscription: None,
+                ssh_connect_hide_task: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
             };
+
+            // 订阅 SshConnectView 的重新连接事件并存储订阅
+            this.ssh_connect_subscription =
+                Some(this.subscribe_ssh_connect_view(&connect_view, cx));
+
             this.update_title(cx);
             this
         })
@@ -345,6 +373,76 @@ impl TerminalView {
                 .into()
             },
         );
+    }
+
+    /// 订阅终端事件（用于重新连接时）
+    fn subscribe_terminal_events(
+        &mut self,
+        terminal: &Entity<Terminal>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(
+            terminal,
+            |this: &mut TerminalView, term, event: &TerminalEvent, cx| match event {
+                TerminalEvent::TitleChanged => {
+                    this.update_title(cx);
+                }
+                TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                    if let Some(connect_view) = this.ssh_connect_view.clone() {
+                        this.handle_ssh_connect_status(
+                            &connect_view,
+                            SshCheckOutcome::check(&term, cx),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                }
+                TerminalEvent::Bell => {}
+                TerminalEvent::CloseTerminal => {
+                    // 正常退出（用户执行 exit 命令），关闭 panel
+                    cx.emit(Event::CloseTerminal);
+                }
+                TerminalEvent::SshAbnormalDisconnect => {
+                    this.handle_ssh_abnormal_disconnect(cx);
+                }
+            },
+        )
+    }
+
+    /// 订阅 SshConnectView 的重新连接事件
+    fn subscribe_ssh_connect_view(
+        &mut self,
+        connect_view: &Entity<SshConnectView>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(
+            connect_view,
+            move |this: &mut TerminalView, _view, event: &crate::ssh_view::connect::Event, cx| {
+                let Reconnect { config } = event;
+                log::info!("重新连接 SSH: {}", config.host_label());
+
+                // 清理旧订阅
+                this.terminal_subscription.take();
+                this.ssh_connect_subscription.take();
+
+                // 创建新的连接视图
+                let new_connect_view =
+                    cx.new(|cx| crate::ssh_view::SshConnectView::new(config.clone(), cx));
+
+                // 订阅新视图的重新连接事件并存储订阅
+                this.ssh_connect_subscription =
+                    Some(this.subscribe_ssh_connect_view(&new_connect_view, cx));
+
+                this.ssh_connect_view = Some(new_connect_view);
+
+                // 创建新的终端
+                let new_terminal = Terminal::new_ssh(cx, config);
+                this.terminal_subscription =
+                    Some(this.subscribe_terminal_events(&new_terminal, cx));
+                this.terminal = new_terminal;
+                cx.notify();
+            },
+        )
     }
 
     pub fn terminal(&self) -> &Entity<Terminal> {

@@ -115,7 +115,8 @@ impl RenderOnce for StepperTrigger {
         let text_center = self.text_center;
         let size = self.size;
         let indicator_size = size.indicator_size();
-        let show_spinner = self.show_spinner && is_current && !disabled;
+        let is_failed = self.status == StepperStatus::Failed;
+        let show_spinner = self.show_spinner && is_current && !disabled && !is_failed;
 
         div()
             .id(("trigger", self.step))

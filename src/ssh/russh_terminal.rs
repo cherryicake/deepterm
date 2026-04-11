@@ -541,6 +541,12 @@ impl RusshTerminal {
                         }
                         Some(ChannelMsg::Eof) | None => {
                             log::info!("russh: 连接关闭 (EOF)");
+                            driver_listener
+                                .0
+                                .unbounded_send(DriverEvent::AbnormalDisconnect {
+                                    reason: "连接意外关闭 (EOF)".to_string(),
+                                })
+                                .ok();
                             listener.send_event(AlacTermEvent::Exit);
                             break;
                         }
@@ -554,6 +560,12 @@ impl RusshTerminal {
                         Some(InputMsg::Data(data)) => {
                             if let Err(e) = channel.data(data.as_ref()).await {
                                 log::error!("russh: 发送数据到服务器失败: {}", e);
+                                driver_listener
+                                    .0
+                                    .unbounded_send(DriverEvent::AbnormalDisconnect {
+                                        reason: format!("发送数据失败: {}", e),
+                                    })
+                                    .ok();
                                 listener.send_event(AlacTermEvent::Exit);
                                 break;
                             }

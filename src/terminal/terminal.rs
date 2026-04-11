@@ -60,6 +60,8 @@ pub enum TerminalType {
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
     RemoteData(bytes::Bytes),
+    /// SSH 连接异常断开（网络问题或连接中断）
+    AbnormalDisconnect { reason: String },
 }
 
 /// Terminal events
@@ -67,6 +69,8 @@ pub enum DriverEvent {
 pub enum Event {
     TitleChanged,
     CloseTerminal,
+    /// SSH 连接异常断开（网络问题）
+    SshAbnormalDisconnect,
     Bell,
     Wakeup,
     SelectionsChanged,
@@ -677,6 +681,10 @@ impl Terminal {
                 while let Some(event) = driver_rx.next().await {
                     let _ = this.update(cx, |terminal: &mut Self, cx| match event {
                         DriverEvent::RemoteData(data) => terminal.handle_remote_data(&data, cx),
+                        DriverEvent::AbnormalDisconnect { reason } => {
+                            log::warn!("SSH 连接异常断开: {}", reason);
+                            cx.emit(Event::SshAbnormalDisconnect);
+                        }
                     });
                 }
             });
