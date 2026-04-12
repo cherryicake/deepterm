@@ -3,6 +3,8 @@
 //! 参考 Zed GPUI 的 input 示例实现，支持光标定位和选择。
 use crate::assets::Icon;
 use crate::theme::ActiveTheme;
+use super::change::Change;
+use super::history::History;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -31,6 +33,8 @@ actions!(
         Paste,
         SelectLeft,
         SelectRight,
+        Undo,
+        Redo,
     ]
 );
 pub(crate) fn init(cx: &mut App) {
@@ -57,6 +61,14 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-z", Undo, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
     ]);
 }
 
@@ -110,6 +122,10 @@ pub struct Input {
     placeholder_font_size: Option<Pixels>,
     /// 上一帧是否聚焦（用于检测焦点获得事件）
     was_focused: bool,
+    /// 编辑历史（用于 undo/redo）
+    history: History<Change>,
+    /// 是否静默替换（undo/redo 时不记录历史）
+    silent_replace: bool,
 }
 
 impl Input {
@@ -137,6 +153,8 @@ impl Input {
             transparent: false,
             placeholder_font_size: None,
             was_focused: false,
+            history: History::new().group_interval(std::time::Duration::from_secs(1)),
+            silent_replace: false,
         }
     }
 
@@ -501,6 +519,51 @@ impl Input {
         }
     }
 
+    /// 处理撤销
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+
+        self.history.ignore = true;
+        if let Some(changes) = self.history.undo() {
+            for change in changes {
+                let range_utf16 = self.range_to_utf16(&change.new_range);
+                self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
+            }
+        }
+        self.history.ignore = false;
+    }
+
+    /// 处理重做
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
+
+        self.history.ignore = true;
+        if let Some(changes) = self.history.redo() {
+            for change in changes {
+                let range_utf16 = self.range_to_utf16(&change.old_range);
+                self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
+            }
+        }
+        self.history.ignore = false;
+    }
+
+    /// 静默替换文本（不记录历史）
+    fn replace_text_in_range_silent(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.silent_replace = true;
+        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        self.silent_replace = false;
+    }
+
     /// 处理全选
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
         if self.disabled {
@@ -740,6 +803,19 @@ impl EntityInputHandler for Input {
         let content_len = self.content.len();
         let start = range.start.min(content_len);
         let end = range.end.min(content_len);
+
+        // 记录历史（如果不是静默替换）
+        if !self.silent_replace && !self.history.ignore {
+            let old_text = &self.content[start..end];
+            let new_range = start..start + new_text.len();
+            self.history.push(Change::new(
+                start..end,
+                old_text,
+                new_range.clone(),
+                new_text,
+            ));
+            self.history.end_grouping();
+        }
 
         self.content = (self.content[0..start].to_owned() + new_text + &self.content[end..]).into();
         self.selected_range = start + new_text.len()..start + new_text.len();
@@ -1181,6 +1257,8 @@ impl Render for Input {
             .on_action(cx.listener(Input::copy))
             .on_action(cx.listener(Input::cut))
             .on_action(cx.listener(Input::paste))
+            .on_action(cx.listener(Input::undo))
+            .on_action(cx.listener(Input::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Input::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Input::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Input::on_mouse_up))
