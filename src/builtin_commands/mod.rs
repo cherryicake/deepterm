@@ -239,6 +239,7 @@ impl BuiltinCommandState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuiltinCommandHandler {
     OpenFileBrowser,
+    OpenFile,
     LogOnly,
 }
 
@@ -261,7 +262,7 @@ pub const BUILTIN_COMMAND_SPECS: &[BuiltinCommandSpec] = &[
         name: "/open-file",
         description: "Open a file in DeepTerm's editor.",
         icon: Icon::Screen,
-        handler: BuiltinCommandHandler::LogOnly,
+        handler: BuiltinCommandHandler::OpenFile,
     },
     BuiltinCommandSpec {
         name: "/open-repo",

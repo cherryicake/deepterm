@@ -21,6 +21,8 @@ pub enum Event {
     CloseTerminal,
     /// Open the file browser view
     OpenFileBrowser { target: FileBrowserTarget },
+    /// Open a file in the editor
+    OpenFile { path: String },
     /// SSH 重新连接请求
     SshReconnect { config: SshConnectionConfig },
 }
@@ -688,6 +690,13 @@ impl TerminalView {
                     _cx.emit(Event::OpenFileBrowser {
                         target: self.parse_open_file_browser_target(command_line, _cx),
                     });
+                } else if spec.handler == BuiltinCommandHandler::OpenFile {
+                    let path = command_line
+                        .strip_prefix(spec.name)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    _cx.emit(Event::OpenFile { path });
                 }
                 true
             }

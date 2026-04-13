@@ -17,6 +17,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::editor::EditorView;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
@@ -454,6 +455,9 @@ impl Workspace {
             }
             PanelEvent::OpenFileBrowser { target, .. } => {
                 self.show_file_browser_panel(target.clone(), cx);
+            }
+            PanelEvent::OpenFile { panel_id, path } => {
+                self.show_editor_panel(panel_id.clone(), path.clone(), cx);
             }
             PanelEvent::Close { panel_id } => {
                 self.handle_panel_close(panel_id, cx);
@@ -1161,6 +1165,74 @@ impl Workspace {
 
         self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
         self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
+        cx.notify();
+    }
+
+    fn show_editor_panel(&mut self, _panel_id: String, path: String, cx: &mut Context<Self>) {
+        // Read file content
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        // Guess language from extension
+        let language = std::path::Path::new(&path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| match ext {
+                "rs" => "rust",
+                "js" => "javascript",
+                "ts" => "typescript",
+                "json" => "json",
+                "py" => "python",
+                "go" => "go",
+                "cpp" | "cc" | "cxx" => "cpp",
+                "c" => "c",
+                "html" => "html",
+                "css" => "css",
+                "md" => "markdown",
+                "sh" | "bash" => "bash",
+                "toml" => "toml",
+                "yaml" | "yml" => "yaml",
+                _ => "text",
+            })
+            .unwrap_or("text")
+            .to_string();
+
+        let tab_id = format!("editor-{}", path);
+        let tab_label = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&path)
+            .to_string();
+
+        let editor_panel = cx.new(|cx| {
+            let editor_view = cx.new(|cx| EditorView::with_file(&path, &content, Some(&language), cx));
+            Panel::with_editor(
+                format!("editor-panel-{}", self.next_panel_id),
+                self.workspace_id.clone(),
+                Some(tab_id.clone().into()),
+                editor_view,
+                cx,
+            )
+        });
+        self.next_panel_id += 1;
+
+        self.tabs.insert(
+            tab_id.clone(),
+            TabInfo::new_normal(&tab_id, &tab_label, editor_panel.clone()),
+        );
+
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(TabItem::new(&tab_id, &tab_label), cx);
+        });
+
+        let subscription = cx.subscribe(&editor_panel, |this, _, event: &PanelEvent, cx| {
+            this.handle_panel_event(event, cx);
+        });
+        self.panel_subscriptions.insert(
+            editor_panel.read(cx).panel_id().to_string(),
+            subscription,
+        );
+
+        self.active_tab_id = tab_id.clone();
+        self.switch_to_tab(&tab_id, cx);
         cx.notify();
     }
 

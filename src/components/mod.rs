@@ -17,5 +17,6 @@ pub mod title_bar;
 /// You must initialize the components at your application's entry point.
 pub fn init(cx: &mut App) {
     input::init(cx);
+    input::code_editor::init(cx);
     menu::init(cx);
 }
