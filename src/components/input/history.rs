@@ -17,10 +17,12 @@ pub struct History<I: HistoryItem> {
     max_undos: usize,
     /// 最后变更时间（用于分组）
     last_changed_at: std::time::Instant,
-    /// 分组间隔（毫秒），在此间隔内的变更会被分到同一组
+    /// 分组间隔，在此间隔内的变更会被分到同一组
     group_interval: Option<std::time::Duration>,
     /// 是否正在分组
     grouping: bool,
+    /// 是否去重，开启后相同变更不会重复记录
+    unique: bool,
 }
 
 impl<I> History<I>
@@ -37,12 +39,19 @@ where
             last_changed_at: std::time::Instant::now(),
             group_interval: None,
             grouping: false,
+            unique: false,
         }
     }
 
     /// 设置最大 undo 次数
     pub fn max_undos(mut self, max_undos: usize) -> Self {
         self.max_undos = max_undos;
+        self
+    }
+
+    /// 设置去重，开启后相同变更不会重复记录
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
         self
     }
 
@@ -92,6 +101,11 @@ where
             self.undos.remove(0);
         }
 
+        if self.unique {
+            self.undos.retain(|c| *c != item);
+            self.redos.retain(|c| *c != item);
+        }
+
         // 清空 redo 栈（新的变更会使 redo 历史失效）
         self.redos.clear();
 
@@ -121,12 +135,14 @@ where
         if let Some(first_change) = self.undos.pop() {
             let mut changes = vec![first_change.clone()];
             // 收集同一版本的所有变更
-            while let Some(last) = self.undos.last() {
-                if last.version() == first_change.version() {
-                    changes.push(self.undos.pop().unwrap());
-                } else {
-                    break;
-                }
+            while self
+                .undos
+                .iter()
+                .filter(|c| c.version() == first_change.version())
+                .count()
+                > 0
+            {
+                changes.push(self.undos.pop().unwrap());
             }
             // 将变更放入 redo 栈
             self.redos.extend(changes.clone());
@@ -141,12 +157,14 @@ where
         if let Some(first_change) = self.redos.pop() {
             let mut changes = vec![first_change.clone()];
             // 收集同一版本的所有变更
-            while let Some(last) = self.redos.last() {
-                if last.version() == first_change.version() {
-                    changes.push(self.redos.pop().unwrap());
-                } else {
-                    break;
-                }
+            while self
+                .redos
+                .iter()
+                .filter(|c| c.version() == first_change.version())
+                .count()
+                > 0
+            {
+                changes.push(self.redos.pop().unwrap());
             }
             // 将变更放入 undo 栈
             self.undos.extend(changes.clone());
@@ -167,6 +185,36 @@ impl Default for History<Change> {
 mod tests {
     use super::*;
     use super::super::change::Change;
+
+    #[derive(Clone)]
+    struct TabIndex {
+        tab_index: usize,
+        version: usize,
+    }
+
+    impl PartialEq for TabIndex {
+        fn eq(&self, other: &Self) -> bool {
+            self.tab_index == other.tab_index
+        }
+    }
+
+    impl From<usize> for TabIndex {
+        fn from(value: usize) -> Self {
+            TabIndex {
+                tab_index: value,
+                version: 0,
+            }
+        }
+    }
+
+    impl HistoryItem for TabIndex {
+        fn version(&self) -> usize {
+            self.version
+        }
+        fn set_version(&mut self, version: usize) {
+            self.version = version;
+        }
+    }
 
     #[test]
     fn test_history_push_and_undo() {
@@ -229,5 +277,51 @@ mod tests {
         // 新的变更会清空 redo 栈
         history.push(Change::new(7..7, "", 7..11, "orld"));
         assert_eq!(history.redos().len(), 0);
+    }
+
+    #[test]
+    fn test_unique_history() {
+        let mut history: History<TabIndex> = History::new().max_undos(100).unique();
+
+        // Push some items
+        history.push(0.into());
+        history.push(1.into());
+        history.push(1.into()); // Duplicate, should be ignored
+        history.push(2.into());
+        history.push(1.into()); // Duplicate, should remove old, and add new
+
+        // Check the version and undo stack
+        assert_eq!(history.undos().len(), 3);
+        assert_eq!(history.undos().last().unwrap().tab_index, 1);
+
+        // Undo the last change
+        let changes = history.undo().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].tab_index, 1);
+
+        assert_eq!(history.redos().len(), 1);
+        // Push duplicate, should clear redo and be ignored in undos
+        history.push(2.into());
+
+        assert_eq!(history.undos().len(), 2);
+        assert_eq!(history.redos().len(), 0); // redos cleared by push
+
+        // Redo should fail because redos was cleared
+        assert!(history.redo().is_none());
+
+        // Push another item
+        history.push(3.into());
+
+        // Check the version and undo stack
+        assert_eq!(history.undos().len(), 3);
+
+        // Undo all changes
+        for _ in 0..3 {
+            history.undo();
+        }
+
+        // Check the undo stack is empty and redo stack has all changes
+        assert_eq!(history.undos().len(), 0);
+        assert_eq!(history.redos().len(), 3);
     }
 }

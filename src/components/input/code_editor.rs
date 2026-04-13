@@ -59,7 +59,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
-        KeyBinding::new("return", Enter, Some(CONTEXT)),
+        KeyBinding::new("enter", Enter, Some(CONTEXT)),
         KeyBinding::new("cmd-s", Save, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
@@ -86,6 +86,8 @@ pub(crate) fn init(cx: &mut App) {
 
 const CURSOR_BLINK_INTERVAL: u64 = 530;
 const CURSOR_WIDTH: Pixels = px(2.);
+const GUTTER_WIDTH: Pixels = px(60.);
+const GUTTER_RIGHT_PADDING: Pixels = px(10.);
 
 /// 多行编辑器组件
 pub struct Editor {
@@ -108,6 +110,10 @@ pub struct Editor {
     highlighter: Option<crate::highlighter::SimpleHighlighter>,
     on_change: Option<Box<dyn Fn(&str, &mut App) + Send + Sync>>,
     on_save: Option<Box<dyn Fn(&str, &mut App) + Send + Sync>>,
+    /// The deferred scroll offset to apply on next layout.
+    deferred_scroll_offset: Option<Point<Pixels>>,
+    /// Line height from the last paint, used for scroll_to calculations.
+    last_line_height: Option<Pixels>,
 }
 
 impl Editor {
@@ -132,6 +138,8 @@ impl Editor {
             highlighter: None,
             on_change: None,
             on_save: None,
+            deferred_scroll_offset: None,
+            last_line_height: None,
         }
     }
 
@@ -224,6 +232,7 @@ impl Editor {
         let offset = self.clamp_to_char_boundary(offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        self.scroll_to(offset, cx);
         cx.notify();
     }
 
@@ -238,6 +247,50 @@ impl Editor {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.scroll_to(self.cursor_offset(), cx);
+        cx.notify();
+    }
+
+    /// Scroll to make the given offset visible.
+    fn scroll_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(lines) = self.last_layout_lines.as_ref() else {
+            return;
+        };
+        let (row, _) = self.offset_to_line_col(offset);
+        let Some((shaped, _, line_start, _)) = lines.get(row) else {
+            return;
+        };
+
+        let mut scroll_offset = self.scroll_handle.offset();
+        let line_height = self.last_line_height.unwrap_or_else(|| px(16.));
+        let row_offset_y = line_height * row as f32;
+
+        let cursor_byte = offset.max(*line_start);
+        let cursor_char = self.text.slice(*line_start..cursor_byte).chars().count();
+        let col_offset_x = shaped.x_for_index(cursor_char);
+
+        let bounds_width = self.input_bounds.size.width - GUTTER_WIDTH;
+        let bounds_height = self.input_bounds.size.height;
+        let safety_margin = CURSOR_WIDTH;
+
+        // horizontal
+        if col_offset_x + scroll_offset.x < safety_margin {
+            scroll_offset.x = safety_margin - col_offset_x;
+        } else if col_offset_x + scroll_offset.x + safety_margin > bounds_width {
+            scroll_offset.x = bounds_width - col_offset_x - safety_margin;
+        }
+
+        // vertical
+        let edge_height = line_height;
+        if row_offset_y + scroll_offset.y < px(0.) {
+            scroll_offset.y = -row_offset_y;
+        } else if row_offset_y + scroll_offset.y + edge_height > bounds_height {
+            scroll_offset.y = bounds_height - row_offset_y - edge_height;
+        }
+
+        scroll_offset.x = scroll_offset.x.min(px(0.));
+        scroll_offset.y = scroll_offset.y.min(px(0.));
+        self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
     }
 
@@ -331,8 +384,20 @@ impl Editor {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        self.replace_text_in_range(None, "\n", window, cx);
+        let indent = self.indent_of_current_line();
+        let new_line_text = format!("\n{}", indent);
+        self.replace_text_in_range(None, &new_line_text, window, cx);
         self.finish_edit(cx);
+    }
+
+    /// Get leading whitespace of the current line for auto-indent on Enter.
+    fn indent_of_current_line(&self) -> String {
+        let line_start = self.line_start(self.offset_to_line_col(self.cursor_offset()).0);
+        self.text
+            .slice(line_start..)
+            .chars()
+            .take_while(|c| c.is_whitespace() && *c != '\n' && *c != '\r')
+            .collect()
     }
 
     fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
@@ -547,9 +612,10 @@ impl Editor {
             px(0.)
         };
         offset.y = offset.y.clamp(max_scroll_y, px(0.));
-        // Horizontal scroll clamp
-        let max_scroll_x = if self.scroll_size.width > self.input_bounds.size.width {
-            self.input_bounds.size.width - self.scroll_size.width
+        // Horizontal scroll clamp (account for gutter width)
+        let content_width = (self.input_bounds.size.width - GUTTER_WIDTH).max(px(0.));
+        let max_scroll_x = if self.scroll_size.width > content_width {
+            content_width - self.scroll_size.width
         } else {
             px(0.)
         };
@@ -656,10 +722,11 @@ struct EditorTextElement {
 
 struct EditorPrepaintState {
     lines: Vec<(ShapedLine, Bounds<Pixels>, usize, usize)>, // line, bounds, start_byte, line_len
+    line_numbers: Vec<(ShapedLine, Point<Pixels>)>,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
     scroll_size: gpui::Size<Pixels>,
-    _scroll_offset: Point<Pixels>,
+    scroll_offset: Point<Pixels>,
 }
 
 impl IntoElement for EditorTextElement {
@@ -690,14 +757,21 @@ impl Element for EditorTextElement {
         let text = editor.text.clone();
         let selected_range = editor.selected_range.clone();
         let cursor = editor.cursor_offset();
+        let cursor_line = editor.offset_to_line_col(cursor).0;
         let line_height = editor.line_height(window);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let theme = cx.theme().ui;
         let is_focused = editor.focus_handle.is_focused(window);
-        let scroll_offset = editor.scroll_handle.offset();
+        let mut scroll_offset = editor.scroll_handle.offset();
+        if let Some(deferred) = editor.deferred_scroll_offset {
+            scroll_offset = deferred;
+        }
+
+        let content_left = bounds.left() + GUTTER_WIDTH;
 
         let mut lines = Vec::new();
+        let mut line_numbers = Vec::new();
         let mut max_width = px(0.);
         let line_count = text.len_lines(LineType::LF);
         for line_idx in 0..line_count {
@@ -778,13 +852,29 @@ impl Element for EditorTextElement {
                     TextRun { len: 1, font: style.font(), color: theme.text, background_color: None, underline: None, strikethrough: None }
                 ], None)
             };
-            let y = bounds.top() + line_height * line_idx as f32;
+            let y = bounds.top() + line_height * line_idx as f32 + scroll_offset.y;
             let line_bounds = Bounds::new(
-                point(bounds.left(), y),
+                point(content_left + scroll_offset.x, y),
                 size(shaped.width, line_height),
             );
             max_width = max_width.max(shaped.width);
             lines.push((shaped, line_bounds, line_start, display_len));
+
+            // line number
+            let num_text = format!("{}", line_idx + 1);
+            let num_color = if line_idx == cursor_line { theme.text } else { theme.text_muted };
+            let num_runs = vec![TextRun {
+                len: num_text.len(),
+                font: style.font(),
+                color: num_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            let num_shaped = window.text_system().shape_line(num_text.into(), font_size, &num_runs, None);
+            let num_x = content_left - GUTTER_RIGHT_PADDING - num_shaped.width;
+            let num_y = y;
+            line_numbers.push((num_shaped, point(num_x, num_y)));
         }
 
         let scroll_size = gpui::Size {
@@ -792,7 +882,6 @@ impl Element for EditorTextElement {
             height: line_height * line_count as f32,
         };
 
-        // selection quads
         // selection quads
         let mut selection_quads = Vec::new();
         if !selected_range.is_empty() {
@@ -805,8 +894,8 @@ impl Element for EditorTextElement {
                 if sel_end > sel_start {
                     let start_char = text.slice(*line_start..sel_start).chars().count();
                     let end_char = text.slice(*line_start..sel_end).chars().count();
-                    let x1 = bounds.left() + shaped.x_for_index(start_char);
-                    let x2 = bounds.left() + shaped.x_for_index(end_char);
+                    let x1 = line_bounds.origin.x + shaped.x_for_index(start_char);
+                    let x2 = line_bounds.origin.x + shaped.x_for_index(end_char);
                     selection_quads.push(fill(
                         Bounds::from_corners(
                             Point::new(x1, line_bounds.top()),
@@ -824,7 +913,7 @@ impl Element for EditorTextElement {
             if let Some((shaped, line_bounds, line_start, _line_len)) = lines.get(line_idx) {
                 let cursor_byte = cursor.max(*line_start);
                 let char_idx = text.slice(*line_start..cursor_byte).chars().count();
-                let cursor_x = bounds.left() + shaped.x_for_index(char_idx);
+                let cursor_x = line_bounds.origin.x + shaped.x_for_index(char_idx);
                 let cursor_y = line_bounds.top();
                 Some(fill(
                     Bounds::new(point(cursor_x, cursor_y), size(CURSOR_WIDTH, line_height)),
@@ -839,10 +928,11 @@ impl Element for EditorTextElement {
 
         EditorPrepaintState {
             lines,
+            line_numbers,
             cursor: cursor_quad,
             selection: selection_quads,
             scroll_size,
-            _scroll_offset: scroll_offset,
+            scroll_offset,
         }
     }
 
@@ -870,8 +960,11 @@ impl Element for EditorTextElement {
         }
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for (num_shaped, origin) in &prepaint.line_numbers {
+                let _ = num_shaped.paint(*origin, window.line_height(), TextAlign::Left, None, window, cx);
+            }
             for (line, line_bounds, _, _) in &prepaint.lines {
-                line.paint(line_bounds.origin, window.line_height(), TextAlign::Left, None, window, cx).unwrap();
+                let _ = line.paint(line_bounds.origin, window.line_height(), TextAlign::Left, None, window, cx);
             }
         });
 
@@ -883,10 +976,17 @@ impl Element for EditorTextElement {
             }
         }
 
-        self.editor.update(cx, |editor, _cx| {
+        let line_height = window.line_height();
+        self.editor.update(cx, |editor, cx| {
             editor.scroll_size = prepaint.scroll_size;
             editor.input_bounds = bounds;
             editor.last_layout_lines = Some(prepaint.lines.clone());
+            editor.last_line_height = Some(line_height);
+
+            // Commit deferred scroll offset to scroll handle
+            editor.scroll_handle.set_offset(prepaint.scroll_offset);
+            editor.deferred_scroll_offset = None;
+            cx.notify();
         });
     }
 }
@@ -939,6 +1039,7 @@ impl EntityInputHandler for Editor {
         self.selected_range = start + new_text.len()..start + new_text.len();
         self.marked_range.take();
         self.reset_blinking(cx);
+        self.scroll_to(self.cursor_offset(), cx);
         self.notify_change(cx);
         cx.notify();
     }
@@ -965,6 +1066,7 @@ impl EntityInputHandler for Editor {
             .map(|r| self.range_from_utf16(r))
             .map(|r| r.start + start..r.end + end)
             .unwrap_or_else(|| start + new_text.len()..start + new_text.len());
+        self.scroll_to(self.cursor_offset(), cx);
         cx.notify();
     }
 
