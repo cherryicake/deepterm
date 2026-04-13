@@ -2,7 +2,7 @@ use gpui::{HighlightStyle, Hsla};
 use ropey::Rope;
 use std::ops::Range;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::theme::{ActiveTheme, ThemeAppearance};
 
@@ -10,6 +10,7 @@ pub struct SimpleHighlighter {
     _language: String,
     parser: Parser,
     query: Option<Query>,
+    tree: Option<Tree>,
 }
 
 impl SimpleHighlighter {
@@ -19,62 +20,62 @@ impl SimpleHighlighter {
             "rust" => Self::setup_language(
                 &mut parser,
                 tree_sitter_rust::LANGUAGE.into(),
-                RUST_QUERY,
+                include_str!("languages/rust/highlights.scm"),
             ),
             "javascript" | "js" => Self::setup_language(
                 &mut parser,
                 tree_sitter_javascript::LANGUAGE.into(),
-                JS_QUERY,
+                include_str!("languages/javascript/highlights.scm"),
             ),
             "typescript" | "ts" => Self::setup_language(
                 &mut parser,
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                TS_QUERY,
+                include_str!("languages/typescript/highlights.scm"),
             ),
             "python" | "py" => Self::setup_language(
                 &mut parser,
                 tree_sitter_python::LANGUAGE.into(),
-                PYTHON_QUERY,
+                tree_sitter_python::HIGHLIGHTS_QUERY,
             ),
             "json" => Self::setup_language(
                 &mut parser,
                 tree_sitter_json::LANGUAGE.into(),
-                JSON_QUERY,
+                include_str!("languages/json/highlights.scm"),
             ),
             "go" => Self::setup_language(
                 &mut parser,
                 tree_sitter_go::LANGUAGE.into(),
-                GO_QUERY,
+                include_str!("languages/go/highlights.scm"),
             ),
             "html" => Self::setup_language(
                 &mut parser,
                 tree_sitter_html::LANGUAGE.into(),
-                HTML_QUERY,
+                include_str!("languages/html/highlights.scm"),
             ),
             "css" => Self::setup_language(
                 &mut parser,
                 tree_sitter_css::LANGUAGE.into(),
-                CSS_QUERY,
+                tree_sitter_css::HIGHLIGHTS_QUERY,
             ),
             "c" => Self::setup_language(
                 &mut parser,
                 tree_sitter_c::LANGUAGE.into(),
-                C_QUERY,
+                tree_sitter_c::HIGHLIGHT_QUERY,
             ),
             "cpp" | "c++" => Self::setup_language(
                 &mut parser,
                 tree_sitter_cpp::LANGUAGE.into(),
-                CPP_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
             ),
             "bash" | "sh" => Self::setup_language(
                 &mut parser,
                 tree_sitter_bash::LANGUAGE.into(),
-                BASH_QUERY,
+                tree_sitter_bash::HIGHLIGHT_QUERY,
             ),
             "markdown" | "md" => Self::setup_language(
                 &mut parser,
                 tree_sitter_md::LANGUAGE.into(),
-                MD_QUERY,
+                include_str!("languages/markdown/highlights.scm"),
             ),
             _ => None,
         };
@@ -82,6 +83,7 @@ impl SimpleHighlighter {
             _language: lang.to_string(),
             parser,
             query,
+            tree: None,
         }
     }
 
@@ -96,7 +98,7 @@ impl SimpleHighlighter {
 
     pub fn update(&mut self, text: &Rope) {
         let text_str = text.to_string();
-        let _tree = self.parser.parse(&text_str, None);
+        self.tree = self.parser.parse(&text_str, self.tree.as_ref());
     }
 
     pub fn styles(
@@ -113,9 +115,18 @@ impl SimpleHighlighter {
         let is_dark = cx.theme().appearance == ThemeAppearance::Dark;
 
         let text_str = text.to_string();
-        let tree = match self.parser.parse(&text_str, None) {
-            Some(t) => t,
-            None => return Vec::new(),
+
+        // Ensure we have a parsed tree that matches the current text
+        let tree = match &self.tree {
+            Some(tree) if tree.root_node().end_byte() == text_str.len() => tree.clone(),
+            _ => {
+                let tree = match self.parser.parse(&text_str, None) {
+                    Some(t) => t,
+                    None => return Vec::new(),
+                };
+                self.tree = Some(tree.clone());
+                tree
+            }
         };
 
         let mut cursor = QueryCursor::new();
@@ -132,7 +143,9 @@ impl SimpleHighlighter {
             }
         }
         styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
-        styles
+
+        // Merge overlapping ranges so that TextRuns align correctly with text
+        unique_styles(0..text.len(), styles)
     }
 }
 
@@ -142,8 +155,30 @@ fn style_for_name(
     is_dark: bool,
 ) -> Option<HighlightStyle> {
     let color = match name {
-        "comment" | "doc-comment" => Hsla::from(gpui::rgb(0x6A9955)),
+        // Comments
+        "comment" => Hsla::from(gpui::rgb(0x6A9955)),
+        "comment.doc" => Hsla::from(gpui::rgb(0x6A9955)),
+
+        // Strings
         "string" => Hsla::from(gpui::rgb(0xCE9178)),
+        "string.escape" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xD7BA7D))
+            } else {
+                Hsla::from(gpui::rgb(0xA04545))
+            }
+        }
+        "string.regex" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xD16969))
+            } else {
+                Hsla::from(gpui::rgb(0xA04545))
+            }
+        }
+        "string.special" => Hsla::from(gpui::rgb(0xCE9178)),
+        "string.special.symbol" => Hsla::from(gpui::rgb(0xCE9178)),
+
+        // Numbers and booleans
         "number" => {
             if is_dark {
                 Hsla::from(gpui::rgb(0xB5CEA8))
@@ -151,6 +186,15 @@ fn style_for_name(
                 Hsla::from(gpui::rgb(0x098658))
             }
         }
+        "boolean" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x569CD6))
+            } else {
+                Hsla::from(gpui::rgb(0x0000FF))
+            }
+        }
+
+        // Functions
         "function" => {
             if is_dark {
                 Hsla::from(gpui::rgb(0xDCDCAA))
@@ -158,6 +202,29 @@ fn style_for_name(
                 Hsla::from(gpui::rgb(0x795E26))
             }
         }
+        "function.method" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xDCDCAA))
+            } else {
+                Hsla::from(gpui::rgb(0x795E26))
+            }
+        }
+        "function.macro" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xDCDCAA))
+            } else {
+                Hsla::from(gpui::rgb(0x795E26))
+            }
+        }
+        "function.builtin" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xDCDCAA))
+            } else {
+                Hsla::from(gpui::rgb(0x795E26))
+            }
+        }
+
+        // Types
         "type" => {
             if is_dark {
                 Hsla::from(gpui::rgb(0x4EC9B0))
@@ -165,14 +232,15 @@ fn style_for_name(
                 Hsla::from(gpui::rgb(0x267F99))
             }
         }
-        "field" => theme.text,
-        "tag" => {
+        "type.builtin" => {
             if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
+                Hsla::from(gpui::rgb(0x4EC9B0))
             } else {
-                Hsla::from(gpui::rgb(0x800000))
+                Hsla::from(gpui::rgb(0x267F99))
             }
         }
+
+        // Variables and properties
         "property" => {
             if is_dark {
                 Hsla::from(gpui::rgb(0x9CDCFE))
@@ -180,6 +248,32 @@ fn style_for_name(
                 Hsla::from(gpui::rgb(0x001080))
             }
         }
+        "variable" => theme.text,
+        "variable.member" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x9CDCFE))
+            } else {
+                Hsla::from(gpui::rgb(0x001080))
+            }
+        }
+        "variable.parameter" => theme.text,
+        "variable.builtin" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x9CDCFE))
+            } else {
+                Hsla::from(gpui::rgb(0x001080))
+            }
+        }
+        "variable.special" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x9CDCFE))
+            } else {
+                Hsla::from(gpui::rgb(0x001080))
+            }
+        }
+        "field" => theme.text,
+
+        // Constants
         "constant" => {
             if is_dark {
                 Hsla::from(gpui::rgb(0x4FC1FF))
@@ -187,7 +281,145 @@ fn style_for_name(
                 Hsla::from(gpui::rgb(0x0070C1))
             }
         }
-        _ => return None,
+        "constant.builtin" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x569CD6))
+            } else {
+                Hsla::from(gpui::rgb(0x0000FF))
+            }
+        }
+        "constructor" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4EC9B0))
+            } else {
+                Hsla::from(gpui::rgb(0x267F99))
+            }
+        }
+
+        // Keywords
+        "keyword" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x569CD6))
+            } else {
+                Hsla::from(gpui::rgb(0x0000FF))
+            }
+        }
+
+        // Operators
+        "operator" => theme.text,
+
+        // Punctuation
+        "punctuation" => theme.text_muted,
+        "punctuation.bracket" => theme.text_muted,
+        "punctuation.delimiter" => theme.text_muted,
+        "punctuation.list_marker" => theme.text_muted,
+        "punctuation.special" => theme.text_muted,
+
+        // Tags
+        "tag" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x569CD6))
+            } else {
+                Hsla::from(gpui::rgb(0x800000))
+            }
+        }
+        "tag.doctype" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x569CD6))
+            } else {
+                Hsla::from(gpui::rgb(0x800000))
+            }
+        }
+        "tag.error" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xF28B9A))
+            } else {
+                Hsla::from(gpui::rgb(0xC5060B))
+            }
+        }
+
+        // Attributes
+        "attribute" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4EC9B0))
+            } else {
+                Hsla::from(gpui::rgb(0x267F99))
+            }
+        }
+
+        // Labels
+        "label" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4EC9B0))
+            } else {
+                Hsla::from(gpui::rgb(0x267F99))
+            }
+        }
+
+        // Other
+        "namespace" => theme.text,
+        "embedded" => theme.text_muted,
+        "enum" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4EC9B0))
+            } else {
+                Hsla::from(gpui::rgb(0x267F99))
+            }
+        }
+        "preproc" => theme.text_muted,
+        "primary" => theme.text,
+        "text.literal" => Hsla::from(gpui::rgb(0xCE9178)),
+        "title" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4EC9B0))
+            } else {
+                Hsla::from(gpui::rgb(0x267F99))
+            }
+        }
+        "variant" => theme.text,
+        "link_text" => Hsla::from(gpui::rgb(0xCE9178)),
+        "link_uri" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4FC1FF))
+            } else {
+                Hsla::from(gpui::rgb(0x0070C1))
+            }
+        }
+        "hint" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x9CDCFE))
+            } else {
+                Hsla::from(gpui::rgb(0x001080))
+            }
+        }
+        "predictive" => theme.text_muted,
+        "escape" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0xD7BA7D))
+            } else {
+                Hsla::from(gpui::rgb(0xA04545))
+            }
+        }
+        "text.uri" => {
+            if is_dark {
+                Hsla::from(gpui::rgb(0x4FC1FF))
+            } else {
+                Hsla::from(gpui::rgb(0x0070C1))
+            }
+        }
+        "text.reference" => Hsla::from(gpui::rgb(0xCE9178)),
+
+        "none" => return None,
+
+        _ => {
+            // Fallback: try prefix for dotted names like `punctuation.bracket`
+            if let Some(prefix) = name.split('.').next() {
+                if prefix != name {
+                    return style_for_name(prefix, theme, is_dark);
+                }
+            }
+            return None;
+        }
     };
 
     Some(HighlightStyle {
@@ -196,150 +428,53 @@ fn style_for_name(
     })
 }
 
-const RUST_QUERY: &str = r#"
-(line_comment) @comment
-(block_comment) @comment
-(string_literal) @string
-(raw_string_literal) @string
-(integer_literal) @number
-(float_literal) @number
-(boolean_literal) @number
-(char_literal) @string
-(function_item name: (identifier) @function)
-(function_signature_item name: (identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-(primitive_type) @type
-(field_identifier) @field
-(macro_invocation macro: (identifier) @function)
-"#;
+/// Merge overlapping highlight ranges into non-overlapping segments.
+/// When multiple styles overlap, the last-started style wins.
+fn unique_styles(
+    total_range: Range<usize>,
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if styles.is_empty() {
+        return styles;
+    }
 
-const JS_QUERY: &str = r#"
-(comment) @comment
-(string) @string
-(template_string) @string
-(regex) @string
-(number) @number
-(true) @number
-(false) @number
-(class_declaration name: (identifier) @function)
-(function_declaration name: (identifier) @function)
-(method_definition name: (property_identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-(predefined_type) @type
-"#;
+    // Create intervals: (position, is_start, style_index)
+    let mut intervals: Vec<(usize, bool, usize)> = Vec::with_capacity(styles.len() * 2 + 2);
+    for (i, (range, _)) in styles.iter().enumerate() {
+        intervals.push((range.start, true, i));
+        intervals.push((range.end, false, i));
+    }
 
-const TS_QUERY: &str = r#"
-(comment) @comment
-(string) @string
-(template_string) @string
-(regex) @string
-(number) @number
-(true) @number
-(false) @number
-(class_declaration name: (identifier) @function)
-(function_declaration name: (identifier) @function)
-(method_definition name: (property_identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-(predefined_type) @type
-"#;
+    intervals.push((total_range.start, true, usize::MAX));
+    intervals.push((total_range.end, false, usize::MAX));
 
-const PYTHON_QUERY: &str = r#"
-(comment) @comment
-(string) @string
-(integer) @number
-(float) @number
-(true) @number
-(false) @number
-(function_definition name: (identifier) @function)
-(call function: (identifier) @function)
-(type) @type
-"#;
+    // Sort by position, with ends before starts at same position.
+    // This ensures we close ranges before opening new ones at boundaries.
+    intervals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-const JSON_QUERY: &str = r#"
-(string) @string
-(number) @number
-(true) @number
-(false) @number
-(null) @constant
-(pair key: (string) @property)
-"#;
+    let mut result: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut active_styles: Vec<usize> = Vec::new();
+    let mut last_pos = total_range.start;
 
-const GO_QUERY: &str = r#"
-(comment) @comment
-(string_literal) @string
-(interpreted_string_literal) @string
-(int_literal) @number
-(float_literal) @number
-(true) @number
-(false) @number
-(function_declaration name: (identifier) @function)
-(method_declaration name: (field_identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-"#;
+    for (pos, is_start, style_idx) in intervals {
+        let is_boundary = style_idx == usize::MAX;
 
-const HTML_QUERY: &str = r#"
-(comment) @comment
-(doctype) @tag
-(tag_name) @tag
-(attribute_name) @property
-(quoted_attribute_value) @string
-"#;
+        if pos > last_pos && !active_styles.is_empty() {
+            // Use the last active style (later-started styles override earlier ones)
+            let style = styles[*active_styles.last().unwrap()].1.clone();
+            result.push((last_pos..pos, style));
+        }
 
-const CSS_QUERY: &str = r#"
-(comment) @comment
-(string_value) @string
-(integer_value) @number
-(float_value) @number
-(property_name) @property
-(class_name) @type
-(id_name) @constant
-(tag_name) @tag
-"#;
+        if !is_boundary {
+            if is_start {
+                active_styles.push(style_idx);
+            } else {
+                active_styles.retain(|&i| i != style_idx);
+            }
+        }
 
-const C_QUERY: &str = r#"
-(comment) @comment
-(string_literal) @string
-(system_lib_string) @string
-(number_literal) @number
-(true) @number
-(false) @number
-(function_declarator declarator: (identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-(primitive_type) @type
-(field_identifier) @field
-"#;
+        last_pos = pos;
+    }
 
-const CPP_QUERY: &str = r#"
-(comment) @comment
-(string_literal) @string
-(raw_string_literal) @string
-(number_literal) @number
-(true) @number
-(false) @number
-(function_declarator declarator: (identifier) @function)
-(call_expression function: (identifier) @function)
-(type_identifier) @type
-(primitive_type) @type
-(field_identifier) @field
-"#;
-
-const BASH_QUERY: &str = r#"
-(comment) @comment
-(string) @string
-(number) @number
-(function_definition name: (word) @function)
-(command name: (command_name) @function)
-(variable_name) @property
-"#;
-
-const MD_QUERY: &str = r#"
-(code_span) @string
-(fenced_code_block) @string
-(link_text) @string
-(link_destination) @property
-"#;
+    result
+}

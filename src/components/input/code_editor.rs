@@ -151,7 +151,11 @@ impl Editor {
 
     pub fn language(mut self, lang: impl Into<String>) -> Self {
         let lang = lang.into();
-        self.highlighter = Some(crate::highlighter::SimpleHighlighter::new(&lang));
+        let mut highlighter = crate::highlighter::SimpleHighlighter::new(&lang);
+        if self.text.len() > 0 {
+            highlighter.update(&self.text);
+        }
+        self.highlighter = Some(highlighter);
         self.language = Some(lang);
         self
     }
@@ -181,6 +185,9 @@ impl Editor {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        if let Some(highlighter) = self.highlighter.as_mut() {
+            highlighter.update(&self.text);
+        }
         cx.notify();
     }
 
