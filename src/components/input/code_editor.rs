@@ -273,8 +273,7 @@ impl Editor {
         let row_offset_y = line_height * row as f32;
 
         let cursor_byte = offset.max(*line_start);
-        let cursor_char = self.text.slice(*line_start..cursor_byte).chars().count();
-        let col_offset_x = shaped.x_for_index(cursor_char);
+        let col_offset_x = shaped.x_for_index(cursor_byte - line_start);
 
         let bounds_width = self.input_bounds.size.width - GUTTER_WIDTH;
         let bounds_height = self.input_bounds.size.height;
@@ -899,10 +898,8 @@ impl Element for EditorTextElement {
                 let sel_start = selected_range.start.max(*line_start).min(line_end_byte);
                 let sel_end = selected_range.end.min(line_end_byte).max(sel_start);
                 if sel_end > sel_start {
-                    let start_char = text.slice(*line_start..sel_start).chars().count();
-                    let end_char = text.slice(*line_start..sel_end).chars().count();
-                    let x1 = line_bounds.origin.x + shaped.x_for_index(start_char);
-                    let x2 = line_bounds.origin.x + shaped.x_for_index(end_char);
+                    let x1 = line_bounds.origin.x + shaped.x_for_index(sel_start - line_start);
+                    let x2 = line_bounds.origin.x + shaped.x_for_index(sel_end - line_start);
                     selection_quads.push(fill(
                         Bounds::from_corners(
                             Point::new(x1, line_bounds.top()),
@@ -919,8 +916,7 @@ impl Element for EditorTextElement {
             let (line_idx, _col) = editor.offset_to_line_col(cursor);
             if let Some((shaped, line_bounds, line_start, _line_len)) = lines.get(line_idx) {
                 let cursor_byte = cursor.max(*line_start);
-                let char_idx = text.slice(*line_start..cursor_byte).chars().count();
-                let cursor_x = line_bounds.origin.x + shaped.x_for_index(char_idx);
+                let cursor_x = line_bounds.origin.x + shaped.x_for_index(cursor_byte - line_start);
                 let cursor_y = line_bounds.top();
                 Some(fill(
                     Bounds::new(point(cursor_x, cursor_y), size(CURSOR_WIDTH, line_height)),
