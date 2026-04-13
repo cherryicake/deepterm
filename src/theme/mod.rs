@@ -1,13 +1,18 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use alacritty_terminal::vte::ansi::NamedColor;
 use gpui::{App, Global, Hsla, SharedString, WindowAppearance, rgb};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+use crate::highlighter::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeAppearance {
     Light,
+    #[default]
     Dark,
 }
 
@@ -123,6 +128,40 @@ impl TerminalTheme {
             self.bright[7],
         ]
     }
+
+    /// Generate a highlight theme from terminal ANSI colors.
+    pub fn to_highlight_theme(&self, name: &str, appearance: ThemeAppearance) -> Arc<HighlightTheme> {
+        Arc::new(HighlightTheme {
+            name: name.to_string(),
+            appearance,
+            style: HighlightThemeStyle {
+                editor_background: Some(self.background),
+                editor_foreground: Some(self.foreground),
+                editor_active_line: None,
+                editor_line_number: Some(self.dim_foreground),
+                editor_active_line_number: Some(self.foreground),
+                editor_invisible: Some(self.dim_foreground),
+                status: StatusColors::default(),
+                syntax: SyntaxColors {
+                    comment: Some(ThemeStyle::color(self.dim_foreground)),
+                    string: Some(ThemeStyle::color(self.normal[1])),
+                    number: Some(ThemeStyle::color(self.normal[2])),
+                    boolean: Some(ThemeStyle::color(self.normal[4])),
+                    function: Some(ThemeStyle::color(self.normal[3])),
+                    keyword: Some(ThemeStyle::color(self.normal[5])),
+                    type_: Some(ThemeStyle::color(self.normal[6])),
+                    variable: Some(ThemeStyle::color(self.foreground)),
+                    property: Some(ThemeStyle::color(self.normal[5])),
+                    constant: Some(ThemeStyle::color(self.normal[5])),
+                    operator: Some(ThemeStyle::color(self.foreground)),
+                    punctuation: Some(ThemeStyle::color(self.dim_foreground)),
+                    tag: Some(ThemeStyle::color(self.normal[1])),
+                    attribute: Some(ThemeStyle::color(self.normal[6])),
+                    ..Default::default()
+                },
+            },
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +172,7 @@ pub struct AppTheme {
     pub appearance: ThemeAppearance,
     pub ui: UiTheme,
     pub terminal: TerminalTheme,
+    pub highlight_theme: Arc<HighlightTheme>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +188,8 @@ struct AppThemeFile {
     appearance: ThemeAppearance,
     ui: UiThemeFile,
     terminal: TerminalThemeFile,
+    #[serde(default, rename = "highlight")]
+    highlight: Option<HighlightThemeStyle>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,13 +466,23 @@ impl TryFrom<AppThemeFile> for AppTheme {
     type Error = anyhow::Error;
 
     fn try_from(value: AppThemeFile) -> anyhow::Result<Self> {
+        let terminal: TerminalTheme = value.terminal.try_into()?;
+        let highlight_theme = match value.highlight {
+            Some(style) => Arc::new(HighlightTheme {
+                name: value.name.clone(),
+                appearance: value.appearance,
+                style,
+            }),
+            None => terminal.to_highlight_theme(&value.name, value.appearance),
+        };
         Ok(Self {
             id: value.id,
             name: value.name,
             description: value.description,
             appearance: value.appearance,
             ui: value.ui.try_into()?,
-            terminal: value.terminal.try_into()?,
+            terminal,
+            highlight_theme,
         })
     }
 }

@@ -1,10 +1,10 @@
-use gpui::{HighlightStyle, Hsla};
+use gpui::HighlightStyle;
 use ropey::Rope;
 use std::ops::Range;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-use crate::theme::{ActiveTheme, ThemeAppearance};
+use crate::theme::ActiveTheme;
 
 pub struct SimpleHighlighter {
     _language: String,
@@ -111,9 +111,7 @@ impl SimpleHighlighter {
             None => return Vec::new(),
         };
 
-        let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance == ThemeAppearance::Dark;
-
+        let highlight_theme = &cx.theme().highlight_theme;
         let text_str = text.to_string();
 
         // Ensure we have a parsed tree that matches the current text
@@ -137,7 +135,7 @@ impl SimpleHighlighter {
             for capture in m.captures {
                 let name = query.capture_names()[capture.index as usize];
                 let range = capture.node.byte_range();
-                if let Some(style) = style_for_name(name, theme, is_dark) {
+                if let Some(style) = highlight_theme.style(name) {
                     styles.push((range, style));
                 }
             }
@@ -147,285 +145,6 @@ impl SimpleHighlighter {
         // Merge overlapping ranges so that TextRuns align correctly with text
         unique_styles(0..text.len(), styles)
     }
-}
-
-fn style_for_name(
-    name: &str,
-    theme: crate::theme::UiTheme,
-    is_dark: bool,
-) -> Option<HighlightStyle> {
-    let color = match name {
-        // Comments
-        "comment" => Hsla::from(gpui::rgb(0x6A9955)),
-        "comment.doc" => Hsla::from(gpui::rgb(0x6A9955)),
-
-        // Strings
-        "string" => Hsla::from(gpui::rgb(0xCE9178)),
-        "string.escape" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xD7BA7D))
-            } else {
-                Hsla::from(gpui::rgb(0xA04545))
-            }
-        }
-        "string.regex" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xD16969))
-            } else {
-                Hsla::from(gpui::rgb(0xA04545))
-            }
-        }
-        "string.special" => Hsla::from(gpui::rgb(0xCE9178)),
-        "string.special.symbol" => Hsla::from(gpui::rgb(0xCE9178)),
-
-        // Numbers and booleans
-        "number" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xB5CEA8))
-            } else {
-                Hsla::from(gpui::rgb(0x098658))
-            }
-        }
-        "boolean" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
-            } else {
-                Hsla::from(gpui::rgb(0x0000FF))
-            }
-        }
-
-        // Functions
-        "function" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xDCDCAA))
-            } else {
-                Hsla::from(gpui::rgb(0x795E26))
-            }
-        }
-        "function.method" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xDCDCAA))
-            } else {
-                Hsla::from(gpui::rgb(0x795E26))
-            }
-        }
-        "function.macro" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xDCDCAA))
-            } else {
-                Hsla::from(gpui::rgb(0x795E26))
-            }
-        }
-        "function.builtin" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xDCDCAA))
-            } else {
-                Hsla::from(gpui::rgb(0x795E26))
-            }
-        }
-
-        // Types
-        "type" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-        "type.builtin" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-
-        // Variables and properties
-        "property" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x9CDCFE))
-            } else {
-                Hsla::from(gpui::rgb(0x001080))
-            }
-        }
-        "variable" => theme.text,
-        "variable.member" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x9CDCFE))
-            } else {
-                Hsla::from(gpui::rgb(0x001080))
-            }
-        }
-        "variable.parameter" => theme.text,
-        "variable.builtin" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x9CDCFE))
-            } else {
-                Hsla::from(gpui::rgb(0x001080))
-            }
-        }
-        "variable.special" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x9CDCFE))
-            } else {
-                Hsla::from(gpui::rgb(0x001080))
-            }
-        }
-        "field" => theme.text,
-
-        // Constants
-        "constant" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4FC1FF))
-            } else {
-                Hsla::from(gpui::rgb(0x0070C1))
-            }
-        }
-        "constant.builtin" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
-            } else {
-                Hsla::from(gpui::rgb(0x0000FF))
-            }
-        }
-        "constructor" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-
-        // Keywords
-        "keyword" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
-            } else {
-                Hsla::from(gpui::rgb(0x0000FF))
-            }
-        }
-
-        // Operators
-        "operator" => theme.text,
-
-        // Punctuation
-        "punctuation" => theme.text_muted,
-        "punctuation.bracket" => theme.text_muted,
-        "punctuation.delimiter" => theme.text_muted,
-        "punctuation.list_marker" => theme.text_muted,
-        "punctuation.special" => theme.text_muted,
-
-        // Tags
-        "tag" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
-            } else {
-                Hsla::from(gpui::rgb(0x800000))
-            }
-        }
-        "tag.doctype" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x569CD6))
-            } else {
-                Hsla::from(gpui::rgb(0x800000))
-            }
-        }
-        "tag.error" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xF28B9A))
-            } else {
-                Hsla::from(gpui::rgb(0xC5060B))
-            }
-        }
-
-        // Attributes
-        "attribute" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-
-        // Labels
-        "label" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-
-        // Other
-        "namespace" => theme.text,
-        "embedded" => theme.text_muted,
-        "enum" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-        "preproc" => theme.text_muted,
-        "primary" => theme.text,
-        "text.literal" => Hsla::from(gpui::rgb(0xCE9178)),
-        "title" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4EC9B0))
-            } else {
-                Hsla::from(gpui::rgb(0x267F99))
-            }
-        }
-        "variant" => theme.text,
-        "link_text" => Hsla::from(gpui::rgb(0xCE9178)),
-        "link_uri" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4FC1FF))
-            } else {
-                Hsla::from(gpui::rgb(0x0070C1))
-            }
-        }
-        "hint" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x9CDCFE))
-            } else {
-                Hsla::from(gpui::rgb(0x001080))
-            }
-        }
-        "predictive" => theme.text_muted,
-        "escape" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0xD7BA7D))
-            } else {
-                Hsla::from(gpui::rgb(0xA04545))
-            }
-        }
-        "text.uri" => {
-            if is_dark {
-                Hsla::from(gpui::rgb(0x4FC1FF))
-            } else {
-                Hsla::from(gpui::rgb(0x0070C1))
-            }
-        }
-        "text.reference" => Hsla::from(gpui::rgb(0xCE9178)),
-
-        "none" => return None,
-
-        _ => {
-            // Fallback: try prefix for dotted names like `punctuation.bracket`
-            if let Some(prefix) = name.split('.').next() {
-                if prefix != name {
-                    return style_for_name(prefix, theme, is_dark);
-                }
-            }
-            return None;
-        }
-    };
-
-    Some(HighlightStyle {
-        color: Some(color),
-        ..Default::default()
-    })
 }
 
 /// Merge overlapping highlight ranges into non-overlapping segments.

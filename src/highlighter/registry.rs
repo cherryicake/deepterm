@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::{
-    ActiveTheme, DEFAULT_THEME_COLORS, ThemeMode,
-    highlighter::{Language, languages},
+    theme::ThemeAppearance,
+    highlighter::languages,
 };
 
 pub(super) const HIGHLIGHT_NAMES: [&str; 40] = [
@@ -94,6 +94,7 @@ pub struct SyntaxColors {
     pub attribute: Option<ThemeStyle>,
     pub boolean: Option<ThemeStyle>,
     pub comment: Option<ThemeStyle>,
+    #[serde(rename = "comment.doc")]
     pub comment_doc: Option<ThemeStyle>,
     pub constant: Option<ThemeStyle>,
     pub constructor: Option<ThemeStyle>,
@@ -202,6 +203,16 @@ pub struct ThemeStyle {
     color: Option<Hsla>,
     font_style: Option<FontStyle>,
     font_weight: Option<FontWeightContent>,
+}
+
+impl ThemeStyle {
+    pub fn color(color: Hsla) -> Self {
+        Self {
+            color: Some(color),
+            font_style: None,
+            font_weight: None,
+        }
+    }
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -324,88 +335,86 @@ pub struct StatusColors {
 
 impl StatusColors {
     #[inline]
-    pub fn error(&self, cx: &App) -> Hsla {
-        self.error.unwrap_or(cx.theme().red)
+    pub fn error(&self, _cx: &App) -> Hsla {
+        self.error.unwrap_or(gpui::red().into())
     }
 
     #[inline]
-    pub fn error_background(&self, cx: &App) -> Hsla {
-        let bg = cx.theme().background;
+    pub fn error_background(&self, _cx: &App) -> Hsla {
         self.error_background
-            .unwrap_or(bg.blend(self.error(cx).alpha(0.2)))
+            .unwrap_or(gpui::red().alpha(0.2).into())
     }
 
     #[inline]
-    pub fn error_border(&self, cx: &App) -> Hsla {
-        self.error_border.unwrap_or(self.error(cx))
+    pub fn error_border(&self, _cx: &App) -> Hsla {
+        self.error_border.unwrap_or(self.error(_cx))
     }
 
     #[inline]
-    pub fn warning(&self, cx: &App) -> Hsla {
-        self.warning.unwrap_or(cx.theme().yellow)
+    pub fn warning(&self, _cx: &App) -> Hsla {
+        self.warning.unwrap_or(gpui::yellow().into())
     }
 
     #[inline]
-    pub fn warning_background(&self, cx: &App) -> Hsla {
-        let bg = cx.theme().background;
+    pub fn warning_background(&self, _cx: &App) -> Hsla {
         self.warning_background
-            .unwrap_or(bg.blend(self.warning(cx).alpha(0.2)))
+            .unwrap_or(gpui::yellow().alpha(0.2).into())
     }
 
     #[inline]
-    pub fn warning_border(&self, cx: &App) -> Hsla {
-        self.warning_border.unwrap_or(self.warning(cx))
+    pub fn warning_border(&self, _cx: &App) -> Hsla {
+        self.warning_border.unwrap_or(self.warning(_cx))
     }
 
     #[inline]
-    pub fn info(&self, cx: &App) -> Hsla {
-        self.info.unwrap_or(cx.theme().blue)
+    pub fn info(&self, _cx: &App) -> Hsla {
+        self.info.unwrap_or(gpui::blue().into())
     }
 
     #[inline]
-    pub fn info_background(&self, cx: &App) -> Hsla {
-        let bg = cx.theme().background;
+    pub fn info_background(&self, _cx: &App) -> Hsla {
         self.info_background
-            .unwrap_or(bg.blend(self.info(cx).alpha(0.2)))
+            .unwrap_or(gpui::blue().alpha(0.2).into())
     }
 
     #[inline]
-    pub fn info_border(&self, cx: &App) -> Hsla {
-        self.info_border.unwrap_or(self.info(cx))
+    pub fn info_border(&self, _cx: &App) -> Hsla {
+        self.info_border.unwrap_or(self.info(_cx))
     }
 
     #[inline]
-    pub fn success(&self, cx: &App) -> Hsla {
-        self.success.unwrap_or(cx.theme().green)
+    pub fn success(&self, _cx: &App) -> Hsla {
+        self.success.unwrap_or(gpui::green().into())
     }
 
     #[inline]
-    pub fn success_background(&self, cx: &App) -> Hsla {
-        let bg = cx.theme().background;
+    pub fn success_background(&self, _cx: &App) -> Hsla {
         self.success_background
-            .unwrap_or(bg.blend(self.success(cx).alpha(0.2)))
+            .unwrap_or(gpui::green().alpha(0.2).into())
     }
 
     #[inline]
-    pub fn success_border(&self, cx: &App) -> Hsla {
-        self.success_border.unwrap_or(self.success(cx))
+    pub fn success_border(&self, _cx: &App) -> Hsla {
+        self.success_border.unwrap_or(self.success(_cx))
     }
 
     #[inline]
-    pub fn hint(&self, cx: &App) -> Hsla {
-        self.hint.unwrap_or(cx.theme().cyan)
+    pub fn hint(&self, _cx: &App) -> Hsla {
+        self.hint.unwrap_or(gpui::rgb(0x00FFFF).into())
     }
 
     #[inline]
-    pub fn hint_background(&self, cx: &App) -> Hsla {
-        let bg = cx.theme().background;
+    pub fn hint_background(&self, _cx: &App) -> Hsla {
         self.hint_background
-            .unwrap_or(bg.blend(self.hint(cx).alpha(0.2)))
+            .unwrap_or_else(|| {
+                let c: Hsla = gpui::rgb(0x00FFFF).into();
+                c.opacity(0.2)
+            })
     }
 
     #[inline]
-    pub fn hint_border(&self, cx: &App) -> Hsla {
-        self.hint_border.unwrap_or(self.hint(cx))
+    pub fn hint_border(&self, _cx: &App) -> Hsla {
+        self.hint_border.unwrap_or(self.hint(_cx))
     }
 }
 
@@ -438,7 +447,7 @@ pub struct HighlightThemeStyle {
 pub struct HighlightTheme {
     pub name: String,
     #[serde(default)]
-    pub appearance: ThemeMode,
+    pub appearance: ThemeAppearance,
     pub style: HighlightThemeStyle,
 }
 
@@ -452,11 +461,19 @@ impl Deref for HighlightTheme {
 
 impl HighlightTheme {
     pub fn default_dark() -> Arc<Self> {
-        DEFAULT_THEME_COLORS[&ThemeMode::Dark].1.clone()
+        Arc::new(Self {
+            name: "Default Dark".to_string(),
+            appearance: ThemeAppearance::Dark,
+            style: HighlightThemeStyle::default(),
+        })
     }
 
     pub fn default_light() -> Arc<Self> {
-        DEFAULT_THEME_COLORS[&ThemeMode::Light].1.clone()
+        Arc::new(Self {
+            name: "Default Light".to_string(),
+            appearance: ThemeAppearance::Light,
+            style: HighlightThemeStyle::default(),
+        })
     }
 }
 
@@ -471,8 +488,8 @@ impl LanguageRegistry {
         static INSTANCE: LazyLock<LanguageRegistry> = LazyLock::new(|| LanguageRegistry {
             languages: Mutex::new(
                 languages::Language::all()
-                    .map(|language| (language.name().into(), language.config()))
-                    .collect(),
+                    .map(|language: languages::Language| (language.name().into(), language.config()))
+                    .collect::<HashMap<SharedString, LanguageConfig>>(),
             ),
         });
         &INSTANCE
@@ -498,7 +515,7 @@ impl LanguageRegistry {
         let languages = self.languages.lock().unwrap();
         languages
             .get(name)
-            .or_else(|| languages.get(Language::from_str(name).name()))
+            .or_else(|| languages.get(languages::Language::from_str(name).name()))
             .cloned()
     }
 }
