@@ -25,4 +25,7 @@ pub use ropey::Rope;
 pub use selection::Selection;
 pub use state::*;
 
+pub use lsp::*;
+pub use mask_pattern::MaskPattern;
+pub use popovers::*;
 pub use lsp_types::Position;

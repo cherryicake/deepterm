@@ -308,7 +308,7 @@ impl RopeExt for Rope {
         RopeLines::new(&self)
     }
 
-    fn line_len(&self, row: usize) -> usize {
+    fn line_byte_len(&self, row: usize) -> usize {
         self.slice_line(row).len()
     }
 

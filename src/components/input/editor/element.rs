@@ -11,9 +11,9 @@ use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
-    ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
+    theme::ActiveTheme as _,
+    components::button::{Button, ButtonVariants as _, Size as ButtonSize},
+    components::input::editor::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
 };
 
 use super::{InputState, LastLayout, WhitespaceIndicators, mode::InputMode};
@@ -264,8 +264,8 @@ impl TextElement {
 
             // cursor bounds
             let cursor_height = match state.size {
-                crate::Size::Large => 1.,
-                crate::Size::Small => 0.75,
+                ButtonSize::Large => 1.,
+                ButtonSize::Small => 0.75,
                 _ => 0.85,
             } * line_height;
 
@@ -817,91 +817,8 @@ impl TextElement {
             icons: vec![],
         };
 
-        let fold_infos: Vec<FoldInfo> = {
-            let state = self.state.read(cx);
-            if !state.mode.is_folding() {
-                return icon_layout;
-            }
-
-            let mut infos = Vec::with_capacity(last_layout.visible_buffer_lines.len());
-            let mut offset_y = last_layout.visible_top;
-
-            for (line, &buffer_line) in last_layout
-                .lines
-                .iter()
-                .zip(last_layout.visible_buffer_lines.iter())
-            {
-                if state.display_map.is_fold_candidate(buffer_line) {
-                    let is_folded = state.display_map.is_folded_at(buffer_line);
-                    infos.push(FoldInfo {
-                        buffer_line,
-                        is_folded,
-                        display_row: buffer_line,
-                        offset_y,
-                    });
-                }
-
-                offset_y += line.wrapped_lines.len() * last_layout.line_height;
-            }
-
-            infos
-        }; // state is dropped here
-
-        // Second pass: create and prepaint icons
-        let line_height = last_layout.line_height;
-        let line_number_width = last_layout.line_number_width
-            - LINE_NUMBER_RIGHT_MARGIN.half()
-            - FOLD_ICON_HITBOX_WIDTH;
-        let icon_relative_pos = point(
-            (FOLD_ICON_HITBOX_WIDTH - FOLD_ICON_WIDTH).half(),
-            (line_height - FOLD_ICON_WIDTH).half(),
-        );
-
-        for (ix, info) in fold_infos.iter().enumerate() {
-            // Position fold icon to the right of line numbers
-            let fold_icon_bounds = Bounds::new(
-                bounds.origin + icon_relative_pos + point(line_number_width, info.offset_y),
-                size(FOLD_ICON_HITBOX_WIDTH, line_height),
-            );
-
-            // Create and prepaint icon
-            let mut icon = Button::new(("fold", ix))
-                .ghost()
-                .icon(if info.is_folded {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .rounded_xs()
-                .size(FOLD_ICON_WIDTH)
-                .selected(info.is_folded)
-                .on_mouse_down(MouseButton::Left, {
-                    let state = self.state.clone();
-                    let buffer_line = info.buffer_line;
-                    move |_, _: &mut Window, cx: &mut App| {
-                        cx.stop_propagation();
-
-                        state.update(cx, |state, cx| {
-                            state.display_map.toggle_fold(buffer_line);
-                            cx.notify();
-                        });
-                    }
-                })
-                .into_any_element();
-
-            icon.prepaint_as_root(
-                fold_icon_bounds.origin,
-                fold_icon_bounds.size.into(),
-                window,
-                cx,
-            );
-
-            icon_layout
-                .icons
-                .push((info.display_row, info.is_folded, icon));
-        }
-
+        // Fold icons disabled in deepterm (missing Button/Icon integration)
+        let _ = (last_layout, bounds, window, cx);
         icon_layout
     }
 
@@ -1631,30 +1548,6 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.state.clone()),
             cx,
         );
-
-        // Set Root focused_input when self is focused
-        if focused {
-            let state = self.state.clone();
-            if Root::read(window, cx).focused_input.as_ref() != Some(&state) {
-                Root::update(window, cx, |root, _, cx| {
-                    root.focused_input = Some(state);
-                    cx.notify();
-                });
-            }
-        }
-
-        // And reset focused_input when next_frame start
-        window.on_next_frame({
-            let state = self.state.clone();
-            move |window, cx| {
-                if !focused && Root::read(window, cx).focused_input.as_ref() == Some(&state) {
-                    Root::update(window, cx, |root, _, cx| {
-                        root.focused_input = None;
-                        cx.notify();
-                    });
-                }
-            }
-        });
 
         // Paint multi line text
         let line_height = window.line_height();

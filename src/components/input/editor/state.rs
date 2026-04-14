@@ -23,21 +23,20 @@ use super::{
     DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, change::Change, element::TextElement,
     mask_pattern::MaskPattern, mode::InputMode, number_input,
 };
-use crate::components::input::editor::TabSize;
-use crate::components::input::editor::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
 use crate::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::highlighter::LanguageRegistry;
 use crate::components::input::editor::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::editor::movement::MoveDirection;
 use crate::components::input::editor::{
-    HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
+    HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection, TabSize,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
     popovers::{ContextMenu, DiagnosticPopover, HoverPopover, InputContextMenu},
     search::{self, SearchPanel},
 };
 use crate::components::input::history::History;
+use crate::components::button::Size;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
@@ -80,6 +79,10 @@ actions!(
         Paste,
         Undo,
         Redo,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown,
         MoveToStartOfLine,
         MoveToEndOfLine,
         MoveToStart,
@@ -1905,9 +1908,6 @@ impl InputState {
         self.clear_inline_completion(cx);
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.stop(cx);
-        });
-        Root::update(window, cx, |root, _, _| {
-            root.focused_input = None;
         });
         cx.emit(InputEvent::Blur);
         cx.notify();
