@@ -148,7 +148,7 @@ pub struct TabBar {
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
     /// Panel 拖拽到 TabBar 的回调
-    on_panel_drop: Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut App) + Send + Sync>>,
+    on_panel_drop: Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>>,
     /// 溢出状态变化回调
     on_overflow_changed: Option<OnOverflowChanged>,
     focus_handle: FocusHandle,
@@ -295,7 +295,7 @@ impl TabBar {
     /// 设置 Panel 拖拽到 TabBar 的回调
     pub fn on_panel_drop<F>(&mut self, callback: F)
     where
-        F: Fn(DraggedPanel, Option<usize>, &mut App) + Send + Sync + 'static,
+        F: Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_panel_drop = Some(Rc::new(callback));
     }
@@ -729,11 +729,11 @@ impl Render for TabBar {
             // TabBar 整体接受 DraggedPanel drop
             .on_drop(cx.listener({
                 let on_panel_drop = on_panel_drop.clone();
-                move |this, dragged: &DraggedPanel, _window, cx| {
+                move |this, dragged: &DraggedPanel, window, cx| {
                     let insert_index = this.panel_drop_preview.as_ref().map(|preview| preview.insert_index);
                     this.reset_panel_drop_preview(cx);
                     if let Some(ref callback) = on_panel_drop {
-                        callback(dragged.clone(), insert_index, cx);
+                        callback(dragged.clone(), insert_index, window, cx);
                     }
                 }
             }))
@@ -896,7 +896,7 @@ impl Render for TabBar {
                             }))
                             .on_drop(cx.listener({
                                 let on_panel_drop = on_panel_drop.clone();
-                                move |this, dragged: &DraggedPanel, _window, cx| {
+                                move |this, dragged: &DraggedPanel, window, cx| {
                                     let insert_index = this
                                         .panel_drop_preview
                                         .as_ref()
@@ -906,7 +906,7 @@ impl Render for TabBar {
                                     cx.stop_propagation();
 
                                     if let Some(ref callback) = on_panel_drop {
-                                        callback(dragged.clone(), insert_index, cx);
+                                        callback(dragged.clone(), insert_index, window, cx);
                                     }
                                 }
                             }))
@@ -1061,11 +1061,11 @@ impl Render for TabBar {
                                             // 放置处理 - DraggedPanel，插入到当前 tab 位置
                                             .on_drop(cx.listener({
                                                 let on_panel_drop_for_tab = on_panel_drop_for_tab.clone();
-                                                move |this, dragged: &DraggedPanel, _window, cx| {
+                                                move |this, dragged: &DraggedPanel, window, cx| {
                                                     cx.stop_propagation(); // 阻止事件冒泡到 TabBar 容器
                                                     this.reset_panel_drop_preview(cx);
                                                     if let Some(ref callback) = on_panel_drop_for_tab {
-                                                        callback(dragged.clone(), Some(index), cx);
+                                                        callback(dragged.clone(), Some(index), window, cx);
                                                     }
                                                 }
                                             }))

@@ -1,12 +1,12 @@
 use gpui::{Context, SharedString, Window, px};
 use ropey::Rope;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct HoverDefinition {
     pub label: SharedString,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct InlineCompletion {
     pub text: SharedString,
     pub range: std::ops::Range<usize>,

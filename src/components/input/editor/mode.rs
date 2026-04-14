@@ -283,7 +283,7 @@ impl InputMode {
                 } else {
                     // Timed out. Return the data needed for background parsing.
                     let pending = PendingBackgroundParse {
-                        language: h.language().clone(),
+                        language: SharedString::from(h.language().to_string()),
                         text: text.clone(),
                         highlighter: highlighter.clone(),
                         parse_task: parse_task.clone(),

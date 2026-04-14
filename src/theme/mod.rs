@@ -58,6 +58,12 @@ pub struct UiTheme {
     pub shadow: Hsla,
 }
 
+impl UiTheme {
+    pub fn transparent(&self) -> Hsla {
+        gpui::transparent_black()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalTheme {
     pub background: Hsla,
@@ -143,20 +149,37 @@ impl TerminalTheme {
                 editor_invisible: Some(self.dim_foreground),
                 status: StatusColors::default(),
                 syntax: SyntaxColors {
-                    comment: Some(ThemeStyle::color(self.dim_foreground)),
-                    string: Some(ThemeStyle::color(self.normal[1])),
-                    number: Some(ThemeStyle::color(self.normal[2])),
+                    attribute: Some(ThemeStyle::color(self.normal[6])),
                     boolean: Some(ThemeStyle::color(self.normal[4])),
+                    comment: Some(ThemeStyle::color(self.dim_foreground)),
+                    comment_doc: Some(ThemeStyle::color(self.dim_foreground)),
+                    constant: Some(ThemeStyle::color(self.normal[5])),
+                    constructor: Some(ThemeStyle::color(self.normal[3])),
+                    embedded: Some(ThemeStyle::color(self.foreground)),
+                    enum_: Some(ThemeStyle::color(self.normal[6])),
                     function: Some(ThemeStyle::color(self.normal[3])),
                     keyword: Some(ThemeStyle::color(self.normal[5])),
+                    label: Some(ThemeStyle::color(self.normal[3])),
+                    link_text: Some(ThemeStyle::color(self.normal[4])),
+                    link_uri: Some(ThemeStyle::color(self.normal[4])),
+                    number: Some(ThemeStyle::color(self.normal[2])),
+                    operator: Some(ThemeStyle::color(self.foreground)),
+                    preproc: Some(ThemeStyle::color(self.normal[5])),
+                    property: Some(ThemeStyle::color(self.normal[5])),
+                    punctuation: Some(ThemeStyle::color(self.dim_foreground)),
+                    punctuation_bracket: Some(ThemeStyle::color(self.dim_foreground)),
+                    punctuation_delimiter: Some(ThemeStyle::color(self.dim_foreground)),
+                    punctuation_special: Some(ThemeStyle::color(self.normal[5])),
+                    string: Some(ThemeStyle::color(self.normal[1])),
+                    string_escape: Some(ThemeStyle::color(self.normal[6])),
+                    string_regex: Some(ThemeStyle::color(self.normal[1])),
+                    string_special: Some(ThemeStyle::color(self.normal[3])),
+                    tag: Some(ThemeStyle::color(self.normal[1])),
+                    text_literal: Some(ThemeStyle::color(self.normal[6])),
+                    title: Some(ThemeStyle::color(self.normal[5])),
                     type_: Some(ThemeStyle::color(self.normal[6])),
                     variable: Some(ThemeStyle::color(self.foreground)),
-                    property: Some(ThemeStyle::color(self.normal[5])),
-                    constant: Some(ThemeStyle::color(self.normal[5])),
-                    operator: Some(ThemeStyle::color(self.foreground)),
-                    punctuation: Some(ThemeStyle::color(self.dim_foreground)),
-                    tag: Some(ThemeStyle::color(self.normal[1])),
-                    attribute: Some(ThemeStyle::color(self.normal[6])),
+                    variable_special: Some(ThemeStyle::color(self.normal[5])),
                     ..Default::default()
                 },
             },
@@ -173,6 +196,27 @@ pub struct AppTheme {
     pub ui: UiTheme,
     pub terminal: TerminalTheme,
     pub highlight_theme: Arc<HighlightTheme>,
+}
+
+impl std::ops::Deref for AppTheme {
+    type Target = UiTheme;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ui
+    }
+}
+
+impl AppTheme {
+    pub fn editor_background(&self) -> Hsla {
+        self.highlight_theme
+            .style
+            .editor_background
+            .unwrap_or(self.ui.panel_background)
+    }
+
+    pub fn input_background(&self) -> Hsla {
+        self.ui.panel_background
+    }
 }
 
 #[derive(Debug, Deserialize)]

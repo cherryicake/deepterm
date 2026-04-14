@@ -1,16 +1,19 @@
 use gpui::HighlightStyle;
 use ropey::Rope;
+use std::collections::BTreeSet;
 use std::ops::Range;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-use crate::theme::ActiveTheme;
+pub struct InjectionParseData;
+pub struct InjectionLayer;
 
 pub struct SimpleHighlighter {
     _language: String,
     parser: Parser,
     query: Option<Query>,
     tree: Option<Tree>,
+    text: String,
 }
 
 impl SimpleHighlighter {
@@ -84,6 +87,7 @@ impl SimpleHighlighter {
             parser,
             query,
             tree: None,
+            text: String::new(),
         }
     }
 
@@ -96,61 +100,97 @@ impl SimpleHighlighter {
         Query::new(&language, query).ok()
     }
 
-    pub fn update(&mut self, text: &Rope) {
-        let text_str = text.to_string();
-        self.tree = self.parser.parse(&text_str, self.tree.as_ref());
+    pub fn update(
+        &mut self,
+        _edit: Option<tree_sitter::InputEdit>,
+        text: &Rope,
+        _timeout: Option<std::time::Duration>,
+    ) -> bool {
+        self.text = text.to_string();
+        self.tree = self.parser.parse(&self.text, self.tree.as_ref());
+        true
     }
 
+    /// gpui-component compatible interface: styles for a byte range with a given theme.
     pub fn styles(
         &mut self,
-        text: &Rope,
-        cx: &gpui::App,
+        range: &Range<usize>,
+        theme: &crate::highlighter::HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         let query = match &self.query {
             Some(q) => q,
             None => return Vec::new(),
         };
 
-        let highlight_theme = &cx.theme().highlight_theme;
-        let text_str = text.to_string();
-
-        // Ensure we have a parsed tree that matches the current text
+        // Ensure we have a parsed tree
         let tree = match &self.tree {
-            Some(tree) if tree.root_node().end_byte() == text_str.len() => tree.clone(),
-            _ => {
-                let tree = match self.parser.parse(&text_str, None) {
-                    Some(t) => t,
-                    None => return Vec::new(),
-                };
-                self.tree = Some(tree.clone());
-                tree
-            }
+            Some(tree) => tree.clone(),
+            None => return Vec::new(),
         };
 
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), text_str.as_bytes());
+        cursor.set_byte_range(range.clone());
+        let mut matches = cursor.matches(query, tree.root_node(), self.text.as_bytes());
 
         let mut styles = Vec::new();
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let name = query.capture_names()[capture.index as usize];
-                let range = capture.node.byte_range();
-                if let Some(style) = highlight_theme.style(name) {
-                    styles.push((range, style));
+                let cap_range = capture.node.byte_range();
+                let s = cap_range.start.max(range.start).min(range.end);
+                let e = cap_range.end.min(range.end).max(s);
+                if e > s {
+                    styles.push((s..e, theme.style(name).unwrap_or_default()));
                 }
             }
         }
         styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
 
-        // Merge overlapping ranges so that TextRuns align correctly with text
-        unique_styles(0..text.len(), styles)
+        // If the matched styles is empty, return a default range.
+        if styles.is_empty() {
+            return vec![(range.start..range.end, HighlightStyle::default())];
+        }
+
+        unique_styles(range, styles)
+    }
+
+    // Additional stubs for gpui-component compatibility
+    pub fn tree(&self) -> Option<&Tree> {
+        self.tree.as_ref()
+    }
+
+    pub fn language(&self) -> &str {
+        &self._language
+    }
+
+    pub fn injection_parse_data(&self) -> Option<InjectionParseData> {
+        None
+    }
+
+    pub fn apply_background_tree(
+        &mut self,
+        tree: Tree,
+        _text: &Rope,
+        _injection_layers: std::collections::HashMap<gpui::SharedString, InjectionLayer>,
+    ) {
+        self.tree = Some(tree);
+    }
+
+    pub fn compute_injection_layers(
+        _data: InjectionParseData,
+        _tree: &Tree,
+        _text: &Rope,
+    ) -> std::collections::HashMap<gpui::SharedString, InjectionLayer> {
+        std::collections::HashMap::new()
     }
 }
 
 /// Merge overlapping highlight ranges into non-overlapping segments.
-/// When multiple styles overlap, the last-started style wins.
+/// When multiple styles overlap, the later-started styles override earlier ones.
+/// Gaps are filled with `HighlightStyle::default()` so the result always covers
+/// the entire `total_range`.
 fn unique_styles(
-    total_range: Range<usize>,
+    total_range: &Range<usize>,
     styles: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     if styles.is_empty() {
@@ -171,6 +211,12 @@ fn unique_styles(
     // This ensures we close ranges before opening new ones at boundaries.
     intervals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
+    // Track significant intervals (where style ranges end) for merging decisions.
+    let mut significant_intervals: BTreeSet<usize> = BTreeSet::new();
+    for (range, _) in &styles {
+        significant_intervals.insert(range.end);
+    }
+
     let mut result: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
     let mut active_styles: Vec<usize> = Vec::new();
     let mut last_pos = total_range.start;
@@ -178,10 +224,18 @@ fn unique_styles(
     for (pos, is_start, style_idx) in intervals {
         let is_boundary = style_idx == usize::MAX;
 
-        if pos > last_pos && !active_styles.is_empty() {
-            // Use the last active style (later-started styles override earlier ones)
-            let style = styles[*active_styles.last().unwrap()].1.clone();
-            result.push((last_pos..pos, style));
+        if pos > last_pos {
+            let interval = last_pos..pos;
+            let combined_style = if active_styles.is_empty() {
+                HighlightStyle::default()
+            } else {
+                let mut combined = HighlightStyle::default();
+                for &idx in &active_styles {
+                    merge_highlight_style(&mut combined, &styles[idx].1);
+                }
+                combined
+            };
+            result.push((interval, combined_style));
         }
 
         if !is_boundary {
@@ -195,5 +249,138 @@ fn unique_styles(
         last_pos = pos;
     }
 
-    result
+    // Merge adjacent ranges with the same style, but not across significant boundaries.
+    let mut merged: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(result.len());
+    for (range, style) in result {
+        if let Some((last_range, last_style)) = merged.last_mut() {
+            if last_range.end == range.start
+                && *last_style == style
+                && !significant_intervals.contains(&range.start)
+            {
+                last_range.end = range.end;
+                continue;
+            }
+        }
+        merged.push((range, style));
+    }
+
+    merged
+}
+
+/// Merge `other` style on top of `style`.
+fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
+    if let Some(color) = other.color {
+        style.color = Some(color);
+    }
+    if let Some(font_weight) = other.font_weight {
+        style.font_weight = Some(font_weight);
+    }
+    if let Some(font_style) = other.font_style {
+        style.font_style = Some(font_style);
+    }
+    if let Some(background_color) = other.background_color {
+        style.background_color = Some(background_color);
+    }
+    if let Some(underline) = other.underline {
+        style.underline = Some(underline);
+    }
+    if let Some(strikethrough) = other.strikethrough {
+        style.strikethrough = Some(strikethrough);
+    }
+    if let Some(fade_out) = other.fade_out {
+        style.fade_out = Some(fade_out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::highlighter::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
+    use crate::theme::ThemeAppearance;
+
+    fn test_theme() -> HighlightTheme {
+        HighlightTheme {
+            name: "test".into(),
+            appearance: ThemeAppearance::Dark,
+            style: HighlightThemeStyle {
+                syntax: SyntaxColors {
+                    keyword: Some(crate::highlighter::ThemeStyle::color(gpui::red())),
+                    type_: Some(crate::highlighter::ThemeStyle::color(gpui::blue())),
+                    function: Some(crate::highlighter::ThemeStyle::color(gpui::green())),
+                    number: Some(crate::highlighter::ThemeStyle::color(gpui::yellow())),
+                    string: Some(crate::highlighter::ThemeStyle::color(gpui::blue())),
+                    comment: Some(crate::highlighter::ThemeStyle::color(gpui::red())),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn test_rust_highlight_let() {
+        let code = "let x = 1;\nconst Y: i32 = 2;\nfn main() {}\n";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+        for (range, style) in &styles {
+            println!("{:?}: {:?} -> {:?}", range, &code[range.clone()], style.color);
+        }
+
+        // Check that 'let' is highlighted as keyword
+        let let_range = 0..3;
+        assert!(
+            styles.iter().any(|(r, s)| r.start <= let_range.start && r.end >= let_range.end && s.color == Some(gpui::red())),
+            "'let' should be highlighted as keyword (red)"
+        );
+
+        // Check that 'const' is highlighted as keyword
+        let const_range = 12..17;
+        assert!(
+            styles.iter().any(|(r, s)| r.start <= const_range.start && r.end >= const_range.end && s.color == Some(gpui::red())),
+            "'const' should be highlighted as keyword (red)"
+        );
+
+        // Check that 'fn' is highlighted as keyword
+        let fn_range = 28..30;
+        assert!(
+            styles.iter().any(|(r, s)| r.start <= fn_range.start && r.end >= fn_range.end && s.color == Some(gpui::red())),
+            "'fn' should be highlighted as keyword (red)"
+        );
+
+        // Check that 'i32' is highlighted as type
+        let i32_range = 20..23;
+        assert!(
+            styles.iter().any(|(r, s)| r.start <= i32_range.start && r.end >= i32_range.end && s.color == Some(gpui::blue())),
+            "'i32' should be highlighted as type (blue)"
+        );
+
+        // Check that 'main' is highlighted as function
+        let main_range = 31..35;
+        assert!(
+            styles.iter().any(|(r, s)| r.start <= main_range.start && r.end >= main_range.end && s.color == Some(gpui::green())),
+            "'main' should be highlighted as function (green)"
+        );
+    }
+
+    #[test]
+    fn test_rust_highlight_use_path() {
+        let code = "use crate::components::title_bar::TitleBar;\n";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+        for (range, style) in &styles {
+            println!("{:?}: {:?} -> {:?}", range, &code[range.clone()], style.color);
+        }
+
+        // Check coverage
+        let total_len: usize = styles.iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(total_len, code.len(), "styles should cover entire range");
+    }
 }

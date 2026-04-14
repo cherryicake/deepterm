@@ -356,7 +356,7 @@ impl RopeExt for Rope {
             return self.len();
         }
 
-        self.line_start_offset(row) + self.line_len(row)
+        self.line_start_offset(row) + self.line_byte_len(row)
     }
 
     fn lines_len(&self) -> usize {

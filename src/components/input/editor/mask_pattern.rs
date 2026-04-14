@@ -7,8 +7,8 @@ impl MaskPattern {
     pub fn is_none(&self) -> bool {
         true
     }
-    pub fn placeholder(&self) -> SharedString {
-        SharedString::default()
+    pub fn placeholder(&self) -> Option<SharedString> {
+        None
     }
     pub fn mask(&self, text: &str) -> SharedString {
         SharedString::from(text.to_string())

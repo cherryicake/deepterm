@@ -38,7 +38,3 @@ impl TabSize {
     }
 }
 
-gpui::actions!(
-    editor,
-    [Indent, Outdent, IndentInline, OutdentInline]
-);

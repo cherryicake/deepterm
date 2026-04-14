@@ -16,7 +16,7 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
+    App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
     WindowBackgroundAppearance, WindowDecorations, WindowOptions, actions, div, size,
 };
 
@@ -46,9 +46,9 @@ pub struct AppWindow {
 }
 
 impl AppWindow {
-    pub fn new(cx: &mut App) -> Self {
+    pub fn new(window: &mut Window, cx: &mut App) -> Self {
         // 先创建 Workspace
-        let workspace = Workspace::new(cx);
+        let workspace = Workspace::new(window, cx);
 
         // 从 Workspace 获取 TabBar，然后创建 TitleBar
         let tab_bar = workspace.read(cx).tab_bar.clone();
@@ -171,7 +171,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let app_window = cx.new(|_cx| AppWindow::new(_cx));
+                    let app_window = cx.new(|_cx| AppWindow::new(window, _cx));
                     // Schedule initial focus after the window is fully created
                     let window_handle = app_window.clone();
                     window.defer(cx, move |window, cx| {

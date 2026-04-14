@@ -39,14 +39,14 @@ use crate::components::input::history::History;
 use crate::components::button::Size;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = input, no_json)]
+#[action(namespace = editor, no_json)]
 pub struct Enter {
     /// Is confirm with secondary.
     pub secondary: bool,
 }
 
 actions!(
-    input,
+    editor,
     [
         Backspace,
         Delete,
@@ -106,7 +106,7 @@ pub enum InputEvent {
 
 pub(super) const CONTEXT: &str = "Input";
 
-pub(crate) fn init(cx: &mut App) {
+pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("shift-backspace", Backspace, Some(CONTEXT)),
@@ -1429,32 +1429,8 @@ impl InputState {
         let offset = self.index_for_mouse_position(event.position);
         self.handle_mouse_move(offset, event, window, cx);
 
-        if self.mode.is_code_editor() {
-            if let Some(diagnostic) = self
-                .mode
-                .diagnostics()
-                .and_then(|set| set.for_offset(offset))
-            {
-                if let Some(diagnostic_popover) = self.diagnostic_popover.as_ref() {
-                    if diagnostic_popover.read(cx).diagnostic.range == diagnostic.range {
-                        diagnostic_popover.update(cx, |this, cx| {
-                            this.show(cx);
-                        });
-
-                        return;
-                    }
-                }
-
-                self.diagnostic_popover = Some(DiagnosticPopover::new(diagnostic, cx.entity(), cx));
-                cx.notify();
-            } else {
-                if let Some(diagnostic_popover) = self.diagnostic_popover.as_mut() {
-                    diagnostic_popover.update(cx, |this, cx| {
-                        this.check_to_hide(event.position, cx);
-                    })
-                }
-            }
-        }
+        // Diagnostics / hover popover disabled in DeepTerm
+        let _ = offset;
     }
 
     pub(super) fn on_scroll_wheel(
@@ -2487,6 +2463,23 @@ impl EntityInputHandler for InputState {
     }
 }
 
+// === Stubs for features disabled in DeepTerm ===
+impl InputState {
+    pub(super) fn clear_inline_completion(&mut self, _cx: &mut Context<Self>) {}
+    pub(super) fn has_inline_completion(&self) -> bool { false }
+    pub(super) fn handle_action_for_context_menu(&mut self, _action: Box<dyn Action>, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
+    pub(super) fn hide_context_menu(&mut self, _cx: &mut Context<Self>) {}
+    pub(super) fn is_context_menu_open(&self, _cx: &App) -> bool { false }
+    pub(super) fn handle_right_click_menu(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(super) fn handle_click_hover_definition(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
+    pub(super) fn clear_hover_state(&mut self, _cx: &mut Context<Self>) {}
+    pub(super) fn handle_mouse_move(&mut self, _offset: usize, _event: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(super) fn select_word(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(super) fn select_line(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(super) fn update_search(&mut self, _cx: &mut Context<Self>) {}
+    pub(super) fn handle_completion_trigger(&mut self, _range: &Range<usize>, _new_text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
+}
+
 impl Focusable for InputState {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2514,165 +2507,34 @@ impl Render for InputState {
             .when(self.mode.is_multi_line(), |this| this.h_full())
             .flex_grow()
             .overflow_x_hidden()
+            .track_focus(&self.focus_handle)
+            .key_context(CONTEXT)
+            .on_mouse_down(
+                MouseButton::Left,
+                window.listener_for(&cx.entity(), InputState::on_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                window.listener_for(&cx.entity(), InputState::on_mouse_down),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                window.listener_for(&cx.entity(), InputState::on_mouse_up),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                window.listener_for(&cx.entity(), InputState::on_mouse_up),
+            )
+            .on_mouse_move(window.listener_for(&cx.entity(), InputState::on_mouse_move))
+            .on_scroll_wheel(window.listener_for(&cx.entity(), InputState::on_scroll_wheel))
             .child(TextElement::new(cx.entity().clone()).placeholder(self.placeholder.clone()))
             .children(self.diagnostic_popover.clone())
-            .children(self.context_menu_content.as_ref().map(|menu| menu.render()))
+            // .children(self.context_menu_content.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::theme::Theme;
-    use gpui::{TestAppContext, VisualTestContext};
-
-    struct InputView {
-        input: Entity<InputState>,
-        window_handle: gpui::WindowHandle<Root>,
-    }
-
-    /// Helper to create an InputState in a window for testing
-    impl InputView {
-        pub fn new(cx: &mut TestAppContext) -> Self {
-            let mut input: Option<Entity<InputState>> = None;
-
-            let window = cx.update(|cx| {
-                cx.open_window(Default::default(), |window, cx| {
-                    // Set up the theme first
-                    cx.set_global(Theme::default());
-                    // Initialize input keybindings
-                    super::super::init(cx);
-
-                    input = Some(cx.new(|cx| InputState::new(window, cx).code_editor("sql")));
-
-                    cx.new(|cx| crate::Root::new(input.clone().unwrap(), window, cx))
-                })
-                .unwrap()
-            });
-
-            Self {
-                input: input.clone().unwrap(),
-                window_handle: window,
-            }
-        }
-    }
-
-    #[gpui::test]
-    fn test_highlighting_preserved_after_fold(cx: &mut TestAppContext) {
-        use crate::highlighter::HighlightTheme;
-        use crate::components::input::editor::display_map::FoldRange;
-
-        let input_view = InputView::new(cx);
-        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
-        let input = input_view.input;
-
-        // SQL text: fold the SELECT..WHERE block, verify comments keep highlighting.
-        // Lines 0-9: SELECT block (fold range 0..9 hides lines 1-8)
-        // Line 10+: comments that must keep highlighting
-        let text = "\
-SELECT *
-FROM users
-WHERE id = 1
-AND name = 'test'
-AND active = true
-AND role = 'admin'
-AND age > 18
-AND status = 'ok'
-AND country = 'US'
-ORDER BY id
-
--- Comment 1
--- Comment 2
--- Comment 3";
-
-        cx.update(|window, cx| {
-            input.update(cx, |state, cx| {
-                state.set_value(text, window, cx);
-            });
-        });
-        cx.run_until_parked();
-
-        // Grab styles for "-- Comment 1" (line 11) before folding
-        let theme = HighlightTheme::default_dark();
-        let comment_line = 11;
-        let comment_start = cx.update(|_, cx| {
-            input.read_with(cx, |state, _| state.text.line_start_offset(comment_line))
-        });
-        let styles_before: Vec<(Range<usize>, gpui::HighlightStyle)> = cx.update(|_, cx| {
-            input.read_with(cx, |state, _| {
-                let mode = &state.mode;
-                if let crate::components::input::editor::mode::InputMode::CodeEditor { highlighter, .. } = mode {
-                    let h = highlighter.borrow();
-                    if let Some(h) = h.as_ref() {
-                        let line_end = state.text.line_end_offset(comment_line);
-                        return h.styles(&(comment_start..line_end), &theme);
-                    }
-                }
-                vec![]
-            })
-        });
-
-        // Fold at line 0 with range 0..9 (hides lines 1-8)
-        cx.update(|_, cx| {
-            input.update(cx, |state, _cx| {
-                state
-                    .display_map
-                    .set_fold_candidates(vec![FoldRange::new(0, 9)]);
-                state.display_map.set_folded(0, true);
-            });
-        });
-        cx.run_until_parked();
-
-        // Verify fold is active and lines 1-8 are hidden
-        cx.update(|_, cx| {
-            input.read_with(cx, |state, _| {
-                assert!(state.display_map.is_folded_at(0));
-                for line in 1..=8 {
-                    assert!(
-                        state.display_map.is_buffer_line_hidden(line),
-                        "Line {} should be hidden",
-                        line
-                    );
-                }
-                assert!(
-                    !state.display_map.is_buffer_line_hidden(9),
-                    "Line 9 (ORDER BY) should be visible"
-                );
-            });
-        });
-
-        // Get styles for the same comment line after folding
-        let styles_after: Vec<(Range<usize>, gpui::HighlightStyle)> = cx.update(|_, cx| {
-            input.read_with(cx, |state, _| {
-                let mode = &state.mode;
-                if let crate::components::input::editor::mode::InputMode::CodeEditor { highlighter, .. } = mode {
-                    let h = highlighter.borrow();
-                    if let Some(h) = h.as_ref() {
-                        let line_end = state.text.line_end_offset(comment_line);
-                        return h.styles(&(comment_start..line_end), &theme);
-                    }
-                }
-                vec![]
-            })
-        });
-
-        let colored_before: Vec<_> = styles_before
-            .iter()
-            .filter(|(_, s)| s.color.is_some())
-            .cloned()
-            .collect();
-        let colored_after: Vec<_> = styles_after
-            .iter()
-            .filter(|(_, s)| s.color.is_some())
-            .cloned()
-            .collect();
-
-        assert_eq!(
-            colored_before, colored_after,
-            "Comment highlighting must be identical before and after folding.\n\
-             Before: {:?}\nAfter: {:?}",
-            colored_before, colored_after
-        );
-    }
+    // Tests disabled: gpui testing utilities not available in DeepTerm
 }

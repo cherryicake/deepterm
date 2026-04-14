@@ -1,4 +1,4 @@
-use gpui::{Context, Entity, IntoElement, Render, SharedString, Window, div};
+use gpui::{App, AppContext, Context, Entity, IntoElement, Render, Window, div};
 
 pub struct ContextMenu;
 impl Render for ContextMenu {
@@ -32,8 +32,9 @@ impl Render for HoverPopover {
 pub struct InputContextMenu;
 
 impl InputContextMenu {
-    pub fn new(_entity: Entity<super::InputState>, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
-        Self
+    pub fn new(_entity: Entity<super::InputState>, _window: &mut Window, cx: &mut App) -> Entity<Self> {
+        cx.new(|_cx| Self)
     }
     pub fn hide(&mut self, _cx: &mut Context<Self>) {}
+    pub fn is_open(&self) -> bool { false }
 }

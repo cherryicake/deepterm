@@ -1,16 +1,16 @@
 use gpui::prelude::*;
 use gpui::{App, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div};
 
-use crate::components::input::code_editor::Editor;
+use crate::components::input::editor::InputState;
 
 pub struct EditorView {
-    editor: Entity<Editor>,
+    editor: Entity<InputState>,
     file_path: Option<SharedString>,
 }
 
 impl EditorView {
-    pub fn new(cx: &mut App) -> Self {
-        let editor = cx.new(|cx| Editor::new(cx));
+    pub fn new(window: &mut Window, cx: &mut App) -> Self {
+        let editor = cx.new(|cx| InputState::new(window, cx).multi_line(true));
         Self {
             editor,
             file_path: None,
@@ -21,15 +21,18 @@ impl EditorView {
         path: impl Into<SharedString>,
         content: &str,
         language: Option<&str>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Self {
         let path = path.into();
-        let editor = cx.new(|cx| {
-            let mut e = Editor::new(cx).with_text(content);
-            if let Some(lang) = language {
-                e = e.language(lang);
-            }
-            e
+        let content = content.to_string();
+        let lang = language.map(|s| s.to_string()).unwrap_or_else(|| "text".to_string());
+        let editor = cx.new(move |cx| {
+            let mut state = InputState::new(window, cx)
+                .code_editor(lang)
+                .multi_line(true);
+            state.set_value(&content, window, cx);
+            state
         });
         Self {
             editor,
@@ -39,8 +42,8 @@ impl EditorView {
 }
 
 impl Focusable for EditorView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.editor.read(_cx).focus_handle(_cx)
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.read(cx).focus_handle(cx)
     }
 }
 

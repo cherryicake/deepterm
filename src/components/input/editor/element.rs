@@ -434,65 +434,54 @@ impl TextElement {
 
     fn layout_search_matches(
         &self,
-        last_layout: &LastLayout,
-        bounds: &Bounds<Pixels>,
-        cx: &mut App,
+        _last_layout: &LastLayout,
+        _bounds: &Bounds<Pixels>,
+        _cx: &mut App,
     ) -> Vec<(Path<Pixels>, bool)> {
-        let state = self.state.read(cx);
-        let search_panel = state.search_panel.clone();
-
-        let Some((ranges, current_match_ix)) = search_panel.and_then(|panel| {
-            if let Some(matcher) = panel.read(cx).matcher() {
-                Some((matcher.matched_ranges.clone(), matcher.current_match_ix))
-            } else {
-                None
-            }
-        }) else {
-            return vec![];
-        };
-
-        let mut paths = Vec::with_capacity(ranges.as_ref().len());
-        for (index, range) in ranges.as_ref().iter().enumerate() {
-            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
-                paths.push((path, current_match_ix == index));
-            }
-        }
-
-        paths
+        vec![]
     }
 
     fn layout_hover_highlight(
         &self,
-        last_layout: &LastLayout,
-        bounds: &Bounds<Pixels>,
-        cx: &mut App,
+        _last_layout: &LastLayout,
+        _bounds: &Bounds<Pixels>,
+        _cx: &mut App,
     ) -> Option<Path<Pixels>> {
-        let state = self.state.read(cx);
-        let hover_popover = state.hover_popover.clone();
-
-        let Some(symbol_range) = hover_popover.map(|popover| popover.read(cx).symbol_range.clone())
-        else {
-            return None;
-        };
-
-        Self::layout_match_range(symbol_range, last_layout, bounds)
+        None
     }
 
     fn layout_document_colors(
         &self,
-        document_colors: &[(Range<usize>, Hsla)],
-        last_layout: &LastLayout,
-        bounds: &Bounds<Pixels>,
+        _document_colors: &[(Range<usize>, Hsla)],
+        _last_layout: &LastLayout,
+        _bounds: &Bounds<Pixels>,
         _cx: &mut App,
     ) -> Vec<(Path<Pixels>, Hsla)> {
-        let mut paths = vec![];
-        for (range, color) in document_colors.iter() {
-            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
-                paths.push((path, *color));
-            }
-        }
+        vec![]
+    }
 
-        paths
+    fn layout_hover_definition(&mut self, _cx: &mut App) -> Option<(Range<usize>, HighlightStyle)> {
+        None
+    }
+
+    fn layout_hover_definition_hitbox(
+        &mut self,
+        _state: &InputState,
+        _window: &mut Window,
+        _cx: &App,
+    ) -> Option<Hitbox> {
+        None
+    }
+
+    fn layout_indent_guides(
+        &mut self,
+        _state: &InputState,
+        _bounds: &Bounds<Pixels>,
+        _last_layout: &LastLayout,
+        _text_style: &TextStyle,
+        _window: &mut Window,
+    ) -> Option<Path<Pixels>> {
+        None
     }
 
     fn layout_selections(
@@ -619,7 +608,7 @@ impl TextElement {
                 &[TextRun {
                     len: line_number_len,
                     font: style.font(),
-                    color: gpui::black(),
+                    color: style.color,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -661,7 +650,7 @@ impl TextElement {
             .highlight_theme
             .style
             .editor_invisible
-            .unwrap_or(cx.theme().muted_foreground);
+            .unwrap_or(cx.theme().text_muted);
 
         let space_font_size = text_size.half();
         let tab_font_size = text_size;
@@ -705,83 +694,13 @@ impl TextElement {
     /// - first_line: Shaped text for the first line (goes after cursor on same line)
     /// - ghost_lines: Shaped lines for subsequent lines (shift content down)
     fn layout_inline_completion(
-        state: &InputState,
-        visible_range: &Range<usize>,
-        font_size: Pixels,
-        window: &mut Window,
-        cx: &App,
+        _state: &InputState,
+        _visible_range: &Range<usize>,
+        _font_size: Pixels,
+        _window: &mut Window,
+        _cx: &App,
     ) -> (Option<ShapedLine>, Vec<ShapedLine>) {
-        // Must be focused to show inline completion
-        if !state.focus_handle.is_focused(window) {
-            return (None, vec![]);
-        }
-
-        let Some(completion_item) = state.inline_completion.item.as_ref() else {
-            return (None, vec![]);
-        };
-
-        // Get cursor row from cursor position
-        let cursor_row = state.cursor_position().line as usize;
-
-        // Only show if cursor row is visible
-        if cursor_row < visible_range.start || cursor_row >= visible_range.end {
-            return (None, vec![]);
-        }
-
-        let completion_text = &completion_item.insert_text;
-        let completion_color = cx.theme().muted_foreground.opacity(0.5);
-
-        let text_style = window.text_style();
-        let font = text_style.font();
-
-        let lines: Vec<&str> = completion_text.split('\n').collect();
-        if lines.is_empty() {
-            return (None, vec![]);
-        }
-
-        // Shape first line (goes after cursor)
-        let first_text: SharedString = lines[0].to_string().into();
-        let first_line = if !first_text.is_empty() {
-            let first_run = TextRun {
-                len: first_text.len(),
-                font: font.clone(),
-                color: completion_color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            Some(
-                window
-                    .text_system()
-                    .shape_line(first_text, font_size, &[first_run], None),
-            )
-        } else {
-            None
-        };
-
-        // Shape ghost lines (lines 2+ that shift content down)
-        let ghost_lines: Vec<ShapedLine> = lines[1..]
-            .iter()
-            .map(|line_text| {
-                let text: SharedString = line_text.to_string().into();
-                let len = text.len().max(1); // Ensure at least 1 for empty lines
-                let run = TextRun {
-                    len,
-                    font: font.clone(),
-                    color: completion_color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                // Use space for empty lines so they take up height
-                let shaped_text = if text.is_empty() { " ".into() } else { text };
-                window
-                    .text_system()
-                    .shape_line(shaped_text, font_size, &[run], None)
-            })
-            .collect();
-
-        (first_line, ghost_lines)
+        (None, vec![])
     }
 
     /// Return (line_number_width, line_number_len)
@@ -855,6 +774,7 @@ impl TextElement {
         last_layout: &LastLayout,
         font_size: Pixels,
         runs: &[TextRun],
+        default_color: Hsla,
         bg_segments: &[(Range<usize>, Hsla)],
         whitespace_indicators: Option<WhitespaceIndicators>,
         window: &mut Window,
@@ -916,10 +836,12 @@ impl TextElement {
                 let line_runs = if bg_segments.is_empty() {
                     line_runs
                 } else {
+                    let default_color = runs.first().map(|r| r.color).unwrap_or(default_color);
                     split_runs_by_bg_segments(
                         last_layout.visible_line_byte_offsets[vi] + (range.start),
                         &line_runs,
                         bg_segments,
+                        default_color,
                     )
                 };
 
@@ -955,20 +877,21 @@ impl TextElement {
         let text = &state.text;
         let is_multi_line = state.mode.is_multi_line();
 
-        let (mut highlighter, diagnostics) = match &state.mode {
+        let (mut highlighter_ref, diagnostics) = match &state.mode {
             InputMode::CodeEditor {
                 highlighter,
                 diagnostics,
                 ..
-            } => (highlighter.borrow_mut(), diagnostics),
+            } => (highlighter.borrow_mut(), diagnostics.clone()),
             _ => return None,
         };
-        let highlighter = highlighter.as_mut()?;
+        let highlighter = highlighter_ref.as_mut()?;
 
         let mut styles = Vec::with_capacity(visible_buffer_lines.len());
+        let highlight_theme = cx.theme().highlight_theme.clone();
 
         // Helper to flush a contiguous range of lines
-        let flush_range = |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
+        let mut flush_range = |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
             let byte_start = text.line_start_offset(start_line);
             let byte_end = if is_multi_line {
                 // +1 for `\n`
@@ -979,7 +902,7 @@ impl TextElement {
             let range_styles = if skip {
                 vec![(byte_start..byte_end, HighlightStyle::default())]
             } else {
-                highlighter.styles(&(byte_start..byte_end), &cx.theme().highlight_theme)
+                highlighter.styles(&(byte_start..byte_end), &highlight_theme)
             };
 
             *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
@@ -1019,6 +942,7 @@ impl TextElement {
         }
 
         let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
+        drop(highlighter_ref);
 
         // hover definition style
         if let Some(hover_style) = self.layout_hover_definition(cx) {
@@ -1195,12 +1119,18 @@ impl Element for TextElement {
         let is_empty = text.len() == 0;
         let placeholder = self.placeholder.clone();
 
-        let text_style = window.text_style();
-        let fg = text_style.color;
+        let mut text_style = window.text_style();
+        let fg = cx
+            .theme()
+            .highlight_theme
+            .style
+            .editor_foreground
+            .unwrap_or(text_style.color);
+        text_style.color = fg;
         let (display_text, text_color) = if is_empty {
             (
                 &Rope::from(placeholder.as_str()),
-                cx.theme().muted_foreground,
+                cx.theme().text_muted,
             )
         } else if state.masked {
             (
@@ -1329,7 +1259,7 @@ impl Element for TextElement {
 
         let document_colors = state
             .lsp
-            .document_colors_for_range(&text, &last_layout.visible_range);
+            .document_colors_for_range(0..text.len());
 
         // Create shaped lines for whitespace indicators before layout
         let whitespace_indicators =
@@ -1341,6 +1271,7 @@ impl Element for TextElement {
             &last_layout,
             text_size,
             &runs,
+            fg,
             &document_colors,
             whitespace_indicators,
             window,
@@ -1360,7 +1291,7 @@ impl Element for TextElement {
                     &[TextRun {
                         len: longest_line.len(),
                         font: style.font(),
-                        color: gpui::black(),
+                        color: fg,
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -1455,7 +1386,7 @@ impl Element for TextElement {
             let other_line_runs = vec![TextRun {
                 len: line_number_len,
                 font: style.font(),
-                color: cx.theme().muted_foreground,
+                color: cx.theme().text_muted,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -1463,7 +1394,7 @@ impl Element for TextElement {
             let current_line_runs = vec![TextRun {
                 len: line_number_len,
                 font: style.font(),
-                color: cx.theme().foreground,
+                color: cx.theme().text,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -1500,7 +1431,9 @@ impl Element for TextElement {
             None
         };
 
+        let state = self.state.read(cx);
         let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
+        let state = self.state.read(cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
         let fold_icon_layout = self.layout_fold_icons(&bounds, &last_layout, window, cx);
@@ -1589,7 +1522,7 @@ impl Element for TextElement {
 
         // Paint selections
         if window.is_window_active() {
-            let secondary_selection = cx.theme().selection.saturation(0.1);
+            let secondary_selection = cx.theme().selection;
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);
 
@@ -1694,7 +1627,7 @@ impl Element for TextElement {
         // Paint blinking cursor
         if focused && show_cursor {
             if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
-                window.paint_quad(fill(cursor_bounds, cx.theme().caret));
+                window.paint_quad(fill(cursor_bounds, cx.theme().accent));
             }
         }
 
@@ -1836,6 +1769,7 @@ fn split_runs_by_bg_segments(
     start_offset: usize,
     runs: &[TextRun],
     bg_segments: &[(Range<usize>, Hsla)],
+    default_color: Hsla,
 ) -> Vec<TextRun> {
     let mut result = vec![];
 
@@ -1864,7 +1798,7 @@ fn split_runs_by_bg_segments(
             let text_color = if bg_color.l >= 0.5 {
                 gpui::black()
             } else {
-                gpui::white()
+                default_color
             };
 
             let run_len = overlap_end.saturating_sub(overlap_start);
@@ -1983,7 +1917,7 @@ mod tests {
         ];
 
         let bg_segments = vec![(8..12, gpui::red()), (12..18, gpui::blue())];
-        let result = split_runs_by_bg_segments(5, &runs, &bg_segments);
+        let result = split_runs_by_bg_segments(5, &runs, &bg_segments, gpui::black());
         assert_eq!(
             result.iter().map(|run| run.len).collect::<Vec<_>>(),
             vec![3, 2, 2, 5, 1, 23]

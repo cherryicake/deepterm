@@ -293,7 +293,7 @@ impl FoldMap {
 
         // Merge overlapping hidden ranges
         hidden_ranges.sort_by_key(|r| r.start);
-        let mut merged_hidden = Vec::new();
+        let mut merged_hidden: Vec<usize> = Vec::new();
         for range in hidden_ranges {
             if let Some(last) = merged_hidden.last_mut() {
                 if range.start <= *last {

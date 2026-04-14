@@ -197,7 +197,7 @@ impl Workspace {
         Self::generate_indexed_name("WorkSpace", &mut self.workspace_index)
     }
 
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
         // 创建初始tab - 本地终端（不显示编号）
@@ -242,7 +242,7 @@ impl Workspace {
             };
 
             // 在创建时完成所有初始化
-            workspace.subscribe_to_panels(cx);
+            workspace.subscribe_to_panels(window, cx);
             workspace.setup_tab_bar_handlers(cx);
 
             workspace
@@ -355,14 +355,12 @@ impl Workspace {
             // 设置 Panel 拖拽到 TabBar 事件
             tab_bar.on_panel_drop({
                 let workspace = workspace.clone();
-                move |dragged_panel, insert_index, cx| {
-                    cx.defer({
-                        let workspace = workspace.clone();
-                        move |cx| {
-                            workspace.update(cx, |this, cx| {
-                                this.handle_panel_drop_on_tab_bar(dragged_panel, insert_index, cx);
-                            });
-                        }
+                move |dragged_panel, insert_index, window, cx| {
+                    let workspace = workspace.clone();
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |this, cx| {
+                            this.handle_panel_drop_on_tab_bar(dragged_panel, insert_index, window, cx);
+                        });
                     });
                 }
             });
@@ -385,11 +383,11 @@ impl Workspace {
             // 设置 SettingsHub 点击事件
             tab_bar.on_settingshub_click({
                 let workspace = workspace.clone();
-                move |_window, cx| {
+                move |window, cx| {
                     let workspace = workspace.clone();
-                    cx.defer(move |cx| {
+                    window.defer(cx, move |window, cx| {
                         workspace.update(cx, |this, cx| {
-                            this.show_hostshub_panel(cx);
+                            this.show_hostshub_panel(window, cx);
                         });
                     });
                 }
@@ -398,7 +396,7 @@ impl Workspace {
     }
 
     /// 订阅所有面板的事件
-    fn subscribe_to_panels(&mut self, cx: &mut Context<Self>) {
+    fn subscribe_to_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 收集所有panel
         let mut panels: Vec<Entity<Panel>> = Vec::new();
         for tab_info in self.tabs.values() {
@@ -422,8 +420,8 @@ impl Workspace {
 
             if !already_subscribed {
                 log::info!("Subscribing to panel: {}", panel_id);
-                let subscription = cx.subscribe(&panel, |this, _panel, event: &PanelEvent, cx| {
-                    this.handle_panel_event(event, cx);
+                let subscription = cx.subscribe_in(&panel, window, |this, _panel, event: &PanelEvent, window, cx| {
+                    this.handle_panel_event(event, window, cx);
                 });
                 self.panel_subscriptions.insert(panel_id, subscription);
             }
@@ -431,7 +429,12 @@ impl Workspace {
     }
 
     /// 处理面板事件
-    fn handle_panel_event(&mut self, event: &PanelEvent, cx: &mut Context<Self>) {
+    fn handle_panel_event(
+        &mut self,
+        event: &PanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             PanelEvent::DragPreview { .. } => {
                 // 预览事件由Panel自己处理
@@ -441,26 +444,32 @@ impl Workspace {
                 dragged_tab,
                 placement,
             } => {
-                self.handle_tab_drop_on_panel(panel_id, dragged_tab, *placement, cx);
+                self.handle_tab_drop_on_panel(panel_id, dragged_tab, *placement, window, cx);
             }
             PanelEvent::PanelDrop {
                 target_panel_id,
                 dragged_panel,
                 placement,
             } => {
-                self.handle_panel_drop_on_panel(target_panel_id, dragged_panel, *placement, cx);
+                self.handle_panel_drop_on_panel(
+                    target_panel_id,
+                    dragged_panel,
+                    *placement,
+                    window,
+                    cx,
+                );
             }
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
             }
             PanelEvent::OpenFileBrowser { target, .. } => {
-                self.show_file_browser_panel(target.clone(), cx);
+                self.show_file_browser_panel(target.clone(), window, cx);
             }
             PanelEvent::OpenFile { panel_id, path } => {
-                self.show_editor_panel(panel_id.clone(), path.clone(), cx);
+                self.show_editor_panel(panel_id.clone(), path.clone(), window, cx);
             }
             PanelEvent::Close { panel_id } => {
-                self.handle_panel_close(panel_id, cx);
+                self.handle_panel_close(panel_id, window, cx);
             }
             PanelEvent::Selected { panel_id } => {
                 self.handle_panel_selected(panel_id, cx);
@@ -636,7 +645,7 @@ impl Workspace {
         for panel in panels {
             if panel.read(cx).is_selected() {
                 let panel_id = panel.read(cx).panel_id().to_string();
-                self.handle_panel_close(&panel_id, cx);
+                self.handle_panel_close(&panel_id, window, cx);
                 return;
             }
         }
@@ -644,12 +653,12 @@ impl Workspace {
         // 如果没有选中的panel，但有多个panel存在，关闭第一个
         if let Some(first_panel) = tab_info.container.get_first_panel() {
             let panel_id = first_panel.read(cx).panel_id().to_string();
-            self.handle_panel_close(&panel_id, cx);
+            self.handle_panel_close(&panel_id, window, cx);
         }
     }
 
     /// 处理关闭panel事件
-    fn handle_panel_close(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+    fn handle_panel_close(&mut self, panel_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // 在所有 tab 中搜索包含该 panel 的 tab
         let Some(target_tab_id) = self
             .tabs
@@ -715,7 +724,7 @@ impl Workspace {
         }
 
         // 重新订阅所有panel
-        self.subscribe_to_panels(cx);
+        self.subscribe_to_panels(window, cx);
 
         if panel_count == 1 {
             self.disable_tab_broadcast(&target_tab_id, cx);
@@ -730,6 +739,7 @@ impl Workspace {
         target_panel_id: &str,
         dragged_tab: &DraggedTab,
         placement: PanelPlacement,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let dragged_tab_id = dragged_tab.tab_id.to_string();
@@ -788,7 +798,7 @@ impl Workspace {
         });
 
         // 重新订阅所有panel
-        self.subscribe_to_panels(cx);
+        self.subscribe_to_panels(window, cx);
 
         // 设置新加入的panels的广播状态和workspace_id（与当前Workspace tab保持一致）
         let broadcast_enabled = self.get_current_broadcast_state();
@@ -826,6 +836,7 @@ impl Workspace {
         target_panel_id: &str,
         dragged_panel: &DraggedPanel,
         placement: PanelPlacement,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 如果被拖拽的是同一个panel，不做处理
@@ -890,7 +901,7 @@ impl Workspace {
         let dragged_panel_id = dragged_panel.panel_id.clone();
 
         // 重新订阅所有panel（这会改变self）
-        self.subscribe_to_panels(cx);
+        self.subscribe_to_panels(window, cx);
 
         // 设置被拖拽的panel的广播状态和workspace_id（与当前Workspace保持一致）
         let workspace_id = self.workspace_id.clone();
@@ -921,6 +932,7 @@ impl Workspace {
         &mut self,
         dragged_panel: DraggedPanel,
         insert_index: Option<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let active_tab_id = self.active_tab_id.clone();
@@ -1019,10 +1031,10 @@ impl Workspace {
 
         // 订阅新panel的事件
         // 只订阅这个新panel，不需要重新订阅所有panel
-        let subscription = cx.subscribe(
-            &dragged_panel_entity,
-            |this, _panel, event: &PanelEvent, cx| {
-                this.handle_panel_event(event, cx);
+        let subscription = cx.subscribe_in(
+            &dragged_panel_entity, window,
+            |this, _panel, event: &PanelEvent, window, cx| {
+                this.handle_panel_event(event, window, cx);
             },
         );
         self.panel_subscriptions
@@ -1067,7 +1079,7 @@ impl Workspace {
 
     /// 显示 hostshub panel
     /// 当点击 HostsHub 标签时调用，显示SettingsHubView（包含左侧边栏和中心内容）中的Host配置内容
-    fn show_hostshub_panel(&mut self, cx: &mut Context<Self>) {
+    fn show_hostshub_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 防止重复创建 SettingsHub Panel
         if self.active_tab_id == HOSTS_HUB_TAB_ID {
             return;
@@ -1114,8 +1126,8 @@ impl Workspace {
         );
 
         // 订阅 SettingsHub panel 的事件
-        let subscription = cx.subscribe(&hostshub_panel, |this, _, event: &PanelEvent, cx| {
-            this.handle_panel_event(event, cx);
+        let subscription = cx.subscribe_in(&hostshub_panel, window, |this, _, event: &PanelEvent, window, cx| {
+            this.handle_panel_event(event, window, cx);
         });
         self.panel_subscriptions
             .insert(HOSTS_HUB_TAB_ID.to_string(), subscription);
@@ -1123,7 +1135,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn show_file_browser_panel(&mut self, target: FileBrowserTarget, cx: &mut Context<Self>) {
+    fn show_file_browser_panel(&mut self, target: FileBrowserTarget, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
             if let Some(panel) = tab_info.container.get_first_panel() {
                 self.replace_or_update_file_browser_panel(&panel, target, cx);
@@ -1155,8 +1167,8 @@ impl Workspace {
             tab_bar.add_tab(TabItem::new(FILE_BROWSER_TAB_ID, "Files"), cx);
         });
 
-        let subscription = cx.subscribe(&file_browser_panel, |this, _, event: &PanelEvent, cx| {
-            this.handle_panel_event(event, cx);
+        let subscription = cx.subscribe_in(&file_browser_panel, window, |this, _, event: &PanelEvent, window, cx| {
+            this.handle_panel_event(event, window, cx);
         });
         self.panel_subscriptions.insert(
             file_browser_panel.read(cx).panel_id().to_string(),
@@ -1168,7 +1180,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn show_editor_panel(&mut self, _panel_id: String, path: String, cx: &mut Context<Self>) {
+    fn show_editor_panel(&mut self, _panel_id: String, path: String, window: &mut Window, cx: &mut Context<Self>) {
         // Read file content
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         // Guess language from extension
@@ -1203,7 +1215,7 @@ impl Workspace {
             .to_string();
 
         let editor_panel = cx.new(|cx| {
-            let editor_view = cx.new(|cx| EditorView::with_file(&path, &content, Some(&language), cx));
+            let editor_view = cx.new(|cx| EditorView::with_file(&path, &content, Some(&language), window, cx));
             Panel::with_editor(
                 format!("editor-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
@@ -1223,8 +1235,8 @@ impl Workspace {
             tab_bar.add_tab(TabItem::new(&tab_id, &tab_label), cx);
         });
 
-        let subscription = cx.subscribe(&editor_panel, |this, _, event: &PanelEvent, cx| {
-            this.handle_panel_event(event, cx);
+        let subscription = cx.subscribe_in(&editor_panel, window, |this, _, event: &PanelEvent, window, cx| {
+            this.handle_panel_event(event, window, cx);
         });
         self.panel_subscriptions.insert(
             editor_panel.read(cx).panel_id().to_string(),
@@ -1390,8 +1402,8 @@ impl Workspace {
             tab_bar.add_tab(TabItem::new(&tab_id, &label), cx)
         });
 
-        let subscription = cx.subscribe(&panel, |this, _, event: &PanelEvent, cx| {
-            this.handle_panel_event(event, cx);
+        let subscription = cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
+            this.handle_panel_event(event, window, cx);
         });
         self.panel_subscriptions
             .insert(panel.read(cx).panel_id().to_string(), subscription);
