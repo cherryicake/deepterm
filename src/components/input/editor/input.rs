@@ -39,7 +39,9 @@ impl EditorInput {
 impl RenderOnce for EditorInput {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state.update(cx, |state, _cx| {
-            state.disabled = self.disabled;
+            if state.disabled != self.disabled {
+                state.disabled = self.disabled;
+            }
         });
 
         let state = self.state.read(cx);

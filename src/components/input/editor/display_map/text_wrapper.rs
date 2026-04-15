@@ -174,7 +174,25 @@ impl TextWrapper {
         let start_row = start_row.min(self.lines.len().saturating_sub(1));
         let end_row = self.text.offset_to_point(range.end).row;
         let end_row = end_row.min(self.lines.len().saturating_sub(1));
-        let rows_range = start_row..=end_row;
+
+        let new_start_row = changed_text.offset_to_point(range.start).row;
+        let new_end_row = changed_text
+            .offset_to_point(range.start + new_text.len())
+            .row;
+
+        let new_text_has_newline = new_text.to_string().contains('\n');
+
+        let (rows_range, new_range) = if new_text_has_newline || start_row != end_row {
+            // Multi-line edit: rewrap from start row to end to ensure line count stays in sync.
+            let rows_range = start_row..=self.lines.len().saturating_sub(1);
+            let new_range = changed_text.line_start_offset(new_start_row)..changed_text.len();
+            (rows_range, new_range)
+        } else {
+            let rows_range = start_row..=end_row;
+            let new_range = changed_text.line_start_offset(new_start_row)
+                ..changed_text.line_end_offset(new_end_row);
+            (rows_range, new_range)
+        };
 
         if rows_range.contains(&self.longest_row.row) {
             self.longest_row = LongestRow::default();
@@ -182,15 +200,6 @@ impl TextWrapper {
 
         let mut longest_row_ix = self.longest_row.row;
         let mut longest_row_len = self.longest_row.len;
-
-        // To add the new lines.
-        let new_start_row = changed_text.offset_to_point(range.start).row;
-        let new_start_offset = changed_text.line_start_offset(new_start_row);
-        let new_end_row = changed_text
-            .offset_to_point(range.start + new_text.len())
-            .row;
-        let new_end_offset = changed_text.line_end_offset(new_end_row);
-        let new_range = new_start_offset..new_end_offset;
 
         let mut new_lines = vec![];
         let wrap_width = self.wrap_width;

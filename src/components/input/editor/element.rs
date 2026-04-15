@@ -1,26 +1,27 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Half,
-    HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId, MouseButton,
-    MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size, Style, TextAlign, TextRun,
-    TextStyle, UnderlineStyle, Window, fill, point, px, relative, size,
+    fill, point, px, relative, size, App, Bounds, Corners, Element, ElementId, ElementInputHandler,
+    Entity, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement,
+    LayoutId, MouseButton, MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size,
+    Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
-    theme::ActiveTheme as _,
     components::button::Size as ButtonSize,
-    components::input::editor::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
+    components::input::editor::{
+        blink_cursor::CURSOR_WIDTH, display_map::LineLayout, RopeExt as _,
+    },
+    theme::ActiveTheme as _,
 };
 
-use super::{InputState, LastLayout, WhitespaceIndicators, mode::InputMode};
+use super::{mode::InputMode, InputState, LastLayout, WhitespaceIndicators};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
-const FOLD_ICON_WIDTH: Pixels = px(14.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 
@@ -739,14 +740,6 @@ impl TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> FoldIconLayout {
-        // First pass: collect fold information from state
-        struct FoldInfo {
-            buffer_line: usize,
-            is_folded: bool,
-            display_row: usize,
-            offset_y: Pixels,
-        }
-
         let line_number_hitbox = window.insert_hitbox(
             Bounds::new(
                 bounds.origin + point(px(0.), last_layout.visible_top),
@@ -755,7 +748,7 @@ impl TextElement {
             HitboxBehavior::Normal,
         );
 
-        let mut icon_layout = FoldIconLayout {
+        let icon_layout = FoldIconLayout {
             line_number_hitbox,
             icons: vec![],
         };
@@ -869,7 +862,32 @@ impl TextElement {
                     )
                 };
 
+                // Defensive checks to avoid panics from out-of-sync display map
+                if range.start > line_text.len()
+                    || range.end > line_text.len()
+                    || !line_text.is_char_boundary(range.start)
+                    || !line_text.is_char_boundary(range.end)
+                {
+                    log::error!(
+                        "layout_lines invalid range: line_text.len={}, range={:?}, buffer_line={}",
+                        line_text.len(),
+                        range,
+                        buffer_line
+                    );
+                    continue;
+                }
+
                 let sub_line: SharedString = line_text[range.clone()].to_string().into();
+                let runs_len: usize = line_runs.iter().map(|r| r.len).sum();
+                if runs_len != sub_line.len() {
+                    log::error!(
+                        "layout_lines run length mismatch: sub_line.len={}, runs_len={}, buffer_line={}, range={:?}",
+                        sub_line.len(),
+                        runs_len,
+                        buffer_line,
+                        range
+                    );
+                }
                 let shaped_line = window
                     .text_system()
                     .shape_line(sub_line, font_size, &line_runs, None);
@@ -915,22 +933,23 @@ impl TextElement {
         let highlight_theme = cx.theme().highlight_theme.clone();
 
         // Helper to flush a contiguous range of lines
-        let mut flush_range = |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
-            let byte_start = text.line_start_offset(start_line);
-            let byte_end = if is_multi_line {
-                // +1 for `\n`
-                text.line_start_offset(end_line + 1)
-            } else {
-                text.line_end_offset(end_line)
-            };
-            let range_styles = if skip {
-                vec![(byte_start..byte_end, HighlightStyle::default())]
-            } else {
-                highlighter.styles(&(byte_start..byte_end), &highlight_theme)
-            };
+        let mut flush_range =
+            |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
+                let byte_start = text.line_start_offset(start_line);
+                let byte_end = if is_multi_line {
+                    // +1 for `\n`
+                    text.line_start_offset(end_line + 1)
+                } else {
+                    text.line_end_offset(end_line)
+                };
+                let range_styles = if skip {
+                    vec![(byte_start..byte_end, HighlightStyle::default())]
+                } else {
+                    highlighter.styles(&(byte_start..byte_end), &highlight_theme)
+                };
 
-            *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
-        };
+                *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
+            };
 
         // Group contiguous visible lines into ranges and call styles() once per range
         let mut visible_iter = visible_buffer_lines.iter().peekable();
@@ -1148,10 +1167,7 @@ impl Element for TextElement {
             .unwrap_or(text_style.color);
         text_style.color = fg;
         let (display_text, text_color) = if is_empty {
-            (
-                &Rope::from(placeholder.as_str()),
-                cx.theme().text_muted,
-            )
+            (&Rope::from(placeholder.as_str()), cx.theme().text_muted)
         } else if state.masked {
             (
                 &Rope::from(MASK_CHAR.to_string().repeat(text.chars().count())),

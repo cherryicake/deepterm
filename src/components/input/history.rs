@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt::Debug;
 
 use super::change::{Change, HistoryItem};
@@ -6,9 +7,9 @@ use super::change::{Change, HistoryItem};
 #[derive(Debug)]
 pub struct History<I: HistoryItem> {
     /// undo 栈
-    undos: Vec<I>,
+    undos: VecDeque<I>,
     /// redo 栈
-    redos: Vec<I>,
+    redos: VecDeque<I>,
     /// 当前版本号
     version: usize,
     /// 是否忽略变更记录（undo/redo 操作时使用）
@@ -98,7 +99,7 @@ where
 
         // 限制 undo 栈大小
         if self.undos.len() >= self.max_undos {
-            self.undos.remove(0);
+            self.undos.pop_front();
         }
 
         if self.unique {
@@ -111,16 +112,16 @@ where
 
         let mut item = item;
         item.set_version(version);
-        self.undos.push(item);
+        self.undos.push_back(item);
     }
 
     /// 获取 undo 栈
-    pub fn undos(&self) -> &Vec<I> {
+    pub fn undos(&self) -> &VecDeque<I> {
         &self.undos
     }
 
     /// 获取 redo 栈
-    pub fn redos(&self) -> &Vec<I> {
+    pub fn redos(&self) -> &VecDeque<I> {
         &self.redos
     }
 
@@ -132,46 +133,38 @@ where
 
     /// 执行 undo，返回被撤销的变更列表
     pub fn undo(&mut self) -> Option<Vec<I>> {
-        if let Some(first_change) = self.undos.pop() {
-            let mut changes = vec![first_change.clone()];
-            // 收集同一版本的所有变更
-            while self
-                .undos
-                .iter()
-                .filter(|c| c.version() == first_change.version())
-                .count()
-                > 0
-            {
-                changes.push(self.undos.pop().unwrap());
+        let first_change = self.undos.pop_back()?;
+        let target_version = first_change.version();
+        let mut changes = vec![first_change];
+        // 收集同一版本的所有变更
+        while let Some(change) = self.undos.back() {
+            if change.version() == target_version {
+                changes.push(self.undos.pop_back().unwrap());
+            } else {
+                break;
             }
-            // 将变更放入 redo 栈
-            self.redos.extend(changes.clone());
-            Some(changes)
-        } else {
-            None
         }
+        // 将变更放入 redo 栈
+        self.redos.extend(changes.iter().cloned());
+        Some(changes)
     }
 
     /// 执行 redo，返回被重做的变更列表
     pub fn redo(&mut self) -> Option<Vec<I>> {
-        if let Some(first_change) = self.redos.pop() {
-            let mut changes = vec![first_change.clone()];
-            // 收集同一版本的所有变更
-            while self
-                .redos
-                .iter()
-                .filter(|c| c.version() == first_change.version())
-                .count()
-                > 0
-            {
-                changes.push(self.redos.pop().unwrap());
+        let first_change = self.redos.pop_back()?;
+        let target_version = first_change.version();
+        let mut changes = vec![first_change];
+        // 收集同一版本的所有变更
+        while let Some(change) = self.redos.back() {
+            if change.version() == target_version {
+                changes.push(self.redos.pop_back().unwrap());
+            } else {
+                break;
             }
-            // 将变更放入 undo 栈
-            self.undos.extend(changes.clone());
-            Some(changes)
-        } else {
-            None
         }
+        // 将变更放入 undo 栈
+        self.undos.extend(changes.iter().cloned());
+        Some(changes)
     }
 }
 
@@ -292,7 +285,7 @@ mod tests {
 
         // Check the version and undo stack
         assert_eq!(history.undos().len(), 3);
-        assert_eq!(history.undos().last().unwrap().tab_index, 1);
+        assert_eq!(history.undos().back().unwrap().tab_index, 1);
 
         // Undo the last change
         let changes = history.undo().unwrap();

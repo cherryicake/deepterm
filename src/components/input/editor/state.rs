@@ -2,12 +2,11 @@
 //!
 //! Based on the `Input` example from the `gpui` crate.
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
-use anyhow::Result;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, Subscription, Task, UTF16Selection, Window, actions, point, px,
+    SharedString, Subscription, UTF16Selection, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
@@ -1084,39 +1083,6 @@ impl InputState {
         logical_end
     }
 
-    /// Get start line of selection start or end (The min value).
-    ///
-    /// This is means is always get the first line of selection.
-    pub(crate) fn start_of_line_of_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> usize {
-        if self.mode.is_single_line() {
-            return 0;
-        }
-
-        let mut offset =
-            self.previous_boundary(self.selected_range.start.min(self.selected_range.end));
-        if self.text.char_at(offset) == Some('\r') {
-            offset += 1;
-        }
-
-        let line = self
-            .text_for_range(self.range_to_utf16(&(0..offset + 1)), &mut None, window, cx)
-            .unwrap_or_default()
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        line
-    }
-
-    /// Get indent string of next line.
-    pub(crate) fn indent_inline(&mut self, _: &super::IndentInline, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn outdent_inline(&mut self, _: &super::OutdentInline, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn indent_block(&mut self, _: &super::Indent, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn outdent_block(&mut self, _: &super::Outdent, _window: &mut Window, _cx: &mut Context<Self>) {}
-
     ///
     /// To get current and next line indent, to return more depth one.
     pub(crate) fn indent_of_next_line(&mut self) -> String {
@@ -1266,15 +1232,6 @@ impl InputState {
     }
 
     pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
-            return;
-        }
-
-        // Clear inline completion on enter (user chose not to accept it)
-        if self.has_inline_completion() {
-            self.clear_inline_completion(cx);
-        }
-
         if self.mode.is_multi_line() {
             // Get current line indent
             let indent = if self.mode.is_code_editor() {
@@ -1303,15 +1260,8 @@ impl InputState {
         self.scroll_to(0, None, cx);
     }
 
-    pub(crate) fn escape(&mut self, action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
-            return;
-        }
-
-        // Clear inline completion on escape
-        if self.has_inline_completion() {
-            self.clear_inline_completion(cx);
-            return; // Consume the escape, don't propagate
+    pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clean_on_escape {
         }
 
         if self.ime_marked_range.is_some() {
@@ -1328,12 +1278,9 @@ impl InputState {
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Clear inline completion on any mouse interaction
-        self.clear_inline_completion(cx);
-
         // If there have IME marked range and is empty (Means pressed Esc to abort IME typing)
         // Clear the marked range.
         if let Some(ime_marked_range) = &self.ime_marked_range {
@@ -1344,18 +1291,6 @@ impl InputState {
 
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
-
-        // Triple click to select line
-        if event.button == MouseButton::Left && event.click_count >= 3 {
-            self.select_line(offset, window, cx);
-            return;
-        }
-
-        // Double click to select word
-        if event.button == MouseButton::Left && event.click_count == 2 {
-            self.select_word(offset, window, cx);
-            return;
-        }
 
         // Ignore right click
         if event.button == MouseButton::Right {
@@ -1385,28 +1320,15 @@ impl InputState {
     pub(crate) fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
         // Check if mouse is within bounds
-        let within_bounds = self
+        let _within_bounds = self
             .last_bounds
             .as_ref()
             .map(|bounds| bounds.contains(&event.position))
             .unwrap_or(false);
-
-        if !within_bounds {
-            // Clear hover when mouse leaves the input
-            self.clear_hover_state(cx);
-            return;
-        }
-
-        // Show diagnostic popover on mouse move
-        let offset = self.index_for_mouse_position(event.position);
-        self.handle_mouse_move(offset, event, window, cx);
-
-        // Diagnostics / hover popover disabled in DeepTerm
-        let _ = offset;
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -1723,8 +1645,6 @@ impl InputState {
     ///
     /// Ensure the offset use self.next_boundary or self.previous_boundary to get the correct offset.
     pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.clear_inline_completion(cx);
-
         let offset = offset.clamp(0, self.text.len());
         if self.selection_reversed {
             self.selected_range.start = offset
@@ -1814,7 +1734,6 @@ impl InputState {
                 offset -= 1;
             }
         }
-
         self.clamp_offset_to_visible_backward(offset)
     }
 
@@ -1825,13 +1744,12 @@ impl InputState {
                 offset += 1;
             }
         }
-
         self.clamp_offset_to_visible_forward(offset)
     }
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
     pub(crate) fn show_cursor(&self, window: &Window, cx: &App) -> bool {
-        (self.focus_handle.is_focused(window) || self.is_context_menu_open(cx))
+        self.focus_handle.is_focused(window)
             && !self.disabled
             && self.blink_cursor.read(cx).visible()
             && window.is_window_active()
@@ -1848,7 +1766,6 @@ impl InputState {
         // NOTE: Do not cancel select, when blur.
         // Because maybe user want to copy the selected text by AppMenuBar (will take focus handle).
 
-        self.clear_inline_completion(cx);
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.stop(cx);
         });
@@ -2078,10 +1995,11 @@ impl InputState {
                     let new_tree = parser.parse_with_options(
                         &mut |offset, _| {
                             if offset >= text.len() {
-                                ""
+                                &[] as &[u8]
                             } else {
                                 let (chunk, chunk_byte_ix) = text.chunk(offset);
-                                &chunk[offset - chunk_byte_ix..]
+                                let start_in_chunk = offset - chunk_byte_ix;
+                                chunk.as_bytes().get(start_in_chunk..).unwrap_or(&[])
                             }
                         },
                         old_tree.as_ref(),
@@ -2194,7 +2112,7 @@ impl EntityInputHandler for InputState {
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 
-        let mut new_offset = (range.start + new_text.len()).min(self.text.len());
+        let new_offset = (range.start + new_text.len()).min(self.text.len());
 
         if self.mode.is_single_line() {
             let pending_text = self.text.to_string();
@@ -2227,11 +2145,7 @@ impl EntityInputHandler for InputState {
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         self.update_preferred_column();
-        self.update_search(cx);
         self.mode.update_auto_grow(&self.display_map);
-        if !self.silent_replace_text {
-            self.handle_completion_trigger(&range, &new_text, window, cx);
-        }
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -2383,23 +2297,6 @@ impl EntityInputHandler for InputState {
 
         None
     }
-}
-
-// === Stubs for features disabled in DeepTerm ===
-impl InputState {
-    pub(crate) fn clear_inline_completion(&mut self, _cx: &mut Context<Self>) {}
-    pub(crate) fn has_inline_completion(&self) -> bool { false }
-    pub(crate) fn handle_action_for_context_menu(&mut self, _action: Box<dyn Action>, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
-    pub(crate) fn hide_context_menu(&mut self, _cx: &mut Context<Self>) {}
-    pub(crate) fn is_context_menu_open(&self, _cx: &App) -> bool { false }
-    pub(crate) fn handle_right_click_menu(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn handle_click_hover_definition(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
-    pub(crate) fn clear_hover_state(&mut self, _cx: &mut Context<Self>) {}
-    pub(crate) fn handle_mouse_move(&mut self, _offset: usize, _event: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn select_word(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn select_line(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(crate) fn update_search(&mut self, _cx: &mut Context<Self>) {}
-    pub(crate) fn handle_completion_trigger(&mut self, _range: &Range<usize>, _new_text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 impl Focusable for InputState {

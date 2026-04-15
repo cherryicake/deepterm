@@ -10,8 +10,7 @@ use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
 use crate::components::input::editor::{InputEdit, RopeExt as _, TabSize};
 
-#[allow(dead_code)]
-pub(super) struct PendingBackgroundParse {
+pub(crate) struct PendingBackgroundParse {
     pub highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
     pub parse_task: Rc<RefCell<Option<Task<()>>>>,
     pub language: SharedString,

@@ -50,8 +50,6 @@ impl InputState {
         self.scroll_to(offset, direction, cx);
         self.pause_blink_cursor(cx);
         self.update_preferred_column();
-        self.hide_context_menu(cx);
-        self.clear_inline_completion(cx);
         cx.notify()
     }
 
@@ -154,11 +152,7 @@ impl InputState {
         }
     }
 
-    pub(crate) fn up(&mut self, action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
-            return;
-        }
-
+    pub(crate) fn up(&mut self, _action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
@@ -174,11 +168,7 @@ impl InputState {
         self.move_vertical(-1, window, cx);
     }
 
-    pub(crate) fn down(&mut self, action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
-            return;
-        }
-
+    pub(crate) fn down(&mut self, _action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }

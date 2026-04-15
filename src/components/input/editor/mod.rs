@@ -1,7 +1,6 @@
 pub const MASK_CHAR: char = '•';
 
 pub mod blink_cursor;
-pub mod cursor;
 pub mod display_map;
 pub mod element;
 pub mod indent;
@@ -12,7 +11,6 @@ pub mod rope_ext;
 pub mod selection;
 pub mod state;
 
-pub use blink_cursor::*;
 pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange};
 pub use indent::TabSize;
 pub use input::EditorInput;

@@ -1,9 +1,12 @@
 use gpui::HighlightStyle;
-use ropey::Rope;
+use ropey::{ChunkCursor, Rope};
 use std::collections::BTreeSet;
 use std::ops::Range;
 use streaming_iterator::StreamingIterator;
+use sum_tree::Bias;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
+
+use crate::components::input::editor::RopeExt as _;
 
 pub struct InjectionParseData;
 pub struct InjectionLayer;
@@ -13,7 +16,7 @@ pub struct SimpleHighlighter {
     parser: Parser,
     query: Option<Query>,
     tree: Option<Tree>,
-    text: String,
+    text: Rope,
 }
 
 impl SimpleHighlighter {
@@ -87,7 +90,7 @@ impl SimpleHighlighter {
             parser,
             query,
             tree: None,
-            text: String::new(),
+            text: Rope::new(),
         }
     }
 
@@ -102,22 +105,37 @@ impl SimpleHighlighter {
 
     pub fn update(
         &mut self,
-        _edit: Option<tree_sitter::InputEdit>,
+        edit: Option<tree_sitter::InputEdit>,
         text: &Rope,
         _timeout: Option<std::time::Duration>,
     ) -> bool {
-        self.text = text.to_string();
-        // Only reuse the old tree for incremental parsing when both the old
-        // tree and the new text are non-empty. Empty <-> non-empty transitions
-        // (common after cut-all + undo) cannot be safely incrementally parsed
-        // without a proper InputEdit, and will either panic or produce a
-        // corrupted syntax tree that yields no highlight styles.
-        let old_tree = self.tree.as_ref().filter(|t| {
-            let tree_len = t.root_node().end_byte();
+        self.text = text.clone();
+        let mut old_tree = self.tree.clone();
+
+        if let Some(tree) = old_tree.as_mut() {
+            let tree_len = tree.root_node().end_byte();
             let text_len = self.text.len();
-            tree_len > 0 && text_len > 0
-        });
-        self.tree = self.parser.parse(&self.text, old_tree);
+            if tree_len > 0 && text_len > 0 {
+                if let Some(edit) = edit {
+                    tree.edit(&edit);
+                }
+            } else {
+                // Cannot safely reuse tree for empty <-> non-empty transitions
+                old_tree = None;
+            }
+        }
+
+        self.tree = self.parser.parse_with(
+            &mut |offset, _| {
+                if offset >= self.text.len() {
+                    return &[] as &[u8];
+                }
+                let (chunk, chunk_byte_ix) = self.text.chunk(offset);
+                let start_in_chunk = offset - chunk_byte_ix;
+                chunk.as_bytes().get(start_in_chunk..).unwrap_or(&[])
+            },
+            old_tree.as_ref(),
+        );
         true
     }
 
@@ -140,15 +158,19 @@ impl SimpleHighlighter {
 
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(range.clone());
-        let mut matches = cursor.matches(query, tree.root_node(), self.text.as_bytes());
+        let provider = RopeTextProvider(&self.text);
+        let mut matches = cursor.matches(query, tree.root_node(), provider);
 
         let mut styles = Vec::new();
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let name = query.capture_names()[capture.index as usize];
                 let cap_range = capture.node.byte_range();
-                let s = cap_range.start.max(range.start).min(range.end);
-                let e = cap_range.end.min(range.end).max(s);
+                let mut s = cap_range.start.max(range.start).min(range.end);
+                let mut e = cap_range.end.min(range.end).max(s);
+                // Ensure byte offsets are on char boundaries to avoid invalid UTF-8 slices
+                s = self.text.clip_offset(s, Bias::Right);
+                e = self.text.clip_offset(e, Bias::Left);
                 if e > s {
                     styles.push((s..e, theme.style(name).unwrap_or_default()));
                 }
@@ -192,6 +214,57 @@ impl SimpleHighlighter {
         _text: &Rope,
     ) -> std::collections::HashMap<gpui::SharedString, InjectionLayer> {
         std::collections::HashMap::new()
+    }
+}
+
+struct RopeTextProvider<'a>(&'a Rope);
+struct RopeByteChunks<'a> {
+    cursor: ChunkCursor<'a>,
+    node_start: usize,
+    node_end: usize,
+    at_first: bool,
+}
+
+impl<'a> tree_sitter::TextProvider<&'a [u8]> for RopeTextProvider<'a> {
+    type I = RopeByteChunks<'a>;
+
+    fn text(&mut self, node: tree_sitter::Node) -> Self::I {
+        let range = node.byte_range();
+        let cursor = self.0.chunk_cursor_at(range.start);
+        RopeByteChunks {
+            cursor,
+            node_start: range.start,
+            node_end: range.end,
+            at_first: true,
+        }
+    }
+}
+
+impl<'a> Iterator for RopeByteChunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.at_first {
+            if !self.cursor.next() {
+                return None;
+            }
+        }
+        self.at_first = false;
+
+        let chunk_byte_start = self.cursor.byte_offset();
+        if chunk_byte_start >= self.node_end {
+            return None;
+        }
+
+        let chunk = self.cursor.chunk().as_bytes();
+        let start_in_chunk = self.node_start.saturating_sub(chunk_byte_start);
+        let end_in_chunk = (self.node_end - chunk_byte_start).min(chunk.len());
+
+        if start_in_chunk >= end_in_chunk {
+            return None;
+        }
+
+        Some(&chunk[start_in_chunk..end_in_chunk])
     }
 }
 
@@ -305,7 +378,7 @@ fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::highlighter::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
+    use crate::highlighter::{registry::SyntaxColors, HighlightTheme, HighlightThemeStyle};
     use crate::theme::ThemeAppearance;
 
     fn test_theme() -> HighlightTheme {
@@ -337,41 +410,56 @@ mod tests {
         let theme = test_theme();
         let styles = h.styles(&(0..code.len()), &theme);
         for (range, style) in &styles {
-            println!("{:?}: {:?} -> {:?}", range, &code[range.clone()], style.color);
+            println!(
+                "{:?}: {:?} -> {:?}",
+                range,
+                &code[range.clone()],
+                style.color
+            );
         }
 
         // Check that 'let' is highlighted as keyword
         let let_range = 0..3;
         assert!(
-            styles.iter().any(|(r, s)| r.start <= let_range.start && r.end >= let_range.end && s.color == Some(gpui::red())),
+            styles.iter().any(|(r, s)| r.start <= let_range.start
+                && r.end >= let_range.end
+                && s.color == Some(gpui::red())),
             "'let' should be highlighted as keyword (red)"
         );
 
         // Check that 'const' is highlighted as keyword
-        let const_range = 12..17;
+        let const_range = 11..16;
         assert!(
-            styles.iter().any(|(r, s)| r.start <= const_range.start && r.end >= const_range.end && s.color == Some(gpui::red())),
+            styles.iter().any(|(r, s)| r.start <= const_range.start
+                && r.end >= const_range.end
+                && s.color == Some(gpui::red())),
             "'const' should be highlighted as keyword (red)"
         );
 
         // Check that 'fn' is highlighted as keyword
-        let fn_range = 28..30;
+        let fn_range = 29..31;
         assert!(
-            styles.iter().any(|(r, s)| r.start <= fn_range.start && r.end >= fn_range.end && s.color == Some(gpui::red())),
+            styles.iter().any(|(r, s)| r.start <= fn_range.start
+                && r.end >= fn_range.end
+                && s.color == Some(gpui::red())),
             "'fn' should be highlighted as keyword (red)"
         );
 
         // Check that 'i32' is highlighted as type
         let i32_range = 20..23;
         assert!(
-            styles.iter().any(|(r, s)| r.start <= i32_range.start && r.end >= i32_range.end && s.color == Some(gpui::blue())),
+            styles.iter().any(|(r, s)| r.start <= i32_range.start
+                && r.end >= i32_range.end
+                && s.color == Some(gpui::blue())),
             "'i32' should be highlighted as type (blue)"
         );
 
         // Check that 'main' is highlighted as function
-        let main_range = 31..35;
+        let main_range = 32..36;
         assert!(
-            styles.iter().any(|(r, s)| r.start <= main_range.start && r.end >= main_range.end && s.color == Some(gpui::green())),
+            styles.iter().any(|(r, s)| r.start <= main_range.start
+                && r.end >= main_range.end
+                && s.color == Some(gpui::green())),
             "'main' should be highlighted as function (green)"
         );
     }
@@ -386,7 +474,12 @@ mod tests {
         let theme = test_theme();
         let styles = h.styles(&(0..code.len()), &theme);
         for (range, style) in &styles {
-            println!("{:?}: {:?} -> {:?}", range, &code[range.clone()], style.color);
+            println!(
+                "{:?}: {:?} -> {:?}",
+                range,
+                &code[range.clone()],
+                style.color
+            );
         }
 
         // Check coverage
