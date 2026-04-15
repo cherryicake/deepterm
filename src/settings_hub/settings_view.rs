@@ -321,19 +321,20 @@ pub struct SettingsHubCenter {
 }
 
 impl SettingsHubCenter {
-    pub fn new(cx: &mut App) -> Entity<Self> {
-        Self::with_page(cx, SettingsHubPage::Hosts, None)
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
+        Self::with_page(window, cx, SettingsHubPage::Hosts, None)
     }
 
     pub fn with_page(
+        window: &mut Window,
         cx: &mut App,
         page: SettingsHubPage,
         workspace: Option<Entity<Workspace>>,
     ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-            let hosts_view = HostsView::new_with_workspace(cx, workspace);
-            let keychain_view = KeychainView::new(cx);
+            let hosts_view = HostsView::new_with_workspace(window, cx, workspace);
+            let keychain_view = KeychainView::new(window, cx);
             let theme_scroll_handle = ScrollHandle::new();
 
             Self {
@@ -675,11 +676,11 @@ pub struct SettingsHubView {
 }
 
 impl SettingsHubView {
-    pub fn new(cx: &mut App) -> Entity<Self> {
-        Self::new_with_workspace(cx, None)
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
+        Self::new_with_workspace(window, cx, None)
     }
 
-    pub fn new_with_workspace(cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
+    pub fn new_with_workspace(window: &mut Window, cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
@@ -689,11 +690,11 @@ impl SettingsHubView {
 
             // 创建中心内容，默认显示 Hosts 页面，传入 workspace
             let center =
-                SettingsHubCenter::with_page(cx, SettingsHubPage::Hosts, workspace.clone());
+                SettingsHubCenter::with_page(window, cx, SettingsHubPage::Hosts, workspace.clone());
 
             // 创建新主机表单
-            let host_form = HostForm::new(cx);
-            let keychain_editor = KeychainEditor::new(cx);
+            let host_form = HostForm::new(window, cx);
+            let keychain_editor = KeychainEditor::new(window, cx);
 
             left_sidebar.update(cx, |sidebar, _cx| {
                 sidebar.set_active_item("hosts", _cx);

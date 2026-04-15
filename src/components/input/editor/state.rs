@@ -5,11 +5,9 @@
 use anyhow::Result;
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Styled as _,
-    Subscription, Task, UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _,
-    px,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
+    SharedString, Subscription, Task, UTF16Selection, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
@@ -20,23 +18,22 @@ use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
-    DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, change::Change, element::TextElement,
-    mask_pattern::MaskPattern, mode::InputMode, number_input,
+    DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode,
 };
+use crate::components::input::change::Change;
 use crate::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::highlighter::LanguageRegistry;
 use crate::components::input::editor::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::editor::movement::MoveDirection;
 use crate::components::input::editor::{
-    HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection, TabSize,
+    RopeExt as _, Selection,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
-    popovers::{ContextMenu, DiagnosticPopover, HoverPopover, InputContextMenu},
-    search::{self, SearchPanel},
 };
 use crate::components::input::history::History;
 use crate::components::button::Size;
+use lsp_types::Position;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = editor, no_json)]
@@ -104,7 +101,7 @@ pub enum InputEvent {
     Blur,
 }
 
-pub(super) const CONTEXT: &str = "Input";
+pub(crate) const CONTEXT: &str = "Input";
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -230,8 +227,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
     ]);
 
-    search::init(cx);
-    number_input::init(cx);
 }
 
 /// Whitespace indicators for rendering spaces and tabs.
@@ -244,33 +239,33 @@ pub(crate) struct WhitespaceIndicators {
 }
 
 #[derive(Clone)]
-pub(super) struct LastLayout {
+pub(crate) struct LastLayout {
     /// The visible range (no wrap) of lines in the viewport, the value is row (0-based) index.
     /// This is the buffer line range that encompasses all visible lines.
-    pub(super) visible_range: Range<usize>,
+    pub(crate) visible_range: Range<usize>,
     /// The list of visible buffer line indices (excludes hidden/folded lines).
     /// Parallel to `lines`: `visible_buffer_lines[i]` is the buffer line index of `lines[i]`.
-    pub(super) visible_buffer_lines: Vec<usize>,
+    pub(crate) visible_buffer_lines: Vec<usize>,
     /// Byte offset of each visible buffer line in the Rope (parallel to visible_buffer_lines/lines).
-    pub(super) visible_line_byte_offsets: Vec<usize>,
+    pub(crate) visible_line_byte_offsets: Vec<usize>,
     /// The first visible line top position in scroll viewport.
-    pub(super) visible_top: Pixels,
+    pub(crate) visible_top: Pixels,
     /// The range of byte offset of the visible lines.
-    pub(super) visible_range_offset: Range<usize>,
+    pub(crate) visible_range_offset: Range<usize>,
     /// The last layout lines (Only have visible lines, no empty entries for hidden lines).
-    pub(super) lines: Rc<Vec<LineLayout>>,
+    pub(crate) lines: Rc<Vec<LineLayout>>,
     /// The line_height of text layout, this will change will InputElement painted.
-    pub(super) line_height: Pixels,
+    pub(crate) line_height: Pixels,
     /// The wrap width of text layout, this will change will InputElement painted.
-    pub(super) wrap_width: Option<Pixels>,
+    pub(crate) wrap_width: Option<Pixels>,
     /// The line number area width of text layout, if not line number, this will be 0px.
-    pub(super) line_number_width: Pixels,
+    pub(crate) line_number_width: Pixels,
     /// The cursor position (top, left) in pixels.
-    pub(super) cursor_bounds: Option<Bounds<Pixels>>,
+    pub(crate) cursor_bounds: Option<Bounds<Pixels>>,
     /// The text align of the text layout.
-    pub(super) text_align: TextAlign,
+    pub(crate) text_align: TextAlign,
     /// The content width of the text layout.
-    pub(super) content_width: Pixels,
+    pub(crate) content_width: Pixels,
 }
 
 impl LastLayout {
@@ -284,7 +279,7 @@ impl LastLayout {
     }
 
     /// Get the alignment offset for the given line width.
-    pub(super) fn alignment_offset(&self, line_width: Pixels) -> Pixels {
+    pub(crate) fn alignment_offset(&self, line_width: Pixels) -> Pixels {
         match self.text_align {
             TextAlign::Left => px(0.),
             TextAlign::Center => (self.content_width - line_width).half().max(px(0.)),
@@ -295,85 +290,64 @@ impl LastLayout {
 
 /// InputState to keep editing state of the [`super::Input`].
 pub struct InputState {
-    pub(super) focus_handle: FocusHandle,
-    pub(super) mode: InputMode,
-    pub(super) text: Rope,
-    pub(super) display_map: DisplayMap,
-    pub(super) history: History<Change>,
-    pub(super) blink_cursor: Entity<BlinkCursor>,
-    pub(super) loading: bool,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) mode: InputMode,
+    pub(crate) text: Rope,
+    pub(crate) display_map: DisplayMap,
+    pub(crate) history: History<Change>,
+    pub(crate) blink_cursor: Entity<BlinkCursor>,
+    pub(crate) loading: bool,
     /// Range in UTF-8 length for the selected text.
     ///
     /// - "Hello 世界💝" = 16
     /// - "💝" = 4
-    pub(super) selected_range: Selection,
-    pub(super) search_panel: Option<Entity<SearchPanel>>,
-    pub(super) searchable: bool,
+    pub(crate) selected_range: Selection,
+    pub(crate) searchable: bool,
     /// Range for save the selected word, use to keep word range when drag move.
-    pub(super) selected_word_range: Option<Selection>,
-    pub(super) selection_reversed: bool,
+    pub(crate) selected_word_range: Option<Selection>,
+    pub(crate) selection_reversed: bool,
     /// The marked range is the temporary insert text on IME typing.
-    pub(super) ime_marked_range: Option<Selection>,
-    pub(super) last_layout: Option<LastLayout>,
-    pub(super) last_cursor: Option<usize>,
+    pub(crate) ime_marked_range: Option<Selection>,
+    pub(crate) last_layout: Option<LastLayout>,
+    pub(crate) last_cursor: Option<usize>,
     /// The input container bounds
-    pub(super) input_bounds: Bounds<Pixels>,
+    pub(crate) input_bounds: Bounds<Pixels>,
     /// The text bounds
-    pub(super) last_bounds: Option<Bounds<Pixels>>,
-    pub(super) last_selected_range: Option<Selection>,
-    pub(super) selecting: bool,
-    pub(super) size: Size,
-    pub(super) disabled: bool,
-    pub(super) masked: bool,
-    pub(super) clean_on_escape: bool,
-    pub(super) soft_wrap: bool,
-    pub(super) show_whitespaces: bool,
+    pub(crate) last_bounds: Option<Bounds<Pixels>>,
+    pub(crate) last_selected_range: Option<Selection>,
+    pub(crate) selecting: bool,
+    pub(crate) size: Size,
+    pub(crate) disabled: bool,
+    pub(crate) masked: bool,
+    pub(crate) clean_on_escape: bool,
+    pub(crate) soft_wrap: bool,
+    pub(crate) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
-    pub(super) pattern: Option<regex::Regex>,
-    pub(super) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
+    pub(crate) pattern: Option<regex::Regex>,
+    pub(crate) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
-    pub(super) text_align: TextAlign,
-
-    /// The mask pattern for formatting the input text
-    pub(crate) mask_pattern: MaskPattern,
-    pub(super) placeholder: SharedString,
-
-    /// Popover
-    diagnostic_popover: Option<Entity<DiagnosticPopover>>,
-    /// Completion/CodeAction context menu
-    pub(super) context_menu_content: Option<ContextMenu>,
-    pub(super) context_menu: Entity<InputContextMenu>,
-    pub(super) enable_context_menu: bool,
-
-    /// A flag to indicate if we are currently inserting a completion item.
-    pub(super) completion_inserting: bool,
-    pub(super) hover_popover: Option<Entity<HoverPopover>>,
-    /// The LSP definitions locations for "Go to Definition" feature.
-    pub(super) hover_definition: HoverDefinition,
-
-    pub lsp: Lsp,
+    pub(crate) text_align: TextAlign,
+    pub(crate) placeholder: SharedString,
+    pub(crate) placeholder_font_size: Option<Pixels>,
 
     /// A flag to indicate if we have a pending update to the text.
     ///
     /// If true, will call some update (for example LSP, Syntax Highlight) before render.
-    _pending_update: bool,
+    pub(crate) _pending_update: bool,
     /// A flag to indicate if we should ignore the next completion event.
-    pub(super) silent_replace_text: bool,
+    pub(crate) silent_replace_text: bool,
 
     /// To remember the horizontal column (x-coordinate) of the cursor position for keep column for move up/down.
     ///
     /// The first element is the x-coordinate (Pixels), preferred to use this.
     /// The second element is the column (usize), fallback to use this.
-    pub(super) preferred_column: Option<(Pixels, usize)>,
+    pub(crate) preferred_column: Option<(Pixels, usize)>,
     _subscriptions: Vec<Subscription>,
-
-    pub(super) _context_menu_task: Task<Result<()>>,
-    pub(super) inline_completion: InlineCompletion,
 }
 
 impl EventEmitter<InputEvent> for InputState {}
@@ -406,7 +380,6 @@ impl InputState {
         ];
 
         let text_style = window.text_style();
-        let mouse_context_menu = InputContextMenu::new(cx.entity(), window, cx);
 
         Self {
             focus_handle: focus_handle.clone(),
@@ -415,7 +388,6 @@ impl InputState {
             blink_cursor,
             history,
             selected_range: Selection::default(),
-            search_panel: None,
             searchable: false,
             selected_word_range: None,
             selection_reversed: false,
@@ -440,22 +412,12 @@ impl InputState {
             deferred_scroll_offset: None,
             preferred_column: None,
             placeholder: SharedString::default(),
-            mask_pattern: MaskPattern::default(),
+            placeholder_font_size: None,
             text_align: TextAlign::Left,
-            lsp: Lsp::default(),
-            diagnostic_popover: None,
-            context_menu_content: None,
-            context_menu: mouse_context_menu,
-            enable_context_menu: true,
-            completion_inserting: false,
-            hover_popover: None,
-            hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
             size: Size::default(),
             _subscriptions,
-            _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
-            inline_completion: InlineCompletion::default(),
             cursor_line_end_affinity: false,
         }
     }
@@ -502,14 +464,6 @@ impl InputState {
         self
     }
 
-    /// Sets whether the context menu that shows on right-click is enabled.
-    ///
-    /// The context menu is enabled by default.
-    pub fn context_menu(mut self, enable: bool) -> Self {
-        self.enable_context_menu = enable;
-        self
-    }
-
     /// Set this input is searchable, default is false (Default true for Code Editor).
     pub fn searchable(mut self, searchable: bool) -> Self {
         debug_assert!(self.mode.is_multi_line());
@@ -520,6 +474,12 @@ impl InputState {
     /// Set placeholder
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Set placeholder font size
+    pub fn placeholder_font_size(mut self, size: Pixels) -> Self {
+        self.placeholder_font_size = Some(size);
         self
     }
 
@@ -653,7 +613,7 @@ impl InputState {
     /// - The index of the line (zero-based) containing the offset.
     /// - The index of the sub-line (zero-based) within the line containing the offset.
     /// - The position of the offset.
-    pub(super) fn line_and_position_for_offset(
+    pub(crate) fn line_and_position_for_offset(
         &self,
         offset: usize,
     ) -> (usize, usize, Option<Point<Pixels>>) {
@@ -699,13 +659,36 @@ impl InputState {
 
         if self.mode.is_code_editor() {
             self._pending_update = true;
-            self.lsp.reset();
         }
 
         // Move scroll to top
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
 
         cx.notify();
+    }
+
+    /// Set the text of the input field without requiring a window.
+    ///
+    /// This is a lightweight alternative to [`Self::set_value`] for simple single-line inputs.
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.history.ignore = true;
+        let text: SharedString = text.into();
+        self.text = Rope::from(text.as_ref());
+        if self.mode.is_single_line() {
+            self.selected_range = (self.text.len()..self.text.len()).into();
+        } else {
+            self.selected_range.clear();
+        }
+        self.ime_marked_range = None;
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        self.history.ignore = false;
+        cx.emit(InputEvent::Change);
+        cx.notify();
+    }
+
+    /// Clear the input text.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.set_text("", cx);
     }
 
     /// Insert text at the current cursor position.
@@ -897,11 +880,6 @@ impl InputState {
         SharedString::new(self.selected_text().to_string())
     }
 
-    /// Return the value without mask.
-    pub fn unmask_value(&self) -> SharedString {
-        self.mask_pattern.unmask(&self.text.to_string()).into()
-    }
-
     /// Return the text [`Rope`] of the input field.
     pub fn text(&self) -> &Rope {
         &self.text
@@ -938,15 +916,15 @@ impl InputState {
         });
     }
 
-    pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor()), cx);
     }
 
-    pub(super) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor()), cx);
     }
 
-    pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
@@ -954,7 +932,7 @@ impl InputState {
         self.select_to(self.previous_boundary(offset), cx);
     }
 
-    pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
@@ -962,12 +940,12 @@ impl InputState {
         self.select_to(self.next_boundary(offset), cx);
     }
 
-    pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = (0..self.text.len()).into();
         cx.notify();
     }
 
-    pub(super) fn select_to_start(
+    pub(crate) fn select_to_start(
         &mut self,
         _: &SelectToStart,
         _: &mut Window,
@@ -976,7 +954,7 @@ impl InputState {
         self.select_to(0, cx);
     }
 
-    pub(super) fn select_to_end(
+    pub(crate) fn select_to_end(
         &mut self,
         _: &SelectToEnd,
         _: &mut Window,
@@ -986,7 +964,7 @@ impl InputState {
         self.select_to(end, cx);
     }
 
-    pub(super) fn select_to_start_of_line(
+    pub(crate) fn select_to_start_of_line(
         &mut self,
         _: &SelectToStartOfLine,
         _: &mut Window,
@@ -996,7 +974,7 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
-    pub(super) fn select_to_end_of_line(
+    pub(crate) fn select_to_end_of_line(
         &mut self,
         _: &SelectToEndOfLine,
         _: &mut Window,
@@ -1006,7 +984,7 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
-    pub(super) fn select_to_previous_word(
+    pub(crate) fn select_to_previous_word(
         &mut self,
         _: &SelectToPreviousWordStart,
         _: &mut Window,
@@ -1016,7 +994,7 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
-    pub(super) fn select_to_next_word(
+    pub(crate) fn select_to_next_word(
         &mut self,
         _: &SelectToNextWordEnd,
         _: &mut Window,
@@ -1027,7 +1005,7 @@ impl InputState {
     }
 
     /// Return the start offset of the previous word.
-    pub(super) fn previous_start_of_word(&mut self) -> usize {
+    pub(crate) fn previous_start_of_word(&mut self) -> usize {
         let offset = self.selected_range.start;
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
         // FIXME: Avoid to_string
@@ -1040,7 +1018,7 @@ impl InputState {
     }
 
     /// Return the next end offset of the next word.
-    pub(super) fn next_end_of_word(&mut self) -> usize {
+    pub(crate) fn next_end_of_word(&mut self) -> usize {
         let offset = self.cursor();
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
         let right_part = self.text.slice(offset..self.text.len()).to_string();
@@ -1055,7 +1033,7 @@ impl InputState {
     ///
     /// When soft wrap is active, first press goes to visual line start,
     /// second press (already at visual start) goes to logical line start.
-    pub(super) fn start_of_line(&self) -> usize {
+    pub(crate) fn start_of_line(&self) -> usize {
         if self.mode.is_single_line() {
             return 0;
         }
@@ -1082,7 +1060,7 @@ impl InputState {
     ///
     /// When soft wrap is active, first press goes to visual line end,
     /// second press (already at visual end) goes to logical line end.
-    pub(super) fn end_of_line(&self) -> usize {
+    pub(crate) fn end_of_line(&self) -> usize {
         if self.mode.is_single_line() {
             return self.text.len();
         }
@@ -1109,7 +1087,7 @@ impl InputState {
     /// Get start line of selection start or end (The min value).
     ///
     /// This is means is always get the first line of selection.
-    pub(super) fn start_of_line_of_selection(
+    pub(crate) fn start_of_line_of_selection(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1134,9 +1112,14 @@ impl InputState {
     }
 
     /// Get indent string of next line.
+    pub(crate) fn indent_inline(&mut self, _: &super::IndentInline, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn outdent_inline(&mut self, _: &super::OutdentInline, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn indent_block(&mut self, _: &super::Indent, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn outdent_block(&mut self, _: &super::Outdent, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     ///
     /// To get current and next line indent, to return more depth one.
-    pub(super) fn indent_of_next_line(&mut self) -> String {
+    pub(crate) fn indent_of_next_line(&mut self) -> String {
         if self.mode.is_single_line() {
             return "".into();
         }
@@ -1172,7 +1155,7 @@ impl InputState {
         }
     }
 
-    pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor()), cx)
         }
@@ -1180,7 +1163,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor()), cx)
         }
@@ -1188,7 +1171,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn delete_to_beginning_of_line(
+    pub(crate) fn delete_to_beginning_of_line(
         &mut self,
         _: &DeleteToBeginningOfLine,
         window: &mut Window,
@@ -1213,7 +1196,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn delete_to_end_of_line(
+    pub(crate) fn delete_to_end_of_line(
         &mut self,
         _: &DeleteToEndOfLine,
         window: &mut Window,
@@ -1238,7 +1221,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn delete_previous_word(
+    pub(crate) fn delete_previous_word(
         &mut self,
         _: &DeleteToPreviousWordStart,
         window: &mut Window,
@@ -1260,7 +1243,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn delete_next_word(
+    pub(crate) fn delete_next_word(
         &mut self,
         _: &DeleteToNextWordEnd,
         window: &mut Window,
@@ -1282,7 +1265,7 @@ impl InputState {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
@@ -1314,13 +1297,13 @@ impl InputState {
         });
     }
 
-    pub(super) fn clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text("", window, cx);
         self.selected_range = (0..0).into();
         self.scroll_to(0, None, cx);
     }
 
-    pub(super) fn escape(&mut self, action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn escape(&mut self, action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
@@ -1342,7 +1325,7 @@ impl InputState {
         cx.propagate();
     }
 
-    pub(super) fn on_mouse_down(
+    pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -1362,10 +1345,6 @@ impl InputState {
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
 
-        if self.handle_click_hover_definition(event, offset, window, cx) {
-            return;
-        }
-
         // Triple click to select line
         if event.button == MouseButton::Left && event.click_count >= 3 {
             self.select_line(offset, window, cx);
@@ -1378,11 +1357,8 @@ impl InputState {
             return;
         }
 
-        // Show Mouse context menu
+        // Ignore right click
         if event.button == MouseButton::Right {
-            if self.enable_context_menu {
-                self.handle_right_click_menu(event, offset, window, cx);
-            }
             return;
         }
 
@@ -1393,7 +1369,7 @@ impl InputState {
         }
     }
 
-    pub(super) fn on_mouse_up(
+    pub(crate) fn on_mouse_up(
         &mut self,
         _: &MouseUpEvent,
         _window: &mut Window,
@@ -1406,7 +1382,7 @@ impl InputState {
         self.selected_word_range = None;
     }
 
-    pub(super) fn on_mouse_move(
+    pub(crate) fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
@@ -1433,7 +1409,7 @@ impl InputState {
         let _ = offset;
     }
 
-    pub(super) fn on_scroll_wheel(
+    pub(crate) fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
         window: &mut Window,
@@ -1453,11 +1429,9 @@ impl InputState {
         if self.scroll_handle.offset() != old_offset {
             cx.stop_propagation();
         }
-
-        self.diagnostic_popover = None;
     }
 
-    pub(super) fn update_scroll_offset(
+    pub(crate) fn update_scroll_offset(
         &mut self,
         offset: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
@@ -1572,7 +1546,7 @@ impl InputState {
         cx.notify();
     }
 
-    pub(super) fn show_character_palette(
+    pub(crate) fn show_character_palette(
         &mut self,
         _: &ShowCharacterPalette,
         window: &mut Window,
@@ -1581,7 +1555,7 @@ impl InputState {
         window.show_character_palette();
     }
 
-    pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             return;
         }
@@ -1590,7 +1564,7 @@ impl InputState {
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
     }
 
-    pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             return;
         }
@@ -1601,7 +1575,7 @@ impl InputState {
         self.replace_text_in_range_silent(None, "", window, cx);
     }
 
-    pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(clipboard) = cx.read_from_clipboard() {
             let mut new_text = clipboard.text().unwrap_or_default();
             if !self.mode.is_multi_line() {
@@ -1627,7 +1601,7 @@ impl InputState {
             .push(Change::new(range, &old_text, new_range, new_text));
     }
 
-    pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
             for change in changes {
@@ -1638,7 +1612,7 @@ impl InputState {
         self.history.ignore = false;
     }
 
-    pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
             for change in changes {
@@ -1786,22 +1760,22 @@ impl InputState {
     }
 
     #[inline]
-    pub(super) fn offset_from_utf16(&self, offset: usize) -> usize {
+    pub(crate) fn offset_from_utf16(&self, offset: usize) -> usize {
         self.text.offset_utf16_to_offset(offset)
     }
 
     #[inline]
-    pub(super) fn offset_to_utf16(&self, offset: usize) -> usize {
+    pub(crate) fn offset_to_utf16(&self, offset: usize) -> usize {
         self.text.offset_to_offset_utf16(offset)
     }
 
     #[inline]
-    pub(super) fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+    pub(crate) fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
 
     #[inline]
-    pub(super) fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
+    pub(crate) fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
     }
 
@@ -1833,7 +1807,7 @@ impl InputState {
         offset
     }
 
-    pub(super) fn previous_boundary(&self, offset: usize) -> usize {
+    pub(crate) fn previous_boundary(&self, offset: usize) -> usize {
         let mut offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
         if let Some(ch) = self.text.char_at(offset) {
             if ch == '\r' {
@@ -1844,7 +1818,7 @@ impl InputState {
         self.clamp_offset_to_visible_backward(offset)
     }
 
-    pub(super) fn next_boundary(&self, offset: usize) -> usize {
+    pub(crate) fn next_boundary(&self, offset: usize) -> usize {
         let mut offset = self.text.clip_offset(offset + 1, Bias::Right);
         if let Some(ch) = self.text.char_at(offset) {
             if ch == '\r' {
@@ -1870,17 +1844,10 @@ impl InputState {
         cx.emit(InputEvent::Focus);
     }
 
-    fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_context_menu_open(cx) {
-            return;
-        }
-
+    fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // NOTE: Do not cancel select, when blur.
         // Because maybe user want to copy the selected text by AppMenuBar (will take focus handle).
 
-        self.hover_popover = None;
-        self.diagnostic_popover = None;
-        self.context_menu_content = None;
         self.clear_inline_completion(cx);
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.stop(cx);
@@ -1889,17 +1856,17 @@ impl InputState {
         cx.notify();
     }
 
-    pub(super) fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn pause_blink_cursor(&mut self, cx: &mut Context<Self>) {
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.pause(cx);
         });
     }
 
-    pub(super) fn on_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
     }
 
-    pub(super) fn on_drag_move(
+    pub(crate) fn on_drag_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
@@ -1936,10 +1903,6 @@ impl InputState {
             }
         }
 
-        if !self.mask_pattern.is_valid(new_text) {
-            return false;
-        }
-
         let Some(pattern) = &self.pattern else {
             return true;
         };
@@ -1947,37 +1910,8 @@ impl InputState {
         pattern.is_match(new_text)
     }
 
-    /// Set the mask pattern for formatting the input text.
-    ///
-    /// The pattern can contain:
-    /// - 9: Any digit or dot
-    /// - A: Any letter
-    /// - *: Any character
-    /// - Other characters will be treated as literal mask characters
-    ///
-    /// Example: "(999)999-999" for phone numbers
-    pub fn mask_pattern(mut self, pattern: impl Into<MaskPattern>) -> Self {
-        self.mask_pattern = pattern.into();
-        if let Some(placeholder) = self.mask_pattern.placeholder() {
-            self.placeholder = placeholder.into();
-        }
-        self
-    }
 
-    pub fn set_mask_pattern(
-        &mut self,
-        pattern: impl Into<MaskPattern>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.mask_pattern = pattern.into();
-        if let Some(placeholder) = self.mask_pattern.placeholder() {
-            self.placeholder = placeholder.into();
-        }
-        cx.notify();
-    }
-
-    pub(super) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;
         self.input_bounds = new_bounds;
 
@@ -1998,7 +1932,7 @@ impl InputState {
         }
     }
 
-    pub(super) fn selected_text(&self) -> RopeSlice<'_> {
+    pub(crate) fn selected_text(&self) -> RopeSlice<'_> {
         let range_utf16 = self.range_to_utf16(&self.selected_range.into());
         let range = self.range_from_utf16(&range_utf16);
         self.text.slice(range)
@@ -2049,7 +1983,7 @@ impl InputState {
 
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
     /// Used only on initial load or language changes.
-    fn update_fold_candidates(&mut self) {
+    pub(crate) fn update_fold_candidates(&mut self) {
         if !self.mode.is_folding() {
             return;
         }
@@ -2105,7 +2039,7 @@ impl InputState {
     /// Dropping the returned `Task` (stored in `parse_task`) cancels the
     /// parse, which naturally debounces rapid edits.
     #[cfg(not(target_family = "wasm"))]
-    fn dispatch_background_parse(
+    pub(crate) fn dispatch_background_parse(
         pending: super::mode::PendingBackgroundParse,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2184,7 +2118,7 @@ impl InputState {
     }
 
     #[cfg(target_family = "wasm")]
-    fn dispatch_background_parse(
+    pub(crate) fn dispatch_background_parse(
         _pending: super::mode::PendingBackgroundParse,
         _window: &mut Window,
         _cx: &mut Context<Self>,
@@ -2269,14 +2203,6 @@ impl EntityInputHandler for InputState {
                 self.text = old_text;
                 return;
             }
-
-            if !self.mask_pattern.is_none() {
-                let mask_text = self.mask_pattern.mask(&pending_text);
-                self.text = Rope::from(mask_text.as_str());
-                let new_text_len =
-                    (new_text.len() + mask_text.len()).saturating_sub(pending_text.len());
-                new_offset = (range.start + new_text_len).min(mask_text.len());
-            }
         }
 
         self.push_history(&old_text, &range, &new_text);
@@ -2298,7 +2224,6 @@ impl EntityInputHandler for InputState {
         }
 
         self.update_fold_candidates_incremental(&range, new_text);
-        self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         self.update_preferred_column();
@@ -2323,8 +2248,6 @@ impl EntityInputHandler for InputState {
         if self.disabled {
             return;
         }
-
-        self.lsp.reset();
 
         let range = range_utf16
             .as_ref()
@@ -2363,7 +2286,6 @@ impl EntityInputHandler for InputState {
         }
 
         self.update_fold_candidates_incremental(&range, new_text);
-        self.lsp.update(&self.text, window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.selected_range = (range.start..range.start).into();
@@ -2465,72 +2387,24 @@ impl EntityInputHandler for InputState {
 
 // === Stubs for features disabled in DeepTerm ===
 impl InputState {
-    pub(super) fn clear_inline_completion(&mut self, _cx: &mut Context<Self>) {}
-    pub(super) fn has_inline_completion(&self) -> bool { false }
-    pub(super) fn handle_action_for_context_menu(&mut self, _action: Box<dyn Action>, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
-    pub(super) fn hide_context_menu(&mut self, _cx: &mut Context<Self>) {}
-    pub(super) fn is_context_menu_open(&self, _cx: &App) -> bool { false }
-    pub(super) fn handle_right_click_menu(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(super) fn handle_click_hover_definition(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
-    pub(super) fn clear_hover_state(&mut self, _cx: &mut Context<Self>) {}
-    pub(super) fn handle_mouse_move(&mut self, _offset: usize, _event: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(super) fn select_word(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(super) fn select_line(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
-    pub(super) fn update_search(&mut self, _cx: &mut Context<Self>) {}
-    pub(super) fn handle_completion_trigger(&mut self, _range: &Range<usize>, _new_text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn clear_inline_completion(&mut self, _cx: &mut Context<Self>) {}
+    pub(crate) fn has_inline_completion(&self) -> bool { false }
+    pub(crate) fn handle_action_for_context_menu(&mut self, _action: Box<dyn Action>, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
+    pub(crate) fn hide_context_menu(&mut self, _cx: &mut Context<Self>) {}
+    pub(crate) fn is_context_menu_open(&self, _cx: &App) -> bool { false }
+    pub(crate) fn handle_right_click_menu(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn handle_click_hover_definition(&mut self, _event: &MouseDownEvent, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) -> bool { false }
+    pub(crate) fn clear_hover_state(&mut self, _cx: &mut Context<Self>) {}
+    pub(crate) fn handle_mouse_move(&mut self, _offset: usize, _event: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn select_word(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn select_line(&mut self, _offset: usize, _window: &mut Window, _cx: &mut Context<Self>) {}
+    pub(crate) fn update_search(&mut self, _cx: &mut Context<Self>) {}
+    pub(crate) fn handle_completion_trigger(&mut self, _range: &Range<usize>, _new_text: &str, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 impl Focusable for InputState {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
-    }
-}
-
-impl Render for InputState {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self._pending_update {
-            let bg = self
-                .mode
-                .update_highlighter(&(0..0), &self.text, "", false, cx);
-            if let Some(bg) = bg {
-                Self::dispatch_background_parse(bg, window, cx);
-            }
-
-            self.update_fold_candidates();
-            self.lsp.update(&self.text, window, cx);
-            self._pending_update = false;
-        }
-
-        div()
-            .id("input-state")
-            .flex_1()
-            .when(self.mode.is_multi_line(), |this| this.h_full())
-            .flex_grow()
-            .overflow_x_hidden()
-            .track_focus(&self.focus_handle)
-            .key_context(CONTEXT)
-            .on_mouse_down(
-                MouseButton::Left,
-                window.listener_for(&cx.entity(), InputState::on_mouse_down),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                window.listener_for(&cx.entity(), InputState::on_mouse_down),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                window.listener_for(&cx.entity(), InputState::on_mouse_up),
-            )
-            .on_mouse_up(
-                MouseButton::Right,
-                window.listener_for(&cx.entity(), InputState::on_mouse_up),
-            )
-            .on_mouse_move(window.listener_for(&cx.entity(), InputState::on_mouse_move))
-            .on_scroll_wheel(window.listener_for(&cx.entity(), InputState::on_scroll_wheel))
-            .child(TextElement::new(cx.entity().clone()).placeholder(self.placeholder.clone()))
-            .children(self.diagnostic_popover.clone())
-            // .children(self.context_menu_content.as_ref().map(|menu| menu.render()))
-            .children(self.hover_popover.clone())
     }
 }
 

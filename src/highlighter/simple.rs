@@ -107,7 +107,17 @@ impl SimpleHighlighter {
         _timeout: Option<std::time::Duration>,
     ) -> bool {
         self.text = text.to_string();
-        self.tree = self.parser.parse(&self.text, self.tree.as_ref());
+        // Only reuse the old tree for incremental parsing when both the old
+        // tree and the new text are non-empty. Empty <-> non-empty transitions
+        // (common after cut-all + undo) cannot be safely incrementally parsed
+        // without a proper InputEdit, and will either panic or produce a
+        // corrupted syntax tree that yields no highlight styles.
+        let old_tree = self.tree.as_ref().filter(|t| {
+            let tree_len = t.root_node().end_byte();
+            let text_len = self.text.len();
+            tree_len > 0 && text_len > 0
+        });
+        self.tree = self.parser.parse(&self.text, old_tree);
         true
     }
 
@@ -382,5 +392,49 @@ mod tests {
         // Check coverage
         let total_len: usize = styles.iter().map(|(r, _)| r.len()).sum();
         assert_eq!(total_len, code.len(), "styles should cover entire range");
+    }
+
+    #[test]
+    fn test_delete_all_cjk_text_no_panic() {
+        let code = "fn 中文() {}";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        // Simulate cutting all text: empty rope
+        let empty_rope = Rope::new();
+        h.update(None, &empty_rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..0), &theme);
+        assert_eq!(styles.len(), 1);
+    }
+
+    #[test]
+    fn test_undo_restores_highlights() {
+        let code = "fn main() {}";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let original_styles = h.styles(&(0..code.len()), &theme);
+        // Ensure we have actual highlight colors (keyword 'fn' or function 'main')
+        let has_color = original_styles.iter().any(|(_, s)| s.color.is_some());
+        assert!(has_color, "original text should have syntax highlights");
+
+        // Simulate cut-all (empty text)
+        let empty_rope = Rope::new();
+        h.update(None, &empty_rope, None);
+
+        // Undo: restore original text
+        h.update(None, &rope, None);
+
+        let restored_styles = h.styles(&(0..code.len()), &theme);
+        let restored_color = restored_styles.iter().any(|(_, s)| s.color.is_some());
+        assert!(
+            restored_color,
+            "restored text should still have syntax highlights after undo"
+        );
     }
 }

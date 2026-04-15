@@ -2,17 +2,16 @@ use std::{ops::Range, rc::Rc};
 
 use gpui::{
     App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Half,
-    HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
-    MouseButton, MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size, Style,
-    Styled as _, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, fill, point, px, relative,
-    size,
+    HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId, MouseButton,
+    MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size, Style, TextAlign, TextRun,
+    TextStyle, UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
     theme::ActiveTheme as _,
-    components::button::{Button, ButtonVariants as _, Size as ButtonSize},
+    components::button::Size as ButtonSize,
     components::input::editor::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
 };
 
@@ -44,7 +43,7 @@ struct FoldIconLayout {
     icons: Vec<(usize, bool, gpui::AnyElement)>,
 }
 
-pub(super) struct TextElement {
+pub(crate) struct TextElement {
     pub(crate) state: Entity<InputState>,
     placeholder: SharedString,
 }
@@ -74,6 +73,31 @@ impl TextElement {
                     });
                 }
             }
+        });
+    }
+
+    /// Prepare the state before layout.
+    ///
+    /// Handles pending updates (moved from InputState::render) and ensures
+    /// the display map is ready for layout.
+    fn prepare_if_needed(&mut self, window: &mut Window, cx: &mut App) {
+        self.state.update(cx, |state, cx| {
+            if state._pending_update {
+                let bg = state
+                    .mode
+                    .update_highlighter(&(0..0), &state.text, "", false, cx);
+                if let Some(bg) = bg {
+                    InputState::dispatch_background_parse(bg, window, cx);
+                }
+                state.update_fold_candidates();
+                state._pending_update = false;
+            }
+            state.display_map.set_font(
+                window.text_style().font(),
+                window.text_style().font_size.to_pixels(window.rem_size()),
+                cx,
+            );
+            state.display_map.ensure_text_prepared(&state.text, cx);
         });
     }
 
@@ -956,7 +980,7 @@ impl TextElement {
     }
 }
 
-pub(super) struct PrepaintState {
+pub(crate) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
@@ -1055,6 +1079,8 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        self.prepare_if_needed(window, cx);
+
         let state = self.state.read(cx);
         let line_height = window.line_height();
 
@@ -1088,13 +1114,7 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let style = window.text_style();
-        let font = style.font();
         let text_size = style.font_size.to_pixels(window.rem_size());
-
-        self.state.update(cx, |state, cx| {
-            state.display_map.set_font(font, text_size, cx);
-            state.display_map.ensure_text_prepared(&state.text, cx);
-        });
 
         let state = self.state.read(cx);
         let line_height = window.line_height();
@@ -1257,9 +1277,7 @@ impl Element for TextElement {
             vec![run]
         };
 
-        let document_colors = state
-            .lsp
-            .document_colors_for_range(0..text.len());
+        let document_colors: Vec<(std::ops::Range<usize>, gpui::Hsla)> = Vec::new();
 
         // Create shaped lines for whitespace indicators before layout
         let whitespace_indicators =

@@ -6,11 +6,11 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Styled, Window, actions, div, px, rems, svg,
+    MouseButton, ParentElement, Render, Styled, Subscription, Window, actions, div, px, rems, svg,
 };
 
 use crate::assets::Icon;
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputEvent, InputState};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
@@ -176,7 +176,7 @@ fn scan_unix_terminals() -> Vec<LocalTerminalOption> {
 /// SSH 连接选择器
 pub struct SshPicker {
     focus_handle: FocusHandle,
-    search_input: Entity<Input>,
+    search_input: Entity<InputState>,
     query: String,
     configs: Vec<SshConnectionConfig>,
     filtered_indices: Vec<usize>,
@@ -185,29 +185,32 @@ pub struct SshPicker {
     pub visible: bool,
     local_terminal_options: Vec<LocalTerminalOption>,
     filtered_local_indices: Vec<usize>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SshPicker {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let configs = Self::load_configs();
         let filtered_indices = (0..configs.len()).collect();
         let local_terminal_options = Self::scan_local_terminals();
         let filtered_local_indices = (0..local_terminal_options.len()).collect();
 
-        let picker_entity = cx.entity();
         let search_input = cx.new(|cx| {
-            Input::new(cx)
+            InputState::new(window, cx)
                 .placeholder("Search hosts or tabs...")
                 .placeholder_font_size(px(14.0))
-                .transparent()
-                .on_change(move |text, cx| {
-                    let text = text.to_string();
-                    picker_entity.update(cx, |this, cx| {
-                        this.update_query(text, cx);
-                    });
-                })
         });
+
+        let subscription = cx.subscribe(
+            &search_input,
+            |this: &mut SshPicker, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    let text = this.search_input.read(cx).value().to_string();
+                    this.update_query(text, cx);
+                }
+            },
+        );
 
         Self {
             focus_handle,
@@ -220,6 +223,7 @@ impl SshPicker {
             visible: false,
             local_terminal_options,
             filtered_local_indices,
+            _subscriptions: vec![subscription],
         }
     }
 
@@ -427,7 +431,7 @@ impl SshPicker {
                             .path(Icon::MagnifyingGlass.path()),
                     ),
                 )
-                .child(div().flex_1().child(self.search_input.clone()))
+                .child(div().flex_1().child(EditorInput::new(&self.search_input).transparent()))
                 .child(
                     div()
                         .text_color(theme.text_subtle)

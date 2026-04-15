@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileEntry as SftpFileEntry, RemoteFileKind};
@@ -96,7 +96,7 @@ struct LoadedState {
 
 pub struct RemoteFileBrowserView {
     ssh_config: SshConnectionConfig,
-    search_input: Entity<Input>,
+    search_input: Entity<InputState>,
     search_query: String,
     home_path: Option<String>,
     root_path: String,
@@ -113,24 +113,28 @@ pub struct RemoteFileBrowserView {
 
 impl RemoteFileBrowserView {
     pub fn new(
+        window: &mut Window,
         cx: &mut App,
         ssh_config: SshConnectionConfig,
         requested_path: Option<String>,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            let view = cx.entity();
             let search_input = cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Search")
                     .placeholder_font_size(px(13.0))
-                    .transparent()
-                    .on_change(move |text, cx| {
-                        let text = text.to_string();
-                        view.update(cx, |this: &mut Self, cx| {
-                            this.update_search_query(text, cx);
-                        });
-                    })
             });
+
+            let subscription = cx.subscribe(
+                &search_input,
+                |this: &mut RemoteFileBrowserView, _, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        let text = this.search_input.read(cx).value().to_string();
+                        this.update_search_query(text, cx);
+                    }
+                },
+            );
+            std::mem::forget(subscription);
 
             let mut this = Self {
                 ssh_config,
@@ -148,12 +152,12 @@ impl RemoteFileBrowserView {
                 load_generation: 0,
                 preview_generation: 0,
             };
-            this.open_requested_path(requested_path, cx);
+            this.open_requested_path(requested_path, window, cx);
             this
         })
     }
 
-    pub fn open_requested_path(&mut self, requested_path: Option<String>, cx: &mut Context<Self>) {
+    pub fn open_requested_path(&mut self, requested_path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.start_load(LoadRequest::OpenRequested { requested_path }, true, cx);
@@ -900,7 +904,7 @@ impl RemoteFileBrowserView {
                                     .text_color(theme.icon_muted)
                                     .path(Icon::MagnifyingGlass.path()),
                             )
-                            .child(div().flex_1().child(self.search_input.clone())),
+                            .child(div().flex_1().child(EditorInput::new(&self.search_input).transparent())),
                     ),
             )
     }

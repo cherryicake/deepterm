@@ -7,7 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
-use crate::editor::EditorView;
+use crate::components::input::editor::{EditorInput, InputState};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
@@ -95,7 +95,7 @@ pub enum PanelContent {
     /// Remote file browser
     RemoteFileBrowser(Entity<RemoteFileBrowserView>),
     /// Editor panel
-    Editor(Entity<EditorView>),
+    Editor(Entity<InputState>),
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -312,7 +312,7 @@ impl Panel {
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
         active_tab_id: Option<SharedString>,
-        editor_view: Entity<EditorView>,
+        editor_state: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -324,7 +324,7 @@ impl Panel {
             active_tab_label: Some("Editor".into()),
             is_solo: false,
             is_selected: false,
-            content: PanelContent::Editor(editor_view),
+            content: PanelContent::Editor(editor_state),
             broadcast_enabled: false,
         }
     }
@@ -679,11 +679,11 @@ impl Panel {
                 .min_h_0()
                 .overflow_hidden()
                 .child(file_browser_view.clone()),
-            PanelContent::Editor(editor_view) => div()
+            PanelContent::Editor(editor_state) => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .child(editor_view.clone()),
+                .child(EditorInput::new(&editor_state)),
         }
     }
 

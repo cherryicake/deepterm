@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::theme::ActiveTheme;
 
@@ -92,7 +92,7 @@ struct FilePreview {
 }
 
 pub struct FileBrowserView {
-    search_input: Entity<Input>,
+    search_input: Entity<InputState>,
     search_query: String,
     root_path: PathBuf,
     selected_path: Option<PathBuf>,
@@ -102,21 +102,25 @@ pub struct FileBrowserView {
 }
 
 impl FileBrowserView {
-    pub fn new_with_path(cx: &mut App, requested_path: Option<PathBuf>) -> Entity<Self> {
+    pub fn new_with_path(window: &mut Window, cx: &mut App, requested_path: Option<PathBuf>) -> Entity<Self> {
         cx.new(|cx| {
-            let view = cx.entity();
             let search_input = cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Search")
                     .placeholder_font_size(px(13.0))
-                    .transparent()
-                    .on_change(move |text, cx| {
-                        let text = text.to_string();
-                        view.update(cx, |this: &mut Self, cx| {
-                            this.update_search_query(text, cx);
-                        });
-                    })
             });
+
+            let subscription = cx.subscribe(
+                &search_input,
+                |this: &mut FileBrowserView, _, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        let text = this.search_input.read(cx).value().to_string();
+                        this.update_search_query(text, cx);
+                    }
+                },
+            );
+            // Keep subscription alive for the lifetime of the view
+            std::mem::forget(subscription);
 
             let mut this = Self {
                 search_input,
@@ -127,12 +131,12 @@ impl FileBrowserView {
                 preview: None,
                 error_message: None,
             };
-            this.open_requested_path(requested_path, cx);
+            this.open_requested_path(requested_path, window, cx);
             this
         })
     }
 
-    pub fn open_requested_path(&mut self, requested_path: Option<PathBuf>, cx: &mut Context<Self>) {
+    pub fn open_requested_path(&mut self, requested_path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let default_root = Self::default_root_path();
         let mut pending_error = None;
         let requested_path = requested_path.unwrap_or_else(|| default_root.clone());
@@ -863,7 +867,7 @@ impl FileBrowserView {
                                     .text_color(theme.icon_muted)
                                     .path(Icon::MagnifyingGlass.path()),
                             )
-                            .child(div().flex_1().child(self.search_input.clone())),
+                            .child(div().flex_1().child(EditorInput::new(&self.search_input).transparent())),
                     ),
             )
     }

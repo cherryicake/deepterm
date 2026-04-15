@@ -17,7 +17,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
-use crate::editor::EditorView;
+use crate::components::input::editor::InputState;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
@@ -1097,7 +1097,7 @@ impl Workspace {
 
         // 创建完整的 SettingsHubView（包含左侧边栏和中心内容）
         let workspace_entity = cx.entity();
-        let settings_hub_view = SettingsHubView::new_with_workspace(cx, Some(workspace_entity));
+        let settings_hub_view = SettingsHubView::new_with_workspace(window, cx, Some(workspace_entity));
 
         // 设置 HostsView 的回调
         settings_hub_view.update(cx, |view, cx| {
@@ -1138,7 +1138,7 @@ impl Workspace {
     fn show_file_browser_panel(&mut self, target: FileBrowserTarget, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
             if let Some(panel) = tab_info.container.get_first_panel() {
-                self.replace_or_update_file_browser_panel(&panel, target, cx);
+                self.replace_or_update_file_browser_panel(&panel, target, window, cx);
             }
 
             self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
@@ -1151,11 +1151,11 @@ impl Workspace {
                 format!("file-browser-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
                 Some(FILE_BROWSER_TAB_ID.into()),
-                FileBrowserView::new_with_path(cx, None),
+                FileBrowserView::new_with_path(window, cx, None),
                 cx,
             )
         });
-        self.replace_or_update_file_browser_panel(&file_browser_panel, target, cx);
+        self.replace_or_update_file_browser_panel(&file_browser_panel, target, window, cx);
         self.next_panel_id += 1;
 
         self.tabs.insert(
@@ -1215,12 +1215,18 @@ impl Workspace {
             .to_string();
 
         let editor_panel = cx.new(|cx| {
-            let editor_view = cx.new(|cx| EditorView::with_file(&path, &content, Some(&language), window, cx));
+            let editor_state = cx.new(|cx| {
+                let mut state = InputState::new(window, cx)
+                    .code_editor(language)
+                    .multi_line(true);
+                state.set_value(&content, window, cx);
+                state
+            });
             Panel::with_editor(
                 format!("editor-panel-{}", self.next_panel_id),
                 self.workspace_id.clone(),
                 Some(tab_id.clone().into()),
-                editor_view,
+                editor_state,
                 cx,
             )
         });
@@ -1252,6 +1258,7 @@ impl Workspace {
         &self,
         panel: &Entity<Panel>,
         target: FileBrowserTarget,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         panel.update(cx, move |panel, cx| match target {
@@ -1263,10 +1270,10 @@ impl Workspace {
 
                 if let Some(file_browser_view) = existing_view {
                     file_browser_view.update(cx, |file_browser, cx| {
-                        file_browser.open_requested_path(requested_path.clone(), cx);
+                        file_browser.open_requested_path(requested_path.clone(), window, cx);
                     });
                 } else {
-                    let file_browser_view = FileBrowserView::new_with_path(cx, requested_path);
+                    let file_browser_view = FileBrowserView::new_with_path(window, cx, requested_path);
                     panel.set_content(PanelContent::FileBrowser(file_browser_view), cx);
                 }
             }
@@ -1286,16 +1293,16 @@ impl Workspace {
 
                     if should_replace {
                         let file_browser_view =
-                            RemoteFileBrowserView::new(cx, ssh_config, requested_path);
+                            RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
                         panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
                     } else {
                         file_browser_view.update(cx, |file_browser, cx| {
-                            file_browser.open_requested_path(requested_path.clone(), cx);
+                            file_browser.open_requested_path(requested_path.clone(), window, cx);
                         });
                     }
                 } else {
                     let file_browser_view =
-                        RemoteFileBrowserView::new(cx, ssh_config, requested_path);
+                        RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
                     panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
                 }
             }

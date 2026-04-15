@@ -1,13 +1,15 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Font, Half, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px,
-    size,
+    point, px, size, App, Font, Half, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign,
+    Window,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 
-use crate::components::input::editor::{LastLayout, Point as TreeSitterPoint, RopeExt, WhitespaceIndicators};
+use crate::components::input::editor::{
+    LastLayout, Point as TreeSitterPoint, RopeExt, WhitespaceIndicators,
+};
 
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
@@ -580,7 +582,7 @@ impl LineLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+    use gpui::{px, Boundary, FontFeatures, FontStyle, FontWeight};
 
     #[test]
     fn test_update() {

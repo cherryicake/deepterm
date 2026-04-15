@@ -8,7 +8,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::button::{Button, ButtonVariants};
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputState};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
@@ -39,14 +39,14 @@ impl AuthType {
 /// Host Form 组件 - 用于创建和编辑 SSH 主机配置
 pub struct HostForm {
     focus_handle: FocusHandle,
-    nickname_input: Entity<Input>,
-    hostname_input: Entity<Input>,
-    port_input: Entity<Input>,
-    username_input: Entity<Input>,
-    password_input: Entity<Input>,
-    key_path_input: Entity<Input>,
-    key_passphrase_input: Entity<Input>,
-    credential_label_input: Entity<Input>,
+    nickname_input: Entity<InputState>,
+    hostname_input: Entity<InputState>,
+    port_input: Entity<InputState>,
+    username_input: Entity<InputState>,
+    password_input: Entity<InputState>,
+    key_path_input: Entity<InputState>,
+    key_passphrase_input: Entity<InputState>,
+    credential_label_input: Entity<InputState>,
     auth_type: AuthType,
     show_auth_dropdown: bool,
     show_credential_dropdown: bool,
@@ -60,31 +60,31 @@ pub struct HostForm {
 }
 
 impl HostForm {
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let default_username = get_current_username().unwrap_or_default();
 
-            let nickname_input = cx.new(|cx| Input::new(cx).placeholder("My Server"));
+            let nickname_input = cx.new(|cx| InputState::new(window, cx).placeholder("My Server"));
             let hostname_input =
-                cx.new(|cx| Input::new(cx).placeholder("192.168.1.100 or example.com"));
-            let port_input = cx.new(|cx| Input::new(cx).value("22"));
-            let username_input = cx.new(|cx| Input::new(cx).value(&default_username));
+                cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.100 or example.com"));
+            let port_input = cx.new(|cx| InputState::new(window, cx));
+            port_input.update(cx, |input, cx| input.set_text("22", cx));
+            let username_input = cx.new(|cx| InputState::new(window, cx));
+            username_input.update(cx, |input, cx| input.set_text(&default_username, cx));
             let password_input = cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Save into system keychain")
                     .masked(true)
-                    .mask_toggle(true)
             });
-            let key_path_input = cx.new(|cx| Input::new(cx).placeholder("~/.ssh/id_ed25519"));
+            let key_path_input = cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519"));
             let key_passphrase_input = cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Optional passphrase")
                     .masked(true)
-                    .mask_toggle(true)
             });
             let credential_label_input =
-                cx.new(|cx| Input::new(cx).placeholder("DeepTerm generated label"));
+                cx.new(|cx| InputState::new(window, cx).placeholder("DeepTerm generated label"));
 
             Self {
                 focus_handle,
@@ -246,9 +246,9 @@ impl HostForm {
     }
 
     fn validate_form(&self, cx: &Context<Self>) -> Result<(), String> {
-        let hostname = self.hostname_input.read(cx).text().to_string();
-        let username = self.username_input.read(cx).text().to_string();
-        let port = self.port_input.read(cx).text().to_string();
+        let hostname = self.hostname_input.read(cx).value().to_string();
+        let username = self.username_input.read(cx).value().to_string();
+        let port = self.port_input.read(cx).value().to_string();
 
         if hostname.trim().is_empty() {
             return Err("Host address is required".to_string());
@@ -272,10 +272,10 @@ impl HostForm {
         cx: &Context<Self>,
     ) -> Result<AuthMethod, String> {
         let selected_keychain_id = self.selected_keychain_id.clone();
-        let credential_label = self.credential_label_input.read(cx).text().to_string();
-        let password = self.password_input.read(cx).text().to_string();
-        let key_path = self.key_path_input.read(cx).text().to_string();
-        let key_passphrase = self.key_passphrase_input.read(cx).text().to_string();
+        let credential_label = self.credential_label_input.read(cx).value().to_string();
+        let password = self.password_input.read(cx).value().to_string();
+        let key_path = self.key_path_input.read(cx).value().to_string();
+        let key_passphrase = self.key_passphrase_input.read(cx).value().to_string();
 
         let mut store = KeychainStore::load_or_default();
         let fallback_label = if credential_label.trim().is_empty() {
@@ -380,10 +380,10 @@ impl HostForm {
             return;
         }
 
-        let nickname = self.nickname_input.read(cx).text().to_string();
-        let hostname = self.hostname_input.read(cx).text().to_string();
-        let username = self.username_input.read(cx).text().to_string();
-        let port = self.port_input.read(cx).text().parse::<u16>().unwrap_or(22);
+        let nickname = self.nickname_input.read(cx).value().to_string();
+        let hostname = self.hostname_input.read(cx).value().to_string();
+        let username = self.username_input.read(cx).value().to_string();
+        let port = self.port_input.read(cx).value().parse::<u16>().unwrap_or(22);
 
         let host_label = if nickname.trim().is_empty() {
             format!("{}@{}", username.trim(), hostname.trim())
@@ -467,7 +467,7 @@ impl HostForm {
     fn render_labeled_input(
         &self,
         label: &str,
-        input: &Entity<Input>,
+        input: &Entity<InputState>,
         cx: &App,
     ) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -482,7 +482,7 @@ impl HostForm {
                     .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
-            .child(input.clone())
+            .child(EditorInput::new(input))
     }
 
     fn render_auth_type_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {

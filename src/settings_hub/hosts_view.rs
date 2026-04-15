@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -150,7 +150,7 @@ impl HostGroup {
 
 /// Hosts View Component - Main content for the Hosts settings page
 pub struct HostsView {
-    search_input: Entity<Input>,
+    search_input: Entity<InputState>,
     search_query: SharedString,
     hosts: Vec<Host>,
     filtered_hosts: Vec<Host>, // Filtered hosts based on search query
@@ -166,8 +166,8 @@ pub struct HostsView {
 }
 
 impl HostsView {
-    pub fn new(cx: &mut App) -> Entity<Self> {
-        Self::new_with_workspace(cx, None)
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
+        Self::new_with_workspace(window, cx, None)
     }
 
     /// Set the workspace for terminal operations
@@ -177,26 +177,29 @@ impl HostsView {
     }
 
     /// Create a new HostsView with optional workspace
-    pub fn new_with_workspace(cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
+    pub fn new_with_workspace(window: &mut Window, cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let scroll_handle = ScrollHandle::new();
             let (hosts, groups, configs) = Self::load_hosts_from_config();
             let filtered_hosts = hosts.clone();
 
-            let view_entity = cx.entity();
             let search_input = cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Find a host or ssh user@hostname...")
                     .placeholder_font_size(px(14.0))
-                    .transparent()
-                    .on_change(move |text, cx| {
-                        let text = text.to_string();
-                        view_entity.update(cx, |this: &mut Self, cx| {
-                            this.update_search_query(text, cx);
-                        });
-                    })
             });
+
+            let subscription = cx.subscribe(
+                &search_input,
+                |this: &mut HostsView, _, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        let text = this.search_input.read(cx).value().to_string();
+                        this.update_search_query(text, cx);
+                    }
+                },
+            );
+            std::mem::forget(subscription);
 
             Self {
                 search_input,
@@ -372,7 +375,7 @@ impl HostsView {
                     )
                     .child(
                         // Input component
-                        div().flex_1().child(self.search_input.clone()),
+                        div().flex_1().child(EditorInput::new(&self.search_input).transparent()),
                     )
                     .child(
                         // Connect button inside search box using Button component

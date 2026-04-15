@@ -1049,4 +1049,27 @@ $x = 1;
             ],
         );
     }
+
+    #[test]
+    fn test_delete_all_text_with_cjk() {
+        let code = "fn 中文() {}";
+        let rope = Rope::from_str(code);
+        let mut highlighter = SyntaxHighlighter::new("rust");
+        highlighter.update(None, &rope, None);
+
+        // Simulate deleting all text: old range 0..code.len(), new text ""
+        let edit = InputEdit {
+            start_byte: 0,
+            old_end_byte: code.len(),
+            new_end_byte: 0,
+            start_position: Point::new(0, 0),
+            old_end_position: Point::new(0, 0),
+            new_end_position: Point::new(0, 0),
+        };
+        let empty_rope = Rope::new();
+        highlighter.update(Some(edit), &empty_rope, None);
+
+        let styles = highlighter.styles(&(0..0), &HighlightTheme::default_dark());
+        assert_eq!(styles.len(), 1);
+    }
 }

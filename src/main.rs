@@ -3,7 +3,6 @@
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
-pub mod editor;
 pub mod file_browser;
 pub mod highlighter;
 mod settings_hub;
@@ -56,7 +55,7 @@ impl AppWindow {
 
         // 创建 SSH 选择器（先不关联 workspace，在 cx.new 内部设置）
         let workspace_for_picker = workspace.clone();
-        let ssh_picker = cx.new(|cx| SshPicker::new(cx).with_workspace(workspace_for_picker));
+        let ssh_picker = cx.new(|cx| SshPicker::new(window, cx).with_workspace(workspace_for_picker));
 
         // 设置全局 SSH picker 引用，让 Workspace 可以通过 action 访问
         cx.set_global(GlobalSshPicker(ssh_picker.clone()));

@@ -100,12 +100,12 @@ impl InputMode {
     }
 
     #[inline]
-    pub(super) fn is_single_line(&self) -> bool {
+    pub(crate) fn is_single_line(&self) -> bool {
         !self.is_multi_line()
     }
 
     #[inline]
-    pub(super) fn is_code_editor(&self) -> bool {
+    pub(crate) fn is_code_editor(&self) -> bool {
         matches!(self, InputMode::CodeEditor { .. })
     }
 
@@ -127,12 +127,12 @@ impl InputMode {
     }
 
     #[inline]
-    pub(super) fn is_auto_grow(&self) -> bool {
+    pub(crate) fn is_auto_grow(&self) -> bool {
         matches!(self, InputMode::AutoGrow { .. })
     }
 
     #[inline]
-    pub(super) fn is_multi_line(&self) -> bool {
+    pub(crate) fn is_multi_line(&self) -> bool {
         match self {
             InputMode::PlainText { multi_line, .. } => *multi_line,
             InputMode::CodeEditor { multi_line, .. } => *multi_line,
@@ -140,7 +140,7 @@ impl InputMode {
         }
     }
 
-    pub(super) fn set_rows(&mut self, new_rows: usize) {
+    pub(crate) fn set_rows(&mut self, new_rows: usize) {
         match self {
             InputMode::PlainText { rows, .. } => {
                 *rows = new_rows;
@@ -158,7 +158,7 @@ impl InputMode {
         }
     }
 
-    pub(super) fn update_auto_grow(&mut self, display_map: &DisplayMap) {
+    pub(crate) fn update_auto_grow(&mut self, display_map: &DisplayMap) {
         if self.is_single_line() {
             return;
         }
@@ -168,7 +168,7 @@ impl InputMode {
     }
 
     /// At least 1 row be return.
-    pub(super) fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         if !self.is_multi_line() {
             return 1;
         }
@@ -183,7 +183,7 @@ impl InputMode {
 
     /// At least 1 row be return.
     #[allow(unused)]
-    pub(super) fn min_rows(&self) -> usize {
+    pub(crate) fn min_rows(&self) -> usize {
         match self {
             InputMode::AutoGrow { min_rows, .. } => *min_rows,
             _ => 1,
@@ -192,7 +192,7 @@ impl InputMode {
     }
 
     #[allow(unused)]
-    pub(super) fn max_rows(&self) -> usize {
+    pub(crate) fn max_rows(&self) -> usize {
         if !self.is_multi_line() {
             return 1;
         }
@@ -205,7 +205,7 @@ impl InputMode {
 
     /// Return false if the mode is not [`InputMode::CodeEditor`].
     #[inline]
-    pub(super) fn line_number(&self) -> bool {
+    pub(crate) fn line_number(&self) -> bool {
         match self {
             InputMode::CodeEditor {
                 line_number,
@@ -324,10 +324,9 @@ impl InputMode {
 mod tests {
     use ropey::Rope;
 
-    use crate::{
-        highlighter::DiagnosticSet,
-        input::{TabSize, mode::InputMode},
-    };
+    use crate::highlighter::DiagnosticSet;
+
+    use super::{InputMode, TabSize};
 
     #[test]
     fn test_code_editor() {
@@ -336,7 +335,6 @@ mod tests {
         assert_eq!(mode.is_multi_line(), true);
         assert_eq!(mode.is_single_line(), false);
         assert_eq!(mode.line_number(), true);
-        assert_eq!(mode.has_indent_guides(), true);
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), true);
@@ -357,7 +355,6 @@ mod tests {
         assert_eq!(mode.is_multi_line(), false);
         assert_eq!(mode.is_single_line(), true);
         assert_eq!(mode.line_number(), false);
-        assert_eq!(mode.has_indent_guides(), false);
         assert_eq!(mode.max_rows(), 1);
         assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), false);

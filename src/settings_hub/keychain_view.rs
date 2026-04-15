@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::button::{Button, ButtonVariants, Icon as ButtonIconType, Sizable};
-use crate::components::input::Input;
+use crate::components::input::editor::{EditorInput, InputState};
 use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
     sibling_certificate_path,
@@ -205,7 +205,7 @@ pub struct KeychainView {
 }
 
 impl KeychainView {
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    pub fn new(_window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| Self {
             focus_handle: cx.focus_handle(),
             items: Self::load_items(),
@@ -486,9 +486,9 @@ impl Render for KeychainView {
 
 pub struct KeychainEditor {
     focus_handle: FocusHandle,
-    label_input: Entity<Input>,
-    username_input: Entity<Input>,
-    password_input: Entity<Input>,
+    label_input: Entity<InputState>,
+    username_input: Entity<InputState>,
+    password_input: Entity<InputState>,
     private_key_input: Entity<MultilineTextArea>,
     draft_kind: KeychainItemKind,
     editing_item_id: Option<String>,
@@ -504,16 +504,15 @@ pub struct KeychainEditor {
 }
 
 impl KeychainEditor {
-    pub fn new(cx: &mut App) -> Entity<Self> {
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| Self {
             focus_handle: cx.focus_handle(),
-            label_input: cx.new(|cx| Input::new(cx).placeholder("Add a label...")),
-            username_input: cx.new(|cx| Input::new(cx).placeholder("root")),
+            label_input: cx.new(|cx| InputState::new(window, cx).placeholder("Add a label...")),
+            username_input: cx.new(|cx| InputState::new(window, cx).placeholder("root")),
             password_input: cx.new(|cx| {
-                Input::new(cx)
+                InputState::new(window, cx)
                     .placeholder("Password")
                     .masked(true)
-                    .mask_toggle(true)
             }),
             private_key_input: cx.new(|cx| {
                 MultilineTextArea::new(cx)
@@ -663,7 +662,7 @@ impl KeychainEditor {
             .or_else(|| sibling_certificate_path(&private_key_path).filter(|path| path.exists()));
         self.editing_certificate_path = certificate_path.clone();
 
-        if self.label_input.read(cx).text().trim().is_empty() {
+        if self.label_input.read(cx).value().trim().is_empty() {
             if let Some(file_name) = private_key_path.file_name() {
                 self.label_input.update(cx, |input, cx| {
                     input.set_text(file_name.to_string_lossy().to_string(), cx);
@@ -752,9 +751,9 @@ impl KeychainEditor {
     }
 
     fn save_item(&mut self, cx: &mut Context<Self>) {
-        let label = self.label_input.read(cx).text().to_string();
-        let username = self.username_input.read(cx).text().to_string();
-        let password = self.password_input.read(cx).text().to_string();
+        let label = self.label_input.read(cx).value().to_string();
+        let username = self.username_input.read(cx).value().to_string();
+        let password = self.password_input.read(cx).value().to_string();
         let private_key_text = self.private_key_input.read(cx).text().to_string();
 
         self.error_message = None;
@@ -838,7 +837,7 @@ impl KeychainEditor {
     fn render_labeled_input(
         &self,
         label: &str,
-        input: &Entity<Input>,
+        input: &Entity<InputState>,
         cx: &App,
     ) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -853,7 +852,7 @@ impl KeychainEditor {
                     .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
-            .child(input.clone())
+            .child(EditorInput::new(input))
     }
 
     fn render_labeled_multiline_input(

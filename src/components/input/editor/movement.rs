@@ -13,7 +13,7 @@ pub(crate) enum MoveDirection {
 
 impl InputState {
     /// Called after moving the cursor. Updates preferred_column if we know where the cursor now is.
-    pub(super) fn update_preferred_column(&mut self) {
+    pub(crate) fn update_preferred_column(&mut self) {
         let Some(last_layout) = &self.last_layout else {
             self.preferred_column = None;
             return;
@@ -58,7 +58,7 @@ impl InputState {
     /// Move the cursor vertically by one line (up or down) while preserving the column if possible.
     ///
     /// move_lines: Number of lines to move vertically (positive for down, negative for up).
-    pub(super) fn move_vertical(
+    pub(crate) fn move_vertical(
         &mut self,
         move_lines: isize,
         _: &mut Window,
@@ -136,7 +136,7 @@ impl InputState {
         cx.notify();
     }
 
-    pub(super) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor()), None, cx);
@@ -145,7 +145,7 @@ impl InputState {
         }
     }
 
-    pub(super) fn right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), None, cx);
@@ -154,7 +154,7 @@ impl InputState {
         }
     }
 
-    pub(super) fn up(&mut self, action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn up(&mut self, action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
@@ -174,7 +174,7 @@ impl InputState {
         self.move_vertical(-1, window, cx);
     }
 
-    pub(super) fn down(&mut self, action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn down(&mut self, action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
@@ -195,7 +195,7 @@ impl InputState {
         self.move_vertical(1, window, cx);
     }
 
-    pub(super) fn page_up(&mut self, _: &MovePageUp, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn page_up(&mut self, _: &MovePageUp, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
             return;
         }
@@ -208,7 +208,7 @@ impl InputState {
         self.move_vertical(-display_lines, window, cx);
     }
 
-    pub(super) fn page_down(
+    pub(crate) fn page_down(
         &mut self,
         _: &MovePageDown,
         window: &mut Window,
@@ -226,20 +226,20 @@ impl InputState {
         self.move_vertical(display_lines, window, cx);
     }
 
-    pub(super) fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         let offset = self.start_of_line();
         self.move_to(offset, Some(MoveDirection::Up), cx);
     }
 
-    pub(super) fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
         let offset = self.end_of_line();
         self.move_to(offset, Some(MoveDirection::Down), cx);
         self.cursor_line_end_affinity = true;
     }
 
-    pub(super) fn move_to_start(
+    pub(crate) fn move_to_start(
         &mut self,
         _: &MoveToStart,
         _: &mut Window,
@@ -248,11 +248,11 @@ impl InputState {
         self.move_to(0, None, cx);
     }
 
-    pub(super) fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.text.len(), None, cx);
     }
 
-    pub(super) fn move_to_previous_word(
+    pub(crate) fn move_to_previous_word(
         &mut self,
         _: &MoveToPreviousWord,
         _: &mut Window,
@@ -262,7 +262,7 @@ impl InputState {
         self.move_to(offset, None, cx);
     }
 
-    pub(super) fn move_to_next_word(
+    pub(crate) fn move_to_next_word(
         &mut self,
         _: &MoveToNextWord,
         _: &mut Window,
