@@ -462,8 +462,8 @@ mod tests {
     use sum_tree::Bias;
     use tree_sitter::Point;
 
-    use crate::components::input::editor::RopeExt;
-    use crate::components::input::editor::rope_ext::Position;
+    use crate::components::input::RopeExt;
+    use crate::components::input::rope_ext::Position;
 
     #[test]
     fn test_slice_line() {

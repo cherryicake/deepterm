@@ -7,7 +7,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
-use crate::components::input::editor::{EditorInput, InputState};
+use crate::components::input::{EditorInput, InputState};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;

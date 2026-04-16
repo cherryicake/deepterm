@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::editor::{EditorInput, InputEvent, InputState};
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileEntry as SftpFileEntry, RemoteFileKind};

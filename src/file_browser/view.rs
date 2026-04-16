@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::editor::{EditorInput, InputEvent, InputState};
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::theme::ActiveTheme;
 

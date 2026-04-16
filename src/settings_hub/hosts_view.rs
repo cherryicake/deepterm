@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
-use crate::components::input::editor::{EditorInput, InputEvent, InputState};
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};

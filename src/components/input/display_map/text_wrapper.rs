@@ -7,7 +7,7 @@ use gpui::{
 use ropey::Rope;
 use smallvec::SmallVec;
 
-use crate::components::input::editor::{
+use crate::components::input::{
     LastLayout, Point as TreeSitterPoint, RopeExt, WhitespaceIndicators,
 };
 

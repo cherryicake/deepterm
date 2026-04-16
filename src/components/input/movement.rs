@@ -1,6 +1,6 @@
 use gpui::{Context, Point, Window};
 
-use crate::components::input::editor::{
+use crate::components::input::{
     InputState, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, RopeExt as _,
 };

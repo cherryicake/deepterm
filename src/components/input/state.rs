@@ -23,9 +23,9 @@ use crate::components::input::change::Change;
 use crate::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::highlighter::LanguageRegistry;
-use crate::components::input::editor::blink_cursor::CURSOR_WIDTH;
-use crate::components::input::editor::movement::MoveDirection;
-use crate::components::input::editor::{
+use crate::components::input::blink_cursor::CURSOR_WIDTH;
+use crate::components::input::movement::MoveDirection;
+use crate::components::input::{
     RopeExt as _, Selection,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
@@ -1918,7 +1918,7 @@ impl InputState {
             return;
         };
 
-        let fold_ranges = crate::components::input::editor::display_map::extract_fold_ranges(tree);
+        let fold_ranges = crate::components::input::display_map::extract_fold_ranges(tree);
         self.display_map.set_fold_candidates(fold_ranges);
     }
 

@@ -6,7 +6,7 @@ use streaming_iterator::StreamingIterator;
 use sum_tree::Bias;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-use crate::components::input::editor::RopeExt as _;
+use crate::components::input::RopeExt as _;
 
 pub struct InjectionParseData;
 pub struct InjectionLayer;

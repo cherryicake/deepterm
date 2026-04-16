@@ -17,7 +17,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::GlobalSshPicker;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
-use crate::components::input::editor::InputState;
+use crate::components::input::InputState;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;

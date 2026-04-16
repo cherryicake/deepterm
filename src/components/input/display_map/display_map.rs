@@ -14,9 +14,9 @@ use super::folding::FoldRange;
 use super::text_wrapper::{LineItem, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
-use crate::components::input::editor::display_map::WrapPoint;
-use crate::components::input::editor::rope_ext::RopeExt as _;
-use crate::components::input::editor::Point as TreeSitterPoint;
+use crate::components::input::display_map::WrapPoint;
+use crate::components::input::rope_ext::RopeExt as _;
+use crate::components::input::Point as TreeSitterPoint;
 
 /// DisplayMap is the main interface for Editor/Input coordinate mapping.
 ///

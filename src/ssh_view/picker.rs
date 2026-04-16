@@ -10,7 +10,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::components::input::editor::{EditorInput, InputEvent, InputState};
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;

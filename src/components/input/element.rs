@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     components::button::Size as ButtonSize,
-    components::input::editor::{
+    components::input::{
         blink_cursor::CURSOR_WIDTH, display_map::LineLayout, RopeExt as _,
     },
     theme::ActiveTheme as _,

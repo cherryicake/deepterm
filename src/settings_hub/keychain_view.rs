@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::button::{Button, ButtonVariants, Icon as ButtonIconType, Sizable};
-use crate::components::input::editor::{EditorInput, InputState};
+use crate::components::input::{EditorInput, InputState};
 use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
     sibling_certificate_path,
