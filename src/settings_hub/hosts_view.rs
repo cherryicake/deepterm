@@ -1,10 +1,15 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Window, div, px, svg,
+    Window, actions, div, px, svg,
 };
 
 use std::collections::HashSet;
+
+actions!(
+    host_actions,
+    [ConnectHost, EditHost, DuplicateHost, DeleteHost]
+);
 
 use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
@@ -642,20 +647,20 @@ impl HostsView {
                     menu.menu_with_icon(
                         "Connect",
                         MenuIcon::new("icons/link.svg"),
-                        Box::new(crate::ConnectHost),
+                        Box::new(ConnectHost),
                     )
                     .separator()
                     .menu_with_icon(
                         "Edit",
                         MenuIcon::new("icons/edit.svg"),
-                        Box::new(crate::EditHost),
+                        Box::new(EditHost),
                     )
-                    .menu("Duplicate", Box::new(crate::DuplicateHost))
+                    .menu("Duplicate", Box::new(DuplicateHost))
                     .separator()
                     .menu_with_icon(
                         "Delete",
                         MenuIcon::new("icons/trash.svg"),
-                        Box::new(crate::DeleteHost),
+                        Box::new(DeleteHost),
                     )
                 }
             })
@@ -829,14 +834,14 @@ impl Render for HostsView {
             .relative()
             .bg(theme.panel_background)
             // Register context menu actions
-            .on_action(cx.listener(|this, _: &crate::ConnectHost, window, cx| {
+            .on_action(cx.listener(|this, _: &ConnectHost, window, cx| {
                 // Connect to all selected hosts
                 let selected_ids: Vec<_> = this.selected_host_ids.iter().cloned().collect();
                 for host_id in selected_ids {
                     this.connect_to_host(&host_id, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &crate::EditHost, _window, cx| {
+            .on_action(cx.listener(|this, _: &EditHost, _window, cx| {
                 // Edit the host that was right-clicked, or the first selected host
                 let host_id_to_edit = this
                     .context_menu_host_id
@@ -856,11 +861,11 @@ impl Render for HostsView {
                     }
                 }
             }))
-            .on_action(cx.listener(|this, _: &crate::DuplicateHost, _window, _cx| {
+            .on_action(cx.listener(|this, _: &DuplicateHost, _window, _cx| {
                 // TODO: Implement duplicate host functionality for multiple hosts
                 println!("Duplicate hosts: {:?}", this.selected_host_ids);
             }))
-            .on_action(cx.listener(|this, _: &crate::DeleteHost, window, cx| {
+            .on_action(cx.listener(|this, _: &DeleteHost, window, cx| {
                 // Delete all selected hosts
                 let host_ids_to_delete: Vec<_> = this.selected_host_ids.iter().cloned().collect();
                 if host_ids_to_delete.is_empty() {

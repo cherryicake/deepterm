@@ -26,11 +26,6 @@ use crate::workspace::workspace::Workspace;
 // Define application-level actions
 actions!(app, [Quit, ShowSshPicker]);
 
-// Host management actions for context menu
-actions!(
-    host_actions,
-    [ConnectHost, EditHost, DuplicateHost, DeleteHost]
-);
 const CONTEXT: &str = "AppWindow";
 
 /// 全局 SSH picker 引用，用于从 Workspace 触发显示
@@ -55,7 +50,8 @@ impl AppWindow {
 
         // 创建 SSH 选择器（先不关联 workspace，在 cx.new 内部设置）
         let workspace_for_picker = workspace.clone();
-        let ssh_picker = cx.new(|cx| SshPicker::new(window, cx).with_workspace(workspace_for_picker));
+        let ssh_picker =
+            cx.new(|cx| SshPicker::new(window, cx).with_workspace(workspace_for_picker));
 
         // 设置全局 SSH picker 引用，让 Workspace 可以通过 action 访问
         cx.set_global(GlobalSshPicker(ssh_picker.clone()));
