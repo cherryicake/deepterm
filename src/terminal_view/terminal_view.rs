@@ -1476,6 +1476,12 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                // Ignore mouse moves while a global drag is in progress (e.g. dragging a tab or panel)
+                // to prevent terminal applications like tmux from receiving spurious drag events.
+                if cx.has_active_drag() {
+                    return;
+                }
+
                 this.terminal.update(cx, |terminal, cx| {
                     // Always send mouse move events in mouse mode (e.g., neovim)
                     // so the application can handle selection in real-time
