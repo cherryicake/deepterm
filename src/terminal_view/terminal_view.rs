@@ -691,11 +691,18 @@ impl TerminalView {
                         target: self.parse_open_file_browser_target(command_line, _cx),
                     });
                 } else if spec.handler == BuiltinCommandHandler::OpenFile {
-                    let path = command_line
+                    let raw_path = command_line
                         .strip_prefix(spec.name)
                         .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                        .trim();
+                    let path = if self.is_remote(_cx) {
+                        self.resolve_remote_open_target(raw_path, _cx)
+                            .unwrap_or_else(|| raw_path.to_string())
+                    } else {
+                        self.resolve_open_target(raw_path, _cx)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
                     _cx.emit(Event::OpenFile { path });
                 }
                 true

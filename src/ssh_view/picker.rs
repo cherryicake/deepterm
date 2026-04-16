@@ -431,7 +431,7 @@ impl SshPicker {
                             .path(Icon::MagnifyingGlass.path()),
                     ),
                 )
-                .child(div().flex_1().child(EditorInput::new(&self.search_input).transparent()))
+                .child(EditorInput::new(&self.search_input).transparent())
                 .child(
                     div()
                         .text_color(theme.text_subtle)

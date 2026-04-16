@@ -143,7 +143,13 @@ impl TerminalTheme {
             style: HighlightThemeStyle {
                 editor_background: Some(self.background),
                 editor_foreground: Some(self.foreground),
-                editor_active_line: None,
+                editor_active_line: Some(gpui::Hsla::from(gpui::Rgba::from(self.background).blend(
+                    if appearance.is_dark() {
+                        gpui::rgba(0xFFFFFF10)
+                    } else {
+                        gpui::rgba(0x0000000C)
+                    },
+                ))),
                 editor_line_number: Some(self.dim_foreground),
                 editor_active_line_number: Some(self.foreground),
                 editor_invisible: Some(self.dim_foreground),

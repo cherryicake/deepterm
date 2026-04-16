@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::{App, Entity, IntoElement, MouseButton, RenderOnce, Window, div, px};
 
+use crate::components::button::Size;
 use crate::theme::ActiveTheme;
 
 use super::{InputState, element::TextElement};
@@ -14,6 +15,7 @@ pub struct EditorInput {
     state: Entity<InputState>,
     disabled: bool,
     transparent: bool,
+    size: Size,
 }
 
 impl EditorInput {
@@ -22,6 +24,7 @@ impl EditorInput {
             state: state.clone(),
             disabled: false,
             transparent: false,
+            size: Size::default(),
         }
     }
 
@@ -34,6 +37,15 @@ impl EditorInput {
         self.transparent = true;
         self
     }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = size;
+        self
+    }
+
+    pub fn small(self) -> Self {
+        self.size(Size::Small)
+    }
 }
 
 impl RenderOnce for EditorInput {
@@ -42,16 +54,27 @@ impl RenderOnce for EditorInput {
             if state.disabled != self.disabled {
                 state.disabled = self.disabled;
             }
+            state.size = self.size;
         });
 
         let state = self.state.read(cx);
         let is_focused = state.focus_handle.is_focused(window) && !state.disabled;
         let is_multi_line = state.mode.is_multi_line();
         let theme = cx.theme().ui;
+        const LINE_HEIGHT: gpui::Rems = gpui::Rems(1.25);
+
+        let input_py = match self.size {
+            Size::Large => px(10.0),
+            Size::Medium => px(8.0),
+            Size::Small => px(2.0),
+            Size::XSmall => px(0.0),
+            Size::Size(_) => px(8.0),
+        };
 
         let actions = div()
             .key_context(super::CONTEXT)
             .track_focus(&state.focus_handle)
+            .line_height(LINE_HEIGHT)
             .when(!state.disabled, |this| {
                 this.on_action(window.listener_for(&self.state, InputState::backspace))
                     .on_action(window.listener_for(&self.state, InputState::delete))
@@ -111,7 +134,8 @@ impl RenderOnce for EditorInput {
                 window.listener_for(&self.state, InputState::on_mouse_up),
             )
             .on_mouse_move(window.listener_for(&self.state, InputState::on_mouse_move))
-            .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel));
+            .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel))
+            .when(self.transparent, |this| this.flex_1());
 
         if is_multi_line {
             // Multi-line mode: match the original InputState::render layout
@@ -132,9 +156,11 @@ impl RenderOnce for EditorInput {
                     div()
                         .w_full()
                         .min_w(px(0.0))
+                        .line_height(LINE_HEIGHT)
                         .when(!self.transparent, |this| {
                             this.h(px(36.0))
                                 .px(px(10.0))
+                                .py(input_py)
                                 .gap(px(8.0))
                                 .rounded(px(6.0))
                                 .border_1()

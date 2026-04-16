@@ -375,7 +375,7 @@ impl HostsView {
                     )
                     .child(
                         // Input component
-                        div().flex_1().child(EditorInput::new(&self.search_input).transparent()),
+                        EditorInput::new(&self.search_input).transparent(),
                     )
                     .child(
                         // Connect button inside search box using Button component

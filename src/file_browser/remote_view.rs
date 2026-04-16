@@ -904,7 +904,7 @@ impl RemoteFileBrowserView {
                                     .text_color(theme.icon_muted)
                                     .path(Icon::MagnifyingGlass.path()),
                             )
-                            .child(div().flex_1().child(EditorInput::new(&self.search_input).transparent())),
+                            .child(EditorInput::new(&self.search_input).transparent()),
                     ),
             )
     }
