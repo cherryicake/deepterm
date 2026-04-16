@@ -5,9 +5,9 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
-use crate::components::input::{EditorInput, InputState};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
@@ -67,10 +67,7 @@ pub enum PanelEvent {
         target: FileBrowserTarget,
     },
     /// 在编辑器中打开文件
-    OpenFile {
-        panel_id: String,
-        path: String,
-    },
+    OpenFile { panel_id: String, path: String },
     /// 关闭panel事件
     Close { panel_id: String },
     /// 选中状态变更事件
@@ -694,6 +691,7 @@ impl Panel {
             div()
                 .absolute()
                 .bg(theme.drop_target)
+                .opacity(0.95)
                 .rounded(px(10.0))
                 .map(|div| match preview {
                     PanelPlacement::Left => div
