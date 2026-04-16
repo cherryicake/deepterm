@@ -17,6 +17,13 @@ use crate::workspace::workspace::Workspace;
 
 actions!(ssh_picker, [Dismiss, SelectNext, SelectPrevious, Confirm]);
 
+// Action to show the SSH picker.
+actions!(ssh_picker_actions, [ShowSshPicker]);
+
+/// 全局 SSH picker 引用，用于从 Workspace 触发显示
+pub struct GlobalSshPicker(pub Entity<SshPicker>);
+impl gpui::Global for GlobalSshPicker {}
+
 // 尺寸常量
 const ITEM_HEIGHT: f32 = 30.0;
 const PANEL_WIDTH: f32 = 600.0;

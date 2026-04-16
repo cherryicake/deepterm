@@ -40,11 +40,11 @@ pub struct ImeState {
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
-use crate::ShowSshPicker;
 use crate::builtin_commands::{
     BuiltinCommandHandler, BuiltinCommandManager, find_builtin_command, resolve_command_line,
 };
 use crate::ssh::{SshConnectionConfig, sftp_fs};
+use crate::ssh_view::picker::ShowSshPicker;
 use crate::ssh_view::SshConnectView;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};

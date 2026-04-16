@@ -20,17 +20,13 @@ use gpui::{
 };
 
 use crate::components::title_bar::TitleBar;
-use crate::ssh_view::picker::SshPicker;
+use crate::ssh_view::picker::{GlobalSshPicker, SshPicker, ShowSshPicker};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(app, [Quit, ShowSshPicker]);
+actions!(app, [Quit]);
 
 const CONTEXT: &str = "AppWindow";
-
-/// 全局 SSH picker 引用，用于从 Workspace 触发显示
-struct GlobalSshPicker(Entity<SshPicker>);
-impl gpui::Global for GlobalSshPicker {}
 
 /// Root component that contains title bar and workspace
 pub struct AppWindow {

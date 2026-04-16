@@ -18,6 +18,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
+use crate::ssh_view::picker::ShowSshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
@@ -389,7 +390,7 @@ impl HostsView {
                             .small()
                             .on_click(cx.listener(|_this, _event, _window, cx| {
                                 // Trigger SSH picker or connection
-                                cx.dispatch_action(&crate::ShowSshPicker);
+                                cx.dispatch_action(&ShowSshPicker);
                             })),
                     ),
             )
