@@ -27,6 +27,8 @@ pub struct RemoteFileEntry {
     pub name: String,
     pub path: String,
     pub kind: RemoteFileKind,
+    pub size: u64,
+    pub modified_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,10 +94,17 @@ impl BlockingSftpSession {
                 .sftp
                 .read_dir(path)
                 .await?
-                .map(|entry| RemoteFileEntry {
-                    name: entry.file_name(),
-                    path: join_remote_path(path, &entry.file_name()),
-                    kind: convert_file_type(entry.file_type()),
+                .map(|entry| {
+                    let metadata = entry.metadata();
+                    RemoteFileEntry {
+                        name: entry.file_name(),
+                        path: join_remote_path(path, &entry.file_name()),
+                        kind: convert_file_type(entry.file_type()),
+                        size: metadata.len(),
+                        modified_at: metadata.mtime.map(|secs| {
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+                        }),
+                    }
                 })
                 .collect();
             Ok(entries)

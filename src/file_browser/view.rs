@@ -1,22 +1,27 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Local};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
-    px, svg,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Stateful,
+    Window, div, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
+use crate::file_browser::shared::{
+    FileBrowserViewMode, format_datetime, format_size, render_icon_columns, render_icon_gallery,
+    render_icon_grid, render_icon_list, render_icon_more, render_icon_share, render_icon_tag,
+};
 use crate::theme::ActiveTheme;
 
 const COLUMN_WIDTH: f32 = 208.0;
 const HEADER_HEIGHT: f32 = 46.0;
+const LIST_ROW_HEIGHT: f32 = 24.0;
+const LIST_HEADER_HEIGHT: f32 = 26.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FileEntryKind {
@@ -29,8 +34,11 @@ enum FileEntryKind {
 #[derive(Clone, Debug)]
 struct FileEntry {
     name: String,
+    name_lower: String,
     path: PathBuf,
     kind: FileEntryKind,
+    size: u64,
+    modified_at: Option<std::time::SystemTime>,
 }
 
 impl FileEntry {
@@ -48,8 +56,17 @@ impl FileEntry {
         } else {
             FileEntryKind::Other
         };
+        let size = metadata.len();
+        let modified_at = metadata.modified().ok();
 
-        Some(Self { name, path, kind })
+        Some(Self {
+            name: name.clone(),
+            name_lower: name.to_lowercase(),
+            path,
+            kind,
+            size,
+            modified_at,
+        })
     }
 
     fn icon(&self) -> Icon {
@@ -75,7 +92,20 @@ impl FileEntry {
             FileEntryKind::File => 2,
             FileEntryKind::Other => 3,
         };
-        (rank, self.name.to_lowercase())
+        (rank, self.name_lower.clone())
+    }
+
+    fn size_label(&self) -> String {
+        match self.kind {
+            FileEntryKind::Directory => "--".to_string(),
+            _ => format_size(self.size),
+        }
+    }
+
+    fn modified_label(&self) -> String {
+        self.modified_at
+            .map(format_datetime)
+            .unwrap_or_else(|| "Unknown".to_string())
     }
 }
 
@@ -99,6 +129,8 @@ pub struct FileBrowserView {
     directory_cache: HashMap<PathBuf, Vec<FileEntry>>,
     preview: Option<FilePreview>,
     error_message: Option<String>,
+    view_mode: FileBrowserViewMode,
+    expanded_folders: HashSet<PathBuf>,
 }
 
 impl FileBrowserView {
@@ -130,6 +162,8 @@ impl FileBrowserView {
                 directory_cache: HashMap::new(),
                 preview: None,
                 error_message: None,
+                view_mode: FileBrowserViewMode::Columns,
+                expanded_folders: HashSet::new(),
             };
             this.open_requested_path(requested_path, window, cx);
             this
@@ -208,6 +242,21 @@ impl FileBrowserView {
 
     fn update_search_query(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_query = query.to_lowercase();
+        cx.notify();
+    }
+
+    fn set_view_mode(&mut self, mode: FileBrowserViewMode, cx: &mut Context<Self>) {
+        self.view_mode = mode;
+        cx.notify();
+    }
+
+    fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.expanded_folders.contains(&path) {
+            self.expanded_folders.remove(&path);
+        } else {
+            self.expanded_folders.insert(path.clone());
+            let _ = self.ensure_directory_loaded(&path);
+        }
         cx.notify();
     }
 
@@ -313,12 +362,12 @@ impl FileBrowserView {
         let size_label = if is_directory {
             "Directory".to_string()
         } else {
-            Self::format_size(metadata.len())
+            format_size(metadata.len())
         };
         let modified_label = metadata
             .modified()
             .ok()
-            .map(Self::format_datetime)
+            .map(format_datetime)
             .unwrap_or_else(|| "Unknown".to_string());
         let location_label = preview_path
             .parent()
@@ -394,31 +443,8 @@ impl FileBrowserView {
         path.display().to_string()
     }
 
-    fn format_datetime(timestamp: std::time::SystemTime) -> String {
-        DateTime::<Local>::from(timestamp)
-            .format("%Y-%m-%d %H:%M")
-            .to_string()
-    }
-
-    fn format_size(size: u64) -> String {
-        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-
-        let mut value = size as f64;
-        let mut unit = 0;
-        while value >= 1024.0 && unit < UNITS.len() - 1 {
-            value /= 1024.0;
-            unit += 1;
-        }
-
-        if unit == 0 {
-            format!("{} {}", size, UNITS[unit])
-        } else {
-            format!("{:.1} {}", value, UNITS[unit])
-        }
-    }
-
     fn matches_search(&self, entry: &FileEntry) -> bool {
-        self.search_query.is_empty() || entry.name.to_lowercase().contains(&self.search_query)
+        self.search_query.is_empty() || entry.name_lower.contains(&self.search_query)
     }
 
     fn selected_child_for_directory(&self, directory: &Path) -> Option<PathBuf> {
@@ -542,195 +568,6 @@ impl FileBrowserView {
             })
     }
 
-    fn render_icon_grid(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded(px(1.0))
-                            .bg(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded(px(1.0))
-                            .bg(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded(px(1.0))
-                            .bg(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .w(px(4.0))
-                            .h(px(4.0))
-                            .rounded(px(1.0))
-                            .bg(theme.text_muted),
-                    ),
-            )
-    }
-
-    fn render_icon_list(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-    }
-
-    fn render_icon_columns(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .flex()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .w(px(3.0))
-                    .h(px(10.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text),
-            )
-            .child(
-                div()
-                    .w(px(3.0))
-                    .h(px(10.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text),
-            )
-            .child(
-                div()
-                    .w(px(3.0))
-                    .h(px(10.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text),
-            )
-    }
-
-    fn render_icon_gallery(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .w(px(11.0))
-            .h(px(8.0))
-            .rounded(px(2.0))
-            .border_1()
-            .border_color(theme.text_muted)
-            .child(
-                div()
-                    .w_full()
-                    .h(px(2.0))
-                    .mt(px(4.0))
-                    .bg(theme.text_muted.opacity(0.8)),
-            )
-    }
-
-    fn render_icon_share(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(1.0))
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(6.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-            .child(
-                div()
-                    .w(px(8.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-    }
-
-    fn render_icon_tag(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .w(px(10.0))
-            .h(px(7.0))
-            .rounded(px(2.0))
-            .border_1()
-            .border_color(theme.text_muted)
-    }
-
-    fn render_icon_more(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-
-        div()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(2.0))
-                    .rounded(px(999.0))
-                    .bg(theme.text_muted),
-            )
-    }
-
     fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
 
@@ -790,25 +627,43 @@ impl FileBrowserView {
                         .items_center()
                         .overflow_hidden()
                         .child(self.render_toolbar_segment_button(
-                            self.render_icon_grid(cx),
+                            render_icon_grid(&theme),
                             false,
                             cx,
                         ))
                         .child(div().w(px(1.0)).h_full().bg(theme.border))
-                        .child(self.render_toolbar_segment_button(
-                            self.render_icon_list(cx),
-                            false,
-                            cx,
-                        ))
+                        .child(
+                            self.render_toolbar_segment_button(
+                                render_icon_list(&theme),
+                                self.view_mode == FileBrowserViewMode::List,
+                                cx,
+                            )
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_view_mode(FileBrowserViewMode::List, cx);
+                                }),
+                            ),
+                        )
+                        .child(div().w(px(1.0)).h_full().bg(theme.border))
+                        .child(
+                            self.render_toolbar_segment_button(
+                                render_icon_columns(&theme),
+                                self.view_mode == FileBrowserViewMode::Columns,
+                                cx,
+                            )
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.set_view_mode(FileBrowserViewMode::Columns, cx);
+                                }),
+                            ),
+                        )
                         .child(div().w(px(1.0)).h_full().bg(theme.border))
                         .child(self.render_toolbar_segment_button(
-                            self.render_icon_columns(cx),
-                            true,
-                            cx,
-                        ))
-                        .child(div().w(px(1.0)).h_full().bg(theme.border))
-                        .child(self.render_toolbar_segment_button(
-                            self.render_icon_gallery(cx),
+                            render_icon_gallery(&theme),
                             false,
                             cx,
                         )),
@@ -831,19 +686,19 @@ impl FileBrowserView {
                                 .items_center()
                                 .overflow_hidden()
                                 .child(self.render_toolbar_segment_button(
-                                    self.render_icon_share(cx),
+                                    render_icon_share(&theme),
                                     false,
                                     cx,
                                 ))
                                 .child(div().w(px(1.0)).h_full().bg(theme.border))
                                 .child(self.render_toolbar_segment_button(
-                                    self.render_icon_tag(cx),
+                                    render_icon_tag(&theme),
                                     false,
                                     cx,
                                 ))
                                 .child(div().w(px(1.0)).h_full().bg(theme.border))
                                 .child(self.render_toolbar_segment_button(
-                                    self.render_icon_more(cx),
+                                    render_icon_more(&theme),
                                     false,
                                     cx,
                                 )),
@@ -1032,6 +887,210 @@ impl FileBrowserView {
             .flex()
             .flex_col()
             .child(columns)
+    }
+
+    fn render_tree_rows(
+        &self,
+        directory: &Path,
+        depth: usize,
+        rows: Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        const MAX_TREE_DEPTH: usize = 20;
+        if depth > MAX_TREE_DEPTH {
+            return rows;
+        }
+
+        let theme = cx.theme().ui;
+        let entries: Vec<&FileEntry> = self
+            .directory_cache
+            .get(directory)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| self.matches_search(entry))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut rows = rows;
+        let indent = px(depth as f32 * 16.0);
+
+        for entry in entries {
+            let path = entry.path.clone();
+            let is_selected = self.selected_path.as_ref() == Some(&path);
+            let is_directory = entry.kind == FileEntryKind::Directory;
+            let is_expanded = is_directory && self.expanded_folders.contains(&path);
+            let name = entry.name.clone();
+            let modified_label = entry.modified_label();
+            let size_label = entry.size_label();
+            let kind_label = entry.kind_label().to_string();
+            let icon = entry.icon();
+            let row_background = if is_selected {
+                theme.selection.opacity(0.96)
+            } else {
+                theme.elevated_background.opacity(0.0)
+            };
+            let row_text = if is_selected {
+                theme.accent_foreground
+            } else {
+                theme.text
+            };
+            let row_meta = if is_selected {
+                theme.accent_foreground.opacity(0.72)
+            } else {
+                theme.text_subtle
+            };
+
+            let click_path = path.clone();
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .h(px(LIST_ROW_HEIGHT))
+                    .pl(px(12.0) + indent)
+                    .pr(px(12.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .bg(row_background)
+                    .when(!is_selected, |this| {
+                        this.hover(move |style| style.bg(theme.tab_hover_background))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if is_directory {
+                                this.toggle_folder_expanded(click_path.clone(), cx);
+                            } else {
+                                this.select_path(click_path.clone(), cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .flex_none()
+                                    .text_lg()
+                                    .text_color(row_meta)
+                                    .flex()
+                                    .items_center()
+                                    .justify_start()
+                                    .child(if is_directory {
+                                        if is_expanded {
+                                            "▾"
+                                        } else {
+                                            "▸"
+                                        }
+                                    } else {
+                                        ""
+                                    }),
+                            )
+                            .child(
+                                svg()
+                                    .size(px(14.0))
+                                    .text_color(if is_directory {
+                                        if is_selected {
+                                            theme.accent_foreground
+                                        } else {
+                                            theme.accent
+                                        }
+                                    } else if is_selected {
+                                        theme.accent_foreground
+                                    } else {
+                                        theme.icon_muted
+                                    })
+                                    .path(icon.path()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(row_text)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .w(px(140.0))
+                            .text_xs()
+                            .text_color(row_meta)
+                            .child(modified_label),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .text_color(row_meta)
+                            .child(size_label),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .text_color(row_meta)
+                            .child(kind_label),
+                    ),
+            );
+
+            if is_expanded {
+                rows = self.render_tree_rows(&path, depth + 1, rows, cx);
+            }
+        }
+
+        rows
+    }
+
+    fn render_list(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = cx.theme().ui;
+        let directory = self.root_path.clone();
+        let is_directory_loaded = self.directory_cache.contains_key(&directory);
+
+        let mut rows = div()
+            .id("file-browser-list")
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
+
+        if is_directory_loaded
+            && self
+                .directory_cache
+                .get(&directory)
+                .map_or(true, |e| !e.iter().any(|e| self.matches_search(e)))
+        {
+            rows = rows.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .pt(px(18.0))
+                    .text_xs()
+                    .text_color(theme.text_subtle)
+                    .child(if self.search_query.is_empty() {
+                        "This folder is empty.".to_string()
+                    } else {
+                        "No matching items.".to_string()
+                    }),
+            );
+        } else {
+            rows = self.render_tree_rows(&directory, 0, rows, cx);
+        }
+
+        div()
+            .flex_1()
+            .h_full()
+            .bg(theme.app_background)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(rows)
     }
 
     fn render_preview_row(
@@ -1229,7 +1288,11 @@ impl Render for FileBrowserView {
                             .min_h_0()
                             .flex()
                             .gap(px(0.0))
-                            .child(self.render_columns(cx))
+                            .child(if self.view_mode == FileBrowserViewMode::List {
+                                self.render_list(cx)
+                            } else {
+                                self.render_columns(cx)
+                            })
                             .when(self.should_show_preview(), |this| {
                                 this.child(self.render_preview(cx))
                             }),
