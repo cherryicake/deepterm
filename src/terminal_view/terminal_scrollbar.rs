@@ -7,11 +7,48 @@ use gpui::{
 
 use crate::terminal::terminal::Terminal;
 
-/// Minimum thumb size (same as Zed's MINIMUM_THUMB_SIZE)
-const MINIMUM_THUMB_SIZE: Pixels = px(8.);
+/// Minimum thumb size — bumped up for better visibility.
+pub(crate) const MINIMUM_THUMB_SIZE: Pixels = px(24.);
 
 /// Scrollbar thumb corner radius
 const THUMB_CORNER_RADIUS: Pixels = px(4.);
+
+/// Compute scrollbar thumb Y offset and size from terminal metrics.
+/// Returns `None` when no scrollbar is needed (content fits in viewport).
+pub(crate) fn calculate_thumb_metrics(
+    total_lines: usize,
+    viewport_lines: usize,
+    display_offset: usize,
+    line_height: Pixels,
+    viewport_height: Pixels,
+) -> Option<(Pixels, Pixels)> {
+    if total_lines <= viewport_lines {
+        return None;
+    }
+
+    let content_size = px(total_lines as f32 * line_height.as_f32());
+    let viewport_px = px(viewport_lines as f32 * line_height.as_f32());
+    let max_offset = content_size - viewport_px;
+    let visible_percentage = viewport_px / content_size;
+    let thumb_size = MINIMUM_THUMB_SIZE.max(viewport_px * visible_percentage);
+
+    if thumb_size >= viewport_px {
+        return None;
+    }
+
+    let max_scroll_lines = total_lines.saturating_sub(viewport_lines);
+    let scroll_offset = max_scroll_lines.saturating_sub(display_offset);
+    let current_offset = px(scroll_offset as f32 * line_height.as_f32());
+
+    let thumb_y = if max_offset.as_f32() > 0.0 {
+        px((current_offset.as_f32() / max_offset.as_f32())
+            * (viewport_height - thumb_size).as_f32())
+    } else {
+        px(0.0)
+    };
+
+    Some((thumb_y, thumb_size))
+}
 
 /// Zed-style scrollbar thumb color
 /// Uses a semi-transparent gray similar to Zed's neutral().light_alpha().step_4()
@@ -27,11 +64,22 @@ fn scrollbar_thumb_color() -> Hsla {
 /// Terminal scrollbar component
 pub struct TerminalScrollbar {
     terminal: Entity<Terminal>,
+    /// Optional override for the thumb's Y offset within the track.
+    /// When `Some`, the thumb is positioned at this exact pixel offset
+    /// instead of being derived from `display_offset`.
+    thumb_y_override: Option<Pixels>,
 }
 
 impl TerminalScrollbar {
-    pub fn new(terminal: Entity<Terminal>, _cx: &mut App) -> Self {
-        Self { terminal }
+    pub fn new(
+        terminal: Entity<Terminal>,
+        thumb_y_override: Option<Pixels>,
+        _cx: &mut App,
+    ) -> Self {
+        Self {
+            terminal,
+            thumb_y_override,
+        }
     }
 }
 
@@ -41,6 +89,7 @@ impl IntoElement for TerminalScrollbar {
     fn into_element(self) -> Self::Element {
         ScrollbarElement {
             terminal: self.terminal,
+            thumb_y_override: self.thumb_y_override,
         }
     }
 }
@@ -48,6 +97,7 @@ impl IntoElement for TerminalScrollbar {
 /// Scrollbar element
 pub struct ScrollbarElement {
     terminal: Entity<Terminal>,
+    thumb_y_override: Option<Pixels>,
 }
 
 impl IntoElement for ScrollbarElement {
@@ -124,31 +174,22 @@ impl gpui::Element for ScrollbarElement {
             return; // No scrollbar needed
         }
 
-        // Calculate content and viewport heights (in pixels)
-        let content_size = px(total_lines as f32 * line_height.as_f32());
-        let viewport_px = px(viewport_lines as f32 * line_height.as_f32());
-
-        // Calculate max scroll in pixels
-        let max_offset = content_size - viewport_px;
-
-        // Calculate thumb size
-        let visible_percentage = viewport_px / content_size;
-        let thumb_size = MINIMUM_THUMB_SIZE.max(viewport_px * visible_percentage);
-
-        if thumb_size >= viewport_px {
+        let Some((start_offset, thumb_size)) = calculate_thumb_metrics(
+            total_lines,
+            viewport_lines,
+            display_offset,
+            line_height,
+            viewport_size,
+        ) else {
             return; // No scrollbar needed
-        }
+        };
 
-        // Calculate thumb position
         let max_scroll_lines = total_lines.saturating_sub(viewport_lines);
-        let scroll_offset = max_scroll_lines.saturating_sub(display_offset);
-        let current_offset = px(scroll_offset as f32 * line_height.as_f32());
 
-        let start_offset = if max_offset.as_f32() > 0.0 {
-            px((current_offset.as_f32() / max_offset.as_f32())
-                * (viewport_size - thumb_size).as_f32())
+        let start_offset = if let Some(override_y) = self.thumb_y_override {
+            override_y
         } else {
-            px(0.0)
+            start_offset
         };
 
         // Thumb fills the track width (no padding) for a cleaner look

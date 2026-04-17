@@ -1433,8 +1433,22 @@ impl Terminal {
 
                 Some(new_offset - old_offset)
             }
-            gpui::TouchPhase::Ended => None,
+            gpui::TouchPhase::Ended => {
+                let remainder = (self.scroll_px / line_height).abs();
+                let direction = if remainder > 0.5 {
+                    Some(if self.scroll_px >= px(0.) { 1 } else { -1 })
+                } else {
+                    None
+                };
+                self.scroll_px = px(0.);
+                direction
+            }
         }
+    }
+
+    /// Reset the scroll-pixel accumulator (called on direction change).
+    pub fn reset_scroll_px(&mut self) {
+        self.scroll_px = px(0.);
     }
 
     // Selection

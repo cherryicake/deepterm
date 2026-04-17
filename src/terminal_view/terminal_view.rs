@@ -1,5 +1,6 @@
 //! Terminal view component - Full featured
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -107,6 +108,24 @@ pub struct TerminalView {
     pub cached_selection_range: Option<SelectionRange>,
     /// Last mouse mode state used to build row cache.
     pub cached_selection_mouse_mode: bool,
+    // ── Scrollbar thumb animation ───────────────────────────────────────────
+    /// Current animated thumb Y offset (relative to track top).
+    pub scrollbar_thumb_y: Pixels,
+    /// Target thumb Y offset for the ongoing animation.
+    scrollbar_target_y: Pixels,
+    /// Thumb Y offset at animation start.
+    scrollbar_anim_from_y: Pixels,
+    /// Animation start instant.
+    scrollbar_anim_start: Instant,
+    /// Whether a thumb-position animation is currently running.
+    scrollbar_animating: bool,
+    // ── Scroll velocity tracking ────────────────────────────────────────────
+    /// Instant of the last scroll-wheel event (for velocity calculation).
+    last_scroll_instant: Instant,
+    /// Sliding window of recent scroll velocities (pixels / second).
+    recent_scroll_velocities: VecDeque<f32>,
+    /// Last scroll direction: -1 = up, 1 = down, 0 = none.
+    last_scroll_direction: i32,
 }
 
 /// SSH 连接状态检查结果
@@ -234,6 +253,14 @@ impl TerminalView {
                 cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
+                scrollbar_thumb_y: px(0.0),
+                scrollbar_target_y: px(0.0),
+                scrollbar_anim_from_y: px(0.0),
+                scrollbar_anim_start: Instant::now(),
+                scrollbar_animating: false,
+                last_scroll_instant: Instant::now(),
+                recent_scroll_velocities: VecDeque::with_capacity(3),
+                last_scroll_direction: 0,
             };
             this.update_title(cx);
             this
@@ -351,6 +378,14 @@ impl TerminalView {
                 cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
+                scrollbar_thumb_y: px(0.0),
+                scrollbar_target_y: px(0.0),
+                scrollbar_anim_from_y: px(0.0),
+                scrollbar_anim_start: Instant::now(),
+                scrollbar_animating: false,
+                last_scroll_instant: Instant::now(),
+                recent_scroll_velocities: VecDeque::with_capacity(3),
+                last_scroll_direction: 0,
             };
 
             // 订阅 SshConnectView 的重新连接事件并存储订阅
@@ -496,6 +531,32 @@ impl TerminalView {
         let last_scroll = term.last_scroll_time.get();
         let elapsed = last_scroll.elapsed();
         elapsed < SCROLLBAR_VISIBLE_AFTER_SCROLL
+    }
+
+    /// Calculate the scrollbar thumb Y offset (relative to track top) from
+    /// the current terminal `display_offset`.
+    fn calculate_scrollbar_thumb_y(&self, cx: &App) -> Pixels {
+        let term = self.terminal.read(cx);
+        let content = term.last_content();
+        let line_height = term.terminal_bounds().line_height;
+
+        crate::terminal_view::terminal_scrollbar::calculate_thumb_metrics(
+            content.total_lines,
+            content.viewport_lines,
+            content.display_offset,
+            line_height,
+            px(content.viewport_lines as f32 * line_height.as_f32()),
+        )
+        .map(|(y, _)| y)
+        .unwrap_or(px(0.0))
+    }
+
+    /// Kick off a short ease-out animation of the scrollbar thumb to `target_y`.
+    fn animate_scrollbar(&mut self, target_y: Pixels) {
+        self.scrollbar_anim_from_y = self.scrollbar_thumb_y;
+        self.scrollbar_target_y = target_y;
+        self.scrollbar_anim_start = Instant::now();
+        self.scrollbar_animating = true;
     }
 
     // IME handling methods for CJK input methods
@@ -1409,6 +1470,32 @@ impl Render for TerminalView {
         let is_focused = focus_handle.is_focused(window);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
+        // ── Scrollbar thumb position ─────────────────────────────────────────
+        // While dragging, snap to the exact position and kill any animation.
+        let scrollbar_thumb_y = if self.terminal.read(cx).scrollbar_drag_offset.get().is_some() {
+            self.scrollbar_animating = false;
+            self.scrollbar_thumb_y = self.calculate_scrollbar_thumb_y(cx);
+            self.scrollbar_thumb_y
+        } else if self.scrollbar_animating {
+            let elapsed = self.scrollbar_anim_start.elapsed().as_secs_f32();
+            let duration = 0.15_f32;
+            let t = (elapsed / duration).min(1.0);
+            let ease = 1.0 - (1.0 - t).powi(3);
+            self.scrollbar_thumb_y = px(
+                self.scrollbar_anim_from_y.as_f32()
+                    + (self.scrollbar_target_y.as_f32() - self.scrollbar_anim_from_y.as_f32())
+                        * ease,
+            );
+            if t < 1.0 {
+                cx.notify();
+            } else {
+                self.scrollbar_animating = false;
+            }
+            self.scrollbar_thumb_y
+        } else {
+            self.scrollbar_thumb_y
+        };
+
         // Schedule a single refresh when the scrollbar should actually hide.
         // Polling every 100ms keeps repainting even when terminal content is unchanged.
         if show_scrollbar {
@@ -1496,9 +1583,48 @@ impl Render for TerminalView {
                 cx.notify();
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                let now = Instant::now();
+                let elapsed = this.last_scroll_instant.elapsed().as_secs_f32();
+                this.last_scroll_instant = now;
+
+                let line_height = this.terminal.read(cx).terminal_bounds().line_height;
+
+                // Compute instantaneous velocity (pixels / second).
+                let delta_px = event.delta.pixel_delta(line_height).y.as_f32().abs();
+                let velocity = if elapsed > 0.001 {
+                    delta_px / elapsed
+                } else {
+                    0.0
+                };
+
+                // Maintain a sliding window of the last 3 velocities.
+                this.recent_scroll_velocities.push_back(velocity);
+                if this.recent_scroll_velocities.len() > 3 {
+                    this.recent_scroll_velocities.pop_front();
+                }
+                let avg_velocity: f32 = this.recent_scroll_velocities.iter().sum::<f32>()
+                    / this.recent_scroll_velocities.len().max(1) as f32;
+
+                // Dynamic multiplier: base 3.0 + velocity bonus (capped at 8.0).
+                let dynamic_multiplier = (3.0 + avg_velocity / 2000.0).min(8.0);
+
+                // Detect direction change and tell Terminal to reset accumulator.
+                let current_direction = event.delta.pixel_delta(line_height).y.signum() as i32;
+                let direction_changed =
+                    current_direction != 0 && this.last_scroll_direction != 0
+                        && current_direction != this.last_scroll_direction;
+                if direction_changed {
+                    this.terminal.update(cx, |t, _cx| {
+                        t.reset_scroll_px();
+                    });
+                }
+                this.last_scroll_direction = current_direction;
+
                 this.terminal.update(cx, |terminal, _cx| {
-                    terminal.scroll_wheel(event, 3.0);
+                    terminal.scroll_wheel(event, dynamic_multiplier);
                 });
+                let target_y = this.calculate_scrollbar_thumb_y(cx);
+                this.animate_scrollbar(target_y);
                 cx.stop_propagation();
                 cx.notify();
             }))
@@ -1530,7 +1656,11 @@ impl Render for TerminalView {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(8.0))
-                                .child(TerminalScrollbar::new(terminal, cx)),
+                                .child(TerminalScrollbar::new(
+                                    terminal,
+                                    Some(scrollbar_thumb_y),
+                                    cx,
+                                )),
                         )
                     })
                     .when(
