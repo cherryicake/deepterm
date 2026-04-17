@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::assets::Icon;
 use crate::components::sidebar::Sidebar;
+use crate::settings_hub::font_view::FontSettingsView;
 use crate::settings_hub::host_form::HostForm;
 use crate::settings_hub::hosts_view::HostsView;
 use crate::settings_hub::keychain_view::{KeychainEditor, KeychainView};
@@ -72,6 +73,7 @@ pub enum SettingsHubPage {
     Keychain,
     Agent,
     Theme,
+    Fonts,
 }
 
 impl SettingsHubPage {
@@ -81,6 +83,7 @@ impl SettingsHubPage {
             "keychain" => Some(Self::Keychain),
             "agent" => Some(Self::Agent),
             "theme" => Some(Self::Theme),
+            "fonts" => Some(Self::Fonts),
             _ => None,
         }
     }
@@ -316,6 +319,7 @@ pub struct SettingsHubCenter {
     current_page: SettingsHubPage,
     hosts_view: Entity<HostsView>,
     keychain_view: Entity<KeychainView>,
+    font_view: Entity<FontSettingsView>,
     theme_scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
 }
@@ -335,12 +339,14 @@ impl SettingsHubCenter {
             let focus_handle = cx.focus_handle();
             let hosts_view = HostsView::new_with_workspace(window, cx, workspace);
             let keychain_view = KeychainView::new(window, cx);
+            let font_view = FontSettingsView::new(window, cx);
             let theme_scroll_handle = ScrollHandle::new();
 
             Self {
                 current_page: page,
                 hosts_view,
                 keychain_view,
+                font_view,
                 theme_scroll_handle,
                 focus_handle,
             }
@@ -642,6 +648,7 @@ impl SettingsHubCenter {
                         .child("Agent settings coming soon..."),
                 ),
             SettingsHubPage::Theme => self.render_theme_page(cx),
+            SettingsHubPage::Fonts => div().size_full().child(self.font_view.clone()),
         }
     }
 }
@@ -884,7 +891,9 @@ impl SettingsHubView {
             // 延迟后停止渲染侧边栏（与退出动画时长 ANIMATION_DURATION_EXIT_MS 一致）
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(250))
+                    .timer(std::time::Duration::from_millis(
+                        crate::components::sidebar::ANIMATION_DURATION_EXIT_MS,
+                    ))
                     .await;
                 let _ = this.update(cx, |view, cx| {
                     view.right_sidebar_rendered = false;
@@ -964,6 +973,9 @@ pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
         ]),
         // 终端设置分组
         SettingsHubSection::new("terminal_setting", Some("偏好设置"))
-            .with_items(vec![SettingsHubItem::new("theme", Icon::Screen, "Theme")]),
+            .with_items(vec![
+                SettingsHubItem::new("theme", Icon::Screen, "Theme"),
+                SettingsHubItem::new("fonts", Icon::Terminal, "Fonts"),
+            ]),
     ]
 }

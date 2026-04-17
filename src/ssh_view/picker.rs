@@ -6,7 +6,8 @@
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Styled, Subscription, Window, actions, div, px, rems, svg,
+    MouseButton, ParentElement, Render, ScrollHandle, Styled, Subscription, Window, actions, div,
+    px, rems, svg,
 };
 
 use crate::assets::Icon;
@@ -192,6 +193,7 @@ pub struct SshPicker {
     pub visible: bool,
     local_terminal_options: Vec<LocalTerminalOption>,
     filtered_local_indices: Vec<usize>,
+    scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -230,6 +232,7 @@ impl SshPicker {
             visible: false,
             local_terminal_options,
             filtered_local_indices,
+            scroll_handle: ScrollHandle::new(),
             _subscriptions: vec![subscription],
         }
     }
@@ -262,7 +265,8 @@ impl SshPicker {
         self.configs = Self::load_configs();
         self.filtered_indices = (0..self.configs.len()).collect();
         self.selected_index = 0;
-        self.local_terminal_options = Self::scan_local_terminals();
+        // Local terminals rarely change during a session; reuse cached scan
+        // instead of blocking the UI thread with synchronous process spawns.
         self.filtered_local_indices = (0..self.local_terminal_options.len()).collect();
 
         self.search_input.update(cx, |input, cx| input.clear(cx));
@@ -291,6 +295,7 @@ impl SshPicker {
         self.query = query.to_lowercase();
         self.filter_items();
         self.selected_index = 0;
+        self.scroll_to_selected(cx);
         cx.notify();
     }
 
@@ -336,6 +341,7 @@ impl SshPicker {
         let total = self.total_items();
         if total > 0 {
             self.selected_index = (self.selected_index + 1) % total;
+            self.scroll_to_selected(cx);
             cx.notify();
         }
     }
@@ -348,7 +354,16 @@ impl SshPicker {
             } else {
                 self.selected_index - 1
             };
+            self.scroll_to_selected(cx);
             cx.notify();
+        }
+    }
+
+    fn scroll_to_selected(&self, _cx: &Context<Self>) {
+        let local_count = self.filtered_local_indices.len();
+        if self.selected_index >= local_count {
+            let host_index = self.selected_index - local_count;
+            self.scroll_handle.scroll_to_item(host_index);
         }
     }
 
@@ -671,6 +686,7 @@ impl Render for SshPicker {
                                     .id("ssh-hosts-list")
                                     .max_h(rems(16.))
                                     .overflow_y_scroll()
+                                    .track_scroll(&self.scroll_handle)
                                     .children(self.filtered_indices.iter().enumerate().map(
                                         |(item_index, &config_index)| {
                                             self.render_ssh_item(item_index, config_index, cx)

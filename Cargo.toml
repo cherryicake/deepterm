@@ -25,7 +25,7 @@ futures = "0.3"
 smol = "2.0"
 
 # SSH dependencies
-russh = { path = "../russh/russh" }
+russh = "0.59.0"
 bytes = "1"
 russh-sftp = "2.1.1"
 async-trait = "0.1"
@@ -34,7 +34,15 @@ async-trait = "0.1"
 keyring = { version = "3.6", features = ["apple-native"] }
 
 # Async runtime compatibility
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "fs", "net", "sync", "time"] }
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "fs",
+  "net",
+  "sync",
+  "time",
+] }
 async-process = "2.3"
 async-io = "2.4"
 
@@ -53,7 +61,10 @@ unicode-segmentation = "1.12"
 unicode-width = "0.2"
 
 # Code Editor
-ropey = { version = "2.0.0-beta.1", features = ["metric_lines_lf", "metric_utf16"] }
+ropey = { version = "2.0.0-beta.1", features = [
+  "metric_lines_lf",
+  "metric_utf16",
+] }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 smallvec = "1"
 lsp-types = { version = "0.97.0", features = ["proposed"] }
@@ -79,8 +90,8 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
-    "Win32_System_Console",
-    "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_Foundation",
 ] }
 
 [target.'cfg(windows)'.dependencies.gpui_platform]
@@ -89,13 +100,13 @@ git = "https://github.com/zed-industries/zed.git"
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.10"
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = [
-    "wayland",
-    "x11",
+  "wayland",
+  "x11",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = [
-    "font-kit",
+  "font-kit",
 ] }
 mach2 = "0.4"
 

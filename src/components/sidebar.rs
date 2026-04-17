@@ -6,7 +6,7 @@ use crate::theme::ActiveTheme;
 
 /// 动画时长常量
 const ANIMATION_DURATION_ENTER_MS: u64 = 450;
-const ANIMATION_DURATION_EXIT_MS: u64 = 250;
+pub const ANIMATION_DURATION_EXIT_MS: u64 = 250;
 
 /// 侧边栏容器组件 - 只负责渲染侧边栏面板本身
 /// 内部内容由调用方通过 children 传入

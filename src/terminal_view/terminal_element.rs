@@ -4,38 +4,21 @@ use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::TerminalView;
+use crate::settings_hub::font_settings::{FontState, platform_default_fallbacks};
 use crate::theme::{ActiveTheme, TerminalTheme};
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
-    Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontFallbacks,
-    FontStyle, FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style,
-    TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
+    Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle,
+    FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style, TextRun,
+    TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
 use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
 const CURSOR_THICKNESS_RATIO: f32 = 0.15;
-
-/// 获取 Linux 系统默认等宽字体名称（带缓存）
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn get_system_monospace_font() -> &'static str {
-    use fontconfig::Fontconfig;
-    use std::sync::OnceLock;
-
-    static SYSTEM_MONO_FONT: OnceLock<String> = OnceLock::new();
-    SYSTEM_MONO_FONT.get_or_init(|| {
-        if let Some(fc) = Fontconfig::new() {
-            if let Some(font) = fc.find("monospace", None) {
-                return font.name;
-            }
-        }
-        // Fallback to common Linux monospace fonts
-        "DejaVu Sans Mono".to_string()
-    })
-}
 
 /// Returns how many terminal cells this Unicode scalar usually occupies.
 /// This is used for cursor width and run-splitting math.
@@ -853,34 +836,14 @@ impl Element for TerminalElement {
         let ui_theme = theme.ui;
         let terminal_theme = theme.terminal;
         let active_theme_id = theme.id.clone();
-        let font_size = px(18.0);
-        let line_height = font_size * 1.25;
+        let settings = &FontState::global(cx).settings;
+        let font_size = px(settings.terminal_font_size);
+        let line_height = font_size * settings.terminal_line_height;
 
-        #[cfg(target_os = "macos")]
-        let (font_family, font_fallbacks) = (
-            "Menlo".into(),
-            Some(FontFallbacks::from_fonts(vec![
-                "Monaco".to_string(),
-                "Courier New".to_string(),
-            ])),
-        );
-
-        #[cfg(target_os = "windows")]
-        let (font_family, font_fallbacks) = (
-            "Consolas".into(),
-            Some(FontFallbacks::from_fonts(vec!["Courier New".to_string()])),
-        );
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let (font_family, font_fallbacks) = {
-            let font_name = get_system_monospace_font();
-            let fallbacks = Some(FontFallbacks::from_fonts(vec![
-                "Noto Sans Mono".to_string(),
-                "Source Code Pro".to_string(),
-                "DejaVu Sans Mono".to_string(),
-            ]));
-            (font_name.into(), fallbacks)
-        };
+        let font_family = crate::settings_hub::font_settings::clean_font_choice(&settings.terminal_font_family)
+            .to_string()
+            .into();
+        let font_fallbacks = Some(platform_default_fallbacks());
 
         let text_style = TextStyle {
             font_family,
@@ -922,21 +885,6 @@ impl Element for TerminalElement {
                 let content = terminal.last_content();
                 (content.display_offset, content.cursor, content.cursor_shape)
             });
-
-        // Calculate visible viewport
-        let visible_bounds = window.content_mask().bounds;
-        let intersection = visible_bounds.intersect(&bounds);
-
-        let _visible_line_start = if intersection.size.height > px(0.0) {
-            ((intersection.top() - bounds.top()).max(px(0.0)) / line_height).floor() as usize
-        } else {
-            0
-        };
-        let _visible_line_count = if intersection.size.height > px(0.0) {
-            ((intersection.size.height / line_height).ceil() as usize).max(1)
-        } else {
-            terminal_bounds.num_lines()
-        };
 
         // Get viewport info for cursor calculation
         let viewport_lines = terminal_bounds.num_lines();

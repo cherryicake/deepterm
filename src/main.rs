@@ -131,6 +131,7 @@ fn main() {
         .with_assets(Assets)
         .run(|cx: &mut App| {
             theme::init(cx);
+            settings_hub::font_settings::FontState::init(cx);
             components::init(cx);
             terminal_view::init(cx);
             workspace::init(cx);

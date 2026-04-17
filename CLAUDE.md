@@ -22,7 +22,6 @@
 ## Editor Architecture (In Progress)
 
 - Migrating toward gpui-component's architecture: `InputState` (pure state) + `Input` (UI wrapper) + `TextElement` (custom Element)
-- `docs/editor-optimization-plan.md` tracks the full refactoring plan
 - Avoid adding new stub modules (LSP, popovers, search, mask_pattern, number_input) — these are slated for removal
 
 ## Theme & Highlighting
