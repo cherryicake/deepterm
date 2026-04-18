@@ -377,22 +377,58 @@ impl TerminalElement {
     }
 
     #[cfg(debug_assertions)]
+    fn run_signature(runs: &[BatchedTextRun]) -> Vec<(usize, usize, String)> {
+        runs.iter()
+            .map(|run| {
+                (
+                    run.start_col,
+                    run.cell_count,
+                    run.shaped_line.text.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(debug_assertions)]
     fn assert_row_consistency<'a>(
-        _row_idx: usize,
-        _row_cells: &'a [IndexedCell],
-        _row_runs: &[BatchedTextRun],
-        _row_boxes: &[BoxDrawingCell],
-        _row_backgrounds: &[BackgroundSpan],
-        _row_selection_cols: &[usize],
-        _window: &mut Window,
-        _text_style: &TextStyle,
-        _font_size: Pixels,
-        _cell_width: Pixels,
-        _terminal_theme: &TerminalTheme,
-        _selection_range: &Option<SelectionRange>,
+        row_idx: usize,
+        row_cells: &'a [IndexedCell],
+        row_runs: &[BatchedTextRun],
+        row_boxes: &[BoxDrawingCell],
+        row_backgrounds: &[BackgroundSpan],
+        row_selection_cols: &[usize],
+        window: &mut Window,
+        text_style: &TextStyle,
+        font_size: Pixels,
+        cell_width: Pixels,
+        terminal_theme: &TerminalTheme,
+        selection_range: &Option<SelectionRange>,
     ) {
-        // Debug asserts disabled to avoid debug-build crashes caused by
-        // a pre-existing cache inconsistency in incremental row updates.
+        let full_entry = Self::layout_row(
+            row_idx,
+            row_cells.iter(),
+            window,
+            text_style,
+            font_size,
+            cell_width,
+            terminal_theme,
+        );
+        let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme);
+        let full_backgrounds = Self::background_spans_for_row(row_idx, row_cells, terminal_theme);
+        let full_selection_cols = Self::selected_cols_for_row(row_cells, selection_range);
+
+        if Self::run_signature(row_runs) != Self::run_signature(&full_entry.runs) {
+            log::warn!("row {row_idx} run mismatch");
+        }
+        if row_boxes != full_boxes.as_slice() {
+            log::warn!("row {row_idx} box mismatch");
+        }
+        if row_backgrounds != full_backgrounds.as_slice() {
+            log::warn!("row {row_idx} background mismatch");
+        }
+        if row_selection_cols != full_selection_cols.as_slice() {
+            log::warn!("row {row_idx} selection mismatch");
+        }
     }
 
     pub fn new(
@@ -804,7 +840,7 @@ impl Element for TerminalElement {
         let text_style = TextStyle {
             font_family,
             font_features: Default::default(),
-            font_weight: FontWeight::NORMAL,
+            font_weight: FontWeight(settings.terminal_font_weight),
             font_fallbacks,
             font_size: font_size.into(),
             font_style: FontStyle::Normal,

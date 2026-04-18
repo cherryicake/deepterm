@@ -20,7 +20,7 @@ use gpui::{
 };
 
 use crate::components::title_bar::TitleBar;
-use crate::ssh_view::picker::{GlobalSshPicker, SshPicker, ShowSshPicker};
+use crate::ssh_view::picker::{GlobalSshPicker, ShowSshPicker, SshPicker};
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions

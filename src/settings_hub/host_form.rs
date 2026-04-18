@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Window, div,
-    px, svg,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    px,
 };
 
-use crate::assets::Icon;
 use crate::components::button::{Button, ButtonVariants};
 use crate::components::input::{EditorInput, InputState};
+use crate::components::select::Select;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
@@ -48,8 +48,8 @@ pub struct HostForm {
     key_passphrase_input: Entity<InputState>,
     credential_label_input: Entity<InputState>,
     auth_type: AuthType,
-    show_auth_dropdown: bool,
-    show_credential_dropdown: bool,
+    auth_type_select: Entity<Select>,
+    keychain_select: Entity<Select>,
     selected_keychain_id: Option<String>,
     keychain_items: Vec<KeychainItem>,
     error_message: Option<String>,
@@ -86,6 +86,113 @@ impl HostForm {
             let credential_label_input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("DeepTerm generated label"));
 
+            let entity = cx.entity();
+            let entity2 = entity.clone();
+
+            let auth_type_select = {
+                let auth_labels: Vec<SharedString> = AuthType::all()
+                    .into_iter()
+                    .map(|a| a.display_name().into())
+                    .collect();
+                let select = Select::new(
+                    window,
+                    cx,
+                    auth_labels,
+                    AuthType::Password.display_name(),
+                );
+                select.update(cx, |select, _cx| {
+                    select.searchable(false);
+                    select.on_select(move |label, _index, cx| {
+                        let auth_type = match label.as_ref() {
+                            "Password" => AuthType::Password,
+                            "Private Key" => AuthType::PrivateKey,
+                            "SSH Agent" => AuthType::Agent,
+                            _ => AuthType::Password,
+                        };
+                        cx.update_entity(&entity, |this: &mut HostForm, _cx| {
+                            this.auth_type = auth_type;
+                            this.selected_keychain_id = None;
+                            this.reload_keychain_items();
+
+                            let (select_items, subtitles) = {
+                                let items = this.available_items();
+                                let mut select_items: Vec<SharedString> =
+                                    vec!["Create new".into()];
+                                let mut subtitles: Vec<SharedString> = vec!["".into()];
+                                for item in items {
+                                    select_items.push(item.label.clone().into());
+                                    subtitles.push(item.subtitle().into());
+                                }
+                                (select_items, subtitles)
+                            };
+
+                            this.keychain_select.update(_cx, |select: &mut Select, cx| {
+                                select.set_items(select_items, cx);
+                                select.set_subtitles(subtitles, cx);
+                                select.set_selected("Create new", cx);
+                            });
+
+                            _cx.notify();
+                        });
+                    });
+                });
+                select
+            };
+
+            let keychain_select = {
+                let select = Select::new(window, cx, vec!["Create new".into()], "Create new");
+                select.update(cx, |select, _cx| {
+                    select.searchable(false);
+                    select.on_select(move |_label, index, cx| {
+                        let keychain_id = cx.update_entity(
+                            &entity2,
+                            |this: &mut HostForm, _cx| {
+                                if index == 0 {
+                                    None
+                                } else {
+                                    this.available_items()
+                                        .get(index - 1)
+                                        .map(|item| item.id.clone())
+                                }
+                            },
+                        );
+                        cx.update_entity(&entity2,
+                            |this: &mut HostForm, _cx| {
+                            this.selected_keychain_id = keychain_id.clone();
+
+                            let selected_label = this
+                                .selected_item()
+                                .map(|item| item.label.clone())
+                                .unwrap_or_else(|| "Create new".to_string());
+
+                            this.keychain_select.update(_cx, |select: &mut Select, cx| {
+                                select.set_selected(selected_label, cx);
+                            });
+
+                            let username = keychain_id.as_ref().and_then(|id| {
+                                this.keychain_items.iter().find(|item| item.id == *id).and_then(
+                                    |item| {
+                                        if item.kind == KeychainItemKind::Identity {
+                                            item.username.clone()
+                                        } else {
+                                            None
+                                        }
+                                    },
+                                )
+                            });
+                            if let Some(username) = username {
+                                this.username_input.update(_cx, |input: &mut InputState, cx| {
+                                    input.set_text(&username, cx);
+                                });
+                            }
+
+                            _cx.notify();
+                        });
+                    });
+                });
+                select
+            };
+
             Self {
                 focus_handle,
                 nickname_input,
@@ -97,8 +204,8 @@ impl HostForm {
                 key_passphrase_input,
                 credential_label_input,
                 auth_type: AuthType::Password,
-                show_auth_dropdown: false,
-                show_credential_dropdown: false,
+                auth_type_select,
+                keychain_select,
                 selected_keychain_id: None,
                 keychain_items: Self::load_keychain_items(),
                 error_message: None,
@@ -183,6 +290,32 @@ impl HostForm {
             }
         }
 
+        // Update selects to match loaded config
+        self.auth_type_select.update(cx, |select, cx| {
+            select.set_selected(self.auth_type.display_name(), cx);
+        });
+
+        let (select_items, subtitles, selected_label) = {
+            let items = self.available_items();
+            let mut select_items: Vec<SharedString> = vec!["Create new".into()];
+            let mut subtitles: Vec<SharedString> = vec!["".into()];
+            for item in items {
+                select_items.push(item.label.clone().into());
+                subtitles.push(item.subtitle().into());
+            }
+            let selected_label = self
+                .selected_item()
+                .map(|item| item.label.clone())
+                .unwrap_or_else(|| "Create new".to_string());
+            (select_items, subtitles, selected_label)
+        };
+
+        self.keychain_select.update(cx, |select, cx| {
+            select.set_items(select_items, cx);
+            select.set_subtitles(subtitles, cx);
+            select.set_selected(selected_label, cx);
+        });
+
         self.error_message = None;
         self.success_message = None;
         cx.notify();
@@ -201,6 +334,25 @@ impl HostForm {
         self.clear_auth_inputs(cx);
         self.auth_type = AuthType::Password;
         self.selected_keychain_id = None;
+
+        self.auth_type_select.update(cx, |select, cx| {
+            select.set_selected(AuthType::Password.display_name(), cx);
+        });
+
+        let items = self.available_items();
+        let mut select_items: Vec<SharedString> = vec!["Create new".into()];
+        let mut subtitles: Vec<SharedString> = vec!["".into()];
+        for item in items {
+            select_items.push(item.label.clone().into());
+            subtitles.push(item.subtitle().into());
+        }
+
+        self.keychain_select.update(cx, |select, cx| {
+            select.set_items(select_items, cx);
+            select.set_subtitles(subtitles, cx);
+            select.set_selected("Create new", cx);
+        });
+
         self.error_message = None;
         self.success_message = None;
         cx.notify();
@@ -429,34 +581,6 @@ impl HostForm {
         }
     }
 
-    fn set_auth_type(&mut self, auth_type: AuthType, cx: &mut Context<Self>) {
-        self.auth_type = auth_type;
-        self.show_auth_dropdown = false;
-        self.show_credential_dropdown = false;
-        self.selected_keychain_id = None;
-        self.reload_keychain_items();
-        cx.notify();
-    }
-
-    fn set_selected_keychain_item(&mut self, keychain_id: Option<String>, cx: &mut Context<Self>) {
-        self.selected_keychain_id = keychain_id.clone();
-        self.show_credential_dropdown = false;
-
-        if let Some(item) = keychain_id
-            .as_ref()
-            .and_then(|id| self.keychain_items.iter().find(|item| item.id == *id))
-            && item.kind == KeychainItemKind::Identity
-            && item.username.as_ref().is_some()
-        {
-            let username = item.username.clone().unwrap_or_default();
-            self.username_input.update(cx, |input, cx| {
-                input.set_text(&username, cx);
-            });
-        }
-
-        cx.notify();
-    }
-
     fn handle_cancel(&mut self, cx: &mut Context<Self>) {
         self.reset_form(cx);
         if let Some(ref callback) = self.on_cancel {
@@ -485,11 +609,8 @@ impl HostForm {
             .child(EditorInput::new(input))
     }
 
-    fn render_auth_type_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_auth_type_selector(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let current_auth = self.auth_type.clone();
-        let show_dropdown = self.show_auth_dropdown;
-
         div()
             .w_full()
             .flex()
@@ -501,112 +622,11 @@ impl HostForm {
                     .text_color(theme.text_muted)
                     .child("Authentication"),
             )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.app_background)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.show_auth_dropdown = !this.show_auth_dropdown;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.text)
-                                    .child(current_auth.display_name()),
-                            )
-                            .child(
-                                svg()
-                                    .size(px(12.0))
-                                    .path(Icon::ChevronDown.path())
-                                    .text_color(theme.icon),
-                            ),
-                    )
-                    .when(show_dropdown, |this| {
-                        this.child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.elevated_background)
-                                .children(AuthType::all().into_iter().map(|auth| {
-                                    let is_selected = auth == current_auth;
-                                    let auth_clone = auth.clone();
-                                    div()
-                                        .w_full()
-                                        .h(px(32.0))
-                                        .px(px(10.0))
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .when(is_selected, |d| {
-                                            d.bg(theme.accent.opacity(
-                                                if cx.theme().appearance.is_dark() {
-                                                    0.18
-                                                } else {
-                                                    0.10
-                                                },
-                                            ))
-                                        })
-                                        .when(!is_selected, |d| {
-                                            d.hover(|s| s.bg(theme.tab_hover_background))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.set_auth_type(auth_clone.clone(), cx);
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(if is_selected {
-                                                    theme.text
-                                                } else {
-                                                    theme.text_muted
-                                                })
-                                                .child(auth.display_name()),
-                                        )
-                                        .into_any_element()
-                                })),
-                        )
-                    }),
-            )
+            .child(self.auth_type_select.clone())
     }
 
-    fn render_keychain_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_keychain_selector(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let items = self.available_items();
-        let selected_label = self
-            .selected_item()
-            .map(|item| item.label.clone())
-            .unwrap_or_else(|| match self.auth_type {
-                AuthType::Password => "Create new identity".to_string(),
-                AuthType::PrivateKey => "Create new key".to_string(),
-                AuthType::Agent => String::new(),
-            });
-
         let title = match self.auth_type {
             AuthType::Password => "Keychain Identity",
             AuthType::PrivateKey => "Keychain Key",
@@ -619,133 +639,7 @@ impl HostForm {
             .flex_col()
             .gap(px(4.0))
             .child(div().text_xs().text_color(theme.text_muted).child(title))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(36.0))
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.app_background)
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.show_credential_dropdown = !this.show_credential_dropdown;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(div().text_sm().text_color(theme.text).child(selected_label))
-                            .child(
-                                svg()
-                                    .size(px(12.0))
-                                    .path(Icon::ChevronDown.path())
-                                    .text_color(theme.icon),
-                            ),
-                    )
-                    .when(self.show_credential_dropdown, |this| {
-                        this.child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_col()
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.elevated_background)
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(32.0))
-                                        .px(px(10.0))
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .when(self.selected_keychain_id.is_none(), |d| {
-                                            d.bg(theme.accent.opacity(
-                                                if cx.theme().appearance.is_dark() {
-                                                    0.18
-                                                } else {
-                                                    0.10
-                                                },
-                                            ))
-                                        })
-                                        .when(self.selected_keychain_id.is_some(), |d| {
-                                            d.hover(|s| s.bg(theme.tab_hover_background))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.set_selected_keychain_item(None, cx);
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.text)
-                                                .child("Create new"),
-                                        ),
-                                )
-                                .children(items.into_iter().map(|item| {
-                                    let item_id = item.id.clone();
-                                    let is_selected =
-                                        self.selected_keychain_id.as_ref() == Some(&item.id);
-                                    div()
-                                        .w_full()
-                                        .px(px(10.0))
-                                        .py(px(8.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.0))
-                                        .cursor_pointer()
-                                        .when(is_selected, |d| {
-                                            d.bg(theme.accent.opacity(
-                                                if cx.theme().appearance.is_dark() {
-                                                    0.18
-                                                } else {
-                                                    0.10
-                                                },
-                                            ))
-                                        })
-                                        .when(!is_selected, |d| {
-                                            d.hover(|s| s.bg(theme.tab_hover_background))
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.set_selected_keychain_item(
-                                                    Some(item_id.clone()),
-                                                    cx,
-                                                );
-                                            }),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.text)
-                                                .child(item.label.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.text_subtle)
-                                                .child(item.subtitle()),
-                                        )
-                                        .into_any_element()
-                                })),
-                        )
-                    }),
-            )
+            .child(self.keychain_select.clone())
     }
 
     fn render_new_identity_fields(&self, cx: &App) -> impl IntoElement {

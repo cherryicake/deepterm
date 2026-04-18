@@ -18,12 +18,14 @@ pub struct Select {
     focus_handle: FocusHandle,
     is_open: bool,
     is_closing: bool,
+    searchable: bool,
     query_input: Entity<InputState>,
     all_items: Vec<SharedString>,
+    item_subtitles: Vec<SharedString>,
     selected_item: SharedString,
     highlighted_index: usize,
     scroll_handle: ScrollHandle,
-    on_select: Option<Arc<dyn Fn(SharedString, &mut App) + Send + Sync>>,
+    on_select: Option<Arc<dyn Fn(SharedString, usize, &mut App) + Send + Sync>>,
     trigger_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -48,8 +50,10 @@ impl Select {
                 focus_handle,
                 is_open: false,
                 is_closing: false,
+                searchable: true,
                 query_input,
                 all_items: items,
+                item_subtitles: Vec::new(),
                 selected_item: selected,
                 highlighted_index: 0,
                 scroll_handle: ScrollHandle::new(),
@@ -65,7 +69,7 @@ impl Select {
 
     pub fn on_select<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, &mut App) + Send + Sync + 'static,
+        F: Fn(SharedString, usize, &mut App) + Send + Sync + 'static,
     {
         self.on_select = Some(Arc::new(callback));
     }
@@ -75,9 +79,18 @@ impl Select {
         cx.notify();
     }
 
+    pub fn set_subtitles(&mut self, subtitles: Vec<SharedString>, cx: &mut Context<Self>) {
+        self.item_subtitles = subtitles;
+        cx.notify();
+    }
+
     pub fn set_selected(&mut self, selected: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.selected_item = selected.into();
         cx.notify();
+    }
+
+    pub fn searchable(&mut self, searchable: bool) {
+        self.searchable = searchable;
     }
 
     fn subscribe_to_input(&mut self, cx: &mut Context<Self>) {
@@ -92,14 +105,17 @@ impl Select {
         self._subscriptions.push(subscription);
     }
 
-    pub(crate) fn filtered_items(&self, cx: &App) -> Vec<&SharedString> {
+    /// Returns indices of items matching the current search query.
+    pub(crate) fn filtered_item_indices(&self, cx: &App) -> Vec<usize> {
         let query = self.query_input.read(cx).value().to_string().to_lowercase();
         if query.is_empty() {
-            self.all_items.iter().collect()
+            (0..self.all_items.len()).collect()
         } else {
             self.all_items
                 .iter()
-                .filter(|item| item.to_lowercase().contains(&query))
+                .enumerate()
+                .filter(|(_, item)| item.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
                 .collect()
         }
     }
@@ -114,10 +130,11 @@ impl Select {
             self.is_open = true;
             self.query_input
                 .update(cx, |input, cx| input.set_text("", cx));
-            let items = self.filtered_items(cx);
-            self.highlighted_index = items
+            let indices = self.filtered_item_indices(cx);
+            self.highlighted_index = indices
                 .iter()
-                .position(|item| *item == &self.selected_item)
+                .map(|&i| &self.all_items[i])
+                .position(|item| item == &self.selected_item)
                 .unwrap_or(0);
             cx.notify();
         }
@@ -135,17 +152,17 @@ impl Select {
         });
     }
 
-    fn confirm(&mut self, item: SharedString, cx: &mut Context<Self>) {
+    fn confirm(&mut self, item: SharedString, item_idx: usize, cx: &mut Context<Self>) {
         self.selected_item = item.clone();
         self.close(cx);
         if let Some(ref on_select) = self.on_select {
-            on_select(item, cx);
+            on_select(item, item_idx, cx);
         }
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let items = self.filtered_items(cx);
-        let count = items.len();
+        let indices = self.filtered_item_indices(cx);
+        let count = indices.len();
         if count == 0 {
             self.highlighted_index = 0;
             return;
@@ -166,10 +183,10 @@ impl Select {
     }
 
     fn confirm_highlighted(&mut self, cx: &mut Context<Self>) {
-        let items = self.filtered_items(cx);
-        if let Some(item) = items.get(self.highlighted_index) {
-            let item = (*item).clone();
-            self.confirm(item, cx);
+        let indices = self.filtered_item_indices(cx);
+        if let Some(&item_idx) = indices.get(self.highlighted_index) {
+            let item = self.all_items[item_idx].clone();
+            self.confirm(item, item_idx, cx);
         }
     }
 }
@@ -184,7 +201,7 @@ impl Render for Select {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let is_open = self.is_open;
-        let items = self.filtered_items(cx);
+        let indices = self.filtered_item_indices(cx);
         let selected = self.selected_item.clone();
         let trigger_bounds = self.trigger_bounds.clone();
         let bounds = trigger_bounds.get();
@@ -198,13 +215,15 @@ impl Render for Select {
         let scroll_handle = self.scroll_handle.clone();
         let query_input = self.query_input.clone();
 
-        let item_elements: Vec<gpui::AnyElement> = items
+        let item_elements: Vec<gpui::AnyElement> = indices
             .into_iter()
             .enumerate()
-            .map(|(ix, item)| {
+            .map(|(ix, item_idx)| {
+                let item = &self.all_items[item_idx];
                 let is_selected = *item == selected;
                 let is_highlighted = ix == highlighted;
                 let item_clone = item.clone();
+                let subtitle = self.item_subtitles.get(item_idx).cloned();
                 div()
                     .id(("select-item", ix))
                     .w_full()
@@ -212,8 +231,8 @@ impl Render for Select {
                     .pl(px(6.0))
                     .pr(px(8.0))
                     .flex()
-                    .items_center()
-                    .gap(px(6.0))
+                    .flex_col()
+                    .gap(px(2.0))
                     .cursor_pointer()
                     .rounded(px(4.0))
                     .when(is_highlighted, |d| {
@@ -231,27 +250,44 @@ impl Render for Select {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.confirm(item_clone.clone(), cx);
+                            this.confirm(item_clone.clone(), item_idx, cx);
                         }),
                     )
                     .child(
                         div()
-                            .w(px(2.0))
-                            .h(px(12.0))
-                            .rounded_full()
-                            .bg(theme_accent)
-                            .when(!is_selected, |d| d.opacity(0.0)),
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .w(px(2.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .bg(theme_accent)
+                                    .when(!is_selected, |d| d.opacity(0.0)),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if is_selected {
+                                        theme_text
+                                    } else {
+                                        theme_text_muted
+                                    })
+                                    .child(item.to_string()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if is_selected {
-                                theme_text
-                            } else {
-                                theme_text_muted
-                            })
-                            .child(item.to_string()),
-                    )
+                    .when(subtitle.as_ref().map_or(false, |s| !s.is_empty()), |d| {
+                        d.child(
+                            div()
+                                .pl(px(8.0))
+                                .text_xs()
+                                .text_color(theme_text_muted)
+                                .child(subtitle.unwrap().to_string()),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();
@@ -345,30 +381,32 @@ impl Render for Select {
                                             }
                                         }))
                                         .track_focus(&focus_handle)
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .h(px(28.0))
-                                                .px(px(6.0))
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(6.0))
-                                                .rounded(px(4.0))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .bg(theme.app_background)
-                                                .child(
-                                                    svg()
-                                                        .size(px(12.0))
-                                                        .path(Icon::MagnifyingGlass.path())
-                                                        .text_color(theme.icon),
-                                                )
-                                                .child(
-                                                    EditorInput::new(&query_input)
-                                                        .size(Size::Small)
-                                                        .transparent(),
-                                                ),
-                                        )
+                                        .when(self.searchable, |d| {
+                                            d.child(
+                                                div()
+                                                    .w_full()
+                                                    .h(px(28.0))
+                                                    .px(px(6.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .rounded(px(4.0))
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .bg(theme.app_background)
+                                                    .child(
+                                                        svg()
+                                                            .size(px(12.0))
+                                                            .path(Icon::MagnifyingGlass.path())
+                                                            .text_color(theme.icon),
+                                                    )
+                                                    .child(
+                                                        EditorInput::new(&query_input)
+                                                            .size(Size::Small)
+                                                            .transparent(),
+                                                    ),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("select-list")

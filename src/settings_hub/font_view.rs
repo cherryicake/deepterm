@@ -1,14 +1,27 @@
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div, px};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render, SharedString, Window, div, px};
 
 use crate::components::select::Select;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::settings_hub::font_settings::{FontState, platform_default_font_family, format_font_choice, clean_font_choice};
 use crate::theme::ActiveTheme;
 
+const WEIGHT_OPTIONS: &[(FontWeight, &str)] = &[
+    (FontWeight::THIN, "Thin"),
+    (FontWeight::EXTRA_LIGHT, "Extra Light"),
+    (FontWeight::LIGHT, "Light"),
+    (FontWeight::NORMAL, "Normal"),
+    (FontWeight::MEDIUM, "Medium"),
+    (FontWeight::SEMIBOLD, "Semibold"),
+    (FontWeight::BOLD, "Bold"),
+    (FontWeight::EXTRA_BOLD, "Extra Bold"),
+    (FontWeight::BLACK, "Black"),
+];
+
 pub struct FontSettingsView {
     focus_handle: FocusHandle,
     font_select: Entity<Select>,
+    weight_select: Entity<Select>,
     font_size_input: Entity<InputState>,
     line_height_input: Entity<InputState>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -51,11 +64,39 @@ impl FontSettingsView {
                 selected_label,
             );
             font_select.update(cx, |select, _cx| {
-                select.on_select(move |family, cx| {
+                select.on_select(move |family, _index, cx| {
                     let family = clean_font_choice(&family.to_string()).to_string();
                     FontState::update(cx, |settings| {
                         settings.terminal_font_family = family;
                     });
+                });
+            });
+
+            let current_weight = FontState::global(cx).settings.terminal_font_weight;
+            let weight_labels: Vec<SharedString> = WEIGHT_OPTIONS
+                .iter()
+                .map(|(_, label)| (*label).into())
+                .collect();
+            let selected_weight_label = WEIGHT_OPTIONS
+                .iter()
+                .find(|(w, _)| w.0 == current_weight)
+                .map(|(_, label)| (*label).to_string())
+                .unwrap_or("Normal".to_string());
+
+            let weight_select = Select::new(
+                window,
+                cx,
+                weight_labels,
+                selected_weight_label,
+            );
+            weight_select.update(cx, |select, _cx| {
+                select.searchable(false);
+                select.on_select(move |label, _index, cx| {
+                    if let Some((weight, _)) = WEIGHT_OPTIONS.iter().find(|(_, l)| *l == label.as_ref()) {
+                        FontState::update(cx, |settings| {
+                            settings.terminal_font_weight = weight.0;
+                        });
+                    }
                 });
             });
 
@@ -80,6 +121,7 @@ impl FontSettingsView {
             let mut view = Self {
                 focus_handle,
                 font_select,
+                weight_select,
                 font_size_input,
                 line_height_input,
                 _subscriptions: Vec::new(),
@@ -231,24 +273,42 @@ impl Render for FontSettingsView {
                             div()
                                 .w_full()
                                 .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child("Terminal Font Family"),
-                                )
-                                .child(self.font_select.clone()),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
                                 .flex_row()
                                 .gap_4()
                                 .child(
                                     div().flex_1().child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.text_muted)
+                                                    .child("Terminal Font Family"),
+                                            )
+                                            .child(self.font_select.clone()),
+                                    ),
+                                )
+                                .child(
+                                    div().w(px(140.0)).child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.text_muted)
+                                                    .child("Font Weight"),
+                                            )
+                                            .child(self.weight_select.clone()),
+                                    ),
+                                )
+                                .child(
+                                    div().w(px(120.0)).child(
                                         div()
                                             .w_full()
                                             .flex()
@@ -272,7 +332,7 @@ impl Render for FontSettingsView {
                                     ),
                                 )
                                 .child(
-                                    div().flex_1().child(
+                                    div().w(px(120.0)).child(
                                         div()
                                             .w_full()
                                             .flex()

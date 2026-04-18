@@ -59,6 +59,15 @@ use crate::theme::ActiveTheme;
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 const CONTEXT: &str = "Terminal";
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
+
+// Scroll velocity tracking constants
+const SCROLL_VELOCITY_WINDOW_SIZE: usize = 3;
+const SCROLL_MULTIPLIER_BASE: f32 = 3.0;
+const SCROLL_MULTIPLIER_MAX: f32 = 8.0;
+const SCROLL_VELOCITY_SCALE: f32 = 2000.0;
+
+// Scrollbar thumb animation duration (seconds)
+const SCROLLBAR_ANIMATION_DURATION: f32 = 0.15;
 pub(crate) fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     cx.bind_keys([
@@ -259,7 +268,7 @@ impl TerminalView {
                 scrollbar_anim_start: Instant::now(),
                 scrollbar_animating: false,
                 last_scroll_instant: Instant::now(),
-                recent_scroll_velocities: VecDeque::with_capacity(3),
+                recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
                 last_scroll_direction: 0,
             };
             this.update_title(cx);
@@ -384,7 +393,7 @@ impl TerminalView {
                 scrollbar_anim_start: Instant::now(),
                 scrollbar_animating: false,
                 last_scroll_instant: Instant::now(),
-                recent_scroll_velocities: VecDeque::with_capacity(3),
+                recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
                 last_scroll_direction: 0,
             };
 
@@ -545,7 +554,7 @@ impl TerminalView {
             content.viewport_lines,
             content.display_offset,
             line_height,
-            px(content.viewport_lines as f32 * line_height.as_f32()),
+            term.terminal_bounds().bounds.size.height,
         )
         .map(|(y, _)| y)
         .unwrap_or(px(0.0))
@@ -1470,15 +1479,21 @@ impl Render for TerminalView {
         let is_focused = focus_handle.is_focused(window);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
+        // Pre-read terminal state needed below to avoid redundant entity locks.
+        let (scrollbar_drag_offset, last_scroll_time) = {
+            let term = self.terminal.read(cx);
+            (term.scrollbar_drag_offset.get(), term.last_scroll_time.get())
+        };
+
         // ── Scrollbar thumb position ─────────────────────────────────────────
         // While dragging, snap to the exact position and kill any animation.
-        let scrollbar_thumb_y = if self.terminal.read(cx).scrollbar_drag_offset.get().is_some() {
+        let scrollbar_thumb_y = if scrollbar_drag_offset.is_some() {
             self.scrollbar_animating = false;
             self.scrollbar_thumb_y = self.calculate_scrollbar_thumb_y(cx);
             self.scrollbar_thumb_y
         } else if self.scrollbar_animating {
             let elapsed = self.scrollbar_anim_start.elapsed().as_secs_f32();
-            let duration = 0.15_f32;
+            let duration = SCROLLBAR_ANIMATION_DURATION;
             let t = (elapsed / duration).min(1.0);
             let ease = 1.0 - (1.0 - t).powi(3);
             self.scrollbar_thumb_y = px(
@@ -1499,7 +1514,6 @@ impl Render for TerminalView {
         // Schedule a single refresh when the scrollbar should actually hide.
         // Polling every 100ms keeps repainting even when terminal content is unchanged.
         if show_scrollbar {
-            let last_scroll_time = self.terminal.read(cx).last_scroll_time.get();
             let should_reschedule = self.scrollbar_hide_scheduled_at != Some(last_scroll_time);
             if should_reschedule {
                 self.scrollbar_hide_task = None;
@@ -1597,16 +1611,18 @@ impl Render for TerminalView {
                     0.0
                 };
 
-                // Maintain a sliding window of the last 3 velocities.
+                // Maintain a sliding window of recent velocities.
                 this.recent_scroll_velocities.push_back(velocity);
-                if this.recent_scroll_velocities.len() > 3 {
+                if this.recent_scroll_velocities.len() > SCROLL_VELOCITY_WINDOW_SIZE {
                     this.recent_scroll_velocities.pop_front();
                 }
                 let avg_velocity: f32 = this.recent_scroll_velocities.iter().sum::<f32>()
                     / this.recent_scroll_velocities.len().max(1) as f32;
 
-                // Dynamic multiplier: base 3.0 + velocity bonus (capped at 8.0).
-                let dynamic_multiplier = (3.0 + avg_velocity / 2000.0).min(8.0);
+                // Dynamic multiplier: base + velocity bonus (capped at max).
+                let dynamic_multiplier = (SCROLL_MULTIPLIER_BASE
+                    + avg_velocity / SCROLL_VELOCITY_SCALE)
+                    .min(SCROLL_MULTIPLIER_MAX);
 
                 // Detect direction change and tell Terminal to reset accumulator.
                 let current_direction = event.delta.pixel_delta(line_height).y.signum() as i32;

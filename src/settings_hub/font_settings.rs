@@ -13,6 +13,9 @@ pub struct FontSettings {
 
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
+
+    #[serde(default = "default_terminal_font_weight")]
+    pub terminal_font_weight: f32,
 }
 
 impl Default for FontSettings {
@@ -21,6 +24,7 @@ impl Default for FontSettings {
             terminal_font_family: default_terminal_font_family(),
             terminal_font_size: default_terminal_font_size(),
             terminal_line_height: default_terminal_line_height(),
+            terminal_font_weight: default_terminal_font_weight(),
         }
     }
 }
@@ -60,6 +64,10 @@ fn default_terminal_font_size() -> f32 {
 
 fn default_terminal_line_height() -> f32 {
     1.25
+}
+
+fn default_terminal_font_weight() -> f32 {
+    400.0
 }
 
 /// 获取 Linux 系统默认等宽字体名称（带缓存）
