@@ -24,7 +24,11 @@ impl DiagnosticSet {
     pub fn for_offset(&self, _offset: usize) -> Option<DiagnosticItem> {
         None
     }
-    pub fn styles_for_range(&self, _range: &std::ops::Range<usize>, _cx: &gpui::App) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
+    pub fn styles_for_range(
+        &self,
+        _range: &std::ops::Range<usize>,
+        _cx: &gpui::App,
+    ) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
         Vec::new()
     }
 }

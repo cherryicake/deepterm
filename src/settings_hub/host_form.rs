@@ -66,8 +66,8 @@ impl HostForm {
             let default_username = get_current_username().unwrap_or_default();
 
             let nickname_input = cx.new(|cx| InputState::new(window, cx).placeholder("My Server"));
-            let hostname_input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("192.168.1.100 or example.com"));
+            let hostname_input = cx
+                .new(|cx| InputState::new(window, cx).placeholder("192.168.1.100 or example.com"));
             let port_input = cx.new(|cx| InputState::new(window, cx));
             port_input.update(cx, |input, cx| input.set_text("22", cx));
             let username_input = cx.new(|cx| InputState::new(window, cx));
@@ -77,7 +77,8 @@ impl HostForm {
                     .placeholder("Save into system keychain")
                     .masked(true)
             });
-            let key_path_input = cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519"));
+            let key_path_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519"));
             let key_passphrase_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Optional passphrase")
@@ -94,12 +95,8 @@ impl HostForm {
                     .into_iter()
                     .map(|a| a.display_name().into())
                     .collect();
-                let select = Select::new(
-                    window,
-                    cx,
-                    auth_labels,
-                    AuthType::Password.display_name(),
-                );
+                let select =
+                    Select::new(window, cx, auth_labels, AuthType::Password.display_name());
                 select.update(cx, |select, _cx| {
                     select.searchable(false);
                     select.on_select(move |label, _index, cx| {
@@ -116,8 +113,7 @@ impl HostForm {
 
                             let (select_items, subtitles) = {
                                 let items = this.available_items();
-                                let mut select_items: Vec<SharedString> =
-                                    vec!["Create new".into()];
+                                let mut select_items: Vec<SharedString> = vec!["Create new".into()];
                                 let mut subtitles: Vec<SharedString> = vec!["".into()];
                                 for item in items {
                                     select_items.push(item.label.clone().into());
@@ -144,20 +140,16 @@ impl HostForm {
                 select.update(cx, |select, _cx| {
                     select.searchable(false);
                     select.on_select(move |_label, index, cx| {
-                        let keychain_id = cx.update_entity(
-                            &entity2,
-                            |this: &mut HostForm, _cx| {
-                                if index == 0 {
-                                    None
-                                } else {
-                                    this.available_items()
-                                        .get(index - 1)
-                                        .map(|item| item.id.clone())
-                                }
-                            },
-                        );
-                        cx.update_entity(&entity2,
-                            |this: &mut HostForm, _cx| {
+                        let keychain_id = cx.update_entity(&entity2, |this: &mut HostForm, _cx| {
+                            if index == 0 {
+                                None
+                            } else {
+                                this.available_items()
+                                    .get(index - 1)
+                                    .map(|item| item.id.clone())
+                            }
+                        });
+                        cx.update_entity(&entity2, |this: &mut HostForm, _cx| {
                             this.selected_keychain_id = keychain_id.clone();
 
                             let selected_label = this
@@ -170,20 +162,22 @@ impl HostForm {
                             });
 
                             let username = keychain_id.as_ref().and_then(|id| {
-                                this.keychain_items.iter().find(|item| item.id == *id).and_then(
-                                    |item| {
+                                this.keychain_items
+                                    .iter()
+                                    .find(|item| item.id == *id)
+                                    .and_then(|item| {
                                         if item.kind == KeychainItemKind::Identity {
                                             item.username.clone()
                                         } else {
                                             None
                                         }
-                                    },
-                                )
+                                    })
                             });
                             if let Some(username) = username {
-                                this.username_input.update(_cx, |input: &mut InputState, cx| {
-                                    input.set_text(&username, cx);
-                                });
+                                this.username_input
+                                    .update(_cx, |input: &mut InputState, cx| {
+                                        input.set_text(&username, cx);
+                                    });
                             }
 
                             _cx.notify();
@@ -535,7 +529,12 @@ impl HostForm {
         let nickname = self.nickname_input.read(cx).value().to_string();
         let hostname = self.hostname_input.read(cx).value().to_string();
         let username = self.username_input.read(cx).value().to_string();
-        let port = self.port_input.read(cx).value().parse::<u16>().unwrap_or(22);
+        let port = self
+            .port_input
+            .read(cx)
+            .value()
+            .parse::<u16>()
+            .unwrap_or(22);
 
         let host_label = if nickname.trim().is_empty() {
             format!("{}@{}", username.trim(), hostname.trim())

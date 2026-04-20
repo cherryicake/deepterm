@@ -1,10 +1,10 @@
 //! Terminal element for rendering
 
+use crate::settings_hub::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::TerminalView;
-use crate::settings_hub::font_settings::{FontState, platform_default_fallbacks};
 use crate::theme::{ActiveTheme, TerminalTheme};
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
@@ -832,9 +832,10 @@ impl Element for TerminalElement {
         let font_size = px(settings.terminal_font_size);
         let line_height = font_size * settings.terminal_line_height;
 
-        let font_family = crate::settings_hub::font_settings::clean_font_choice(&settings.terminal_font_family)
-            .to_string()
-            .into();
+        let font_family =
+            crate::settings_hub::font_settings::clean_font_choice(&settings.terminal_font_family)
+                .to_string()
+                .into();
         let font_fallbacks = Some(platform_default_fallbacks());
 
         let text_style = TextStyle {

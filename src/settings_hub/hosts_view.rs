@@ -183,7 +183,11 @@ impl HostsView {
     }
 
     /// Create a new HostsView with optional workspace
-    pub fn new_with_workspace(window: &mut Window, cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
+    pub fn new_with_workspace(
+        window: &mut Window,
+        cx: &mut App,
+        workspace: Option<Entity<Workspace>>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let scroll_handle = ScrollHandle::new();
@@ -651,11 +655,7 @@ impl HostsView {
                         Box::new(ConnectHost),
                     )
                     .separator()
-                    .menu_with_icon(
-                        "Edit",
-                        MenuIcon::new("icons/edit.svg"),
-                        Box::new(EditHost),
-                    )
+                    .menu_with_icon("Edit", MenuIcon::new("icons/edit.svg"), Box::new(EditHost))
                     .menu("Duplicate", Box::new(DuplicateHost))
                     .separator()
                     .menu_with_icon(

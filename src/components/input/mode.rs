@@ -6,9 +6,9 @@ use gpui::{App, SharedString, Task};
 use ropey::Rope;
 
 use super::display_map::DisplayMap;
+use crate::components::input::{InputEdit, RopeExt as _, TabSize};
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
-use crate::components::input::{InputEdit, RopeExt as _, TabSize};
 
 pub(crate) struct PendingBackgroundParse {
     pub highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,

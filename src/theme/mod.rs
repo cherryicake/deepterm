@@ -6,7 +6,9 @@ use gpui::{App, Global, Hsla, SharedString, WindowAppearance, rgb};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::highlighter::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
+use crate::highlighter::{
+    HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -136,20 +138,24 @@ impl TerminalTheme {
     }
 
     /// Generate a highlight theme from terminal ANSI colors.
-    pub fn to_highlight_theme(&self, name: &str, appearance: ThemeAppearance) -> Arc<HighlightTheme> {
+    pub fn to_highlight_theme(
+        &self,
+        name: &str,
+        appearance: ThemeAppearance,
+    ) -> Arc<HighlightTheme> {
         Arc::new(HighlightTheme {
             name: name.to_string(),
             appearance,
             style: HighlightThemeStyle {
                 editor_background: Some(self.background),
                 editor_foreground: Some(self.foreground),
-                editor_active_line: Some(gpui::Hsla::from(gpui::Rgba::from(self.background).blend(
-                    if appearance.is_dark() {
+                editor_active_line: Some(gpui::Hsla::from(
+                    gpui::Rgba::from(self.background).blend(if appearance.is_dark() {
                         gpui::rgba(0xFFFFFF10)
                     } else {
                         gpui::rgba(0x0000000C)
-                    },
-                ))),
+                    }),
+                )),
                 editor_line_number: Some(self.dim_foreground),
                 editor_active_line_number: Some(self.foreground),
                 editor_invisible: Some(self.dim_foreground),

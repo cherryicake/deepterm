@@ -1,23 +1,21 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, Corners, Element, ElementId, ElementInputHandler,
-    Entity, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement,
-    LayoutId, MouseButton, MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size,
-    Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window,
+    App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Half,
+    HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId, MouseButton,
+    MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size, Style, TextAlign, TextRun,
+    TextStyle, UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
     components::button::Size as ButtonSize,
-    components::input::{
-        blink_cursor::CURSOR_WIDTH, display_map::LineLayout, RopeExt as _,
-    },
+    components::input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
     theme::ActiveTheme as _,
 };
 
-use super::{mode::InputMode, InputState, LastLayout, WhitespaceIndicators};
+use super::{InputState, LastLayout, WhitespaceIndicators, mode::InputMode};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);

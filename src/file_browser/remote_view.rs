@@ -185,7 +185,12 @@ impl RemoteFileBrowserView {
         })
     }
 
-    pub fn open_requested_path(&mut self, requested_path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_requested_path(
+        &mut self,
+        requested_path: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| input.clear(cx));
         self.start_load(LoadRequest::OpenRequested { requested_path }, true, cx);
@@ -234,8 +239,10 @@ impl RemoteFileBrowserView {
                 let _ = entity.update(cx, |this, cx| {
                     match result {
                         Ok(entries) => {
-                            let mut entries: Vec<FileEntry> =
-                                entries.into_iter().map(FileEntry::from_sftp_entry).collect();
+                            let mut entries: Vec<FileEntry> = entries
+                                .into_iter()
+                                .map(FileEntry::from_sftp_entry)
+                                .collect();
                             entries.sort_by_key(FileEntry::sort_key);
                             this.directory_cache.insert(path, entries);
                         }
@@ -1050,11 +1057,7 @@ impl RemoteFileBrowserView {
                                     .items_center()
                                     .justify_start()
                                     .child(if is_directory {
-                                        if is_expanded {
-                                            "▾"
-                                        } else {
-                                            "▸"
-                                        }
+                                        if is_expanded { "▾" } else { "▸" }
                                     } else {
                                         ""
                                     }),

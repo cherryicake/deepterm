@@ -134,7 +134,11 @@ pub struct FileBrowserView {
 }
 
 impl FileBrowserView {
-    pub fn new_with_path(window: &mut Window, cx: &mut App, requested_path: Option<PathBuf>) -> Entity<Self> {
+    pub fn new_with_path(
+        window: &mut Window,
+        cx: &mut App,
+        requested_path: Option<PathBuf>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             let search_input = cx.new(|cx| {
                 InputState::new(window, cx)
@@ -170,7 +174,12 @@ impl FileBrowserView {
         })
     }
 
-    pub fn open_requested_path(&mut self, requested_path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_requested_path(
+        &mut self,
+        requested_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let default_root = Self::default_root_path();
         let mut pending_error = None;
         let requested_path = requested_path.unwrap_or_else(|| default_root.clone());
@@ -981,11 +990,7 @@ impl FileBrowserView {
                                     .items_center()
                                     .justify_start()
                                     .child(if is_directory {
-                                        if is_expanded {
-                                            "▾"
-                                        } else {
-                                            "▸"
-                                        }
+                                        if is_expanded { "▾" } else { "▸" }
                                     } else {
                                         ""
                                     }),

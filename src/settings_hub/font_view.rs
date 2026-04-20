@@ -1,9 +1,14 @@
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render, SharedString, Window, div, px};
+use gpui::{
+    App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render, SharedString,
+    Window, div, px,
+};
 
-use crate::components::select::Select;
 use crate::components::input::{EditorInput, InputEvent, InputState};
-use crate::settings_hub::font_settings::{FontState, platform_default_font_family, format_font_choice, clean_font_choice};
+use crate::components::select::Select;
+use crate::settings_hub::font_settings::{
+    FontState, clean_font_choice, format_font_choice, platform_default_font_family,
+};
 use crate::theme::ActiveTheme;
 
 const WEIGHT_OPTIONS: &[(FontWeight, &str)] = &[
@@ -40,16 +45,26 @@ impl FontSettingsView {
 
             let default_font = platform_default_font_family().to_string();
             let hardcoded = vec![
-                "Menlo", "Monaco", "Consolas", "Courier New", "JetBrains Mono",
-                "Fira Code", "Source Code Pro", "Hack", "DejaVu Sans Mono", "SF Mono",
+                "Menlo",
+                "Monaco",
+                "Consolas",
+                "Courier New",
+                "JetBrains Mono",
+                "Fira Code",
+                "Source Code Pro",
+                "Hack",
+                "DejaVu Sans Mono",
+                "SF Mono",
             ];
-            let default_fonts: Vec<SharedString> = std::iter::once(format_font_choice(&default_font, true).into())
-                .chain(
-                    hardcoded.into_iter()
-                        .filter(|f| *f != default_font.as_str())
-                        .map(|f| f.into())
-                )
-                .collect();
+            let default_fonts: Vec<SharedString> =
+                std::iter::once(format_font_choice(&default_font, true).into())
+                    .chain(
+                        hardcoded
+                            .into_iter()
+                            .filter(|f| *f != default_font.as_str())
+                            .map(|f| f.into()),
+                    )
+                    .collect();
 
             let selected_label = if current_family == default_font {
                 format_font_choice(&default_font, true)
@@ -57,12 +72,7 @@ impl FontSettingsView {
                 current_family.clone()
             };
 
-            let font_select = Select::new(
-                window,
-                cx,
-                default_fonts,
-                selected_label,
-            );
+            let font_select = Select::new(window, cx, default_fonts, selected_label);
             font_select.update(cx, |select, _cx| {
                 select.on_select(move |family, _index, cx| {
                     let family = clean_font_choice(&family.to_string()).to_string();
@@ -83,16 +93,13 @@ impl FontSettingsView {
                 .map(|(_, label)| (*label).to_string())
                 .unwrap_or("Normal".to_string());
 
-            let weight_select = Select::new(
-                window,
-                cx,
-                weight_labels,
-                selected_weight_label,
-            );
+            let weight_select = Select::new(window, cx, weight_labels, selected_weight_label);
             weight_select.update(cx, |select, _cx| {
                 select.searchable(false);
                 select.on_select(move |label, _index, cx| {
-                    if let Some((weight, _)) = WEIGHT_OPTIONS.iter().find(|(_, l)| *l == label.as_ref()) {
+                    if let Some((weight, _)) =
+                        WEIGHT_OPTIONS.iter().find(|(_, l)| *l == label.as_ref())
+                    {
                         FontState::update(cx, |settings| {
                             settings.terminal_font_weight = weight.0;
                         });
@@ -213,14 +220,14 @@ impl FontSettingsView {
             fonts.sort();
             fonts.dedup();
             fonts.retain(|f| f != &default_font);
-            let mut final_fonts: Vec<SharedString> = vec![format_font_choice(&default_font, true).into()];
+            let mut final_fonts: Vec<SharedString> =
+                vec![format_font_choice(&default_font, true).into()];
             final_fonts.extend(fonts.into_iter().map(|s| s.into()));
             if !final_fonts.is_empty() {
                 select.set_items(final_fonts, cx);
             }
         });
     }
-
 }
 
 impl Focusable for FontSettingsView {
@@ -264,98 +271,93 @@ impl Render for FontSettingsView {
                         ),
                 )
                 .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .flex_row()
-                                .gap_4()
-                                .child(
-                                    div().flex_1().child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_muted)
-                                                    .child("Terminal Font Family"),
-                                            )
-                                            .child(self.font_select.clone()),
-                                    ),
-                                )
-                                .child(
-                                    div().w(px(140.0)).child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_muted)
-                                                    .child("Font Weight"),
-                                            )
-                                            .child(self.weight_select.clone()),
-                                    ),
-                                )
-                                .child(
-                                    div().w(px(120.0)).child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_muted)
-                                                    .child("Font Size (px)"),
-                                            )
-                                            .child(EditorInput::new(&self.font_size_input))
-                                            .when(!self.font_size_valid, |d| {
-                                                d.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(error_color)
-                                                        .child("Value must be between 6 and 72"),
-                                                )
-                                            }),
-                                    ),
-                                )
-                                .child(
-                                    div().w(px(120.0)).child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.0))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.text_muted)
-                                                    .child("Line Height (ratio)"),
-                                            )
-                                            .child(EditorInput::new(&self.line_height_input))
-                                            .when(!self.line_height_valid, |d| {
-                                                d.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(error_color)
-                                                        .child("Value must be between 0.8 and 3.0"),
-                                                )
-                                            }),
-                                    ),
+                    div().w_full().flex().flex_col().gap_4().child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .gap_4()
+                            .child(
+                                div().flex_1().child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child("Terminal Font Family"),
+                                        )
+                                        .child(self.font_select.clone()),
                                 ),
-                        ),
+                            )
+                            .child(
+                                div().w(px(140.0)).child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child("Font Weight"),
+                                        )
+                                        .child(self.weight_select.clone()),
+                                ),
+                            )
+                            .child(
+                                div().w(px(120.0)).child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child("Font Size (px)"),
+                                        )
+                                        .child(EditorInput::new(&self.font_size_input))
+                                        .when(!self.font_size_valid, |d| {
+                                            d.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(error_color)
+                                                    .child("Value must be between 6 and 72"),
+                                            )
+                                        }),
+                                ),
+                            )
+                            .child(
+                                div().w(px(120.0)).child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.text_muted)
+                                                .child("Line Height (ratio)"),
+                                        )
+                                        .child(EditorInput::new(&self.line_height_input))
+                                        .when(!self.line_height_valid, |d| {
+                                            d.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(error_color)
+                                                    .child("Value must be between 0.8 and 3.0"),
+                                            )
+                                        }),
+                                ),
+                            ),
+                    ),
                 ),
         )
     }

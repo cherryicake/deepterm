@@ -8,10 +8,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use crate::{
-    theme::ThemeAppearance,
-    highlighter::languages,
-};
+use crate::{highlighter::languages, theme::ThemeAppearance};
 
 pub(super) const HIGHLIGHT_NAMES: [&str; 40] = [
     "attribute",
@@ -405,11 +402,10 @@ impl StatusColors {
 
     #[inline]
     pub fn hint_background(&self, _cx: &App) -> Hsla {
-        self.hint_background
-            .unwrap_or_else(|| {
-                let c: Hsla = gpui::rgb(0x00FFFF).into();
-                c.opacity(0.2)
-            })
+        self.hint_background.unwrap_or_else(|| {
+            let c: Hsla = gpui::rgb(0x00FFFF).into();
+            c.opacity(0.2)
+        })
     }
 
     #[inline]
@@ -488,7 +484,9 @@ impl LanguageRegistry {
         static INSTANCE: LazyLock<LanguageRegistry> = LazyLock::new(|| LanguageRegistry {
             languages: Mutex::new(
                 languages::Language::all()
-                    .map(|language: languages::Language| (language.name().into(), language.config()))
+                    .map(|language: languages::Language| {
+                        (language.name().into(), language.config())
+                    })
                     .collect::<HashMap<SharedString, LanguageConfig>>(),
             ),
         });

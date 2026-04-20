@@ -61,7 +61,9 @@ pub enum TerminalType {
 pub enum DriverEvent {
     RemoteData(bytes::Bytes),
     /// SSH 连接异常断开（网络问题或连接中断）
-    AbnormalDisconnect { reason: String },
+    AbnormalDisconnect {
+        reason: String,
+    },
 }
 
 /// Terminal events

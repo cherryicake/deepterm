@@ -687,7 +687,11 @@ impl SettingsHubView {
         Self::new_with_workspace(window, cx, None)
     }
 
-    pub fn new_with_workspace(window: &mut Window, cx: &mut App, workspace: Option<Entity<Workspace>>) -> Entity<Self> {
+    pub fn new_with_workspace(
+        window: &mut Window,
+        cx: &mut App,
+        workspace: Option<Entity<Workspace>>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
 
@@ -972,10 +976,9 @@ pub fn create_default_settingshub_sections() -> Vec<SettingsHubSection> {
             SettingsHubItem::new("keychain", Icon::KeyShield, "Keychain"),
         ]),
         // 终端设置分组
-        SettingsHubSection::new("terminal_setting", Some("偏好设置"))
-            .with_items(vec![
-                SettingsHubItem::new("theme", Icon::Screen, "Theme"),
-                SettingsHubItem::new("fonts", Icon::Terminal, "Fonts"),
-            ]),
+        SettingsHubSection::new("terminal_setting", Some("偏好设置")).with_items(vec![
+            SettingsHubItem::new("theme", Icon::Screen, "Theme"),
+            SettingsHubItem::new("fonts", Icon::Terminal, "Fonts"),
+        ]),
     ]
 }

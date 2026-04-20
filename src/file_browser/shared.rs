@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use gpui::prelude::*;
-use gpui::{div, px, Div};
+use gpui::{Div, div, px};
 
 use crate::theme::UiTheme;
 

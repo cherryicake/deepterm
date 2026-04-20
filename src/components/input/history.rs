@@ -176,8 +176,8 @@ impl Default for History<Change> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::change::Change;
+    use super::*;
 
     #[derive(Clone)]
     struct TabIndex {
@@ -238,8 +238,7 @@ mod tests {
 
     #[test]
     fn test_history_grouping() {
-        let mut history = History::new()
-            .group_interval(std::time::Duration::from_secs(1));
+        let mut history = History::new().group_interval(std::time::Duration::from_secs(1));
 
         // 开始分组
         history.start_grouping();

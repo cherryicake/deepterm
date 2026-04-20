@@ -108,10 +108,7 @@ impl SshConnectView {
                 let should_continue = this
                     .update(cx, |view, _cx| {
                         // 连接完成或失败后停止动画
-                        matches!(
-                            view.status,
-                            ConnectStatus::Connecting { .. }
-                        )
+                        matches!(view.status, ConnectStatus::Connecting { .. })
                     })
                     .unwrap_or(false);
                 if !should_continue {

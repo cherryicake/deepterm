@@ -78,7 +78,9 @@ impl RenderOnce for EditorInput {
             .when(!state.disabled, |this| {
                 this.on_action(window.listener_for(&self.state, InputState::backspace))
                     .on_action(window.listener_for(&self.state, InputState::delete))
-                    .on_action(window.listener_for(&self.state, InputState::delete_to_beginning_of_line))
+                    .on_action(
+                        window.listener_for(&self.state, InputState::delete_to_beginning_of_line),
+                    )
                     .on_action(window.listener_for(&self.state, InputState::delete_to_end_of_line))
                     .on_action(window.listener_for(&self.state, InputState::delete_previous_word))
                     .on_action(window.listener_for(&self.state, InputState::delete_next_word))
@@ -101,9 +103,13 @@ impl RenderOnce for EditorInput {
                             .on_action(window.listener_for(&self.state, InputState::page_down))
                     })
                     .on_action(window.listener_for(&self.state, InputState::select_all))
-                    .on_action(window.listener_for(&self.state, InputState::select_to_start_of_line))
+                    .on_action(
+                        window.listener_for(&self.state, InputState::select_to_start_of_line),
+                    )
                     .on_action(window.listener_for(&self.state, InputState::select_to_end_of_line))
-                    .on_action(window.listener_for(&self.state, InputState::select_to_previous_word))
+                    .on_action(
+                        window.listener_for(&self.state, InputState::select_to_previous_word),
+                    )
                     .on_action(window.listener_for(&self.state, InputState::select_to_next_word))
                     .on_action(window.listener_for(&self.state, InputState::home))
                     .on_action(window.listener_for(&self.state, InputState::end))
@@ -175,7 +181,10 @@ impl RenderOnce for EditorInput {
                         .flex()
                         .items_center()
                         .overflow_hidden()
-                        .child(TextElement::new(self.state.clone()).placeholder(state.placeholder.clone()))
+                        .child(
+                            TextElement::new(self.state.clone())
+                                .placeholder(state.placeholder.clone()),
+                        ),
                 )
                 .into_any_element()
         }

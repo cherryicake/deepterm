@@ -169,16 +169,11 @@ pub fn platform_default_font_family() -> SharedString {
 pub fn platform_default_fallbacks() -> gpui::FontFallbacks {
     #[cfg(target_os = "macos")]
     {
-        gpui::FontFallbacks::from_fonts(vec![
-            "Monaco".to_string(),
-            "Courier New".to_string(),
-        ])
+        gpui::FontFallbacks::from_fonts(vec!["Monaco".to_string(), "Courier New".to_string()])
     }
     #[cfg(target_os = "windows")]
     {
-        gpui::FontFallbacks::from_fonts(vec![
-            "Courier New".to_string(),
-        ])
+        gpui::FontFallbacks::from_fonts(vec!["Courier New".to_string()])
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

@@ -45,8 +45,8 @@ use crate::builtin_commands::{
     BuiltinCommandHandler, BuiltinCommandManager, find_builtin_command, resolve_command_line,
 };
 use crate::ssh::{SshConnectionConfig, sftp_fs};
-use crate::ssh_view::picker::ShowSshPicker;
 use crate::ssh_view::SshConnectView;
+use crate::ssh_view::picker::ShowSshPicker;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
 use crate::terminal_view::terminal_element::{
@@ -301,13 +301,7 @@ impl TerminalView {
         };
         let terminal =
             Terminal::new_with_command(cx, working_dir.clone(), &command_string, &args_vec);
-        Self::create_terminal_view(
-            cx,
-            terminal,
-            working_dir,
-            None,
-            command_string.into(),
-        )
+        Self::create_terminal_view(cx, terminal, working_dir, None, command_string.into())
     }
 
     /// 创建新的 SSH 远程终端
@@ -1482,7 +1476,10 @@ impl Render for TerminalView {
         // Pre-read terminal state needed below to avoid redundant entity locks.
         let (scrollbar_drag_offset, last_scroll_time) = {
             let term = self.terminal.read(cx);
-            (term.scrollbar_drag_offset.get(), term.last_scroll_time.get())
+            (
+                term.scrollbar_drag_offset.get(),
+                term.last_scroll_time.get(),
+            )
         };
 
         // ── Scrollbar thumb position ─────────────────────────────────────────
@@ -1496,11 +1493,8 @@ impl Render for TerminalView {
             let duration = SCROLLBAR_ANIMATION_DURATION;
             let t = (elapsed / duration).min(1.0);
             let ease = 1.0 - (1.0 - t).powi(3);
-            self.scrollbar_thumb_y = px(
-                self.scrollbar_anim_from_y.as_f32()
-                    + (self.scrollbar_target_y.as_f32() - self.scrollbar_anim_from_y.as_f32())
-                        * ease,
-            );
+            self.scrollbar_thumb_y = px(self.scrollbar_anim_from_y.as_f32()
+                + (self.scrollbar_target_y.as_f32() - self.scrollbar_anim_from_y.as_f32()) * ease);
             if t < 1.0 {
                 cx.notify();
             } else {
@@ -1626,9 +1620,9 @@ impl Render for TerminalView {
 
                 // Detect direction change and tell Terminal to reset accumulator.
                 let current_direction = event.delta.pixel_delta(line_height).y.signum() as i32;
-                let direction_changed =
-                    current_direction != 0 && this.last_scroll_direction != 0
-                        && current_direction != this.last_scroll_direction;
+                let direction_changed = current_direction != 0
+                    && this.last_scroll_direction != 0
+                    && current_direction != this.last_scroll_direction;
                 if direction_changed {
                     this.terminal.update(cx, |t, _cx| {
                         t.reset_scroll_px();

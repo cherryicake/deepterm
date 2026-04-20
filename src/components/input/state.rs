@@ -16,22 +16,18 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
-use super::{
-    DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode,
-};
+use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
+use crate::components::button::Size;
+use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
+use crate::components::input::history::History;
+use crate::components::input::movement::MoveDirection;
+use crate::components::input::{
+    RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
+};
 use crate::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::highlighter::LanguageRegistry;
-use crate::components::input::blink_cursor::CURSOR_WIDTH;
-use crate::components::input::movement::MoveDirection;
-use crate::components::input::{
-    RopeExt as _, Selection,
-    display_map::LineLayout,
-    element::RIGHT_MARGIN,
-};
-use crate::components::input::history::History;
-use crate::components::button::Size;
 use lsp_types::Position;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
@@ -225,7 +221,6 @@ pub fn init(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
     ]);
-
 }
 
 /// Whitespace indicators for rendering spaces and tabs.
@@ -1261,8 +1256,7 @@ impl InputState {
     }
 
     pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clean_on_escape {
-        }
+        if self.clean_on_escape {}
 
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
@@ -1826,7 +1820,6 @@ impl InputState {
 
         pattern.is_match(new_text)
     }
-
 
     pub(crate) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;

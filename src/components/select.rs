@@ -236,13 +236,11 @@ impl Render for Select {
                     .cursor_pointer()
                     .rounded(px(4.0))
                     .when(is_highlighted, |d| {
-                        d.bg(theme_accent.opacity(
-                            if cx.theme().appearance.is_dark() {
-                                0.18
-                            } else {
-                                0.10
-                            },
-                        ))
+                        d.bg(theme_accent.opacity(if cx.theme().appearance.is_dark() {
+                            0.18
+                        } else {
+                            0.10
+                        }))
                     })
                     .when(!is_highlighted && !is_selected, |d| {
                         d.hover(|s| s.bg(theme.tab_hover_background))
@@ -371,15 +369,19 @@ impl Render for Select {
                                         .flex_col()
                                         .gap(px(4.0))
                                         .key_context("Select")
-                                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                            match event.keystroke.key.as_str() {
-                                                "down" => this.move_highlight(1, cx),
-                                                "up" => this.move_highlight(-1, cx),
-                                                "enter" | "return" => this.confirm_highlighted(cx),
-                                                "escape" => this.close(cx),
-                                                _ => {}
-                                            }
-                                        }))
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, _, cx| {
+                                                match event.keystroke.key.as_str() {
+                                                    "down" => this.move_highlight(1, cx),
+                                                    "up" => this.move_highlight(-1, cx),
+                                                    "enter" | "return" => {
+                                                        this.confirm_highlighted(cx)
+                                                    }
+                                                    "escape" => this.close(cx),
+                                                    _ => {}
+                                                }
+                                            },
+                                        ))
                                         .track_focus(&focus_handle)
                                         .when(self.searchable, |d| {
                                             d.child(
