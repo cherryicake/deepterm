@@ -20,6 +20,7 @@ pub use crate::ssh::SshConnectionConfig;
 pub struct DraggedPanel {
     pub panel_id: String,
     pub source_tab_id: String,
+    pub tab_label: SharedString,
 }
 
 /// Panel placement threshold for drag operations (start at 35% of dimension)
@@ -557,6 +558,7 @@ impl Panel {
                         DraggedPanel {
                             panel_id: panel_id.clone(),
                             source_tab_id,
+                            tab_label: drag_title.clone().into(),
                         },
                         move |_drag_data, position, _window, cx| {
                             // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步

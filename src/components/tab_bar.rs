@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
-    IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, Window, canvas, div,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
+    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, Window, canvas, div,
     ease_out_quint, px,
 };
 
@@ -32,12 +32,13 @@ struct TabReorderPreview {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PanelDropPreview {
     insert_index: usize,
+    tab_label: SharedString,
 }
 
 const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
 const TAB_REORDER_GAP_PX: f32 = 4.0;
 const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
-const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.22;
+const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 
 /// Tab 放置事件
 pub struct TabDropEvent {
@@ -148,7 +149,8 @@ pub struct TabBar {
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
     /// Panel 拖拽到 TabBar 的回调
-    on_panel_drop: Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>>,
+    on_panel_drop:
+        Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>>,
     /// 溢出状态变化回调
     on_overflow_changed: Option<OnOverflowChanged>,
     focus_handle: FocusHandle,
@@ -170,8 +172,6 @@ pub struct TabBar {
     tab_list_bounds: Option<Bounds<Pixels>>,
     /// 当前 Panel 拖入 TabBar 的插入预览
     panel_drop_preview: Option<PanelDropPreview>,
-    /// 上一次 Panel 拖入 TabBar 的插入预览
-    previous_panel_drop_preview: Option<PanelDropPreview>,
 }
 
 impl TabBar {
@@ -200,7 +200,6 @@ impl TabBar {
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
             panel_drop_preview: None,
-            previous_panel_drop_preview: None,
         })
     }
 
@@ -239,7 +238,6 @@ impl TabBar {
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
             panel_drop_preview: None,
-            previous_panel_drop_preview: None,
         })
     }
 
@@ -364,6 +362,7 @@ impl TabBar {
         if self.active_tab_id.is_none() && !self.tabs.is_empty() {
             self.active_tab_id = Some(self.tabs[0].id.clone());
         }
+        self.update_overflow_state(cx);
         cx.notify();
     }
 
@@ -387,7 +386,7 @@ impl TabBar {
 
     /// 检查并更新溢出状态
     /// 当溢出状态变化时触发回调
-    fn update_overflow_state(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) {
         if self.measured_container_width <= 0.0 {
             return;
         }
@@ -434,6 +433,7 @@ impl TabBar {
         cx: &mut Context<Self>,
     ) {
         let position = event.event.position;
+        let dragged: &DraggedPanel = event.drag(cx);
         let Some(bounds) = self.tab_list_bounds else {
             return;
         };
@@ -449,7 +449,7 @@ impl TabBar {
         }
 
         let insert_index = self.tab_insert_slot_for_position(position);
-        self.set_panel_drop_preview(insert_index, cx);
+        self.set_panel_drop_preview(insert_index, dragged.tab_label.clone(), cx);
     }
 
     fn set_tab_reorder_preview(
@@ -468,7 +468,6 @@ impl TabBar {
         }
 
         self.panel_drop_preview = None;
-        self.previous_panel_drop_preview = None;
         self.previous_reorder_preview = self.reorder_preview.clone();
         self.reorder_preview = Some(next_preview);
         self.reorder_animation_epoch += 1;
@@ -485,9 +484,15 @@ impl TabBar {
         cx.notify();
     }
 
-    fn set_panel_drop_preview(&mut self, insert_index: usize, cx: &mut Context<Self>) {
+    fn set_panel_drop_preview(
+        &mut self,
+        insert_index: usize,
+        tab_label: SharedString,
+        cx: &mut Context<Self>,
+    ) {
         let next_preview = PanelDropPreview {
             insert_index: insert_index.min(self.tabs.len()),
+            tab_label,
         };
 
         if self.panel_drop_preview.as_ref() == Some(&next_preview) {
@@ -496,9 +501,7 @@ impl TabBar {
 
         self.reorder_preview = None;
         self.previous_reorder_preview = None;
-        self.previous_panel_drop_preview = self.panel_drop_preview.clone();
         self.panel_drop_preview = Some(next_preview);
-        self.reorder_animation_epoch += 1;
         cx.notify();
     }
 
@@ -507,8 +510,7 @@ impl TabBar {
             return;
         }
 
-        self.previous_panel_drop_preview = self.panel_drop_preview.take();
-        self.reorder_animation_epoch += 1;
+        self.panel_drop_preview = None;
         cx.notify();
     }
 
@@ -524,13 +526,11 @@ impl TabBar {
     }
 
     fn reset_panel_drop_preview(&mut self, cx: &mut Context<Self>) {
-        if self.panel_drop_preview.is_none() && self.previous_panel_drop_preview.is_none() {
+        if self.panel_drop_preview.is_none() {
             return;
         }
 
         self.panel_drop_preview = None;
-        self.previous_panel_drop_preview = None;
-        self.reorder_animation_epoch += 1;
         cx.notify();
     }
 
@@ -577,24 +577,6 @@ impl TabBar {
             .unwrap_or(TAB_REORDER_FALLBACK_WIDTH_PX)
     }
 
-    fn panel_drop_shift_width(&self, preview: &PanelDropPreview) -> f32 {
-        if self.tabs.is_empty() {
-            return TAB_REORDER_FALLBACK_WIDTH_PX;
-        }
-
-        self.tab_bounds
-            .get(
-                preview
-                    .insert_index
-                    .min(self.tab_bounds.len().saturating_sub(1)),
-            )
-            .map(|bounds| {
-                let width: f32 = bounds.size.width.into();
-                width + TAB_REORDER_GAP_PX
-            })
-            .unwrap_or(TAB_REORDER_FALLBACK_WIDTH_PX)
-    }
-
     fn tab_offset_for_preview(&self, preview: Option<&TabReorderPreview>, index: usize) -> f32 {
         let Some(preview) = preview else {
             return 0.0;
@@ -625,38 +607,8 @@ impl TabBar {
         }
     }
 
-    fn tab_offset_for_panel_drop_preview(
-        &self,
-        preview: Option<&PanelDropPreview>,
-        index: usize,
-    ) -> f32 {
-        let Some(preview) = preview else {
-            return 0.0;
-        };
-
-        if preview.insert_index >= self.tabs.len() {
-            return 0.0;
-        }
-
-        let shift = self.panel_drop_shift_width(preview);
-        if index >= preview.insert_index {
-            shift
-        } else {
-            0.0
-        }
-    }
-
-    fn animated_tab_offset(
-        &self,
-        tab_preview: Option<&TabReorderPreview>,
-        panel_preview: Option<&PanelDropPreview>,
-        index: usize,
-    ) -> f32 {
-        if tab_preview.is_some() {
-            self.tab_offset_for_preview(tab_preview, index)
-        } else {
-            self.tab_offset_for_panel_drop_preview(panel_preview, index)
-        }
+    fn animated_tab_offset(&self, tab_preview: Option<&TabReorderPreview>, index: usize) -> f32 {
+        self.tab_offset_for_preview(tab_preview, index)
     }
 
     fn animated_tab_opacity(&self, tab_preview: Option<&TabReorderPreview>, index: usize) -> f32 {
@@ -697,6 +649,7 @@ impl Render for TabBar {
         let animation_epoch = self.reorder_animation_epoch;
         let is_settingshub_active =
             self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(HOSTS_HUB_TAB_ID);
+        let panel_drop_preview = self.panel_drop_preview.clone();
 
         // 根据溢出状态决定布局模式
         // 如果还没测量过，根据预估宽度预判；否则使用测量结果
@@ -753,11 +706,13 @@ impl Render for TabBar {
                             |_, _, _| {},
                             move |bounds, _, _, cx| {
                                 let container_width: f32 = bounds.size.width.into();
-                                entity.update(cx, |this, _cx| {
+                                entity.update(cx, |this, cx| {
                                     // 只在宽度变化超过 1px 时更新
                                     if (this.measured_container_width - container_width).abs() > 1.0
                                     {
                                         this.measured_container_width = container_width;
+                                        this.update_overflow_state(cx);
+                                        cx.notify();
                                     }
                                 });
                             },
@@ -852,13 +807,26 @@ impl Render for TabBar {
                                 let entity = cx.entity();
                                 move |bounds, _window, cx| {
                                     entity.update(cx, |this, _cx| {
-                                        let tab_count = this.tabs.len();
-                                        this.tab_bounds = if tab_count == 0 {
+                                        let expected_bounds =
+                                            this.tabs.len() + usize::from(this.panel_drop_preview.is_some());
+                                        let mut tab_bounds = if expected_bounds == 0 {
                                             Vec::new()
                                         } else {
-                                            bounds.into_iter().rev().take(tab_count).collect::<Vec<_>>()
+                                            bounds
+                                                .into_iter()
+                                                .rev()
+                                                .take(expected_bounds)
+                                                .collect::<Vec<_>>()
                                         };
-                                        this.tab_bounds.reverse();
+                                        tab_bounds.reverse();
+
+                                        if let Some(preview) = this.panel_drop_preview.as_ref()
+                                            && preview.insert_index < tab_bounds.len()
+                                        {
+                                            tab_bounds.remove(preview.insert_index);
+                                        }
+
+                                        this.tab_bounds = tab_bounds;
                                     });
                                 }
                             })
@@ -920,23 +888,53 @@ impl Render for TabBar {
                                 // 普通模式：flex 布局，不换行
                                 this.flex_1().overflow_x_hidden()
                             })
-                            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                            .children({
+                                let mut children: Vec<AnyElement> = Vec::with_capacity(
+                                    self.tabs.len() + usize::from(panel_drop_preview.is_some()),
+                                );
+
+                                for index in 0..=self.tabs.len() {
+                                    if let Some(preview) = panel_drop_preview.as_ref()
+                                        && preview.insert_index == index
+                                    {
+                                        children.push(
+                                            div()
+                                                .id(format!("panel-drop-preview-{index}"))
+                                                .h(px(28.0))
+                                                .px(px(12.0))
+                                                .flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .rounded(px(6.0))
+                                                .border_1()
+                                                .border_color(theme.border_strong.opacity(0.55))
+                                                .bg(theme.tab_hover_background.opacity(0.6))
+                                                .opacity(0.75)
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(theme.text_muted)
+                                                        .child(preview.tab_label.clone()),
+                                                )
+                                                .into_any_element(),
+                                        );
+                                    }
+
+                                    let Some(tab) = self.tabs.get(index) else {
+                                        continue;
+                                    };
+
                                 let tab_id = tab.id.clone();
                                 let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                                 let label = tab.label.clone();
                                 let is_modified = tab.is_modified;
                                 let on_panel_drop_for_tab = on_panel_drop.clone();
                                 let entity = cx.entity();
-                                let start_offset = self.animated_tab_offset(
-                                    self.previous_reorder_preview.as_ref(),
-                                    self.previous_panel_drop_preview.as_ref(),
-                                    index,
-                                );
-                                let end_offset = self.animated_tab_offset(
-                                    self.reorder_preview.as_ref(),
-                                    self.panel_drop_preview.as_ref(),
-                                    index,
-                                );
+                                let start_offset =
+                                    self.animated_tab_offset(self.previous_reorder_preview.as_ref(), index);
+                                let end_offset =
+                                    self.animated_tab_offset(self.reorder_preview.as_ref(), index);
                                 let start_opacity = self
                                     .animated_tab_opacity(self.previous_reorder_preview.as_ref(), index);
                                 let end_opacity = self
@@ -944,204 +942,225 @@ impl Render for TabBar {
                                 let animation_id =
                                     format!("tab-reorder-{}-{}", tab_id, animation_epoch);
 
-                                div()
-                                    .child(
+                                    children.push(
                                         div()
-                                            .id(tab_id.clone())
-                                            .h(px(28.0))
-                                            .px(px(12.0))
-                                            .flex()
-                                            .flex_shrink_0()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .rounded(px(6.0))
-                                            .border_1()
-                                            .border_color(if is_active {
-                                                theme.border_strong
-                                            } else {
-                                                theme.border.opacity(0.0)
-                                            })
-                                            .bg(if is_active {
-                                                theme.tab_active_background
-                                            } else {
-                                                theme.tab_inactive_background
-                                            })
-                                            .hover(move |style| {
-                                                if !is_active {
-                                                    style.bg(theme.tab_hover_background)
-                                                } else {
-                                                    style
-                                                }
-                                            })
-                                            .cursor_pointer()
-                                            // 拖拽功能
-                                            .on_drag(
-                                                DraggedTab {
-                                                    tab_id: tab_id.clone(),
-                                                    from_index: index,
-                                                },
-                                                {
-                                                    let label = label.clone();
-                                                    move |_drag_data, position, _, cx| {
-                                                        // 阻止事件冒泡，防止触发窗口拖拽
-                                                        cx.stop_propagation();
-                                                        // 返回拖拽时的视觉反馈 - 创建一个新的视图实体
-                                                        cx.new(|_cx| DragPreview {
-                                                            tab_label: label.clone(),
-                                                            drag_offset: position,
-                                                        })
-                                                    }
-                                                },
-                                            )
-                                            .on_drag_move::<DraggedTab>(cx.listener(
-                                                |this, event, _window, cx| {
-                                                    this.handle_tab_drag_move(event, cx);
-                                                },
-                                            ))
-                                            .drag_over::<DraggedTab>({
-                                                let entity = entity.clone();
-                                                let tab_id = tab_id.clone();
-                                                move |tab, dragged: &DraggedTab, _window, cx| {
-                                                    let dragged = dragged.clone();
-                                                    let entity = entity.clone();
-                                                    let tab_id = tab_id.clone();
-                                                    cx.defer(move |cx| {
-                                                        entity.update(cx, |this, cx| {
+                                            .child(
+                                                div()
+                                                    .id(tab_id.clone())
+                                                    .h(px(28.0))
+                                                    .px(px(12.0))
+                                                    .flex()
+                                                    .flex_shrink_0()
+                                                    .items_center()
+                                                    .gap(px(6.0))
+                                                    .rounded(px(6.0))
+                                                    .border_1()
+                                                    .border_color(if is_active {
+                                                        theme.border_strong
+                                                    } else {
+                                                        theme.border.opacity(0.0)
+                                                    })
+                                                    .bg(if is_active {
+                                                        theme.tab_active_background
+                                                    } else {
+                                                        theme.tab_inactive_background
+                                                    })
+                                                    .hover(move |style| {
+                                                        if !is_active {
+                                                            style.bg(theme.tab_hover_background)
+                                                        } else {
+                                                            style
+                                                        }
+                                                    })
+                                                    .cursor_pointer()
+                                                    .on_drag(
+                                                        DraggedTab {
+                                                            tab_id: tab_id.clone(),
+                                                            from_index: index,
+                                                        },
+                                                        {
+                                                            let label = label.clone();
+                                                            move |_drag_data, position, _, cx| {
+                                                                cx.stop_propagation();
+                                                                cx.new(|_cx| DragPreview {
+                                                                    tab_label: label.clone(),
+                                                                    drag_offset: position,
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .on_drag_move::<DraggedTab>(cx.listener(
+                                                        |this, event, _window, cx| {
+                                                            this.handle_tab_drag_move(event, cx);
+                                                        },
+                                                    ))
+                                                    .drag_over::<DraggedTab>({
+                                                        let entity = entity.clone();
+                                                        let tab_id = tab_id.clone();
+                                                        move |tab, dragged: &DraggedTab, _window, cx| {
+                                                            let dragged = dragged.clone();
+                                                            let entity = entity.clone();
+                                                            let tab_id = tab_id.clone();
+                                                            cx.defer(move |cx| {
+                                                                entity.update(cx, |this, cx| {
+                                                                    if dragged.tab_id != tab_id {
+                                                                        this.set_tab_reorder_preview(
+                                                                            &dragged, index, cx,
+                                                                        );
+                                                                    } else {
+                                                                        this.clear_tab_reorder_preview(cx);
+                                                                    }
+                                                                });
+                                                            });
+                                                            tab
+                                                        }
+                                                    })
+                                                    .drag_over::<DraggedPanel>({
+                                                        let entity = entity.clone();
+                                                        move |tab, dragged: &DraggedPanel, _window, cx| {
+                                                            let entity = entity.clone();
+                                                            let tab_label = dragged.tab_label.clone();
+                                                            cx.defer(move |cx| {
+                                                                entity.update(cx, |this, cx| {
+                                                                    this.set_panel_drop_preview(
+                                                                        index,
+                                                                        tab_label,
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            });
+                                                            tab
+                                                        }
+                                                    })
+                                                    .on_drop(cx.listener({
+                                                        let on_tab_reorder = on_tab_reorder.clone();
+                                                        let tab_id = tab_id.clone();
+                                                        move |this, dragged: &DraggedTab, _window, cx| {
+                                                            cx.stop_propagation();
+
                                                             if dragged.tab_id != tab_id {
-                                                                this.set_tab_reorder_preview(
-                                                                    &dragged, index, cx,
-                                                                );
+                                                                if let Some(ref callback) = on_tab_reorder {
+                                                                    if let Some(to_index) = this
+                                                                        .tabs
+                                                                        .iter()
+                                                                        .position(|t| t.id == tab_id)
+                                                                    {
+                                                                        this.apply_tab_reorder_locally(
+                                                                            dragged,
+                                                                            to_index,
+                                                                        );
+                                                                        this.reset_tab_reorder_preview(cx);
+                                                                        callback(dragged.clone(), to_index, cx);
+                                                                    }
+                                                                }
                                                             } else {
                                                                 this.clear_tab_reorder_preview(cx);
                                                             }
-                                                        });
-                                                    });
-                                                    tab
-                                                }
-                                            })
-                                            // 拖拽悬停效果 - DraggedPanel（显示放置指示器）
-                                            .drag_over::<DraggedPanel>({
-                                                let entity = entity.clone();
-                                                move |tab, _dragged: &DraggedPanel, _window, cx| {
-                                                    let entity = entity.clone();
-                                                    cx.defer(move |cx| {
-                                                        entity.update(cx, |this, cx| {
-                                                            this.set_panel_drop_preview(index, cx);
-                                                        });
-                                                    });
-                                                    tab
-                                                }
-                                            })
-                                            .on_drop(cx.listener({
-                                                let on_tab_reorder = on_tab_reorder.clone();
-                                                let tab_id = tab_id.clone();
-                                                move |this, dragged: &DraggedTab, _window, cx| {
-                                                    cx.stop_propagation();
-
-                                                    if dragged.tab_id != tab_id {
-                                                        if let Some(ref callback) = on_tab_reorder {
-                                                            if let Some(to_index) = this
-                                                                .tabs
-                                                                .iter()
-                                                                .position(|t| t.id == tab_id)
-                                                            {
-                                                                this.apply_tab_reorder_locally(
-                                                                    dragged,
-                                                                    to_index,
+                                                        }
+                                                    }))
+                                                    .on_drop(cx.listener({
+                                                        let on_panel_drop_for_tab =
+                                                            on_panel_drop_for_tab.clone();
+                                                        move |this, dragged: &DraggedPanel, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.reset_panel_drop_preview(cx);
+                                                            if let Some(ref callback) = on_panel_drop_for_tab {
+                                                                callback(
+                                                                    dragged.clone(),
+                                                                    Some(index),
+                                                                    window,
+                                                                    cx,
                                                                 );
-                                                                this.reset_tab_reorder_preview(cx);
-                                                                callback(dragged.clone(), to_index, cx);
                                                             }
                                                         }
-                                                    } else {
-                                                        this.clear_tab_reorder_preview(cx);
-                                                    }
-                                                }
-                                            }))
-                                            // 放置处理 - DraggedPanel，插入到当前 tab 位置
-                                            .on_drop(cx.listener({
-                                                let on_panel_drop_for_tab = on_panel_drop_for_tab.clone();
-                                                move |this, dragged: &DraggedPanel, window, cx| {
-                                                    cx.stop_propagation(); // 阻止事件冒泡到 TabBar 容器
-                                                    this.reset_panel_drop_preview(cx);
-                                                    if let Some(ref callback) = on_panel_drop_for_tab {
-                                                        callback(dragged.clone(), Some(index), window, cx);
-                                                    }
-                                                }
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(if is_active {
-                                                        gpui::FontWeight::SEMIBOLD
-                                                    } else {
-                                                        gpui::FontWeight::NORMAL
-                                                    })
-                                                    .text_color(if is_active {
-                                                        theme.text
-                                                    } else {
-                                                        theme.text_muted
-                                                    })
-                                                    .child(label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(14.0))
-                                                    .h(px(14.0))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded_full()
-                                                    .hover(move |style| {
-                                                        style.bg(theme.tab_hover_background)
-                                                    })
-                                                    .cursor_pointer()
-                                                    .text_color(theme.icon_muted)
-                                                    .text_xs()
-                                                    .child(if is_modified { "●" } else { "×" })
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_weight(if is_active {
+                                                                gpui::FontWeight::SEMIBOLD
+                                                            } else {
+                                                                gpui::FontWeight::NORMAL
+                                                            })
+                                                            .text_color(if is_active {
+                                                                theme.text
+                                                            } else {
+                                                                theme.text_muted
+                                                            })
+                                                            .child(label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(14.0))
+                                                            .h(px(14.0))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded_full()
+                                                            .hover(move |style| {
+                                                                style.bg(theme.tab_hover_background)
+                                                            })
+                                                            .cursor_pointer()
+                                                            .text_color(theme.icon_muted)
+                                                            .text_xs()
+                                                            .child(if is_modified { "●" } else { "×" })
+                                                            .on_mouse_down(
+                                                                gpui::MouseButton::Left,
+                                                                cx.listener({
+                                                                    let on_tab_close =
+                                                                        on_tab_close.clone();
+                                                                    let tab_id = tab_id.clone();
+                                                                    move |_this, _, window, cx| {
+                                                                        if let Some(ref callback) =
+                                                                            on_tab_close
+                                                                        {
+                                                                            callback(
+                                                                                tab_id.clone(),
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                }),
+                                                            ),
+                                                    )
+                                                    .on_click(cx.listener({
+                                                        let on_tab_click = on_tab_click.clone();
+                                                        let tab_id = tab_id.clone();
+                                                        move |_this, _event: &gpui::ClickEvent, window, cx| {
+                                                            if let Some(ref callback) = on_tab_click {
+                                                                callback(tab_id.clone(), window, cx);
+                                                            }
+                                                        }
+                                                    }))
                                                     .on_mouse_down(
                                                         gpui::MouseButton::Left,
-                                                        cx.listener({
-                                                            let on_tab_close = on_tab_close.clone();
-                                                            let tab_id = tab_id.clone();
-                                                            move |_this, _, window, cx| {
-                                                                if let Some(ref callback) = on_tab_close {
-                                                                    callback(tab_id.clone(), window, cx);
-                                                                }
-                                                            }
-                                                        }),
+                                                        |_, _, cx| {
+                                                            cx.stop_propagation();
+                                                        },
                                                     ),
                                             )
-                                            .on_click(cx.listener({
-                                                let on_tab_click = on_tab_click.clone();
-                                                let tab_id = tab_id.clone();
-                                                move |_this, _event: &gpui::ClickEvent, window, cx| {
-                                                    // 只有在没有发生拖拽的情况下才触发点击
-                                                    if let Some(ref callback) = on_tab_click {
-                                                        callback(tab_id.clone(), window, cx);
-                                                    }
-                                                }
-                                            }))
-                                            // 阻止事件冒泡到 TitleBar，防止在 macOS 上触发窗口拖拽
-                                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation();
-                                            }),
-                                    )
-                                    .flex_shrink_0()
-                                    .with_animation(
-                                        animation_id,
-                                        Animation::new(Duration::from_millis(
-                                            TAB_REORDER_ANIMATION_DURATION_MS,
-                                        ))
-                                        .with_easing(ease_out_quint()),
-                                        move |this, delta| {
-                                            let offset = start_offset + (end_offset - start_offset) * delta;
-                                            let opacity =
-                                                start_opacity + (end_opacity - start_opacity) * delta;
-                                            this.left(px(offset)).opacity(opacity)
-                                        },
-                                    )
-                            })),
+                                            .flex_shrink_0()
+                                            .with_animation(
+                                                animation_id,
+                                                Animation::new(Duration::from_millis(
+                                                    TAB_REORDER_ANIMATION_DURATION_MS,
+                                                ))
+                                                .with_easing(ease_out_quint()),
+                                                move |this, delta| {
+                                                    let offset =
+                                                        start_offset + (end_offset - start_offset) * delta;
+                                                    let opacity =
+                                                        start_opacity + (end_opacity - start_opacity) * delta;
+                                                    this.left(px(offset)).opacity(opacity)
+                                                },
+                                            )
+                                            .into_any_element(),
+                                    );
+                                }
+
+                                children
+                            }),
                     )
                     // 新建标签按钮 - 放在滚动区域外面，始终可见
                     // 使用 ml_1 保持与 Tab 标签页之间的间距一致（gap_1 = 4px）
