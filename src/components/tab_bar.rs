@@ -4,8 +4,8 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
-    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, Window, canvas, div,
-    ease_out_quint, px,
+    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun,
+    TextStyle, Window, canvas, div, ease_out_quint, px,
 };
 
 use crate::assets::Icon;
@@ -39,6 +39,8 @@ const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
 const TAB_REORDER_GAP_PX: f32 = 4.0;
 const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
 const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
+const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
+const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
 
 /// Tab 放置事件
 pub struct TabDropEvent {
@@ -66,11 +68,48 @@ pub struct TabSplitEvent {
 pub struct DragPreview {
     pub tab_label: SharedString,
     pub drag_offset: Point<Pixels>,
+    pub preview_width: Pixels,
+}
+
+impl DragPreview {
+    pub fn new(
+        tab_label: SharedString,
+        drag_offset: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        Self {
+            preview_width: Self::measure_width(window, &tab_label, cx),
+            tab_label,
+            drag_offset,
+        }
+    }
+
+    fn measure_width(window: &mut Window, label: &SharedString, cx: &mut App) -> Pixels {
+        let font_size = px(14.0);
+
+        let shaped_line = window.text_system().shape_line(
+            label.clone(),
+            font_size,
+            &[TextRun {
+                len: label.len(),
+                font: TextStyle::default().font(),
+                color: cx.theme().ui.text,
+                ..Default::default()
+            }],
+            None,
+        );
+
+        px(
+            (shaped_line.width.as_f32() + TAB_DRAG_PREVIEW_PADDING_X_PX * 2.0)
+                .max(TAB_DRAG_PREVIEW_MIN_WIDTH_PX),
+        )
+    }
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let preview_width = px(152.0);
+        let preview_width = self.preview_width;
         let preview_height = px(30.0);
         let theme = cx.theme().ui;
 
@@ -82,7 +121,7 @@ impl Render for DragPreview {
                 div()
                     .w(preview_width)
                     .h(preview_height)
-                    .px(px(12.0))
+                    .px(px(TAB_DRAG_PREVIEW_PADDING_X_PX))
                     .flex()
                     .items_center()
                     .rounded(px(7.0))
@@ -980,12 +1019,15 @@ impl Render for TabBar {
                                                         },
                                                         {
                                                             let label = label.clone();
-                                                            move |_drag_data, position, _, cx| {
+                                                            move |_drag_data, position, window, cx| {
                                                                 cx.stop_propagation();
-                                                                cx.new(|_cx| DragPreview {
-                                                                    tab_label: label.clone(),
-                                                                    drag_offset: position,
-                                                                })
+                                                                let preview = DragPreview::new(
+                                                                    label.clone(),
+                                                                    position,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                                cx.new(move |_cx| preview)
                                                             }
                                                         },
                                                     )

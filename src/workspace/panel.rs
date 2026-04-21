@@ -560,13 +560,12 @@ impl Panel {
                             source_tab_id,
                             tab_label: drag_title.clone().into(),
                         },
-                        move |_drag_data, position, _window, cx| {
+                        move |_drag_data, position, window, cx| {
                             // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步
                             cx.stop_propagation();
-                            cx.new(|_cx| DragPreview {
-                                tab_label: drag_title.clone().into(),
-                                drag_offset: position,
-                            })
+                            let preview =
+                                DragPreview::new(drag_title.clone().into(), position, window, cx);
+                            cx.new(move |_cx| preview)
                         },
                     )
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
