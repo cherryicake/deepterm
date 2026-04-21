@@ -175,6 +175,9 @@ pub struct LocalOverlayLayout {
     origin: Point<Pixels>,
     builtin_width: Pixels,
     ime_width: Pixels,
+    cursor_shape: CursorShape,
+    cursor_color: Hsla,
+    cursor_thickness: Pixels,
 }
 
 impl CursorLayout {
@@ -1172,6 +1175,23 @@ impl Element for TerminalElement {
         // 本地覆盖输入存在时隐藏终端光标，由覆盖层负责显示
         let has_local_overlay_input = self.view.read(cx).has_local_overlay_input();
 
+        // 预先计算光标形状和颜色，供终端光标和覆盖层光标共用
+        let overlay_cursor_shape = match cursor_shape {
+            AlacCursorShape::Block if !self.focused => CursorShape::Hollow,
+            AlacCursorShape::Block => CursorShape::Block,
+            AlacCursorShape::Underline => CursorShape::Underline,
+            AlacCursorShape::Beam => CursorShape::Bar,
+            AlacCursorShape::HollowBlock => CursorShape::Hollow,
+            AlacCursorShape::Hidden => CursorShape::Bar,
+        };
+
+        let cursor_color = convert_alacritty_color(
+            &alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Cursor,
+            ),
+            &terminal_theme,
+        );
+
         // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
         // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
         // 终端不渲染光标，让应用程序自己处理
@@ -1186,15 +1206,6 @@ impl Element for TerminalElement {
             let cursor_y = terminal_bounds.bounds.top()
                 + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
 
-            let shape = match cursor_shape {
-                AlacCursorShape::Block if !self.focused => CursorShape::Hollow,
-                AlacCursorShape::Block => CursorShape::Block,
-                AlacCursorShape::Underline => CursorShape::Underline,
-                AlacCursorShape::Beam => CursorShape::Bar,
-                AlacCursorShape::HollowBlock => CursorShape::Hollow,
-                AlacCursorShape::Hidden => unreachable!(),
-            };
-
             let cursor_char = cursor_cell.c;
             let cursor_cells_wide = if cursor_cell
                 .flags
@@ -1208,7 +1219,7 @@ impl Element for TerminalElement {
             let block_text_color = terminal_theme.background;
 
             // Create text for block cursor (inverted color effect)
-            let block_text = if matches!(shape, CursorShape::Block) {
+            let block_text = if matches!(overlay_cursor_shape, CursorShape::Block) {
                 if cursor_char != '\0' && cursor_char != ' ' {
                     let char_str = cursor_char.to_string();
                     let len = cursor_char.len_utf8();
@@ -1230,20 +1241,13 @@ impl Element for TerminalElement {
                 None
             };
 
-            let cursor_color = convert_alacritty_color(
-                &alacritty_terminal::vte::ansi::Color::Named(
-                    alacritty_terminal::vte::ansi::NamedColor::Cursor,
-                ),
-                &terminal_theme,
-            );
-
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
                 block_width: cursor_block_width,
                 line_height,
                 thickness: cursor_thickness(cell_width),
                 color: cursor_color,
-                shape,
+                shape: overlay_cursor_shape,
                 block_text,
             })
         } else {
@@ -1335,6 +1339,9 @@ impl Element for TerminalElement {
                     origin: point(overlay_x, overlay_y),
                     builtin_width,
                     ime_width,
+                    cursor_shape: overlay_cursor_shape,
+                    cursor_color,
+                    cursor_thickness: cursor_thickness(cell_width),
                 })
             }
         } else {
@@ -1443,17 +1450,6 @@ impl Element for TerminalElement {
 
         // Render local buffered input at cursor position.
         if let Some(input_overlay) = input_overlay {
-            if input_overlay.builtin_width > Pixels::ZERO {
-                let builtin_background_bounds = Bounds::new(
-                    input_overlay.origin,
-                    size(input_overlay.builtin_width, *line_height),
-                );
-                window.paint_quad(fill(
-                    builtin_background_bounds,
-                    cx.theme().ui.elevated_background,
-                ));
-            }
-
             if input_overlay.ime_width > Pixels::ZERO {
                 let ime_origin =
                     input_overlay.origin + point(input_overlay.builtin_width, Pixels::ZERO);
@@ -1470,6 +1466,75 @@ impl Element for TerminalElement {
                 window,
                 cx,
             );
+
+            // 为内置命令输入绘制光标（终端光标被隐藏时接管显示）
+            if self.cursor_visible && input_overlay.builtin_width > Pixels::ZERO {
+                let cursor_x = input_overlay.origin.x + input_overlay.builtin_width;
+                let cursor_origin = point(cursor_x, input_overlay.origin.y);
+                let block_width = *cell_width;
+                let thickness = input_overlay.cursor_thickness;
+
+                match input_overlay.cursor_shape {
+                    CursorShape::Bar => {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: cursor_origin,
+                                size: size(thickness, *line_height),
+                            },
+                            input_overlay.cursor_color,
+                        ));
+                    }
+                    CursorShape::Block => {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: cursor_origin,
+                                size: size(block_width, *line_height),
+                            },
+                            input_overlay.cursor_color,
+                        ));
+                    }
+                    CursorShape::Underline => {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: cursor_origin
+                                    + point(px(0.0), *line_height - thickness),
+                                size: size(block_width, thickness),
+                            },
+                            input_overlay.cursor_color,
+                        ));
+                    }
+                    CursorShape::Hollow => {
+                        let vertical_height = if *line_height > thickness * 2.0 {
+                            *line_height - thickness * 2.0
+                        } else {
+                            Pixels::ZERO
+                        };
+                        let quads = [
+                            Bounds {
+                                origin: cursor_origin,
+                                size: size(block_width, thickness),
+                            },
+                            Bounds {
+                                origin: cursor_origin
+                                    + point(px(0.0), *line_height - thickness),
+                                size: size(block_width, thickness),
+                            },
+                            Bounds {
+                                origin: cursor_origin + point(px(0.0), thickness),
+                                size: size(thickness, vertical_height),
+                            },
+                            Bounds {
+                                origin: cursor_origin
+                                    + point(block_width - thickness, thickness),
+                                size: size(thickness, vertical_height),
+                            },
+                        ];
+                        for quad in quads {
+                            window.paint_quad(fill(quad, input_overlay.cursor_color));
+                        }
+                    }
+                }
+            }
 
             if input_overlay.ime_width > Pixels::ZERO {
                 let ime_origin =
