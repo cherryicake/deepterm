@@ -1,7 +1,7 @@
 use gpui::prelude::*;
-use gpui::{App, Entity, IntoElement, MouseButton, RenderOnce, Window, div, px};
+use gpui::{App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px};
 
-use crate::components::button::Size;
+use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Size, Sizable};
 use crate::theme::ActiveTheme;
 
 use super::{InputState, element::TextElement};
@@ -16,6 +16,7 @@ pub struct EditorInput {
     disabled: bool,
     transparent: bool,
     size: Size,
+    mask_toggle: bool,
 }
 
 impl EditorInput {
@@ -25,6 +26,7 @@ impl EditorInput {
             disabled: false,
             transparent: false,
             size: Size::default(),
+            mask_toggle: false,
         }
     }
 
@@ -45,6 +47,38 @@ impl EditorInput {
 
     pub fn small(self) -> Self {
         self.size(Size::Small)
+    }
+
+    pub fn mask_toggle(mut self) -> Self {
+        self.mask_toggle = true;
+        self
+    }
+
+    fn render_toggle_mask_button(state: &Entity<InputState>, cx: &App) -> impl IntoElement {
+        let masked = state.read(cx).masked;
+        let icon_path: &'static str = if masked {
+            "icons/eye_off.svg"
+        } else {
+            "icons/eye.svg"
+        };
+        let style = ButtonCustomVariant::new(cx)
+            .color(gpui::transparent_black())
+            .hover(gpui::transparent_black())
+            .active(gpui::transparent_black());
+        Button::new("toggle-mask")
+            .icon(Icon::new(icon_path).xsmall())
+            .custom(style)
+            .tab_stop(false)
+            .on_click({
+                let state = state.clone();
+                move |_, window, cx| {
+                    state.update(cx, |state, cx| {
+                        state.set_masked(!state.masked, window, cx);
+                    });
+                    let focus_handle = state.read(cx).focus_handle(cx);
+                    window.focus(&focus_handle, cx);
+                }
+            })
     }
 }
 
@@ -154,7 +188,13 @@ impl RenderOnce for EditorInput {
                 .child(TextElement::new(self.state.clone()).placeholder(state.placeholder.clone()))
                 .into_any_element()
         } else {
-            // Single-line mode: chrome wrapper with border and fixed height
+            let mask_toggle_el = if self.mask_toggle {
+                Some(Self::render_toggle_mask_button(&self.state, cx).into_any_element())
+            } else {
+                None
+            };
+            let input_pr = if mask_toggle_el.is_some() { px(4.0) } else { px(10.0) };
+
             actions
                 .w_full()
                 .flex()
@@ -165,7 +205,8 @@ impl RenderOnce for EditorInput {
                         .line_height(LINE_HEIGHT)
                         .when(!self.transparent, |this| {
                             this.h(px(36.0))
-                                .px(px(10.0))
+                                .pl(px(10.0))
+                                .pr(input_pr)
                                 .py(input_py)
                                 .gap(px(8.0))
                                 .rounded(px(6.0))
@@ -184,7 +225,10 @@ impl RenderOnce for EditorInput {
                         .child(
                             TextElement::new(self.state.clone())
                                 .placeholder(state.placeholder.clone()),
-                        ),
+                        )
+                        .when_some(mask_toggle_el, |this, el| {
+                            this.child(el)
+                        }),
                 )
                 .into_any_element()
         }

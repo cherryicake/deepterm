@@ -838,9 +838,15 @@ impl KeychainEditor {
         &self,
         label: &str,
         input: &Entity<InputState>,
+        mask_toggle: bool,
         cx: &App,
     ) -> impl IntoElement {
         let theme = cx.theme().ui;
+        let editor = if mask_toggle {
+            EditorInput::new(input).mask_toggle()
+        } else {
+            EditorInput::new(input)
+        };
         div()
             .w_full()
             .flex()
@@ -852,7 +858,7 @@ impl KeychainEditor {
                     .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
-            .child(EditorInput::new(input))
+            .child(editor)
     }
 
     fn render_labeled_multiline_input(
@@ -971,10 +977,10 @@ impl Render for KeychainEditor {
                     .child(div().text_xs().text_color(theme.text_muted).child(subtitle)),
             )
             .children(self.render_message(cx).into_iter())
-            .child(self.render_labeled_input("Label", &self.label_input, cx))
+            .child(self.render_labeled_input("Label", &self.label_input, false, cx))
             .when(self.draft_kind == KeychainItemKind::Identity, |this| {
-                this.child(self.render_labeled_input("Username", &self.username_input, cx))
-                    .child(self.render_labeled_input("Password", &self.password_input, cx))
+                this.child(self.render_labeled_input("Username", &self.username_input, false, cx))
+                    .child(self.render_labeled_input("Password", &self.password_input, true, cx))
             })
             .when(self.draft_kind == KeychainItemKind::Key, |this| {
                 this.child(div().pt(px(4.0)).child(self.render_labeled_multiline_input(

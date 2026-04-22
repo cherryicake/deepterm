@@ -591,9 +591,15 @@ impl HostForm {
         &self,
         label: &str,
         input: &Entity<InputState>,
+        mask_toggle: bool,
         cx: &App,
     ) -> impl IntoElement {
         let theme = cx.theme().ui;
+        let editor = if mask_toggle {
+            EditorInput::new(input).mask_toggle()
+        } else {
+            EditorInput::new(input)
+        };
         div()
             .w_full()
             .flex()
@@ -605,7 +611,7 @@ impl HostForm {
                     .text_color(theme.text_muted)
                     .child(label.to_string()),
             )
-            .child(EditorInput::new(input))
+            .child(editor)
     }
 
     fn render_auth_type_selector(&self, cx: &App) -> impl IntoElement {
@@ -648,8 +654,8 @@ impl HostForm {
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(self.render_labeled_input("Identity Label", &self.credential_label_input, cx))
-            .child(self.render_labeled_input("Password", &self.password_input, cx))
+            .child(self.render_labeled_input("Identity Label", &self.credential_label_input, false, cx))
+            .child(self.render_labeled_input("Password", &self.password_input, true, cx))
             .child(
                 div()
                     .px(px(10.0))
@@ -674,9 +680,9 @@ impl HostForm {
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(self.render_labeled_input("Key Label", &self.credential_label_input, cx))
-            .child(self.render_labeled_input("Private Key Path", &self.key_path_input, cx))
-            .child(self.render_labeled_input("Passphrase (optional)", &self.key_passphrase_input, cx))
+            .child(self.render_labeled_input("Key Label", &self.credential_label_input, false, cx))
+            .child(self.render_labeled_input("Private Key Path", &self.key_path_input, false, cx))
+            .child(self.render_labeled_input("Passphrase (optional)", &self.key_passphrase_input, true, cx))
             .child(
                 div()
                     .px(px(10.0))
@@ -899,9 +905,10 @@ impl Render for HostForm {
                     .child(self.render_labeled_input(
                         "Nickname (optional)",
                         &self.nickname_input,
+                        false,
                         cx,
                     ))
-                    .child(self.render_labeled_input("Host Address *", &self.hostname_input, cx))
+                    .child(self.render_labeled_input("Host Address *", &self.hostname_input, false, cx))
                     .child(
                         div()
                             .w_full()
@@ -911,11 +918,13 @@ impl Render for HostForm {
                             .child(div().w(px(80.0)).child(self.render_labeled_input(
                                 "Port",
                                 &self.port_input,
+                                false,
                                 cx,
                             )))
                             .child(div().flex_1().child(self.render_labeled_input(
                                 "Username *",
                                 &self.username_input,
+                                false,
                                 cx,
                             ))),
                     )
