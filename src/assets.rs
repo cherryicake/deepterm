@@ -61,6 +61,7 @@ pub enum Icon {
     Rhel,
     Opensuse,
     Manjaro,
+    Workspace,
 }
 
 impl Icon {
@@ -99,6 +100,7 @@ impl Icon {
             Icon::Rhel => SharedString::new_static("icons/rhel.svg"),
             Icon::Opensuse => SharedString::new_static("icons/opensuse.svg"),
             Icon::Manjaro => SharedString::new_static("icons/manjaro.svg"),
+            Icon::Workspace => SharedString::new_static("icons/workspace.svg"),
         }
     }
 }
