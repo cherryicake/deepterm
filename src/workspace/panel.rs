@@ -410,6 +410,11 @@ impl Panel {
         self.active_tab_label.as_ref()
     }
 
+    /// 获取检测到的远程操作系统
+    pub fn remote_os(&self) -> Option<RemoteOS> {
+        self.remote_os
+    }
+
     pub fn panel_id(&self) -> &str {
         &self.panel_id
     }

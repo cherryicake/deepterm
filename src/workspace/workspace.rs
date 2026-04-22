@@ -836,8 +836,23 @@ impl Workspace {
         target_tab_info.container = new_container;
         target_tab_info.tab_type = TabType::Workspace;
 
-        // 更新TabBar显示
+        // 更新TabBar显示（保留目标tab或被拖拽tab的icon）
         let workspace_label = self.generate_workspace_label();
+        let target_icon = self
+            .tab_bar
+            .read(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == target_tab_id)
+            .and_then(|t| t.icon);
+        let dragged_icon = self
+            .tab_bar
+            .read(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == dragged_tab_id)
+            .and_then(|t| t.icon);
+        let icon = dragged_icon.or(target_icon);
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
             // 更新目标tab的标签
@@ -846,7 +861,7 @@ impl Workspace {
                 .iter()
                 .map(|t| {
                     if t.id == target_tab_id {
-                        TabItem::new(&target_tab_id, &workspace_label)
+                        TabItem::new(&target_tab_id, &workspace_label).with_icon(icon)
                     } else {
                         t.clone()
                     }
@@ -1044,21 +1059,19 @@ impl Workspace {
                 tab_info.label = new_label;
             }
 
-            // 更新TabBar显示（保留原tab的icon）
-            let old_icon = self
-                .tab_bar
-                .read(cx)
-                .tabs
-                .iter()
-                .find(|t| t.id == active_tab_id)
-                .and_then(|t| t.icon);
+            // 更新TabBar显示（使用剩余panel的icon）
+            let remaining_icon = tab_info
+                .container
+                .get_first_panel()
+                .and_then(|p| p.read(cx).remote_os())
+                .map(|os| os.icon());
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(old_icon)
+                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(remaining_icon)
                         } else {
                             t.clone()
                         }
