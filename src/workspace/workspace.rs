@@ -937,15 +937,22 @@ impl Workspace {
         if tab_info.tab_type != TabType::Workspace {
             tab_info.tab_type = TabType::Workspace;
 
-            // 更新TabBar显示
+            // 更新TabBar显示（保留原tab的icon）
             let workspace_label = self.generate_workspace_label();
+            let old_icon = self
+                .tab_bar
+                .read(cx)
+                .tabs
+                .iter()
+                .find(|t| t.id == active_tab_id)
+                .and_then(|t| t.icon);
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &workspace_label)
+                            TabItem::new(&active_tab_id, &workspace_label).with_icon(old_icon)
                         } else {
                             t.clone()
                         }
@@ -1036,14 +1043,21 @@ impl Workspace {
                 tab_info.label = new_label;
             }
 
-            // 更新TabBar显示
+            // 更新TabBar显示（保留原tab的icon）
+            let old_icon = self
+                .tab_bar
+                .read(cx)
+                .tabs
+                .iter()
+                .find(|t| t.id == active_tab_id)
+                .and_then(|t| t.icon);
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &tab_info.label)
+                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(old_icon)
                         } else {
                             t.clone()
                         }
@@ -1062,8 +1076,15 @@ impl Workspace {
             TabInfo::new_normal(&new_tab_id, &panel_label, dragged_panel_entity.clone());
         self.tabs.insert(new_tab_id.clone(), new_tab_info);
 
-        // 添加到TabBar的指定位置
-        let new_tab_item = TabItem::new(&new_tab_id, &panel_label);
+        // 添加到TabBar的指定位置，继承原tab的icon
+        let icon = self
+            .tab_bar
+            .read(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == active_tab_id)
+            .and_then(|t| t.icon);
+        let new_tab_item = TabItem::new(&new_tab_id, &panel_label).with_icon(icon);
         self.tab_bar.update(cx, |tab_bar, cx| {
             match insert_index {
                 Some(index) => {
