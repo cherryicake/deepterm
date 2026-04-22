@@ -608,6 +608,15 @@ impl Panel {
                             cx.new(move |_cx| preview)
                         },
                     )
+                    .when_some(self.remote_os, |this, os| {
+                        this.child(
+                            svg()
+                                .size(px(14.0))
+                                .path(os.icon().path())
+                                .text_color(theme.text_muted)
+                                .mr(px(6.0)),
+                        )
+                    })
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
             .child(
