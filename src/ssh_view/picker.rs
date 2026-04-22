@@ -13,6 +13,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
+use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
@@ -243,9 +244,7 @@ impl SshPicker {
     }
 
     fn load_configs() -> Vec<SshConnectionConfig> {
-        SshGlobalConfig::load()
-            .map(|config| config.saved_connections)
-            .unwrap_or_default()
+        SshGlobalConfig::load().saved_connections
     }
 
     fn scan_local_terminals() -> Vec<LocalTerminalOption> {
@@ -409,24 +408,16 @@ impl SshPicker {
         }
     }
 
-    fn get_os_icon(host: &str, nickname: Option<&str>) -> Icon {
-        let text = nickname.unwrap_or(host).to_lowercase();
-        if text.contains("ubuntu")
-            || text.contains("centos")
-            || text.contains("debian")
-            || text.contains("fedora")
-            || text.contains("arch")
-            || text.contains("alpine")
-            || text.contains("linux")
-        {
-            Icon::Linux
-        } else if text.contains("windows")
-            || text.contains("win")
-            || text.contains("mac")
-            || text.contains("darwin")
-            || text.contains("apple")
-        {
-            Icon::Screen
+    fn get_os_icon(host: &str, nickname: Option<&str>, os: Option<&str>) -> Icon {
+        if let Some(os_id) = os {
+            let detected = RemoteOS::from_id(os_id);
+            if detected != RemoteOS::Unknown {
+                return detected.icon();
+            }
+        }
+        let guessed = guess_os_from_text(nickname.unwrap_or(host));
+        if guessed != RemoteOS::Unknown {
+            guessed.icon()
         } else {
             Icon::Server
         }
@@ -569,7 +560,7 @@ impl SshPicker {
         let config = &self.configs[config_index];
         let local_count = self.filtered_local_indices.len();
         let actual_index = item_index + local_count;
-        let icon = Self::get_os_icon(&config.host, config.nickname.as_deref());
+        let icon = Self::get_os_icon(&config.host, config.nickname.as_deref(), config.os.as_deref());
 
         Self::render_list_item_content(
             icon,

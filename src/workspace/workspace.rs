@@ -20,6 +20,7 @@ use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::GlobalSshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
@@ -470,6 +471,54 @@ impl Workspace {
             }
             PanelEvent::TabChanged { .. } => {
                 // Tab切换事件
+            }
+            PanelEvent::TabIconChanged {
+                panel_id,
+                os,
+                ssh_config_id,
+            } => {
+                // 找到包含该panel的tab，更新tab图标
+                if let Some(tab_id) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
+                    tab_info
+                        .container
+                        .contains_panel(panel_id, cx)
+                        .then_some(tab_id.clone())
+                }) {
+                    if let Some(os) = os {
+                        let icon = os.icon();
+                        self.tab_bar.update(cx, |tab_bar, cx| {
+                            let tabs: Vec<TabItem> = tab_bar
+                                .tabs
+                                .iter()
+                                .map(|t| {
+                                    if t.id == tab_id {
+                                        TabItem::new(&tab_id, &t.label).with_icon(Some(icon))
+                                    } else {
+                                        t.clone()
+                                    }
+                                })
+                                .collect();
+                            tab_bar.set_tabs(tabs, cx);
+                        });
+                    }
+                }
+                // 保存检测到的OS到SSH配置
+                if let (Some(config_id), Some(os)) = (ssh_config_id, os) {
+                    let os_id = os.to_id();
+                    let mut config = crate::ssh::config::SshGlobalConfig::load();
+                    if let Some(conn) = config
+                        .saved_connections
+                        .iter_mut()
+                        .find(|c| c.id() == *config_id)
+                    {
+                        if conn.os.as_deref() != Some(os_id) {
+                            conn.os = Some(os_id.to_string());
+                            if let Err(e) = config.save() {
+                                log::warn!("保存 SSH 配置失败: {}", e);
+                            }
+                        }
+                    }
+                }
             }
             PanelEvent::OpenFileBrowser { target, .. } => {
                 self.show_file_browser_panel(target.clone(), window, cx);
@@ -1368,7 +1417,7 @@ impl Workspace {
                 cx,
             )
         });
-        self.add_terminal_tab(label, panel, window, cx);
+        self.add_terminal_tab(label, panel, None, window, cx);
     }
 
     /// 使用指定命令创建本地终端Tab
@@ -1391,7 +1440,7 @@ impl Workspace {
                 cx,
             )
         });
-        self.add_terminal_tab(label, panel, window, cx);
+        self.add_terminal_tab(label, panel, None, window, cx);
     }
 
     /// 使用指定配置创建 SSH 终端
@@ -1402,6 +1451,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let label = config.display_name();
+        let initial_icon = config
+            .os
+            .as_deref()
+            .and_then(|id| {
+                let os = RemoteOS::from_id(id);
+                (os != RemoteOS::Unknown).then(|| os.icon())
+            })
+            .or_else(|| {
+                let os = guess_os_from_text(config.nickname.as_deref().unwrap_or(&config.host));
+                (os != RemoteOS::Unknown).then(|| os.icon())
+            });
         let panel = cx.new(|cx| {
             Panel::with_ssh_terminal(
                 format!("panel-{}", self.next_panel_id),
@@ -1412,7 +1472,7 @@ impl Workspace {
                 cx,
             )
         });
-        self.add_terminal_tab(label, panel, window, cx);
+        self.add_terminal_tab(label, panel, initial_icon, window, cx);
     }
 
     /// 添加终端到Tab（通用方法）
@@ -1420,6 +1480,7 @@ impl Workspace {
         &mut self,
         label: String,
         panel: Entity<Panel>,
+        icon: Option<crate::assets::Icon>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1440,7 +1501,7 @@ impl Workspace {
         );
 
         self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.add_tab(TabItem::new(&tab_id, &label), cx)
+            tab_bar.add_tab(TabItem::new(&tab_id, &label).with_icon(icon), cx)
         });
 
         let subscription =

@@ -557,7 +557,7 @@ impl HostForm {
             config = config.with_nickname(nickname.trim());
         }
 
-        let mut global_config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
+        let mut global_config = SshGlobalConfig::load();
         if let Some(ref editing_id) = self.editing_config_id {
             global_config.remove_connection(editing_id);
         }

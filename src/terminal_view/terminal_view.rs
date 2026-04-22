@@ -14,6 +14,7 @@ use gpui::{
 use gpui::{KeyBinding, prelude::*};
 
 use crate::file_browser::FileBrowserTarget;
+use crate::ssh::platform::RemoteOS;
 use crate::ssh_view::connect::Event::Reconnect;
 /// Events emitted by TerminalView
 #[derive(Clone, Debug)]
@@ -26,6 +27,8 @@ pub enum Event {
     OpenFile { path: String },
     /// SSH 重新连接请求
     SshReconnect { config: SshConnectionConfig },
+    /// 远程操作系统已检测到
+    RemoteOsDetected { os: RemoteOS },
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -107,6 +110,8 @@ pub struct TerminalView {
     ssh_connect_subscription: Option<Subscription>,
     /// SSH 连接视图隐藏任务 - 用于取消延迟隐藏任务
     ssh_connect_hide_task: Option<Task<()>>,
+    /// 检测到的远程操作系统（仅对SSH终端有意义）
+    remote_os: Option<RemoteOS>,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
     /// Flattened render data reused across frames when nothing changed.
@@ -174,6 +179,16 @@ impl TerminalView {
         }
     }
 
+    /// 检查终端是否检测到新的远程操作系统，如果是则发出事件
+    fn check_remote_os(&mut self, terminal: Entity<Terminal>, cx: &mut Context<Self>) {
+        if let Some(os) = terminal.read(cx).remote_os() {
+            if self.remote_os != Some(os) {
+                self.remote_os = Some(os);
+                cx.emit(Event::RemoteOsDetected { os });
+            }
+        }
+    }
+
     /// 处理 SSH 连接进度视图状态更新
     fn handle_ssh_connect_status(
         &mut self,
@@ -223,11 +238,12 @@ impl TerminalView {
             // 本地终端只需要处理基本事件，不需要处理 SSH 相关事件
             let subscription = cx.subscribe(
                 &terminal_clone,
-                |this: &mut TerminalView, _terminal, event: &TerminalEvent, cx| match event {
+                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
                     TerminalEvent::TitleChanged => {
                         this.update_title(cx);
                     }
                     TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                        this.check_remote_os(terminal.clone(), cx);
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
@@ -257,6 +273,7 @@ impl TerminalView {
                 ssh_connect_view: None,
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
+                remote_os: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -346,6 +363,7 @@ impl TerminalView {
                                 cx,
                             );
                         }
+                        this.check_remote_os(terminal.clone(), cx);
                         cx.notify();
                     }
                     TerminalEvent::Bell => {}
@@ -376,6 +394,7 @@ impl TerminalView {
                 ssh_connect_view: Some(connect_view.clone()),
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
+                remote_os: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,

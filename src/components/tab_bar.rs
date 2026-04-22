@@ -145,6 +145,7 @@ impl Render for DragPreview {
 pub struct TabItem {
     pub id: SharedString,
     pub label: SharedString,
+    pub icon: Option<Icon>,
     pub is_active: bool,
     pub is_modified: bool,
 }
@@ -154,6 +155,7 @@ impl TabItem {
         Self {
             id: id.into(),
             label: label.into(),
+            icon: None,
             is_active: false,
             is_modified: false,
         }
@@ -161,6 +163,11 @@ impl TabItem {
 
     pub fn with_modified(mut self, modified: bool) -> Self {
         self.is_modified = modified;
+        self
+    }
+
+    pub fn with_icon(mut self, icon: Option<Icon>) -> Self {
+        self.icon = icon;
         self
     }
 }
@@ -967,6 +974,7 @@ impl Render for TabBar {
                                 let tab_id = tab.id.clone();
                                 let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                                 let label = tab.label.clone();
+                                let icon = tab.icon;
                                 let is_modified = tab.is_modified;
                                 let on_panel_drop_for_tab = on_panel_drop.clone();
                                 let entity = cx.entity();
@@ -1116,6 +1124,18 @@ impl Render for TabBar {
                                                             }
                                                         }
                                                     }))
+                                                    .when_some(icon, |this, icon| {
+                                                        this.child(
+                                                            svg()
+                                                                .size(px(14.0))
+                                                                .text_color(if is_active {
+                                                                    theme.text
+                                                                } else {
+                                                                    theme.text_muted
+                                                                })
+                                                                .path(icon.path()),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
                                                             .text_sm()

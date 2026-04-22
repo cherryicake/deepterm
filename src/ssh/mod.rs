@@ -30,6 +30,7 @@ pub mod config;
 pub mod connection_manager;
 pub mod error;
 pub mod keychain;
+pub mod platform;
 pub mod russh_terminal;
 pub mod sftp_fs;
 pub mod ssh_pty;
@@ -95,6 +96,16 @@ pub fn remote_shell_tracking_command() -> String {
          unset _DTF _DTRC _f\n\
          DEEPTERM_RC_EOF\n\
          export PROMPT_COMMAND='__deepterm_precmd'\n\
+         __deepterm_emit_os() {{\n\
+           local os_id=\"\"\n\
+           if [ -r /etc/os-release ]; then\n\
+             os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"')\n\
+           else\n\
+             os_id=$(uname -s | tr '[:upper:]' '[:lower:]')\n\
+           fi\n\
+           printf '\\033]1338;%s\\007' \"$os_id\"\n\
+         }}\n\
+         __deepterm_emit_os\n\
          exec bash --rcfile \"$_DTRC\" -i",
         REMOTE_SHELL_TRACKING_SNIPPET
     )

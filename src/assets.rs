@@ -49,6 +49,18 @@ pub enum Icon {
     Eye,
     EyeOff,
     Loader,
+    // OS icons
+    Macos,
+    Ubuntu,
+    Debian,
+    Centos,
+    Arch,
+    Windows,
+    LinuxMint,
+    Fedora,
+    Rhel,
+    Opensuse,
+    Manjaro,
 }
 
 impl Icon {
@@ -76,6 +88,17 @@ impl Icon {
             Icon::Eye => SharedString::new_static("icons/eye.svg"),
             Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
             Icon::Loader => SharedString::new_static("icons/loader.svg"),
+            Icon::Macos => SharedString::new_static("icons/macos.svg"),
+            Icon::Ubuntu => SharedString::new_static("icons/ubuntu.svg"),
+            Icon::Debian => SharedString::new_static("icons/debian.svg"),
+            Icon::Centos => SharedString::new_static("icons/centos.svg"),
+            Icon::Arch => SharedString::new_static("icons/arch.svg"),
+            Icon::Windows => SharedString::new_static("icons/windows.svg"),
+            Icon::LinuxMint => SharedString::new_static("icons/linuxmint.svg"),
+            Icon::Fedora => SharedString::new_static("icons/fedora.svg"),
+            Icon::Rhel => SharedString::new_static("icons/rhel.svg"),
+            Icon::Opensuse => SharedString::new_static("icons/opensuse.svg"),
+            Icon::Manjaro => SharedString::new_static("icons/manjaro.svg"),
         }
     }
 }

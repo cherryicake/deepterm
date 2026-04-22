@@ -39,6 +39,9 @@ pub struct SshConnectionConfig {
     /// 是否保存此配置
     #[serde(default = "default_save")]
     pub save_config: bool,
+    /// 检测到的远程操作系统 ID
+    #[serde(default)]
+    pub os: Option<String>,
 }
 
 impl SshConnectionConfig {
@@ -84,6 +87,7 @@ impl SshConnectionConfig {
             extra_args: None,
             timeout: default_timeout(),
             save_config: default_save(),
+            os: None,
         }
     }
 
@@ -105,6 +109,7 @@ impl SshConnectionConfig {
             extra_args: None,
             timeout: default_timeout(),
             save_config: default_save(),
+            os: None,
         }
     }
 
@@ -421,13 +426,16 @@ impl SshGlobalConfig {
 
     /// 从配置文件加载
     /// 配置文件路径: ~/.config/deepterm/ssh.json
-    /// 如果文件不存在，返回默认配置（不自动创建文件）
-    pub fn load() -> Option<Self> {
-        let config_path = Self::config_path()?;
+    /// 如果文件不存在或解析失败，返回默认配置（不自动创建文件）
+    pub fn load() -> Self {
+        let config_path = match Self::config_path() {
+            Some(path) => path,
+            None => return Self::new(),
+        };
 
         let content = match std::fs::read_to_string(&config_path) {
             Ok(content) => content,
-            Err(_) => return Some(Self::new()),
+            Err(_) => return Self::new(),
         };
 
         let mut config = serde_json::from_str(&content)
@@ -436,7 +444,7 @@ impl SshGlobalConfig {
         if let Err(err) = config.migrate_keychain_refs() {
             log::warn!("SSH 凭据迁移失败: {}", err);
         }
-        Some(config)
+        config
     }
 
     /// 加载配置，如果不存在则创建默认配置文件

@@ -9,6 +9,7 @@ use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DragPreview, DraggedTab};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
+use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
 
@@ -62,6 +63,12 @@ pub enum PanelEvent {
         panel_id: String,
         tab_id: SharedString,
     },
+    /// Tab 图标变更事件
+    TabIconChanged {
+        panel_id: String,
+        os: Option<RemoteOS>,
+        ssh_config_id: Option<String>,
+    },
     /// 打开文件浏览器
     OpenFileBrowser {
         panel_id: String,
@@ -114,6 +121,8 @@ pub struct Panel {
     active_tab_id: Option<SharedString>,
     /// Label for the active tab (shown in title bar)
     active_tab_label: Option<SharedString>,
+    /// SSH config ID for saving detected OS info
+    ssh_config_id: Option<String>,
     /// ID of the workspace this panel belongs to
     workspace_id: String,
     /// Whether this is the only panel in the workspace (affects border rendering)
@@ -151,6 +160,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label: None,
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Text(content_text),
@@ -176,7 +186,7 @@ impl Panel {
         let close_panel_id = panel_id.to_string();
         cx.subscribe(
             terminal_view,
-            move |_this, _view, event: &TerminalViewEvent, cx| match event {
+            move |this, _view, event: &TerminalViewEvent, cx| match event {
                 TerminalViewEvent::CloseTerminal => {
                     cx.emit(PanelEvent::Close {
                         panel_id: close_panel_id.clone(),
@@ -201,7 +211,14 @@ impl Panel {
                     // 重新订阅新 TerminalView 的事件
                     Self::subscribe_terminal_events(&close_panel_id, &new_terminal_view, cx);
                     // 更新 panel 内容
-                    _this.set_content(PanelContent::Terminal(new_terminal_view), cx);
+                    this.set_content(PanelContent::Terminal(new_terminal_view), cx);
+                }
+                TerminalViewEvent::RemoteOsDetected { os } => {
+                    cx.emit(PanelEvent::TabIconChanged {
+                        panel_id: close_panel_id.clone(),
+                        os: Some(*os),
+                        ssh_config_id: this.ssh_config_id.clone(),
+                    });
                 }
             },
         )
@@ -225,6 +242,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label,
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -252,6 +270,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label,
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -278,6 +297,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label,
+            ssh_config_id: Some(ssh_config.id()),
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -299,6 +319,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label: Some("Files".into()),
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::FileBrowser(file_browser_view),
@@ -320,6 +341,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label: Some("Editor".into()),
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Editor(editor_state),
@@ -342,6 +364,7 @@ impl Panel {
             drag_preview: None,
             active_tab_id,
             active_tab_label: Some("Hosts".into()),
+            ssh_config_id: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::SettingsHubView(settings_hub_view),

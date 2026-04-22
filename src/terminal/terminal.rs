@@ -29,8 +29,11 @@ use gpui::{
     Task, Window, px,
 };
 
-use crate::ssh::keychain::{PreferredSshTransport, preferred_ssh_transport};
-use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal};
+use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal, platform::detect_local_os};
+use crate::ssh::{
+    keychain::{PreferredSshTransport, preferred_ssh_transport},
+    platform::RemoteOS,
+};
 use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -243,6 +246,8 @@ pub struct Terminal {
     /// 远程 shell 提示符是否已准备好。
     remote_shell_ready: bool,
     remote_working_directory: Option<String>,
+    /// 检测到的远程操作系统
+    remote_os: Option<RemoteOS>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
@@ -356,6 +361,7 @@ impl Terminal {
                 pty_master_fd,
                 remote_shell_ready: false,
                 remote_working_directory: None,
+                remote_os: Some(detect_local_os()),
                 window_title: None,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
@@ -441,6 +447,7 @@ impl Terminal {
             pty_master_fd: None,
             remote_shell_ready: false,
             remote_working_directory: None,
+            remote_os: None,
             window_title: None,
             sender: None,
             last_content: TerminalContent::default(),
@@ -514,6 +521,7 @@ impl Terminal {
                 pty_master_fd: None,
                 remote_shell_ready: false,
                 remote_working_directory: None,
+                remote_os: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
                 last_content: TerminalContent::default(),
@@ -698,6 +706,7 @@ impl Terminal {
                 pty_master_fd: None,
                 remote_shell_ready: false,
                 remote_working_directory: None,
+                remote_os: None,
                 window_title: None,
                 sender: None,
                 last_content: TerminalContent::default(),
@@ -781,6 +790,11 @@ impl Terminal {
 
     pub fn remote_working_directory(&self) -> Option<&str> {
         self.remote_working_directory.as_deref()
+    }
+
+    /// 获取检测到的远程操作系统
+    pub fn remote_os(&self) -> Option<RemoteOS> {
+        self.remote_os
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
@@ -880,6 +894,11 @@ impl Terminal {
             return true;
         }
 
+        if let Some(os) = Self::parse_remote_os_osc(osc_content) {
+            self.remote_os = Some(os);
+            return true;
+        }
+
         false
     }
 
@@ -929,6 +948,16 @@ impl Terminal {
         }
 
         None
+    }
+
+    fn parse_remote_os_osc(osc_content: &[u8]) -> Option<RemoteOS> {
+        let content = std::str::from_utf8(osc_content).ok()?.trim();
+        let id = content.strip_prefix("1338;")?;
+        let os = RemoteOS::from_id(id.trim());
+        if os == RemoteOS::Unknown {
+            return None;
+        }
+        Some(os)
     }
 
     fn parse_osc7_file_uri(uri: &str) -> Option<String> {

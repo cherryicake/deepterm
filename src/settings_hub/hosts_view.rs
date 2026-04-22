@@ -18,6 +18,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
+use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
@@ -45,6 +46,7 @@ pub struct Host {
     pub hostname: Option<SharedString>,
     pub auth_label: Option<SharedString>,
     pub icon_color: HostIconColor,
+    pub os_icon: Option<Icon>,
 }
 
 impl Host {
@@ -61,6 +63,7 @@ impl Host {
             hostname: None,
             auth_label: None,
             icon_color: HostIconColor::Orange,
+            os_icon: None,
         }
     }
 
@@ -81,6 +84,11 @@ impl Host {
 
     pub fn with_icon_color(mut self, color: HostIconColor) -> Self {
         self.icon_color = color;
+        self
+    }
+
+    pub fn with_os_icon(mut self, icon: Icon) -> Self {
+        self.os_icon = Some(icon);
         self
     }
 
@@ -283,7 +291,7 @@ impl HostsView {
 
     /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
     fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
-        let config = SshGlobalConfig::load().unwrap_or_else(SshGlobalConfig::new);
+        let config = SshGlobalConfig::load();
         let keychain = KeychainStore::load_or_default();
 
         // Convert saved connections to Host structs
@@ -328,11 +336,21 @@ impl HostsView {
                     _ => (HostIconColor::Orange, "auto".to_string()),
                 };
 
-                Host::new(conn.id(), display_name, HostType::Ssh)
+                let os = conn
+                    .os
+                    .as_deref()
+                    .map(RemoteOS::from_id)
+                    .unwrap_or_else(|| guess_os_from_text(&display_name));
+                let host = Host::new(conn.id(), display_name, HostType::Ssh)
                     .with_username(&conn.username)
                     .with_hostname(&conn.host)
                     .with_auth_label(auth_label)
-                    .with_icon_color(icon_color)
+                    .with_icon_color(icon_color);
+                if os != RemoteOS::Unknown {
+                    host.with_os_icon(os.icon())
+                } else {
+                    host
+                }
             })
             .collect();
 
@@ -678,7 +696,7 @@ impl HostsView {
                     .child(
                         svg()
                             .size(px(22.0))
-                            .path(Icon::Linux.path())
+                            .path(host.os_icon.unwrap_or(Icon::Linux).path())
                             .text_color(theme.accent_foreground),
                     ),
             )
