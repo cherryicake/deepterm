@@ -937,7 +937,7 @@ impl Workspace {
         if tab_info.tab_type != TabType::Workspace {
             tab_info.tab_type = TabType::Workspace;
 
-            // 更新TabBar显示（保留原tab的icon）
+            // 更新TabBar显示（保留原tab或被拖拽panel的icon）
             let workspace_label = self.generate_workspace_label();
             let old_icon = self
                 .tab_bar
@@ -946,13 +946,14 @@ impl Workspace {
                 .iter()
                 .find(|t| t.id == active_tab_id)
                 .and_then(|t| t.icon);
+            let icon = dragged_panel.icon.or(old_icon);
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &workspace_label).with_icon(old_icon)
+                            TabItem::new(&active_tab_id, &workspace_label).with_icon(icon)
                         } else {
                             t.clone()
                         }
@@ -1076,15 +1077,8 @@ impl Workspace {
             TabInfo::new_normal(&new_tab_id, &panel_label, dragged_panel_entity.clone());
         self.tabs.insert(new_tab_id.clone(), new_tab_info);
 
-        // 添加到TabBar的指定位置，继承原tab的icon
-        let icon = self
-            .tab_bar
-            .read(cx)
-            .tabs
-            .iter()
-            .find(|t| t.id == active_tab_id)
-            .and_then(|t| t.icon);
-        let new_tab_item = TabItem::new(&new_tab_id, &panel_label).with_icon(icon);
+        // 添加到TabBar的指定位置，使用拖拽panel自身的icon
+        let new_tab_item = TabItem::new(&new_tab_id, &panel_label).with_icon(dragged_panel.icon);
         self.tab_bar.update(cx, |tab_bar, cx| {
             match insert_index {
                 Some(index) => {

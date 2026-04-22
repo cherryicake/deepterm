@@ -22,6 +22,7 @@ pub struct DraggedPanel {
     pub panel_id: String,
     pub source_tab_id: String,
     pub tab_label: SharedString,
+    pub icon: Option<Icon>,
 }
 
 /// Panel placement threshold for drag operations (start at 35% of dimension)
@@ -123,6 +124,8 @@ pub struct Panel {
     active_tab_label: Option<SharedString>,
     /// SSH config ID for saving detected OS info
     ssh_config_id: Option<String>,
+    /// 检测到的远程操作系统
+    remote_os: Option<RemoteOS>,
     /// ID of the workspace this panel belongs to
     workspace_id: String,
     /// Whether this is the only panel in the workspace (affects border rendering)
@@ -161,6 +164,7 @@ impl Panel {
             active_tab_id,
             active_tab_label: None,
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Text(content_text),
@@ -214,6 +218,7 @@ impl Panel {
                     this.set_content(PanelContent::Terminal(new_terminal_view), cx);
                 }
                 TerminalViewEvent::RemoteOsDetected { os } => {
+                    this.remote_os = Some(*os);
                     cx.emit(PanelEvent::TabIconChanged {
                         panel_id: close_panel_id.clone(),
                         os: Some(*os),
@@ -243,6 +248,7 @@ impl Panel {
             active_tab_id,
             active_tab_label,
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -271,6 +277,7 @@ impl Panel {
             active_tab_id,
             active_tab_label,
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -298,6 +305,7 @@ impl Panel {
             active_tab_id,
             active_tab_label,
             ssh_config_id: Some(ssh_config.id()),
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
@@ -320,6 +328,7 @@ impl Panel {
             active_tab_id,
             active_tab_label: Some("Files".into()),
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::FileBrowser(file_browser_view),
@@ -342,6 +351,7 @@ impl Panel {
             active_tab_id,
             active_tab_label: Some("Editor".into()),
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::Editor(editor_state),
@@ -365,6 +375,7 @@ impl Panel {
             active_tab_id,
             active_tab_label: Some("Hosts".into()),
             ssh_config_id: None,
+            remote_os: None,
             is_solo: false,
             is_selected: false,
             content: PanelContent::SettingsHubView(settings_hub_view),
@@ -582,6 +593,7 @@ impl Panel {
                             panel_id: panel_id.clone(),
                             source_tab_id,
                             tab_label: drag_title.clone().into(),
+                            icon: self.remote_os.map(|os| os.icon()),
                         },
                         move |_drag_data, position, window, cx| {
                             // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步
