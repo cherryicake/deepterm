@@ -400,7 +400,7 @@ impl SshPicker {
 
     fn handle_input(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
-            "down" => self.select_next(cx),
+            "down" | "tab" => self.select_next(cx),
             "up" => self.select_previous(cx),
             "enter" | "return" => self.confirm_selection(window, cx),
             "escape" => self.hide(cx),
