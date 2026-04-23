@@ -853,12 +853,14 @@ impl Render for TabBar {
                                 let entity = cx.entity();
                                 move |bounds, _window, cx| {
                                     entity.update(cx, |this, _cx| {
+                                        // 跳过第一个 bound（canvas 测量元素），只取 tab 和 preview 的 bounds
+                                        let all_bounds: Vec<_> = bounds.into_iter().skip(1).collect();
                                         let expected_bounds =
                                             this.tabs.len() + usize::from(this.panel_drop_preview.is_some());
                                         let mut tab_bounds = if expected_bounds == 0 {
                                             Vec::new()
                                         } else {
-                                            bounds
+                                            all_bounds
                                                 .into_iter()
                                                 .rev()
                                                 .take(expected_bounds)
@@ -989,218 +991,221 @@ impl Render for TabBar {
                                 let animation_id =
                                     format!("tab-reorder-{}-{}", tab_id, animation_epoch);
 
-                                    children.push(
-                                        div()
-                                            .child(
-                                                div()
-                                                    .id(tab_id.clone())
-                                                    .h(px(28.0))
-                                                    .px(px(12.0))
-                                                    .flex()
-                                                    .flex_shrink_0()
-                                                    .items_center()
-                                                    .gap(px(6.0))
-                                                    .rounded(px(6.0))
-                                                    .border_1()
-                                                    .border_color(if is_active {
-                                                        theme.border_strong
-                                                    } else {
-                                                        theme.border.opacity(0.0)
-                                                    })
-                                                    .bg(if is_active {
-                                                        theme.tab_active_background
-                                                    } else {
-                                                        theme.tab_inactive_background
-                                                    })
-                                                    .hover(move |style| {
-                                                        if !is_active {
-                                                            style.bg(theme.tab_hover_background)
+                                    let tab_inner = div()
+                                        .id(tab_id.clone())
+                                        .h(px(28.0))
+                                        .px(px(12.0))
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .rounded(px(6.0))
+                                        .border_1()
+                                        .border_color(if is_active {
+                                            theme.border_strong
+                                        } else {
+                                            theme.border.opacity(0.0)
+                                        })
+                                        .bg(if is_active {
+                                            theme.tab_active_background
+                                        } else {
+                                            theme.tab_inactive_background
+                                        })
+                                        .hover(move |style| {
+                                            if !is_active {
+                                                style.bg(theme.tab_hover_background)
+                                            } else {
+                                                style
+                                            }
+                                        })
+                                        .on_drag(
+                                            DraggedTab {
+                                                tab_id: tab_id.clone(),
+                                                from_index: index,
+                                            },
+                                            {
+                                                let label = label.clone();
+                                                move |_drag_data, position, window, cx| {
+                                                    cx.stop_propagation();
+                                                    let preview = DragPreview::new(
+                                                        label.clone(),
+                                                        position,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    cx.new(move |_cx| preview)
+                                                }
+                                            },
+                                        )
+                                        .on_drag_move::<DraggedTab>(cx.listener(
+                                            |this, event, _window, cx| {
+                                                this.handle_tab_drag_move(event, cx);
+                                            },
+                                        ))
+                                        .drag_over::<DraggedTab>({
+                                            let entity = entity.clone();
+                                            let tab_id = tab_id.clone();
+                                            move |tab, dragged: &DraggedTab, _window, cx| {
+                                                let dragged = dragged.clone();
+                                                let entity = entity.clone();
+                                                let tab_id = tab_id.clone();
+                                                cx.defer(move |cx| {
+                                                    entity.update(cx, |this, cx| {
+                                                        if dragged.tab_id != tab_id {
+                                                            this.set_tab_reorder_preview(
+                                                                &dragged, index, cx,
+                                                            );
                                                         } else {
-                                                            style
+                                                            this.clear_tab_reorder_preview(cx);
                                                         }
-                                                    })
-                                                    .on_drag(
-                                                        DraggedTab {
-                                                            tab_id: tab_id.clone(),
-                                                            from_index: index,
-                                                        },
-                                                        {
-                                                            let label = label.clone();
-                                                            move |_drag_data, position, window, cx| {
-                                                                cx.stop_propagation();
-                                                                let preview = DragPreview::new(
-                                                                    label.clone(),
-                                                                    position,
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                                cx.new(move |_cx| preview)
-                                                            }
-                                                        },
-                                                    )
-                                                    .on_drag_move::<DraggedTab>(cx.listener(
-                                                        |this, event, _window, cx| {
-                                                            this.handle_tab_drag_move(event, cx);
-                                                        },
-                                                    ))
-                                                    .drag_over::<DraggedTab>({
-                                                        let entity = entity.clone();
-                                                        let tab_id = tab_id.clone();
-                                                        move |tab, dragged: &DraggedTab, _window, cx| {
-                                                            let dragged = dragged.clone();
-                                                            let entity = entity.clone();
-                                                            let tab_id = tab_id.clone();
-                                                            cx.defer(move |cx| {
-                                                                entity.update(cx, |this, cx| {
-                                                                    if dragged.tab_id != tab_id {
-                                                                        this.set_tab_reorder_preview(
-                                                                            &dragged, index, cx,
-                                                                        );
-                                                                    } else {
-                                                                        this.clear_tab_reorder_preview(cx);
-                                                                    }
-                                                                });
-                                                            });
-                                                            tab
-                                                        }
-                                                    })
-                                                    .drag_over::<DraggedPanel>({
-                                                        let entity = entity.clone();
-                                                        move |tab, dragged: &DraggedPanel, _window, cx| {
-                                                            let entity = entity.clone();
-                                                            let tab_label = dragged.tab_label.clone();
-                                                            cx.defer(move |cx| {
-                                                                entity.update(cx, |this, cx| {
-                                                                    this.set_panel_drop_preview(
-                                                                        index,
-                                                                        tab_label,
-                                                                        cx,
-                                                                    );
-                                                                });
-                                                            });
-                                                            tab
-                                                        }
-                                                    })
-                                                    .on_drop(cx.listener({
-                                                        let on_tab_reorder = on_tab_reorder.clone();
-                                                        let tab_id = tab_id.clone();
-                                                        move |this, dragged: &DraggedTab, _window, cx| {
-                                                            cx.stop_propagation();
+                                                    });
+                                                });
+                                                tab
+                                            }
+                                        })
+                                        .drag_over::<DraggedPanel>({
+                                            let entity = entity.clone();
+                                            move |tab, dragged: &DraggedPanel, _window, cx| {
+                                                let entity = entity.clone();
+                                                let tab_label = dragged.tab_label.clone();
+                                                cx.defer(move |cx| {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.set_panel_drop_preview(
+                                                            index,
+                                                            tab_label,
+                                                            cx,
+                                                        );
+                                                    });
+                                                });
+                                                tab
+                                            }
+                                        })
+                                        .on_drop(cx.listener({
+                                            let on_tab_reorder = on_tab_reorder.clone();
+                                            let tab_id = tab_id.clone();
+                                            move |this, dragged: &DraggedTab, _window, cx| {
+                                                cx.stop_propagation();
 
-                                                            if dragged.tab_id != tab_id {
-                                                                if let Some(ref callback) = on_tab_reorder {
-                                                                    if let Some(to_index) = this
-                                                                        .tabs
-                                                                        .iter()
-                                                                        .position(|t| t.id == tab_id)
-                                                                    {
-                                                                        this.apply_tab_reorder_locally(
-                                                                            dragged,
-                                                                            to_index,
-                                                                        );
-                                                                        this.reset_tab_reorder_preview(cx);
-                                                                        callback(dragged.clone(), to_index, cx);
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                this.clear_tab_reorder_preview(cx);
-                                                            }
+                                                if dragged.tab_id != tab_id {
+                                                    if let Some(ref callback) = on_tab_reorder {
+                                                        if let Some(to_index) = this
+                                                            .tabs
+                                                            .iter()
+                                                            .position(|t| t.id == tab_id)
+                                                        {
+                                                            this.apply_tab_reorder_locally(
+                                                                dragged,
+                                                                to_index,
+                                                            );
+                                                            this.reset_tab_reorder_preview(cx);
+                                                            callback(dragged.clone(), to_index, cx);
                                                         }
-                                                    }))
-                                                    .on_drop(cx.listener({
-                                                        let on_panel_drop_for_tab =
-                                                            on_panel_drop_for_tab.clone();
-                                                        move |this, dragged: &DraggedPanel, window, cx| {
-                                                            cx.stop_propagation();
-                                                            this.reset_panel_drop_preview(cx);
-                                                            if let Some(ref callback) = on_panel_drop_for_tab {
+                                                    }
+                                                } else {
+                                                    this.clear_tab_reorder_preview(cx);
+                                                }
+                                            }
+                                        }))
+                                        .on_drop(cx.listener({
+                                            let on_panel_drop_for_tab =
+                                                on_panel_drop_for_tab.clone();
+                                            move |this, dragged: &DraggedPanel, window, cx| {
+                                                cx.stop_propagation();
+                                                this.reset_panel_drop_preview(cx);
+                                                if let Some(ref callback) = on_panel_drop_for_tab {
+                                                    callback(
+                                                        dragged.clone(),
+                                                        Some(index),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            }
+                                        }))
+                                        .when_some(icon, |this, icon| {
+                                            this.child(
+                                                svg()
+                                                    .size(px(14.0))
+                                                    .text_color(if is_active {
+                                                        theme.text
+                                                    } else {
+                                                        theme.text_muted
+                                                    })
+                                                    .path(icon.path()),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(if is_active {
+                                                    gpui::FontWeight::SEMIBOLD
+                                                } else {
+                                                    gpui::FontWeight::NORMAL
+                                                })
+                                                .text_color(if is_active {
+                                                    theme.text
+                                                } else {
+                                                    theme.text_muted
+                                                })
+                                                .child(label),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(14.0))
+                                                .h(px(14.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_full()
+                                                .hover(move |style| {
+                                                    style.bg(theme.tab_hover_background)
+                                                })
+                                                .cursor_pointer()
+                                                .text_color(theme.icon_muted)
+                                                .text_xs()
+                                                .child(if is_modified { "●" } else { "×" })
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    cx.listener({
+                                                        let on_tab_close =
+                                                            on_tab_close.clone();
+                                                        let tab_id = tab_id.clone();
+                                                        move |_this, _, window, cx| {
+                                                            if let Some(ref callback) =
+                                                                on_tab_close
+                                                            {
                                                                 callback(
-                                                                    dragged.clone(),
-                                                                    Some(index),
+                                                                    tab_id.clone(),
                                                                     window,
                                                                     cx,
                                                                 );
                                                             }
                                                         }
-                                                    }))
-                                                    .when_some(icon, |this, icon| {
-                                                        this.child(
-                                                            svg()
-                                                                .size(px(14.0))
-                                                                .text_color(if is_active {
-                                                                    theme.text
-                                                                } else {
-                                                                    theme.text_muted
-                                                                })
-                                                                .path(icon.path()),
-                                                        )
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_weight(if is_active {
-                                                                gpui::FontWeight::SEMIBOLD
-                                                            } else {
-                                                                gpui::FontWeight::NORMAL
-                                                            })
-                                                            .text_color(if is_active {
-                                                                theme.text
-                                                            } else {
-                                                                theme.text_muted
-                                                            })
-                                                            .child(label),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w(px(14.0))
-                                                            .h(px(14.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .rounded_full()
-                                                            .hover(move |style| {
-                                                                style.bg(theme.tab_hover_background)
-                                                            })
-                                                            .cursor_pointer()
-                                                            .text_color(theme.icon_muted)
-                                                            .text_xs()
-                                                            .child(if is_modified { "●" } else { "×" })
-                                                            .on_mouse_down(
-                                                                gpui::MouseButton::Left,
-                                                                cx.listener({
-                                                                    let on_tab_close =
-                                                                        on_tab_close.clone();
-                                                                    let tab_id = tab_id.clone();
-                                                                    move |_this, _, window, cx| {
-                                                                        if let Some(ref callback) =
-                                                                            on_tab_close
-                                                                        {
-                                                                            callback(
-                                                                                tab_id.clone(),
-                                                                                window,
-                                                                                cx,
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }),
-                                                            ),
-                                                    )
-                                                    .on_click(cx.listener({
-                                                        let on_tab_click = on_tab_click.clone();
-                                                        let tab_id = tab_id.clone();
-                                                        move |_this, _event: &gpui::ClickEvent, window, cx| {
-                                                            if let Some(ref callback) = on_tab_click {
-                                                                callback(tab_id.clone(), window, cx);
-                                                            }
-                                                        }
-                                                    }))
-                                                    .on_mouse_down(
-                                                        gpui::MouseButton::Left,
-                                                        |_, _, cx| {
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ),
-                                            )
+                                                    }),
+                                                ),
+                                        )
+                                        .on_click(cx.listener({
+                                            let on_tab_click = on_tab_click.clone();
+                                            let tab_id = tab_id.clone();
+                                            move |_this, _event: &gpui::ClickEvent, window, cx| {
+                                                if let Some(ref callback) = on_tab_click {
+                                                    callback(tab_id.clone(), window, cx);
+                                                }
+                                            }
+                                        }))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            |_, _, cx| {
+                                                cx.stop_propagation();
+                                            },
+                                        );
+
+                                    let needs_animation =
+                                        start_offset != end_offset || start_opacity != end_opacity;
+
+                                    let tab_element = if needs_animation {
+                                        div()
+                                            .child(tab_inner)
                                             .flex_shrink_0()
                                             .with_animation(
                                                 animation_id,
@@ -1209,15 +1214,19 @@ impl Render for TabBar {
                                                 ))
                                                 .with_easing(ease_out_quint()),
                                                 move |this, delta| {
-                                                    let offset =
-                                                        start_offset + (end_offset - start_offset) * delta;
-                                                    let opacity =
-                                                        start_opacity + (end_opacity - start_opacity) * delta;
+                                                    let offset = start_offset
+                                                        + (end_offset - start_offset) * delta;
+                                                    let opacity = start_opacity
+                                                        + (end_opacity - start_opacity) * delta;
                                                     this.left(px(offset)).opacity(opacity)
                                                 },
                                             )
-                                            .into_any_element(),
-                                    );
+                                            .into_any_element()
+                                    } else {
+                                        tab_inner.into_any_element()
+                                    };
+
+                                    children.push(tab_element);
                                 }
 
                                 children
