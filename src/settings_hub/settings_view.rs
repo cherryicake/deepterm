@@ -226,7 +226,6 @@ impl<W: SidebarWidth> Render for SettingsHubSidebar<W> {
                     .px(px(10.0))
                     .gap_3()
                     .rounded(px(8.0))
-                    .cursor_pointer()
                     .when(is_active, |this| this.bg(Sidebar::selected_background(cx)))
                     .when(!is_active, |this| {
                         this.hover(|style| style.bg(Sidebar::hover_background(cx)))

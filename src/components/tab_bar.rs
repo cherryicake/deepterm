@@ -1019,7 +1019,6 @@ impl Render for TabBar {
                                                             style
                                                         }
                                                     })
-                                                    .cursor_pointer()
                                                     .on_drag(
                                                         DraggedTab {
                                                             tab_id: tab_id.clone(),

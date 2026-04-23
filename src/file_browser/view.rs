@@ -647,7 +647,6 @@ impl FileBrowserView {
                                 self.view_mode == FileBrowserViewMode::List,
                                 cx,
                             )
-                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -662,7 +661,6 @@ impl FileBrowserView {
                                 self.view_mode == FileBrowserViewMode::Columns,
                                 cx,
                             )
-                            .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
