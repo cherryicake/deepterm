@@ -4,8 +4,8 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
-    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun,
-    TextStyle, Window, canvas, div, ease_out_quint, px,
+    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun, TextStyle,
+    Window, canvas, div, ease_out_quint, px,
 };
 
 use crate::assets::Icon;
@@ -463,12 +463,7 @@ impl TabBar {
             return;
         };
 
-        let is_inside = position.x >= bounds.left()
-            && position.x <= bounds.right()
-            && position.y >= bounds.top()
-            && position.y <= bounds.bottom();
-
-        if !is_inside {
+        if !Self::bounds_contains_position(bounds, position) {
             self.clear_tab_reorder_preview(cx);
         }
     }
@@ -484,18 +479,20 @@ impl TabBar {
             return;
         };
 
-        let is_inside = position.x >= bounds.left()
-            && position.x <= bounds.right()
-            && position.y >= bounds.top()
-            && position.y <= bounds.bottom();
-
-        if !is_inside {
+        if !Self::bounds_contains_position(bounds, position) {
             self.clear_panel_drop_preview(cx);
             return;
         }
 
         let insert_index = self.tab_insert_slot_for_position(position);
         self.set_panel_drop_preview(insert_index, dragged.tab_label.clone(), cx);
+    }
+
+    fn bounds_contains_position(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+        position.x >= bounds.left()
+            && position.x <= bounds.right()
+            && position.y >= bounds.top()
+            && position.y <= bounds.bottom()
     }
 
     fn set_tab_reorder_preview(
@@ -653,14 +650,6 @@ impl TabBar {
         }
     }
 
-    fn animated_tab_offset(&self, tab_preview: Option<&TabReorderPreview>, index: usize) -> f32 {
-        self.tab_offset_for_preview(tab_preview, index)
-    }
-
-    fn animated_tab_opacity(&self, tab_preview: Option<&TabReorderPreview>, index: usize) -> f32 {
-        self.tab_opacity_for_preview(tab_preview, index)
-    }
-
     fn tab_opacity_for_preview(&self, preview: Option<&TabReorderPreview>, index: usize) -> f32 {
         let Some(preview) = preview else {
             return 1.0;
@@ -729,7 +718,10 @@ impl Render for TabBar {
             .on_drop(cx.listener({
                 let on_panel_drop = on_panel_drop.clone();
                 move |this, dragged: &DraggedPanel, window, cx| {
-                    let insert_index = this.panel_drop_preview.as_ref().map(|preview| preview.insert_index);
+                    let insert_index = this
+                        .panel_drop_preview
+                        .as_ref()
+                        .map(|preview| preview.insert_index);
                     this.reset_panel_drop_preview(cx);
                     if let Some(ref callback) = on_panel_drop {
                         callback(dragged.clone(), insert_index, window, cx);
@@ -854,9 +846,10 @@ impl Render for TabBar {
                                 move |bounds, _window, cx| {
                                     entity.update(cx, |this, _cx| {
                                         // 跳过第一个 bound（canvas 测量元素），只取 tab 和 preview 的 bounds
-                                        let all_bounds: Vec<_> = bounds.into_iter().skip(1).collect();
-                                        let expected_bounds =
-                                            this.tabs.len() + usize::from(this.panel_drop_preview.is_some());
+                                        let all_bounds: Vec<_> =
+                                            bounds.into_iter().skip(1).collect();
+                                        let expected_bounds = this.tabs.len()
+                                            + usize::from(this.panel_drop_preview.is_some());
                                         let mut tab_bounds = if expected_bounds == 0 {
                                             Vec::new()
                                         } else {
@@ -884,24 +877,29 @@ impl Render for TabBar {
                             .items_center()
                             .gap_1()
                             .h_full()
-                            .on_drag_move::<DraggedPanel>(cx.listener(|this, event, _window, cx| {
-                                this.handle_panel_drag_move(event, cx);
-                            }))
+                            .on_drag_move::<DraggedPanel>(cx.listener(
+                                |this, event, _window, cx| {
+                                    this.handle_panel_drag_move(event, cx);
+                                },
+                            ))
                             .on_drop(cx.listener({
                                 let on_tab_reorder = on_tab_reorder.clone();
                                 move |this, dragged: &DraggedTab, _window, cx| {
                                     let target_index = this
                                         .reorder_preview
                                         .as_ref()
-                                        .filter(|preview| preview.dragged_tab.tab_id == dragged.tab_id)
+                                        .filter(|preview| {
+                                            preview.dragged_tab.tab_id == dragged.tab_id
+                                        })
                                         .map(|preview| preview.insert_slot);
 
                                     if let Some(target_index) = target_index {
-                                        this.apply_tab_reorder_locally(dragged, target_index);
+                                        let did_reorder =
+                                            this.apply_tab_reorder_locally(dragged, target_index);
                                         this.reset_tab_reorder_preview(cx);
 
                                         if let Some(ref callback) = on_tab_reorder
-                                            && target_index != dragged.from_index
+                                            && did_reorder
                                         {
                                             callback(dragged.clone(), target_index, cx);
                                         }
@@ -973,23 +971,29 @@ impl Render for TabBar {
                                         continue;
                                     };
 
-                                let tab_id = tab.id.clone();
-                                let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
-                                let label = tab.label.clone();
-                                let icon = tab.icon;
-                                let is_modified = tab.is_modified;
-                                let on_panel_drop_for_tab = on_panel_drop.clone();
-                                let entity = cx.entity();
-                                let start_offset =
-                                    self.animated_tab_offset(self.previous_reorder_preview.as_ref(), index);
-                                let end_offset =
-                                    self.animated_tab_offset(self.reorder_preview.as_ref(), index);
-                                let start_opacity = self
-                                    .animated_tab_opacity(self.previous_reorder_preview.as_ref(), index);
-                                let end_opacity = self
-                                    .animated_tab_opacity(self.reorder_preview.as_ref(), index);
-                                let animation_id =
-                                    format!("tab-reorder-{}-{}", tab_id, animation_epoch);
+                                    let tab_id = tab.id.clone();
+                                    let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
+                                    let label = tab.label.clone();
+                                    let icon = tab.icon;
+                                    let is_modified = tab.is_modified;
+                                    let on_panel_drop_for_tab = on_panel_drop.clone();
+                                    let entity = cx.entity();
+                                    let start_offset = self.tab_offset_for_preview(
+                                        self.previous_reorder_preview.as_ref(),
+                                        index,
+                                    );
+                                    let end_offset = self.tab_offset_for_preview(
+                                        self.reorder_preview.as_ref(),
+                                        index,
+                                    );
+                                    let start_opacity = self.tab_opacity_for_preview(
+                                        self.previous_reorder_preview.as_ref(),
+                                        index,
+                                    );
+                                    let end_opacity = self.tab_opacity_for_preview(
+                                        self.reorder_preview.as_ref(),
+                                        index,
+                                    );
 
                                     let tab_inner = div()
                                         .id(tab_id.clone())
@@ -1071,9 +1075,7 @@ impl Render for TabBar {
                                                 cx.defer(move |cx| {
                                                     entity.update(cx, |this, cx| {
                                                         this.set_panel_drop_preview(
-                                                            index,
-                                                            tab_label,
-                                                            cx,
+                                                            index, tab_label, cx,
                                                         );
                                                     });
                                                 });
@@ -1087,17 +1089,20 @@ impl Render for TabBar {
                                                 cx.stop_propagation();
 
                                                 if dragged.tab_id != tab_id {
-                                                    if let Some(ref callback) = on_tab_reorder {
-                                                        if let Some(to_index) = this
-                                                            .tabs
-                                                            .iter()
-                                                            .position(|t| t.id == tab_id)
-                                                        {
-                                                            this.apply_tab_reorder_locally(
-                                                                dragged,
-                                                                to_index,
+                                                    if let Some(to_index) = this
+                                                        .tabs
+                                                        .iter()
+                                                        .position(|t| t.id == tab_id)
+                                                    {
+                                                        let did_reorder = this
+                                                            .apply_tab_reorder_locally(
+                                                                dragged, to_index,
                                                             );
-                                                            this.reset_tab_reorder_preview(cx);
+                                                        this.reset_tab_reorder_preview(cx);
+
+                                                        if let Some(ref callback) = on_tab_reorder
+                                                            && did_reorder
+                                                        {
                                                             callback(dragged.clone(), to_index, cx);
                                                         }
                                                     }
@@ -1167,12 +1172,10 @@ impl Render for TabBar {
                                                 .on_mouse_down(
                                                     gpui::MouseButton::Left,
                                                     cx.listener({
-                                                        let on_tab_close =
-                                                            on_tab_close.clone();
+                                                        let on_tab_close = on_tab_close.clone();
                                                         let tab_id = tab_id.clone();
                                                         move |_this, _, window, cx| {
-                                                            if let Some(ref callback) =
-                                                                on_tab_close
+                                                            if let Some(ref callback) = on_tab_close
                                                             {
                                                                 callback(
                                                                     tab_id.clone(),
@@ -1193,17 +1196,17 @@ impl Render for TabBar {
                                                 }
                                             }
                                         }))
-                                        .on_mouse_down(
-                                            gpui::MouseButton::Left,
-                                            |_, _, cx| {
-                                                cx.stop_propagation();
-                                            },
-                                        );
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        });
 
                                     let needs_animation =
                                         start_offset != end_offset || start_opacity != end_opacity;
 
                                     let tab_element = if needs_animation {
+                                        let animation_id =
+                                            format!("tab-reorder-{}-{}", tab_id, animation_epoch);
+
                                         div()
                                             .child(tab_inner)
                                             .flex_shrink_0()
