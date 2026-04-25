@@ -916,11 +916,11 @@ impl Render for Panel {
                 |this| this.bg(theme.panel_background),
             )
             .when(!is_solo, |this| {
-                // 选中时边框颜色加深，未选中时使用浅色边框
+                // 选中时边框颜色加深，未选中时让边框更接近背景色，仅微微可见
                 let border_color = if is_selected {
                     theme.border_strong
                 } else {
-                    theme.border
+                    theme.border.opacity(0.35)
                 };
                 this.border_1()
                     .border_color(border_color)
