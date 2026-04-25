@@ -95,7 +95,6 @@ pub fn remote_shell_tracking_command() -> String {
          source \"$_DTF\"\n\
          unset _DTF _DTRC _f\n\
          DEEPTERM_RC_EOF\n\
-         export PROMPT_COMMAND='__deepterm_precmd'\n\
          __deepterm_emit_os() {{\n\
            local os_id=\"\"\n\
            if [ -r /etc/os-release ]; then\n\
