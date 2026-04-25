@@ -763,6 +763,14 @@ impl Workspace {
         if panel_count == 1 && tab_info.tab_type == TabType::Workspace {
             tab_info.tab_type = TabType::Normal;
 
+            // 保留剩余panel的系统图标
+            let remaining_icon = tab_info
+                .container
+                .get_first_panel()
+                .map(|p| p.read(cx).remote_os())
+                .flatten()
+                .map(|os| os.icon());
+
             // 更新TabBar显示
             let label = tab_info.label.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
@@ -771,7 +779,7 @@ impl Workspace {
                     .iter()
                     .map(|t| {
                         if t.id == target_tab_id {
-                            TabItem::new(&target_tab_id, &label)
+                            TabItem::new(&target_tab_id, &label).with_icon(remaining_icon)
                         } else {
                             t.clone()
                         }
