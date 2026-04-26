@@ -9,6 +9,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
 use tokio::io::AsyncReadExt;
 
+use crate::ssh::auth::{try_agent_auth, try_default_keys};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
     ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
@@ -299,82 +300,9 @@ async fn authenticate(
                     .map_err(|e| anyhow!("公钥认证失败: {}", e))
             }
         }
-        ResolvedAuthMethod::Auto => authenticate_with_default_keys(handle, config).await,
-        ResolvedAuthMethod::Agent => {
-            let agent_result = russh::keys::agent::client::AgentClient::connect_env().await;
-
-            if let Ok(mut agent) = agent_result {
-                let identities = agent
-                    .request_identities()
-                    .await
-                    .map_err(|e| anyhow!("获取 SSH Agent 密钥列表失败: {}", e))?;
-
-                if !identities.is_empty() {
-                    let hash_alg = handle
-                        .best_supported_rsa_hash()
-                        .await
-                        .ok()
-                        .flatten()
-                        .flatten();
-
-                    for identity in &identities {
-                        let pub_key = identity.public_key().into_owned();
-                        match handle
-                            .authenticate_publickey_with(
-                                &config.username,
-                                pub_key,
-                                hash_alg,
-                                &mut agent,
-                            )
-                            .await
-                        {
-                            Ok(result) if result.success() => return Ok(result),
-                            Ok(_) | Err(_) => {}
-                        }
-                    }
-                }
-            }
-
-            authenticate_with_default_keys(handle, config).await
-        }
+        ResolvedAuthMethod::Auto => try_default_keys(handle, config).await,
+        ResolvedAuthMethod::Agent => try_agent_auth(handle, config).await,
     }
-}
-
-async fn authenticate_with_default_keys(
-    handle: &mut client::Handle<SftpClientHandler>,
-    config: &SshConnectionConfig,
-) -> anyhow::Result<AuthResult> {
-    let default_keys = crate::ssh::find_default_ssh_keys();
-    if default_keys.is_empty() {
-        return Err(anyhow!("自动认证失败：~/.ssh 中未找到密钥文件"));
-    }
-
-    let hash_alg = handle
-        .best_supported_rsa_hash()
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-
-    for key_path in &default_keys {
-        let key = match russh::keys::load_secret_key(key_path, None) {
-            Ok(key) => key,
-            Err(_) => continue,
-        };
-
-        match handle
-            .authenticate_publickey(
-                &config.username,
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-            )
-            .await
-        {
-            Ok(result) if result.success() => return Ok(result),
-            Ok(_) | Err(_) => {}
-        }
-    }
-
-    Err(anyhow!("所有默认密钥均无效（用户: {}）", config.username))
 }
 
 fn convert_file_type(file_type: FileType) -> RemoteFileKind {

@@ -21,7 +21,7 @@ pub const TITLE_BAR_HEIGHT: Pixels = px(38.);
 const TITLE_BAR_LEFT_PADDING: Pixels = px(80.);
 
 #[cfg(not(target_os = "macos"))]
-const TITLE_BAR_LEFT_PADDING: Pixels = px(0.);
+const TITLE_BAR_LEFT_PADDING: Pixels = px(6.);
 
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(400);
 

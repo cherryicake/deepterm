@@ -1,8 +1,10 @@
 //! Terminal module - simplified but functional
 
 use std::{
-    borrow::Cow, cell::Cell, os::fd::AsRawFd, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
+    borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
 };
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use alacritty_terminal::{
     Term,
@@ -303,6 +305,7 @@ impl Terminal {
         cx: &mut App,
         pty_options: tty::Options,
         pty_error_message: String,
+        remote_os: Option<RemoteOS>,
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -319,19 +322,22 @@ impl Terminal {
             &default_bounds,
             listener.clone(),
         )));
-        let child_process_id = Some(pty.child().id());
         #[cfg(unix)]
-        let shell_process_group_id = match unsafe { libc::getpgid(pty.child().id() as libc::pid_t) }
-        {
-            pgid if pgid >= 0 => Some(pgid),
-            _ => None,
+        let (child_process_id, shell_process_group_id, pty_master_fd) = {
+            let pid = pty.child().id();
+            let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+            (
+                Some(pid),
+                if pgid >= 0 { Some(pgid) } else { None },
+                Some(pty.file().as_raw_fd()),
+            )
         };
         #[cfg(not(unix))]
-        let shell_process_group_id = None;
-        #[cfg(unix)]
-        let pty_master_fd = Some(pty.file().as_raw_fd());
-        #[cfg(not(unix))]
-        let pty_master_fd = None;
+        let (child_process_id, shell_process_group_id, pty_master_fd) = (
+            pty.child_watcher().pid().map(|p| p.get()),
+            None,
+            None,
+        );
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
@@ -361,7 +367,7 @@ impl Terminal {
                 pty_master_fd,
                 remote_shell_ready: false,
                 remote_working_directory: None,
-                remote_os: Some(detect_local_os()),
+                remote_os,
                 window_title: None,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
@@ -395,6 +401,8 @@ impl Terminal {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
         };
 
+        let remote_os = Some(detect_local_os());
+
         Self::build_local_terminal(
             cx,
             tty::Options {
@@ -404,6 +412,7 @@ impl Terminal {
                 ..Default::default()
             },
             "Failed to create PTY".to_string(),
+            remote_os,
         )
     }
 
@@ -421,6 +430,16 @@ impl Terminal {
         command: &str,
         args: &[String],
     ) -> Entity<Self> {
+        let remote_os = {
+            let cmd_lower = command.to_lowercase();
+            let is_wsl = cmd_lower.ends_with("wsl") || cmd_lower.ends_with("wsl.exe");
+            if is_wsl {
+                Some(crate::ssh::platform::detect_wsl_os(command, args))
+            } else {
+                Some(detect_local_os())
+            }
+        };
+
         Self::build_local_terminal(
             cx,
             tty::Options {
@@ -430,6 +449,7 @@ impl Terminal {
                 ..Default::default()
             },
             format!("Failed to create PTY for command '{command}'"),
+            remote_os,
         )
     }
 

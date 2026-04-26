@@ -121,11 +121,17 @@ fn scan_windows_terminals() -> Vec<LocalTerminalOption> {
             for line in output_str.lines() {
                 let distro = line.trim().replace('\0', "");
                 if !distro.is_empty() {
+                    let os = RemoteOS::from_id(&distro);
+                    let icon = if os != RemoteOS::Unknown {
+                        os.icon()
+                    } else {
+                        Icon::Linux
+                    };
                     options.push(LocalTerminalOption::new(
                         format!("WSL: {distro}"),
                         "wsl.exe",
                         vec!["~".to_string(), "-d".to_string(), distro],
-                        Icon::Linux,
+                        icon,
                     ));
                 }
             }
