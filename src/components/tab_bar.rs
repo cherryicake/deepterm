@@ -772,9 +772,9 @@ impl Render for TabBar {
                             .rounded(px(6.0))
                             .border_1()
                             .border_color(if is_settingshub_active {
-                                theme.border_strong
+                                theme.border
                             } else {
-                                theme.border.opacity(0.0)
+                                theme.transparent()
                             })
                             .cursor_pointer()
                             .bg(if is_settingshub_active {
@@ -1006,9 +1006,9 @@ impl Render for TabBar {
                                         .rounded(px(6.0))
                                         .border_1()
                                         .border_color(if is_active {
-                                            theme.border_strong
+                                            theme.border
                                         } else {
-                                            theme.border.opacity(0.0)
+                                            theme.transparent()
                                         })
                                         .bg(if is_active {
                                             theme.tab_active_background
