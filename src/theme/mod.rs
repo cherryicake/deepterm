@@ -421,8 +421,8 @@ impl ThemePreference {
 
 fn default_theme_id(appearance: WindowAppearance) -> &'static str {
     match appearance {
-        WindowAppearance::Light | WindowAppearance::VibrantLight => "flexoki-light",
-        WindowAppearance::Dark | WindowAppearance::VibrantDark => "deepterm-night",
+        WindowAppearance::Light | WindowAppearance::VibrantLight => "macos26-light",
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => "macos26-dark",
     }
 }
 
