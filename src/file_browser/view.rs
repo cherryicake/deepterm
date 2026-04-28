@@ -143,7 +143,7 @@ impl FileBrowserView {
             let search_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Search")
-                    .placeholder_font_size(px(13.0))
+                    .placeholder_font_size(px(15.0))
             });
 
             let subscription = cx.subscribe(
@@ -516,7 +516,7 @@ impl FileBrowserView {
             .justify_center()
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(label),
@@ -567,7 +567,7 @@ impl FileBrowserView {
             .child(
                 div()
                     .min_w_0()
-                    .text_xs()
+                    .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(self.toolbar_directory_name()),
@@ -765,7 +765,7 @@ impl FileBrowserView {
                     .w_full()
                     .px(px(12.0))
                     .pt(px(18.0))
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(if self.search_query.is_empty() {
                         "This folder is empty.".to_string()
@@ -847,8 +847,8 @@ impl FileBrowserView {
                                 .items_center()
                                 .justify_between()
                                 .gap(px(6.0))
-                                .child(div().text_xs().text_color(row_text).child(name))
-                                .child(div().text_xs().text_color(row_meta).child(
+                                .child(div().text_sm().text_color(row_text).child(name))
+                                .child(div().text_sm().text_color(row_meta).child(
                                     if matches!(entry.kind, FileEntryKind::Directory) {
                                         "›".to_string()
                                     } else {
@@ -982,7 +982,7 @@ impl FileBrowserView {
                                 div()
                                     .w(px(14.0))
                                     .flex_none()
-                                    .text_lg()
+                                    .text_xl()
                                     .text_color(row_meta)
                                     .flex()
                                     .items_center()
@@ -1014,28 +1014,28 @@ impl FileBrowserView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_xs()
+                            .text_sm()
                             .text_color(row_text)
                             .child(name),
                     )
                     .child(
                         div()
                             .w(px(140.0))
-                            .text_xs()
+                            .text_sm()
                             .text_color(row_meta)
                             .child(modified_label),
                     )
                     .child(
                         div()
                             .w(px(80.0))
-                            .text_xs()
+                            .text_sm()
                             .text_color(row_meta)
                             .child(size_label),
                     )
                     .child(
                         div()
                             .w(px(80.0))
-                            .text_xs()
+                            .text_sm()
                             .text_color(row_meta)
                             .child(kind_label),
                     ),
@@ -1074,7 +1074,7 @@ impl FileBrowserView {
                     .w_full()
                     .px(px(12.0))
                     .pt(px(18.0))
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(if self.search_query.is_empty() {
                         "This folder is empty.".to_string()
@@ -1114,15 +1114,15 @@ impl FileBrowserView {
             .border_color(theme.border.opacity(0.65))
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(label.to_string()),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_base()
                     .text_color(theme.text)
-                    .line_height(px(20.0))
+                    .line_height(px(22.0))
                     .child(value.into()),
             )
     }
@@ -1158,8 +1158,8 @@ impl FileBrowserView {
                         .child(
                             div()
                                 .w_full()
-                                .text_xs()
-                                .line_height(px(18.0))
+                                .text_sm()
+                                .line_height(px(21.0))
                                 .text_color(theme.text)
                                 .child(text_preview),
                         ),
@@ -1194,14 +1194,14 @@ impl FileBrowserView {
                         .gap(px(3.0))
                         .child(
                             div()
-                                .text_sm()
+                                .text_base()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
                                 .child(preview.name),
                         )
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(theme.text_muted)
                                 .child(format!("{} - {}", preview.kind_label, preview.size_label)),
                         ),
@@ -1216,7 +1216,7 @@ impl FileBrowserView {
         } else {
             content = content.child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child("Select a file or folder to inspect it here."),
             );
@@ -1247,7 +1247,7 @@ impl FileBrowserView {
                 .border_color(theme.warning.opacity(0.35))
                 .child(
                     div()
-                        .text_sm()
+                        .text_base()
                         .text_color(theme.text)
                         .child(message.clone()),
                 )
