@@ -219,6 +219,9 @@ pub trait RopeExt {
     /// Get word at the given byte offset (0-based).
     fn word_at(&self, offset: usize) -> String;
 
+    /// Get the line byte range at the given byte offset (0-based).
+    fn line_range(&self, offset: usize) -> Option<Range<usize>>;
+
     /// Convert offset in UTF-16 to byte offset (0-based).
     ///
     /// Runs in O(log N) time.
@@ -402,6 +405,21 @@ impl RopeExt for Rope {
             self.slice(range).to_string()
         } else {
             String::new()
+        }
+    }
+
+    fn line_range(&self, offset: usize) -> Option<Range<usize>> {
+        // Allow offset == len so triple-click at EOF selects the last line.
+        if offset > self.len() {
+            return None;
+        }
+        let point = self.offset_to_point(offset);
+        let start = self.line_start_offset(point.row);
+        let end = self.line_end_offset(point.row);
+        if start == end {
+            None
+        } else {
+            Some(start..end)
         }
     }
 

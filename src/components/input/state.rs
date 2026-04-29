@@ -1275,8 +1275,6 @@ impl InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // If there have IME marked range and is empty (Means pressed Esc to abort IME typing)
-        // Clear the marked range.
         if let Some(ime_marked_range) = &self.ime_marked_range {
             if ime_marked_range.len() == 0 {
                 self.ime_marked_range = None;
@@ -1286,15 +1284,48 @@ impl InputState {
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
 
-        // Ignore right click
         if event.button == MouseButton::Right {
             return;
         }
 
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, None, cx)
+        match event.click_count {
+            1 => {
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, None, cx);
+                    self.selected_word_range = None;
+                }
+            }
+            2 => {
+                self.select_word_at(offset, cx);
+            }
+            3 => {
+                self.selected_word_range = None;
+                self.select_line_at(offset, cx);
+            }
+            _ => {
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, None, cx)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn select_word_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if let Some(range) = self.text.word_range(offset) {
+            self.selected_word_range = Some(range.clone().into());
+            self.selected_range = range.into();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_line_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if let Some(range) = self.text.line_range(offset) {
+            self.selected_range = range.into();
+            cx.notify();
         }
     }
 
