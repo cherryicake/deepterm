@@ -15,16 +15,16 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
-    WindowBackgroundAppearance, WindowDecorations, WindowOptions, actions, div, size,
+    actions, div, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
 };
 
 use crate::components::title_bar::TitleBar;
-use crate::ssh_view::picker::{GlobalSshPicker, ShowSshPicker, SshPicker};
+use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
+use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::Workspace;
 
 // Define application-level actions
-actions!(app, [Quit]);
+actions!(app, [Quit, NewWindow]);
 
 const CONTEXT: &str = "AppWindow";
 
@@ -49,8 +49,10 @@ impl AppWindow {
         let ssh_picker =
             cx.new(|cx| SshPicker::new(window, cx).with_workspace(workspace_for_picker));
 
-        // 设置全局 SSH picker 引用，让 Workspace 可以通过 action 访问
-        cx.set_global(GlobalSshPicker(ssh_picker.clone()));
+        // 将 SSH picker 注入到 Workspace，供 TabBar 的 "+" 按钮使用
+        workspace.update(cx, |ws, _cx| {
+            ws.set_ssh_picker(ssh_picker.clone());
+        });
 
         Self {
             title_bar,
@@ -84,6 +86,9 @@ impl Render for AppWindow {
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ShowSshPicker, window, cx| {
                 this.show_ssh_picker(window, cx);
+            }))
+            .on_action(cx.listener(|_this, _: &NewWindow, _window, cx| {
+                WindowManager::open_window(cx);
             }))
             // Title bar for window management
             .child(self.title_bar.clone())
@@ -135,46 +140,19 @@ fn main() {
             components::init(cx);
             terminal_view::init(cx);
             workspace::init(cx);
+            WindowManager::init(cx);
             // Bind keyboard shortcuts
             // 使用 None 作为 context，让这些快捷键全局有效
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-k", ShowSshPicker, None),
+                KeyBinding::new("cmd-n", NewWindow, None),
             ]);
 
             // Register global action handlers
             cx.on_action(|_: &Quit, cx| cx.quit());
 
-            let bounds = Bounds::centered(None, size(gpui::px(1400.0), gpui::px(900.0)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitleBar::title_bar_options()),
-                    // 使用客户端装饰，隐藏系统标题栏
-                    window_decorations: Some(WindowDecorations::Client),
-                    // macOS: 禁用原生窗口拖拽，改用 GPUI 手动实现
-                    // 这样可以避免透明标题栏导致整个区域都可拖拽的问题
-                    #[cfg(target_os = "macos")]
-                    is_movable: false,
-                    #[cfg(not(target_os = "macos"))]
-                    is_movable: true,
-                    // 窗口背景使用毛玻璃效果
-                    window_background: WindowBackgroundAppearance::Blurred,
-                    ..Default::default()
-                },
-                |window, cx| {
-                    let app_window = cx.new(|_cx| AppWindow::new(window, _cx));
-                    // Schedule initial focus after the window is fully created
-                    let window_handle = app_window.clone();
-                    window.defer(cx, move |window, cx| {
-                        window_handle.update(cx, |app, cx| {
-                            app.setup_initial_focus(window, cx);
-                        });
-                    });
-                    app_window
-                },
-            )
-            .unwrap();
+            WindowManager::open_window(cx);
             cx.activate(true);
         });
 }

@@ -21,7 +21,7 @@ use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserV
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
-use crate::ssh_view::picker::GlobalSshPicker;
+use crate::ssh_view::picker::SshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
@@ -123,6 +123,8 @@ pub struct Workspace {
     workspace_id: String,
     /// Resize拖拽状态
     resize_drag: Option<ResizeDragState>,
+    /// SSH picker for this window's workspace
+    ssh_picker: Option<Entity<SshPicker>>,
 }
 
 /// Resize拖拽状态
@@ -240,6 +242,7 @@ impl Workspace {
                 panel_subscriptions: HashMap::new(),
                 workspace_id,
                 resize_drag: None,
+                ssh_picker: None,
             };
 
             // 在创建时完成所有初始化
@@ -254,6 +257,11 @@ impl Workspace {
     /// 需要在 window 创建完成后调用
     pub fn set_initial_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active_tab_panel(window, cx);
+    }
+
+    /// 设置该 workspace 使用的 SSH picker
+    pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>) {
+        self.ssh_picker = Some(picker);
     }
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
@@ -288,7 +296,12 @@ impl Workspace {
                 });
             }
         } else {
-            cx.quit();
+            // 关闭当前窗口而不是退出整个应用
+            if let Some(wh) = cx.active_window() {
+                let _ = cx.update_window(wh, |_, window, _| {
+                    window.remove_window();
+                });
+            }
         }
     }
 
@@ -330,13 +343,14 @@ impl Workspace {
             });
 
             // 设置新建tab事件 - 显示 SSH 选择器弹窗
+            let ssh_picker = self.ssh_picker.clone();
             tab_bar.on_new_tab({
                 move |window, cx| {
-                    // 通过全局状态获取 ssh_picker 并显示
-                    let ssh_picker = cx.global::<GlobalSshPicker>().0.clone();
-                    ssh_picker.update(cx, |picker, cx| {
-                        picker.toggle(window, cx);
-                    });
+                    if let Some(ref picker) = ssh_picker {
+                        picker.update(cx, |picker, cx| {
+                            picker.toggle(window, cx);
+                        });
+                    }
                 }
             });
 
@@ -1556,7 +1570,7 @@ impl Workspace {
                 self.switch_to_tab(&next_tab_id, cx);
                 self.focus_active_tab_panel(window, cx);
             } else {
-                cx.quit();
+                window.remove_window();
             }
         }
 
