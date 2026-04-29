@@ -122,6 +122,7 @@ struct FilePreview {
 }
 
 pub struct FileBrowserView {
+    focus_handle: FocusHandle,
     search_input: Entity<InputState>,
     search_query: String,
     root_path: PathBuf,
@@ -159,6 +160,7 @@ impl FileBrowserView {
             std::mem::forget(subscription);
 
             let mut this = Self {
+                focus_handle: cx.focus_handle(),
                 search_input,
                 search_query: String::new(),
                 root_path: Self::default_root_path(),
@@ -1256,8 +1258,8 @@ impl FileBrowserView {
 }
 
 impl Focusable for FileBrowserView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.search_input.read(cx).focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -1267,6 +1269,7 @@ impl Render for FileBrowserView {
 
         div()
             .id("file-browser-view")
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme.app_background)
             .flex()

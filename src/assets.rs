@@ -69,7 +69,7 @@ impl Icon {
     pub fn path(&self) -> SharedString {
         // Use new_static to avoid allocation - these are compile-time constants
         match self {
-            Icon::Folder => SharedString::new_static("icons/folder.svg"),
+            Icon::Folder => SharedString::new_static("icons/folder.fill.svg"),
             Icon::File => SharedString::new_static("icons/file.svg"),
             Icon::Linux => SharedString::new_static("icons/linux.svg"),
             Icon::Server => SharedString::new_static("icons/server.svg"),

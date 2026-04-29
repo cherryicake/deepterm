@@ -119,6 +119,7 @@ struct LoadedState {
 }
 
 pub struct RemoteFileBrowserView {
+    focus_handle: FocusHandle,
     ssh_config: SshConnectionConfig,
     search_input: Entity<InputState>,
     search_query: String,
@@ -163,6 +164,7 @@ impl RemoteFileBrowserView {
             std::mem::forget(subscription);
 
             let mut this = Self {
+                focus_handle: cx.focus_handle(),
                 ssh_config,
                 search_input,
                 search_query: String::new(),
@@ -1587,8 +1589,8 @@ fn display_path_with_home(home_path: &str, path: &str) -> String {
 }
 
 impl Focusable for RemoteFileBrowserView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.search_input.read(cx).focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -1598,6 +1600,7 @@ impl Render for RemoteFileBrowserView {
 
         div()
             .id("remote-file-browser-view")
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme.app_background)
             .flex()

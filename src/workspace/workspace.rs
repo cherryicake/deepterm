@@ -1238,6 +1238,7 @@ impl Workspace {
         if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
             if let Some(panel) = tab_info.container.get_first_panel() {
                 self.replace_or_update_file_browser_panel(&panel, target, window, cx);
+                self.focus_panel_content(panel, window, cx);
             }
 
             self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
@@ -1280,7 +1281,21 @@ impl Workspace {
 
         self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
         self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
+        self.focus_panel_content(file_browser_panel, window, cx);
         cx.notify();
+    }
+
+    fn focus_panel_content(
+        &self,
+        panel: Entity<Panel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.defer_in(window, move |_, window, cx| {
+            if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
+                window.focus(&handle, cx);
+            }
+        });
     }
 
     fn show_editor_panel(
