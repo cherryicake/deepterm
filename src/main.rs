@@ -50,8 +50,8 @@ impl AppWindow {
             cx.new(|cx| SshPicker::new(window, cx).with_workspace(workspace_for_picker));
 
         // 将 SSH picker 注入到 Workspace，供 TabBar 的 "+" 按钮使用
-        workspace.update(cx, |ws, _cx| {
-            ws.set_ssh_picker(ssh_picker.clone());
+        workspace.update(cx, |ws, cx| {
+            ws.set_ssh_picker(ssh_picker.clone(), cx);
         });
 
         Self {

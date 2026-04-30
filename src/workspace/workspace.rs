@@ -260,8 +260,15 @@ impl Workspace {
     }
 
     /// 设置该 workspace 使用的 SSH picker
-    pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>) {
-        self.ssh_picker = Some(picker);
+    pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>, cx: &mut Context<Self>) {
+        self.ssh_picker = Some(picker.clone());
+        self.tab_bar.update(cx, |tab_bar, _cx| {
+            tab_bar.on_new_tab(move |window, cx| {
+                picker.update(cx, |picker, cx| {
+                    picker.toggle(window, cx);
+                });
+            });
+        });
     }
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
@@ -339,18 +346,6 @@ impl Workspace {
                             });
                         }
                     });
-                }
-            });
-
-            // 设置新建tab事件 - 显示 SSH 选择器弹窗
-            let ssh_picker = self.ssh_picker.clone();
-            tab_bar.on_new_tab({
-                move |window, cx| {
-                    if let Some(ref picker) = ssh_picker {
-                        picker.update(cx, |picker, cx| {
-                            picker.toggle(window, cx);
-                        });
-                    }
                 }
             });
 
