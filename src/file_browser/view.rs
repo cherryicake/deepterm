@@ -132,6 +132,7 @@ pub struct FileBrowserView {
     error_message: Option<String>,
     view_mode: FileBrowserViewMode,
     expanded_folders: HashSet<PathBuf>,
+    available_width: Option<gpui::Pixels>,
 }
 
 impl FileBrowserView {
@@ -170,6 +171,7 @@ impl FileBrowserView {
                 error_message: None,
                 view_mode: FileBrowserViewMode::Columns,
                 expanded_folders: HashSet::new(),
+                available_width: None,
             };
             this.open_requested_path(requested_path, window, cx);
             this
@@ -1263,11 +1265,87 @@ impl Focusable for FileBrowserView {
     }
 }
 
+/// 包装 FileBrowserView 的渲染结果，在 prepaint 阶段测量实际容器宽度
+/// 并缓存到 FileBrowserView 中，供下一帧 render 时判断是否渲染预览列
+struct FileBrowserRender {
+    view: Entity<FileBrowserView>,
+    inner: gpui::AnyElement,
+}
+
+impl gpui::IntoElement for FileBrowserRender {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for FileBrowserRender {
+    type RequestLayoutState = gpui::LayoutId;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        Some(gpui::ElementId::Name("file-browser-render".into()))
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let layout_id = self.inner.request_layout(window, cx);
+        (layout_id, layout_id)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+        self.inner.prepaint(window, cx);
+
+        let new_width = Some(bounds.size.width);
+        let view = self.view.clone();
+        cx.defer(move |cx| {
+            view.update(cx, |view, cx| {
+                if view.available_width != new_width {
+                    view.available_width = new_width;
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        self.inner.paint(window, cx);
+    }
+}
+
 impl Render for FileBrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
+        let show_preview = self.should_show_preview()
+            && self.available_width.map_or(false, |w| w >= px(560.0));
 
-        div()
+        let inner = div()
             .id("file-browser-view")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -1301,10 +1379,16 @@ impl Render for FileBrowserView {
                             } else {
                                 self.render_columns(cx)
                             })
-                            .when(self.should_show_preview(), |this| {
+                            .when(show_preview, |this| {
                                 this.child(self.render_preview(cx))
                             }),
                     ),
             )
+            .into_any_element();
+
+        FileBrowserRender {
+            view: cx.entity(),
+            inner,
+        }
     }
 }
