@@ -948,7 +948,7 @@ impl RemoteFileBrowserView {
             visible[start..].to_vec()
         };
 
-        let mut columns = div().h_full().flex().min_w_full().bg(theme.app_background);
+        let mut columns = div().h_full().flex().w_full().bg(theme.app_background);
         for (index, directory) in directories.iter().enumerate() {
             if index > 0 {
                 columns = columns.child(div().h_full().w(px(1.0)).bg(theme.border));
@@ -1602,6 +1602,7 @@ impl Render for RemoteFileBrowserView {
             .id("remote-file-browser-view")
             .track_focus(&self.focus_handle)
             .size_full()
+            .overflow_hidden()
             .bg(theme.app_background)
             .flex()
             .flex_col()
@@ -1623,6 +1624,7 @@ impl Render for RemoteFileBrowserView {
                         div()
                             .flex_1()
                             .min_h_0()
+                            .overflow_hidden()
                             .flex()
                             .gap(px(0.0))
                             .child(if self.view_mode == FileBrowserViewMode::List {

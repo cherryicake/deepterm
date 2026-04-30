@@ -719,11 +719,13 @@ impl Panel {
             PanelContent::FileBrowser(file_browser_view) => div()
                 .flex_1()
                 .min_h_0()
+                .min_w(px(0.0))
                 .overflow_hidden()
                 .child(file_browser_view.clone()),
             PanelContent::RemoteFileBrowser(file_browser_view) => div()
                 .flex_1()
                 .min_h_0()
+                .min_w(px(0.0))
                 .overflow_hidden()
                 .child(file_browser_view.clone()),
             PanelContent::Editor(editor_state) => div()

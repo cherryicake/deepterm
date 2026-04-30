@@ -1613,7 +1613,7 @@ impl Workspace {
     ) -> gpui::Div {
         let theme = cx.theme().ui;
         match container {
-            SplitContainer::Panel(panel) => div().size_full().child(panel.clone()),
+            SplitContainer::Panel(panel) => div().size_full().overflow_hidden().child(panel.clone()),
             SplitContainer::Split {
                 direction,
                 children,
@@ -1631,6 +1631,8 @@ impl Workspace {
                     let child_element = div()
                         .flex_basis(gpui::DefiniteLength::Fraction(size.into()))
                         .flex_shrink()
+                        .overflow_hidden()
+                        .min_w(px(0.0))
                         .child(self.render_split_container(child, &child_path, cx))
                         .into_any_element();
 
@@ -1686,6 +1688,7 @@ impl Workspace {
 
                 div()
                     .size_full()
+                    .overflow_hidden()
                     .flex()
                     .when(is_horizontal, |this| this.flex_row())
                     .when(!is_horizontal, |this| this.flex_col())
