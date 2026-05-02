@@ -13,16 +13,14 @@ use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::file_browser::shared::{
-    FileBrowserViewMode, format_datetime, format_size, render_icon_columns, render_icon_gallery,
-    render_icon_grid, render_icon_list, render_icon_more, render_icon_share, render_icon_tag,
+    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
+    format_datetime, format_size, render_column_resize_handle, render_columns_container,
+    render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
+    render_icon_share, render_icon_tag,
 };
 use crate::theme::ActiveTheme;
 
 const COLUMN_DEFAULT_WIDTH: f32 = 240.0;
-const COLUMN_MIN_WIDTH: f32 = 140.0;
-const COLUMN_MAX_WIDTH: f32 = 720.0;
-const COLUMN_HANDLE_HIT_WIDTH: f32 = 6.0;
-const COLUMN_HANDLE_VISUAL_WIDTH: f32 = 1.0;
 const HEADER_HEIGHT: f32 = 46.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const LIST_HEADER_HEIGHT: f32 = 26.0;
@@ -125,13 +123,6 @@ struct FilePreview {
     text_preview: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ColumnResizeState {
-    index: usize,
-    start_mouse_x: gpui::Pixels,
-    start_width: gpui::Pixels,
-}
-
 pub struct FileBrowserView {
     focus_handle: FocusHandle,
     search_input: Entity<InputState>,
@@ -143,9 +134,7 @@ pub struct FileBrowserView {
     error_message: Option<String>,
     view_mode: FileBrowserViewMode,
     expanded_folders: HashSet<PathBuf>,
-    available_width: Option<gpui::Pixels>,
-    column_widths: Vec<gpui::Pixels>,
-    resizing: Option<ColumnResizeState>,
+    layout: FileBrowserLayoutState,
 }
 
 impl FileBrowserView {
@@ -184,9 +173,7 @@ impl FileBrowserView {
                 error_message: None,
                 view_mode: FileBrowserViewMode::Columns,
                 expanded_folders: HashSet::new(),
-                available_width: None,
-                column_widths: Vec::new(),
-                resizing: None,
+                layout: FileBrowserLayoutState::new(px(COLUMN_DEFAULT_WIDTH)),
             };
             this.open_requested_path(requested_path, window, cx);
             this
@@ -275,43 +262,22 @@ impl FileBrowserView {
 
     fn set_view_mode(&mut self, mode: FileBrowserViewMode, cx: &mut Context<Self>) {
         self.view_mode = mode;
-        self.resizing = None;
+        self.layout.columns_mut().clear_resize();
         cx.notify();
     }
 
     fn column_width_at(&self, index: usize) -> gpui::Pixels {
-        self.column_widths
-            .get(index)
-            .copied()
-            .unwrap_or(px(COLUMN_DEFAULT_WIDTH))
+        self.layout.columns().width_at(index)
     }
 
-    fn ensure_column_widths(&mut self, count: usize) {
-        if self.column_widths.len() < count {
-            self.column_widths
-                .resize(count, px(COLUMN_DEFAULT_WIDTH));
-        }
-    }
-
-    fn set_column_width(&mut self, index: usize, width: gpui::Pixels, cx: &mut Context<Self>) {
-        let clamped = width
-            .max(px(COLUMN_MIN_WIDTH))
-            .min(px(COLUMN_MAX_WIDTH));
-        self.ensure_column_widths(index + 1);
-        if self.column_widths[index] != clamped {
-            self.column_widths[index] = clamped;
+    fn handle_columns_mouse_move(&mut self, mouse_x: gpui::Pixels, cx: &mut Context<Self>) {
+        if self.layout.columns_mut().resize_to(mouse_x) {
             cx.notify();
         }
     }
 
-    fn handle_columns_mouse_move(&mut self, mouse_x: gpui::Pixels, cx: &mut Context<Self>) {
-        let Some(state) = self.resizing else { return };
-        let delta = mouse_x - state.start_mouse_x;
-        self.set_column_width(state.index, state.start_width + delta, cx);
-    }
-
     fn handle_columns_mouse_up(&mut self, cx: &mut Context<Self>) {
-        if self.resizing.take().is_some() {
+        if self.layout.columns_mut().finish_resize() {
             cx.notify();
         }
     }
@@ -929,48 +895,20 @@ impl FileBrowserView {
         column_index: usize,
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
-        let theme = cx.theme().ui;
-        let is_active = self
-            .resizing
-            .as_ref()
-            .map_or(false, |s| s.index == column_index);
-        let group_name = format!("file-browser-col-handle-{}", column_index);
-
-        div()
-            .id(("file-browser-col-handle", column_index))
-            .group(group_name.clone())
-            .h_full()
-            .w(px(COLUMN_HANDLE_HIT_WIDTH))
-            .flex_none()
-            .flex()
-            .items_stretch()
-            .justify_center()
-            .cursor_col_resize()
-            .child(
-                div()
-                    .w(px(COLUMN_HANDLE_VISUAL_WIDTH))
-                    .h_full()
-                    .bg(if is_active {
-                        theme.drop_target
-                    } else {
-                        theme.border
-                    })
-                    .group_hover(&group_name, |this| this.bg(theme.drop_target)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                    let start_width = this.column_width_at(column_index);
-                    this.ensure_column_widths(column_index + 1);
-                    this.resizing = Some(ColumnResizeState {
-                        index: column_index,
-                        start_mouse_x: ev.position.x,
-                        start_width,
-                    });
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
+        render_column_resize_handle(
+            column_index,
+            self.layout.columns().is_resizing_column(column_index),
+            "file-browser-col-handle",
+            "file-browser-col-handle-",
+            cx,
+            move |this, ev, _, cx| {
+                this.layout
+                    .columns_mut()
+                    .start_resize(column_index, ev.position.x);
+                cx.stop_propagation();
+                cx.notify();
+            },
+        )
     }
 
     fn render_columns(&self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
@@ -986,15 +924,7 @@ impl FileBrowserView {
             columns = columns.child(self.render_directory_column(directory, index, cx));
         }
 
-        div()
-            .id("file-browser-columns-container")
-            .flex_1()
-            .h_full()
-            .bg(theme.app_background)
-            .overflow_x_scroll()
-            .overflow_y_hidden()
-            .flex()
-            .child(columns)
+        render_columns_container("file-browser-columns-container", &theme, columns)
     }
 
     fn render_tree_rows(
@@ -1358,85 +1288,18 @@ impl Focusable for FileBrowserView {
     }
 }
 
-/// 包装 FileBrowserView 的渲染结果，在 prepaint 阶段测量实际容器宽度
-/// 并缓存到 FileBrowserView 中，供下一帧 render 时判断是否渲染预览列
-struct FileBrowserRender {
-    view: Entity<FileBrowserView>,
-    inner: gpui::AnyElement,
-}
-
-impl gpui::IntoElement for FileBrowserRender {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl gpui::Element for FileBrowserRender {
-    type RequestLayoutState = gpui::LayoutId;
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        Some(gpui::ElementId::Name("file-browser-render".into()))
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let layout_id = self.inner.request_layout(window, cx);
-        (layout_id, layout_id)
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: gpui::Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) -> Self::PrepaintState {
-        self.inner.prepaint(window, cx);
-
-        let new_width = Some(bounds.size.width);
-        let view = self.view.clone();
-        cx.defer(move |cx| {
-            view.update(cx, |view, cx| {
-                if view.available_width != new_width {
-                    view.available_width = new_width;
-                    cx.notify();
-                }
-            });
-        });
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: gpui::Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut gpui::App,
-    ) {
-        self.inner.paint(window, cx);
+impl TracksFileBrowserWidth for FileBrowserView {
+    fn set_tracked_width(&mut self, width: Option<gpui::Pixels>, cx: &mut Context<Self>) {
+        if self.layout.set_available_width(width) {
+            cx.notify();
+        }
     }
 }
 
 impl Render for FileBrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let show_preview = self.should_show_preview()
-            && self.available_width.map_or(false, |w| w >= px(560.0));
+        let show_preview = self.layout.should_show_preview(self.should_show_preview());
 
         let inner = div()
             .id("file-browser-view")
@@ -1446,7 +1309,7 @@ impl Render for FileBrowserView {
             .bg(theme.app_background)
             .flex()
             .flex_col()
-            .when(self.resizing.is_some(), |this| {
+            .when(self.layout.columns().is_resizing(), |this| {
                 this.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| {
                     this.handle_columns_mouse_move(ev.position.x, cx);
                 }))
@@ -1491,16 +1354,11 @@ impl Render for FileBrowserView {
                                     self.render_columns(cx).into_any_element()
                                 }
                             })
-                            .when(show_preview, |this| {
-                                this.child(self.render_preview(cx))
-                            }),
+                            .when(show_preview, |this| this.child(self.render_preview(cx))),
                     ),
             )
             .into_any_element();
 
-        FileBrowserRender {
-            view: cx.entity(),
-            inner,
-        }
+        FileBrowserWidthTracker::new("file-browser-render", cx.entity(), inner)
     }
 }
