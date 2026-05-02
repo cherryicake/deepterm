@@ -9,6 +9,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
+use crate::components::tab_bar::DragPreview;
 use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
     FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
@@ -16,6 +17,7 @@ use crate::file_browser::shared::{
     render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
     render_icon_share, render_icon_tag,
 };
+use crate::file_transfer::{FileDragPayload, FileEndpoint, TransferRequest};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileEntry as SftpFileEntry, RemoteFileKind};
 use crate::theme::ActiveTheme;
@@ -315,7 +317,7 @@ impl RemoteFileBrowserView {
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.show_location(
             self.root_path.clone(),
             self.selected_path.clone(),
@@ -350,6 +352,51 @@ impl RemoteFileBrowserView {
         }
 
         self.show_location(self.root_path.clone(), Some(path), None, false, cx);
+    }
+
+    fn drag_payload_for_path(&self, path: String) -> FileDragPayload {
+        FileDragPayload::move_one(FileEndpoint::Remote {
+            ssh_config: self.ssh_config.clone(),
+            path,
+        })
+    }
+
+    fn destination_for_path(&self, path: String, is_directory: bool) -> FileEndpoint {
+        let destination_path = if is_directory {
+            path
+        } else {
+            sftp_fs::remote_parent(&path).unwrap_or_else(|| self.root_path.clone())
+        };
+
+        FileEndpoint::Remote {
+            ssh_config: self.ssh_config.clone(),
+            path: destination_path,
+        }
+    }
+
+    fn request_transfer_to_path(
+        &mut self,
+        payload: FileDragPayload,
+        path: String,
+        is_directory: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = self.destination_for_path(path, is_directory);
+        cx.emit(FileBrowserEvent::TransferRequested(
+            TransferRequest::from_drag_payload(payload, destination),
+        ));
+    }
+
+    fn request_transfer_to_root(&mut self, payload: FileDragPayload, cx: &mut Context<Self>) {
+        cx.emit(FileBrowserEvent::TransferRequested(
+            TransferRequest::from_drag_payload(
+                payload,
+                FileEndpoint::Remote {
+                    ssh_config: self.ssh_config.clone(),
+                    path: self.root_path.clone(),
+                },
+            ),
+        ));
     }
 
     fn show_location(
@@ -894,6 +941,7 @@ impl RemoteFileBrowserView {
                 let path = entry.path.clone();
                 let name = entry.name.clone();
                 let kind_label = entry.kind_label().to_string();
+                let is_directory = entry.kind == RemoteFileKind::Directory;
                 let is_selected = selected_child.as_ref() == Some(&entry.path);
                 let is_deepest_selected_folder = entry.kind == RemoteFileKind::Directory
                     && self.selected_path.as_ref() == Some(&entry.path);
@@ -919,6 +967,9 @@ impl RemoteFileBrowserView {
 
                 let hover_path = path.clone();
                 let click_path = path.clone();
+                let drag_payload = self.drag_payload_for_path(path.clone());
+                let drag_label = drag_payload.preview_label();
+                let drop_path = path.clone();
                 rows = rows.child(
                     div()
                         .id(format!("remote-file-entry-{}", path))
@@ -940,6 +991,20 @@ impl RemoteFileBrowserView {
                                 this.select_path(click_path.clone(), cx);
                             }),
                         )
+                        .on_drag(drag_payload, move |_, position, window, cx| {
+                            cx.stop_propagation();
+                            cx.new(|cx| {
+                                DragPreview::new(drag_label.clone().into(), position, window, cx)
+                            })
+                        })
+                        .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                            this.request_transfer_to_path(
+                                payload.clone(),
+                                drop_path.clone(),
+                                is_directory,
+                                cx,
+                            );
+                        }))
                         .child(
                             svg()
                                 .size(px(12.0))
@@ -1078,6 +1143,9 @@ impl RemoteFileBrowserView {
             };
             let click_path = path.clone();
             let hover_path = path.clone();
+            let drag_payload = self.drag_payload_for_path(path.clone());
+            let drag_label = drag_payload.preview_label();
+            let drop_path = path.clone();
 
             rows = rows.child(
                 div()
@@ -1103,6 +1171,20 @@ impl RemoteFileBrowserView {
                             }
                         }),
                     )
+                    .on_drag(drag_payload, move |_, position, window, cx| {
+                        cx.stop_propagation();
+                        cx.new(|cx| {
+                            DragPreview::new(drag_label.clone().into(), position, window, cx)
+                        })
+                    })
+                    .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                        this.request_transfer_to_path(
+                            payload.clone(),
+                            drop_path.clone(),
+                            is_directory,
+                            cx,
+                        );
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1718,6 +1800,9 @@ impl Render for RemoteFileBrowserView {
                             .overflow_hidden()
                             .flex()
                             .gap(px(0.0))
+                            .on_drop(cx.listener(|this, payload: &FileDragPayload, _, cx| {
+                                this.request_transfer_to_root(payload.clone(), cx);
+                            }))
                             .child({
                                 if self.view_mode == FileBrowserViewMode::List {
                                     self.render_list(cx).into_any_element()

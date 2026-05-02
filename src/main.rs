@@ -4,6 +4,7 @@ pub mod assets;
 pub mod builtin_commands;
 pub mod components;
 pub mod file_browser;
+pub mod file_transfer;
 pub mod highlighter;
 mod settings_hub;
 pub mod ssh;

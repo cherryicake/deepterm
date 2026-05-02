@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -7,7 +11,7 @@ use russh::client::{self, AuthResult};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileType;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ssh::auth::{try_agent_auth, try_default_keys};
 use crate::ssh::config::SshConnectionConfig;
@@ -59,6 +63,8 @@ pub struct BlockingSftpSession {
 }
 
 impl BlockingSftpSession {
+    const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
+
     pub fn connect(config: &SshConnectionConfig) -> anyhow::Result<Self> {
         let runtime = tokio::runtime::Runtime::new()?;
         let (handle, sftp) = runtime.block_on(connect_sftp(config))?;
@@ -86,6 +92,152 @@ impl BlockingSftpSession {
                 metadata.len(),
                 metadata.mtime,
             ))
+        })
+    }
+
+    pub fn exists(&mut self, path: &str) -> anyhow::Result<bool> {
+        self.runtime.block_on(async {
+            self.sftp
+                .try_exists(path)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    pub fn create_dir_all(&mut self, path: &str) -> anyhow::Result<()> {
+        if path.is_empty() || path == "/" {
+            return Ok(());
+        }
+
+        let mut current = if path.starts_with('/') {
+            "/".to_string()
+        } else {
+            String::new()
+        };
+
+        for component in remote_components(path) {
+            current = join_remote_path(&current, component);
+            if self.exists(&current)? {
+                continue;
+            }
+
+            self.runtime
+                .block_on(async { self.sftp.create_dir(current.clone()).await })?;
+        }
+
+        Ok(())
+    }
+
+    pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.runtime.block_on(async {
+            self.sftp
+                .rename(from, to)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    pub fn remove_file(&mut self, path: &str) -> anyhow::Result<()> {
+        self.runtime.block_on(async {
+            self.sftp
+                .remove_file(path)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    pub fn remove_dir(&mut self, path: &str) -> anyhow::Result<()> {
+        self.runtime.block_on(async {
+            self.sftp
+                .remove_dir(path)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    pub fn upload_file_from_local(
+        &mut self,
+        local_path: &Path,
+        remote_path: &str,
+    ) -> anyhow::Result<u64> {
+        self.upload_file_from_local_with_cancel(local_path, remote_path, &AtomicBool::new(false))
+    }
+
+    pub fn upload_file_from_local_with_cancel(
+        &mut self,
+        local_path: &Path,
+        remote_path: &str,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<u64> {
+        let mut local_file = File::open(local_path)?;
+        self.runtime.block_on(async {
+            let mut remote_file = self.sftp.create(remote_path).await?;
+            let mut transferred = 0;
+            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow!("transfer cancelled"));
+                }
+
+                let read = local_file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+
+                remote_file.write_all(&buffer[..read]).await?;
+                transferred += read as u64;
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow!("transfer cancelled"));
+            }
+
+            remote_file.shutdown().await?;
+            Ok(transferred)
+        })
+    }
+
+    pub fn download_file_to_local(
+        &mut self,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<u64> {
+        self.download_file_to_local_with_cancel(remote_path, local_path, &AtomicBool::new(false))
+    }
+
+    pub fn download_file_to_local_with_cancel(
+        &mut self,
+        remote_path: &str,
+        local_path: &Path,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<u64> {
+        let mut local_file = File::create(local_path)?;
+        self.runtime.block_on(async {
+            let mut remote_file = self.sftp.open(remote_path).await?;
+            let mut transferred = 0;
+            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow!("transfer cancelled"));
+                }
+
+                let read = remote_file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+
+                local_file.write_all(&buffer[..read])?;
+                transferred += read as u64;
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow!("transfer cancelled"));
+            }
+
+            local_file.flush()?;
+            Ok(transferred)
         })
     }
 
@@ -176,7 +328,7 @@ fn evict_session(key: &str, session: &SharedBlockingSftpSession) {
 
 pub fn with_cached_session<T>(
     config: &SshConnectionConfig,
-    f: impl Fn(&mut BlockingSftpSession) -> anyhow::Result<T>,
+    mut f: impl FnMut(&mut BlockingSftpSession) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let key = cache_key(config);
     let session = get_or_connect_session(config, &key)?;

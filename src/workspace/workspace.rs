@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use gpui::{
     App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable, GlobalElementId,
-    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
-    Styled, Subscription, Window, div, px,
+    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, StatefulInteractiveElement, Style, Styled, Subscription, Window, div, px,
 };
 use gpui::{KeyBinding, actions, prelude::*};
 
@@ -17,7 +19,9 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::file_browser::shared::format_size;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
+use crate::file_transfer::{FileEndpoint, TransferManager, TransferRequest, TransferSummary};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
@@ -125,6 +129,26 @@ pub struct Workspace {
     resize_drag: Option<ResizeDragState>,
     /// SSH picker for this window's workspace
     ssh_picker: Option<Entity<SshPicker>>,
+    /// 下一个传输任务序号
+    next_transfer_id: usize,
+    /// 文件传输任务状态
+    transfer_tasks: Vec<TransferTaskState>,
+}
+
+#[derive(Clone, Debug)]
+enum TransferTaskStatus {
+    Running,
+    Completed { files: usize, bytes: u64 },
+    Failed(String),
+    Cancelled,
+}
+
+#[derive(Clone)]
+struct TransferTaskState {
+    id: usize,
+    label: String,
+    status: TransferTaskStatus,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Resize拖拽状态
@@ -243,6 +267,8 @@ impl Workspace {
                 workspace_id,
                 resize_drag: None,
                 ssh_picker: None,
+                next_transfer_id: 1,
+                transfer_tasks: Vec::new(),
             };
 
             // 在创建时完成所有初始化
@@ -537,6 +563,9 @@ impl Workspace {
                     self.focus_panel_content(panel, window, cx);
                 }
             }
+            PanelEvent::TransferRequested { panel_id, request } => {
+                self.start_transfer_request(panel_id.clone(), request.clone(), cx);
+            }
             PanelEvent::OpenFile { panel_id, path } => {
                 self.show_editor_panel(panel_id.clone(), path.clone(), window, cx);
             }
@@ -549,6 +578,109 @@ impl Workspace {
             PanelEvent::BroadcastToggle { .. } => {
                 self.handle_broadcast_toggle(cx);
             }
+        }
+    }
+
+    fn start_transfer_request(
+        &mut self,
+        panel_id: String,
+        request: TransferRequest,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "Starting transfer from panel {}: {:?} -> {:?}",
+            panel_id,
+            request.sources,
+            request.destination
+        );
+
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = cancelled.clone();
+        let weak = cx.weak_entity();
+
+        self.transfer_tasks.push(TransferTaskState {
+            id: transfer_id,
+            label: transfer_label(&request),
+            status: TransferTaskStatus::Running,
+            cancelled,
+        });
+        cx.notify();
+
+        let task = cx.background_executor().spawn(async move {
+            TransferManager::execute_blocking_with_cancel(request, task_cancelled)
+        });
+
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            if let Some(entity) = weak.upgrade() {
+                let _ = entity.update(cx, |this, cx| {
+                    this.finish_transfer_task(transfer_id, result, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn finish_transfer_task(
+        &mut self,
+        transfer_id: usize,
+        result: anyhow::Result<TransferSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self
+            .transfer_tasks
+            .iter_mut()
+            .find(|task| task.id == transfer_id)
+        else {
+            return;
+        };
+
+        match result {
+            Ok(summary) => {
+                log::info!(
+                    "Transfer finished: {} files, {} bytes",
+                    summary.files_transferred,
+                    summary.bytes_transferred
+                );
+                task.status = TransferTaskStatus::Completed {
+                    files: summary.files_transferred,
+                    bytes: summary.bytes_transferred,
+                };
+                self.refresh_file_browsers(cx);
+            }
+            Err(error) if error.to_string().contains("transfer cancelled") => {
+                log::info!("Transfer cancelled");
+                task.status = TransferTaskStatus::Cancelled;
+            }
+            Err(error) => {
+                log::warn!("Transfer failed: {:#}", error);
+                task.status = TransferTaskStatus::Failed(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_file_browsers(&mut self, cx: &mut Context<Self>) {
+        for tab in self.tabs.values() {
+            for panel in tab.container.collect_panels_vec() {
+                panel.update(cx, |panel, cx| {
+                    panel.refresh_file_browser_content(cx);
+                });
+            }
+        }
+    }
+
+    fn cancel_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
+        if let Some(task) = self
+            .transfer_tasks
+            .iter_mut()
+            .find(|task| task.id == transfer_id)
+        {
+            task.cancelled.store(true, Ordering::Relaxed);
+            task.status = TransferTaskStatus::Cancelled;
+            cx.notify();
         }
     }
 
@@ -1729,6 +1861,131 @@ impl Workspace {
             }
         }
     }
+
+    fn render_transfer_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.transfer_tasks.is_empty() {
+            return None;
+        }
+
+        let theme = cx.theme().ui;
+        let mut panel = div()
+            .absolute()
+            .right(px(18.0))
+            .bottom(px(18.0))
+            .w(px(360.0))
+            .max_h(px(280.0))
+            .overflow_hidden()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.elevated_background)
+            .shadow_md()
+            .p(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(div().text_sm().text_color(theme.text).child("Transfers"));
+
+        for task in self.transfer_tasks.iter().rev().take(5) {
+            let task_id = task.id;
+            let status_label = transfer_status_label(&task.status);
+            let can_cancel = matches!(task.status, TransferTaskStatus::Running);
+
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .rounded(px(8.0))
+                    .bg(theme.panel_background)
+                    .border_1()
+                    .border_color(theme.border.opacity(0.5))
+                    .p(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text)
+                                    .child(task.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_subtle)
+                                    .child(status_label),
+                            ),
+                    )
+                    .when(can_cancel, |this| {
+                        this.child(
+                            div()
+                                .id(format!("transfer-cancel-{}", task_id))
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(theme.tab_hover_background)
+                                .text_xs()
+                                .text_color(theme.text)
+                                .cursor_pointer()
+                                .child("Cancel")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.cancel_transfer_task(task_id, cx);
+                                })),
+                        )
+                    }),
+            );
+        }
+
+        Some(panel)
+    }
+}
+
+fn transfer_label(request: &TransferRequest) -> String {
+    let source_label = match request.sources.as_slice() {
+        [] => "No files".to_string(),
+        [source] => endpoint_label(source),
+        sources => format!("{} items", sources.len()),
+    };
+    format!(
+        "{} → {}",
+        source_label,
+        endpoint_label(&request.destination)
+    )
+}
+
+fn endpoint_label(endpoint: &FileEndpoint) -> String {
+    match endpoint {
+        FileEndpoint::Local { path } => path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string()),
+        FileEndpoint::Remote { ssh_config, path } => {
+            let name = path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("/");
+            format!("{}:{}", ssh_config.host_label(), name)
+        }
+    }
+}
+
+fn transfer_status_label(status: &TransferTaskStatus) -> String {
+    match status {
+        TransferTaskStatus::Running => "Running...".to_string(),
+        TransferTaskStatus::Completed { files, bytes } => {
+            format!("Completed: {} files, {}", files, format_size(*bytes))
+        }
+        TransferTaskStatus::Failed(error) => format!("Failed: {}", error),
+        TransferTaskStatus::Cancelled => "Cancelled".to_string(),
+    }
 }
 
 impl Focusable for Workspace {
@@ -1770,6 +2027,7 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.app_background)
@@ -1787,6 +2045,9 @@ impl Render for Workspace {
                         this.child(self.render_split_container(container, &[], cx))
                     }),
             )
+            .when_some(self.render_transfer_overlay(cx), |this, overlay| {
+                this.child(overlay)
+            })
             .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
                 this.create_local_terminal(window, cx);
             }))

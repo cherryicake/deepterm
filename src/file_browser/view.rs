@@ -12,6 +12,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
+use crate::components::tab_bar::DragPreview;
 use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
     FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
@@ -19,6 +20,7 @@ use crate::file_browser::shared::{
     render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
     render_icon_share, render_icon_tag,
 };
+use crate::file_transfer::{FileDragPayload, FileEndpoint, TransferRequest};
 use crate::theme::ActiveTheme;
 
 const COLUMN_DEFAULT_WIDTH: f32 = 240.0;
@@ -320,7 +322,7 @@ impl FileBrowserView {
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.directory_cache.clear();
         self.refresh_visible_data(cx);
     }
@@ -328,6 +330,48 @@ impl FileBrowserView {
     fn select_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.selected_path = Some(path);
         self.refresh_visible_data(cx);
+    }
+
+    fn drag_payload_for_path(&self, path: PathBuf) -> FileDragPayload {
+        FileDragPayload::move_one(FileEndpoint::Local { path })
+    }
+
+    fn destination_for_path(&self, path: PathBuf, is_directory: bool) -> FileEndpoint {
+        let destination_path = if is_directory {
+            path
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root_path.clone())
+        };
+
+        FileEndpoint::Local {
+            path: destination_path,
+        }
+    }
+
+    fn request_transfer_to_path(
+        &mut self,
+        payload: FileDragPayload,
+        path: PathBuf,
+        is_directory: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = self.destination_for_path(path, is_directory);
+        cx.emit(FileBrowserEvent::TransferRequested(
+            TransferRequest::from_drag_payload(payload, destination),
+        ));
+    }
+
+    fn request_transfer_to_root(&mut self, payload: FileDragPayload, cx: &mut Context<Self>) {
+        cx.emit(FileBrowserEvent::TransferRequested(
+            TransferRequest::from_drag_payload(
+                payload,
+                FileEndpoint::Local {
+                    path: self.root_path.clone(),
+                },
+            ),
+        ));
     }
 
     fn refresh_visible_data(&mut self, cx: &mut Context<Self>) {
@@ -823,6 +867,7 @@ impl FileBrowserView {
             for entry in entries {
                 let path = entry.path.clone();
                 let name = entry.name.clone();
+                let is_directory = entry.kind == FileEntryKind::Directory;
                 let is_selected = selected_child.as_ref() == Some(&entry.path);
                 let is_deepest_selected = self.selected_path.as_ref() == Some(&entry.path);
                 let is_active = is_selected || is_deepest_selected;
@@ -847,6 +892,9 @@ impl FileBrowserView {
 
                 let hover_path = path.clone();
                 let click_path = path.clone();
+                let drag_payload = self.drag_payload_for_path(path.clone());
+                let drag_label = drag_payload.preview_label();
+                let drop_path = path.clone();
                 rows = rows.child(
                     div()
                         .id(format!("file-entry-{}", path.display()))
@@ -863,6 +911,20 @@ impl FileBrowserView {
                                 this.select_path(click_path.clone(), cx);
                             }),
                         )
+                        .on_drag(drag_payload, move |_, position, window, cx| {
+                            cx.stop_propagation();
+                            cx.new(|cx| {
+                                DragPreview::new(drag_label.clone().into(), position, window, cx)
+                            })
+                        })
+                        .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                            this.request_transfer_to_path(
+                                payload.clone(),
+                                drop_path.clone(),
+                                is_directory,
+                                cx,
+                            );
+                        }))
                         .child(
                             div()
                                 .w_full()
@@ -1009,6 +1071,9 @@ impl FileBrowserView {
 
             let click_path = path.clone();
             let hover_path = path.clone();
+            let drag_payload = self.drag_payload_for_path(path.clone());
+            let drag_label = drag_payload.preview_label();
+            let drop_path = path.clone();
             rows = rows.child(
                 div()
                     .id(format!("file-browser-list-entry-{}", path.display()))
@@ -1033,6 +1098,20 @@ impl FileBrowserView {
                             }
                         }),
                     )
+                    .on_drag(drag_payload, move |_, position, window, cx| {
+                        cx.stop_propagation();
+                        cx.new(|cx| {
+                            DragPreview::new(drag_label.clone().into(), position, window, cx)
+                        })
+                    })
+                    .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                        this.request_transfer_to_path(
+                            payload.clone(),
+                            drop_path.clone(),
+                            is_directory,
+                            cx,
+                        );
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1386,6 +1465,9 @@ impl Render for FileBrowserView {
                             .overflow_hidden()
                             .flex()
                             .gap(px(0.0))
+                            .on_drop(cx.listener(|this, payload: &FileDragPayload, _, cx| {
+                                this.request_transfer_to_root(payload.clone(), cx);
+                            }))
                             .child({
                                 if self.view_mode == FileBrowserViewMode::List {
                                     self.render_list(cx).into_any_element()
