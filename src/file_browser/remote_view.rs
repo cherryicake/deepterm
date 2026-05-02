@@ -17,7 +17,11 @@ use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileEntry as SftpFileEntry, RemoteFileKind};
 use crate::theme::ActiveTheme;
 
-const COLUMN_WIDTH: f32 = 208.0;
+const COLUMN_DEFAULT_WIDTH: f32 = 208.0;
+const COLUMN_MIN_WIDTH: f32 = 140.0;
+const COLUMN_MAX_WIDTH: f32 = 720.0;
+const COLUMN_HANDLE_HIT_WIDTH: f32 = 6.0;
+const COLUMN_HANDLE_VISUAL_WIDTH: f32 = 1.0;
 const HEADER_HEIGHT: f32 = 46.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const LIST_HEADER_HEIGHT: f32 = 26.0;
@@ -118,6 +122,13 @@ struct LoadedState {
     error_message: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ColumnResizeState {
+    index: usize,
+    start_mouse_x: gpui::Pixels,
+    start_width: gpui::Pixels,
+}
+
 pub struct RemoteFileBrowserView {
     focus_handle: FocusHandle,
     ssh_config: SshConnectionConfig,
@@ -137,6 +148,8 @@ pub struct RemoteFileBrowserView {
     view_mode: FileBrowserViewMode,
     expanded_folders: HashSet<String>,
     available_width: Option<gpui::Pixels>,
+    column_widths: Vec<gpui::Pixels>,
+    resizing: Option<ColumnResizeState>,
 }
 
 impl RemoteFileBrowserView {
@@ -183,6 +196,8 @@ impl RemoteFileBrowserView {
                 view_mode: FileBrowserViewMode::Columns,
                 expanded_folders: HashSet::new(),
                 available_width: None,
+                column_widths: Vec::new(),
+                resizing: None,
             };
             this.open_requested_path(requested_path, window, cx);
             this
@@ -211,7 +226,45 @@ impl RemoteFileBrowserView {
 
     fn set_view_mode(&mut self, mode: FileBrowserViewMode, cx: &mut Context<Self>) {
         self.view_mode = mode;
+        self.resizing = None;
         cx.notify();
+    }
+
+    fn column_width_at(&self, index: usize) -> gpui::Pixels {
+        self.column_widths
+            .get(index)
+            .copied()
+            .unwrap_or(px(COLUMN_DEFAULT_WIDTH))
+    }
+
+    fn ensure_column_widths(&mut self, count: usize) {
+        if self.column_widths.len() < count {
+            self.column_widths
+                .resize(count, px(COLUMN_DEFAULT_WIDTH));
+        }
+    }
+
+    fn set_column_width(&mut self, index: usize, width: gpui::Pixels, cx: &mut Context<Self>) {
+        let clamped = width
+            .max(px(COLUMN_MIN_WIDTH))
+            .min(px(COLUMN_MAX_WIDTH));
+        self.ensure_column_widths(index + 1);
+        if self.column_widths[index] != clamped {
+            self.column_widths[index] = clamped;
+            cx.notify();
+        }
+    }
+
+    fn handle_columns_mouse_move(&mut self, mouse_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(state) = self.resizing else { return };
+        let delta = mouse_x - state.start_mouse_x;
+        self.set_column_width(state.index, state.start_width + delta, cx);
+    }
+
+    fn handle_columns_mouse_up(&mut self, cx: &mut Context<Self>) {
+        if self.resizing.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn toggle_folder_expanded(&mut self, path: String, cx: &mut Context<Self>) {
@@ -807,7 +860,12 @@ impl RemoteFileBrowserView {
             )
     }
 
-    fn render_directory_column(&self, directory: &str, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_directory_column(
+        &self,
+        directory: &str,
+        column_index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let theme = cx.theme().ui;
         let selected_child = self.selected_child_for_directory(directory);
         let is_directory_loaded = self.directory_cache.contains_key(directory);
@@ -854,26 +912,19 @@ impl RemoteFileBrowserView {
                 let is_selected = selected_child.as_ref() == Some(&entry.path);
                 let is_deepest_selected_folder = entry.kind == RemoteFileKind::Directory
                     && self.selected_path.as_ref() == Some(&entry.path);
-                let row_background = if is_deepest_selected_folder {
-                    theme.selection.opacity(0.96)
-                } else if is_selected {
-                    theme.selection.opacity(0.64)
+                let is_active = is_selected || is_deepest_selected_folder;
+                let row_background = if is_active {
+                    theme.selection
                 } else {
                     theme.elevated_background.opacity(0.0)
                 };
-                let row_text = if is_selected {
+                let row_text = if is_active {
                     theme.accent_foreground
                 } else {
                     theme.text
                 };
-                let row_meta = if is_selected {
-                    theme
-                        .accent_foreground
-                        .opacity(if is_deepest_selected_folder {
-                            0.88
-                        } else {
-                            0.72
-                        })
+                let row_meta = if is_active {
+                    theme.accent_foreground.opacity(0.72)
                 } else {
                     theme.text_subtle
                 };
@@ -890,7 +941,7 @@ impl RemoteFileBrowserView {
                         .items_center()
                         .gap(px(6.0))
                         .bg(row_background)
-                        .when(!is_selected, |this| {
+                        .when(!is_active, |this| {
                             this.hover(move |style| style.bg(theme.tab_hover_background))
                         })
                         .on_mouse_down(
@@ -903,11 +954,8 @@ impl RemoteFileBrowserView {
                             svg()
                                 .size(px(12.0))
                                 .text_color(match entry.kind {
-                                    RemoteFileKind::Directory if is_selected => {
-                                        theme.accent_foreground
-                                    }
                                     RemoteFileKind::Directory => theme.accent,
-                                    _ if is_selected => theme.accent_foreground,
+                                    _ if is_active => theme.accent_foreground,
                                     _ => theme.icon_muted,
                                 })
                                 .path(entry.icon().path()),
@@ -934,12 +982,61 @@ impl RemoteFileBrowserView {
         }
 
         div()
-            .w(px(COLUMN_WIDTH))
+            .w(self.column_width_at(column_index))
             .h_full()
             .bg(theme.app_background)
             .flex()
             .flex_col()
             .child(rows)
+    }
+
+    fn render_resize_handle(
+        &self,
+        column_index: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let theme = cx.theme().ui;
+        let is_active = self
+            .resizing
+            .as_ref()
+            .map_or(false, |s| s.index == column_index);
+        let group_name = format!("remote-file-browser-col-handle-{}", column_index);
+
+        div()
+            .id(("remote-file-browser-col-handle", column_index))
+            .group(group_name.clone())
+            .h_full()
+            .w(px(COLUMN_HANDLE_HIT_WIDTH))
+            .flex_none()
+            .flex()
+            .items_stretch()
+            .justify_center()
+            .cursor_col_resize()
+            .child(
+                div()
+                    .w(px(COLUMN_HANDLE_VISUAL_WIDTH))
+                    .h_full()
+                    .bg(if is_active {
+                        theme.drop_target
+                    } else {
+                        theme.border
+                    })
+                    .group_hover(&group_name, |this| this.bg(theme.drop_target)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                    let start_width = this.column_width_at(column_index);
+                    this.ensure_column_widths(column_index + 1);
+                    this.resizing = Some(ColumnResizeState {
+                        index: column_index,
+                        start_mouse_x: ev.position.x,
+                        start_width,
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
     }
 
     fn render_columns(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -953,10 +1050,10 @@ impl RemoteFileBrowserView {
         let mut columns = div().h_full().flex().w_full().bg(theme.app_background);
         for (index, directory) in directories.iter().enumerate() {
             if index > 0 {
-                columns = columns.child(div().h_full().w(px(1.0)).bg(theme.border));
+                columns = columns.child(self.render_resize_handle(index - 1, cx));
             }
 
-            columns = columns.child(self.render_directory_column(directory, cx));
+            columns = columns.child(self.render_directory_column(directory, index, cx));
         }
 
         div()
@@ -1007,7 +1104,7 @@ impl RemoteFileBrowserView {
             let kind_label = entry.kind_label().to_string();
             let icon = entry.icon();
             let row_background = if is_selected {
-                theme.selection.opacity(0.96)
+                theme.selection
             } else {
                 theme.elevated_background.opacity(0.0)
             };
@@ -1070,11 +1167,7 @@ impl RemoteFileBrowserView {
                                 svg()
                                     .size(px(14.0))
                                     .text_color(if is_directory {
-                                        if is_selected {
-                                            theme.accent_foreground
-                                        } else {
-                                            theme.accent
-                                        }
+                                        theme.accent
                                     } else if is_selected {
                                         theme.accent_foreground
                                     } else {
@@ -1684,6 +1777,23 @@ impl Render for RemoteFileBrowserView {
             .bg(theme.app_background)
             .flex()
             .flex_col()
+            .when(self.resizing.is_some(), |this| {
+                this.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| {
+                    this.handle_columns_mouse_move(ev.position.x, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.handle_columns_mouse_up(cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.handle_columns_mouse_up(cx);
+                    }),
+                )
+            })
             .when_some(self.render_error_banner(cx), |this, banner| {
                 this.child(banner)
             })
