@@ -138,6 +138,7 @@ pub struct RemoteFileBrowserView {
     preview_generation: u64,
     view_mode: FileBrowserViewMode,
     expanded_folders: HashSet<String>,
+    hovered_path: Option<String>,
     layout: FileBrowserLayoutState,
 }
 
@@ -184,6 +185,7 @@ impl RemoteFileBrowserView {
                 preview_generation: 0,
                 view_mode: FileBrowserViewMode::Columns,
                 expanded_folders: HashSet::new(),
+                hovered_path: None,
                 layout: FileBrowserLayoutState::new(px(COLUMN_DEFAULT_WIDTH)),
             };
             this.open_requested_path(requested_path, window, cx);
@@ -214,7 +216,23 @@ impl RemoteFileBrowserView {
     fn set_view_mode(&mut self, mode: FileBrowserViewMode, cx: &mut Context<Self>) {
         self.view_mode = mode;
         self.layout.columns_mut().clear_resize();
+        self.hovered_path = None;
         cx.notify();
+    }
+
+    fn set_hovered_path(&mut self, path: String, hovered: bool, cx: &mut Context<Self>) {
+        let next = if hovered {
+            Some(path.clone())
+        } else if self.hovered_path.as_ref() == Some(&path) {
+            None
+        } else {
+            return;
+        };
+
+        if self.hovered_path != next {
+            self.hovered_path = next;
+            cx.notify();
+        }
     }
 
     fn column_width_at(&self, index: usize) -> gpui::Pixels {
@@ -879,8 +897,11 @@ impl RemoteFileBrowserView {
                 let is_deepest_selected_folder = entry.kind == RemoteFileKind::Directory
                     && self.selected_path.as_ref() == Some(&entry.path);
                 let is_active = is_selected || is_deepest_selected_folder;
+                let is_hovered = self.hovered_path.as_ref() == Some(&entry.path);
                 let row_background = if is_active {
                     theme.selection
+                } else if is_hovered {
+                    theme.tab_hover_background
                 } else {
                     theme.elevated_background.opacity(0.0)
                 };
@@ -895,6 +916,8 @@ impl RemoteFileBrowserView {
                     theme.text_subtle
                 };
 
+                let hover_path = path.clone();
+                let click_path = path.clone();
                 rows = rows.child(
                     div()
                         .id(format!("remote-file-entry-{}", path))
@@ -907,13 +930,13 @@ impl RemoteFileBrowserView {
                         .items_center()
                         .gap(px(6.0))
                         .bg(row_background)
-                        .when(!is_active, |this| {
-                            this.hover(move |style| style.bg(theme.tab_hover_background))
-                        })
+                        .on_hover(cx.listener(move |this, hovered, _, cx| {
+                            this.set_hovered_path(hover_path.clone(), *hovered, cx);
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
-                                this.select_path(path.clone(), cx);
+                                this.select_path(click_path.clone(), cx);
                             }),
                         )
                         .child(
@@ -1034,8 +1057,11 @@ impl RemoteFileBrowserView {
             let size_label = entry.size_label();
             let kind_label = entry.kind_label().to_string();
             let icon = entry.icon();
+            let is_hovered = self.hovered_path.as_ref() == Some(&path);
             let row_background = if is_selected {
                 theme.selection
+            } else if is_hovered {
+                theme.tab_hover_background
             } else {
                 theme.elevated_background.opacity(0.0)
             };
@@ -1050,9 +1076,11 @@ impl RemoteFileBrowserView {
                 theme.text_subtle
             };
             let click_path = path.clone();
+            let hover_path = path.clone();
 
             rows = rows.child(
                 div()
+                    .id(format!("remote-file-browser-list-entry-{}", path))
                     .w_full()
                     .h(px(LIST_ROW_HEIGHT))
                     .pl(px(12.0) + indent)
@@ -1061,9 +1089,9 @@ impl RemoteFileBrowserView {
                     .flex()
                     .items_center()
                     .bg(row_background)
-                    .when(!is_selected, |this| {
-                        this.hover(move |style| style.bg(theme.tab_hover_background))
-                    })
+                    .on_hover(cx.listener(move |this, hovered, _, cx| {
+                        this.set_hovered_path(hover_path.clone(), *hovered, cx);
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
