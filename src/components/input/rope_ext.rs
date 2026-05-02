@@ -416,11 +416,7 @@ impl RopeExt for Rope {
         let point = self.offset_to_point(offset);
         let start = self.line_start_offset(point.row);
         let end = self.line_end_offset(point.row);
-        if start == end {
-            None
-        } else {
-            Some(start..end)
-        }
+        if start == end { None } else { Some(start..end) }
     }
 
     #[inline]

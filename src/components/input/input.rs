@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px};
 
-use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Size, Sizable};
+use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
 use crate::theme::ActiveTheme;
 
 use super::{InputState, element::TextElement};
@@ -193,7 +193,11 @@ impl RenderOnce for EditorInput {
             } else {
                 None
             };
-            let input_pr = if mask_toggle_el.is_some() { px(4.0) } else { px(10.0) };
+            let input_pr = if mask_toggle_el.is_some() {
+                px(4.0)
+            } else {
+                px(10.0)
+            };
 
             actions
                 .w_full()
@@ -226,9 +230,7 @@ impl RenderOnce for EditorInput {
                             TextElement::new(self.state.clone())
                                 .placeholder(state.placeholder.clone()),
                         )
-                        .when_some(mask_toggle_el, |this, el| {
-                            this.child(el)
-                        }),
+                        .when_some(mask_toggle_el, |this, el| this.child(el)),
                 )
                 .into_any_element()
         }

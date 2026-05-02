@@ -1,10 +1,8 @@
 //! Terminal module - simplified but functional
 
-use std::{
-    borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant,
-};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::{borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
 
 use alacritty_terminal::{
     Term,
@@ -333,11 +331,8 @@ impl Terminal {
             )
         };
         #[cfg(not(unix))]
-        let (child_process_id, shell_process_group_id, pty_master_fd) = (
-            pty.child_watcher().pid().map(|p| p.get()),
-            None,
-            None,
-        );
+        let (child_process_id, shell_process_group_id, pty_master_fd) =
+            (pty.child_watcher().pid().map(|p| p.get()), None, None);
         let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {

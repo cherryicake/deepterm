@@ -1,13 +1,15 @@
 use gpui::prelude::*;
 use gpui::{
     App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, Render, SharedString, Styled, Window, div, point, px, svg,
+    IntoElement, Render, SharedString, Styled, Subscription, Window, div, point, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DragPreview, DraggedTab};
-use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
+use crate::file_browser::{
+    FileBrowserEvent, FileBrowserTarget, FileBrowserView, RemoteFileBrowserView,
+};
 use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
@@ -75,6 +77,8 @@ pub enum PanelEvent {
         panel_id: String,
         target: FileBrowserTarget,
     },
+    /// 关闭当前 Panel 上的文件浏览器覆盖层
+    FileBrowserOverlayClosed { panel_id: String },
     /// 在编辑器中打开文件
     OpenFile { panel_id: String, path: String },
     /// 关闭panel事件
@@ -134,6 +138,9 @@ pub struct Panel {
     is_selected: bool,
     /// Content displayed in this panel
     content: PanelContent,
+    /// Temporary file browser rendered over terminal content.
+    file_browser_overlay: Option<PanelContent>,
+    file_browser_overlay_subscription: Option<Subscription>,
     /// 广播状态 - 由Workspace同步给所有Panel
     broadcast_enabled: bool,
 }
@@ -168,6 +175,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Text(content_text),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -252,6 +261,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -281,6 +292,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -309,6 +322,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Terminal(terminal_view),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -332,6 +347,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::FileBrowser(file_browser_view),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -355,6 +372,8 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::Editor(editor_state),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
         }
     }
@@ -379,7 +398,98 @@ impl Panel {
             is_solo: false,
             is_selected: false,
             content: PanelContent::SettingsHubView(settings_hub_view),
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
             broadcast_enabled: false,
+        }
+    }
+
+    pub fn show_file_browser_overlay(
+        &mut self,
+        target: FileBrowserTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            FileBrowserTarget::Local { requested_path } => {
+                if let Some(PanelContent::FileBrowser(file_browser)) = &self.file_browser_overlay {
+                    file_browser.update(cx, |file_browser, cx| {
+                        file_browser.open_requested_path(requested_path, window, cx);
+                    });
+                } else {
+                    let file_browser = FileBrowserView::new_with_path(window, cx, requested_path);
+                    self.subscribe_file_browser_overlay(&file_browser, cx);
+                    self.file_browser_overlay = Some(PanelContent::FileBrowser(file_browser));
+                }
+            }
+            FileBrowserTarget::Remote {
+                ssh_config,
+                requested_path,
+            } => {
+                let existing_view = match &self.file_browser_overlay {
+                    Some(PanelContent::RemoteFileBrowser(file_browser)) => {
+                        Some(file_browser.clone())
+                    }
+                    _ => None,
+                };
+
+                if let Some(file_browser) = existing_view {
+                    if file_browser.read(cx).ssh_config() == &ssh_config {
+                        file_browser.update(cx, |file_browser, cx| {
+                            file_browser.open_requested_path(requested_path, window, cx);
+                        });
+                    } else {
+                        let file_browser =
+                            RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
+                        self.subscribe_remote_file_browser_overlay(&file_browser, cx);
+                        self.file_browser_overlay =
+                            Some(PanelContent::RemoteFileBrowser(file_browser));
+                    }
+                } else {
+                    let file_browser =
+                        RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
+                    self.subscribe_remote_file_browser_overlay(&file_browser, cx);
+                    self.file_browser_overlay = Some(PanelContent::RemoteFileBrowser(file_browser));
+                }
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn subscribe_file_browser_overlay(
+        &mut self,
+        file_browser: &Entity<FileBrowserView>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe(file_browser, |this, _, event: &FileBrowserEvent, cx| {
+            if matches!(event, FileBrowserEvent::Close) {
+                this.close_file_browser_overlay(cx);
+            }
+        });
+        self.file_browser_overlay_subscription = Some(subscription);
+    }
+
+    fn subscribe_remote_file_browser_overlay(
+        &mut self,
+        file_browser: &Entity<RemoteFileBrowserView>,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe(file_browser, |this, _, event: &FileBrowserEvent, cx| {
+            if matches!(event, FileBrowserEvent::Close) {
+                this.close_file_browser_overlay(cx);
+            }
+        });
+        self.file_browser_overlay_subscription = Some(subscription);
+    }
+
+    fn close_file_browser_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.file_browser_overlay.take().is_some() {
+            self.file_browser_overlay_subscription = None;
+            cx.emit(PanelEvent::FileBrowserOverlayClosed {
+                panel_id: self.panel_id.clone(),
+            });
+            cx.notify();
         }
     }
 
@@ -551,6 +661,18 @@ impl Panel {
             _ => None,
         }
     }
+
+    pub fn active_content_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        match &self.file_browser_overlay {
+            Some(PanelContent::FileBrowser(file_browser)) => {
+                Some(file_browser.read(cx).focus_handle(cx))
+            }
+            Some(PanelContent::RemoteFileBrowser(file_browser)) => {
+                Some(file_browser.read(cx).focus_handle(cx))
+            }
+            _ => self.content_focus_handle(cx),
+        }
+    }
 }
 
 impl EventEmitter<PanelEvent> for Panel {}
@@ -691,7 +813,9 @@ impl Panel {
 
     /// 渲染内容区域
     fn render_content(&self) -> impl IntoElement {
-        match &self.content {
+        let content = self.file_browser_overlay.as_ref().unwrap_or(&self.content);
+
+        match content {
             PanelContent::Text(text) => {
                 div().flex_1().flex().items_center().justify_center().child(
                     self.active_tab_id

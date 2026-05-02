@@ -33,10 +33,7 @@ pub async fn try_agent_auth<H: russh::client::Handler>(
 
                     for identity in &identities {
                         let pub_key = identity.public_key().into_owned();
-                        log::info!(
-                            "russh: 尝试 Agent 密钥: {}",
-                            pub_key.key_data().algorithm()
-                        );
+                        log::info!("russh: 尝试 Agent 密钥: {}", pub_key.key_data().algorithm());
                         match handle
                             .authenticate_publickey_with(
                                 &config.username,
@@ -88,9 +85,7 @@ pub async fn try_default_keys<H: russh::client::Handler>(
 ) -> anyhow::Result<AuthResult> {
     let default_keys = crate::ssh::find_default_ssh_keys();
     if default_keys.is_empty() {
-        return Err(anyhow::anyhow!(
-            "自动认证失败：~/.ssh 中未找到密钥文件"
-        ));
+        return Err(anyhow::anyhow!("自动认证失败：~/.ssh 中未找到密钥文件"));
     }
 
     let hash_alg = handle

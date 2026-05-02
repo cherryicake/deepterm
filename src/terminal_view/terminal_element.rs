@@ -1496,8 +1496,7 @@ impl Element for TerminalElement {
                     CursorShape::Underline => {
                         window.paint_quad(fill(
                             Bounds {
-                                origin: cursor_origin
-                                    + point(px(0.0), *line_height - thickness),
+                                origin: cursor_origin + point(px(0.0), *line_height - thickness),
                                 size: size(block_width, thickness),
                             },
                             input_overlay.cursor_color,
@@ -1515,8 +1514,7 @@ impl Element for TerminalElement {
                                 size: size(block_width, thickness),
                             },
                             Bounds {
-                                origin: cursor_origin
-                                    + point(px(0.0), *line_height - thickness),
+                                origin: cursor_origin + point(px(0.0), *line_height - thickness),
                                 size: size(block_width, thickness),
                             },
                             Bounds {
@@ -1524,8 +1522,7 @@ impl Element for TerminalElement {
                                 size: size(thickness, vertical_height),
                             },
                             Bounds {
-                                origin: cursor_origin
-                                    + point(block_width - thickness, thickness),
+                                origin: cursor_origin + point(block_width - thickness, thickness),
                                 size: size(thickness, vertical_height),
                             },
                         ];

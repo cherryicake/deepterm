@@ -15,7 +15,7 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, div, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
+    App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window, actions, div,
 };
 
 use crate::components::title_bar::TitleBar;

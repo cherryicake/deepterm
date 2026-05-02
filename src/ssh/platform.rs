@@ -61,7 +61,10 @@ impl RemoteOS {
         }
 
         // 前缀匹配：提取第一个词，避免重复调用 split_once
-        let first_token = name.split_once('-').map(|(prefix, _)| prefix).unwrap_or(name);
+        let first_token = name
+            .split_once('-')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(name);
 
         if first_token.eq_ignore_ascii_case("ubuntu") {
             return Some(RemoteOS::Ubuntu);
@@ -72,10 +75,12 @@ impl RemoteOS {
         if first_token.eq_ignore_ascii_case("centos") {
             return Some(RemoteOS::Centos);
         }
-        if first_token.eq_ignore_ascii_case("arch") || first_token.eq_ignore_ascii_case("archlinux") {
+        if first_token.eq_ignore_ascii_case("arch") || first_token.eq_ignore_ascii_case("archlinux")
+        {
             return Some(RemoteOS::Arch);
         }
-        if first_token.eq_ignore_ascii_case("linuxmint") || first_token.eq_ignore_ascii_case("mint") {
+        if first_token.eq_ignore_ascii_case("linuxmint") || first_token.eq_ignore_ascii_case("mint")
+        {
             return Some(RemoteOS::LinuxMint);
         }
         if first_token.eq_ignore_ascii_case("fedora") {
@@ -87,7 +92,8 @@ impl RemoteOS {
         {
             return Some(RemoteOS::Rhel);
         }
-        if first_token.eq_ignore_ascii_case("opensuse") || first_token.eq_ignore_ascii_case("suse") {
+        if first_token.eq_ignore_ascii_case("opensuse") || first_token.eq_ignore_ascii_case("suse")
+        {
             return Some(RemoteOS::Opensuse);
         }
         if first_token.eq_ignore_ascii_case("manjaro") {

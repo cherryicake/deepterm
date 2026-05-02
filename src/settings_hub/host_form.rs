@@ -908,7 +908,12 @@ impl Render for HostForm {
                         false,
                         cx,
                     ))
-                    .child(self.render_labeled_input("Host Address *", &self.hostname_input, false, cx))
+                    .child(self.render_labeled_input(
+                        "Host Address *",
+                        &self.hostname_input,
+                        false,
+                        cx,
+                    ))
                     .child(
                         div()
                             .w_full()

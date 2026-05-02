@@ -566,7 +566,11 @@ impl SshPicker {
         let config = &self.configs[config_index];
         let local_count = self.filtered_local_indices.len();
         let actual_index = item_index + local_count;
-        let icon = Self::get_os_icon(&config.host, config.nickname.as_deref(), config.os.as_deref());
+        let icon = Self::get_os_icon(
+            &config.host,
+            config.nickname.as_deref(),
+            config.os.as_deref(),
+        );
 
         Self::render_list_item_content(
             icon,

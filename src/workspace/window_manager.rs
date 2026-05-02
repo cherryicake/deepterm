@@ -2,9 +2,7 @@
 //!
 //! Manages all open DeepTerm windows and provides operations to open new windows.
 
-use gpui::{
-    App, Global, WindowBackgroundAppearance, WindowDecorations, WindowOptions, AppContext,
-};
+use gpui::{App, AppContext, Global, WindowBackgroundAppearance, WindowDecorations, WindowOptions};
 
 use crate::AppWindow;
 use crate::components::title_bar::TitleBar;
@@ -26,11 +24,8 @@ impl WindowManager {
 
     /// Open a new DeepTerm window with the default size and options.
     pub fn open_window(cx: &mut App) {
-        let bounds = gpui::Bounds::centered(
-            None,
-            gpui::size(gpui::px(1400.0), gpui::px(900.0)),
-            cx,
-        );
+        let bounds =
+            gpui::Bounds::centered(None, gpui::size(gpui::px(1400.0), gpui::px(900.0)), cx);
 
         cx.open_window(
             WindowOptions {
@@ -58,4 +53,3 @@ impl WindowManager {
         .unwrap();
     }
 }
-

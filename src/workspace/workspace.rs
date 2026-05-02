@@ -275,7 +275,7 @@ impl Workspace {
     fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             if let Some(panel) = tab_info.container.get_first_panel() {
-                if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
+                if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
                     window.focus(&handle, cx);
                 }
             }
@@ -295,7 +295,7 @@ impl Workspace {
                 .tabs
                 .get(&next_tab_id)
                 .and_then(|t| t.container.get_first_panel())
-                .and_then(|panel| panel.read(cx).content_focus_handle(cx));
+                .and_then(|panel| panel.read(cx).active_content_focus_handle(cx));
 
             if let (Some(fh), Some(wh)) = (focus_handle, cx.active_window()) {
                 let _ = cx.update_window(wh, |_, window, cx| {
@@ -529,8 +529,13 @@ impl Workspace {
                     }
                 }
             }
-            PanelEvent::OpenFileBrowser { target, .. } => {
-                self.show_file_browser_panel(target.clone(), window, cx);
+            PanelEvent::OpenFileBrowser { panel_id, target } => {
+                self.show_file_browser_overlay(panel_id, target.clone(), window, cx);
+            }
+            PanelEvent::FileBrowserOverlayClosed { panel_id } => {
+                if let Some(panel) = self.find_panel(panel_id, cx) {
+                    self.focus_panel_content(panel, window, cx);
+                }
             }
             PanelEvent::OpenFile { panel_id, path } => {
                 self.show_editor_panel(panel_id.clone(), path.clone(), window, cx);
@@ -1280,6 +1285,32 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_file_browser_overlay(
+        &mut self,
+        panel_id: &str,
+        target: FileBrowserTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.find_panel(panel_id, cx);
+
+        let Some(panel) = panel else {
+            self.show_file_browser_panel(target, window, cx);
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.show_file_browser_overlay(target, window, cx);
+        });
+        self.focus_panel_content(panel, window, cx);
+    }
+
+    fn find_panel(&self, panel_id: &str, cx: &App) -> Option<Entity<Panel>> {
+        self.tabs
+            .values()
+            .find_map(|tab_info| tab_info.container.find_panel(panel_id, cx))
+    }
+
     fn focus_panel_content(
         &self,
         panel: Entity<Panel>,
@@ -1287,7 +1318,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         cx.defer_in(window, move |_, window, cx| {
-            if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
+            if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
                 window.focus(&handle, cx);
             }
         });
@@ -1554,7 +1585,7 @@ impl Workspace {
         self.switch_to_tab(&tab_id, cx);
 
         cx.defer_in(window, move |_, window, cx| {
-            if let Some(handle) = panel.read(cx).content_focus_handle(cx) {
+            if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
                 window.focus(&handle, cx);
             }
         });
@@ -1613,7 +1644,9 @@ impl Workspace {
     ) -> gpui::Div {
         let theme = cx.theme().ui;
         match container {
-            SplitContainer::Panel(panel) => div().size_full().overflow_hidden().child(panel.clone()),
+            SplitContainer::Panel(panel) => {
+                div().size_full().overflow_hidden().child(panel.clone())
+            }
             SplitContainer::Split {
                 direction,
                 children,

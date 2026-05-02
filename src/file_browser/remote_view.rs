@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, Stateful,
-    Window, div, px, svg,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, Render, Stateful, Window, div, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::spinner::{Spinner, SpinnerSize};
+use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
     FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
     format_datetime, format_size, render_column_resize_handle, render_columns_container,
@@ -1648,6 +1649,8 @@ impl Focusable for RemoteFileBrowserView {
     }
 }
 
+impl EventEmitter<FileBrowserEvent> for RemoteFileBrowserView {}
+
 impl TracksFileBrowserWidth for RemoteFileBrowserView {
     fn set_tracked_width(&mut self, width: Option<gpui::Pixels>, cx: &mut Context<Self>) {
         if self.layout.set_available_width(width) {
@@ -1669,6 +1672,14 @@ impl Render for RemoteFileBrowserView {
             .bg(theme.app_background)
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.modifiers.control
+                    && event.keystroke.key.eq_ignore_ascii_case("c")
+                {
+                    cx.emit(FileBrowserEvent::Close);
+                    cx.stop_propagation();
+                }
+            }))
             .when(self.layout.columns().is_resizing(), |this| {
                 this.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| {
                     this.handle_columns_mouse_move(ev.position.x, cx);
