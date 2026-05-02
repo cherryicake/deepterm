@@ -18,7 +18,7 @@ use crate::file_browser::shared::{
 };
 use crate::theme::ActiveTheme;
 
-const COLUMN_WIDTH: f32 = 208.0;
+const COLUMN_WIDTH: f32 = 240.0;
 const HEADER_HEIGHT: f32 = 46.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const LIST_HEADER_HEIGHT: f32 = 26.0;
@@ -589,8 +589,6 @@ impl FileBrowserView {
             .h(px(HEADER_HEIGHT))
             .px(px(12.0))
             .bg(theme.app_background)
-            .border_b_1()
-            .border_color(theme.border)
             .flex()
             .items_center()
             .justify_between()
@@ -760,7 +758,8 @@ impl FileBrowserView {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(1.0))
+            .gap(px(2.0))
+            .pt(px(6.0))
             .overflow_y_scroll();
 
         if is_directory_loaded && entries.is_empty() {
@@ -781,16 +780,11 @@ impl FileBrowserView {
             for entry in entries {
                 let path = entry.path.clone();
                 let name = entry.name.clone();
-                let kind_label = entry.kind_label().to_string();
                 let is_selected = selected_child.as_ref() == Some(&entry.path);
-                let is_deepest_selected_folder = entry.kind == FileEntryKind::Directory
-                    && self.selected_path.as_ref() == Some(&entry.path);
-                let row_background = if is_deepest_selected_folder {
-                    theme.selection.opacity(0.96)
-                } else if is_selected {
-                    theme.selection.opacity(0.64)
+                let row_background = if is_selected {
+                    theme.accent
                 } else {
-                    theme.elevated_background.opacity(0.0)
+                    gpui::transparent_black()
                 };
                 let row_text = if is_selected {
                     theme.accent_foreground
@@ -798,13 +792,7 @@ impl FileBrowserView {
                     theme.text
                 };
                 let row_meta = if is_selected {
-                    theme
-                        .accent_foreground
-                        .opacity(if is_deepest_selected_folder {
-                            0.88
-                        } else {
-                            0.72
-                        })
+                    theme.accent_foreground
                 } else {
                     theme.text_subtle
                 };
@@ -813,17 +801,9 @@ impl FileBrowserView {
                     div()
                         .id(format!("file-entry-{}", path.display()))
                         .w_full()
-                        .h(px(22.0))
-                        .px(px(8.0))
-                        .rounded(px(5.0))
+                        .h(px(24.0))
+                        .px(px(6.0))
                         .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .bg(row_background)
-                        .when(!is_selected, |this| {
-                            this.hover(move |style| style.bg(theme.tab_hover_background))
-                        })
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -831,34 +811,48 @@ impl FileBrowserView {
                             }),
                         )
                         .child(
-                            svg()
-                                .size(px(12.0))
-                                .text_color(match entry.kind {
-                                    FileEntryKind::Directory if is_selected => {
-                                        theme.accent_foreground
-                                    }
-                                    FileEntryKind::Directory => theme.accent,
-                                    _ if is_selected => theme.accent_foreground,
-                                    _ => theme.icon_muted,
-                                })
-                                .path(entry.icon().path()),
-                        )
-                        .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
+                                .w_full()
+                                .h_full()
+                                .px(px(4.0))
+                                .rounded(px(6.0))
                                 .flex()
                                 .items_center()
-                                .justify_between()
                                 .gap(px(6.0))
-                                .child(div().text_sm().text_color(row_text).child(name))
-                                .child(div().text_sm().text_color(row_meta).child(
-                                    if matches!(entry.kind, FileEntryKind::Directory) {
-                                        "›".to_string()
-                                    } else {
-                                        kind_label
-                                    },
-                                )),
+                                .bg(row_background)
+                                .when(!is_selected, |this| {
+                                    this.hover(move |style| style.bg(theme.tab_hover_background))
+                                })
+                                .child(
+                                    svg()
+                                        .size(px(14.0))
+                                        .text_color(match entry.kind {
+                                            FileEntryKind::Directory if is_selected => {
+                                                theme.accent_foreground
+                                            }
+                                            FileEntryKind::Directory => theme.accent,
+                                            _ if is_selected => theme.accent_foreground,
+                                            _ => theme.icon_muted,
+                                        })
+                                        .path(entry.icon().path()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(6.0))
+                                        .child(div().text_sm().text_color(row_text).child(name))
+                                        .child(div().text_sm().text_color(row_meta).child(
+                                            if matches!(entry.kind, FileEntryKind::Directory) {
+                                                "›".to_string()
+                                            } else {
+                                                String::new()
+                                            },
+                                        )),
+                                ),
                         ),
                 );
             }
@@ -873,15 +867,11 @@ impl FileBrowserView {
             .child(rows)
     }
 
-    fn render_columns(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_columns(&self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
-        let directories = {
-            let visible = self.visible_directory_paths();
-            let start = visible.len().saturating_sub(4);
-            visible[start..].to_vec()
-        };
+        let directories = self.visible_directory_paths();
 
-        let mut columns = div().h_full().flex().w_full().bg(theme.app_background);
+        let mut columns = div().h_full().flex().bg(theme.app_background);
         for (index, directory) in directories.iter().enumerate() {
             if index > 0 {
                 columns = columns.child(div().h_full().w(px(1.0)).bg(theme.border));
@@ -891,12 +881,13 @@ impl FileBrowserView {
         }
 
         div()
+            .id("file-browser-columns-container")
             .flex_1()
             .h_full()
             .bg(theme.app_background)
-            .overflow_hidden()
+            .overflow_x_scroll()
+            .overflow_y_hidden()
             .flex()
-            .flex_col()
             .child(columns)
     }
 
@@ -1374,10 +1365,12 @@ impl Render for FileBrowserView {
                             .overflow_hidden()
                             .flex()
                             .gap(px(0.0))
-                            .child(if self.view_mode == FileBrowserViewMode::List {
-                                self.render_list(cx)
-                            } else {
-                                self.render_columns(cx)
+                            .child({
+                                if self.view_mode == FileBrowserViewMode::List {
+                                    self.render_list(cx).into_any_element()
+                                } else {
+                                    self.render_columns(cx).into_any_element()
+                                }
                             })
                             .when(show_preview, |this| {
                                 this.child(self.render_preview(cx))
