@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use gpui::{
@@ -149,6 +149,8 @@ struct TransferTaskState {
     label: String,
     status: TransferTaskStatus,
     cancelled: Arc<AtomicBool>,
+    bytes_transferred: Arc<AtomicU64>,
+    total_bytes: u64,
 }
 
 /// Resize拖拽状态
@@ -599,25 +601,82 @@ impl Workspace {
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = cancelled.clone();
         let weak = cx.weak_entity();
+        let bytes_transferred = Arc::new(AtomicU64::new(0));
+        let progress = bytes_transferred.clone();
+        let is_done = Arc::new(AtomicBool::new(false));
+        let is_done_for_task = is_done.clone();
 
         self.transfer_tasks.push(TransferTaskState {
             id: transfer_id,
             label: transfer_label(&request),
             status: TransferTaskStatus::Running,
             cancelled,
+            bytes_transferred: progress.clone(),
+            total_bytes: 0,
         });
         cx.notify();
 
+        let request_for_size = request.clone();
+        let weak_for_size = weak.clone();
+        cx.spawn(async move |_, cx| {
+            let total_bytes = cx
+                .background_executor()
+                .spawn(async move { quick_total_size(&request_for_size) })
+                .await;
+            if let Some(entity) = weak_for_size.upgrade() {
+                let _ = entity.update(cx, |this, cx| {
+                    if let Some(task) = this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
+                    {
+                        task.total_bytes = total_bytes;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+
         let task = cx.background_executor().spawn(async move {
-            TransferManager::execute_blocking_with_cancel(request, task_cancelled)
+            let result =
+                TransferManager::execute_blocking_with_cancel_and_progress(
+                    request,
+                    task_cancelled,
+                    Some(progress),
+                );
+            is_done_for_task.store(true, Ordering::Relaxed);
+            result
         });
 
+        let weak2 = weak.clone();
         cx.spawn(async move |_, cx| {
             let result = task.await;
-            if let Some(entity) = weak.upgrade() {
+            if let Some(entity) = weak2.upgrade() {
                 let _ = entity.update(cx, |this, cx| {
                     this.finish_transfer_task(transfer_id, result, cx);
                 });
+            }
+        })
+        .detach();
+
+        let poll_progress = bytes_transferred.clone();
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                if is_done.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(entity) = weak.upgrade() {
+                    let transferred = poll_progress.load(Ordering::Relaxed);
+                    let _ = entity.update(cx, |this, cx| {
+                        if let Some(task) =
+                            this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
+                        {
+                            task.bytes_transferred.store(transferred, Ordering::Relaxed);
+                            cx.notify();
+                        }
+                    });
+                }
             }
         })
         .detach();
@@ -1888,7 +1947,9 @@ impl Workspace {
 
         for task in self.transfer_tasks.iter().rev().take(5) {
             let task_id = task.id;
-            let status_label = transfer_status_label(&task.status);
+            let transferred = task.bytes_transferred.load(Ordering::Relaxed);
+            let status_label =
+                transfer_status_label(&task.status, transferred, task.total_bytes);
             let can_cancel = matches!(task.status, TransferTaskStatus::Running);
 
             panel = panel.child(
@@ -1977,15 +2038,43 @@ fn endpoint_label(endpoint: &FileEndpoint) -> String {
     }
 }
 
-fn transfer_status_label(status: &TransferTaskStatus) -> String {
+fn transfer_status_label(
+    status: &TransferTaskStatus,
+    bytes_transferred: u64,
+    total_bytes: u64,
+) -> String {
     match status {
-        TransferTaskStatus::Running => "Running...".to_string(),
+        TransferTaskStatus::Running => {
+            if total_bytes > 0 {
+                let percent = (bytes_transferred * 100 / total_bytes).min(100);
+                format!("{}%", percent)
+            } else {
+                format!("Running... {}", format_size(bytes_transferred))
+            }
+        }
         TransferTaskStatus::Completed { files, bytes } => {
             format!("Completed: {} files, {}", files, format_size(*bytes))
         }
         TransferTaskStatus::Failed(error) => format!("Failed: {}", error),
         TransferTaskStatus::Cancelled => "Cancelled".to_string(),
     }
+}
+
+fn quick_total_size(request: &TransferRequest) -> u64 {
+    use std::fs;
+    request
+        .sources
+        .iter()
+        .map(|source| match source {
+            FileEndpoint::Local { path } => fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0),
+            FileEndpoint::Remote { ssh_config, path } => {
+                crate::ssh::sftp_fs::metadata(ssh_config, path)
+                    .ok()
+                    .map(|m| m.size)
+                    .unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 impl Focusable for Workspace {

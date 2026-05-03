@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context as _, anyhow, bail};
 
@@ -21,6 +21,14 @@ impl TransferManager {
         request: TransferRequest,
         cancelled: Arc<AtomicBool>,
     ) -> anyhow::Result<TransferSummary> {
+        Self::execute_blocking_with_cancel_and_progress(request, cancelled, None)
+    }
+
+    pub fn execute_blocking_with_cancel_and_progress(
+        request: TransferRequest,
+        cancelled: Arc<AtomicBool>,
+        progress: Option<Arc<AtomicU64>>,
+    ) -> anyhow::Result<TransferSummary> {
         let mut summary = TransferSummary::default();
         for source in request.sources {
             check_cancelled(&cancelled)?;
@@ -30,6 +38,7 @@ impl TransferManager {
                 request.operation,
                 request.conflict_policy,
                 &cancelled,
+                progress.as_deref(),
             )?);
         }
 
@@ -42,6 +51,7 @@ impl TransferManager {
         operation: TransferOperation,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         match (source, destination) {
             (
@@ -71,6 +81,7 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     cancelled,
+                    progress,
                 )?;
                 if operation == TransferOperation::Move {
                     remove_local_source(&path)?;
@@ -92,6 +103,7 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     cancelled,
+                    progress,
                 )?;
                 if operation == TransferOperation::Move {
                     sftp_fs::with_cached_session(&ssh_config, |session| {
@@ -116,6 +128,7 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     cancelled,
+                    progress,
                 )
             }
             (
@@ -133,6 +146,7 @@ impl TransferManager {
                 destination_dir,
                 conflict_policy,
                 cancelled,
+                progress,
             ),
             (
                 FileEndpoint::Remote {
@@ -151,6 +165,7 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     cancelled,
+                    progress,
                 )?;
                 if operation == TransferOperation::Move {
                     sftp_fs::with_cached_session(&ssh_config, |session| {
@@ -206,7 +221,7 @@ impl TransferManager {
         let metadata = fs::metadata(source_path)
             .with_context(|| format!("unable to inspect {}", source_path.display()))?;
         fs::create_dir_all(destination_dir)?;
-        if is_local_noop_move(source_path, destination_dir)? {
+        if is_local_noop_move(source_path, destination_dir) {
             return Ok(TransferSummary::default());
         }
 
@@ -241,6 +256,7 @@ impl TransferManager {
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let metadata = fs::metadata(source_path)
@@ -260,6 +276,7 @@ impl TransferManager {
                     source_path,
                     &destination_path,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -274,6 +291,7 @@ impl TransferManager {
                     &destination_root,
                     conflict_policy,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -287,6 +305,7 @@ impl TransferManager {
         destination_dir: &Path,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         fs::create_dir_all(destination_dir)?;
@@ -304,6 +323,7 @@ impl TransferManager {
                     remote_path,
                     &destination_path,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -317,6 +337,7 @@ impl TransferManager {
                     &destination_root,
                     conflict_policy,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -330,6 +351,7 @@ impl TransferManager {
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
@@ -351,6 +373,7 @@ impl TransferManager {
                     remote_path,
                     &destination_path,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -366,6 +389,7 @@ impl TransferManager {
                     &destination_root,
                     conflict_policy,
                     cancelled,
+                    progress,
                 );
             }
 
@@ -379,6 +403,7 @@ impl TransferManager {
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
@@ -404,6 +429,7 @@ impl TransferManager {
                         destination_dir,
                         conflict_policy,
                         cancelled,
+                        progress,
                     )?;
                     remove_remote_source(session, remote_path)?;
                     Ok(summary)
@@ -419,6 +445,7 @@ impl TransferManager {
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
         cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
@@ -442,6 +469,7 @@ impl TransferManager {
                         destination_session,
                         &destination_path,
                         cancelled,
+                        progress,
                     );
                 }
 
@@ -460,6 +488,7 @@ impl TransferManager {
                         &destination_root,
                         conflict_policy,
                         cancelled,
+                        progress,
                     );
                 }
 
@@ -577,6 +606,7 @@ fn upload_local_dir_to_remote_path(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     session.create_dir_all(destination_dir)?;
     let mut summary = TransferSummary::default();
@@ -598,6 +628,7 @@ fn upload_local_dir_to_remote_path(
                 &source_path,
                 &destination_path,
                 cancelled,
+                progress,
             )?);
         } else if metadata.is_dir() {
             let destination_path =
@@ -610,6 +641,7 @@ fn upload_local_dir_to_remote_path(
                 &destination_path,
                 conflict_policy,
                 cancelled,
+                progress,
             )?);
         }
     }
@@ -622,13 +654,18 @@ fn upload_local_file_to_remote_path(
     source_path: &Path,
     destination_path: &str,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     let temporary_path = temporary_remote_path(destination_path);
     if session.exists(&temporary_path)? {
         let _ = session.remove_file(&temporary_path);
     }
-    let result =
-        session.upload_file_from_local_with_cancel(source_path, &temporary_path, cancelled);
+    let result = session.upload_file_from_local_with_cancel_and_progress(
+        source_path,
+        &temporary_path,
+        cancelled,
+        progress,
+    );
     if let Err(error) = result {
         let _ = session.remove_file(&temporary_path);
         return Err(error);
@@ -648,6 +685,7 @@ fn download_remote_dir_to_local_path(
     destination_dir: &Path,
     conflict_policy: ConflictPolicy,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     fs::create_dir_all(destination_dir)?;
     let mut summary = TransferSummary::default();
@@ -664,6 +702,7 @@ fn download_remote_dir_to_local_path(
                 &entry.path,
                 &destination_path,
                 cancelled,
+                progress,
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
             let destination_path = resolve_local_conflict(&destination_path, conflict_policy)?
@@ -675,6 +714,7 @@ fn download_remote_dir_to_local_path(
                 &destination_path,
                 conflict_policy,
                 cancelled,
+                progress,
             )?);
         }
     }
@@ -687,6 +727,7 @@ fn download_remote_file_to_local_path(
     remote_path: &str,
     destination_path: &Path,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     if let Some(parent) = destination_path.parent() {
         fs::create_dir_all(parent)?;
@@ -696,8 +737,12 @@ fn download_remote_file_to_local_path(
     if temporary_path.exists() {
         let _ = fs::remove_file(&temporary_path);
     }
-    let result =
-        session.download_file_to_local_with_cancel(remote_path, &temporary_path, cancelled);
+    let result = session.download_file_to_local_with_cancel_and_progress(
+        remote_path,
+        &temporary_path,
+        cancelled,
+        progress,
+    );
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary_path);
         return Err(error);
@@ -717,6 +762,7 @@ fn copy_remote_dir_to_remote_path(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     session.create_dir_all(destination_dir)?;
     let mut summary = TransferSummary::default();
@@ -734,6 +780,7 @@ fn copy_remote_dir_to_remote_path(
                 &entry.path,
                 &destination_path,
                 cancelled,
+                progress,
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
             let destination_path =
@@ -746,6 +793,7 @@ fn copy_remote_dir_to_remote_path(
                 &destination_path,
                 conflict_policy,
                 cancelled,
+                progress,
             )?);
         }
     }
@@ -758,6 +806,7 @@ fn copy_remote_file_to_remote_path(
     remote_path: &str,
     destination_path: &str,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     let temporary_path = temporary_remote_path(destination_path);
     if session.exists(&temporary_path)? {
@@ -766,8 +815,13 @@ fn copy_remote_file_to_remote_path(
 
     let local_temporary =
         std::env::temp_dir().join(format!("deepterm-remote-copy-{}", uuid::Uuid::new_v4()));
-    let download_result =
-        session.download_file_to_local_with_cancel(remote_path, &local_temporary, cancelled);
+    let download_result = session
+        .download_file_to_local_with_cancel_and_progress(
+            remote_path,
+            &local_temporary,
+            cancelled,
+            progress,
+        );
     if let Err(error) = download_result {
         let _ = fs::remove_file(&local_temporary);
         let _ = session.remove_file(&temporary_path);
@@ -775,8 +829,12 @@ fn copy_remote_file_to_remote_path(
     }
 
     let transferred = download_result?;
-    let upload_result =
-        session.upload_file_from_local_with_cancel(&local_temporary, &temporary_path, cancelled);
+    let upload_result = session.upload_file_from_local_with_cancel_and_progress(
+        &local_temporary,
+        &temporary_path,
+        cancelled,
+        progress,
+    );
     let _ = fs::remove_file(&local_temporary);
     if let Err(error) = upload_result {
         let _ = session.remove_file(&temporary_path);
@@ -796,6 +854,7 @@ fn copy_remote_dir_between_sessions(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     destination_session.create_dir_all(destination_dir)?;
     let mut summary = TransferSummary::default();
@@ -814,6 +873,7 @@ fn copy_remote_dir_between_sessions(
                 destination_session,
                 &destination_path,
                 cancelled,
+                progress,
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
             let destination_path =
@@ -827,6 +887,7 @@ fn copy_remote_dir_between_sessions(
                 &destination_path,
                 conflict_policy,
                 cancelled,
+                progress,
             )?);
         }
     }
@@ -840,6 +901,7 @@ fn copy_remote_file_between_sessions(
     destination_session: &mut sftp_fs::BlockingSftpSession,
     destination_path: &str,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     let temporary_path = temporary_remote_path(destination_path);
     if destination_session.exists(&temporary_path)? {
@@ -848,8 +910,13 @@ fn copy_remote_file_between_sessions(
 
     let local_temporary =
         std::env::temp_dir().join(format!("deepterm-remote-bridge-{}", uuid::Uuid::new_v4()));
-    let download_result =
-        source_session.download_file_to_local_with_cancel(remote_path, &local_temporary, cancelled);
+    let download_result = source_session
+        .download_file_to_local_with_cancel_and_progress(
+            remote_path,
+            &local_temporary,
+            cancelled,
+            progress,
+        );
     if let Err(error) = download_result {
         let _ = fs::remove_file(&local_temporary);
         let _ = destination_session.remove_file(&temporary_path);
@@ -857,10 +924,11 @@ fn copy_remote_file_between_sessions(
     }
 
     let transferred = download_result?;
-    let upload_result = destination_session.upload_file_from_local_with_cancel(
+    let upload_result = destination_session.upload_file_from_local_with_cancel_and_progress(
         &local_temporary,
         &temporary_path,
         cancelled,
+        progress,
     );
     let _ = fs::remove_file(&local_temporary);
     if let Err(error) = upload_result {
@@ -890,15 +958,29 @@ fn remote_file_name(path: &str) -> anyhow::Result<String> {
     Ok(file_name.to_string())
 }
 
-fn is_local_noop_move(source_path: &Path, destination_dir: &Path) -> anyhow::Result<bool> {
-    let source_path = source_path.canonicalize()?;
-    let destination_dir = destination_dir.canonicalize()?;
-
+fn is_local_noop_move(source_path: &Path, destination_dir: &Path) -> bool {
+    // 快速路径：直接相等（把目录拖到它自己上）
     if source_path == destination_dir {
-        return Ok(true);
+        return true;
     }
 
-    Ok(source_path.parent() == Some(destination_dir.as_path()))
+    // 用 components 比较，忽略尾部斜杠差异
+    let source_components: Vec<_> = source_path.components().collect();
+    let dest_components: Vec<_> = destination_dir.components().collect();
+
+    if source_components == dest_components {
+        return true;
+    }
+
+    // source 的父目录是否等于 destination
+    if source_components.len() >= 2 {
+        let parent = &source_components[..source_components.len() - 1];
+        if parent == dest_components.as_slice() {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn is_remote_noop_move(remote_path: &str, destination_dir: &str) -> bool {

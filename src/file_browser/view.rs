@@ -849,6 +849,16 @@ impl FileBrowserView {
             .pt(px(6.0))
             .overflow_y_scroll();
 
+        let column_dir = directory.to_path_buf();
+        rows = rows.on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+            this.request_transfer_to_path(
+                payload.clone(),
+                column_dir.clone(),
+                true,
+                cx,
+            );
+        }));
+
         if is_directory_loaded && entries.is_empty() {
             rows = rows.child(
                 div()

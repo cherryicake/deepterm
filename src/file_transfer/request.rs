@@ -54,10 +54,20 @@ pub struct TransferRequest {
 
 impl TransferRequest {
     pub fn from_drag_payload(payload: FileDragPayload, destination: FileEndpoint) -> Self {
+        let operation = if payload
+            .sources
+            .iter()
+            .all(|source| source.is_same_device(&destination))
+        {
+            payload.operation_hint
+        } else {
+            TransferOperation::Copy
+        };
+
         Self {
             sources: payload.sources,
             destination,
-            operation: payload.operation_hint,
+            operation,
             conflict_policy: ConflictPolicy::AutoRename,
         }
     }

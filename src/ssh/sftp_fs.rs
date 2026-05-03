@@ -169,6 +169,21 @@ impl BlockingSftpSession {
         remote_path: &str,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<u64> {
+        self.upload_file_from_local_with_cancel_and_progress(
+            local_path,
+            remote_path,
+            cancelled,
+            None,
+        )
+    }
+
+    pub fn upload_file_from_local_with_cancel_and_progress(
+        &mut self,
+        local_path: &Path,
+        remote_path: &str,
+        cancelled: &AtomicBool,
+        progress: Option<&std::sync::atomic::AtomicU64>,
+    ) -> anyhow::Result<u64> {
         let mut local_file = File::open(local_path)?;
         self.runtime.block_on(async {
             let mut remote_file = self.sftp.create(remote_path).await?;
@@ -187,6 +202,10 @@ impl BlockingSftpSession {
 
                 remote_file.write_all(&buffer[..read]).await?;
                 transferred += read as u64;
+
+                if let Some(p) = progress {
+                    p.fetch_add(read as u64, Ordering::Relaxed);
+                }
             }
 
             if cancelled.load(Ordering::Relaxed) {
@@ -212,6 +231,21 @@ impl BlockingSftpSession {
         local_path: &Path,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<u64> {
+        self.download_file_to_local_with_cancel_and_progress(
+            remote_path,
+            local_path,
+            cancelled,
+            None,
+        )
+    }
+
+    pub fn download_file_to_local_with_cancel_and_progress(
+        &mut self,
+        remote_path: &str,
+        local_path: &Path,
+        cancelled: &AtomicBool,
+        progress: Option<&std::sync::atomic::AtomicU64>,
+    ) -> anyhow::Result<u64> {
         let mut local_file = File::create(local_path)?;
         self.runtime.block_on(async {
             let mut remote_file = self.sftp.open(remote_path).await?;
@@ -230,6 +264,10 @@ impl BlockingSftpSession {
 
                 local_file.write_all(&buffer[..read])?;
                 transferred += read as u64;
+
+                if let Some(p) = progress {
+                    p.fetch_add(read as u64, Ordering::Relaxed);
+                }
             }
 
             if cancelled.load(Ordering::Relaxed) {
@@ -296,8 +334,12 @@ fn session_cache() -> &'static Mutex<HashMap<String, SharedBlockingSftpSession>>
 }
 
 fn cache_key(config: &SshConnectionConfig) -> String {
-    serde_json::to_string(config)
-        .unwrap_or_else(|_| format!("{}@{}:{}", config.username, config.host, config.port))
+    // v2: inactivity_timeout disabled for long file transfers
+    format!(
+        "v2:{}",
+        serde_json::to_string(config)
+            .unwrap_or_else(|_| format!("{}@{}:{}", config.username, config.host, config.port))
+    )
 }
 
 fn get_or_connect_session(
@@ -378,7 +420,7 @@ async fn connect_sftp(
     config: &SshConnectionConfig,
 ) -> anyhow::Result<(client::Handle<SftpClientHandler>, SftpSession)> {
     let russh_config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(60)),
+        inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         ..Default::default()
