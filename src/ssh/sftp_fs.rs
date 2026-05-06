@@ -10,7 +10,7 @@ use anyhow::anyhow;
 use russh::client::{self, AuthResult};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::FileType;
+use russh_sftp::protocol::{FileAttributes, FileType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::ssh::auth::{try_agent_auth, try_default_keys};
@@ -41,6 +41,7 @@ pub struct RemoteFileMetadata {
     pub kind: RemoteFileKind,
     pub size: u64,
     pub modified_at: Option<std::time::SystemTime>,
+    pub permissions: Option<u32>,
 }
 
 struct SftpClientHandler;
@@ -91,7 +92,24 @@ impl BlockingSftpSession {
                 metadata.file_type(),
                 metadata.len(),
                 metadata.mtime,
+                metadata.permissions,
             ))
+        })
+    }
+
+    pub fn permissions(&mut self, path: &str) -> anyhow::Result<Option<u32>> {
+        self.runtime.block_on(async {
+            let metadata = self.sftp.metadata(path).await?;
+            Ok(metadata.permissions)
+        })
+    }
+
+    pub fn set_permissions(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
+        self.runtime.block_on(async {
+            let mut attrs = FileAttributes::default();
+            attrs.permissions = Some(mode);
+            self.sftp.set_metadata(path, attrs).await?;
+            Ok(())
         })
     }
 
@@ -303,6 +321,7 @@ impl BlockingSftpSession {
     }
 
     pub fn read_text_preview(&mut self, path: &str) -> anyhow::Result<Option<String>> {
+        use crate::file_browser::shared::is_binary_content;
         const PREVIEW_BYTES: usize = 64 * 1024;
 
         self.runtime.block_on(async {
@@ -314,6 +333,10 @@ impl BlockingSftpSession {
 
             if bytes.is_empty() {
                 return Ok(Some("Empty file".to_string()));
+            }
+
+            if is_binary_content(&bytes) {
+                return Ok(None);
             }
 
             let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -508,12 +531,18 @@ fn convert_file_type(file_type: FileType) -> RemoteFileKind {
     }
 }
 
-fn convert_metadata(file_type: FileType, size: u64, mtime: Option<u32>) -> RemoteFileMetadata {
+fn convert_metadata(
+    file_type: FileType,
+    size: u64,
+    mtime: Option<u32>,
+    permissions: Option<u32>,
+) -> RemoteFileMetadata {
     RemoteFileMetadata {
         kind: convert_file_type(file_type),
         size,
         modified_at: mtime
             .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)),
+        permissions,
     }
 }
 

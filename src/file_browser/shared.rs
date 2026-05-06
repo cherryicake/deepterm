@@ -234,7 +234,6 @@ pub fn render_columns_container(id: &'static str, theme: &UiTheme, columns: Div)
         .h_full()
         .bg(theme.app_background)
         .overflow_x_scroll()
-        .overflow_y_hidden()
         .flex()
         .child(columns)
 }
@@ -283,6 +282,35 @@ pub fn format_datetime(timestamp: std::time::SystemTime) -> String {
         .to_string()
 }
 
+/// Column view 中文件名周围的固定宽度开销（padding + icon + gaps）。
+pub const COLUMN_NAME_OVERHEAD_PX: f32 = 50.0;
+
+/// 根据列宽和字体大小估算最大字符数。
+/// 使用比例字体平均字符宽度约为字体大小的 0.58 倍的经验值。
+pub fn max_chars_for_column_width(column_width_px: f32, font_size_px: f32) -> usize {
+    let available = (column_width_px - COLUMN_NAME_OVERHEAD_PX).max(0.0);
+    let avg_char_width = font_size_px * 0.58;
+    (available / avg_char_width).max(12.0) as usize
+}
+
+pub fn truncate_middle(name: &str, max_chars: usize) -> String {
+    let char_count = name.chars().count();
+    if char_count <= max_chars {
+        return name.to_string();
+    }
+
+    let ellipsis = "...";
+    let keep = max_chars.saturating_sub(ellipsis.len());
+    let prefix_len = keep / 2;
+    let suffix_len = keep - prefix_len;
+
+    let chars: Vec<char> = name.chars().collect();
+    let prefix: String = chars.iter().take(prefix_len).collect();
+    let suffix: String = chars.iter().skip(char_count - suffix_len).collect();
+
+    format!("{}{}{}", prefix, ellipsis, suffix)
+}
+
 pub fn format_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
@@ -298,6 +326,68 @@ pub fn format_size(size: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit])
     }
+}
+
+const PREVIEW_ANALYSIS_BYTES: usize = 1024;
+
+/// Detect whether a byte sequence is likely binary content.
+/// Based on zed's heuristic in worktree/src/worktree.rs.
+pub fn is_binary_content(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    // Known binary file headers (magic numbers)
+    if bytes.starts_with(b"%PDF-") // PDF
+        || bytes.starts_with(b"PK\x03\x04") // ZIP local header
+        || bytes.starts_with(b"PK\x05\x06") // ZIP end of central directory
+        || bytes.starts_with(b"PK\x07\x08") // ZIP spanning/splitting
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n") // PNG
+        || bytes.starts_with(b"\xFF\xD8\xFF") // JPEG
+        || bytes.starts_with(b"GIF87a") // GIF87a
+        || bytes.starts_with(b"GIF89a") // GIF89a
+        || bytes.starts_with(b"RIFF") // WAV, AVI, WebP
+        || bytes.starts_with(b"OggS") // OGG (Vorbis, Opus, FLAC)
+        || bytes.starts_with(b"fLaC") // FLAC
+        || bytes.starts_with(b"ID3") // MP3 with ID3v2 tag
+        || bytes.starts_with(b"\xFF\xFB") // MP3 frame sync (MPEG1 Layer3)
+        || bytes.starts_with(b"\xFF\xFA") // MP3 frame sync (MPEG1 Layer3)
+        || bytes.starts_with(b"\xFF\xF3") // MP3 frame sync (MPEG2 Layer3)
+        || bytes.starts_with(b"\xFF\xF2") // MP3 frame sync (MPEG2 Layer3)
+    {
+        return true;
+    }
+
+    let limit = bytes.len().min(PREVIEW_ANALYSIS_BYTES);
+    let mut null_count = 0usize;
+    let mut non_text_like_count = 0usize;
+
+    for &byte in &bytes[..limit] {
+        if byte == 0 {
+            null_count += 1;
+            non_text_like_count += 1;
+            continue;
+        }
+
+        let is_text_like = matches!(
+            byte,
+            b'\t' | b'\n' | b'\r' | 0x0C // tab, newline, carriage return, form feed
+            | 0x20..=0x7E // ASCII printable
+            | 0x80..=0xBF | 0xC2..=0xF4 // UTF-8 continuation / leading bytes
+        );
+
+        if !is_text_like {
+            non_text_like_count += 1;
+        }
+    }
+
+    // Significant null bytes → likely binary (or UTF-16, which we treat as binary for preview)
+    if null_count > 0 && null_count * 16 >= limit {
+        return true;
+    }
+
+    // More than 8% non-text-like bytes → binary
+    non_text_like_count * 100 >= limit * 8
 }
 
 pub fn render_icon_grid(theme: &UiTheme) -> Div {

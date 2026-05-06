@@ -541,6 +541,16 @@ fn copy_local_dir_to_path(
     cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<TransferSummary> {
     fs::create_dir_all(destination_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(source_dir) {
+            let mode = metadata.permissions().mode();
+            let _ = fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
+        }
+    }
+
     let mut summary = TransferSummary::default();
 
     for entry in fs::read_dir(source_dir)? {
@@ -578,6 +588,11 @@ fn copy_local_file_to_path(
     destination_path: &Path,
     cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<TransferSummary> {
+    #[cfg(unix)]
+    let source_permissions = fs::metadata(source_path)
+        .ok()
+        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
+
     if let Some(parent) = destination_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -597,6 +612,13 @@ fn copy_local_file_to_path(
         let _ = fs::remove_file(&temporary_path);
         return Err(error.into());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(mode) = source_permissions {
+            let _ = fs::set_permissions(destination_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
     Ok(TransferSummary::one_file(transferred))
 }
 
@@ -609,6 +631,16 @@ fn upload_local_dir_to_remote_path(
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     session.create_dir_all(destination_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(source_dir) {
+            let mode = metadata.permissions().mode();
+            let _ = session.set_permissions(destination_dir, mode);
+        }
+    }
+
     let mut summary = TransferSummary::default();
 
     for entry in fs::read_dir(source_dir)? {
@@ -656,6 +688,11 @@ fn upload_local_file_to_remote_path(
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
+    #[cfg(unix)]
+    let source_permissions = fs::metadata(source_path)
+        .ok()
+        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
+
     let temporary_path = temporary_remote_path(destination_path);
     if session.exists(&temporary_path)? {
         let _ = session.remove_file(&temporary_path);
@@ -676,6 +713,10 @@ fn upload_local_file_to_remote_path(
         let _ = session.remove_file(&temporary_path);
         return Err(error);
     }
+    #[cfg(unix)]
+    if let Some(mode) = source_permissions {
+        let _ = session.set_permissions(destination_path, mode);
+    }
     Ok(TransferSummary::one_file(transferred))
 }
 
@@ -688,6 +729,15 @@ fn download_remote_dir_to_local_path(
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     fs::create_dir_all(destination_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(Some(mode)) = session.permissions(remote_dir) {
+            let _ = fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
+        }
+    }
+
     let mut summary = TransferSummary::default();
 
     for entry in session.read_dir(remote_dir)? {
@@ -729,6 +779,8 @@ fn download_remote_file_to_local_path(
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
+    let remote_permissions = session.permissions(remote_path).ok().flatten();
+
     if let Some(parent) = destination_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -753,6 +805,13 @@ fn download_remote_file_to_local_path(
         let _ = fs::remove_file(&temporary_path);
         return Err(error.into());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(mode) = remote_permissions {
+            let _ = fs::set_permissions(destination_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
     Ok(TransferSummary::one_file(transferred))
 }
 
@@ -765,6 +824,11 @@ fn copy_remote_dir_to_remote_path(
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     session.create_dir_all(destination_dir)?;
+
+    if let Ok(Some(mode)) = session.permissions(remote_dir) {
+        let _ = session.set_permissions(destination_dir, mode);
+    }
+
     let mut summary = TransferSummary::default();
 
     for entry in session.read_dir(remote_dir)? {
@@ -808,6 +872,8 @@ fn copy_remote_file_to_remote_path(
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
+    let source_permissions = session.permissions(remote_path).ok().flatten();
+
     let temporary_path = temporary_remote_path(destination_path);
     if session.exists(&temporary_path)? {
         let _ = session.remove_file(&temporary_path);
@@ -844,6 +910,9 @@ fn copy_remote_file_to_remote_path(
         let _ = session.remove_file(&temporary_path);
         return Err(error);
     }
+    if let Some(mode) = source_permissions {
+        let _ = session.set_permissions(destination_path, mode);
+    }
     Ok(TransferSummary::one_file(transferred))
 }
 
@@ -857,6 +926,11 @@ fn copy_remote_dir_between_sessions(
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     destination_session.create_dir_all(destination_dir)?;
+
+    if let Ok(Some(mode)) = source_session.permissions(remote_dir) {
+        let _ = destination_session.set_permissions(destination_dir, mode);
+    }
+
     let mut summary = TransferSummary::default();
 
     for entry in source_session.read_dir(remote_dir)? {
@@ -903,6 +977,8 @@ fn copy_remote_file_between_sessions(
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
+    let source_permissions = source_session.permissions(remote_path).ok().flatten();
+
     let temporary_path = temporary_remote_path(destination_path);
     if destination_session.exists(&temporary_path)? {
         let _ = destination_session.remove_file(&temporary_path);
@@ -938,6 +1014,9 @@ fn copy_remote_file_between_sessions(
     if let Err(error) = destination_session.rename(&temporary_path, destination_path) {
         let _ = destination_session.remove_file(&temporary_path);
         return Err(error);
+    }
+    if let Some(mode) = source_permissions {
+        let _ = destination_session.set_permissions(destination_path, mode);
     }
     Ok(TransferSummary::one_file(transferred))
 }

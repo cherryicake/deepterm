@@ -6,3 +6,4 @@
 .DS_Store
 /DeepTerm.app/
 *.dmg
+.deepseek/

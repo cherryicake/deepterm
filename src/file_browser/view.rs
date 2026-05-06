@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, Render, Stateful, Window, div, px, svg,
+    MouseButton, Render, Stateful, Window, div, px, svg, uniform_list,
 };
 
 use crate::assets::Icon;
@@ -15,10 +15,10 @@ use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::components::tab_bar::DragPreview;
 use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
-    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
-    format_datetime, format_size, render_column_resize_handle, render_columns_container,
-    render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
-    render_icon_share, render_icon_tag,
+    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, PREVIEW_MIN_WIDTH, TracksFileBrowserWidth,
+    format_datetime, format_size, max_chars_for_column_width, render_column_resize_handle,
+    render_columns_container, render_icon_columns, render_icon_gallery, render_icon_grid,
+    render_icon_list, render_icon_more, render_icon_share, render_icon_tag, truncate_middle,
 };
 use crate::file_transfer::{FileDragPayload, FileEndpoint, TransferRequest};
 use crate::theme::ActiveTheme;
@@ -42,7 +42,7 @@ struct FileEntry {
     name_lower: String,
     path: PathBuf,
     kind: FileEntryKind,
-    size: u64,
+    size: Option<u64>,
     modified_at: Option<std::time::SystemTime>,
 }
 
@@ -50,8 +50,9 @@ impl FileEntry {
     fn from_dir_entry(entry: fs::DirEntry) -> Option<Self> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        let metadata = fs::symlink_metadata(&path).ok()?;
-        let file_type = metadata.file_type();
+        // 使用 DirEntry::file_type() 而非 fs::symlink_metadata()。
+        // 前者在 Linux/macOS 上利用 readdir 返回的 d_type，无需额外的 stat 系统调用。
+        let file_type = entry.file_type().ok()?;
         let kind = if file_type.is_dir() {
             FileEntryKind::Directory
         } else if file_type.is_file() {
@@ -61,16 +62,14 @@ impl FileEntry {
         } else {
             FileEntryKind::Other
         };
-        let size = metadata.len();
-        let modified_at = metadata.modified().ok();
 
         Some(Self {
             name: name.clone(),
             name_lower: name.to_lowercase(),
             path,
             kind,
-            size,
-            modified_at,
+            size: None,
+            modified_at: None,
         })
     }
 
@@ -103,14 +102,14 @@ impl FileEntry {
     fn size_label(&self) -> String {
         match self.kind {
             FileEntryKind::Directory => "--".to_string(),
-            _ => format_size(self.size),
+            _ => self.size.map(format_size).unwrap_or_else(|| "--".to_string()),
         }
     }
 
     fn modified_label(&self) -> String {
         self.modified_at
             .map(format_datetime)
-            .unwrap_or_else(|| "Unknown".to_string())
+            .unwrap_or_else(|| "--".to_string())
     }
 }
 
@@ -139,6 +138,8 @@ pub struct FileBrowserView {
     expanded_folders: HashSet<PathBuf>,
     hovered_path: Option<PathBuf>,
     layout: FileBrowserLayoutState,
+    /// Lazy cache for the flattened tree used by List view virtual scrolling.
+    list_flat_cache: Option<Vec<(FileEntry, usize)>>,
 }
 
 impl FileBrowserView {
@@ -179,6 +180,7 @@ impl FileBrowserView {
                 expanded_folders: HashSet::new(),
                 hovered_path: None,
                 layout: FileBrowserLayoutState::new(px(COLUMN_DEFAULT_WIDTH)),
+                list_flat_cache: None,
             };
             this.open_requested_path(requested_path, window, cx);
             this
@@ -303,6 +305,10 @@ impl FileBrowserView {
         }
     }
 
+    fn invalidate_list_cache(&mut self) {
+        self.list_flat_cache = None;
+    }
+
     fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
@@ -310,6 +316,7 @@ impl FileBrowserView {
             self.expanded_folders.insert(path.clone());
             let _ = self.ensure_directory_loaded(&path);
         }
+        self.invalidate_list_cache();
         cx.notify();
     }
 
@@ -324,6 +331,7 @@ impl FileBrowserView {
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.directory_cache.clear();
+        self.invalidate_list_cache();
         self.refresh_visible_data(cx);
     }
 
@@ -376,10 +384,19 @@ impl FileBrowserView {
 
     fn refresh_visible_data(&mut self, cx: &mut Context<Self>) {
         let mut error_message = None;
+        let mut newly_loaded = Vec::new();
         for directory in self.visible_directory_paths() {
-            if let Err(error) = self.ensure_directory_loaded(&directory) {
-                error_message = Some(error);
+            if !self.directory_cache.contains_key(&directory) {
+                if let Err(error) = self.ensure_directory_loaded(&directory) {
+                    error_message = Some(error);
+                } else {
+                    newly_loaded.push(directory);
+                }
             }
+        }
+
+        for directory in newly_loaded {
+            self.start_metadata_load(directory, cx);
         }
 
         self.preview = self.build_preview();
@@ -405,7 +422,40 @@ impl FileBrowserView {
         entries.sort_by_key(FileEntry::sort_key);
         self.directory_cache
             .insert(directory.to_path_buf(), entries);
+        self.invalidate_list_cache();
         Ok(())
+    }
+
+    fn start_metadata_load(&self, directory: PathBuf, cx: &mut Context<Self>) {
+        let Some(entries) = self.directory_cache.get(&directory).cloned() else {
+            return;
+        };
+
+        let weak = cx.weak_entity();
+        let task = cx.background_executor().spawn(async move {
+            let mut updated = entries;
+            for entry in &mut updated {
+                if entry.size.is_some() && entry.modified_at.is_some() {
+                    continue;
+                }
+                if let Ok(metadata) = fs::symlink_metadata(&entry.path) {
+                    entry.size = Some(metadata.len());
+                    entry.modified_at = metadata.modified().ok();
+                }
+            }
+            updated
+        });
+
+        cx.spawn(async move |_, cx| {
+            let updated = task.await;
+            if let Some(entity) = weak.upgrade() {
+                let _ = entity.update(cx, |this, cx| {
+                    this.directory_cache.insert(directory, updated);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn visible_directory_paths(&self) -> Vec<PathBuf> {
@@ -492,6 +542,7 @@ impl FileBrowserView {
     }
 
     fn read_text_preview(path: &Path) -> Option<String> {
+        use crate::file_browser::shared::is_binary_content;
         const PREVIEW_BYTES: usize = 64 * 1024;
 
         let file = fs::File::open(path).ok()?;
@@ -499,6 +550,10 @@ impl FileBrowserView {
         let mut bytes = Vec::new();
         if reader.read_to_end(&mut bytes).ok()? == 0 {
             return Some("Empty file".to_string());
+        }
+
+        if is_binary_content(&bytes) {
+            return None;
         }
 
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -510,11 +565,7 @@ impl FileBrowserView {
     }
 
     fn entry_count_for(&self, path: &Path) -> usize {
-        self.directory_cache
-            .get(path)
-            .map(Vec::len)
-            .or_else(|| fs::read_dir(path).ok().map(|reader| reader.count()))
-            .unwrap_or(0)
+        self.directory_cache.get(path).map(Vec::len).unwrap_or(0)
     }
 
     fn display_name(path: &Path) -> String {
@@ -818,172 +869,230 @@ impl FileBrowserView {
             )
     }
 
+    fn render_column_row(
+        &mut self,
+        entry: &FileEntry,
+        selected_child: Option<&PathBuf>,
+        name_max_chars: usize,
+        theme: crate::theme::UiTheme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        let is_directory = entry.kind == FileEntryKind::Directory;
+        let is_selected = selected_child == Some(&entry.path);
+        let is_deepest_selected = self.selected_path.as_ref() == Some(&entry.path);
+        let is_active = is_selected || is_deepest_selected;
+        let is_hovered = self.hovered_path.as_ref() == Some(&entry.path);
+        let row_background = if is_active {
+            theme.selection
+        } else if is_hovered {
+            theme.tab_hover_background
+        } else {
+            gpui::transparent_black()
+        };
+        let row_text = if is_active {
+            theme.accent_foreground
+        } else {
+            theme.text
+        };
+        let row_meta = if is_active {
+            theme.accent_foreground
+        } else {
+            theme.text_subtle
+        };
+
+        let hover_path = path.clone();
+        let click_path = path.clone();
+        let drag_payload = self.drag_payload_for_path(path.clone());
+        let drag_label = drag_payload.preview_label();
+        let drop_path = path.clone();
+        let mut row = div()
+            .id(format!("file-entry-{}", path.display()))
+            .w_full()
+            .h(px(24.0))
+            .px(px(6.0))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hovered_path(hover_path.clone(), *hovered, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.select_path(click_path.clone(), cx);
+                }),
+            )
+            .on_drag(drag_payload, move |_, position, window, cx| {
+                cx.stop_propagation();
+                cx.new(|cx| {
+                    DragPreview::new(drag_label.clone().into(), position, window, cx)
+                })
+            })
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                this.request_transfer_to_path(
+                    payload.clone(),
+                    drop_path.clone(),
+                    is_directory,
+                    cx,
+                );
+            }));
+
+        if is_directory {
+            row = row
+                .drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
+                    style.border_1().border_color(theme.drop_target_border.opacity(0.5))
+                })
+                .rounded(px(6.0));
+        }
+
+        row.child(
+                div()
+                    .w_full()
+                    .h_full()
+                    .px(px(4.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .bg(row_background)
+                    .child(
+                        svg()
+                            .size(px(14.0))
+                            .text_color(match entry.kind {
+                                FileEntryKind::Directory => theme.accent,
+                                _ if is_active => theme.accent_foreground,
+                                _ => theme.icon_muted,
+                            })
+                            .path(entry.icon().path()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(row_text)
+                                    .child(truncate_middle(
+                                        &name, name_max_chars,
+                                    )),
+                            )
+                            .child(div().text_sm().text_color(row_meta).child(
+                                if matches!(entry.kind, FileEntryKind::Directory) {
+                                    "›".to_string()
+                                } else {
+                                    String::new()
+                                },
+                            )),
+                    ),
+            )
+    }
+
     fn render_directory_column(
-        &self,
+        &mut self,
         directory: &Path,
         column_index: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let theme = cx.theme().ui;
-        let selected_child = self.selected_child_for_directory(directory);
+        let theme = cx.theme().ui.clone();
+        let column_width: f32 = self.column_width_at(column_index).into();
+        let name_max_chars = max_chars_for_column_width(column_width, 13.0);
         let is_directory_loaded = self.directory_cache.contains_key(directory);
-        let entries = self
+
+        let filtered_count = self
             .directory_cache
             .get(directory)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| self.matches_search(entry))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut rows = div()
-            .id(format!("file-browser-column-{}", directory.display()))
+            .map(|entries| entries.iter().filter(|e| self.matches_search(e)).count())
+            .unwrap_or(0);
+
+        let directory_buf = directory.to_path_buf();
+
+        let rows_element: gpui::AnyElement = if is_directory_loaded && filtered_count == 0 {
+            div()
+                .id(format!("file-browser-column-{}", directory.display()))
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(12.0))
+                        .pt(px(18.0))
+                        .text_sm()
+                        .text_color(theme.text_subtle)
+                        .child(if self.search_query.is_empty() {
+                            "This folder is empty.".to_string()
+                        } else {
+                            "No matching items.".to_string()
+                        }),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                format!("file-browser-column-{}", directory.display()),
+                filtered_count,
+                cx.processor({
+                    let directory_buf = directory_buf.clone();
+                    let name_max_chars = name_max_chars;
+                    let theme = theme.clone();
+                    move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let entries: Vec<FileEntry> = this
+                            .directory_cache
+                            .get(&directory_buf)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter(|e| this.matches_search(e))
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let selected_child = this.selected_child_for_directory(&directory_buf);
+
+                        range
+                            .filter_map(|ix| {
+                                if ix >= entries.len() {
+                                    return None;
+                                }
+                                let entry = &entries[ix];
+                                Some(this.render_column_row(
+                                    entry,
+                                    selected_child.as_ref(),
+                                    name_max_chars,
+                                    theme.clone(),
+                                    cx,
+                                ))
+                            })
+                            .collect()
+                    }
+                }),
+            )
             .w_full()
             .flex_1()
             .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .pt(px(6.0))
-            .overflow_y_scroll();
+            .into_any_element()
+        };
 
-        let column_dir = directory.to_path_buf();
-        rows = rows.on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-            this.request_transfer_to_path(
-                payload.clone(),
-                column_dir.clone(),
-                true,
-                cx,
-            );
-        }));
-
-        if is_directory_loaded && entries.is_empty() {
-            rows = rows.child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .pt(px(18.0))
-                    .text_sm()
-                    .text_color(theme.text_subtle)
-                    .child(if self.search_query.is_empty() {
-                        "This folder is empty.".to_string()
-                    } else {
-                        "No matching items.".to_string()
-                    }),
-            );
-        } else {
-            for entry in entries {
-                let path = entry.path.clone();
-                let name = entry.name.clone();
-                let is_directory = entry.kind == FileEntryKind::Directory;
-                let is_selected = selected_child.as_ref() == Some(&entry.path);
-                let is_deepest_selected = self.selected_path.as_ref() == Some(&entry.path);
-                let is_active = is_selected || is_deepest_selected;
-                let is_hovered = self.hovered_path.as_ref() == Some(&entry.path);
-                let row_background = if is_active {
-                    theme.selection
-                } else if is_hovered {
-                    theme.tab_hover_background
-                } else {
-                    gpui::transparent_black()
-                };
-                let row_text = if is_active {
-                    theme.accent_foreground
-                } else {
-                    theme.text
-                };
-                let row_meta = if is_active {
-                    theme.accent_foreground
-                } else {
-                    theme.text_subtle
-                };
-
-                let hover_path = path.clone();
-                let click_path = path.clone();
-                let drag_payload = self.drag_payload_for_path(path.clone());
-                let drag_label = drag_payload.preview_label();
-                let drop_path = path.clone();
-                rows = rows.child(
-                    div()
-                        .id(format!("file-entry-{}", path.display()))
-                        .w_full()
-                        .h(px(24.0))
-                        .px(px(6.0))
-                        .cursor_pointer()
-                        .on_hover(cx.listener(move |this, hovered, _, cx| {
-                            this.set_hovered_path(hover_path.clone(), *hovered, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.select_path(click_path.clone(), cx);
-                            }),
-                        )
-                        .on_drag(drag_payload, move |_, position, window, cx| {
-                            cx.stop_propagation();
-                            cx.new(|cx| {
-                                DragPreview::new(drag_label.clone().into(), position, window, cx)
-                            })
-                        })
-                        .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-                            this.request_transfer_to_path(
-                                payload.clone(),
-                                drop_path.clone(),
-                                is_directory,
-                                cx,
-                            );
-                        }))
-                        .child(
-                            div()
-                                .w_full()
-                                .h_full()
-                                .px(px(4.0))
-                                .rounded(px(6.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .bg(row_background)
-                                .child(
-                                    svg()
-                                        .size(px(14.0))
-                                        .text_color(match entry.kind {
-                                            FileEntryKind::Directory => theme.accent,
-                                            _ if is_active => theme.accent_foreground,
-                                            _ => theme.icon_muted,
-                                        })
-                                        .path(entry.icon().path()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(6.0))
-                                        .child(div().text_sm().text_color(row_text).child(name))
-                                        .child(div().text_sm().text_color(row_meta).child(
-                                            if matches!(entry.kind, FileEntryKind::Directory) {
-                                                "›".to_string()
-                                            } else {
-                                                String::new()
-                                            },
-                                        )),
-                                ),
-                        ),
-                );
-            }
-        }
-
+        let column_dir = directory_buf.clone();
         div()
             .w(self.column_width_at(column_index))
             .h_full()
             .bg(theme.app_background)
             .flex()
             .flex_col()
-            .child(rows)
+            .child(rows_element)
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                this.request_transfer_to_path(payload.clone(), column_dir.clone(), true, cx);
+            }))
     }
 
     fn render_resize_handle(
@@ -1007,9 +1116,10 @@ impl FileBrowserView {
         )
     }
 
-    fn render_columns(&self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+    fn render_columns(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
         let directories = self.visible_directory_paths();
+        let show_preview = self.layout.should_show_preview(self.should_show_preview());
 
         let mut columns = div().h_full().flex().bg(theme.app_background);
         for (index, directory) in directories.iter().enumerate() {
@@ -1020,216 +1130,277 @@ impl FileBrowserView {
             columns = columns.child(self.render_directory_column(directory, index, cx));
         }
 
+        if show_preview {
+            let preview_index = directories.len();
+            if preview_index > 0 {
+                columns = columns.child(self.render_resize_handle(preview_index - 1, cx));
+            }
+            columns = columns.child(self.render_preview(cx));
+        } else if !directories.is_empty() {
+            columns = columns.child(self.render_resize_handle(directories.len() - 1, cx));
+        }
+
         render_columns_container("file-browser-columns-container", &theme, columns)
     }
 
-    fn render_tree_rows(
+    fn build_flat_list(
         &self,
         directory: &Path,
         depth: usize,
-        rows: Stateful<gpui::Div>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
+        result: &mut Vec<(FileEntry, usize)>,
+    ) {
         const MAX_TREE_DEPTH: usize = 20;
         if depth > MAX_TREE_DEPTH {
-            return rows;
+            return;
         }
 
-        let theme = cx.theme().ui;
-        let entries: Vec<&FileEntry> = self
-            .directory_cache
-            .get(directory)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| self.matches_search(entry))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut rows = rows;
-        let indent = px(depth as f32 * 16.0);
-
-        for entry in entries {
-            let path = entry.path.clone();
-            let is_selected = self.selected_path.as_ref() == Some(&path);
-            let is_directory = entry.kind == FileEntryKind::Directory;
-            let is_expanded = is_directory && self.expanded_folders.contains(&path);
-            let name = entry.name.clone();
-            let modified_label = entry.modified_label();
-            let size_label = entry.size_label();
-            let kind_label = entry.kind_label().to_string();
-            let icon = entry.icon();
-            let is_hovered = self.hovered_path.as_ref() == Some(&path);
-            let row_background = if is_selected {
-                theme.selection
-            } else if is_hovered {
-                theme.tab_hover_background
-            } else {
-                theme.elevated_background.opacity(0.0)
-            };
-            let row_text = if is_selected {
-                theme.accent_foreground
-            } else {
-                theme.text
-            };
-            let row_meta = if is_selected {
-                theme.accent_foreground.opacity(0.72)
-            } else {
-                theme.text_subtle
-            };
-
-            let click_path = path.clone();
-            let hover_path = path.clone();
-            let drag_payload = self.drag_payload_for_path(path.clone());
-            let drag_label = drag_payload.preview_label();
-            let drop_path = path.clone();
-            rows = rows.child(
-                div()
-                    .id(format!("file-browser-list-entry-{}", path.display()))
-                    .w_full()
-                    .h(px(LIST_ROW_HEIGHT))
-                    .pl(px(12.0) + indent)
-                    .pr(px(12.0))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .bg(row_background)
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        this.set_hovered_path(hover_path.clone(), *hovered, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if is_directory {
-                                this.toggle_folder_expanded(click_path.clone(), cx);
-                            } else {
-                                this.select_path(click_path.clone(), cx);
-                            }
-                        }),
-                    )
-                    .on_drag(drag_payload, move |_, position, window, cx| {
-                        cx.stop_propagation();
-                        cx.new(|cx| {
-                            DragPreview::new(drag_label.clone().into(), position, window, cx)
-                        })
-                    })
-                    .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-                        this.request_transfer_to_path(
-                            payload.clone(),
-                            drop_path.clone(),
-                            is_directory,
-                            cx,
-                        );
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(1.0))
-                            .child(
-                                div()
-                                    .w(px(14.0))
-                                    .flex_none()
-                                    .text_xl()
-                                    .text_color(row_meta)
-                                    .flex()
-                                    .items_center()
-                                    .justify_start()
-                                    .child(if is_directory {
-                                        if is_expanded { "▾" } else { "▸" }
-                                    } else {
-                                        ""
-                                    }),
-                            )
-                            .child(
-                                svg()
-                                    .size(px(14.0))
-                                    .text_color(if is_directory {
-                                        theme.accent
-                                    } else if is_selected {
-                                        theme.accent_foreground
-                                    } else {
-                                        theme.icon_muted
-                                    })
-                                    .path(icon.path()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(row_text)
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .w(px(140.0))
-                            .text_sm()
-                            .text_color(row_meta)
-                            .child(modified_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_sm()
-                            .text_color(row_meta)
-                            .child(size_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_sm()
-                            .text_color(row_meta)
-                            .child(kind_label),
-                    ),
-            );
-
-            if is_expanded {
-                rows = self.render_tree_rows(&path, depth + 1, rows, cx);
+        if let Some(entries) = self.directory_cache.get(directory) {
+            for entry in entries.iter().filter(|e| self.matches_search(e)) {
+                let is_directory = entry.kind == FileEntryKind::Directory;
+                let is_expanded = is_directory && self.expanded_folders.contains(&entry.path);
+                result.push((entry.clone(), depth));
+                if is_expanded {
+                    self.build_flat_list(&entry.path, depth + 1, result);
+                }
             }
         }
-
-        rows
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
+    fn render_list_row(
+        &mut self,
+        entry: &FileEntry,
+        depth: usize,
+        tree_name_max_chars: usize,
+        theme: crate::theme::UiTheme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let path = entry.path.clone();
+        let is_selected = self.selected_path.as_ref() == Some(&path);
+        let is_directory = entry.kind == FileEntryKind::Directory;
+        let is_expanded = is_directory && self.expanded_folders.contains(&path);
+        let name = entry.name.clone();
+        let modified_label = entry.modified_label();
+        let size_label = entry.size_label();
+        let kind_label = entry.kind_label().to_string();
+        let icon = entry.icon();
+        let is_hovered = self.hovered_path.as_ref() == Some(&path);
+        let row_background = if is_selected {
+            theme.selection
+        } else if is_hovered {
+            theme.tab_hover_background
+        } else {
+            theme.elevated_background.opacity(0.0)
+        };
+        let row_text = if is_selected {
+            theme.accent_foreground
+        } else {
+            theme.text
+        };
+        let row_meta = if is_selected {
+            theme.accent_foreground.opacity(0.72)
+        } else {
+            theme.text_subtle
+        };
+
+        let click_path = path.clone();
+        let hover_path = path.clone();
+        let drag_payload = self.drag_payload_for_path(path.clone());
+        let drag_label = drag_payload.preview_label();
+        let drop_path = path.clone();
+        let indent = px(depth as f32 * 16.0);
+
+        let mut row = div()
+            .id(format!("file-browser-list-entry-{}", path.display()))
+            .w_full()
+            .h(px(LIST_ROW_HEIGHT))
+            .pl(px(6.0) + indent)
+            .pr(px(6.0))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hovered_path(hover_path.clone(), *hovered, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if is_directory {
+                        this.toggle_folder_expanded(click_path.clone(), cx);
+                    } else {
+                        this.select_path(click_path.clone(), cx);
+                    }
+                }),
+            )
+            .on_drag(drag_payload, move |_, position, window, cx| {
+                cx.stop_propagation();
+                cx.new(|cx| {
+                    DragPreview::new(drag_label.clone().into(), position, window, cx)
+                })
+            })
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                this.request_transfer_to_path(
+                    payload.clone(),
+                    drop_path.clone(),
+                    is_directory,
+                    cx,
+                );
+            }));
+
+        if is_directory {
+            row = row
+                .drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
+                    style.border_1().border_color(theme.drop_target_border.opacity(0.5))
+                });
+        }
+
+        row.child(
+            div()
+                .w_full()
+                .h_full()
+                .px(px(4.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .bg(row_background)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .w(px(14.0))
+                                .flex_none()
+                                .text_xl()
+                                .text_color(row_meta)
+                                .flex()
+                                .items_center()
+                                .justify_start()
+                                .child(if is_directory {
+                                    if is_expanded { "▾" } else { "▸" }
+                                } else {
+                                    ""
+                                }),
+                        )
+                        .child(
+                            svg()
+                                .size(px(14.0))
+                                .text_color(if is_directory {
+                                    theme.accent
+                                } else if is_selected {
+                                    theme.accent_foreground
+                                } else {
+                                    theme.icon_muted
+                                })
+                                .path(icon.path()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .truncate()
+                        .text_sm()
+                        .text_color(row_text)
+                        .child(truncate_middle(&name, tree_name_max_chars)),
+                )
+                .child(
+                    div()
+                        .w(px(140.0))
+                        .text_sm()
+                        .text_color(row_meta)
+                        .child(modified_label),
+                )
+                .child(
+                    div()
+                        .w(px(80.0))
+                        .text_sm()
+                        .text_color(row_meta)
+                        .child(size_label),
+                )
+                .child(
+                    div()
+                        .w(px(80.0))
+                        .text_sm()
+                        .text_color(row_meta)
+                        .child(kind_label),
+                ),
+        )
+    }
+
+    fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = cx.theme().ui.clone();
         let directory = self.root_path.clone();
         let is_directory_loaded = self.directory_cache.contains_key(&directory);
 
-        let mut rows = div()
-            .id("file-browser-list")
+        if self.list_flat_cache.is_none() {
+            let mut flat = Vec::new();
+            self.build_flat_list(&directory, 0, &mut flat);
+            self.list_flat_cache = Some(flat);
+        }
+        let flat_count = self.list_flat_cache.as_ref().map(|v| v.len()).unwrap_or(0);
+
+        let rows_element: gpui::AnyElement = if is_directory_loaded && flat_count == 0 {
+            div()
+                .id("file-browser-list")
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(12.0))
+                        .pt(px(18.0))
+                        .text_sm()
+                        .text_color(theme.text_subtle)
+                        .child(if self.search_query.is_empty() {
+                            "This folder is empty.".to_string()
+                        } else {
+                            "No matching items.".to_string()
+                        }),
+                )
+                .into_any_element()
+        } else {
+            let available_width: f32 = self.layout.available_width().map_or(800.0, |w| w.into());
+            let tree_fixed_overhead = 12.0 + 12.0 + 14.0 + 14.0 + 1.0 + 140.0 + 80.0 + 80.0;
+
+            let flat_rows = self.list_flat_cache.clone().unwrap_or_default();
+
+            uniform_list(
+                "file-browser-list",
+                flat_rows.len(),
+                cx.processor({
+                    let theme = theme.clone();
+                    let flat_rows = flat_rows;
+                    move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let indent_px = |depth: usize| -> f32 { px(depth as f32 * 16.0).into() };
+                        range
+                            .filter_map(|ix| {
+                                if ix >= flat_rows.len() {
+                                    return None;
+                                }
+                                let (entry, depth) = &flat_rows[ix];
+                                let indent = indent_px(*depth);
+                                let tree_name_max_chars =
+                                    ((available_width - indent - tree_fixed_overhead) / 7.5)
+                                        .max(20.0) as usize;
+                                Some(this.render_list_row(
+                                    entry,
+                                    *depth,
+                                    tree_name_max_chars,
+                                    theme.clone(),
+                                    cx,
+                                ))
+                            })
+                            .collect()
+                    }
+                }),
+            )
             .w_full()
             .flex_1()
             .min_h_0()
-            .flex()
-            .flex_col()
-            .overflow_y_scroll();
-
-        if is_directory_loaded
-            && self
-                .directory_cache
-                .get(&directory)
-                .map_or(true, |e| !e.iter().any(|e| self.matches_search(e)))
-        {
-            rows = rows.child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .pt(px(18.0))
-                    .text_sm()
-                    .text_color(theme.text_subtle)
-                    .child(if self.search_query.is_empty() {
-                        "This folder is empty.".to_string()
-                    } else {
-                        "No matching items.".to_string()
-                    }),
-            );
-        } else {
-            rows = self.render_tree_rows(&directory, 0, rows, cx);
-        }
+            .into_any_element()
+        };
 
         div()
             .flex_1()
@@ -1238,7 +1409,7 @@ impl FileBrowserView {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .child(rows)
+            .child(rows_element)
     }
 
     fn render_preview_row(
@@ -1288,27 +1459,28 @@ impl FileBrowserView {
 
         if let Some(preview) = preview {
             if let Some(text_preview) = preview.text_preview.clone() {
-                content = content.child(
-                    div()
-                        .id("file-browser-text-preview")
-                        .w_full()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .p(px(12.0))
-                        .rounded(px(8.0))
-                        .bg(theme.panel_background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .child(
-                            div()
-                                .w_full()
-                                .text_sm()
-                                .line_height(px(21.0))
-                                .text_color(theme.text)
-                                .child(text_preview),
-                        ),
-                );
+                let mut text_preview_div = div()
+                    .id("file-browser-text-preview")
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .overflow_x_hidden()
+                    .p(px(12.0))
+                    .rounded(px(8.0))
+                    .bg(theme.panel_background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .w_full()
+                            .text_sm()
+                            .line_height(px(21.0))
+                            .text_color(theme.text)
+                            .child(text_preview),
+                    );
+                text_preview_div.style().restrict_scroll_to_axis = Some(true);
+                content = content.child(text_preview_div);
             } else {
                 content = content.child(
                     div()
@@ -1368,12 +1540,9 @@ impl FileBrowserView {
         }
 
         div()
-            .flex_1()
-            .min_w(px(280.0))
+            .min_w(px(PREVIEW_MIN_WIDTH)).flex_1()
             .h_full()
             .bg(theme.app_background)
-            .border_l_1()
-            .border_color(theme.border)
             .flex()
             .flex_col()
             .child(content)
@@ -1419,7 +1588,6 @@ impl TracksFileBrowserWidth for FileBrowserView {
 impl Render for FileBrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let show_preview = self.layout.should_show_preview(self.should_show_preview());
 
         let inner = div()
             .id("file-browser-view")
@@ -1484,8 +1652,7 @@ impl Render for FileBrowserView {
                                 } else {
                                     self.render_columns(cx).into_any_element()
                                 }
-                            })
-                            .when(show_preview, |this| this.child(self.render_preview(cx))),
+                            }),
                     ),
             )
             .into_any_element();

@@ -12,17 +12,17 @@ use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::components::tab_bar::DragPreview;
 use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
-    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, TracksFileBrowserWidth,
-    format_datetime, format_size, render_column_resize_handle, render_columns_container,
-    render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
-    render_icon_share, render_icon_tag,
+    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, PREVIEW_MIN_WIDTH, TracksFileBrowserWidth,
+    format_datetime, format_size, max_chars_for_column_width, render_column_resize_handle,
+    render_columns_container, render_icon_columns, render_icon_gallery, render_icon_grid,
+    render_icon_list, render_icon_more, render_icon_share, render_icon_tag, truncate_middle,
 };
 use crate::file_transfer::{FileDragPayload, FileEndpoint, TransferRequest};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileEntry as SftpFileEntry, RemoteFileKind};
 use crate::theme::ActiveTheme;
 
-const COLUMN_DEFAULT_WIDTH: f32 = 208.0;
+const COLUMN_DEFAULT_WIDTH: f32 = 240.0;
 const HEADER_HEIGHT: f32 = 46.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const LIST_HEADER_HEIGHT: f32 = 26.0;
@@ -156,7 +156,7 @@ impl RemoteFileBrowserView {
             let search_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("Search")
-                    .placeholder_font_size(px(13.0))
+                    .placeholder_font_size(px(15.0))
             });
 
             let subscription = cx.subscribe(
@@ -672,7 +672,7 @@ impl RemoteFileBrowserView {
             .justify_center()
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(label),
@@ -712,14 +712,14 @@ impl RemoteFileBrowserView {
 
         div()
             .min_w(px(120.0))
-            .max_w(px(260.0))
+            .max_w(px(220.0))
             .flex()
             .items_center()
             .gap(px(6.0))
             .child(
                 div()
                     .min_w_0()
-                    .text_xs()
+                    .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(format!(
@@ -741,8 +741,6 @@ impl RemoteFileBrowserView {
             .h(px(HEADER_HEIGHT))
             .px(px(12.0))
             .bg(theme.app_background)
-            .border_b_1()
-            .border_color(theme.border)
             .flex()
             .items_center()
             .justify_between()
@@ -899,6 +897,8 @@ impl RemoteFileBrowserView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let theme = cx.theme().ui;
+        let column_width: f32 = self.column_width_at(column_index).into();
+        let name_max_chars = max_chars_for_column_width(column_width, 13.0);
         let selected_child = self.selected_child_for_directory(directory);
         let is_directory_loaded = self.directory_cache.contains_key(directory);
         let entries = self
@@ -919,18 +919,21 @@ impl RemoteFileBrowserView {
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(1.0))
-            .overflow_y_scroll();
+            .gap(px(2.0))
+            .pt(px(6.0))
+            .overflow_y_scroll()
+            .overflow_x_hidden();
 
         let column_dir = directory.to_string();
-        rows = rows.on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-            this.request_transfer_to_path(
-                payload.clone(),
-                column_dir.clone(),
-                true,
-                cx,
-            );
-        }));
+        rows = rows
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                this.request_transfer_to_path(
+                    payload.clone(),
+                    column_dir.clone(),
+                    true,
+                    cx,
+                );
+            }));
 
         if is_directory_loaded && entries.is_empty() {
             rows = rows.child(
@@ -938,7 +941,7 @@ impl RemoteFileBrowserView {
                     .w_full()
                     .px(px(12.0))
                     .pt(px(18.0))
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(if self.search_query.is_empty() {
                         "This folder is empty.".to_string()
@@ -950,7 +953,6 @@ impl RemoteFileBrowserView {
             for entry in entries {
                 let path = entry.path.clone();
                 let name = entry.name.clone();
-                let kind_label = entry.kind_label().to_string();
                 let is_directory = entry.kind == RemoteFileKind::Directory;
                 let is_selected = selected_child.as_ref() == Some(&entry.path);
                 let is_deepest_selected_folder = entry.kind == RemoteFileKind::Directory
@@ -962,7 +964,7 @@ impl RemoteFileBrowserView {
                 } else if is_hovered {
                     theme.tab_hover_background
                 } else {
-                    theme.elevated_background.opacity(0.0)
+                    gpui::transparent_black()
                 };
                 let row_text = if is_active {
                     theme.accent_foreground
@@ -984,14 +986,9 @@ impl RemoteFileBrowserView {
                     div()
                         .id(format!("remote-file-entry-{}", path))
                         .w_full()
-                        .h(px(22.0))
-                        .px(px(8.0))
-                        .rounded(px(5.0))
+                        .h(px(24.0))
+                        .px(px(6.0))
                         .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .bg(row_background)
                         .on_hover(cx.listener(move |this, hovered, _, cx| {
                             this.set_hovered_path(hover_path.clone(), *hovered, cx);
                         }))
@@ -1015,32 +1012,60 @@ impl RemoteFileBrowserView {
                                 cx,
                             );
                         }))
-                        .child(
-                            svg()
-                                .size(px(12.0))
-                                .text_color(match entry.kind {
-                                    RemoteFileKind::Directory => theme.accent,
-                                    _ if is_active => theme.accent_foreground,
-                                    _ => theme.icon_muted,
-                                })
-                                .path(entry.icon().path()),
-                        )
+                        .when(is_directory, |this| {
+                            this.drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
+                                style.border_1().border_color(theme.drop_target_border.opacity(0.5))
+                            })
+                            .rounded(px(6.0))
+                        })
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
+                                .w_full()
+                                .h_full()
+                                .px(px(4.0))
+                                .rounded(px(6.0))
                                 .flex()
                                 .items_center()
-                                .justify_between()
                                 .gap(px(6.0))
-                                .child(div().text_xs().text_color(row_text).child(name))
-                                .child(div().text_xs().text_color(row_meta).child(
-                                    if matches!(entry.kind, RemoteFileKind::Directory) {
-                                        "›".to_string()
-                                    } else {
-                                        kind_label
-                                    },
-                                )),
+                                .bg(row_background)
+                                .child(
+                                    svg()
+                                        .size(px(14.0))
+                                        .text_color(match entry.kind {
+                                            RemoteFileKind::Directory => theme.accent,
+                                            _ if is_active => theme.accent_foreground,
+                                            _ => theme.icon_muted,
+                                        })
+                                        .path(entry.icon().path()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .truncate()
+                                                .text_sm()
+                                                .text_color(row_text)
+                                                .child(truncate_middle(
+                                                    &name, name_max_chars,
+                                                )),
+                                        )
+                                        .child(div().text_sm().text_color(row_meta).child(
+                                            if matches!(entry.kind, RemoteFileKind::Directory) {
+                                                "›".to_string()
+                                            } else {
+                                                String::new()
+                                            },
+                                        )),
+                                ),
                         ),
                 );
             }
@@ -1078,11 +1103,8 @@ impl RemoteFileBrowserView {
 
     fn render_columns(&self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
-        let directories = {
-            let visible = self.visible_directory_paths();
-            let start = visible.len().saturating_sub(4);
-            visible[start..].to_vec()
-        };
+        let directories = self.visible_directory_paths();
+        let show_preview = self.layout.should_show_preview(self.should_show_preview());
 
         let mut columns = div().h_full().flex().bg(theme.app_background);
         for (index, directory) in directories.iter().enumerate() {
@@ -1091,6 +1113,16 @@ impl RemoteFileBrowserView {
             }
 
             columns = columns.child(self.render_directory_column(directory, index, cx));
+        }
+
+        if show_preview {
+            let preview_index = directories.len();
+            if preview_index > 0 {
+                columns = columns.child(self.render_resize_handle(preview_index - 1, cx));
+            }
+            columns = columns.child(self.render_preview(cx));
+        } else if !directories.is_empty() {
+            columns = columns.child(self.render_resize_handle(directories.len() - 1, cx));
         }
 
         render_columns_container("remote-file-browser-columns-container", &theme, columns)
@@ -1122,6 +1154,11 @@ impl RemoteFileBrowserView {
 
         let mut rows = rows;
         let indent = px(depth as f32 * 16.0);
+        let available_width: f32 = self.layout.available_width().map_or(800.0, |w| w.into());
+        let indent_px: f32 = indent.into();
+        let tree_fixed_overhead = 12.0 + 12.0 + 14.0 + 14.0 + 1.0 + 140.0 + 80.0 + 80.0;
+        let tree_name_max_chars =
+            ((available_width - indent_px - tree_fixed_overhead) / 7.5).max(20.0) as usize;
 
         for entry in entries {
             let path = entry.path.clone();
@@ -1139,7 +1176,7 @@ impl RemoteFileBrowserView {
             } else if is_hovered {
                 theme.tab_hover_background
             } else {
-                theme.elevated_background.opacity(0.0)
+                gpui::transparent_black()
             };
             let row_text = if is_selected {
                 theme.accent_foreground
@@ -1162,12 +1199,9 @@ impl RemoteFileBrowserView {
                     .id(format!("remote-file-browser-list-entry-{}", path))
                     .w_full()
                     .h(px(LIST_ROW_HEIGHT))
-                    .pl(px(12.0) + indent)
-                    .pr(px(12.0))
+                    .pl(px(6.0) + indent)
+                    .pr(px(6.0))
                     .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .bg(row_background)
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.set_hovered_path(hover_path.clone(), *hovered, cx);
                     }))
@@ -1195,67 +1229,87 @@ impl RemoteFileBrowserView {
                             cx,
                         );
                     }))
+                    .when(is_directory, |this| {
+                        this.drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
+                            style.border_1().border_color(theme.drop_target_border.opacity(0.5))
+                        })
+                    })
                     .child(
                         div()
+                            .w_full()
+                            .h_full()
+                            .px(px(4.0))
+                            .rounded(px(6.0))
                             .flex()
                             .items_center()
-                            .gap(px(1.0))
+                            .bg(row_background)
                             .child(
                                 div()
-                                    .w(px(14.0))
-                                    .flex_none()
-                                    .text_lg()
-                                    .text_color(row_meta)
                                     .flex()
                                     .items_center()
-                                    .justify_start()
-                                    .child(if is_directory {
-                                        if is_expanded { "▾" } else { "▸" }
-                                    } else {
-                                        ""
-                                    }),
+                                    .gap(px(1.0))
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .flex_none()
+                                            .text_xl()
+                                            .text_color(row_meta)
+                                            .flex()
+                                            .items_center()
+                                            .justify_start()
+                                            .child(if is_directory {
+                                                if is_expanded { "▾" } else { "▸" }
+                                            } else {
+                                                ""
+                                            }),
+                                    )
+                                    .child(
+                                        svg()
+                                            .size(px(14.0))
+                                            .text_color(if is_directory {
+                                                theme.accent
+                                            } else if is_selected {
+                                                theme.accent_foreground
+                                            } else {
+                                                theme.icon_muted
+                                            })
+                                            .path(icon.path()),
+                                    ),
                             )
                             .child(
-                                svg()
-                                    .size(px(14.0))
-                                    .text_color(if is_directory {
-                                        theme.accent
-                                    } else if is_selected {
-                                        theme.accent_foreground
-                                    } else {
-                                        theme.icon_muted
-                                    })
-                                    .path(icon.path()),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(row_text)
+                                    .child(truncate_middle(
+                                        &name, tree_name_max_chars,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .w(px(140.0))
+                                    .text_sm()
+                                    .text_color(row_meta)
+                                    .child(modified_label),
+                            )
+                            .child(
+                                div()
+                                    .w(px(80.0))
+                                    .text_sm()
+                                    .text_color(row_meta)
+                                    .child(size_label),
+                            )
+                            .child(
+                                div()
+                                    .w(px(80.0))
+                                    .text_sm()
+                                    .text_color(row_meta)
+                                    .child(kind_label),
                             ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(row_text)
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .w(px(140.0))
-                            .text_xs()
-                            .text_color(row_meta)
-                            .child(modified_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_xs()
-                            .text_color(row_meta)
-                            .child(size_label),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_xs()
-                            .text_color(row_meta)
-                            .child(kind_label),
                     ),
             );
 
@@ -1279,7 +1333,8 @@ impl RemoteFileBrowserView {
             .min_h_0()
             .flex()
             .flex_col()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .overflow_x_hidden();
 
         if is_directory_loaded
             && self
@@ -1292,7 +1347,7 @@ impl RemoteFileBrowserView {
                     .w_full()
                     .px(px(12.0))
                     .pt(px(18.0))
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(if self.search_query.is_empty() {
                         "This folder is empty.".to_string()
@@ -1332,15 +1387,15 @@ impl RemoteFileBrowserView {
             .border_color(theme.border.opacity(0.65))
             .child(
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child(label.to_string()),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_base()
                     .text_color(theme.text)
-                    .line_height(px(20.0))
+                    .line_height(px(22.0))
                     .child(value.into()),
             )
     }
@@ -1368,6 +1423,7 @@ impl RemoteFileBrowserView {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
+                        .overflow_x_hidden()
                         .p(px(12.0))
                         .rounded(px(8.0))
                         .bg(theme.panel_background)
@@ -1376,8 +1432,8 @@ impl RemoteFileBrowserView {
                         .child(
                             div()
                                 .w_full()
-                                .text_xs()
-                                .line_height(px(18.0))
+                                .text_sm()
+                                .line_height(px(21.0))
                                 .text_color(theme.text)
                                 .child(text_preview),
                         ),
@@ -1412,14 +1468,14 @@ impl RemoteFileBrowserView {
                         .gap(px(3.0))
                         .child(
                             div()
-                                .text_sm()
+                                .text_base()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
                                 .child(preview.name),
                         )
                         .child(
                             div()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(theme.text_muted)
                                 .child(format!("{} - {}", preview.kind_label, preview.size_label)),
                         ),
@@ -1440,25 +1496,22 @@ impl RemoteFileBrowserView {
                     .child(Spinner::new().size(SpinnerSize::Small).color(theme.accent))
                     .child(
                         div()
-                            .text_xs()
+                            .text_sm()
                             .text_color(theme.text_subtle)
                             .child("Loading preview..."),
                     )
             } else {
                 div()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.text_subtle)
                     .child("Select a file or folder to inspect it here.")
             });
         }
 
         div()
-            .flex_1()
-            .min_w(px(280.0))
+            .min_w(px(PREVIEW_MIN_WIDTH)).flex_1()
             .h_full()
             .bg(theme.app_background)
-            .border_l_1()
-            .border_color(theme.border)
             .flex()
             .flex_col()
             .child(content)
@@ -1477,7 +1530,7 @@ impl RemoteFileBrowserView {
                 .border_color(theme.warning.opacity(0.35))
                 .child(
                     div()
-                        .text_sm()
+                        .text_base()
                         .text_color(theme.text)
                         .child(message.clone()),
                 )
@@ -1754,7 +1807,6 @@ impl TracksFileBrowserWidth for RemoteFileBrowserView {
 impl Render for RemoteFileBrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let show_preview = self.layout.should_show_preview(self.should_show_preview());
 
         let inner = div()
             .id("remote-file-browser-view")
@@ -1819,8 +1871,7 @@ impl Render for RemoteFileBrowserView {
                                 } else {
                                     self.render_columns(cx).into_any_element()
                                 }
-                            })
-                            .when(show_preview, |this| this.child(self.render_preview(cx))),
+                            }),
                     ),
             )
             .into_any_element();
