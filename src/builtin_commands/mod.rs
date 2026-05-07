@@ -1,18 +1,33 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{IntoElement, ParentElement, Styled};
 use gpui::{MouseButton, Pixels, div, px, svg};
 
-use crate::assets::Icon;
 use crate::theme::UiTheme;
+
+pub mod argument;
+pub mod command_model;
+pub mod executor;
+pub mod path_resolver;
+pub mod registry;
+pub mod suggestion_engine;
+pub use argument::{ArgumentError, ArgumentParser, ParsedArgument};
+pub use command_model::{BuiltinCommandModel, CommandEntryState, DetectedCommand};
+pub use executor::{CommandContext, CommandExecutor, CommandHandler, CommandResult};
+pub use path_resolver::{LocalPathContext, PathResolver, RemotePathContext};
+pub use registry::{
+    ArgumentType, Availability, BuiltinCommand, CommandHandlerId, CommandRegistry, global_registry,
+};
+pub use suggestion_engine::{ScoredCommand, SuggestionEngine};
 
 /// 内建命令管理器，封装命令状态和建议逻辑
 pub struct BuiltinCommandManager {
     /// 命令输入缓冲区
     state: Option<BuiltinCommandState>,
     /// 当前查询对应的建议缓存，避免每次读取都重新匹配和排序
-    suggestions: Rc<[&'static BuiltinCommandSpec]>,
+    suggestions: Rc<[Arc<BuiltinCommand>]>,
     /// 当前选中的命令索引
     selected_index: usize,
     /// 用户是否已取消提示（ESC）
@@ -48,14 +63,14 @@ impl BuiltinCommandManager {
     /// 获取建议列表缓存的共享引用。
     ///
     /// 返回 `Rc` 仅复制句柄，不会复制底层建议数组。
-    pub fn suggestions(&self) -> Rc<[&'static BuiltinCommandSpec]> {
+    pub fn suggestions(&self) -> Rc<[Arc<BuiltinCommand>]> {
         self.suggestions.clone()
     }
 
     /// 获取当前选中的命令
-    pub fn selected_command(&self) -> Option<&'static BuiltinCommandSpec> {
+    pub fn selected_command(&self) -> Option<Arc<BuiltinCommand>> {
         let index = self.selected_index();
-        self.suggestions.get(index).copied()
+        self.suggestions.get(index).cloned()
     }
 
     /// 追加输入内容。
@@ -186,7 +201,11 @@ impl BuiltinCommandManager {
     fn refresh_suggestions(&mut self) {
         self.suggestions = self
             .query()
-            .map(command_suggestions)
+            .map(|query| {
+                let all_commands = global_registry().all_commands();
+                let scored = SuggestionEngine::suggest(&all_commands, query);
+                scored.into_iter().map(|s| s.command).collect::<Vec<_>>()
+            })
             .unwrap_or_default()
             .into();
         self.selected_index = self.selected_index();
@@ -236,141 +255,21 @@ impl BuiltinCommandState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BuiltinCommandHandler {
-    OpenFileBrowser,
-    OpenFile,
-    LogOnly,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BuiltinCommandSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub icon: Icon,
-    pub handler: BuiltinCommandHandler,
-}
-
-pub const BUILTIN_COMMAND_SPECS: &[BuiltinCommandSpec] = &[
-    BuiltinCommandSpec {
-        name: "/open",
-        description: "Open DeepTerm's File Browser.",
-        icon: Icon::Folder,
-        handler: BuiltinCommandHandler::OpenFileBrowser,
-    },
-    BuiltinCommandSpec {
-        name: "/open-file",
-        description: "Open a file in DeepTerm's editor.",
-        icon: Icon::Screen,
-        handler: BuiltinCommandHandler::OpenFile,
-    },
-    BuiltinCommandSpec {
-        name: "/open-repo",
-        description: "Switch to another indexed repository.",
-        icon: Icon::Host,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/open-skill",
-        description: "Inspect an installed skill definition.",
-        icon: Icon::KeyShield,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/open-rules",
-        description: "View global and project agent rules.",
-        icon: Icon::SettingsHub,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/open-code-review",
-        description: "Open the code review workspace.",
-        icon: Icon::Plus,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/open-mcp-servers",
-        description: "Inspect configured MCP servers.",
-        icon: Icon::Server,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/open-project-rules",
-        description: "Open the project rules file (AGENTS.md).",
-        icon: Icon::Host,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/new-component",
-        description: "Create new GPUI components. Use when building components or UI elements.",
-        icon: Icon::Plus,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/generate-component-story",
-        description: "Create story examples for components.",
-        icon: Icon::Loader,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-    BuiltinCommandSpec {
-        name: "/generate-component-documentation",
-        description: "Generate documentation for new components.",
-        icon: Icon::Loader,
-        handler: BuiltinCommandHandler::LogOnly,
-    },
-];
-
 /// 根据命令行首个 token 查找内建命令定义。
 ///
 /// 只匹配命令名本身，后续参数不会参与查找。
-pub fn find_builtin_command(input: &str) -> Option<&'static BuiltinCommandSpec> {
+pub fn find_builtin_command(input: &str) -> Option<Arc<BuiltinCommand>> {
     let command_name = input.split_whitespace().next()?;
-    BUILTIN_COMMAND_SPECS
-        .iter()
-        .find(|spec| spec.name == command_name)
+    global_registry().find(command_name)
 }
 
 /// 根据当前查询生成建议列表，并按匹配分数从高到低排序。
 ///
 /// 优先级依次是：精确匹配、前缀匹配、名称子串匹配、描述子串匹配。
-pub fn command_suggestions(query: &str) -> Vec<&'static BuiltinCommandSpec> {
-    let command_prefix = query.split_whitespace().next().unwrap_or(query);
-    // 去掉前导 '/' 用于子串匹配
-    let query_for_substring = command_prefix.strip_prefix('/').unwrap_or(command_prefix);
-    let query_lower = query_for_substring.to_lowercase();
-
-    let mut scored: Vec<(i32, &BuiltinCommandSpec)> = BUILTIN_COMMAND_SPECS
-        .iter()
-        .filter_map(|spec| {
-            let name = spec.name;
-            let name_lower = name.to_lowercase();
-            let name_without_slash = name_lower.strip_prefix('/').unwrap_or(&name_lower);
-            let desc_lower = spec.description.to_lowercase();
-
-            let score = if name == command_prefix {
-                // 精确匹配
-                10_000
-            } else if name.starts_with(command_prefix) {
-                // 前缀匹配：匹配前缀越长分数越高，命令名越短分数越高
-                let prefix_len = command_prefix.len() as i32;
-                let name_len = name.len() as i32;
-                5_000 + prefix_len * 100 + (100 - name_len)
-            } else if name_without_slash.contains(&query_lower) {
-                // 名称子串匹配（去掉 '/' 后）
-                let name_len = name.len() as i32;
-                1_000 + (100 - name_len)
-            } else if desc_lower.contains(&query_lower) {
-                // 描述子串匹配
-                100
-            } else {
-                return None;
-            };
-            Some((score, spec))
-        })
-        .collect();
-
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, spec)| spec).collect()
+pub fn command_suggestions(query: &str) -> Vec<Arc<BuiltinCommand>> {
+    let all_commands = global_registry().all_commands();
+    let scored = SuggestionEngine::suggest(&all_commands, query);
+    scored.into_iter().map(|s| s.command).collect()
 }
 
 /// 根据当前输入和选中项，生成最终要提交的命令行。
@@ -378,7 +277,7 @@ pub fn command_suggestions(query: &str) -> Vec<&'static BuiltinCommandSpec> {
 /// `force_selected = true` 用于显式选择场景（如鼠标点击），允许直接用选中项覆盖当前前缀。
 pub fn resolve_command_line(
     query: &str,
-    selected: Option<&BuiltinCommandSpec>,
+    selected: Option<&BuiltinCommand>,
     force_selected: bool,
 ) -> String {
     let Some(command_name) = query.split_whitespace().next() else {
@@ -426,7 +325,7 @@ fn render_key_hint(key: &str, label: Option<&str>, theme: UiTheme) -> impl IntoE
 ///
 /// `on_pick` 由外层提供，用来响应鼠标选中某一条建议。
 pub fn render_overlay<F>(
-    suggestions: Rc<[&'static BuiltinCommandSpec]>,
+    suggestions: Rc<[Arc<BuiltinCommand>]>,
     selected_index: usize,
     top: Pixels,
     theme: UiTheme,
@@ -466,9 +365,9 @@ where
                 .children(
                     suggestions
                         .iter()
-                        .copied()
+                        .cloned()
                         .enumerate()
-                        .map(move |(index, spec)| {
+                        .map(move |(index, cmd)| {
                             let on_pick = on_pick.clone();
                             let is_selected = index == selected_index;
                             div()
@@ -502,7 +401,7 @@ where
                                             svg()
                                                 .size(px(10.0))
                                                 .text_color(theme.icon_muted)
-                                                .path(spec.icon.path()),
+                                                .path(cmd.icon.path()),
                                         ),
                                 )
                                 .child(
@@ -511,7 +410,7 @@ where
                                         .text_size(px(13.5))
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .text_color(theme.text)
-                                        .child(spec.name),
+                                        .child(cmd.name),
                                 )
                                 .child(
                                     div()
@@ -519,7 +418,7 @@ where
                                         .min_w_0()
                                         .text_size(px(13.0))
                                         .text_color(theme.text_muted)
-                                        .child(spec.description),
+                                        .child(cmd.description),
                                 )
                         }),
                 ),
@@ -528,18 +427,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BUILTIN_COMMAND_SPECS, BuiltinCommandManager, find_builtin_command, resolve_command_line,
-    };
+    use super::{BuiltinCommandManager, find_builtin_command, resolve_command_line};
 
     #[test]
     fn parses_builtin_open_command() {
         assert_eq!(
-            find_builtin_command("/open").map(|spec| spec.name),
+            find_builtin_command("/open").map(|cmd| cmd.name),
             Some("/open")
         );
         assert_eq!(
-            find_builtin_command("/open my-target").map(|spec| spec.name),
+            find_builtin_command("/open my-target").map(|cmd| cmd.name),
             Some("/open")
         );
     }
@@ -552,47 +449,37 @@ mod tests {
 
     #[test]
     fn fake_builtin_command_specs_are_available_for_prompt() {
-        assert!(
-            BUILTIN_COMMAND_SPECS
-                .iter()
-                .any(|spec| spec.name == "/open-file")
-        );
-        assert!(
-            BUILTIN_COMMAND_SPECS
-                .iter()
-                .any(|spec| spec.name == "/open-repo")
-        );
+        let registry = super::global_registry();
+        assert!(registry.find("/open-file").is_some());
+        assert!(registry.find("/open-repo").is_some());
     }
 
     #[test]
     fn resolves_selected_command_when_query_is_a_prefix() {
-        let selected = BUILTIN_COMMAND_SPECS
-            .iter()
-            .find(|spec| spec.name == "/open");
+        let registry = super::global_registry();
+        let selected = registry.find("/open");
         assert_eq!(
-            resolve_command_line("/op target", selected, false),
+            resolve_command_line("/op target", selected.as_deref(), false),
             "/open target"
         );
     }
 
     #[test]
     fn keeps_unknown_query_when_selection_only_comes_from_fallback() {
-        let selected = BUILTIN_COMMAND_SPECS
-            .iter()
-            .find(|spec| spec.name == "/open");
+        let registry = super::global_registry();
+        let selected = registry.find("/open");
         assert_eq!(
-            resolve_command_line("/unknown target", selected, false),
+            resolve_command_line("/unknown target", selected.as_deref(), false),
             "/unknown target"
         );
     }
 
     #[test]
     fn forces_selected_command_for_explicit_pick() {
-        let selected = BUILTIN_COMMAND_SPECS
-            .iter()
-            .find(|spec| spec.name == "/open-file");
+        let registry = super::global_registry();
+        let selected = registry.find("/open-file");
         assert_eq!(
-            resolve_command_line("/unknown target", selected, true),
+            resolve_command_line("/unknown target", selected.as_deref(), true),
             "/open-file target"
         );
     }
@@ -605,7 +492,7 @@ mod tests {
 
         assert_eq!(manager.query(), Some("/open target"));
         assert_eq!(
-            manager.selected_command().map(|spec| spec.name),
+            manager.selected_command().map(|cmd| cmd.name),
             Some("/open")
         );
         assert!(!manager.is_dismissed());
@@ -619,7 +506,7 @@ mod tests {
 
         assert_eq!(manager.query(), Some("/open-file target"));
         assert_eq!(
-            manager.selected_command().map(|spec| spec.name),
+            manager.selected_command().map(|cmd| cmd.name),
             Some("/open-file")
         );
     }

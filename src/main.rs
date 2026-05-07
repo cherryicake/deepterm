@@ -142,6 +142,7 @@ fn main() {
             terminal_view::init(cx);
             workspace::init(cx);
             WindowManager::init(cx);
+            crate::builtin_commands::executor::init_global_executor();
             // Bind keyboard shortcuts
             // 使用 None 作为 context，让这些快捷键全局有效
             cx.bind_keys([

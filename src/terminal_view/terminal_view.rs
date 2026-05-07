@@ -44,9 +44,7 @@ pub struct ImeState {
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
-use crate::builtin_commands::{
-    BuiltinCommandHandler, BuiltinCommandManager, find_builtin_command, resolve_command_line,
-};
+use crate::builtin_commands::{BuiltinCommandManager, find_builtin_command, resolve_command_line};
 use crate::ssh::{SshConnectionConfig, sftp_fs};
 use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
@@ -508,6 +506,14 @@ impl TerminalView {
         &self.terminal
     }
 
+    pub fn working_directory(&self) -> Option<&PathBuf> {
+        self.working_directory.as_ref()
+    }
+
+    pub fn ssh_config(&self) -> Option<&SshConnectionConfig> {
+        self.ssh_config.as_ref()
+    }
+
     pub fn title(&self) -> SharedString {
         self.title.clone()
     }
@@ -652,7 +658,11 @@ impl TerminalView {
     fn builtin_command_submission_text(&self, force_selected: bool) -> Option<String> {
         let query = self.builtin_command_manager.query()?;
         let selected = self.builtin_command_manager.selected_command();
-        Some(resolve_command_line(query, selected, force_selected))
+        Some(resolve_command_line(
+            query,
+            selected.as_deref(),
+            force_selected,
+        ))
     }
 
     /// 计算建议浮层在终端内的绘制位置。
@@ -765,205 +775,58 @@ impl TerminalView {
     /// 执行已经解析完成的内建命令。
     ///
     /// 返回 `true` 表示该命令由应用接管，不应再回落到 shell。
-    fn execute_builtin_command(&mut self, command_line: &str, _cx: &mut Context<Self>) -> bool {
-        match find_builtin_command(command_line) {
-            Some(spec) => {
-                log::info!("builtin command {}: {}", spec.name, spec.description);
-                if spec.handler == BuiltinCommandHandler::OpenFileBrowser {
-                    _cx.emit(Event::OpenFileBrowser {
-                        target: self.parse_open_file_browser_target(command_line, _cx),
-                    });
-                } else if spec.handler == BuiltinCommandHandler::OpenFile {
-                    let raw_path = command_line
-                        .strip_prefix(spec.name)
-                        .unwrap_or_default()
-                        .trim();
-                    let path = if self.is_remote(_cx) {
-                        self.resolve_remote_open_target(raw_path, _cx)
-                            .unwrap_or_else(|| raw_path.to_string())
-                    } else {
-                        self.resolve_open_target(raw_path, _cx)
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    _cx.emit(Event::OpenFile { path });
-                }
+    fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
+        use crate::builtin_commands::executor::CommandResult;
+        use crate::builtin_commands::executor::global_executor;
+        use crate::builtin_commands::{ArgumentParser, CommandContext, global_registry};
+
+        // 提取命令名和参数
+        let command_name = command_line
+            .split_whitespace()
+            .next()
+            .unwrap_or(command_line);
+        let argument = ArgumentParser::extract_argument(command_line, command_name);
+
+        // 在注册表中查找命令
+        let Some(command) = global_registry().find(command_name) else {
+            return false;
+        };
+
+        log::info!("builtin command {}: {}", command.name, command.description);
+
+        // 构建命令上下文
+        let ctx = CommandContext {
+            terminal_view: Some(cx.entity()),
+            working_directory: self.working_directory.clone(),
+            is_remote: self.ssh_config.is_some(),
+            ssh_config: self.ssh_config.clone(),
+        };
+
+        // 执行命令
+        let result = {
+            let executor = global_executor().lock().unwrap();
+            executor.execute(&command, argument, ctx)
+        };
+
+        match result {
+            Some(CommandResult::OpenFileBrowser { target }) => {
+                cx.emit(Event::OpenFileBrowser { target });
+                true
+            }
+            Some(CommandResult::OpenFile { path }) => {
+                cx.emit(Event::OpenFile { path });
+                true
+            }
+            Some(CommandResult::Log { .. }) => {
+                // LogOnly 命令不需要发射事件
+                true
+            }
+            Some(CommandResult::None) => true,
+            Some(CommandResult::Error { message }) => {
+                log::warn!("Command error: {}", message);
                 true
             }
             None => false,
-        }
-    }
-
-    fn parse_open_file_browser_target(&self, command_line: &str, cx: &App) -> FileBrowserTarget {
-        let command = find_builtin_command(command_line)
-            .expect("parse_open_file_browser_target should receive a builtin /open command");
-
-        let raw_path = command_line
-            .strip_prefix(command.name)
-            .unwrap_or_default()
-            .trim();
-        if self.is_remote(cx) {
-            return FileBrowserTarget::Remote {
-                ssh_config: self
-                    .ssh_config
-                    .clone()
-                    .expect("remote terminal should carry ssh config"),
-                requested_path: if raw_path.is_empty() {
-                    self.current_remote_working_directory(cx)
-                } else {
-                    self.resolve_remote_open_target(raw_path, cx)
-                },
-            };
-        }
-
-        let requested_path = if raw_path.is_empty() {
-            self.current_working_directory(cx)
-                .or_else(dirs::home_dir)
-                .or(Some(PathBuf::from("/")))
-        } else {
-            Some(self.resolve_open_target(raw_path, cx))
-        };
-
-        FileBrowserTarget::Local { requested_path }
-    }
-
-    fn current_working_directory(&self, cx: &App) -> Option<PathBuf> {
-        let process_cwd = self
-            .terminal
-            .read(cx)
-            .child_process_id()
-            .and_then(Self::query_process_working_directory);
-
-        process_cwd.or_else(|| self.working_directory.clone())
-    }
-
-    fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
-        let terminal = self.terminal.read(cx);
-        terminal
-            .remote_working_directory()
-            .map(str::to_string)
-            .or_else(|| {
-                terminal
-                    .window_title()
-                    .and_then(Self::parse_remote_working_directory_from_title)
-            })
-    }
-
-    fn parse_remote_working_directory_from_title(title: &str) -> Option<String> {
-        let title = title.trim();
-        if title.is_empty() {
-            return None;
-        }
-
-        let mut candidates = vec![title];
-        if let Some((_, suffix)) = title.rsplit_once(": ") {
-            candidates.push(suffix.trim());
-        }
-        if let Some((_, suffix)) = title.rsplit_once(':') {
-            candidates.push(suffix.trim());
-        }
-        if let Some(index) = title.rfind(" /") {
-            candidates.push(title[index + 1..].trim());
-        }
-        if let Some(index) = title.rfind("~/") {
-            candidates.push(title[index..].trim());
-        }
-        if title.ends_with('~') {
-            candidates.push("~");
-        }
-
-        for candidate in candidates {
-            if let Some(path) = Self::normalize_remote_title_path(candidate) {
-                return Some(path);
-            }
-        }
-
-        title.find('/').and_then(|index| {
-            let candidate = title[index..].trim();
-            Self::normalize_remote_title_path(candidate)
-        })
-    }
-
-    fn normalize_remote_title_path(candidate: &str) -> Option<String> {
-        let candidate = candidate.trim().trim_matches(|c| matches!(c, '"' | '\''));
-        if candidate.is_empty() {
-            return None;
-        }
-
-        if candidate.starts_with('/') {
-            return Some(candidate.to_string());
-        }
-
-        if candidate == "~" {
-            return None;
-        }
-
-        candidate
-            .strip_prefix("~/")
-            .map(|stripped| format!("./{}", stripped))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
-    }
-
-    #[cfg(target_os = "macos")]
-    fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
-        let output = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn query_process_working_directory(_pid: u32) -> Option<PathBuf> {
-        None
-    }
-
-    fn resolve_open_target(&self, raw_path: &str, cx: &App) -> PathBuf {
-        let trimmed = raw_path.trim().trim_matches(|c| matches!(c, '"' | '\''));
-        let expanded = if trimmed == "~" {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed))
-        } else if let Some(stripped) = trimmed.strip_prefix("~/") {
-            dirs::home_dir()
-                .map(|home| home.join(stripped))
-                .unwrap_or_else(|| PathBuf::from(trimmed))
-        } else {
-            PathBuf::from(trimmed)
-        };
-
-        if expanded.is_absolute() {
-            expanded
-        } else {
-            self.current_working_directory(cx)
-                .or_else(|| self.working_directory.clone())
-                .or_else(dirs::home_dir)
-                .map(|cwd| cwd.join(&expanded))
-                .unwrap_or(expanded)
-        }
-    }
-
-    fn resolve_remote_open_target(&self, raw_path: &str, cx: &App) -> Option<String> {
-        let trimmed = raw_path.trim().trim_matches(|c| matches!(c, '"' | '\''));
-        if trimmed.is_empty() || trimmed == "~" {
-            None
-        } else if let Some(stripped) = trimmed.strip_prefix("~/") {
-            Some(format!("./{}", stripped))
-        } else if trimmed.starts_with('/') {
-            Some(trimmed.to_string())
-        } else {
-            self.current_remote_working_directory(cx)
-                .map(|cwd| sftp_fs::join_remote_path(&cwd, trimmed))
-                .or_else(|| Some(trimmed.to_string()))
         }
     }
 
