@@ -15,10 +15,11 @@ use crate::components::spinner::{Spinner, SpinnerSize};
 use crate::components::tab_bar::DragPreview;
 use crate::file_browser::FileBrowserEvent;
 use crate::file_browser::shared::{
-    FileBrowserLayoutState, FileBrowserViewMode, FileBrowserWidthTracker, PREVIEW_MIN_WIDTH, TracksFileBrowserWidth,
-    format_datetime, format_size, max_chars_for_column_width, render_column_resize_handle,
-    render_columns_container, render_icon_columns, render_icon_gallery, render_icon_grid,
-    render_icon_list, render_icon_more, render_icon_share, render_icon_tag, truncate_middle,
+    COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, FileBrowserLayoutState, FileBrowserViewMode,
+    FileBrowserWidthTracker, TracksFileBrowserWidth, format_datetime, format_size,
+    max_chars_for_column_width, render_column_resize_handle, render_columns_container,
+    render_icon_columns, render_icon_gallery, render_icon_grid, render_icon_list, render_icon_more,
+    render_icon_share, render_icon_tag, truncate_middle,
 };
 use crate::file_transfer::{FileDragPayload, FileEndpoint, TransferRequest};
 use crate::theme::ActiveTheme;
@@ -102,7 +103,10 @@ impl FileEntry {
     fn size_label(&self) -> String {
         match self.kind {
             FileEntryKind::Directory => "--".to_string(),
-            _ => self.size.map(format_size).unwrap_or_else(|| "--".to_string()),
+            _ => self
+                .size
+                .map(format_size)
+                .unwrap_or_else(|| "--".to_string()),
         }
     }
 
@@ -190,7 +194,7 @@ impl FileBrowserView {
     pub fn open_requested_path(
         &mut self,
         requested_path: Option<PathBuf>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let default_root = Self::default_root_path();
@@ -924,76 +928,69 @@ impl FileBrowserView {
             )
             .on_drag(drag_payload, move |_, position, window, cx| {
                 cx.stop_propagation();
-                cx.new(|cx| {
-                    DragPreview::new(drag_label.clone().into(), position, window, cx)
-                })
+                cx.new(|cx| DragPreview::new(drag_label.clone().into(), position, window, cx))
             })
             .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-                this.request_transfer_to_path(
-                    payload.clone(),
-                    drop_path.clone(),
-                    is_directory,
-                    cx,
-                );
+                this.request_transfer_to_path(payload.clone(), drop_path.clone(), is_directory, cx);
             }));
 
         if is_directory {
             row = row
                 .drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
-                    style.border_1().border_color(theme.drop_target_border.opacity(0.5))
+                    style
+                        .border_1()
+                        .border_color(theme.drop_target_border.opacity(0.5))
                 })
                 .rounded(px(6.0));
         }
 
         row.child(
-                div()
-                    .w_full()
-                    .h_full()
-                    .px(px(4.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(row_background)
-                    .child(
-                        svg()
-                            .size(px(14.0))
-                            .text_color(match entry.kind {
-                                FileEntryKind::Directory => theme.accent,
-                                _ if is_active => theme.accent_foreground,
-                                _ => theme.icon_muted,
-                            })
-                            .path(entry.icon().path()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(row_text)
-                                    .child(truncate_middle(
-                                        &name, name_max_chars,
-                                    )),
-                            )
-                            .child(div().text_sm().text_color(row_meta).child(
-                                if matches!(entry.kind, FileEntryKind::Directory) {
-                                    "›".to_string()
-                                } else {
-                                    String::new()
-                                },
-                            )),
-                    ),
-            )
+            div()
+                .w_full()
+                .h_full()
+                .px(px(4.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .bg(row_background)
+                .child(
+                    svg()
+                        .size(px(14.0))
+                        .text_color(match entry.kind {
+                            FileEntryKind::Directory => theme.accent,
+                            _ if is_active => theme.accent_foreground,
+                            _ => theme.icon_muted,
+                        })
+                        .path(entry.icon().path()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .truncate()
+                                .text_sm()
+                                .text_color(row_text)
+                                .child(truncate_middle(&name, name_max_chars)),
+                        )
+                        .child(div().text_sm().text_color(row_meta).child(
+                            if matches!(entry.kind, FileEntryKind::Directory) {
+                                "›".to_string()
+                            } else {
+                                String::new()
+                            },
+                        )),
+                ),
+        )
     }
 
     fn render_directory_column(
@@ -1231,24 +1228,18 @@ impl FileBrowserView {
             )
             .on_drag(drag_payload, move |_, position, window, cx| {
                 cx.stop_propagation();
-                cx.new(|cx| {
-                    DragPreview::new(drag_label.clone().into(), position, window, cx)
-                })
+                cx.new(|cx| DragPreview::new(drag_label.clone().into(), position, window, cx))
             })
             .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-                this.request_transfer_to_path(
-                    payload.clone(),
-                    drop_path.clone(),
-                    is_directory,
-                    cx,
-                );
+                this.request_transfer_to_path(payload.clone(), drop_path.clone(), is_directory, cx);
             }));
 
         if is_directory {
-            row = row
-                .drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
-                    style.border_1().border_color(theme.drop_target_border.opacity(0.5))
-                });
+            row = row.drag_over::<FileDragPayload>(move |style, _payload, _window, _cx| {
+                style
+                    .border_1()
+                    .border_color(theme.drop_target_border.opacity(0.5))
+            });
         }
 
         row.child(
@@ -1478,7 +1469,8 @@ impl FileBrowserView {
                             .line_height(px(21.0))
                             .text_color(theme.text)
                             .child(text_preview),
-                    );
+                    )
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
                 text_preview_div.style().restrict_scroll_to_axis = Some(true);
                 content = content.child(text_preview_div);
             } else {
@@ -1540,7 +1532,9 @@ impl FileBrowserView {
         }
 
         div()
-            .min_w(px(PREVIEW_MIN_WIDTH)).flex_1()
+            .min_w(px(COLUMN_MIN_WIDTH * 2.0))
+            .max_w(px(COLUMN_MAX_WIDTH))
+            .flex_1()
             .h_full()
             .bg(theme.app_background)
             .flex()

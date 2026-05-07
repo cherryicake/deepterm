@@ -34,10 +34,7 @@ impl FileEndpoint {
     pub fn is_same_device(&self, other: &FileEndpoint) -> bool {
         match (self, other) {
             (Self::Local { .. }, Self::Local { .. }) => true,
-            (
-                Self::Remote { ssh_config: a, .. },
-                Self::Remote { ssh_config: b, .. },
-            ) => a == b,
+            (Self::Remote { ssh_config: a, .. }, Self::Remote { ssh_config: b, .. }) => a == b,
             _ => false,
         }
     }

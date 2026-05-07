@@ -10,6 +10,8 @@ use crate::file_transfer::{ConflictPolicy, FileEndpoint, TransferOperation, Tran
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
+pub const TRANSFER_CANCELLED_MSG: &str = "transfer cancelled";
+
 pub struct TransferManager;
 
 impl TransferManager {
@@ -881,13 +883,12 @@ fn copy_remote_file_to_remote_path(
 
     let local_temporary =
         std::env::temp_dir().join(format!("deepterm-remote-copy-{}", uuid::Uuid::new_v4()));
-    let download_result = session
-        .download_file_to_local_with_cancel_and_progress(
-            remote_path,
-            &local_temporary,
-            cancelled,
-            progress,
-        );
+    let download_result = session.download_file_to_local_with_cancel_and_progress(
+        remote_path,
+        &local_temporary,
+        cancelled,
+        progress,
+    );
     if let Err(error) = download_result {
         let _ = fs::remove_file(&local_temporary);
         let _ = session.remove_file(&temporary_path);
@@ -986,13 +987,12 @@ fn copy_remote_file_between_sessions(
 
     let local_temporary =
         std::env::temp_dir().join(format!("deepterm-remote-bridge-{}", uuid::Uuid::new_v4()));
-    let download_result = source_session
-        .download_file_to_local_with_cancel_and_progress(
-            remote_path,
-            &local_temporary,
-            cancelled,
-            progress,
-        );
+    let download_result = source_session.download_file_to_local_with_cancel_and_progress(
+        remote_path,
+        &local_temporary,
+        cancelled,
+        progress,
+    );
     if let Err(error) = download_result {
         let _ = fs::remove_file(&local_temporary);
         let _ = destination_session.remove_file(&temporary_path);
@@ -1281,7 +1281,7 @@ fn normalize_remote_dir(path: &str) -> String {
 
 fn check_cancelled(cancelled: &Arc<AtomicBool>) -> anyhow::Result<()> {
     if cancelled.load(Ordering::Relaxed) {
-        bail!("transfer cancelled");
+        bail!("{}", TRANSFER_CANCELLED_MSG);
     }
     Ok(())
 }

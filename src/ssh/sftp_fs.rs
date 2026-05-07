@@ -13,6 +13,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::file_transfer::TRANSFER_CANCELLED_MSG;
 use crate::ssh::auth::{try_agent_auth, try_default_keys};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
@@ -210,7 +211,7 @@ impl BlockingSftpSession {
 
             loop {
                 if cancelled.load(Ordering::Relaxed) {
-                    return Err(anyhow!("transfer cancelled"));
+                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
                 }
 
                 let read = local_file.read(&mut buffer)?;
@@ -227,7 +228,7 @@ impl BlockingSftpSession {
             }
 
             if cancelled.load(Ordering::Relaxed) {
-                return Err(anyhow!("transfer cancelled"));
+                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
             remote_file.shutdown().await?;
@@ -272,7 +273,7 @@ impl BlockingSftpSession {
 
             loop {
                 if cancelled.load(Ordering::Relaxed) {
-                    return Err(anyhow!("transfer cancelled"));
+                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
                 }
 
                 let read = remote_file.read(&mut buffer).await?;
@@ -289,7 +290,7 @@ impl BlockingSftpSession {
             }
 
             if cancelled.load(Ordering::Relaxed) {
-                return Err(anyhow!("transfer cancelled"));
+                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
             local_file.flush()?;

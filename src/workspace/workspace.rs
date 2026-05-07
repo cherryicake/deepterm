@@ -21,7 +21,9 @@ use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
 use crate::file_browser::shared::format_size;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
-use crate::file_transfer::{FileEndpoint, TransferManager, TransferRequest, TransferSummary};
+use crate::file_transfer::{
+    FileEndpoint, TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary,
+};
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
@@ -636,12 +638,11 @@ impl Workspace {
         .detach();
 
         let task = cx.background_executor().spawn(async move {
-            let result =
-                TransferManager::execute_blocking_with_cancel_and_progress(
-                    request,
-                    task_cancelled,
-                    Some(progress),
-                );
+            let result = TransferManager::execute_blocking_with_cancel_and_progress(
+                request,
+                task_cancelled,
+                Some(progress),
+            );
             is_done_for_task.store(true, Ordering::Relaxed);
             result
         });
@@ -657,7 +658,6 @@ impl Workspace {
         })
         .detach();
 
-        let poll_progress = bytes_transferred.clone();
         cx.spawn(async move |_, cx| {
             loop {
                 cx.background_executor()
@@ -667,12 +667,8 @@ impl Workspace {
                     break;
                 }
                 if let Some(entity) = weak.upgrade() {
-                    let transferred = poll_progress.load(Ordering::Relaxed);
                     let _ = entity.update(cx, |this, cx| {
-                        if let Some(task) =
-                            this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
-                        {
-                            task.bytes_transferred.store(transferred, Ordering::Relaxed);
+                        if this.transfer_tasks.iter().any(|t| t.id == transfer_id) {
                             cx.notify();
                         }
                     });
@@ -688,6 +684,8 @@ impl Workspace {
         result: anyhow::Result<TransferSummary>,
         cx: &mut Context<Self>,
     ) {
+        let should_refresh = true;
+
         let Some(task) = self
             .transfer_tasks
             .iter_mut()
@@ -707,9 +705,8 @@ impl Workspace {
                     files: summary.files_transferred,
                     bytes: summary.bytes_transferred,
                 };
-                self.refresh_file_browsers(cx);
             }
-            Err(error) if error.to_string().contains("transfer cancelled") => {
+            Err(error) if error.to_string().contains(TRANSFER_CANCELLED_MSG) => {
                 log::info!("Transfer cancelled");
                 task.status = TransferTaskStatus::Cancelled;
             }
@@ -719,6 +716,24 @@ impl Workspace {
             }
         }
         cx.notify();
+
+        if should_refresh {
+            self.refresh_file_browsers(cx);
+        }
+
+        // 10秒后自动关闭
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+            if let Some(entity) = weak.upgrade() {
+                let _ = entity.update(cx, |this, cx| {
+                    this.remove_transfer_task(transfer_id, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn refresh_file_browsers(&mut self, cx: &mut Context<Self>) {
@@ -739,6 +754,14 @@ impl Workspace {
         {
             task.cancelled.store(true, Ordering::Relaxed);
             task.status = TransferTaskStatus::Cancelled;
+            cx.notify();
+        }
+    }
+
+    fn remove_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
+        let initial_len = self.transfer_tasks.len();
+        self.transfer_tasks.retain(|task| task.id != transfer_id);
+        if self.transfer_tasks.len() != initial_len {
             cx.notify();
         }
     }
@@ -1948,10 +1971,8 @@ impl Workspace {
         for task in self.transfer_tasks.iter().rev().take(5) {
             let task_id = task.id;
             let transferred = task.bytes_transferred.load(Ordering::Relaxed);
-            let status_label =
-                transfer_status_label(&task.status, transferred, task.total_bytes);
-            let can_cancel = matches!(task.status, TransferTaskStatus::Running);
-
+            let status_label = transfer_status_label(&task.status, transferred, task.total_bytes);
+            let is_running = matches!(task.status, TransferTaskStatus::Running);
             panel = panel.child(
                 div()
                     .w_full()
@@ -1983,7 +2004,7 @@ impl Workspace {
                                     .child(status_label),
                             ),
                     )
-                    .when(can_cancel, |this| {
+                    .when(is_running, |this| {
                         this.child(
                             div()
                                 .id(format!("transfer-cancel-{}", task_id))
@@ -1997,6 +2018,23 @@ impl Workspace {
                                 .child("Cancel")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.cancel_transfer_task(task_id, cx);
+                                })),
+                        )
+                    })
+                    .when(!is_running, |this| {
+                        this.child(
+                            div()
+                                .id(format!("transfer-close-{}", task_id))
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .bg(theme.tab_hover_background)
+                                .text_xs()
+                                .text_color(theme.text)
+                                .cursor_pointer()
+                                .child("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_transfer_task(task_id, cx);
                                 })),
                         )
                     }),

@@ -8,7 +8,6 @@ pub const COLUMN_MIN_WIDTH: f32 = 140.0;
 pub const COLUMN_MAX_WIDTH: f32 = 720.0;
 pub const COLUMN_HANDLE_HIT_WIDTH: f32 = 6.0;
 pub const COLUMN_HANDLE_VISUAL_WIDTH: f32 = 1.0;
-pub const PREVIEW_MIN_WIDTH: f32 = 560.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileBrowserViewMode {
@@ -134,7 +133,7 @@ impl FileBrowserLayoutState {
         has_preview
             && self
                 .available_width
-                .map_or(false, |width| width >= px(PREVIEW_MIN_WIDTH))
+                .map_or(false, |width| width >= px(COLUMN_MIN_WIDTH))
     }
 
     pub fn columns(&self) -> &ColumnLayoutState {
@@ -228,14 +227,16 @@ impl<T: TracksFileBrowserWidth> gpui::Element for FileBrowserWidthTracker<T> {
 }
 
 pub fn render_columns_container(id: &'static str, theme: &UiTheme, columns: Div) -> Stateful<Div> {
-    div()
+    let mut container = div()
         .id(id)
         .flex_1()
         .h_full()
         .bg(theme.app_background)
         .overflow_x_scroll()
         .flex()
-        .child(columns)
+        .child(columns);
+    container.style().restrict_scroll_to_axis = Some(true);
+    container
 }
 
 pub fn render_column_resize_handle<T>(
@@ -353,7 +354,8 @@ pub fn is_binary_content(bytes: &[u8]) -> bool {
         || bytes.starts_with(b"\xFF\xFB") // MP3 frame sync (MPEG1 Layer3)
         || bytes.starts_with(b"\xFF\xFA") // MP3 frame sync (MPEG1 Layer3)
         || bytes.starts_with(b"\xFF\xF3") // MP3 frame sync (MPEG2 Layer3)
-        || bytes.starts_with(b"\xFF\xF2") // MP3 frame sync (MPEG2 Layer3)
+        || bytes.starts_with(b"\xFF\xF2")
+    // MP3 frame sync (MPEG2 Layer3)
     {
         return true;
     }
