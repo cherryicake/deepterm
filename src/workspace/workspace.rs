@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use gpui::{
     App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable, GlobalElementId,
     InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, StatefulInteractiveElement, Style, Styled, Subscription, Window, div, px,
+    Render, Style, Styled, Subscription, Window, div, px,
 };
 use gpui::{KeyBinding, actions, prelude::*};
 
@@ -19,10 +19,11 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
-use crate::file_browser::shared::format_size;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::{
-    FileEndpoint, TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary,
+    TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
+    TransferTaskState, TransferTaskStatus, quick_total_size, render_transfer_overlay,
+    transfer_label,
 };
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
@@ -135,24 +136,6 @@ pub struct Workspace {
     next_transfer_id: usize,
     /// 文件传输任务状态
     transfer_tasks: Vec<TransferTaskState>,
-}
-
-#[derive(Clone, Debug)]
-enum TransferTaskStatus {
-    Running,
-    Completed { files: usize, bytes: u64 },
-    Failed(String),
-    Cancelled,
-}
-
-#[derive(Clone)]
-struct TransferTaskState {
-    id: usize,
-    label: String,
-    status: TransferTaskStatus,
-    cancelled: Arc<AtomicBool>,
-    bytes_transferred: Arc<AtomicU64>,
-    total_bytes: u64,
 }
 
 /// Resize拖拽状态
@@ -684,7 +667,6 @@ impl Workspace {
         result: anyhow::Result<TransferSummary>,
         cx: &mut Context<Self>,
     ) {
-        let should_refresh = true;
 
         let Some(task) = self
             .transfer_tasks
@@ -717,9 +699,7 @@ impl Workspace {
         }
         cx.notify();
 
-        if should_refresh {
-            self.refresh_file_browsers(cx);
-        }
+        self.refresh_file_browsers(cx);
 
         // 10秒后自动关闭
         let weak = cx.weak_entity();
@@ -743,26 +723,6 @@ impl Workspace {
                     panel.refresh_file_browser_content(cx);
                 });
             }
-        }
-    }
-
-    fn cancel_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
-        if let Some(task) = self
-            .transfer_tasks
-            .iter_mut()
-            .find(|task| task.id == transfer_id)
-        {
-            task.cancelled.store(true, Ordering::Relaxed);
-            task.status = TransferTaskStatus::Cancelled;
-            cx.notify();
-        }
-    }
-
-    fn remove_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
-        let initial_len = self.transfer_tasks.len();
-        self.transfer_tasks.retain(|task| task.id != transfer_id);
-        if self.transfer_tasks.len() != initial_len {
-            cx.notify();
         }
     }
 
@@ -1943,176 +1903,28 @@ impl Workspace {
             }
         }
     }
-
-    fn render_transfer_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        if self.transfer_tasks.is_empty() {
-            return None;
-        }
-
-        let theme = cx.theme().ui;
-        let mut panel = div()
-            .absolute()
-            .right(px(18.0))
-            .bottom(px(18.0))
-            .w(px(360.0))
-            .max_h(px(280.0))
-            .overflow_hidden()
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.elevated_background)
-            .shadow_md()
-            .p(px(12.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(div().text_sm().text_color(theme.text).child("Transfers"));
-
-        for task in self.transfer_tasks.iter().rev().take(5) {
-            let task_id = task.id;
-            let transferred = task.bytes_transferred.load(Ordering::Relaxed);
-            let status_label = transfer_status_label(&task.status, transferred, task.total_bytes);
-            let is_running = matches!(task.status, TransferTaskStatus::Running);
-            panel = panel.child(
-                div()
-                    .w_full()
-                    .rounded(px(8.0))
-                    .bg(theme.panel_background)
-                    .border_1()
-                    .border_color(theme.border.opacity(0.5))
-                    .p(px(8.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text)
-                                    .child(task.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text_subtle)
-                                    .child(status_label),
-                            ),
-                    )
-                    .when(is_running, |this| {
-                        this.child(
-                            div()
-                                .id(format!("transfer-cancel-{}", task_id))
-                                .px(px(8.0))
-                                .py(px(4.0))
-                                .rounded(px(6.0))
-                                .bg(theme.tab_hover_background)
-                                .text_xs()
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .child("Cancel")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.cancel_transfer_task(task_id, cx);
-                                })),
-                        )
-                    })
-                    .when(!is_running, |this| {
-                        this.child(
-                            div()
-                                .id(format!("transfer-close-{}", task_id))
-                                .px(px(8.0))
-                                .py(px(4.0))
-                                .rounded(px(6.0))
-                                .bg(theme.tab_hover_background)
-                                .text_xs()
-                                .text_color(theme.text)
-                                .cursor_pointer()
-                                .child("×")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_transfer_task(task_id, cx);
-                                })),
-                        )
-                    }),
-            );
-        }
-
-        Some(panel)
-    }
 }
 
-fn transfer_label(request: &TransferRequest) -> String {
-    let source_label = match request.sources.as_slice() {
-        [] => "No files".to_string(),
-        [source] => endpoint_label(source),
-        sources => format!("{} items", sources.len()),
-    };
-    format!(
-        "{} → {}",
-        source_label,
-        endpoint_label(&request.destination)
-    )
-}
-
-fn endpoint_label(endpoint: &FileEndpoint) -> String {
-    match endpoint {
-        FileEndpoint::Local { path } => path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string()),
-        FileEndpoint::Remote { ssh_config, path } => {
-            let name = path
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or("/");
-            format!("{}:{}", ssh_config.host_label(), name)
+impl TransferTaskHandler for Workspace {
+    fn cancel_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
+        if let Some(task) = self
+            .transfer_tasks
+            .iter_mut()
+            .find(|task| task.id == transfer_id)
+        {
+            task.cancelled.store(true, Ordering::Relaxed);
+            task.status = TransferTaskStatus::Cancelled;
+            cx.notify();
         }
     }
-}
 
-fn transfer_status_label(
-    status: &TransferTaskStatus,
-    bytes_transferred: u64,
-    total_bytes: u64,
-) -> String {
-    match status {
-        TransferTaskStatus::Running => {
-            if total_bytes > 0 {
-                let percent = (bytes_transferred * 100 / total_bytes).min(100);
-                format!("{}%", percent)
-            } else {
-                format!("Running... {}", format_size(bytes_transferred))
-            }
+    fn remove_transfer_task(&mut self, transfer_id: usize, cx: &mut Context<Self>) {
+        let initial_len = self.transfer_tasks.len();
+        self.transfer_tasks.retain(|task| task.id != transfer_id);
+        if self.transfer_tasks.len() != initial_len {
+            cx.notify();
         }
-        TransferTaskStatus::Completed { files, bytes } => {
-            format!("Completed: {} files, {}", files, format_size(*bytes))
-        }
-        TransferTaskStatus::Failed(error) => format!("Failed: {}", error),
-        TransferTaskStatus::Cancelled => "Cancelled".to_string(),
     }
-}
-
-fn quick_total_size(request: &TransferRequest) -> u64 {
-    use std::fs;
-    request
-        .sources
-        .iter()
-        .map(|source| match source {
-            FileEndpoint::Local { path } => fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0),
-            FileEndpoint::Remote { ssh_config, path } => {
-                crate::ssh::sftp_fs::metadata(ssh_config, path)
-                    .ok()
-                    .map(|m| m.size)
-                    .unwrap_or(0)
-            }
-        })
-        .sum()
 }
 
 impl Focusable for Workspace {
@@ -2172,9 +1984,27 @@ impl Render for Workspace {
                         this.child(self.render_split_container(container, &[], cx))
                     }),
             )
-            .when_some(self.render_transfer_overlay(cx), |this, overlay| {
-                this.child(overlay)
-            })
+            .when_some(
+                {
+                    let handle = cx.entity().downgrade();
+                    let handle2 = handle.clone();
+                    render_transfer_overlay(
+                        &self.transfer_tasks,
+                        cx.theme().ui,
+                        move |task_id, app| {
+                            if let Some(ws) = handle.upgrade() {
+                                ws.update(app, |this, cx| this.cancel_transfer_task(task_id, cx));
+                            }
+                        },
+                        move |task_id, app| {
+                            if let Some(ws) = handle2.upgrade() {
+                                ws.update(app, |this, cx| this.remove_transfer_task(task_id, cx));
+                            }
+                        },
+                    )
+                },
+                |this, overlay| this.child(overlay),
+            )
             .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
                 this.create_local_terminal(window, cx);
             }))

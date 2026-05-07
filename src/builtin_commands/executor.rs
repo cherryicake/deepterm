@@ -14,6 +14,10 @@ use crate::terminal_view::TerminalView;
 pub struct CommandContext {
     pub terminal_view: Option<Entity<TerminalView>>,
     pub working_directory: Option<PathBuf>,
+    /// 本地 shell 进程的实时工作目录（通过 /proc/<pid>/cwd 或 lsof 查询）
+    pub process_cwd: Option<PathBuf>,
+    /// 远程终端动态追踪的工作目录（通过 OSC 7 / OSC 1337 序列更新）
+    pub remote_cwd: Option<String>,
     pub is_remote: bool,
     pub ssh_config: Option<SshConnectionConfig>,
 }
@@ -117,25 +121,29 @@ impl CommandHandler for OpenFileBrowserHandler {
             let ssh_config = ctx
                 .ssh_config
                 .expect("remote terminal should carry ssh config");
-            // 注意：由于 trait 是 dyn-compatible 的，无法直接使用 GPUI 上下文
-            // 因此远程 cwd 的解析暂时使用 ssh_config 中的信息
-            // 更完整的实现需要在 TerminalView 中预解析 remote_cwd 后传入 ctx
-            let requested_path = argument.and_then(|raw| PathResolver::resolve_remote(raw, None));
+
+            // 使用远程终端动态追踪的 CWD（来自 OSC 序列），作为无参时的默认路径
+            let requested_path = argument.and_then(|raw| {
+                PathResolver::resolve_remote(raw, ctx.remote_cwd.as_deref())
+            });
 
             FileBrowserTarget::Remote {
                 ssh_config,
-                requested_path,
+                // 无参数时默认打开远程终端当前工作目录
+                requested_path: requested_path.or_else(|| ctx.remote_cwd.clone()),
             }
         } else {
             let local_ctx = LocalPathContext {
                 working_directory: ctx.working_directory.clone(),
-                process_cwd: None, // 需要在 TerminalView 中预获取
+                process_cwd: None,
             };
 
             let requested_path = argument.map(|raw| PathResolver::resolve_local(raw, &local_ctx));
 
             FileBrowserTarget::Local {
+                // 优先使用进程实时 CWD，其次用初始工作目录，最后回退到家目录和根目录
                 requested_path: requested_path
+                    .or_else(|| ctx.process_cwd.clone())
                     .or_else(|| local_ctx.working_directory)
                     .or_else(dirs::home_dir)
                     .or(Some(PathBuf::from("/"))),
@@ -246,6 +254,8 @@ mod tests {
                     CommandContext {
                         terminal_view: None,
                         working_directory: None,
+                        process_cwd: None,
+                        remote_cwd: None,
                         is_remote: false,
                         ssh_config: None,
                     }
@@ -262,6 +272,8 @@ mod tests {
             CommandContext {
                 terminal_view: None,
                 working_directory: Some(PathBuf::from("/home/user")),
+                process_cwd: None,
+                remote_cwd: None,
                 is_remote: false,
                 ssh_config: None,
             },
@@ -286,6 +298,8 @@ mod tests {
             CommandContext {
                 terminal_view: None,
                 working_directory: Some(PathBuf::from("/home/user/project")),
+                process_cwd: None,
+                remote_cwd: None,
                 is_remote: false,
                 ssh_config: None,
             },

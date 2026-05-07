@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -44,8 +43,8 @@ pub struct ImeState {
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
-use crate::builtin_commands::{BuiltinCommandManager, find_builtin_command, resolve_command_line};
-use crate::ssh::{SshConnectionConfig, sftp_fs};
+use crate::builtin_commands::{BuiltinCommandManager, resolve_command_line};
+use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::terminal::mappings::keys::to_esc_str;
@@ -778,7 +777,7 @@ impl TerminalView {
     fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
         use crate::builtin_commands::executor::CommandResult;
         use crate::builtin_commands::executor::global_executor;
-        use crate::builtin_commands::{ArgumentParser, CommandContext, global_registry};
+        use crate::builtin_commands::{ArgumentParser, CommandContext, PathResolver, global_registry};
 
         // 提取命令名和参数
         let command_name = command_line
@@ -794,10 +793,26 @@ impl TerminalView {
 
         log::info!("builtin command {}: {}", command.name, command.description);
 
+        // 查询 shell 进程的实时工作目录
+        let (process_cwd, remote_cwd) = if self.ssh_config.is_some() {
+            // 远程终端：通过 OSC 序列动态追踪
+            let remote_cwd = self.terminal.read(cx).remote_working_directory().map(String::from);
+            (None, remote_cwd)
+        } else {
+            // 本地终端：通过操作系统查询 shell 进程实际 CWD
+            let pid = self.terminal.read(cx).child_process_id();
+            let process_cwd = pid
+                .and_then(PathResolver::query_process_working_directory)
+                .or_else(|| self.working_directory.clone());
+            (process_cwd, None)
+        };
+
         // 构建命令上下文
         let ctx = CommandContext {
             terminal_view: Some(cx.entity()),
             working_directory: self.working_directory.clone(),
+            process_cwd,
+            remote_cwd,
             is_remote: self.ssh_config.is_some(),
             ssh_config: self.ssh_config.clone(),
         };
