@@ -434,7 +434,7 @@ impl Workspace {
         // 获取当前存在的所有panel ID
         let current_panel_ids: std::collections::HashSet<String> = panels
             .iter()
-            .map(|p| p.read(cx).panel_id().to_string())
+            .map(|p| p.read(cx).panel_id.to_string())
             .collect();
 
         // 清理已不存在panel的订阅
@@ -443,7 +443,7 @@ impl Workspace {
 
         for panel in panels {
             // 检查是否已经订阅过这个panel
-            let panel_id = panel.read(cx).panel_id().to_string();
+            let panel_id = panel.read(cx).panel_id.to_string();
             let already_subscribed = self.panel_subscriptions.contains_key(&panel_id);
 
             if !already_subscribed {
@@ -746,7 +746,7 @@ impl Workspace {
             let panels = tab_info.container.collect_panels_vec();
             log::info!("Updating broadcast state for {} panels", panels.len());
             for panel in panels {
-                let panel_id = panel.read(cx).panel_id().to_string();
+                let panel_id = panel.read(cx).panel_id.to_string();
                 panel.update(cx, |p, cx| {
                     log::info!(
                         "Setting panel {} broadcast_enabled to {}",
@@ -784,7 +784,7 @@ impl Workspace {
             .into_iter()
             .filter(|panel| {
                 let panel_ref = panel.read(cx);
-                panel_ref.panel_id() != source_panel_id && panel_ref.has_terminal_content()
+                panel_ref.panel_id != source_panel_id && panel_ref.has_terminal_content()
             })
             .collect();
 
@@ -859,8 +859,8 @@ impl Workspace {
         // 取消其他panel的选中状态，设置当前panel为选中
         for panel in panels {
             panel.update(cx, |p, cx| {
-                let should_be_selected = p.panel_id() == selected_panel_id;
-                if p.is_selected() != should_be_selected {
+                let should_be_selected = p.panel_id == selected_panel_id;
+                if p.is_selected != should_be_selected {
                     p.set_selected(should_be_selected, cx);
                 }
             });
@@ -889,8 +889,8 @@ impl Workspace {
         // 找到当前选中的panel
         let panels = tab_info.container.collect_panels_vec();
         for panel in panels {
-            if panel.read(cx).is_selected() {
-                let panel_id = panel.read(cx).panel_id().to_string();
+            if panel.read(cx).is_selected {
+                let panel_id = panel.read(cx).panel_id.to_string();
                 self.handle_panel_close(&panel_id, window, cx);
                 return;
             }
@@ -898,7 +898,7 @@ impl Workspace {
 
         // 如果没有选中的panel，但有多个panel存在，关闭第一个
         if let Some(first_panel) = tab_info.container.get_first_panel() {
-            let panel_id = first_panel.read(cx).panel_id().to_string();
+            let panel_id = first_panel.read(cx).panel_id.to_string();
             self.handle_panel_close(&panel_id, window, cx);
         }
     }
@@ -955,7 +955,7 @@ impl Workspace {
             let remaining_icon = tab_info
                 .container
                 .get_first_panel()
-                .map(|p| p.read(cx).remote_os())
+                .map(|p| p.read(cx).remote_os)
                 .flatten()
                 .map(|os| os.icon());
 
@@ -1069,7 +1069,7 @@ impl Workspace {
         if !dragged_panels.is_empty() {
             let panel_ids: Vec<_> = dragged_panels
                 .iter()
-                .map(|p| p.read(cx).panel_id().to_string())
+                .map(|p| p.read(cx).panel_id.to_string())
                 .collect();
             let workspace = cx.entity();
             cx.defer(move |cx| {
@@ -1238,7 +1238,7 @@ impl Workspace {
             let remaining_icon = tab_info
                 .container
                 .get_first_panel()
-                .and_then(|p| p.read(cx).remote_os())
+                .and_then(|p| p.read(cx).remote_os)
                 .map(|os| os.icon());
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
@@ -1449,7 +1449,7 @@ impl Workspace {
             },
         );
         self.panel_subscriptions.insert(
-            file_browser_panel.read(cx).panel_id().to_string(),
+            file_browser_panel.read(cx).panel_id.to_string(),
             subscription,
         );
 
@@ -1573,7 +1573,7 @@ impl Workspace {
             },
         );
         self.panel_subscriptions
-            .insert(editor_panel.read(cx).panel_id().to_string(), subscription);
+            .insert(editor_panel.read(cx).panel_id.to_string(), subscription);
 
         self.active_tab_id = tab_id.clone();
         self.switch_to_tab(&tab_id, cx);
@@ -1753,7 +1753,7 @@ impl Workspace {
                 this.handle_panel_event(event, window, cx);
             });
         self.panel_subscriptions
-            .insert(panel.read(cx).panel_id().to_string(), subscription);
+            .insert(panel.read(cx).panel_id.to_string(), subscription);
 
         self.active_tab_id = tab_id.clone();
         self.switch_to_tab(&tab_id, cx);

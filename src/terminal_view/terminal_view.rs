@@ -137,6 +137,11 @@ pub struct TerminalView {
     recent_scroll_velocities: VecDeque<f32>,
     /// Last scroll direction: -1 = up, 1 = down, 0 = none.
     last_scroll_direction: i32,
+    // ── Toast notification ─────────────────────────────────────────────────
+    /// 当前显示的 Toast 消息（错误提示等）
+    toast_message: Option<String>,
+    /// Toast 自动隐藏任务
+    toast_hide_task: Option<Task<()>>,
 }
 
 /// SSH 连接状态检查结果
@@ -178,7 +183,7 @@ impl TerminalView {
 
     /// 检查终端是否检测到新的远程操作系统，如果是则发出事件
     fn check_remote_os(&mut self, terminal: Entity<Terminal>, cx: &mut Context<Self>) {
-        if let Some(os) = terminal.read(cx).remote_os() {
+        if let Some(os) = terminal.read(cx).remote_os {
             if self.remote_os != Some(os) {
                 self.remote_os = Some(os);
                 cx.emit(Event::RemoteOsDetected { os });
@@ -284,6 +289,8 @@ impl TerminalView {
                 last_scroll_instant: Instant::now(),
                 recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
                 last_scroll_direction: 0,
+                toast_message: None,
+                toast_hide_task: None,
             };
             this.update_title(cx);
             this
@@ -405,6 +412,8 @@ impl TerminalView {
                 last_scroll_instant: Instant::now(),
                 recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
                 last_scroll_direction: 0,
+                toast_message: None,
+                toast_hide_task: None,
             };
 
             // 订阅 SshConnectView 的重新连接事件并存储订阅
@@ -565,14 +574,14 @@ impl TerminalView {
     fn calculate_scrollbar_thumb_y(&self, cx: &App) -> Pixels {
         let term = self.terminal.read(cx);
         let content = term.last_content();
-        let line_height = term.terminal_bounds().line_height;
+        let line_height = term.terminal_bounds.line_height;
 
         crate::terminal_view::terminal_scrollbar::calculate_thumb_metrics(
             content.total_lines,
             content.viewport_lines,
             content.display_offset,
             line_height,
-            term.terminal_bounds().bounds.size.height,
+            term.terminal_bounds.bounds.size.height,
         )
         .map(|(y, _)| y)
         .unwrap_or(px(0.0))
@@ -670,7 +679,7 @@ impl TerminalView {
     fn builtin_command_overlay_position(&self, cx: &App) -> Pixels {
         let term = self.terminal.read(cx);
         let content = term.last_content();
-        let bounds = term.terminal_bounds();
+        let bounds = term.terminal_bounds;
         let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
         let overlay_row = (cursor_line_in_viewport + 1).max(0) as f32;
 
@@ -680,28 +689,52 @@ impl TerminalView {
     }
 
     /// 渲染内建命令建议浮层，并把鼠标选择转成一次显式补全。
-    fn render_builtin_command_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement + 'static {
-        use crate::builtin_commands::render_overlay;
-
-        let suggestions = self.builtin_command_manager.suggestions();
+    fn render_builtin_command_overlay(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let top = self.builtin_command_overlay_position(cx);
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
-        let selected_index = self.builtin_command_manager.selected_index();
         let view = cx.entity().clone();
 
-        render_overlay(
-            suggestions,
-            selected_index,
-            top,
-            theme,
-            is_dark,
-            move |index, _window, cx| {
-                view.update(cx, |this, cx| {
-                    this.mutate_builtin_command(cx, |manager| manager.pick(index));
-                });
-            },
-        )
+        if self.builtin_command_manager.is_argument_input() {
+            // 参数输入阶段：渲染路径补全浮层
+            let path_completions = self.builtin_command_manager.path_completions.clone();
+            let selected_index = self.builtin_command_manager.path_selected_index;
+
+            crate::builtin_commands::render_path_overlay(
+                &path_completions,
+                selected_index,
+                top,
+                theme,
+                is_dark,
+                move |index, _window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.mutate_builtin_command(cx, |manager| manager.pick_path(index));
+                    });
+                },
+            )
+            .into_any_element()
+        } else {
+            // 命令名输入阶段：渲染命令建议浮层
+            let suggestions = self.builtin_command_manager.suggestions();
+            let selected_index = self.builtin_command_manager.selected_index();
+
+            crate::builtin_commands::render_overlay(
+                suggestions,
+                selected_index,
+                top,
+                theme,
+                is_dark,
+                move |index, _window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.mutate_builtin_command(cx, |manager| manager.pick(index));
+                    });
+                },
+            )
+            .into_any_element()
+        }
     }
 
     /// Clears the marked (pre-edit) text state.
@@ -800,7 +833,7 @@ impl TerminalView {
             (None, remote_cwd)
         } else {
             // 本地终端：通过操作系统查询 shell 进程实际 CWD
-            let pid = self.terminal.read(cx).child_process_id();
+            let pid = self.terminal.read(cx).child_process_id;
             let process_cwd = pid
                 .and_then(PathResolver::query_process_working_directory)
                 .or_else(|| self.working_directory.clone());
@@ -839,6 +872,7 @@ impl TerminalView {
             Some(CommandResult::None) => true,
             Some(CommandResult::Error { message }) => {
                 log::warn!("Command error: {}", message);
+                self.show_toast(message, cx);
                 true
             }
             None => false,
@@ -892,6 +926,69 @@ impl TerminalView {
     ) {
         f(&mut self.builtin_command_manager);
         cx.notify();
+    }
+
+    /// 显示 Toast 错误通知
+    fn show_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.toast_message = Some(message);
+
+        // 取消之前的隐藏任务
+        self.toast_hide_task.take();
+
+        // 4秒后自动隐藏
+        self.toast_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(4))
+                .await;
+            this.update(cx, |this, cx| {
+                this.toast_message = None;
+                this.toast_hide_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+
+        cx.notify();
+    }
+
+    /// 渲染 Toast 通知条
+    fn render_toast(&self, cx: &mut Context<Self>) -> impl IntoElement + 'static {
+        let theme = cx.theme().ui;
+        let is_dark = cx.theme().appearance.is_dark();
+
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.error.opacity(if is_dark { 0.15 } else { 0.1 }))
+                    .border_1()
+                    .border_color(theme.error.opacity(0.3))
+                    .child(
+                        gpui::svg()
+                            .size(px(16.0))
+                            .text_color(theme.error)
+                            .path(crate::assets::Icon::WindowClose.path()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text)
+                            .child(self.toast_message.clone().unwrap_or_default()),
+                    ),
+            )
     }
 
     /// 结束当前内建命令输入，恢复普通终端输入状态。
@@ -951,6 +1048,9 @@ impl TerminalView {
             return false;
         }
 
+        // 根据当前输入阶段决定行为
+        let is_argument_phase = self.builtin_command_manager.is_argument_input();
+
         match key {
             "up" => {
                 self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
@@ -963,8 +1063,11 @@ impl TerminalView {
             "tab" => {
                 if modifiers.shift {
                     self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
+                } else if is_argument_phase {
+                    // 参数输入阶段：路径补全
+                    self.mutate_builtin_command(cx, BuiltinCommandManager::complete_path);
                 } else {
-                    // Tab 补全：将当前选中的命令替换到输入中
+                    // 命令名输入阶段：命令补全
                     self.mutate_builtin_command(cx, BuiltinCommandManager::complete);
                 }
                 true
@@ -1324,7 +1427,7 @@ impl EntityInputHandler for TerminalView {
         }
         self.terminal.update(cx, |terminal, _cx| {
             let content = terminal.last_content();
-            let bounds = terminal.terminal_bounds();
+            let bounds = terminal.terminal_bounds;
 
             let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
 
@@ -1492,7 +1595,7 @@ impl Render for TerminalView {
                 let elapsed = this.last_scroll_instant.elapsed().as_secs_f32();
                 this.last_scroll_instant = now;
 
-                let line_height = this.terminal.read(cx).terminal_bounds().line_height;
+                let line_height = this.terminal.read(cx).terminal_bounds.line_height;
 
                 // Compute instantaneous velocity (pixels / second).
                 let delta_px = event.delta.pixel_delta(line_height).y.as_f32().abs();
@@ -1575,6 +1678,9 @@ impl Render for TerminalView {
                             && !self.builtin_command_manager.is_dismissed(),
                         |this| this.child(self.render_builtin_command_overlay(cx)),
                     )
+                    .when(self.toast_message.is_some(), |this| {
+                        this.child(self.render_toast(cx))
+                    })
                     // SSH 连接进度视图覆盖层 - 在连接建立期间覆盖终端内容
                     .when_some(self.ssh_connect_view.clone(), |this, connect_view| {
                         this.child(div().absolute().inset_0().child(connect_view))

@@ -1152,7 +1152,7 @@ impl RemoteFileBrowserView {
 
         let mut rows = rows;
         let indent = px(depth as f32 * 16.0);
-        let available_width: f32 = self.layout.available_width().map_or(800.0, |w| w.into());
+        let available_width: f32 = self.layout.available_width.map_or(800.0, |w| w.into());
         let indent_px: f32 = indent.into();
         let tree_fixed_overhead = 12.0 + 12.0 + 14.0 + 14.0 + 1.0 + 140.0 + 80.0 + 80.0;
         let tree_name_max_chars =

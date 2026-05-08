@@ -870,7 +870,7 @@ impl Element for TerminalElement {
             self.terminal.update(cx, |terminal, cx| {
                 terminal.sync(window, cx);
 
-                let current_bounds = terminal.terminal_bounds();
+                let current_bounds = terminal.terminal_bounds;
                 if current_bounds.num_columns() != terminal_bounds.num_columns()
                     || current_bounds.num_lines() != terminal_bounds.num_lines()
                 {

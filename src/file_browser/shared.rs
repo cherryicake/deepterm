@@ -17,15 +17,9 @@ pub enum FileBrowserViewMode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnResizeState {
-    index: usize,
+    pub index: usize,
     start_mouse_x: gpui::Pixels,
     start_width: gpui::Pixels,
-}
-
-impl ColumnResizeState {
-    pub fn index(&self) -> usize {
-        self.index
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -58,7 +52,7 @@ impl ColumnLayoutState {
     pub fn is_resizing_column(&self, index: usize) -> bool {
         self.resizing
             .as_ref()
-            .map_or(false, |state| state.index() == index)
+            .map_or(false, |state| state.index == index)
     }
 
     pub fn clear_resize(&mut self) {
@@ -105,7 +99,7 @@ impl ColumnLayoutState {
 
 #[derive(Clone, Debug)]
 pub struct FileBrowserLayoutState {
-    available_width: Option<gpui::Pixels>,
+    pub available_width: Option<gpui::Pixels>,
     columns: ColumnLayoutState,
 }
 
@@ -115,10 +109,6 @@ impl FileBrowserLayoutState {
             available_width: None,
             columns: ColumnLayoutState::new(column_default_width),
         }
-    }
-
-    pub fn available_width(&self) -> Option<gpui::Pixels> {
-        self.available_width
     }
 
     pub fn set_available_width(&mut self, width: Option<gpui::Pixels>) -> bool {

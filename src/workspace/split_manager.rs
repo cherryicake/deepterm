@@ -63,7 +63,7 @@ impl SplitContainer {
     pub fn find_panel(&self, panel_id: &str, cx: &App) -> Option<Entity<Panel>> {
         match self {
             SplitContainer::Panel(panel) => {
-                if panel.read(cx).panel_id() == panel_id {
+                if panel.read(cx).panel_id == panel_id {
                     Some(panel.clone())
                 } else {
                     None
@@ -146,7 +146,7 @@ impl SplitContainer {
     ) -> bool {
         match self {
             SplitContainer::Panel(panel) => {
-                if panel.read(cx).panel_id() == target_panel_id {
+                if panel.read(cx).panel_id == target_panel_id {
                     // 将当前面板转换为分割容器
                     let old_panel = panel.clone();
                     *self = SplitContainer::Split {
@@ -178,7 +178,7 @@ impl SplitContainer {
     pub fn remove_panel(&self, panel_id: &str, cx: &App) -> Self {
         match self {
             SplitContainer::Panel(panel) => {
-                if panel.read(cx).panel_id() == panel_id {
+                if panel.read(cx).panel_id == panel_id {
                     // 找到了要移除的panel，返回克隆（调用者应该处理这种情况）
                     self.clone()
                 } else {
@@ -196,7 +196,7 @@ impl SplitContainer {
                 for (i, child) in children.iter().enumerate() {
                     // 检查这个child是否包含要移除的panel
                     if let SplitContainer::Panel(p) = child {
-                        if p.read(cx).panel_id() == panel_id {
+                        if p.read(cx).panel_id == panel_id {
                             // 跳过这个panel
                             continue;
                         }
@@ -236,7 +236,7 @@ impl SplitContainer {
 
         match self {
             SplitContainer::Panel(panel) => {
-                if panel.read(cx).panel_id() == target_panel_id {
+                if panel.read(cx).panel_id == target_panel_id {
                     // 找到目标panel，创建新的split
                     let children = match placement {
                         PanelPlacement::Left | PanelPlacement::Top => {
@@ -285,7 +285,7 @@ impl SplitContainer {
     /// 检查容器是否包含指定的panel
     pub fn contains_panel(&self, panel_id: &str, cx: &App) -> bool {
         match self {
-            SplitContainer::Panel(panel) => panel.read(cx).panel_id() == panel_id,
+            SplitContainer::Panel(panel) => panel.read(cx).panel_id == panel_id,
             SplitContainer::Split { children, .. } => {
                 children.iter().any(|c| c.contains_panel(panel_id, cx))
             }

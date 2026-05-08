@@ -123,7 +123,7 @@ pub enum PanelContent {
 /// Note: The tab bar is managed by the Workspace, not individual panels.
 pub struct Panel {
     /// Unique identifier for this panel
-    panel_id: String,
+    pub panel_id: String,
     /// Focus handle for keyboard input
     focus_handle: FocusHandle,
     /// Current drag preview position (if any)
@@ -135,13 +135,13 @@ pub struct Panel {
     /// SSH config ID for saving detected OS info
     ssh_config_id: Option<String>,
     /// 检测到的远程操作系统
-    remote_os: Option<RemoteOS>,
+    pub remote_os: Option<RemoteOS>,
     /// ID of the workspace this panel belongs to
-    workspace_id: String,
+    pub workspace_id: String,
     /// Whether this is the only panel in the workspace (affects border rendering)
-    is_solo: bool,
+    pub is_solo: bool,
     /// Whether this panel is currently selected
-    is_selected: bool,
+    pub is_selected: bool,
     /// Content displayed in this panel
     content: PanelContent,
     /// Temporary file browser rendered over terminal content.
@@ -149,7 +149,7 @@ pub struct Panel {
     file_browser_overlay_subscription: Option<Subscription>,
     file_browser_content_subscription: Option<Subscription>,
     /// 广播状态 - 由Workspace同步给所有Panel
-    broadcast_enabled: bool,
+    pub broadcast_enabled: bool,
 }
 
 impl Panel {
@@ -571,14 +571,14 @@ impl Panel {
         }
     }
 
-    /// Returns a reference to the panel's content.
-    pub fn content(&self) -> &PanelContent {
-        &self.content
-    }
-
     /// Returns true if this panel contains a terminal view.
     pub fn has_terminal_content(&self) -> bool {
         matches!(self.content, PanelContent::Terminal(_))
+    }
+
+    /// Returns a reference to the panel's content.
+    pub fn content(&self) -> &PanelContent {
+        &self.content
     }
 
     /// 设置Tab标签名
@@ -592,19 +592,6 @@ impl Panel {
         self.active_tab_label.as_ref()
     }
 
-    /// 获取检测到的远程操作系统
-    pub fn remote_os(&self) -> Option<RemoteOS> {
-        self.remote_os
-    }
-
-    pub fn panel_id(&self) -> &str {
-        &self.panel_id
-    }
-
-    pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
-    }
-
     /// 设置关联的 workspace_id
     pub fn set_workspace_id(&mut self, workspace_id: impl Into<String>) {
         self.workspace_id = workspace_id.into();
@@ -616,20 +603,10 @@ impl Panel {
         cx.notify();
     }
 
-    /// 获取是否为唯一的panel
-    pub fn is_solo(&self) -> bool {
-        self.is_solo
-    }
-
     /// 设置选中状态
     pub fn set_selected(&mut self, is_selected: bool, cx: &mut Context<Self>) {
         self.is_selected = is_selected;
         cx.notify();
-    }
-
-    /// 获取选中状态
-    pub fn is_selected(&self) -> bool {
-        self.is_selected
     }
 
     /// 设置广播状态
@@ -664,11 +641,6 @@ impl Panel {
         }
 
         cx.notify();
-    }
-
-    /// 获取广播状态
-    pub fn is_broadcast_enabled(&self) -> bool {
-        self.broadcast_enabled
     }
 
     /// 获取活动 tab ID

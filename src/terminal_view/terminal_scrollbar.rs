@@ -163,7 +163,7 @@ impl gpui::Element for ScrollbarElement {
 
         // Get terminal metrics
         let term = self.terminal.read(cx);
-        let line_height = term.terminal_bounds().line_height;
+        let line_height = term.terminal_bounds.line_height;
         let total_lines = term.total_lines();
         let viewport_lines = term.viewport_lines();
         let display_offset = term.last_content().display_offset;

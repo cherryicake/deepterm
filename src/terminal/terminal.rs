@@ -238,7 +238,7 @@ pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
     /// 本地 PTY 启动出来的首个子进程 pid，通常就是 shell 进程。
-    child_process_id: Option<u32>,
+    pub child_process_id: Option<u32>,
     /// shell 所在的进程组 id，用来判断当前前台程序是否仍然是 shell。
     shell_process_group_id: Option<i32>,
     /// 本地 PTY master fd，用来读取当前 TTY 的前台进程组。
@@ -247,12 +247,12 @@ pub struct Terminal {
     remote_shell_ready: bool,
     remote_working_directory: Option<String>,
     /// 检测到的远程操作系统
-    remote_os: Option<RemoteOS>,
+    pub remote_os: Option<RemoteOS>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
     last_content: TerminalContent,
-    content_generation: u64,
+    pub content_generation: u64,
     content_dirty: bool,
     /// 每次 update_last_content 后，标记哪些 viewport 行（0 = 顶行）发生了变化
     dirty_rows: Vec<bool>,
@@ -267,7 +267,7 @@ pub struct Terminal {
     driver_task: Option<Task<()>>,
     /// VTE 解析器状态（跨数据块保持，避免转义序列在 chunk 边界处被截断导致乱码）
     vte_processor: Processor<StdSyncHandler>,
-    terminal_bounds: TerminalBounds,
+    pub terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
     last_mouse_position: Option<Point<Pixels>>,
     /// Scroll accumulator for smooth scrolling (trackpad support)
@@ -772,10 +772,6 @@ impl Terminal {
         }
     }
 
-    pub fn child_process_id(&self) -> Option<u32> {
-        self.child_process_id
-    }
-
     /// 判断当前交互上下文是否仍然是 shell 提示符。
     /// 本地终端通过前台进程组判断，远程终端通过远程 shell 发回的提示符标记判断。
     pub fn is_shell_in_foreground(&self) -> bool {
@@ -805,11 +801,6 @@ impl Terminal {
 
     pub fn remote_working_directory(&self) -> Option<&str> {
         self.remote_working_directory.as_deref()
-    }
-
-    /// 获取检测到的远程操作系统
-    pub fn remote_os(&self) -> Option<RemoteOS> {
-        self.remote_os
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
@@ -1267,10 +1258,6 @@ impl Terminal {
         cx.emit(Event::Wakeup);
     }
 
-    pub fn content_generation(&self) -> u64 {
-        self.content_generation
-    }
-
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
     }
@@ -1285,10 +1272,6 @@ impl Terminal {
     pub fn viewport_lines(&self) -> usize {
         let term = self.term.lock();
         term.screen_lines()
-    }
-
-    pub fn terminal_bounds(&self) -> TerminalBounds {
-        self.terminal_bounds
     }
 
     pub fn set_terminal_bounds(&mut self, bounds: TerminalBounds) {

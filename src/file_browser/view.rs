@@ -1352,7 +1352,7 @@ impl FileBrowserView {
                 )
                 .into_any_element()
         } else {
-            let available_width: f32 = self.layout.available_width().map_or(800.0, |w| w.into());
+            let available_width: f32 = self.layout.available_width.map_or(800.0, |w| w.into());
             let tree_fixed_overhead = 12.0 + 12.0 + 14.0 + 14.0 + 1.0 + 140.0 + 80.0 + 80.0;
 
             let flat_rows = self.list_flat_cache.clone().unwrap_or_default();

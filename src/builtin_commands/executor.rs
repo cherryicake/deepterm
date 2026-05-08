@@ -174,15 +174,18 @@ impl CommandHandler for OpenFileHandler {
             };
         };
 
+        // 解析行号和列号（如 "file.txt:4:2"）
+        let (path_part, _line, _col) = crate::builtin_commands::PathCompletionEngine::parse_line_column(raw_path);
+
         let path = if ctx.is_remote {
-            PathResolver::resolve_remote(raw_path, None).unwrap_or_else(|| raw_path.to_string())
+            PathResolver::resolve_remote(&path_part, None).unwrap_or_else(|| path_part.to_string())
         } else {
             let local_ctx = LocalPathContext {
                 working_directory: ctx.working_directory.clone(),
-                process_cwd: None,
+                process_cwd: ctx.process_cwd.clone(),
             };
 
-            PathResolver::resolve_local(raw_path, &local_ctx)
+            PathResolver::resolve_local(&path_part, &local_ctx)
                 .to_string_lossy()
                 .into_owned()
         };

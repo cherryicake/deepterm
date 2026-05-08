@@ -113,10 +113,6 @@ impl TabSwitchAnimation {
         self.progress = 1.0;
         cx.notify();
     }
-
-    pub fn progress(&self) -> f32 {
-        self.progress
-    }
 }
 
 impl Focusable for TabSwitchAnimation {
@@ -158,9 +154,6 @@ impl SplitResizeAnimation {
         cx.notify();
     }
 
-    pub fn current_sizes(&self) -> &Vec<f32> {
-        &self.current_sizes
-    }
 }
 
 impl Focusable for SplitResizeAnimation {

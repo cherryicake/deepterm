@@ -147,7 +147,9 @@ pub fn init_global_registry() -> CommandRegistry {
         description: "Open a file in DeepTerm's editor.",
         icon: Icon::Screen,
         availability: Availability::Always,
-        argument: ArgumentType::None,
+        argument: ArgumentType::Optional {
+            hint: Some("file_path"),
+        },
         handler_id: CommandHandlerId("open_file"),
     });
     registry.register(BuiltinCommand {
