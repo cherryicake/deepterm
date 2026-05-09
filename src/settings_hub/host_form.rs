@@ -152,15 +152,6 @@ impl HostForm {
                         cx.update_entity(&entity2, |this: &mut HostForm, _cx| {
                             this.selected_keychain_id = keychain_id.clone();
 
-                            let selected_label = this
-                                .selected_item()
-                                .map(|item| item.label.clone())
-                                .unwrap_or_else(|| "Create new".to_string());
-
-                            this.keychain_select.update(_cx, |select: &mut Select, cx| {
-                                select.set_selected(selected_label, cx);
-                            });
-
                             let username = keychain_id.as_ref().and_then(|id| {
                                 this.keychain_items
                                     .iter()
