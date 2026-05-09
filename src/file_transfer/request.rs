@@ -68,7 +68,7 @@ impl TransferRequest {
             sources: payload.sources,
             destination,
             operation,
-            conflict_policy: ConflictPolicy::AutoRename,
+            conflict_policy: ConflictPolicy::Ask,
         }
     }
 }

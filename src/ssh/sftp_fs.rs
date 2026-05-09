@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -298,6 +298,123 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 同服务器远程文件流式复制：源路径 → 目标路径，不写本地磁盘。
+    /// 数据在同一个 SFTP session 内直接流转，避免磁盘中转。
+    pub fn copy_remote_file(
+        &mut self,
+        source_path: &str,
+        destination_path: &str,
+        cancelled: &AtomicBool,
+        progress: Option<&AtomicU64>,
+    ) -> anyhow::Result<u64> {
+        let source_permissions = self.permissions(source_path).ok().flatten();
+        // 使用临时文件避免传输中断时污染目标路径
+        let temporary_path = format!("{}.deepterm-part", destination_path);
+
+        if self.exists(&temporary_path)? {
+            let _ = self.remove_file(&temporary_path);
+        }
+
+        // 核心：在单个 block_on 内交替读取源文件并写入目标文件，全程内存缓冲
+        let transferred = self.runtime.block_on(async {
+            let mut source_file = self.sftp.open(source_path).await?;
+            let mut dest_file = self.sftp.create(&temporary_path).await?;
+            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
+            let mut transferred = 0u64;
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+                }
+
+                let read = source_file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+
+                dest_file.write_all(&buffer[..read]).await?;
+                transferred += read as u64;
+
+                if let Some(p) = progress {
+                    p.fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+            }
+
+            dest_file.shutdown().await?;
+            Ok(transferred)
+        });
+
+        // 传输完成后重命名为最终文件名，失败时清理临时文件
+        match transferred {
+            Ok(bytes) => {
+                self.rename(&temporary_path, destination_path)?;
+                if let Some(mode) = source_permissions {
+                    let _ = self.set_permissions(destination_path, mode);
+                }
+                Ok(bytes)
+            }
+            Err(e) => {
+                let _ = self.remove_file(&temporary_path);
+                Err(e)
+            }
+        }
+    }
+
+    /// 跨服务器流式传输：从当前 session 读取源文件，写入目标 session 的目标路径，不写本地磁盘。
+    /// 数据仅在内存 buffer 中中转，源端读取和目的端写入在同一个异步上下文交替执行。
+    ///
+    /// # 运行时假设
+    ///
+    /// 本方法在 `self.runtime` 的 `block_on` 中同时访问 `destination_session.sftp`。
+    /// 这要求 `destination_session` 的 `SftpSession` 可以跨 tokio runtime 使用。
+    /// `russh-sftp` 内部通过 SSH channel buffer 与事件循环通信，不直接依赖 reactor，
+    /// 因此该模式在实践中可行。如果未来 `russh-sftp` 版本引入 runtime 亲和性检查，
+    /// 需要改为分两步执行：在各自 runtime 上分别完成读取和写入。
+    pub fn stream_transfer_to(
+        &mut self,
+        source_path: &str,
+        destination_session: &mut BlockingSftpSession,
+        destination_path: &str,
+        cancelled: &AtomicBool,
+        progress: Option<&AtomicU64>,
+    ) -> anyhow::Result<u64> {
+        self.runtime.block_on(async {
+            let mut source_file = self.sftp.open(source_path).await?;
+            let mut dest_file = destination_session.sftp.create(destination_path).await?;
+            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
+            let mut transferred = 0u64;
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+                }
+
+                let read = source_file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+
+                dest_file.write_all(&buffer[..read]).await?;
+                transferred += read as u64;
+
+                if let Some(p) = progress {
+                    p.fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+            }
+
+            dest_file.shutdown().await?;
+            Ok(transferred)
+        })
+    }
+
     pub fn read_dir(&mut self, path: &str) -> anyhow::Result<Vec<RemoteFileEntry>> {
         self.runtime.block_on(async {
             let entries = self
@@ -347,6 +464,92 @@ impl BlockingSftpSession {
                 Ok(Some(text))
             }
         })
+    }
+
+    /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
+    /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
+    pub fn execute_command(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<RemoteCommandResult> {
+        self.runtime.block_on(async {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(|e| anyhow!("打开 SSH 会话通道失败: {}", e))?;
+
+            // 不分配 PTY：避免终端转义字符干扰命令输出
+            channel
+                .exec(false, command)
+                .await
+                .map_err(|e| anyhow!("执行远程命令失败: {}", e))?;
+
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_status = None;
+
+            let timeout = tokio::time::Duration::from_secs(timeout_secs);
+
+            let result = tokio::time::timeout(timeout, async {
+                loop {
+                    match channel.wait().await {
+                        Some(russh::ChannelMsg::Data { data }) => {
+                            stdout.extend_from_slice(&data);
+                        }
+                        Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
+                            stderr.extend_from_slice(&data);
+                        }
+                        Some(russh::ChannelMsg::ExitStatus { exit_status: status }) => {
+                            exit_status = Some(status);
+                        }
+                        Some(russh::ChannelMsg::Eof) => {
+                            // 标准 SSH 协议顺序为：
+                            //   ExitStatus → Eof → Close
+                            // 此处不 break，继续等待 Close，
+                            // 以防 ExitStatus 在 Eof 之后到达
+                        }
+                        Some(russh::ChannelMsg::Close) => {
+                            break;
+                        }
+                        None => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+
+            // 确保通道关闭
+            let _ = channel.close().await;
+
+            match result {
+                Ok(Ok(())) => Ok(RemoteCommandResult {
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    exit_status,
+                }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(anyhow!("远程命令执行超时 ({}s)", timeout_secs)),
+            }
+        })
+    }
+}
+
+/// 远程命令执行结果
+#[derive(Clone, Debug)]
+pub struct RemoteCommandResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<u32>,
+}
+
+impl RemoteCommandResult {
+    pub fn success(&self) -> bool {
+        self.exit_status == Some(0)
     }
 }
 

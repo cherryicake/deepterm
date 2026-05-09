@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use gpui::{
-    App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable, GlobalElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, Style, Styled, Subscription, Window, div, px,
+    AnyWindowHandle, App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable,
+    GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, Style, Styled, Subscription, Window, div, px,
 };
 use gpui::{KeyBinding, actions, prelude::*};
 
@@ -21,6 +21,7 @@ use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::{
+    ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
     TransferTaskState, TransferTaskStatus, quick_total_size, render_transfer_overlay,
     transfer_label,
@@ -551,7 +552,8 @@ impl Workspace {
                 }
             }
             PanelEvent::TransferRequested { panel_id, request } => {
-                self.start_transfer_request(panel_id.clone(), request.clone(), cx);
+                let window_handle = window.window_handle();
+                self.start_transfer_request(panel_id.clone(), request.clone(), window_handle, cx);
             }
             PanelEvent::OpenFile { panel_id, path } => {
                 self.show_editor_panel(panel_id.clone(), path.clone(), window, cx);
@@ -572,6 +574,7 @@ impl Workspace {
         &mut self,
         panel_id: String,
         request: TransferRequest,
+        window_handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         log::info!(
@@ -620,11 +623,88 @@ impl Workspace {
         })
         .detach();
 
+        // 创建冲突解决通道和共享状态
+        let (conflict_tx, conflict_rx) = async_channel::unbounded::<ConflictPrompt>();
+        let shared_resolver = Arc::new(SharedConflictResolver::new(conflict_tx));
+        shared_resolver.reset();
+        let resolver_ref: Arc<dyn ConflictResolver> = shared_resolver.clone();
+
+        // UI 任务：监听冲突请求并弹出对话框
+        cx.spawn(async move |_, cx| {
+            while let Ok(prompt) = conflict_rx.recv().await {
+                // 检查是否已启用 "应用到全部"
+                if shared_resolver.has_cached_resolution() {
+                    if let Some(resolution) = shared_resolver.get_cached_resolution() {
+                        let _ = prompt.response.try_send(resolution);
+                        continue;
+                    }
+                }
+
+                let answer = cx.update_window(window_handle, |_view, window, cx| {
+                    window.prompt(
+                        gpui::PromptLevel::Warning,
+                        "文件已存在",
+                        Some(
+                            &format!(
+                                "名为 \"{}\" 的文件已存在于该位置。\n是否替换为正在移动的文件？",
+                                prompt.file_name
+                            )
+                        ),
+                        &["停止", "跳过", "替换", "保留两者"],
+                        cx,
+                    )
+                });
+
+                let button_index = match answer {
+                    Ok(receiver) => match receiver.await {
+                        Ok(idx) => idx,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
+
+                let resolution = match button_index {
+                    0 => ConflictResolution::Stop,
+                    1 => ConflictResolution::Skip,
+                    2 => ConflictResolution::Overwrite,
+                    3 => ConflictResolution::AutoRename,
+                    _ => ConflictResolution::Skip,
+                };
+
+                if resolution == ConflictResolution::Stop {
+                    let _ = prompt.response.try_send(resolution);
+                    break;
+                }
+
+                // 询问是否应用到全部
+                let apply_all_answer = cx.update_window(window_handle, |_view, window, cx| {
+                    window.prompt(
+                        gpui::PromptLevel::Info,
+                        "应用到全部",
+                        Some("是否将此选择应用到所有后续冲突文件？"),
+                        &["仅此文件", "应用到全部"],
+                        cx,
+                    )
+                });
+
+                if let Ok(receiver) = apply_all_answer {
+                    if let Ok(1) = receiver.await {
+                        // 用户选择 "应用到全部"
+                        shared_resolver.set_cached_resolution(resolution.clone());
+                    }
+                }
+
+                let _ = prompt.response.try_send(resolution);
+            }
+        })
+        .detach();
+
         let task = cx.background_executor().spawn(async move {
-            let result = TransferManager::execute_blocking_with_cancel_and_progress(
+            let result = TransferManager::execute_blocking_with_cancel_and_progress_and_resolver(
                 request,
                 task_cancelled,
                 Some(progress),
+                Some(resolver_ref.as_ref()),
             );
             is_done_for_task.store(true, Ordering::Relaxed);
             result
@@ -677,6 +757,11 @@ impl Workspace {
         };
 
         match result {
+            Ok(summary) if summary.files_transferred == 0 && summary.bytes_transferred == 0 => {
+                // 空操作（如拖拽到同一文件夹），直接移除任务不显示
+                self.remove_transfer_task(transfer_id, cx);
+                return;
+            }
             Ok(summary) => {
                 log::info!(
                     "Transfer finished: {} files, {} bytes",

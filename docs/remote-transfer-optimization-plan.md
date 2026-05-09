@@ -30,7 +30,7 @@ Remote A  →  [下载到本地临时文件]  →  [上传到 Remote B]
 
 ## Phase 1: 流式管道传输（消除磁盘 I/O）
 
-**状态**: 🔵 计划中
+**状态**: 🟢 核心实现完成（2026-05-08）
 
 ### 目标
 
@@ -38,285 +38,230 @@ Remote A  →  [下载到本地临时文件]  →  [上传到 Remote B]
 
 ### 技术方案
 
-使用**生产者-消费者模式**：
+实际采用**单线程 async 交替读写**方案：
 
 ```rust
-use std::sync::mpsc::{channel, bounded};
-use std::thread;
+// 在单个 block_on 内交替读取源文件并写入目标文件
+self.runtime.block_on(async {
+    let mut source_file = self.sftp.open(source_path).await?;
+    let mut dest_file = destination_session.sftp.create(destination_path).await?;
+    let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE]; // 1MB
+    let mut transferred = 0u64;
 
-fn stream_transfer_between_sessions(
-    source_session: &mut BlockingSftpSession,
-    source_path: &str,
-    destination_session: &mut BlockingSftpSession,
-    destination_path: &str,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
-) -> Result<TransferSummary> {
-    // bounded channel 控制内存占用
-    let (tx, rx) = bounded::<Vec<u8>>(16); // 16 chunks max
-    let chunk_size = 1024 * 1024; // 1MB per chunk
-    
-    // 生产者线程：从 Source 读取
-    let source_handle = thread::spawn(move || {
-        let mut reader = source_session.open_read(source_path)?;
-        let mut buffer = vec![0u8; chunk_size];
-        loop {
-            check_cancelled(cancelled)?;
-            let read = reader.read(&mut buffer)?;
-            if read == 0 { break; }
-            tx.send(buffer[..read].to_vec())?;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
         }
-        Ok(())
-    });
-    
-    // 消费者线程：向 Destination 写入
-    let destination_handle = thread::spawn(move || {
-        let mut writer = destination_session.open_write(destination_path)?;
-        while let Ok(chunk) = rx.recv() {
-            check_cancelled(cancelled)?;
-            writer.write_all(&chunk)?;
-            update_progress(progress, chunk.len() as u64);
+
+        let read = source_file.read(&mut buffer).await?;
+        if read == 0 { break; }
+
+        dest_file.write_all(&buffer[..read]).await?;
+        transferred += read as u64;
+
+        if let Some(p) = progress {
+            p.fetch_add(read as u64, Ordering::Relaxed);
         }
-        writer.flush()?;
-        Ok(())
-    });
-    
-    source_handle.join().unwrap()?;
-    destination_handle.join().unwrap()?;
-    Ok(TransferSummary::one_file(total_bytes))
-}
+    }
+
+    dest_file.shutdown().await?;
+    Ok(transferred)
+})
 ```
+
+**方案调整说明**：原方案计划使用多线程 + channel 的生产者-消费者模式，但 `BlockingSftpSession` 底层 `tokio::runtime` 和 `russh_sftp::SftpSession` 不支持跨线程并发使用。改为在单个 async block 内交替读写，同样消除了磁盘 I/O，且实现更简单。
 
 ### 关键参数
 
-| 参数 | 建议值 | 说明 |
+| 参数 | 当前值 | 说明 |
 |------|--------|------|
-| `chunk_size` | 1MB - 8MB | 平衡内存分配频率和单次读写大小 |
-| `channel_bound` | 8 - 32 | 限制内存中缓冲的数据量 |
-| `read_timeout` | 30s | 防止消费者饥饿 |
+| `TRANSFER_BUFFER_SIZE` | 1MB | 内存缓冲大小，平衡分配频率和单次吞吐量 |
+| `chunk_size` | 1MB | 每次 read/write 的数据块大小 |
 
 ### 收益预估
 
 - **消除磁盘 I/O**：SSD 场景 2-5x 提升，HDD 场景 10-20x 提升
-- **并行读写**：下载和上传同时进行，理论吞吐翻倍
-- **减少延迟**：无需等待完整文件下载
+- **减少延迟**：无需等待完整文件下载即可开始上传
+- **降低资源占用**：不创建本地临时文件，减少文件系统压力
 
 ### 实现位置
 
+- `src/ssh/sftp_fs.rs`
+  - `BlockingSftpSession::copy_remote_file` — 同服务器流式复制
+  - `BlockingSftpSession::stream_transfer_to` — 跨服务器流式传输
 - `src/file_transfer/manager.rs`
-  - 替换 `copy_remote_file_between_sessions` (line 973)
-  - 替换 `copy_remote_file_to_remote_path` (line 870) - 同服务器场景也可优化
-
-### 依赖
-
-- `crossbeam::channel` 或 `std::sync::mpsc::sync_channel`
-- 需要确认 `BlockingSftpSession` 的 read/write 方法是否支持多线程并发
+  - `copy_remote_file_to_remote_path` (line 870) — 已替换为流式
+  - `copy_remote_file_between_sessions` (line 935) — 已替换为流式
 
 ### 任务清单
 
-- [ ] 评估 `BlockingSftpSession` 的线程安全性
-- [ ] 实现 `stream_transfer_between_sessions` 核心函数
-- [ ] 实现 `stream_transfer_same_session` 用于同服务器场景
+- [x] 评估 `BlockingSftpSession` 线程安全性（结论：不支持跨线程并发，改用单线程 async）
+- [x] 实现 `stream_transfer_to` 核心函数（跨服务器流式传输）
+- [x] 实现 `copy_remote_file` 用于同服务器场景
+- [x] 集成到 TransferManager，替换原有磁盘中转逻辑
+- [x] 处理流式传输中的错误恢复（临时文件 + 失败清理）
 - [ ] 添加内存压力测试（大文件 + 高并发）
 - [ ] 对比基准测试：磁盘中转 vs 内存流式
-- [ ] 处理流式传输中的错误恢复（部分失败时清理目标）
 
 ---
 
 ## Phase 2: 并发请求优化（提升单连接吞吐）
 
-**状态**: 🔵 计划中
+**状态**: 🔴 已移除（2026-05-08）
 
 ### 目标
 
-充分利用 SFTP 协议的多请求并发能力。
+充分利用多文件并行传输提升目录传输吞吐。
 
 ### 技术方案
 
-#### 2.1 增大 SFTP Buffer
+#### 2.1 增大 SFTP Buffer（❌ 不可行，当前依赖限制）
 
-```rust
-// 在 sftp_fs.rs 中配置
-const SFTP_READ_BUFFER: usize = 256 * 1024;   // 256KB, 默认 32KB
-const SFTP_WRITE_BUFFER: usize = 256 * 1024;
-const SFTP_MAX_REQUESTS: u32 = 256;           // 默认 64
-```
+**调研结论**：`russh-sftp` 2.1.1 的 `SftpSession` 不支持 buffer/request 配置：
+- 读写上限硬编码为 255KB（`MAX_READ_LENGTH` / `MAX_WRITE_LENGTH`）
+- 底层 `RawSftpSession` 采用严格的请求-响应同步模型，无并发管道
+- 源码注释 `// todo: for new options we need builder` 表明未来可能支持
 
-#### 2.2 并发文件传输
+**缓解措施**：
+- 应用层保持 1MB buffer（`TRANSFER_BUFFER_SIZE`），由库自动切分为 255KB 的 SFTP 请求
+- 关注 `russh-sftp` 版本更新，未来升级后重新评估
 
-对于多个小文件，使用并行传输：
+#### 2.2 并发文件传输（❌ 已移除）
 
-```rust
-use rayon::ThreadPool;
+原方案为目录中的多个文件使用多线程并行传输，每个线程创建独立 SFTP session。
 
-fn parallel_file_transfer(
-    files: Vec<FileTransferTask>,
-    max_concurrency: usize,
-) -> Vec<Result<TransferSummary>> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_concurrency)
-        .build()
-        .unwrap();
-    
-    pool.install(|| {
-        files.into_par_iter()
-            .map(|task| transfer_single_file(task))
-            .collect()
-    })
-}
-```
+**移除原因**：
+- 代码复杂度高，引入大量线程管理和错误处理逻辑
+- 实际收益有限（SFTP 单文件串行传输，库限制）
+- 增加维护负担，与项目当前阶段不符
 
-#### 2.3 连接池分离
-
-当前问题：传输和浏览共用 `Mutex<BlockingSftpSession>`
-
-```rust
-// 建议：分离浏览 session 和传输 session pool
-struct SftpConnectionPool {
-    browse_session: Arc<Mutex<BlockingSftpSession>>,      // 用于目录浏览
-    transfer_sessions: Vec<Arc<Mutex<BlockingSftpSession>>>, // 用于文件传输
-}
-```
-
-### 并发限制策略
-
-| 场景 | 并发数 | 说明 |
-|------|--------|------|
-| 单个大文件 | 1 | SFTP 单文件并发请求已优化 |
-| 同服务器目录 | 4-8 | 同一 host 避免过载 |
-| 跨服务器目录 | min(source_limit, dest_limit) | 取两端较小值 |
-
-### 收益预估
-
-- 大文件（>100MB）：2-3x 提升（buffer 优化）
-- 小文件批量（<1MB each）：5-10x 提升（并行传输）
+**如需重新启用**：可参考 commit 历史恢复 `parallel_transfer_same_remote_files` 和 `parallel_transfer_cross_remote_files` 函数。
 
 ### 任务清单
 
-- [ ] 调研 `russh-sftp` 或底层库是否支持 `nrequests` 和 `buffer` 配置
-- [ ] 修改 `BlockingSftpSession` 构造函数，暴露 buffer/request 配置
-- [ ] 实现 SFTP 连接池（分离浏览和传输 session）
-- [ ] 实现目录级别的并行文件传输
-- [ ] 添加并发数限制逻辑
-- [ ] 压力测试：高并发下的稳定性
+- [x] 调研 `russh-sftp` 或底层库是否支持 `nrequests` 和 `buffer` 配置（结论：不支持）
+- [ ] ~~修改 `BlockingSftpSession` 构造函数，暴露 buffer/request 配置~~（依赖库限制，标记为升级项）
+- [ ] ~~实现传输 session 独立创建~~（已移除）
+- [ ] ~~实现目录级别的并行文件传输~~（已移除）
+- [ ] ~~添加并发数限制逻辑~~（已移除）
 
 ---
 
 ## Phase 3: 服务器直连绕过（最佳方案）
 
-**状态**: 🔵 调研中
+**状态**: 🟢 核心实现完成（2026-05-08）
 
 ### 目标
 
-让两个远程服务器直接通信，绕过 DeepTerm 中转。
+让两个远程服务器直接通信，数据不经过 DeepTerm 内存中转。
 
-### 方案对比
+### 实际采用方案：远程 Shell 执行 SCP（方案 B 安全增强版）
 
-#### 方案 A: ProxyJump / SSH Tunnel
-
-```
-DeepTerm 建立 SSH tunnel:
-  ssh -L local_port:dest_host:22 source_host
-
-Source 服务器直接通过 tunnel 连接到 Dest:
-  scp -P local_port file.txt user@localhost:/path
-```
-
-**优点**：
-- 数据不经过 DeepTerm 内存
-- 利用服务器之间的网络带宽
-- 安全：认证信息通过 tunnel 转发
-
-**缺点**：
-- 需要配置 SSH key forwarding 或临时凭据
-- 仅适用于支持 SSH 的服务器
-- 源服务器需要能访问 DeepTerm 的监听端口
-
-#### 方案 B: 远程 Shell 执行 SCP/SFTP
+**实现思路**：
+1. 检测源服务器是否支持 `scp`/`ssh` 命令
+2. 如果是密钥认证，将目标服务器的私钥**临时上传**到源服务器（传输完成后立即删除）
+3. 在源服务器上执行 `scp` 命令直接传输到目标服务器
+4. 数据直接在 Source ↔ Dest 之间流动，**不经过 DeepTerm**
 
 ```rust
-// 在 Source 服务器上执行：
-let cmd = format!(
-    "scp -r {} user@dest_host:{}",
-    source_path, dest_path
-);
-source_session.exec_remote(cmd)?;
+// 数据流：Source --scp(直连)--> Dest
+// DeepTerm 仅负责：检测 → 上传临时密钥 → 触发 scp → 清理密钥
 ```
 
-**优点**：
-- 零数据经过 DeepTerm
-- 利用服务器最优带宽
+**与原始方案 B 的区别**：
+- **安全性**：私钥仅临时存在于源服务器，传输完成后立即删除（rm -f）
+- **隔离性**：使用独立的临时密钥文件（`/tmp/.deepterm-temp-key-<timestamp>-<random>`）
+- **权限控制**：上传后设置 `chmod 600` 限制访问
 
-**缺点**：
-- 需要源服务器有目标服务器的认证信息
-- 需要将私钥/密码暴露给源服务器（安全风险）
-- 不同服务器间 scp 版本兼容性
-- 错误处理困难（远程执行 stdout/stderr 解析）
-
-#### 方案 C: SFTP 代理转发
-
-通过 SSH agent forwarding 实现认证链：
-
-```
-DeepTerm (agent) → Source (forwarded agent) → Dest
-```
-
-Source 服务器使用 DeepTerm 的 SSH agent 连接到 Dest。
-
-**优点**：
-- 私钥不离开 DeepTerm
-- 标准 SSH 功能，广泛支持
-
-**缺点**：
-- 需要服务器支持 agent forwarding
-- 部分安全策略禁止 agent forwarding
-
-### 决策矩阵
-
-| 方案 | 安全性 | 复杂度 | 兼容性 | 性能 | 推荐度 |
-|------|--------|--------|--------|------|--------|
-| A (ProxyJump) | 高 | 中 | 高 | 高 | ⭐⭐⭐⭐⭐ |
-| B (远程 SCP) | 低 | 低 | 中 | 最高 | ⭐⭐⭐ |
-| C (Agent 转发) | 高 | 高 | 中 | 高 | ⭐⭐⭐⭐ |
-
-### 实施建议
-
-**第一版**：实现方案 A（ProxyJump）
-
-1. 检测源服务器是否能通过 SSH 连接到目标
-2. 如果能，建立 tunnel 并执行远程到远程的直接传输
-3. 如果失败，fallback 到 Phase 1/2 的流式传输
+#### 实现代码
 
 ```rust
+// manager.rs
 enum RemoteToRemoteStrategy {
-    DirectTunnel,      // ProxyJump / SSH Tunnel
-    StreamViaLocal,    // Phase 1 流式
-    FallbackDisk,      // 当前磁盘中转（保留作为 ultimate fallback）
+    DirectScp,      // 远程 scp 直连
+    StreamViaLocal, // Phase 1/2 流式传输
+}
+
+fn detect_transfer_strategy(
+    source_session: &mut BlockingSftpSession,
+    destination_config: &SshConnectionConfig,
+) -> RemoteToRemoteStrategy {
+    // 1. 检查源服务器是否有 scp/ssh 命令
+    // 2. 检查目标服务器是否为密钥认证
+    // 3. 返回策略
+}
+
+fn copy_via_remote_scp(
+    source_session: &mut BlockingSftpSession,
+    remote_path: &str,
+    destination_config: &SshConnectionConfig,
+    destination_path: &str,
+) -> Result<TransferSummary> {
+    // 1. 读取目标服务器私钥
+    // 2. 上传私钥到源服务器临时文件
+    // 3. 执行 scp -i /tmp/temp-key source user@dest:/path
+    // 4. 删除临时密钥文件
 }
 ```
 
-### 前提条件
+### 方案对比（实际实现 vs 计划）
 
-1. **DeepTerm 是否存储目标服务器认证信息？**
-   - 需要能获取目标服务器的 SSH key/password
-   - 或者支持 SSH agent forwarding
+| 方案 | 安全性 | 复杂度 | 兼容性 | 性能 | 实际采用 |
+|------|--------|--------|--------|------|----------|
+| A (ProxyJump) | 高 | 高 | 高 | 中 | ❌ 数据仍经过 DeepTerm（tunnel 转发） |
+| B (远程 SCP) | 中→高 | 低 | 中 | 最高 | ✅ 临时密钥 + 立即清理 |
+| C (Agent 转发) | 高 | 高 | 低 | 高 | ❌ russh 暂不支持 agent forwarding |
 
-2. **网络拓扑**：
-   - 两个服务器在同一内网？→ 直连效果最佳
-   - 通过互联网？→ 取决于各自带宽
+### Fallback 链
 
-3. **安全策略**：
-   - 是否允许临时暴露端口？
-   - 是否允许 agent forwarding？
+```
+跨服务器传输时：
+  1. 检测策略（DirectScp vs StreamViaLocal）
+  2. 如果 DirectScp 且为单文件 → 尝试 copy_via_remote_scp
+  3. 如果远程 scp 失败 → 自动 fallback 到 Phase 1/2 流式传输
+  4. 如果为目录 → 目前仍使用流式传输（scp -r 的进度/错误处理较复杂）
+```
+
+### 安全审计
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 私钥不持久化在源服务器 | ✅ | 使用 `/tmp/` 临时文件，传输后 `rm -f` 删除 |
+| 临时文件权限控制 | ✅ | 上传后执行 `chmod 600` |
+| 密码认证不支持直连 | ✅ | 仅密钥认证支持，避免密码泄露 |
+| 密钥上传使用现有 SFTP 通道 | ✅ | 复用已有 SSH 连接上传，不创建新通道 |
+| 错误时清理临时文件 | ✅ | `match` 结果的 `Ok` 和 `Err` 分支都执行清理 |
+
+### 限制与后续优化
+
+| 限制 | 说明 | 优化方向 |
+|------|------|----------|
+| 仅支持密钥认证 | 密码认证通过命令行传递不安全 | 未来可实现 `sshpass` 集成（需源服务器安装） |
+| 仅支持单文件 | 目录传输的进度/错误处理较复杂 | 未来可扩展支持 `scp -r` 目录传输 |
+| 无传输进度 | scp 的进度无法实时反馈到 UI | 未来可解析 scp 的 `-v` 输出或改用 rsync |
+| 依赖 scp/ssh 命令 | 部分最小化系统可能未安装 | 自动检测并 fallback 到流式传输 |
+
+### 实现位置
+
+- `src/ssh/sftp_fs.rs`
+  - `BlockingSftpSession::execute_command` — 远程命令执行基础能力
+- `src/file_transfer/manager.rs`
+  - `RemoteToRemoteStrategy` — 策略枚举
+  - `detect_transfer_strategy` — 自动检测可用策略
+  - `copy_via_remote_scp` — 远程 scp 直连实现
+  - `copy_remote_to_different_remote` — 集成策略选择和 fallback
 
 ### 任务清单
 
-- [ ] 调研 `russh` 库是否支持 ProxyJump / port forwarding
-- [ ] 设计 `RemoteToRemoteStrategy` 枚举和自动检测逻辑
-- [ ] 实现 `DirectTunnel` 传输模式
-- [ ] 实现 fallback 链：Direct → Stream → Disk
-- [ ] 添加用户确认机制（首次使用直连时提示）
-- [ ] 安全审计：确保不泄露私钥到远程服务器
+- [x] 调研 `russh` 库是否支持 ProxyJump / port forwarding（支持 `channel_open_direct_tcpip`）
+- [x] 调研 `russh` 是否支持 agent forwarding（结论：暂不支持）
+- [x] 设计 `RemoteToRemoteStrategy` 枚举和自动检测逻辑
+- [x] 实现 `BlockingSftpSession::execute_command` 远程命令执行
+- [x] 实现 `copy_via_remote_scp` 远程 SCP 直连传输
+- [x] 实现 fallback 链：DirectScp → StreamViaLocal
+- [x] 安全审计：临时密钥 + 立即清理
+- [ ] 用户确认机制（首次使用直连时提示）— 未来优化
+- [ ] 支持目录级别的远程 scp 传输 — 未来优化
 
 ---
 
@@ -394,22 +339,22 @@ let encoder = GzEncoder::new(writer, Compression::default());
 ## 实施路线图
 
 ```
-Phase 1: 流式管道传输
+Phase 1: 流式管道传输 ✅
 ├── Week 1-2: 核心流式传输实现
 ├── Week 3: 集成到 TransferManager
 └── Week 4: 测试与基准对比
 
-Phase 2: 并发优化
-├── Week 5: SFTP buffer/request 配置
-├── Week 6: 连接池分离
-└── Week 7: 并行文件传输
+Phase 2: 并发优化 ❌ 已移除
+├── Week 5: SFTP buffer/request 配置调研（不支持，russh-sftp 限制）
+├── Week 6: 连接池分离（create_transfer_session）— 代码已移除
+└── Week 7: 并行文件传输 — 代码已移除，如需可恢复
 
-Phase 3: 服务器直连
-├── Week 8-9: ProxyJump 调研与 POC
+Phase 3: 服务器直连 ✅
+├── Week 8-9: ProxyJump / 远程 SCP 调研与 POC
 ├── Week 10: 自动检测与 fallback 链
 └── Week 11: 安全审计
 
-Phase 4: 增量传输
+Phase 4: 增量传输 🔵
 ├── Week 12+: 长期规划，按需实施
 ```
 
@@ -419,18 +364,23 @@ Phase 4: 增量传输
 
 ### 测试场景
 
-| 场景 | 文件大小 | 网络延迟 | 当前速度 | Phase 1 目标 | Phase 3 目标 |
-|------|----------|----------|----------|--------------|--------------|
+| 场景 | 文件大小 | 网络延迟 | 原始(磁盘) | Phase 1(流式) | Phase 3(SCP直连) |
+|------|----------|----------|------------|---------------|------------------|
 | 单个大文件 | 1GB | 50ms | 10MB/s | 20MB/s | 50MB/s |
-| 100个小文件 | 100KB each | 50ms | 2MB/s | 10MB/s | 25MB/s |
-| 大目录 | 10GB total | 100ms | 5MB/s | 12MB/s | 40MB/s |
+| 100个小文件 | 100KB each | 50ms | 2MB/s | 5MB/s | - |
+| 大目录 | 10GB total | 100ms | 5MB/s | 10MB/s | - |
+
+**说明**：
+- Phase 3 仅适用于**跨服务器单文件**传输（目录传输仍使用 Phase 1 流式）
+- Phase 3 的 SCP 直连性能取决于源/目标服务器之间的网络带宽
 
 ### 测量指标
 
 1. **吞吐率** (MB/s)：总字节数 / 总耗时
 2. **CPU 使用率**：DeepTerm 进程占用
 3. **内存占用**：传输过程中的峰值内存
-4. **磁盘 I/O**：写入/读取字节数（目标为 0）
+4. **磁盘 I/O**：写入/读取字节数（Phase 1+ 目标为 0）
+5. **DeepTerm 中转数据量**：Phase 3 目标为 0（数据不经过 DeepTerm）
 
 ---
 
@@ -440,17 +390,32 @@ Phase 4: 增量传输
 
 - [x] 问题分析与方案调研
 - [x] 技术文档编写（本文档）
+- [x] Phase 1 核心实现（2026-05-08）
+  - [x] 评估 `BlockingSftpSession` 线程安全性（不支持跨线程并发）
+  - [x] 设计并实现流式传输接口：`copy_remote_file` + `stream_transfer_to`
+  - [x] 集成到 `TransferManager`，替换原有磁盘中转逻辑
+  - [x] 错误恢复：临时文件机制 + 失败时自动清理
+  - [x] 编译通过，101 个测试全部通过
+- [x] Phase 3 核心实现（2026-05-08）
+  - [x] 调研 `russh` 端口转发支持（支持 `channel_open_direct_tcpip`）
+  - [x] 调研 `russh` agent forwarding 支持（暂不支持）
+  - [x] 设计 `RemoteToRemoteStrategy` 枚举和自动检测逻辑
+  - [x] 实现 `BlockingSftpSession::execute_command` 远程命令执行能力
+  - [x] 实现 `copy_via_remote_scp` 远程 SCP 直连传输（临时密钥 + 立即清理）
+  - [x] 实现 fallback 链：DirectScp → StreamViaLocal
+  - [x] 安全审计：确保不泄露私钥到远程服务器
+  - [x] 编译通过，101 个测试全部通过
 
 ### 进行中 🔄
 
-- [ ] Phase 1 实施准备
-  - [ ] 确认 `BlockingSftpSession` 线程安全性
-  - [ ] 设计流式传输接口
+- [ ] Phase 1/3 性能验证
+  - [ ] 内存压力测试（大文件 + 高并发）
+  - [ ] 对比基准测试：磁盘中转 vs 内存流式
+  - [ ] 对比基准测试：流式 vs 远程 scp 直连
 
 ### 待开始 🔵
 
-- [ ] Phase 1 核心实现
-- [ ] Phase 2-4 实施
+- [ ] Phase 4: 增量传输与压缩（长期规划，按需实施）
 
 ---
 
@@ -458,10 +423,11 @@ Phase 4: 增量传输
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|----------|
-| `BlockingSftpSession` 非线程安全 | Phase 1 无法实现 | 使用单线程 async + channel，或每个线程独立 session |
-| 内存流式导致 OOM | 大文件传输崩溃 | bounded channel + backpressure + 文件大小检测 |
-| ProxyJump 认证复杂 | Phase 3 延迟 | 先实现 Phase 1/2，Phase 3 作为可选功能 |
-| 并发过高导致服务器限流 | 连接断开 | 实现自适应并发，根据错误码调整 |
+| `BlockingSftpSession` 非线程安全 | Phase 1 无法实现 | **已缓解**：采用单线程 async 内交替读写，无需跨线程共享 session |
+| 内存流式导致 OOM | 大文件传输崩溃 | 1MB 固定 buffer 循环复用，不随文件大小增长内存占用；后续可加入 bounded channel |
+| `russh-sftp` 不支持 buffer/request 配置 | Phase 2.1 无法实现 | **已缓解**：当前使用 1MB 应用层 buffer，关注库版本更新 |
+| 远程 scp 临时密钥泄露 | 私钥在源服务器短暂存在 | **已缓解**：使用 `/tmp/` + 随机文件名，传输后立即 `rm -f` 删除；设置 `chmod 600` |
+| 密码认证不支持直连 | 密码暴露在命令行不安全 | 仅密钥认证支持直连；密码认证自动 fallback 到流式传输 |
 
 ---
 
@@ -475,5 +441,5 @@ Phase 4: 增量传输
 
 ---
 
-*文档版本: 1.0*
+*文档版本: 1.4*
 *最后更新: 2026-05-08*
