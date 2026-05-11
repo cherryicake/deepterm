@@ -499,108 +499,120 @@ impl TransferManager {
 
         sftp_fs::with_cached_session(source_config, |source_session| {
             let metadata = source_session.metadata(remote_path)?;
+            let is_directory = metadata.kind == RemoteFileKind::Directory;
 
-            // Phase 3: 检测是否可以使用服务器直连
-            let strategy = detect_transfer_strategy(source_session, destination_config);
+            // 先确保目标父目录存在（scp 要求父目录存在；流式路径也需要）
+            sftp_fs::with_cached_session(destination_config, |destination_session| {
+                destination_session.create_dir_all(destination_dir)
+            })?;
 
-            if strategy == RemoteToRemoteStrategy::DirectScp
-                && metadata.kind == RemoteFileKind::File
-            {
-                // 在 Phase 3 前处理冲突策略（特别是 Ask）
-                let mut scp_destination_path =
-                    sftp_fs::join_remote_path(destination_dir, &file_name);
+            // 预解析冲突：`Ask` / `AutoRename` 在调用 scp 前先定好最终路径，
+            // scp 对这两种策略无法做到精准语义（只能覆盖），所以必要时会降级。
+            let resolved_destination = sftp_fs::with_cached_session(
+                destination_config,
+                |destination_session| {
+                    resolve_remote_conflict(
+                        destination_session,
+                        &desired_path,
+                        conflict_policy,
+                        resolver,
+                    )
+                },
+            )?;
 
-                if conflict_policy == ConflictPolicy::Ask {
-                    // 需要检查目标文件是否存在并询问用户
-                    let conflict_result = sftp_fs::with_cached_session(
-                        destination_config,
-                        |destination_session| {
-                            resolve_remote_conflict(
-                                destination_session,
-                                &desired_path,
-                                conflict_policy,
-                                resolver,
-                            )
-                        },
-                    )?;
+            let destination_path = match resolved_destination {
+                Some(path) => path,
+                None => return Ok(TransferSummary::default()),
+            };
 
-                    match conflict_result {
-                        Some(path) => {
-                            scp_destination_path = path;
-                        }
-                        None => {
-                            // 用户选择跳过
-                            return Ok(TransferSummary::default());
-                        }
-                    }
+            // 只有 `Overwrite` / `Skip`（转换为已存在预检过的路径）/ `AutoRename`
+            // 后得到新文件名的三种情况能安全走 scp；`Ask` 如果选了覆盖等同 Overwrite。
+            // 这里统一把"新路径"交给 scp，由它写入目标即可。
+
+            let strategies =
+                detect_transfer_strategies(source_session, destination_config);
+
+            let mut last_error: Option<anyhow::Error> = None;
+
+            for strategy in &strategies {
+                if cancelled.load(Ordering::Relaxed) {
+                    bail!("{}", TRANSFER_CANCELLED_MSG);
                 }
-
-                match copy_via_remote_scp(
-                    source_session,
-                    remote_path,
-                    destination_config,
-                    &scp_destination_path,
-                    cancelled,
-                ) {
-                    Ok(summary) => {
-                        log::info!("远程 scp 直连传输成功");
-                        return Ok(summary);
+                match strategy {
+                    RemoteToRemoteStrategy::AgentForwardScp => {
+                        match copy_via_agent_forward_scp(
+                            source_session,
+                            remote_path,
+                            destination_config,
+                            &destination_path,
+                            is_directory,
+                            cancelled,
+                            progress,
+                        ) {
+                            Ok(summary) => return Ok(summary),
+                            Err(e) => {
+                                log::warn!(
+                                    "方案 3a (agent forwarding scp) 失败，尝试下一策略: {}",
+                                    e
+                                );
+                                last_error = Some(e);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "远程 scp 直连失败，fallback 到流式传输: {}",
-                            e
+                    RemoteToRemoteStrategy::TempKeyScp => {
+                        match copy_via_remote_scp(
+                            source_session,
+                            remote_path,
+                            destination_config,
+                            &destination_path,
+                            is_directory,
+                            cancelled,
+                        ) {
+                            Ok(summary) => return Ok(summary),
+                            Err(e) => {
+                                log::warn!(
+                                    "方案 3b (临时密钥 scp) 失败，尝试下一策略: {}",
+                                    e
+                                );
+                                last_error = Some(e);
+                            }
+                        }
+                    }
+                    RemoteToRemoteStrategy::StreamViaLocal => {
+                        return sftp_fs::with_cached_session(
+                            destination_config,
+                            |destination_session| {
+                                if metadata.kind == RemoteFileKind::File {
+                                    copy_remote_file_between_sessions(
+                                        source_session,
+                                        remote_path,
+                                        destination_session,
+                                        &destination_path,
+                                        cancelled,
+                                        progress,
+                                    )
+                                } else if metadata.kind == RemoteFileKind::Directory {
+                                    destination_session.create_dir_all(&destination_path)?;
+                                    copy_remote_dir_between_sessions(
+                                        source_session,
+                                        remote_path,
+                                        destination_session,
+                                        &destination_path,
+                                        conflict_policy,
+                                        cancelled,
+                                        progress,
+                                        resolver,
+                                    )
+                                } else {
+                                    bail!("unsupported remote file type: {}", remote_path)
+                                }
+                            },
                         );
-                        // 继续执行流式传输 fallback
                     }
                 }
             }
 
-            // Phase 1/2: 流式传输 fallback
-            sftp_fs::with_cached_session(destination_config, |destination_session| {
-                destination_session.create_dir_all(destination_dir)?;
-
-                if metadata.kind == RemoteFileKind::File {
-                    let destination_path = resolve_remote_conflict(
-                        destination_session,
-                        &desired_path,
-                        conflict_policy,
-                        resolver,
-                    )?
-                    .ok_or_else(|| anyhow!("transfer skipped"))?;
-                    return copy_remote_file_between_sessions(
-                        source_session,
-                        remote_path,
-                        destination_session,
-                        &destination_path,
-                        cancelled,
-                        progress,
-                    );
-                }
-
-                if metadata.kind == RemoteFileKind::Directory {
-                    let destination_root = resolve_remote_conflict(
-                        destination_session,
-                        &desired_path,
-                        conflict_policy,
-                        resolver,
-                    )?
-                    .ok_or_else(|| anyhow!("transfer skipped"))?;
-                    destination_session.create_dir_all(&destination_root)?;
-                    return copy_remote_dir_between_sessions(
-                        source_session,
-                        remote_path,
-                        destination_session,
-                        &destination_root,
-                        conflict_policy,
-                        cancelled,
-                        progress,
-                        resolver,
-                    );
-                }
-
-                bail!("unsupported remote file type: {}", remote_path)
-            })
+            Err(last_error.unwrap_or_else(|| anyhow!("所有远程到远程传输策略均失败")))
         })
     }
 }
@@ -612,58 +624,188 @@ impl TransferManager {
 /// 远程到远程传输策略
 #[derive(Clone, Debug, PartialEq)]
 enum RemoteToRemoteStrategy {
-    /// 在源服务器上执行 scp 直接传输到目标（数据不经过 DeepTerm）
-    DirectScp,
+    /// 在源服务器上执行 scp，通过 **SSH agent forwarding** 鉴权目标端
+    /// （数据不经过 DeepTerm，密钥也不落源端）
+    AgentForwardScp,
+    /// 把目标服务器的私钥临时上传到源端，在源端执行 scp 直接传输
+    /// （数据不经过 DeepTerm）
+    TempKeyScp,
     /// Phase 1/2 流式传输（数据经过 DeepTerm 内存中转）
     StreamViaLocal,
 }
 
-/// 检测可用的远程到远程传输策略。
-/// 首先检测源服务器是否支持远程 scp，如果不支持则 fallback 到流式传输。
-fn detect_transfer_strategy(
+/// 检测可用的远程到远程传输策略，返回按优先级排序的候选列表。
+///
+/// 调用方应依次尝试每个策略，任一失败时自动降级到下一个。返回序列
+/// 最后一定包含 `StreamViaLocal` 作为兜底。
+fn detect_transfer_strategies(
     source_session: &mut sftp_fs::BlockingSftpSession,
     destination_config: &SshConnectionConfig,
-) -> RemoteToRemoteStrategy {
-    // 1. 检查源服务器是否有 scp 和 ssh 命令
+) -> Vec<RemoteToRemoteStrategy> {
+    let mut strategies = Vec::new();
+
+    // 允许通过环境变量强制指定策略，便于排障
+    if let Ok(forced) = std::env::var("DEEPTERM_REMOTE_TRANSFER_STRATEGY") {
+        match forced.as_str() {
+            "3a" | "agent" => return vec![RemoteToRemoteStrategy::AgentForwardScp],
+            "3b" | "tempkey" => return vec![RemoteToRemoteStrategy::TempKeyScp],
+            "pipeline" | "stream" => return vec![RemoteToRemoteStrategy::StreamViaLocal],
+            "auto" | _ => {}
+        }
+    }
+
+    // 1. 检查源服务器是否具备 scp/ssh 能力
     let check_result = source_session.execute_command(
         "command -v scp >/dev/null 2>&1 && command -v ssh >/dev/null 2>&1 && echo 'ok'",
         10,
     );
+    let has_scp_ssh = matches!(
+        check_result,
+        Ok(ref result) if result.success() && result.stdout.trim() == "ok"
+    );
 
-    match check_result {
-        Ok(result) if result.success() && result.stdout.trim() == "ok" => {}
-        _ => {
-            log::info!("源服务器缺少 scp/ssh 命令，使用流式传输");
-            return RemoteToRemoteStrategy::StreamViaLocal;
+    if !has_scp_ssh {
+        log::info!("源服务器缺少 scp/ssh 命令，降级到流式传输");
+        strategies.push(RemoteToRemoteStrategy::StreamViaLocal);
+        return strategies;
+    }
+
+    // 2. 解析目标认证方式，决定可走哪条直连路径
+    match resolve_auth_method(&destination_config.auth_method) {
+        Ok(ResolvedAuthMethod::PrivateKey { path, passphrase, .. }) => {
+            // 3a 首选：如果本机 agent 已加载该密钥，则启用 agent forwarding
+            if passphrase.is_none() {
+                match crate::ssh::agent::agent_has_key(&path) {
+                    Ok(true) => {
+                        log::info!("ssh-agent 已加载目标密钥，优先使用 agent forwarding");
+                        strategies.push(RemoteToRemoteStrategy::AgentForwardScp);
+                    }
+                    Ok(false) => {
+                        log::info!("ssh-agent 不含目标密钥，跳过 agent forwarding");
+                    }
+                    Err(e) => {
+                        log::info!("ssh-agent 不可用 ({}), 跳过 agent forwarding", e);
+                    }
+                }
+            }
+
+            // 3b 次选：临时上传目标私钥，在源端 scp 直连
+            if passphrase.is_none() {
+                strategies.push(RemoteToRemoteStrategy::TempKeyScp);
+            } else {
+                log::info!("目标私钥含 passphrase，不能用于远程 scp 直连");
+            }
+        }
+        Ok(ResolvedAuthMethod::Password { .. }) => {
+            log::info!("目标服务器使用密码认证，远程 scp 不安全，降级到流式传输");
+        }
+        Ok(ResolvedAuthMethod::Agent) => {
+            log::info!("目标服务器使用 Agent 认证，无具体密钥路径可直连");
+        }
+        Ok(ResolvedAuthMethod::Auto) => {
+            log::info!("目标服务器使用自动认证，无法构造 scp 参数");
+        }
+        Err(e) => {
+            log::warn!("解析目标服务器认证方式失败: {}", e);
         }
     }
 
-    // 2. 检查目标服务器认证方式是否支持（仅密钥认证支持直连）
-    match resolve_auth_method(&destination_config.auth_method) {
-        Ok(ResolvedAuthMethod::PrivateKey { .. }) => {
-            log::info!("目标服务器使用密钥认证，支持远程 scp 直连");
-            RemoteToRemoteStrategy::DirectScp
+    // 兜底：流式传输永远可用
+    strategies.push(RemoteToRemoteStrategy::StreamViaLocal);
+    strategies
+}
+
+/// 通过 **agent forwarding + scp** 实现远程直连传输（方案 3a）。
+///
+/// 本机 ssh-agent 已加载目标服务器的密钥时，源端 scp 可以通过转发回来的
+/// agent socket 鉴权目标，不需要把私钥搬到源服务器。相对于 [`copy_via_remote_scp`]
+/// 更安全：
+///
+/// - 私钥始终留在本地 agent 内，源端看不到明文；
+/// - 不在源端 `/tmp` 生成文件；
+/// - 源端命令退出后 forwarded agent socket 立即失效。
+fn copy_via_agent_forward_scp(
+    source_session: &mut sftp_fs::BlockingSftpSession,
+    remote_path: &str,
+    destination_config: &SshConnectionConfig,
+    destination_path: &str,
+    is_directory: bool,
+    cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
+) -> anyhow::Result<TransferSummary> {
+    check_cancelled(cancelled)?;
+
+    let dest_host = format!(
+        "{}@{}",
+        destination_config.username, destination_config.host
+    );
+
+    // scp 的 `-v` 会把详细过程输出到 stderr；目前只拿 exit status，
+    // progress_cb 先保留作为将来解析 rsync --info=progress2 的入口。
+    let recurse = if is_directory { " -r" } else { "" };
+    let port_arg = if destination_config.port == 22 {
+        String::new()
+    } else {
+        format!(" -P {}", destination_config.port)
+    };
+
+    let scp_cmd = format!(
+        "scp{recurse}{port_arg} -p -B \
+         -o StrictHostKeyChecking=accept-new \
+         -o UserKnownHostsFile=/dev/null \
+         -o LogLevel=ERROR \
+         '{src}' '{dst_host}:{dst_path}'",
+        recurse = recurse,
+        port_arg = port_arg,
+        src = shell_single_quote(remote_path),
+        dst_host = dest_host,
+        dst_path = shell_single_quote(destination_path),
+    );
+
+    log::info!("执行 agent forwarding + scp");
+
+    let cmd_result = source_session.execute_command_with_agent_forward(
+        &scp_cmd,
+        3600,
+        |data: &[u8]| {
+            // scp 本身不直接报字节进度；此处预留给未来替换为 `rsync --info=progress2`。
+            if !data.is_empty() && log::log_enabled!(log::Level::Trace) {
+                log::trace!("scp stderr: {}", String::from_utf8_lossy(data).trim_end());
+            }
+        },
+    )?;
+
+    if cmd_result.success() {
+        log::info!("agent forwarding + scp 传输成功");
+        // scp 没有返回传输字节数；用源端文件大小填充 summary
+        if is_directory {
+            // 目录大小用简单估算：递归累加不值得，scp 成功即可
+            Ok(TransferSummary::default())
+        } else {
+            let metadata = source_session.metadata(remote_path)?;
+            // 若有 progress 指针，按文件总大小一次性补齐
+            if let Some(p) = progress {
+                p.fetch_add(metadata.size, Ordering::Relaxed);
+            }
+            Ok(TransferSummary::one_file(metadata.size))
         }
-        Ok(ResolvedAuthMethod::Password { .. }) => {
-            log::info!("目标服务器使用密码认证，远程 scp 不安全，使用流式传输");
-            RemoteToRemoteStrategy::StreamViaLocal
-        }
-        Ok(ResolvedAuthMethod::Agent) => {
-            log::info!("目标服务器使用 Agent 认证，暂不支持远程 scp，使用流式传输");
-            RemoteToRemoteStrategy::StreamViaLocal
-        }
-        Ok(ResolvedAuthMethod::Auto) => {
-            log::info!("目标服务器使用自动认证，使用流式传输");
-            RemoteToRemoteStrategy::StreamViaLocal
-        }
-        Err(e) => {
-            log::warn!("解析目标服务器认证方式失败: {}，使用流式传输", e);
-            RemoteToRemoteStrategy::StreamViaLocal
-        }
+    } else {
+        let stderr = cmd_result.stderr.trim();
+        log::warn!(
+            "agent forwarding + scp 失败 (exit={:?}): {}",
+            cmd_result.exit_status,
+            stderr
+        );
+        bail!("scp failed: {}", if stderr.is_empty() { "no stderr" } else { stderr })
     }
 }
 
-/// 通过远程 scp 实现服务器直连传输。
+/// 转义路径作为 shell 单引号字符串的参数：`a'b` → `'a'\''b'`
+fn shell_single_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
+/// 通过 **临时密钥 + scp** 实现服务器直连（方案 3b）。
 /// 将目标服务器的私钥临时上传到源服务器，在源服务器执行 scp 命令直接传输到目标。
 ///
 /// # 安全措施
@@ -679,6 +821,7 @@ fn copy_via_remote_scp(
     remote_path: &str,
     destination_config: &SshConnectionConfig,
     destination_path: &str,
+    is_directory: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<TransferSummary> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -739,6 +882,7 @@ fn copy_via_remote_scp(
     // 6. 构建 scp 命令
     //    accept-new：接受新主机密钥但拒绝已变更的密钥（比 no 更安全）
     //    UserKnownHostsFile=/dev/null：不在源服务器上持久化主机密钥
+    //    -p：保留权限与时间戳（目录场景下尤其重要）
     let dest_host = format!("{}@{}", destination_config.username, destination_config.host);
 
     log::warn!(
@@ -746,24 +890,28 @@ fn copy_via_remote_scp(
         （StrictHostKeyChecking=accept-new），第一次连接无法防范 MITM 攻击"
     );
 
-    let scp_cmd = if destination_config.port == 22 {
-        format!(
-            "scp -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -i {} '{}' '{}'",
-            remote_key_path,
-            remote_path,
-            format!("{}:{}", dest_host, destination_path)
-        )
+    let recurse = if is_directory { "-r " } else { "" };
+    let port_flag = if destination_config.port == 22 {
+        String::new()
     } else {
-        format!(
-            "scp -P {} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -i {} '{}' '{}'",
-            destination_config.port,
-            remote_key_path,
-            remote_path,
-            format!("{}:{}", dest_host, destination_path)
-        )
+        format!("-P {} ", destination_config.port)
     };
 
-    log::info!("执行远程 scp");
+    let scp_cmd = format!(
+        "scp {recurse}{port_flag}-p -B \
+         -o StrictHostKeyChecking=accept-new \
+         -o UserKnownHostsFile=/dev/null \
+         -o LogLevel=ERROR \
+         -i '{key}' '{src}' '{dst_host}:{dst_path}'",
+        recurse = recurse,
+        port_flag = port_flag,
+        key = shell_single_quote(&remote_key_path),
+        src = shell_single_quote(remote_path),
+        dst_host = dest_host,
+        dst_path = shell_single_quote(destination_path),
+    );
+
+    log::info!("执行远程 scp{}", if is_directory { " -r" } else { "" });
 
     // 7. 执行远程 scp 命令（给予较长的超时时间）
     let result = source_session.execute_command(&scp_cmd, 3600);
@@ -786,8 +934,13 @@ fn copy_via_remote_scp(
         Ok(cmd_result) => {
             if cmd_result.success() {
                 log::info!("远程 scp 传输成功");
-                let metadata = source_session.metadata(remote_path)?;
-                Ok(TransferSummary::one_file(metadata.size))
+                if is_directory {
+                    // 目录无法便捷计算总字节，summary 仅作为"成功"标记
+                    Ok(TransferSummary::default())
+                } else {
+                    let metadata = source_session.metadata(remote_path)?;
+                    Ok(TransferSummary::one_file(metadata.size))
+                }
             } else {
                 log::warn!(
                     "远程 scp 失败 (exit={:?}): stdout={}, stderr={}",

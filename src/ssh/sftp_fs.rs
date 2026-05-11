@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::anyhow;
 use russh::client::{self, AuthResult};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType};
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::file_transfer::TRANSFER_CANCELLED_MSG;
@@ -62,6 +62,9 @@ pub struct BlockingSftpSession {
     runtime: tokio::runtime::Runtime,
     handle: client::Handle<SftpClientHandler>,
     sftp: SftpSession,
+    /// 懒启的 bulk 通道：为管道化批量 read/write 使用独立 SFTP subsystem，
+    /// 避免与常规 `sftp` 元数据操作竞争同一个 request id 空间。
+    bulk: Option<Arc<RawSftpSession>>,
 }
 
 impl BlockingSftpSession {
@@ -74,7 +77,22 @@ impl BlockingSftpSession {
             runtime,
             handle,
             sftp,
+            bulk: None,
         })
+    }
+
+    /// 返回当前 session 的 bulk `RawSftpSession`，首次调用时惰性建立独立 channel。
+    ///
+    /// 该通道与 `self.sftp` 使用不同的 SSH channel，因此可以在 bulk 传输
+    /// 进行时与元数据操作 / 取消检查并发，不会相互阻塞。
+    pub(crate) fn bulk_session(&mut self) -> anyhow::Result<Arc<RawSftpSession>> {
+        if let Some(existing) = &self.bulk {
+            return Ok(existing.clone());
+        }
+        let session = self.runtime.block_on(open_raw_sftp_session(&self.handle))?;
+        let arc = Arc::new(session);
+        self.bulk = Some(arc.clone());
+        Ok(arc)
     }
 
     pub fn canonicalize(&mut self, path: &str) -> anyhow::Result<String> {
@@ -311,6 +329,7 @@ impl BlockingSftpSession {
         progress: Option<&AtomicU64>,
     ) -> anyhow::Result<u64> {
         let source_permissions = self.permissions(source_path).ok().flatten();
+        let size = self.metadata(source_path)?.size;
         // 使用临时文件避免传输中断时污染目标路径
         let temporary_path = format!("{}.deepterm-part", destination_path);
 
@@ -318,40 +337,19 @@ impl BlockingSftpSession {
             let _ = self.remove_file(&temporary_path);
         }
 
-        // 核心：在单个 block_on 内交替读取源文件并写入目标文件，全程内存缓冲
-        let transferred = self.runtime.block_on(async {
-            let mut source_file = self.sftp.open(source_path).await?;
-            let mut dest_file = self.sftp.create(&temporary_path).await?;
-            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
-            let mut transferred = 0u64;
+        let bulk = self.bulk_session()?;
+        let config = ParallelTransferConfig::from_env();
 
-            loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
-                }
-
-                let read = source_file.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-
-                dest_file.write_all(&buffer[..read]).await?;
-                transferred += read as u64;
-
-                if let Some(p) = progress {
-                    p.fetch_add(read as u64, Ordering::Relaxed);
-                }
-            }
-
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
-            }
-
-            dest_file.flush().await?;
-            dest_file.sync_all().await?;
-            dest_file.shutdown().await?;
-            Ok(transferred)
-        });
+        let transferred = self.runtime.block_on(pipelined_copy_between(
+            bulk.clone(),
+            source_path,
+            bulk,
+            &temporary_path,
+            size,
+            config,
+            cancelled,
+            progress,
+        ));
 
         // 传输完成后重命名为最终文件名，失败时清理临时文件
         match transferred {
@@ -372,13 +370,11 @@ impl BlockingSftpSession {
     /// 跨服务器流式传输：从当前 session 读取源文件，写入目标 session 的目标路径，不写本地磁盘。
     /// 数据仅在内存 buffer 中中转，源端读取和目的端写入在同一个异步上下文交替执行。
     ///
-    /// # 运行时假设
+    /// # 并发策略
     ///
-    /// 本方法在 `self.runtime` 的 `block_on` 中同时访问 `destination_session.sftp`。
-    /// 这要求 `destination_session` 的 `SftpSession` 可以跨 tokio runtime 使用。
-    /// `russh-sftp` 内部通过 SSH channel buffer 与事件循环通信，不直接依赖 reactor，
-    /// 因此该模式在实践中可行。如果未来 `russh-sftp` 版本引入 runtime 亲和性检查，
-    /// 需要改为分两步执行：在各自 runtime 上分别完成读取和写入。
+    /// 底层使用两条独立的 bulk SFTP channel（分别从源/目的 session 懒启）。
+    /// 同时保持多个 in-flight `read`/`write` 请求，显著提升高 RTT 链路的吞吐量。
+    /// 具体并发度由 `ParallelTransferConfig::from_env` 从环境变量读取。
     pub fn stream_transfer_to(
         &mut self,
         source_path: &str,
@@ -387,39 +383,21 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
         progress: Option<&AtomicU64>,
     ) -> anyhow::Result<u64> {
-        self.runtime.block_on(async {
-            let mut source_file = self.sftp.open(source_path).await?;
-            let mut dest_file = destination_session.sftp.create(destination_path).await?;
-            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
-            let mut transferred = 0u64;
+        let size = self.metadata(source_path)?.size;
+        let source_raw = self.bulk_session()?;
+        let dest_raw = destination_session.bulk_session()?;
+        let config = ParallelTransferConfig::from_env();
 
-            loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
-                }
-
-                let read = source_file.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-
-                dest_file.write_all(&buffer[..read]).await?;
-                transferred += read as u64;
-
-                if let Some(p) = progress {
-                    p.fetch_add(read as u64, Ordering::Relaxed);
-                }
-            }
-
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
-            }
-
-            dest_file.flush().await?;
-            dest_file.sync_all().await?;
-            dest_file.shutdown().await?;
-            Ok(transferred)
-        })
+        self.runtime.block_on(pipelined_copy_between(
+            source_raw,
+            source_path,
+            dest_raw,
+            destination_path,
+            size,
+            config,
+            cancelled,
+            progress,
+        ))
     }
 
     pub fn read_dir(&mut self, path: &str) -> anyhow::Result<Vec<RemoteFileEntry>> {
@@ -531,6 +509,82 @@ impl BlockingSftpSession {
             .await;
 
             // 确保通道关闭
+            let _ = channel.close().await;
+
+            match result {
+                Ok(Ok(())) => Ok(RemoteCommandResult {
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    exit_status,
+                }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(anyhow!("远程命令执行超时 ({}s)", timeout_secs)),
+            }
+        })
+    }
+
+    /// 在远程服务器上执行命令，并为该通道启用 **SSH agent forwarding**。
+    ///
+    /// 启用 agent forwarding 后，远程进程可以通过本机 ssh-agent 做鉴权，
+    /// 从而支持在源服务器上直接 `scp`/`rsync` 到目标服务器而无需把私钥
+    /// 搬到源端（方案 3a）。
+    ///
+    /// `progress_cb` 用于实时消费 stderr（scp `-v` / rsync `--info=progress2`
+    /// 都走 stderr），调用方可解析进度写入 `AtomicU64`。stdout 仍然完整收集
+    /// 并作为结果返回。
+    pub fn execute_command_with_agent_forward(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+        mut progress_cb: impl FnMut(&[u8]),
+    ) -> anyhow::Result<RemoteCommandResult> {
+        self.runtime.block_on(async {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(|e| anyhow!("打开 SSH 会话通道失败: {}", e))?;
+
+            // 通知服务器此 channel 接受 agent forwarding
+            channel
+                .agent_forward(true)
+                .await
+                .map_err(|e| anyhow!("请求 agent forwarding 失败: {}", e))?;
+
+            channel
+                .exec(false, command)
+                .await
+                .map_err(|e| anyhow!("执行远程命令失败: {}", e))?;
+
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_status = None;
+
+            let timeout = tokio::time::Duration::from_secs(timeout_secs);
+
+            let result = tokio::time::timeout(timeout, async {
+                loop {
+                    match channel.wait().await {
+                        Some(russh::ChannelMsg::Data { data }) => {
+                            stdout.extend_from_slice(&data);
+                        }
+                        Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
+                            progress_cb(&data);
+                            stderr.extend_from_slice(&data);
+                        }
+                        Some(russh::ChannelMsg::ExitStatus { exit_status: status }) => {
+                            exit_status = Some(status);
+                        }
+                        Some(russh::ChannelMsg::Eof) => {}
+                        Some(russh::ChannelMsg::Close) => break,
+                        None => break,
+                        _ => {}
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+
             let _ = channel.close().await;
 
             match result {
@@ -688,6 +742,31 @@ async fn connect_sftp(
     Ok((handle, sftp))
 }
 
+/// 在已有 SSH 连接上开一条新的 SFTP subsystem，返回底层 `RawSftpSession`。
+///
+/// 独立 channel 使得 pipelined bulk 传输不会占用主 `SftpSession` 的 request
+/// id 空间；同时保持了 keepalive / 鉴权等连接级共享状态。
+async fn open_raw_sftp_session(
+    handle: &client::Handle<SftpClientHandler>,
+) -> anyhow::Result<RawSftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| anyhow!("打开 bulk SFTP 通道失败: {}", e))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| anyhow!("启动 bulk SFTP 子系统失败: {}", e))?;
+
+    let raw = RawSftpSession::new(channel.into_stream());
+    // bulk 传输耗时远超默认 10s，放宽到 5 分钟；任意单个请求都不该超过这个值。
+    raw.set_timeout(300).await;
+    raw.init()
+        .await
+        .map_err(|e| anyhow!("初始化 bulk SFTP 会话失败: {}", e))?;
+    Ok(raw)
+}
+
 async fn authenticate(
     handle: &mut client::Handle<SftpClientHandler>,
     config: &SshConnectionConfig,
@@ -791,3 +870,307 @@ pub fn remote_parent(path: &str) -> Option<String> {
 pub fn remote_components(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
 }
+
+// ============================================================================
+// 方案 1/2：SFTP 请求级管道化传输
+// ============================================================================
+
+/// 管道化传输的运行期参数。
+///
+/// - `parallel`: 同时保持的 in-flight 请求数，越高越能掩盖 RTT，但占内存越多。
+/// - `chunk`: 单次 SFTP read/write 的字节数，必须 ≤ 服务器协商的 `max_read_len`
+///   / `max_write_len`（通常 256 KiB）。这里默认取 248 KiB 留少量余量。
+/// - `io_timeout_secs`: 单个 SFTP 请求的响应超时。默认比 `RawSftpSession` 的
+///   10s 更宽松，避免大块写入时误判。
+#[derive(Clone, Copy, Debug)]
+pub struct ParallelTransferConfig {
+    pub parallel: usize,
+    pub chunk: usize,
+    pub io_timeout_secs: u64,
+}
+
+impl Default for ParallelTransferConfig {
+    fn default() -> Self {
+        Self {
+            parallel: 16,
+            chunk: 248 * 1024,
+            io_timeout_secs: 300,
+        }
+    }
+}
+
+impl ParallelTransferConfig {
+    /// 从环境变量读取覆盖值，便于无需重编译进行调试。
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("DEEPTERM_SFTP_PARALLEL") {
+            if let Ok(parsed) = v.parse::<usize>() {
+                if parsed >= 1 {
+                    cfg.parallel = parsed.min(64);
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("DEEPTERM_SFTP_CHUNK") {
+            if let Ok(parsed) = v.parse::<usize>() {
+                // 上限贴近 russh-sftp 的 261120，避免触发服务器限流。
+                if (1024..=256 * 1024).contains(&parsed) {
+                    cfg.chunk = parsed;
+                }
+            }
+        }
+        cfg
+    }
+}
+
+/// 管道化跨 session 传输单文件：源读 + 目标写全部走各自 session 的 bulk channel，
+/// 通过 K 个并发 read / K 个并发 write 掩盖 RTT。
+///
+/// `size` 为源文件的大小字节数；`progress` 累加已成功写入字节；`cancelled`
+/// 被设置时立刻 bail 出 `TRANSFER_CANCELLED_MSG`（可能留下半传输的临时文件，
+/// 由调用方清理）。
+pub(crate) async fn pipelined_copy_between(
+    source_raw: Arc<RawSftpSession>,
+    source_path: &str,
+    dest_raw: Arc<RawSftpSession>,
+    dest_path: &str,
+    size: u64,
+    config: ParallelTransferConfig,
+    cancelled: &AtomicBool,
+    progress: Option<&AtomicU64>,
+) -> anyhow::Result<u64> {
+    let src_handle = open_handle(&source_raw, source_path, OpenFlags::READ).await?;
+    let dst_handle = open_handle(
+        &dest_raw,
+        dest_path,
+        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+    )
+    .await?;
+
+    let result = pipelined_copy(
+        &source_raw,
+        &src_handle,
+        &dest_raw,
+        &dst_handle,
+        size,
+        config,
+        cancelled,
+        progress,
+    )
+    .await;
+
+    // 无论成功失败都尝试关闭句柄，避免泄漏
+    let _ = source_raw.close(src_handle).await;
+    let _ = dest_raw.close(dst_handle).await;
+
+    result
+}
+
+async fn open_handle(
+    raw: &RawSftpSession,
+    path: &str,
+    flags: OpenFlags,
+) -> anyhow::Result<String> {
+    let handle = raw
+        .open(path.to_string(), flags, FileAttributes::default())
+        .await
+        .map_err(|e| anyhow!("打开远程文件 {} 失败: {}", path, e))?;
+    Ok(handle.handle)
+}
+
+/// 管道化拷贝：读端保留最多 `parallel` 个 in-flight `read`，
+/// 每读到一块数据即提交对应 offset 的 `write`。读与写在同一个 `select!`
+/// 上调度，不等对方完成即可继续。
+///
+/// 正确性要点：每块数据携带显式 offset，服务器端即使乱序到达也按 offset 写。
+/// 管道化拷贝：把读端与写端拆分为两个独立的 async 任务，
+/// 通过 bounded channel 做背压。这样源端最多可保持 `parallel` 个
+/// in-flight `read`、目标端最多可保持 `parallel` 个 in-flight `write`，
+/// 二者并发掩盖各自链路的 RTT。
+///
+/// 正确性要点：每块数据携带显式 offset，写入端按 offset 调用 `write`，
+/// 服务器即使乱序处理也会落到正确位置。
+async fn pipelined_copy(
+    src_raw: &RawSftpSession,
+    src_handle: &str,
+    dst_raw: &RawSftpSession,
+    dst_handle: &str,
+    size: u64,
+    config: ParallelTransferConfig,
+    cancelled: &AtomicBool,
+    progress: Option<&AtomicU64>,
+) -> anyhow::Result<u64> {
+    if size == 0 {
+        return Ok(0);
+    }
+
+    let parallel = config.parallel.max(1);
+    // channel 容量 = parallel：reader 最多领先 writer 一个窗口，
+    // 避免内存峰值无上限。
+    let (tx, rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(parallel);
+
+    let reader = pipelined_reader(src_raw, src_handle, size, config, cancelled, tx);
+    let writer = pipelined_writer(dst_raw, dst_handle, config, cancelled, progress, rx);
+
+    // try_join!：任一端出错立刻中止另一端（channel 被 drop 时对方感知到 EOF/Closed）。
+    let (_, bytes_written) = tokio::try_join!(reader, writer)?;
+    Ok(bytes_written)
+}
+
+async fn pipelined_reader(
+    raw: &RawSftpSession,
+    handle: &str,
+    size: u64,
+    config: ParallelTransferConfig,
+    cancelled: &AtomicBool,
+    tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    use futures::future::FutureExt;
+    use futures::stream::{FuturesOrdered, StreamExt};
+
+    let chunk = config.chunk.max(1024) as u32;
+    let parallel = config.parallel.max(1);
+    let mut reads: FuturesOrdered<_> = FuturesOrdered::new();
+    let mut next_offset: u64 = 0;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+        }
+
+        while reads.len() < parallel && next_offset < size {
+            let remaining = size - next_offset;
+            let len = (chunk as u64).min(remaining) as u32;
+            let offset = next_offset;
+            let h = handle.to_string();
+            reads.push_back(
+                async move {
+                    raw.read(h, offset, len)
+                        .await
+                        .map(|d| (offset, d.data))
+                        .map_err(|e| anyhow!("SFTP read({}) 失败: {}", offset, e))
+                }
+                .boxed(),
+            );
+            next_offset += len as u64;
+        }
+
+        match reads.next().await {
+            Some(Ok((offset, data))) => {
+                if data.is_empty() {
+                    if offset >= size {
+                        break;
+                    }
+                    return Err(anyhow!(
+                        "源文件在 offset={} 早于预期结束 (声明大小 {})",
+                        offset,
+                        size
+                    ));
+                }
+                tx.send((offset, data))
+                    .await
+                    .map_err(|_| anyhow!("写入端已关闭，传输终止"))?;
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
+    }
+
+    Ok(())
+}
+
+async fn pipelined_writer(
+    raw: &RawSftpSession,
+    handle: &str,
+    config: ParallelTransferConfig,
+    cancelled: &AtomicBool,
+    progress: Option<&AtomicU64>,
+    mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+) -> anyhow::Result<u64> {
+    use futures::future::FutureExt;
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let parallel = config.parallel.max(1);
+    let mut writes: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut bytes_written: u64 = 0;
+    let mut rx_closed = false;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+        }
+
+        if rx_closed && writes.is_empty() {
+            break;
+        }
+
+        let can_recv = !rx_closed && writes.len() < parallel;
+        let has_writes = !writes.is_empty();
+
+        if can_recv && has_writes {
+            tokio::select! {
+                biased;
+                Some(res) = writes.next() => {
+                    let n = res?;
+                    bytes_written += n as u64;
+                    if let Some(p) = progress {
+                        p.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some((offset, data)) => {
+                            let n = data.len();
+                            let h = handle.to_string();
+                            writes.push(
+                                async move {
+                                    raw.write(h, offset, data)
+                                        .await
+                                        .map(|_| n)
+                                        .map_err(|e| anyhow!("SFTP write(offset={}) 失败: {}", offset, e))
+                                }
+                                .boxed(),
+                            );
+                        }
+                        None => {
+                            rx_closed = true;
+                        }
+                    }
+                }
+            }
+        } else if can_recv {
+            // 当前没有 in-flight 写，只等待读端产出
+            match rx.recv().await {
+                Some((offset, data)) => {
+                    let n = data.len();
+                    let h = handle.to_string();
+                    writes.push(
+                        async move {
+                            raw.write(h, offset, data)
+                                .await
+                                .map(|_| n)
+                                .map_err(|e| anyhow!("SFTP write(offset={}) 失败: {}", offset, e))
+                        }
+                        .boxed(),
+                    );
+                }
+                None => {
+                    rx_closed = true;
+                }
+            }
+        } else if has_writes {
+            // 写窗口已满（或 rx 已关闭）：等一个写完成腾出空位
+            if let Some(res) = writes.next().await {
+                let n = res?;
+                bytes_written += n as u64;
+                if let Some(p) = progress {
+                    p.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(bytes_written)
+}
+

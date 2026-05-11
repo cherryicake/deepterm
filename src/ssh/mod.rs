@@ -26,6 +26,7 @@
 //! manager.connect(config).await?;
 //! ```
 
+pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod connection_manager;
