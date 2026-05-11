@@ -1017,9 +1017,9 @@ fn upload_local_file_to_remote_path(
         cancelled,
         progress,
     );
-    if let Err(error) = result {
+    if let Err(error) = &result {
         let _ = session.remove_file(&temporary_path);
-        return Err(error);
+        return Err(anyhow!("upload failed: {}", error));
     }
 
     let transferred = result?;
@@ -1111,9 +1111,9 @@ fn download_remote_file_to_local_path(
         cancelled,
         progress,
     );
-    if let Err(error) = result {
+    if let Err(error) = &result {
         let _ = fs::remove_file(&temporary_path);
-        return Err(error);
+        return Err(anyhow!("download failed: {}", error));
     }
 
     let transferred = result?;

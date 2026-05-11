@@ -107,7 +107,7 @@ impl BlockingSftpSession {
 
     pub fn set_permissions(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
         self.runtime.block_on(async {
-            let mut attrs = FileAttributes::default();
+            let mut attrs = FileAttributes::empty();
             attrs.permissions = Some(mode);
             self.sftp.set_metadata(path, attrs).await?;
             Ok(())
@@ -231,6 +231,8 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            remote_file.flush().await?;
+            remote_file.sync_all().await?;
             remote_file.shutdown().await?;
             Ok(transferred)
         })
@@ -294,6 +296,7 @@ impl BlockingSftpSession {
             }
 
             local_file.flush()?;
+            local_file.sync_all()?;
             Ok(transferred)
         })
     }
@@ -344,6 +347,8 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            dest_file.flush().await?;
+            dest_file.sync_all().await?;
             dest_file.shutdown().await?;
             Ok(transferred)
         });
@@ -410,6 +415,8 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            dest_file.flush().await?;
+            dest_file.sync_all().await?;
             dest_file.shutdown().await?;
             Ok(transferred)
         })
