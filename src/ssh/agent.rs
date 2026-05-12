@@ -47,7 +47,11 @@ pub fn agent_has_key(key_path: &Path) -> anyhow::Result<bool> {
             .request_identities()
             .await
             .map_err(|e| anyhow!("ssh-agent 列出密钥失败: {}", e))?;
-        Ok::<bool, anyhow::Error>(identities.iter().any(|id| identity_matches(id, &public, &target_fp)))
+        Ok::<bool, anyhow::Error>(
+            identities
+                .iter()
+                .any(|id| identity_matches(id, &public, &target_fp)),
+        )
     })?;
 
     Ok(has)
@@ -59,9 +63,7 @@ fn identity_matches(
     target_fp: &ssh_key::Fingerprint,
 ) -> bool {
     match identity {
-        AgentIdentity::PublicKey { key, .. } => {
-            key.fingerprint(HashAlg::Sha256) == *target_fp
-        }
+        AgentIdentity::PublicKey { key, .. } => key.fingerprint(HashAlg::Sha256) == *target_fp,
         AgentIdentity::Certificate { certificate, .. } => {
             certificate.public_key().fingerprint(HashAlg::Sha256) == *target_fp
         }

@@ -37,6 +37,7 @@
         "error": "#FF3B30",
         "error_background": "#FFE5E5",
         "error_foreground": "#991111",
+        "notification_background": "#FFFFFF",
         "shadow": "#C6C6C8"
       },
       "terminal": {
@@ -117,6 +118,7 @@
         "error": "#FF453A",
         "error_background": "#3D0A0A",
         "error_foreground": "#FFE5E5",
+        "notification_background": "#2C2C2E",
         "shadow": "#000000"
       },
       "terminal": {
@@ -197,6 +199,7 @@
         "error": "#f7768e",
         "error_background": "#3d1f2b",
         "error_foreground": "#ffe7ef",
+        "notification_background": "#2a3045",
         "shadow": "#0f1118"
       },
       "terminal": {
@@ -277,6 +280,7 @@
         "error": "#fb4934",
         "error_background": "#40201c",
         "error_foreground": "#ffebe7",
+        "notification_background": "#3c3836",
         "shadow": "#101010"
       },
       "terminal": {
@@ -357,6 +361,7 @@
         "error": "#af3029",
         "error_background": "#ffe1d5",
         "error_foreground": "#5e1008",
+        "notification_background": "#fffef5",
         "shadow": "#b7b5ac"
       },
       "terminal": {
@@ -437,6 +442,7 @@
         "error": "#f38ba8",
         "error_background": "#3d1f2b",
         "error_foreground": "#f5e0dc",
+        "notification_background": "#45475a",
         "shadow": "#11111b"
       },
       "terminal": {
@@ -517,6 +523,7 @@
         "error": "#d20f39",
         "error_background": "#fddfdc",
         "error_foreground": "#6e1a33",
+        "notification_background": "#ffffff",
         "shadow": "#bcc0cc"
       },
       "terminal": {
@@ -597,6 +604,7 @@
         "error": "#ff5555",
         "error_background": "#3d1b22",
         "error_foreground": "#ffe9e9",
+        "notification_background": "#44475a",
         "shadow": "#191a21"
       },
       "terminal": {
@@ -677,6 +685,7 @@
         "error": "#bf616a",
         "error_background": "#3b2428",
         "error_foreground": "#eceff4",
+        "notification_background": "#434c5e",
         "shadow": "#1f232d"
       },
       "terminal": {
@@ -757,6 +766,7 @@
         "error": "#dc322f",
         "error_background": "#002b36",
         "error_foreground": "#fdf6e3",
+        "notification_background": "#073642",
         "shadow": "#001217"
       },
       "terminal": {
@@ -837,6 +847,7 @@
         "error": "#dc322f",
         "error_background": "#fdf6e3",
         "error_foreground": "#586e75",
+        "notification_background": "#fff8e7",
         "shadow": "#93a1a1"
       },
       "terminal": {
@@ -917,6 +928,7 @@
         "error": "#ea6c73",
         "error_background": "#0a0e14",
         "error_foreground": "#ffffff",
+        "notification_background": "#131721",
         "shadow": "#01060e"
       },
       "terminal": {
@@ -997,6 +1009,7 @@
         "error": "#ea6c6d",
         "error_background": "#fafafa",
         "error_foreground": "#6c7680",
+        "notification_background": "#ffffff",
         "shadow": "#d8dae0"
       },
       "terminal": {
@@ -1077,6 +1090,7 @@
         "error": "#ed8274",
         "error_background": "#1f2430",
         "error_foreground": "#cbccc6",
+        "notification_background": "#2a3344",
         "shadow": "#191e2a"
       },
       "terminal": {
@@ -1157,6 +1171,7 @@
         "error": "#fa2772",
         "error_background": "#272822",
         "error_foreground": "#f1ebeb",
+        "notification_background": "#48483e",
         "shadow": "#1e1e1b"
       },
       "terminal": {
@@ -1237,6 +1252,7 @@
         "error": "#eb6f92",
         "error_background": "#1f1d2e",
         "error_foreground": "#e0def4",
+        "notification_background": "#2e2b45",
         "shadow": "#11111b"
       },
       "terminal": {
@@ -1317,6 +1333,7 @@
         "error": "#eb6f92",
         "error_background": "#2a273f",
         "error_foreground": "#e0def4",
+        "notification_background": "#393552",
         "shadow": "#181825"
       },
       "terminal": {
@@ -1397,6 +1414,7 @@
         "error": "#b4637a",
         "error_background": "#fffaf3",
         "error_foreground": "#575279",
+        "notification_background": "#fffdf9",
         "shadow": "#cecacd"
       },
       "terminal": {

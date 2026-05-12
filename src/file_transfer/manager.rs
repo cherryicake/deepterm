@@ -36,10 +36,7 @@ impl TransferManager {
         progress: Option<Arc<AtomicU64>>,
     ) -> anyhow::Result<TransferSummary> {
         Self::execute_blocking_with_cancel_and_progress_and_resolver(
-            request,
-            cancelled,
-            progress,
-            None,
+            request, cancelled, progress, None,
         )
     }
 
@@ -81,15 +78,25 @@ impl TransferManager {
                 FileEndpoint::Local {
                     path: destination_dir,
                 },
-            ) if operation == TransferOperation::Move => {
-                Self::move_local_to_local(&path, destination_dir, conflict_policy, cancelled, resolver)
-            }
+            ) if operation == TransferOperation::Move => Self::move_local_to_local(
+                &path,
+                destination_dir,
+                conflict_policy,
+                cancelled,
+                resolver,
+            ),
             (
                 FileEndpoint::Local { path },
                 FileEndpoint::Local {
                     path: destination_dir,
                 },
-            ) => Self::copy_local_to_local(&path, destination_dir, conflict_policy, cancelled, resolver),
+            ) => Self::copy_local_to_local(
+                &path,
+                destination_dir,
+                conflict_policy,
+                cancelled,
+                resolver,
+            ),
             (
                 FileEndpoint::Local { path },
                 FileEndpoint::Remote {
@@ -222,14 +229,16 @@ impl TransferManager {
         let desired_path = destination_dir.join(file_name);
 
         if metadata.is_file() {
-            let destination_path = resolve_local_conflict(&desired_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path =
+                resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             return copy_local_file_to_path(source_path, &destination_path, cancelled);
         }
 
         if metadata.is_dir() {
-            let destination_root = resolve_local_conflict(&desired_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_root =
+                resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             prevent_local_recursive_copy(source_path, &destination_root)?;
             return copy_local_dir_to_path(
                 source_path,
@@ -508,17 +517,15 @@ impl TransferManager {
 
             // 预解析冲突：`Ask` / `AutoRename` 在调用 scp 前先定好最终路径，
             // scp 对这两种策略无法做到精准语义（只能覆盖），所以必要时会降级。
-            let resolved_destination = sftp_fs::with_cached_session(
-                destination_config,
-                |destination_session| {
+            let resolved_destination =
+                sftp_fs::with_cached_session(destination_config, |destination_session| {
                     resolve_remote_conflict(
                         destination_session,
                         &desired_path,
                         conflict_policy,
                         resolver,
                     )
-                },
-            )?;
+                })?;
 
             let destination_path = match resolved_destination {
                 Some(path) => path,
@@ -529,8 +536,7 @@ impl TransferManager {
             // 后得到新文件名的三种情况能安全走 scp；`Ask` 如果选了覆盖等同 Overwrite。
             // 这里统一把"新路径"交给 scp，由它写入目标即可。
 
-            let strategies =
-                detect_transfer_strategies(source_session, destination_config);
+            let strategies = detect_transfer_strategies(source_session, destination_config);
 
             let mut last_error: Option<anyhow::Error> = None;
 
@@ -567,13 +573,11 @@ impl TransferManager {
                             &destination_path,
                             is_directory,
                             cancelled,
+                            progress,
                         ) {
                             Ok(summary) => return Ok(summary),
                             Err(e) => {
-                                log::warn!(
-                                    "方案 3b (临时密钥 scp) 失败，尝试下一策略: {}",
-                                    e
-                                );
+                                log::warn!("方案 3b (临时密钥 scp) 失败，尝试下一策略: {}", e);
                                 last_error = Some(e);
                             }
                         }
@@ -672,7 +676,9 @@ fn detect_transfer_strategies(
 
     // 2. 解析目标认证方式，决定可走哪条直连路径
     match resolve_auth_method(&destination_config.auth_method) {
-        Ok(ResolvedAuthMethod::PrivateKey { path, passphrase, .. }) => {
+        Ok(ResolvedAuthMethod::PrivateKey {
+            path, passphrase, ..
+        }) => {
             // 3a 首选：如果本机 agent 已加载该密钥，则启用 agent forwarding
             if passphrase.is_none() {
                 match crate::ssh::agent::agent_has_key(&path) {
@@ -764,30 +770,32 @@ fn copy_via_agent_forward_scp(
 
     log::info!("执行 agent forwarding + scp");
 
-    let cmd_result = source_session.execute_command_with_agent_forward(
-        &scp_cmd,
-        3600,
-        |data: &[u8]| {
+    let cmd_result =
+        source_session.execute_command_with_agent_forward(&scp_cmd, 3600, |data: &[u8]| {
             // scp 本身不直接报字节进度；此处预留给未来替换为 `rsync --info=progress2`。
             if !data.is_empty() && log::log_enabled!(log::Level::Trace) {
                 log::trace!("scp stderr: {}", String::from_utf8_lossy(data).trim_end());
             }
-        },
-    )?;
+        })?;
 
     if cmd_result.success() {
         log::info!("agent forwarding + scp 传输成功");
-        // scp 没有返回传输字节数；用源端文件大小填充 summary
-        if is_directory {
-            // 目录大小用简单估算：递归累加不值得，scp 成功即可
-            Ok(TransferSummary::default())
+        // scp 没有报告传输字节数；在成功后用源端 metadata 补齐 summary/progress。
+        let total = if is_directory {
+            remote_total_size(source_session, remote_path)
         } else {
-            let metadata = source_session.metadata(remote_path)?;
-            // 若有 progress 指针，按文件总大小一次性补齐
-            if let Some(p) = progress {
-                p.fetch_add(metadata.size, Ordering::Relaxed);
-            }
-            Ok(TransferSummary::one_file(metadata.size))
+            source_session.metadata(remote_path)?.size
+        };
+        if let Some(p) = progress {
+            p.fetch_add(total, Ordering::Relaxed);
+        }
+        if is_directory {
+            Ok(TransferSummary {
+                files_transferred: 0,
+                bytes_transferred: total,
+            })
+        } else {
+            Ok(TransferSummary::one_file(total))
         }
     } else {
         let stderr = cmd_result.stderr.trim();
@@ -796,13 +804,46 @@ fn copy_via_agent_forward_scp(
             cmd_result.exit_status,
             stderr
         );
-        bail!("scp failed: {}", if stderr.is_empty() { "no stderr" } else { stderr })
+        bail!(
+            "scp failed: {}",
+            if stderr.is_empty() {
+                "no stderr"
+            } else {
+                stderr
+            }
+        )
     }
 }
 
 /// 转义路径作为 shell 单引号字符串的参数：`a'b` → `'a'\''b'`
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
+}
+
+/// 递归统计远程路径（文件或目录）的总字节数。
+///
+/// 仅用于 scp 直连路径事后补齐进度，失败时返回 0 以免阻塞 summary 生成——
+/// 反正 UI 会退回到"传输完成"的状态。
+fn remote_total_size(session: &mut sftp_fs::BlockingSftpSession, path: &str) -> u64 {
+    fn walk(session: &mut sftp_fs::BlockingSftpSession, path: &str) -> anyhow::Result<u64> {
+        let meta = session.metadata(path)?;
+        match meta.kind {
+            RemoteFileKind::File => Ok(meta.size),
+            RemoteFileKind::Directory => {
+                let mut total = 0u64;
+                for entry in session.read_dir(path)? {
+                    total = total.saturating_add(match entry.kind {
+                        RemoteFileKind::File => entry.size,
+                        RemoteFileKind::Directory => walk(session, &entry.path).unwrap_or(0),
+                        _ => 0,
+                    });
+                }
+                Ok(total)
+            }
+            _ => Ok(0),
+        }
+    }
+    walk(session, path).unwrap_or(0)
 }
 
 /// 通过 **临时密钥 + scp** 实现服务器直连（方案 3b）。
@@ -823,6 +864,7 @@ fn copy_via_remote_scp(
     destination_path: &str,
     is_directory: bool,
     cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -831,14 +873,16 @@ fn copy_via_remote_scp(
     // 1. 获取目标服务器的认证信息（仅支持无密码短语的密钥认证）
     let resolved_auth = resolve_auth_method(&destination_config.auth_method)?;
     let (key_path, passphrase) = match &resolved_auth {
-        ResolvedAuthMethod::PrivateKey { path, passphrase, .. } => {
-            (path.clone(), passphrase.clone())
-        }
+        ResolvedAuthMethod::PrivateKey {
+            path, passphrase, ..
+        } => (path.clone(), passphrase.clone()),
         _ => bail!("远程 scp 仅支持密钥认证"),
     };
 
     if passphrase.is_some() {
-        bail!("带密码短语的私钥暂不支持远程 scp 直连传输（远程端无 TTY 输入密码），已自动回退到流式传输");
+        bail!(
+            "带密码短语的私钥暂不支持远程 scp 直连传输（远程端无 TTY 输入密码），已自动回退到流式传输"
+        );
     }
 
     // 2. 读取私钥文件内容（使用 Vec<u8> 便于后续内存清零）
@@ -854,36 +898,33 @@ fn copy_via_remote_scp(
     // 3. 在源服务器上创建权限受限的临时目录（避免 /tmp/ 下直接被其他用户读取）
     let temp_dir_name = format!(".deepterm-transfer-{}-{}", timestamp, transfer_id);
     let remote_temp_dir = format!("/tmp/{}", temp_dir_name);
-    source_session.execute_command(
-        &format!("mkdir -m 700 {}", remote_temp_dir),
-        5,
-    ).map_err(|e| anyhow!("在源服务器创建临时目录失败: {}", e))?;
+    source_session
+        .execute_command(&format!("mkdir -m 700 {}", remote_temp_dir), 5)
+        .map_err(|e| anyhow!("在源服务器创建临时目录失败: {}", e))?;
 
     let remote_key_path = format!("{}/id_key", remote_temp_dir);
     let local_temp_path = std::env::temp_dir().join(&temp_dir_name);
 
     // 4. 写入本地临时文件
-    std::fs::write(&local_temp_path, &key_bytes)
-        .with_context(|| "写入本地临时密钥文件失败")?;
+    std::fs::write(&local_temp_path, &key_bytes).with_context(|| "写入本地临时密钥文件失败")?;
 
     // 5. 上传私钥到源服务器的临时目录
-    source_session.upload_file_from_local_with_cancel(
-        &local_temp_path,
-        &remote_key_path,
-        cancelled,
-    ).map_err(|e| {
-        let _ = std::fs::remove_file(&local_temp_path);
-        let _ = source_session.execute_command(
-            &format!("rm -rf {}", remote_temp_dir), 5,
-        );
-        anyhow!("上传临时密钥到源服务器失败: {}", e)
-    })?;
+    source_session
+        .upload_file_from_local_with_cancel(&local_temp_path, &remote_key_path, cancelled)
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&local_temp_path);
+            let _ = source_session.execute_command(&format!("rm -rf {}", remote_temp_dir), 5);
+            anyhow!("上传临时密钥到源服务器失败: {}", e)
+        })?;
 
     // 6. 构建 scp 命令
     //    accept-new：接受新主机密钥但拒绝已变更的密钥（比 no 更安全）
     //    UserKnownHostsFile=/dev/null：不在源服务器上持久化主机密钥
     //    -p：保留权限与时间戳（目录场景下尤其重要）
-    let dest_host = format!("{}@{}", destination_config.username, destination_config.host);
+    let dest_host = format!(
+        "{}@{}",
+        destination_config.username, destination_config.host
+    );
 
     log::warn!(
         "远程 scp 直连使用 trust-on-first-use 主机密钥验证 \
@@ -917,10 +958,7 @@ fn copy_via_remote_scp(
     let result = source_session.execute_command(&scp_cmd, 3600);
 
     // 8. 清理远程临时目录（无论成功失败都清理）
-    let _cleanup = source_session.execute_command(
-        &format!("rm -rf {}", remote_temp_dir),
-        10,
-    );
+    let _cleanup = source_session.execute_command(&format!("rm -rf {}", remote_temp_dir), 10);
 
     // 9. 安全清理本地临时文件：用零覆盖后删除，降低磁盘残留风险
     let _ = std::fs::write(&local_temp_path, &vec![0u8; key_bytes.len()]);
@@ -934,12 +972,21 @@ fn copy_via_remote_scp(
         Ok(cmd_result) => {
             if cmd_result.success() {
                 log::info!("远程 scp 传输成功");
-                if is_directory {
-                    // 目录无法便捷计算总字节，summary 仅作为"成功"标记
-                    Ok(TransferSummary::default())
+                let total = if is_directory {
+                    remote_total_size(source_session, remote_path)
                 } else {
-                    let metadata = source_session.metadata(remote_path)?;
-                    Ok(TransferSummary::one_file(metadata.size))
+                    source_session.metadata(remote_path)?.size
+                };
+                if let Some(p) = progress {
+                    p.fetch_add(total, Ordering::Relaxed);
+                }
+                if is_directory {
+                    Ok(TransferSummary {
+                        files_transferred: 0,
+                        bytes_transferred: total,
+                    })
+                } else {
+                    Ok(TransferSummary::one_file(total))
                 }
             } else {
                 log::warn!(
@@ -948,10 +995,7 @@ fn copy_via_remote_scp(
                     cmd_result.stdout,
                     cmd_result.stderr
                 );
-                bail!(
-                    "远程 scp 失败: {}",
-                    cmd_result.stderr.trim()
-                )
+                bail!("远程 scp 失败: {}", cmd_result.stderr.trim())
             }
         }
         Err(e) => {
@@ -1025,16 +1069,18 @@ fn copy_local_dir_to_path(
         let destination_path = destination_dir.join(entry.file_name());
 
         if metadata.is_file() {
-            let destination_path = resolve_local_conflict(&destination_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path =
+                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             summary.merge(copy_local_file_to_path(
                 &source_path,
                 &destination_path,
                 cancelled,
             )?);
         } else if metadata.is_dir() {
-            let destination_path = resolve_local_conflict(&destination_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path =
+                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             summary.merge(copy_local_dir_to_path(
                 &source_path,
                 &destination_path,
@@ -1213,8 +1259,9 @@ fn download_remote_dir_to_local_path(
         let destination_path = destination_dir.join(&entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            let destination_path = resolve_local_conflict(&destination_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path =
+                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             summary.merge(download_remote_file_to_local_path(
                 session,
                 &entry.path,
@@ -1223,8 +1270,9 @@ fn download_remote_dir_to_local_path(
                 progress,
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
-            let destination_path = resolve_local_conflict(&destination_path, conflict_policy, resolver)?
-                .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path =
+                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                    .ok_or_else(|| anyhow!("transfer skipped"))?;
             fs::create_dir_all(&destination_path)?;
             summary.merge(download_remote_dir_to_local_path(
                 session,
@@ -1372,9 +1420,13 @@ fn copy_remote_dir_between_sessions(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            let destination_path =
-                resolve_remote_conflict(destination_session, &destination_path, conflict_policy, resolver)?
-                    .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path = resolve_remote_conflict(
+                destination_session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+            )?
+            .ok_or_else(|| anyhow!("transfer skipped"))?;
             summary.merge(copy_remote_file_between_sessions(
                 source_session,
                 &entry.path,
@@ -1384,9 +1436,13 @@ fn copy_remote_dir_between_sessions(
                 progress,
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
-            let destination_path =
-                resolve_remote_conflict(destination_session, &destination_path, conflict_policy, resolver)?
-                    .ok_or_else(|| anyhow!("transfer skipped"))?;
+            let destination_path = resolve_remote_conflict(
+                destination_session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+            )?
+            .ok_or_else(|| anyhow!("transfer skipped"))?;
             destination_session.create_dir_all(&destination_path)?;
             summary.merge(copy_remote_dir_between_sessions(
                 source_session,

@@ -23,8 +23,7 @@ use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserV
 use crate::file_transfer::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
-    TransferTaskState, TransferTaskStatus, quick_total_size, render_transfer_overlay,
-    transfer_label,
+    TransferTaskState, TransferTaskStatus, quick_total_size, transfer_item_name, transfer_label,
 };
 use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
@@ -597,10 +596,12 @@ impl Workspace {
         self.transfer_tasks.push(TransferTaskState {
             id: transfer_id,
             label: transfer_label(&request),
+            item_name: transfer_item_name(&request),
             status: TransferTaskStatus::Running,
             cancelled,
             bytes_transferred: progress.clone(),
             total_bytes: 0,
+            started_at: std::time::Instant::now(),
         });
         cx.notify();
 
@@ -644,12 +645,10 @@ impl Workspace {
                     window.prompt(
                         gpui::PromptLevel::Warning,
                         "文件已存在",
-                        Some(
-                            &format!(
-                                "名为 \"{}\" 的文件已存在于该位置。\n是否替换为正在移动的文件？",
-                                prompt.file_name
-                            )
-                        ),
+                        Some(&format!(
+                            "名为 \"{}\" 的文件已存在于该位置。\n是否替换为正在移动的文件？",
+                            prompt.file_name
+                        )),
                         &["停止", "跳过", "替换", "保留两者"],
                         cx,
                     )
@@ -747,7 +746,6 @@ impl Workspace {
         result: anyhow::Result<TransferSummary>,
         cx: &mut Context<Self>,
     ) {
-
         let Some(task) = self
             .transfer_tasks
             .iter_mut()
@@ -786,19 +784,8 @@ impl Workspace {
 
         self.refresh_file_browsers(cx);
 
-        // 10秒后自动关闭
-        let weak = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(10))
-                .await;
-            if let Some(entity) = weak.upgrade() {
-                let _ = entity.update(cx, |this, cx| {
-                    this.remove_transfer_task(transfer_id, cx);
-                });
-            }
-        })
-        .detach();
+        // 已完成/失败/取消的任务保留在列表中，仅通过用户点击"清除"或"×"手动移除。
+        let _ = transfer_id;
     }
 
     fn refresh_file_browsers(&mut self, cx: &mut Context<Self>) {
@@ -2012,6 +1999,23 @@ impl TransferTaskHandler for Workspace {
     }
 }
 
+impl Workspace {
+    /// 读取当前所有传输任务（只读视图）。
+    pub(crate) fn transfer_tasks(&self) -> &[TransferTaskState] {
+        &self.transfer_tasks
+    }
+
+    /// 清除所有已完成 / 失败 / 已取消的传输任务，保留运行中的条目。
+    pub(crate) fn clear_finished_transfer_tasks(&mut self, cx: &mut Context<Self>) {
+        let initial_len = self.transfer_tasks.len();
+        self.transfer_tasks
+            .retain(|task| matches!(task.status, TransferTaskStatus::Running));
+        if self.transfer_tasks.len() != initial_len {
+            cx.notify();
+        }
+    }
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2068,27 +2072,6 @@ impl Render for Workspace {
                     .when_some(active_container, |this, container| {
                         this.child(self.render_split_container(container, &[], cx))
                     }),
-            )
-            .when_some(
-                {
-                    let handle = cx.entity().downgrade();
-                    let handle2 = handle.clone();
-                    render_transfer_overlay(
-                        &self.transfer_tasks,
-                        cx.theme().ui,
-                        move |task_id, app| {
-                            if let Some(ws) = handle.upgrade() {
-                                ws.update(app, |this, cx| this.cancel_transfer_task(task_id, cx));
-                            }
-                        },
-                        move |task_id, app| {
-                            if let Some(ws) = handle2.upgrade() {
-                                ws.update(app, |this, cx| this.remove_transfer_task(task_id, cx));
-                            }
-                        },
-                    )
-                },
-                |this, overlay| this.child(overlay),
             )
             .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
                 this.create_local_terminal(window, cx);

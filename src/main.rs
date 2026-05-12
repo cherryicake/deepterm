@@ -43,7 +43,12 @@ impl AppWindow {
 
         // 从 Workspace 获取 TabBar，然后创建 TitleBar
         let tab_bar = workspace.read(cx).tab_bar.clone();
-        let title_bar = cx.new(|_cx| TitleBar::new("title-bar").with_tab_bar(tab_bar));
+        let workspace_weak = workspace.downgrade();
+        let title_bar = cx.new(|cx| {
+            let mut bar = TitleBar::new("title-bar").with_tab_bar(tab_bar);
+            bar.bind_workspace(workspace_weak, cx);
+            bar
+        });
 
         // 创建 SSH 选择器（先不关联 workspace，在 cx.new 内部设置）
         let workspace_for_picker = workspace.clone();

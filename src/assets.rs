@@ -62,6 +62,8 @@ pub enum Icon {
     Opensuse,
     Manjaro,
     Workspace,
+    Bell,
+    Reveal,
 }
 
 impl Icon {
@@ -101,6 +103,8 @@ impl Icon {
             Icon::Opensuse => SharedString::new_static("icons/opensuse.svg"),
             Icon::Manjaro => SharedString::new_static("icons/manjaro.svg"),
             Icon::Workspace => SharedString::new_static("icons/workspace.svg"),
+            Icon::Bell => SharedString::new_static("icons/bell.svg"),
+            Icon::Reveal => SharedString::new_static("icons/reveal.svg"),
         }
     }
 }

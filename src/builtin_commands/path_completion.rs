@@ -128,12 +128,10 @@ impl PathCompletionEngine {
             .collect();
 
         // 排序：目录在前，然后按字母顺序
-        items.sort_by(|a, b| {
-            match (b.is_directory, a.is_directory) {
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                _ => a.name.cmp(&b.name),
-            }
+        items.sort_by(|a, b| match (b.is_directory, a.is_directory) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a.name.cmp(&b.name),
         });
 
         items

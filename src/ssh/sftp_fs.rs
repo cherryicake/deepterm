@@ -486,7 +486,9 @@ impl BlockingSftpSession {
                         Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
                             stderr.extend_from_slice(&data);
                         }
-                        Some(russh::ChannelMsg::ExitStatus { exit_status: status }) => {
+                        Some(russh::ChannelMsg::ExitStatus {
+                            exit_status: status,
+                        }) => {
                             exit_status = Some(status);
                         }
                         Some(russh::ChannelMsg::Eof) => {
@@ -572,7 +574,9 @@ impl BlockingSftpSession {
                             progress_cb(&data);
                             stderr.extend_from_slice(&data);
                         }
-                        Some(russh::ChannelMsg::ExitStatus { exit_status: status }) => {
+                        Some(russh::ChannelMsg::ExitStatus {
+                            exit_status: status,
+                        }) => {
                             exit_status = Some(status);
                         }
                         Some(russh::ChannelMsg::Eof) => {}
@@ -965,11 +969,7 @@ pub(crate) async fn pipelined_copy_between(
     result
 }
 
-async fn open_handle(
-    raw: &RawSftpSession,
-    path: &str,
-    flags: OpenFlags,
-) -> anyhow::Result<String> {
+async fn open_handle(raw: &RawSftpSession, path: &str, flags: OpenFlags) -> anyhow::Result<String> {
     let handle = raw
         .open(path.to_string(), flags, FileAttributes::default())
         .await
@@ -1173,4 +1173,3 @@ async fn pipelined_writer(
 
     Ok(bytes_written)
 }
-

@@ -97,10 +97,7 @@ pub fn wait_for_resolution(
 }
 
 /// 设置 "应用到全部" 决策。
-pub fn set_apply_to_all(
-    resolver: &SharedConflictResolver,
-    resolution: ConflictResolution,
-) {
+pub fn set_apply_to_all(resolver: &SharedConflictResolver, resolution: ConflictResolution) {
     resolver.apply_to_all.store(true, Ordering::Relaxed);
     *resolver.cached_resolution.lock() = Some(resolution);
 }

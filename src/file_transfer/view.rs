@@ -1,12 +1,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{Context, ClickEvent, Window, App, div, px};
+use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
 
+use crate::assets::Icon;
 use crate::file_browser::shared::format_size;
 use crate::file_transfer::{FileEndpoint, TransferRequest};
 use crate::theme::UiTheme;
+
+const PANEL_WIDTH: f32 = 520.0;
+const PANEL_MAX_HEIGHT: f32 = 440.0;
 
 /// Handler trait for transfer task actions.
 pub trait TransferTaskHandler: 'static {
@@ -30,122 +35,453 @@ pub enum TransferTaskStatus {
 pub struct TransferTaskState {
     pub id: usize,
     pub label: String,
+    /// Short name shown as the list item title (e.g. file name without path).
+    pub item_name: String,
     pub(crate) status: TransferTaskStatus,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) bytes_transferred: Arc<AtomicU64>,
     pub total_bytes: u64,
+    pub started_at: Instant,
 }
 
-pub fn render_transfer_overlay(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferHoverAction {
+    Cancel,
+    Remove,
+    Reveal,
+}
+
+impl TransferHoverAction {
+    fn hint_text(self) -> &'static str {
+        match self {
+            TransferHoverAction::Cancel => "取消传输",
+            TransferHoverAction::Remove => "从列表中移除",
+            TransferHoverAction::Reveal => "在文件夹中显示",
+        }
+    }
+}
+
+/// Render the full transfer popover panel, including the header with a
+/// "clear all completed" action and the task list. Returns `None` when no
+/// task exists so callers can decide whether to show the trigger button.
+pub fn render_transfer_panel(
     tasks: &[TransferTaskState],
     theme: UiTheme,
+    hover_hint: Option<(usize, TransferHoverAction)>,
+    on_hover: impl Fn(Option<(usize, TransferHoverAction)>, &mut App) + 'static + Clone,
     on_cancel: impl Fn(usize, &mut App) + 'static + Clone,
     on_remove: impl Fn(usize, &mut App) + 'static + Clone,
-) -> Option<gpui::Div> {
+    on_clear_finished: impl Fn(&mut App) + 'static + Clone,
+    on_reveal: impl Fn(usize, &mut App) + 'static + Clone,
+) -> Option<Div> {
     if tasks.is_empty() {
         return None;
     }
 
-    let mut panel = div()
-        .absolute()
-        .right(px(18.0))
-        .bottom(px(18.0))
-        .w(px(360.0))
-        .max_h(px(280.0))
-        .overflow_hidden()
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.elevated_background)
-        .shadow_md()
-        .p(px(12.0))
+    let has_finished = tasks
+        .iter()
+        .any(|task| !matches!(task.status, TransferTaskStatus::Running));
+
+    let header = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .px(px(14.0))
+        .pt(px(10.0))
+        .pb(px(8.0))
+        .child(
+            div()
+                .flex_1()
+                .text_center()
+                .text_sm()
+                .text_color(theme.text)
+                .child("传输"),
+        )
+        .child({
+            let mut btn = div()
+                .id("transfer-clear")
+                .text_xs()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(6.0))
+                .text_color(if has_finished {
+                    theme.text
+                } else {
+                    theme.text_subtle
+                })
+                .child("清除");
+            if has_finished {
+                btn = btn
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.tab_hover_background))
+                    .on_click({
+                        let on_clear_finished = on_clear_finished.clone();
+                        move |_: &ClickEvent, _: &mut Window, app: &mut App| {
+                            on_clear_finished(app);
+                        }
+                    });
+            }
+            btn
+        });
+
+    let mut list = div()
+        .id("transfer-list")
         .flex()
         .flex_col()
-        .gap(px(8.0))
-        .child(div().text_sm().text_color(theme.text).child("Transfers"));
+        .overflow_y_scroll()
+        .max_h(px(PANEL_MAX_HEIGHT - 46.0));
 
-    for task in tasks.iter().rev().take(5) {
-        let task_id = task.id;
-        let transferred = task.bytes_transferred.load(Ordering::Relaxed);
-        let status_label = transfer_status_label(&task.status, transferred, task.total_bytes);
-        let is_running = matches!(task.status, TransferTaskStatus::Running);
-        let on_cancel = on_cancel.clone();
-        let on_remove = on_remove.clone();
-        panel = panel.child(
-            div()
-                .w_full()
-                .rounded(px(8.0))
-                .bg(theme.panel_background)
-                .border_1()
-                .border_color(theme.border.opacity(0.5))
-                .p(px(8.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.text)
-                                .child(task.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.text_subtle)
-                                .child(status_label),
-                        ),
-                )
-                .when(is_running, |this| {
-                    this.child(
-                        div()
-                            .id(format!("transfer-cancel-{}", task_id))
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .bg(theme.tab_hover_background)
-                            .text_xs()
-                            .text_color(theme.text)
-                            .cursor_pointer()
-                            .child("Cancel")
-                            .on_click({
-                                let on_cancel = on_cancel.clone();
-                                move |_: &ClickEvent, _: &mut Window, app: &mut App| {
-                                    on_cancel(task_id, app);
-                                }
-                            }),
-                    )
-                })
-                .when(!is_running, |this| {
-                    this.child(
-                        div()
-                            .id(format!("transfer-close-{}", task_id))
-                            .px(px(8.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .bg(theme.tab_hover_background)
-                            .text_xs()
-                            .text_color(theme.text)
-                            .cursor_pointer()
-                            .child("×")
-                            .on_click({
-                                let on_remove = on_remove.clone();
-                                move |_: &ClickEvent, _: &mut Window, app: &mut App| {
-                                    on_remove(task_id, app);
-                                }
-                            }),
-                    )
-                }),
-        );
+    for (i, task) in tasks.iter().rev().enumerate() {
+        let is_last = i + 1 == tasks.len();
+        let task_hover = hover_hint
+            .filter(|(id, _)| *id == task.id)
+            .map(|(_, action)| action);
+        list = list.child(render_transfer_list_item(
+            task,
+            theme,
+            is_last,
+            task_hover,
+            on_hover.clone(),
+            on_cancel.clone(),
+            on_remove.clone(),
+            on_reveal.clone(),
+        ));
     }
 
-    Some(panel)
+    // 使用主题中定义的通知弹窗背景色，确保在任意主题下都能与终端背景做明显区分。
+    let panel_bg = theme.notification_background;
+    Some(
+        div()
+            .w(px(PANEL_WIDTH))
+            .max_h(px(PANEL_MAX_HEIGHT))
+            .rounded(px(12.0))
+            .bg(panel_bg)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list),
+    )
+}
+
+fn render_transfer_list_item(
+    task: &TransferTaskState,
+    theme: UiTheme,
+    is_last: bool,
+    hover: Option<TransferHoverAction>,
+    on_hover: impl Fn(Option<(usize, TransferHoverAction)>, &mut App) + 'static + Clone,
+    on_cancel: impl Fn(usize, &mut App) + 'static + Clone,
+    on_remove: impl Fn(usize, &mut App) + 'static + Clone,
+    on_reveal: impl Fn(usize, &mut App) + 'static + Clone,
+) -> Div {
+    let task_id = task.id;
+    let transferred = task.bytes_transferred.load(Ordering::Relaxed);
+    let is_running = matches!(task.status, TransferTaskStatus::Running);
+    let total_bytes = task.total_bytes;
+
+    let status_line = if let Some(action) = hover {
+        action.hint_text().to_string()
+    } else {
+        match &task.status {
+            TransferTaskStatus::Running => {
+                let elapsed = task.started_at.elapsed().as_secs_f64().max(0.001);
+                let speed = (transferred as f64) / elapsed;
+                let mut parts = Vec::with_capacity(3);
+                if total_bytes > 0 {
+                    parts.push(format!(
+                        "{}/{}",
+                        format_size(transferred),
+                        format_size(total_bytes)
+                    ));
+                } else {
+                    parts.push(format_size(transferred));
+                }
+                if speed > 0.0 {
+                    parts.push(format!("({}/秒)", format_size(speed as u64)));
+                }
+                if total_bytes > transferred && speed > 1.0 {
+                    let remaining_secs = ((total_bytes - transferred) as f64 / speed) as u64;
+                    parts.push(format!(
+                        "— 剩余 {}",
+                        format_duration_remaining(remaining_secs)
+                    ));
+                }
+                parts.join(" ")
+            }
+            TransferTaskStatus::Completed { bytes, .. } => format_size(*bytes),
+            TransferTaskStatus::Failed(error) => format!("失败: {}", trim_error(error)),
+            TransferTaskStatus::Cancelled => "已取消".to_string(),
+        }
+    };
+
+    // 进度条：仅运行中显示
+    let progress_ratio = if total_bytes > 0 {
+        (transferred as f64 / total_bytes as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let display_name = truncate_middle_preserving_suffix(&task.item_name, 56);
+
+    let text_column = div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .truncate()
+                .text_xs()
+                .text_color(theme.text)
+                .child(display_name),
+        )
+        .when(is_running && total_bytes > 0, |this| {
+            this.child(
+                div()
+                    .w_full()
+                    .h(px(4.0))
+                    .rounded(px(2.0))
+                    .bg(theme.border.opacity(0.5))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(progress_ratio as f32))
+                            .rounded(px(2.0))
+                            .bg(rgb(0x3b82f6)),
+                    ),
+            )
+        })
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .truncate()
+                .text_xs()
+                .text_color(theme.text_subtle)
+                .child(status_line),
+        );
+
+    let cancel_button = div()
+        .id(("transfer-cancel", task_id))
+        .size(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(theme.text_subtle)
+        .hover(|style| style.text_color(theme.text).bg(theme.tab_hover_background))
+        .cursor_pointer()
+        .child(
+            gpui::svg()
+                .size(px(12.0))
+                .text_color(theme.text_subtle)
+                .path(Icon::WindowClose.path()),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_hover({
+            let on_hover = on_hover.clone();
+            move |hovered: &bool, _: &mut Window, app: &mut App| {
+                on_hover(
+                    if *hovered {
+                        Some((task_id, TransferHoverAction::Cancel))
+                    } else {
+                        None
+                    },
+                    app,
+                );
+            }
+        })
+        .on_click({
+            let on_cancel = on_cancel.clone();
+            move |_: &ClickEvent, _: &mut Window, app: &mut App| {
+                on_cancel(task_id, app);
+            }
+        });
+
+    let reveal_button = div()
+        .id(("transfer-reveal", task_id))
+        .size(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(theme.text_subtle)
+        .hover(|style| style.text_color(theme.text).bg(theme.tab_hover_background))
+        .cursor_pointer()
+        .child(
+            gpui::svg()
+                .size(px(14.0))
+                .text_color(theme.text_subtle)
+                .path(Icon::Reveal.path()),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_hover({
+            let on_hover = on_hover.clone();
+            move |hovered: &bool, _: &mut Window, app: &mut App| {
+                on_hover(
+                    if *hovered {
+                        Some((task_id, TransferHoverAction::Reveal))
+                    } else {
+                        None
+                    },
+                    app,
+                );
+            }
+        })
+        .on_click({
+            let on_reveal = on_reveal.clone();
+            move |_: &ClickEvent, _: &mut Window, app: &mut App| {
+                on_reveal(task_id, app);
+            }
+        });
+
+    let remove_button = div()
+        .id(("transfer-remove", task_id))
+        .size(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(theme.text_subtle)
+        .hover(|style| style.text_color(theme.text).bg(theme.tab_hover_background))
+        .cursor_pointer()
+        .child(
+            gpui::svg()
+                .size(px(12.0))
+                .text_color(theme.text_subtle)
+                .path(Icon::WindowClose.path()),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_hover({
+            let on_hover = on_hover.clone();
+            move |hovered: &bool, _: &mut Window, app: &mut App| {
+                on_hover(
+                    if *hovered {
+                        Some((task_id, TransferHoverAction::Remove))
+                    } else {
+                        None
+                    },
+                    app,
+                );
+            }
+        })
+        .on_click({
+            let on_remove = on_remove.clone();
+            move |_: &ClickEvent, _: &mut Window, app: &mut App| {
+                on_remove(task_id, app);
+            }
+        });
+
+    let actions = div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .when(is_running, |this| this.child(cancel_button))
+        .when(!is_running, |this| this.child(remove_button))
+        .child(reveal_button);
+
+    let icon_column = div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(44.0))
+        .h_full()
+        .text_color(theme.text_subtle)
+        .child(
+            gpui::svg()
+                .size(px(34.0))
+                .text_color(theme.text_subtle)
+                .path(Icon::File.path()),
+        );
+
+    let mut row = div()
+        .relative()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(12.0))
+        .py(px(8.0))
+        .child(icon_column)
+        .child(text_column)
+        .child(actions);
+
+    if !is_last {
+        // 分割线：起始位置与文件名左对齐，结束位置距弹窗右边界 4px
+        row = row.child(
+            div()
+                .absolute()
+                .bottom(px(0.0))
+                .left(px(64.0))
+                .right(px(12.0))
+                .h(px(1.0))
+                .bg(theme.border.opacity(0.35)),
+        );
+    }
+    row
+}
+
+fn format_duration_remaining(secs: u64) -> String {
+    if secs < 60 {
+        format!("{} 秒", secs)
+    } else if secs < 3600 {
+        format!("{} 分", (secs + 30) / 60)
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600 + 30) / 60;
+        if mins == 0 {
+            format!("{} 小时", hours)
+        } else {
+            format!("{} 小时 {} 分", hours, mins)
+        }
+    }
+}
+
+fn trim_error(error: &str) -> String {
+    const MAX: usize = 80;
+    if error.chars().count() <= MAX {
+        error.to_string()
+    } else {
+        let truncated: String = error.chars().take(MAX).collect();
+        format!("{}…", truncated)
+    }
+}
+
+/// 截断长文件名：优先在主文件名（扩展名前）部分做 "…" 省略，
+/// 始终保留扩展名。若没有扩展名（或扩展名本身过长），退化为普通前缀省略。
+fn truncate_middle_preserving_suffix(name: &str, max_chars: usize) -> String {
+    let total = name.chars().count();
+    if total <= max_chars {
+        return name.to_string();
+    }
+
+    // 最后一个 '.' 视为扩展分隔（不含首字符的点文件情况）
+    let dot_index = name
+        .char_indices()
+        .rev()
+        .find(|(i, c)| *c == '.' && *i > 0)
+        .map(|(i, _)| i);
+
+    if let Some(dot) = dot_index {
+        let (stem, ext_with_dot) = name.split_at(dot);
+        let ext_chars = ext_with_dot.chars().count();
+        // 若扩展名本身太长（如无点后缀、随机字符串），按字符总额一半上限兜底
+        if ext_chars + 4 >= max_chars {
+            let head: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+            return format!("{}…", head);
+        }
+        let keep_stem = max_chars.saturating_sub(ext_chars + 1); // 预留 "…"
+        let stem_prefix: String = stem.chars().take(keep_stem).collect();
+        format!("{}…{}", stem_prefix, ext_with_dot)
+    } else {
+        let head: String = name.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", head)
+    }
 }
 
 pub fn transfer_label(request: &TransferRequest) -> String {
@@ -159,6 +495,17 @@ pub fn transfer_label(request: &TransferRequest) -> String {
         source_label,
         endpoint_label(&request.destination)
     )
+}
+
+/// Short name for the list-item title, shown prominently above the progress
+/// bar. For a single source we use its file name; for multi-selection we
+/// summarize as "N 项".
+pub fn transfer_item_name(request: &TransferRequest) -> String {
+    match request.sources.as_slice() {
+        [] => "传输".to_string(),
+        [source] => endpoint_label(source),
+        sources => format!("{} 项", sources.len()),
+    }
 }
 
 pub fn endpoint_label(endpoint: &FileEndpoint) -> String {
@@ -176,28 +523,6 @@ pub fn endpoint_label(endpoint: &FileEndpoint) -> String {
                 .unwrap_or("/");
             format!("{}:{}", ssh_config.host_label(), name)
         }
-    }
-}
-
-pub fn transfer_status_label(
-    status: &TransferTaskStatus,
-    bytes_transferred: u64,
-    total_bytes: u64,
-) -> String {
-    match status {
-        TransferTaskStatus::Running => {
-            if total_bytes > 0 {
-                let percent = (bytes_transferred * 100 / total_bytes).min(100);
-                format!("{}%", percent)
-            } else {
-                format!("Running... {}", format_size(bytes_transferred))
-            }
-        }
-        TransferTaskStatus::Completed { files, bytes } => {
-            format!("Completed: {} files, {}", files, format_size(*bytes))
-        }
-        TransferTaskStatus::Failed(error) => format!("Failed: {}", error),
-        TransferTaskStatus::Cancelled => "Cancelled".to_string(),
     }
 }
 

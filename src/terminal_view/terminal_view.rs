@@ -689,10 +689,7 @@ impl TerminalView {
     }
 
     /// 渲染内建命令建议浮层，并把鼠标选择转成一次显式补全。
-    fn render_builtin_command_overlay(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_builtin_command_overlay(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let top = self.builtin_command_overlay_position(cx);
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
@@ -810,7 +807,9 @@ impl TerminalView {
     fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
         use crate::builtin_commands::executor::CommandResult;
         use crate::builtin_commands::executor::global_executor;
-        use crate::builtin_commands::{ArgumentParser, CommandContext, PathResolver, global_registry};
+        use crate::builtin_commands::{
+            ArgumentParser, CommandContext, PathResolver, global_registry,
+        };
 
         // 提取命令名和参数
         let command_name = command_line
@@ -829,7 +828,11 @@ impl TerminalView {
         // 查询 shell 进程的实时工作目录
         let (process_cwd, remote_cwd) = if self.ssh_config.is_some() {
             // 远程终端：通过 OSC 序列动态追踪
-            let remote_cwd = self.terminal.read(cx).remote_working_directory().map(String::from);
+            let remote_cwd = self
+                .terminal
+                .read(cx)
+                .remote_working_directory()
+                .map(String::from);
             (None, remote_cwd)
         } else {
             // 本地终端：通过操作系统查询 shell 进程实际 CWD
@@ -938,9 +941,7 @@ impl TerminalView {
 
         // 4秒后自动隐藏
         self.toast_hide_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(4))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(4)).await;
             this.update(cx, |this, cx| {
                 this.toast_message = None;
                 this.toast_hide_task = None;

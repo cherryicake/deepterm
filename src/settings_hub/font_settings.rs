@@ -132,10 +132,6 @@ impl FontState {
         cx.global::<Self>()
     }
 
-    pub fn global_mut(cx: &mut App) -> &mut Self {
-        cx.global_mut::<Self>()
-    }
-
     pub fn update<F>(cx: &mut App, f: F)
     where
         F: FnOnce(&mut FontSettings),

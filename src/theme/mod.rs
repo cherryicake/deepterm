@@ -57,6 +57,7 @@ pub struct UiTheme {
     pub error: Hsla,
     pub error_background: Hsla,
     pub error_foreground: Hsla,
+    pub notification_background: Hsla,
     pub shadow: Hsla,
 }
 
@@ -281,6 +282,7 @@ struct UiThemeFile {
     error: String,
     error_background: String,
     error_foreground: String,
+    notification_background: String,
     shadow: String,
 }
 
@@ -479,6 +481,7 @@ impl TryFrom<UiThemeFile> for UiTheme {
             error: parse_color(&value.error)?,
             error_background: parse_color(&value.error_background)?,
             error_foreground: parse_color(&value.error_foreground)?,
+            notification_background: parse_color(&value.notification_background)?,
             shadow: parse_color(&value.shadow)?,
         })
     }

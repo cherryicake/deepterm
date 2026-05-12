@@ -153,7 +153,6 @@ impl SplitResizeAnimation {
         self.current_sizes = new_sizes;
         cx.notify();
     }
-
 }
 
 impl Focusable for SplitResizeAnimation {

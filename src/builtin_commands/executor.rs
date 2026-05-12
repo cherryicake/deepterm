@@ -123,9 +123,8 @@ impl CommandHandler for OpenFileBrowserHandler {
                 .expect("remote terminal should carry ssh config");
 
             // 使用远程终端动态追踪的 CWD（来自 OSC 序列），作为无参时的默认路径
-            let requested_path = argument.and_then(|raw| {
-                PathResolver::resolve_remote(raw, ctx.remote_cwd.as_deref())
-            });
+            let requested_path = argument
+                .and_then(|raw| PathResolver::resolve_remote(raw, ctx.remote_cwd.as_deref()));
 
             FileBrowserTarget::Remote {
                 ssh_config,
@@ -175,7 +174,8 @@ impl CommandHandler for OpenFileHandler {
         };
 
         // 解析行号和列号（如 "file.txt:4:2"）
-        let (path_part, _line, _col) = crate::builtin_commands::PathCompletionEngine::parse_line_column(raw_path);
+        let (path_part, _line, _col) =
+            crate::builtin_commands::PathCompletionEngine::parse_line_column(raw_path);
 
         let path = if ctx.is_remote {
             PathResolver::resolve_remote(&path_part, None).unwrap_or_else(|| path_part.to_string())

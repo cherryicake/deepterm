@@ -402,11 +402,13 @@ impl BuiltinCommandManager {
 
     /// 获取参数提示文本（如 "file_path"）。
     pub fn argument_hint(&self) -> Option<&'static str> {
-        self.resolved_command.as_ref().and_then(|cmd| match cmd.argument {
-            ArgumentType::Optional { hint } => hint,
-            ArgumentType::Required { hint } => Some(hint),
-            ArgumentType::None => None,
-        })
+        self.resolved_command
+            .as_ref()
+            .and_then(|cmd| match cmd.argument {
+                ArgumentType::Optional { hint } => hint,
+                ArgumentType::Required { hint } => Some(hint),
+                ArgumentType::None => None,
+            })
     }
 }
 
@@ -726,11 +728,7 @@ where
                                             .min_w_0()
                                             .text_size(px(12.0))
                                             .text_color(theme.text_muted)
-                                            .child(
-                                                item.path
-                                                    .to_string_lossy()
-                                                    .into_owned(),
-                                            ),
+                                            .child(item.path.to_string_lossy().into_owned()),
                                     )
                                 })
                         }),
