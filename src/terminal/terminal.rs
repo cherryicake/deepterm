@@ -79,6 +79,9 @@ pub enum Event {
     Bell,
     Wakeup,
     SelectionsChanged,
+    /// 终端应用通过 DEC 私有模式 ?12 或 CSI `Ps SP q` 改变了光标闪烁策略。
+    /// `bool` 为 true 表示应用希望光标闪烁。
+    BlinkChanged(bool),
 }
 
 #[derive(Clone)]
@@ -1098,9 +1101,12 @@ impl Terminal {
                 self.write(response.as_bytes());
             }
             AlacTermEvent::CursorBlinkingChange => {
-                // Ignore cursor blinking changes for now.
-                // They can trigger frequent whole-terminal repaints with no content damage,
-                // which is disproportionately expensive in the current GPUI renderer.
+                // Application requested a cursor blink state change via DEC
+                // private mode `?12h` / `?12l` or CSI `Ps SP q`. Forward the
+                // new flag so the view layer can run (or stop) its blink
+                // state machine.
+                let blinking = self.term.lock().cursor_style().blinking;
+                cx.emit(Event::BlinkChanged(blinking));
             }
         }
     }

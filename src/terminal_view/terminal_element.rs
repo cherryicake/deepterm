@@ -159,7 +159,15 @@ pub struct CursorLayout {
     thickness: Pixels,
     color: gpui::Hsla,
     shape: CursorShape,
+    /// Shaped glyph painted over a Block cursor in the background color to
+    /// produce the inverted look. `None` when the underlying cell is empty
+    /// or the char is handled by `block_box_drawing` below.
     block_text: Option<gpui::ShapedLine>,
+    /// When the character under a Block cursor is a U+2500–U+259F box-drawing
+    /// character, we bypass the font rasterizer and re-draw the same glyph
+    /// using the inverted color via `box_drawing::paint_box_drawing`.
+    /// (char, cell_width) is enough to re-run the existing paint routine.
+    block_box_drawing: Option<(char, Hsla)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -252,6 +260,21 @@ impl CursorLayout {
                 None,
                 window,
                 cx,
+            );
+        }
+
+        // Paint inverted box-drawing glyph on top of a Block cursor.
+        // `block_width` may be wider than `cell_width` for wide chars, but
+        // box-drawing characters are never wide (U+2500–U+259F); use the
+        // cell_width implicit from `block_width` when it equals 1 cell.
+        if let Some((ch, color)) = self.block_box_drawing {
+            box_drawing::paint_box_drawing(
+                ch,
+                self.origin,
+                self.block_width,
+                self.line_height,
+                color,
+                window,
             );
         }
     }
@@ -1218,28 +1241,52 @@ impl Element for TerminalElement {
             let cursor_block_width = cell_width * cursor_cells_wide;
             let block_text_color = terminal_theme.background;
 
-            // Create text for block cursor (inverted color effect)
-            let block_text = if matches!(overlay_cursor_shape, CursorShape::Block) {
-                if cursor_char != '\0' && cursor_char != ' ' {
-                    let char_str = cursor_char.to_string();
-                    let len = cursor_char.len_utf8();
-                    Some(window.text_system().shape_line(
-                        char_str.into(),
-                        font_size,
-                        &[TextRun {
-                            len,
-                            font: text_style.font(),
-                            color: block_text_color,
-                            ..Default::default()
-                        }],
-                        Some(cursor_block_width),
-                    ))
-                } else {
-                    None
+            // Preserve bold/italic so the inverted glyph matches the cell.
+            let cursor_font = {
+                let mut f = text_style.font();
+                if cursor_cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::BOLD)
+                {
+                    f.weight = FontWeight::BOLD;
                 }
-            } else {
-                None
+                if cursor_cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::ITALIC)
+                {
+                    f.style = FontStyle::Italic;
+                }
+                f
             };
+
+            // Block cursor draws the glyph on top in the inverted (background)
+            // color. For box-drawing chars we bypass the font rasterizer and
+            // re-run our rect-based painter so the lines stay aligned.
+            let (block_text, block_box_drawing) =
+                if matches!(overlay_cursor_shape, CursorShape::Block) {
+                    if box_drawing::is_box_drawing_char(cursor_char) {
+                        (None, Some((cursor_char, block_text_color)))
+                    } else if cursor_char != '\0' && cursor_char != ' ' {
+                        let char_str = cursor_char.to_string();
+                        let len = cursor_char.len_utf8();
+                        let shaped = window.text_system().shape_line(
+                            char_str.into(),
+                            font_size,
+                            &[TextRun {
+                                len,
+                                font: cursor_font,
+                                color: block_text_color,
+                                ..Default::default()
+                            }],
+                            Some(cursor_block_width),
+                        );
+                        (Some(shaped), None)
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
 
             Some(CursorLayout {
                 origin: point(cursor_x, cursor_y),
@@ -1249,6 +1296,7 @@ impl Element for TerminalElement {
                 color: cursor_color,
                 shape: overlay_cursor_shape,
                 block_text,
+                block_box_drawing,
             })
         } else {
             None
@@ -1382,8 +1430,8 @@ impl Element for TerminalElement {
             selection_cells,
             cell_width,
             line_height,
-            _cursor_col,
-            _cursor_row,
+            cursor_col,
+            cursor_row,
             _cursor_in_viewport,
             terminal_bounds,
             cursor,
@@ -1426,7 +1474,18 @@ impl Element for TerminalElement {
         // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
         // 效果等同于 Alacritty 的 builtin_box_drawing = true：
         // 相邻格的边框线条精确对齐，不依赖字体字形，不会出现间隙。
+        //
+        // Exception: when the Block cursor overlays a box-drawing cell we skip
+        // the foreground-colored paint here and let `CursorLayout::paint`
+        // redraw that single cell with the inverted color.
+        let skip_cursor_box = cursor
+            .as_ref()
+            .map(|c| c.block_box_drawing.is_some())
+            .unwrap_or(false);
         for cell in box_cells.iter() {
+            if skip_cursor_box && cell.col == *cursor_col && cell.row == *cursor_row {
+                continue;
+            }
             let cell_origin = point(
                 origin.x + *cell_width * cell.col as f32,
                 origin.y + *line_height * cell.row as f32,

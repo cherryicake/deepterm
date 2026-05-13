@@ -49,6 +49,7 @@ use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::terminal::mappings::keys::to_esc_str;
 use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
+use crate::terminal_view::blink_cursor::BlinkCursor;
 use crate::terminal_view::terminal_element::{
     FlattenedRenderCache, RowRenderCache, TerminalElement,
 };
@@ -58,6 +59,19 @@ use crate::theme::ActiveTheme;
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
 const CONTEXT: &str = "Terminal";
+
+/// Cursor blink policy. Mirrors Zed's `TerminalBlink` setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TerminalBlink {
+    /// Never blink the cursor, regardless of what the application asks for.
+    Off,
+    /// Always blink the cursor.
+    On,
+    /// Default. Do not blink unless the running application explicitly
+    /// enables blinking via DEC private mode `?12h` or CSI `Ps SP q`.
+    #[default]
+    TerminalControlled,
+}
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
 
 // Scroll velocity tracking constants
@@ -86,7 +100,19 @@ pub struct TerminalView {
     working_directory: Option<PathBuf>,
     ssh_config: Option<SshConnectionConfig>,
     focus_handle: FocusHandle,
-    cursor_visible: bool,
+    /// Drives cursor blink on/off. `visible()` is the final signal
+    /// consumed by the element.
+    blink_manager: Entity<BlinkCursor>,
+    /// Subscriptions that must stay alive for the blink manager to fire
+    /// repaints and the focus in/out hooks to run.
+    _blink_subscriptions: Vec<Subscription>,
+    /// Current blink policy. See `TerminalBlink`.
+    blink_setting: TerminalBlink,
+    /// Whether the running application currently wants the cursor to blink
+    /// (set via DEC private mode `?12` or CSI `Ps SP q`).
+    app_requests_blink: bool,
+    /// Track previous focus state so we can only react on edges.
+    was_focused: bool,
     title: SharedString,
     selecting: bool,
     /// IME composition state for CJK input methods
@@ -181,6 +207,77 @@ impl TerminalView {
         }
     }
 
+    /// Apply the current blink policy to the `BlinkCursor` entity.
+    ///
+    /// Called from `on_blink_changed` and on focus/policy transitions.
+    fn sync_blink_manager(&self, focused: bool, cx: &mut Context<Self>) {
+        let should_blink = focused
+            && match self.blink_setting {
+                TerminalBlink::Off => false,
+                TerminalBlink::On => true,
+                TerminalBlink::TerminalControlled => self.app_requests_blink,
+            };
+
+        self.blink_manager.update(cx, |blink, cx| {
+            if should_blink {
+                blink.start(cx);
+            } else {
+                blink.stop(cx);
+            }
+        });
+    }
+
+    /// React to a `BlinkChanged` event from the terminal (DEC ?12 or
+    /// CSI `Ps SP q`). Only toggles the manager when the current policy
+    /// actually consults the application's preference.
+    fn on_blink_changed(&mut self, blinking: bool, cx: &mut Context<Self>) {
+        self.app_requests_blink = blinking;
+        if matches!(self.blink_setting, TerminalBlink::TerminalControlled) {
+            self.sync_blink_manager(self.was_focused, cx);
+        }
+    }
+
+    /// Override the blink policy. Exposed so that settings/UI can flip the
+    /// behaviour at runtime without recreating the view.
+    #[allow(dead_code)]
+    pub fn set_blink_setting(&mut self, setting: TerminalBlink, cx: &mut Context<Self>) {
+        if self.blink_setting == setting {
+            return;
+        }
+        self.blink_setting = setting;
+        self.sync_blink_manager(self.was_focused, cx);
+    }
+
+    /// Called on every key event that reaches the terminal input path.
+    /// Keeps the caret solid for `PAUSE_DELAY` so typing never produces
+    /// a mid-stroke blank frame.
+    fn pause_blink(&self, cx: &mut Context<Self>) {
+        self.blink_manager
+            .update(cx, |blink, cx| blink.pause(cx));
+    }
+
+    /// Returns whether the cursor should currently be painted. Failing the
+    /// focused check renders the hollow/outline form of the cursor; the
+    /// blink manager only runs while focused.
+    fn should_show_cursor(&self, focused: bool, cx: &App) -> bool {
+        if !focused {
+            // When unfocused we always draw the hollow outline; element
+            // maps Block->Hollow unconditionally.
+            return true;
+        }
+        self.blink_manager.read(cx).visible()
+    }
+
+    /// Reacts to focus edges. Enables blinking on focus-in (subject to
+    /// policy) and disables it on focus-out.
+    fn on_focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.was_focused == focused {
+            return;
+        }
+        self.was_focused = focused;
+        self.sync_blink_manager(focused, cx);
+    }
+
     /// 检查终端是否检测到新的远程操作系统，如果是则发出事件
     fn check_remote_os(&mut self, terminal: Entity<Terminal>, cx: &mut Context<Self>) {
         if let Some(os) = terminal.read(cx).remote_os {
@@ -254,8 +351,15 @@ impl TerminalView {
                     }
                     // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
                     TerminalEvent::SshAbnormalDisconnect => {}
+                    TerminalEvent::BlinkChanged(blinking) => {
+                        this.on_blink_changed(*blinking, cx);
+                    }
                 },
             );
+
+            let blink_manager = cx.new(|_| BlinkCursor::new());
+            let blink_subscriptions =
+                vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
 
             let mut this = Self {
                 terminal: terminal_clone,
@@ -263,7 +367,11 @@ impl TerminalView {
                 working_directory,
                 ssh_config,
                 focus_handle,
-                cursor_visible: true,
+                blink_manager,
+                _blink_subscriptions: blink_subscriptions,
+                blink_setting: TerminalBlink::default(),
+                app_requests_blink: false,
+                was_focused: false,
                 title: initial_title,
                 selecting: false,
                 ime_state: None,
@@ -377,8 +485,15 @@ impl TerminalView {
                     TerminalEvent::SshAbnormalDisconnect => {
                         this.handle_ssh_abnormal_disconnect(cx);
                     }
+                    TerminalEvent::BlinkChanged(blinking) => {
+                        this.on_blink_changed(*blinking, cx);
+                    }
                 },
             );
+
+            let blink_manager = cx.new(|_| BlinkCursor::new());
+            let blink_subscriptions =
+                vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
 
             let mut this = Self {
                 terminal: terminal_clone,
@@ -386,7 +501,11 @@ impl TerminalView {
                 working_directory: None,
                 ssh_config: Some(ssh_config_clone.clone()),
                 focus_handle,
-                cursor_visible: true,
+                blink_manager,
+                _blink_subscriptions: blink_subscriptions,
+                blink_setting: TerminalBlink::default(),
+                app_requests_blink: false,
+                was_focused: false,
                 title: ssh_config_clone.host_label().into(),
                 selecting: false,
                 ime_state: None,
@@ -469,6 +588,9 @@ impl TerminalView {
                 }
                 TerminalEvent::SshAbnormalDisconnect => {
                     this.handle_ssh_abnormal_disconnect(cx);
+                }
+                TerminalEvent::BlinkChanged(blinking) => {
+                    this.on_blink_changed(*blinking, cx);
                 }
             },
         )
@@ -1273,6 +1395,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Keep the cursor solid while the user is actively typing.
+        self.pause_blink(cx);
+
         // If user has scrolled up, pressing any key should scroll back to bottom
         let was_scrolled = self.terminal.update(cx, |terminal, _cx| {
             let display_offset = terminal.last_content().display_offset;
@@ -1389,6 +1514,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pause_blink(cx);
         self.clear_marked_text(cx);
         if self.route_text_to_builtin_command(text, cx) {
             return;
@@ -1472,6 +1598,9 @@ impl Render for TerminalView {
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
         let is_focused = focus_handle.is_focused(window);
+        // React to focus edges so we can start/stop blinking.
+        self.on_focus_changed(is_focused, cx);
+        let cursor_visible = self.should_show_cursor(is_focused, cx);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
         // Pre-read terminal state needed below to avoid redundant entity locks.
@@ -1653,7 +1782,7 @@ impl Render for TerminalView {
                             terminal.clone(),
                             focus_handle,
                             is_focused,
-                            self.cursor_visible,
+                            cursor_visible,
                             view_entity,
                         ),
                     )
