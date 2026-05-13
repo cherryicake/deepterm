@@ -565,24 +565,37 @@ impl TransferManager {
                             }
                         }
                     }
-                    RemoteToRemoteStrategy::TempKeyScp => {
+                    RemoteToRemoteStrategy::TempKeyScp { key_path } => {
                         match copy_via_remote_scp(
                             source_session,
+                            source_config,
                             remote_path,
                             destination_config,
                             &destination_path,
+                            key_path,
                             is_directory,
                             cancelled,
                             progress,
                         ) {
                             Ok(summary) => return Ok(summary),
                             Err(e) => {
-                                log::warn!("方案 3b (临时密钥 scp) 失败，尝试下一策略: {}", e);
+                                log::warn!(
+                                    "方案 3b (临时密钥 scp, key={}) 失败，尝试下一策略: {}",
+                                    key_path.display(),
+                                    e
+                                );
                                 last_error = Some(e);
                             }
                         }
                     }
                     RemoteToRemoteStrategy::StreamViaLocal => {
+                        log::warn!(
+                            "降级到流式传输：源 {} -> 目标 {}@{}:{}，数据将经过 DeepTerm 内存中转（可能较慢）",
+                            remote_path,
+                            destination_config.username,
+                            destination_config.host,
+                            destination_path
+                        );
                         return sftp_fs::with_cached_session(
                             destination_config,
                             |destination_session| {
@@ -631,9 +644,9 @@ enum RemoteToRemoteStrategy {
     /// 在源服务器上执行 scp，通过 **SSH agent forwarding** 鉴权目标端
     /// （数据不经过 DeepTerm，密钥也不落源端）
     AgentForwardScp,
-    /// 把目标服务器的私钥临时上传到源端，在源端执行 scp 直接传输
-    /// （数据不经过 DeepTerm）
-    TempKeyScp,
+    /// 把一把本地私钥临时上传到源端，在源端执行 scp 直接传输
+    /// （数据不经过 DeepTerm；携带具体密钥路径，支持多把 default key 逐个尝试）
+    TempKeyScp { key_path: PathBuf },
     /// Phase 1/2 流式传输（数据经过 DeepTerm 内存中转）
     StreamViaLocal,
 }
@@ -650,9 +663,45 @@ fn detect_transfer_strategies(
 
     // 允许通过环境变量强制指定策略，便于排障
     if let Ok(forced) = std::env::var("DEEPTERM_REMOTE_TRANSFER_STRATEGY") {
+        log::info!("检测到 DEEPTERM_REMOTE_TRANSFER_STRATEGY={}", forced);
         match forced.as_str() {
             "3a" | "agent" => return vec![RemoteToRemoteStrategy::AgentForwardScp],
-            "3b" | "tempkey" => return vec![RemoteToRemoteStrategy::TempKeyScp],
+            "3b" | "tempkey" => {
+                // 强制 3b 时优先查缓存，其次看目标配置，最后兜底枚举默认密钥
+                let mut forced_strategies = Vec::new();
+                if let Some(cached) =
+                    crate::ssh::auth::lookup_authenticated_key(destination_config)
+                {
+                    forced_strategies
+                        .push(RemoteToRemoteStrategy::TempKeyScp { key_path: cached });
+                }
+                if let Ok(ResolvedAuthMethod::PrivateKey {
+                    path,
+                    passphrase: None,
+                    ..
+                }) = resolve_auth_method(&destination_config.auth_method)
+                {
+                    let candidate = RemoteToRemoteStrategy::TempKeyScp { key_path: path };
+                    if !forced_strategies.contains(&candidate) {
+                        forced_strategies.push(candidate);
+                    }
+                }
+                if forced_strategies.is_empty() {
+                    for key_path in usable_default_keys() {
+                        let candidate = RemoteToRemoteStrategy::TempKeyScp {
+                            key_path: key_path.clone(),
+                        };
+                        if !forced_strategies.contains(&candidate) {
+                            forced_strategies.push(candidate);
+                        }
+                    }
+                }
+                if forced_strategies.is_empty() {
+                    log::warn!("强制 3b 但找不到可用的本地无 passphrase 私钥，回退到流式");
+                    return vec![RemoteToRemoteStrategy::StreamViaLocal];
+                }
+                return forced_strategies;
+            }
             "pipeline" | "stream" => return vec![RemoteToRemoteStrategy::StreamViaLocal],
             "auto" | _ => {}
         }
@@ -669,13 +718,36 @@ fn detect_transfer_strategies(
     );
 
     if !has_scp_ssh {
-        log::info!("源服务器缺少 scp/ssh 命令，降级到流式传输");
+        log::warn!(
+            "源服务器缺少 scp/ssh 命令（检测输出: {:?}），只能走流式传输，数据将经过 DeepTerm 中转",
+            check_result.as_ref().map(|r| r.stdout.trim()).unwrap_or("<err>")
+        );
         strategies.push(RemoteToRemoteStrategy::StreamViaLocal);
         return strategies;
     }
+    log::debug!("源服务器具备 scp/ssh 命令");
 
     // 2. 解析目标认证方式，决定可走哪条直连路径
-    match resolve_auth_method(&destination_config.auth_method) {
+    let resolved = resolve_auth_method(&destination_config.auth_method);
+    log::info!(
+        "目标服务器({}@{}:{}) 认证方式解析结果: {}",
+        destination_config.username,
+        destination_config.host,
+        destination_config.port,
+        match &resolved {
+            Ok(ResolvedAuthMethod::PrivateKey { path, passphrase, .. }) => format!(
+                "PrivateKey(path={}, has_passphrase={})",
+                path.display(),
+                passphrase.is_some()
+            ),
+            Ok(ResolvedAuthMethod::Password { .. }) => "Password".to_string(),
+            Ok(ResolvedAuthMethod::Agent) => "Agent".to_string(),
+            Ok(ResolvedAuthMethod::Auto) => "Auto".to_string(),
+            Err(e) => format!("Err({})", e),
+        }
+    );
+
+    match resolved {
         Ok(ResolvedAuthMethod::PrivateKey {
             path, passphrase, ..
         }) => {
@@ -683,33 +755,90 @@ fn detect_transfer_strategies(
             if passphrase.is_none() {
                 match crate::ssh::agent::agent_has_key(&path) {
                     Ok(true) => {
-                        log::info!("ssh-agent 已加载目标密钥，优先使用 agent forwarding");
+                        log::info!(
+                            "ssh-agent 已加载目标密钥 {}，优先使用 agent forwarding + scp（数据不经 DeepTerm）",
+                            path.display()
+                        );
                         strategies.push(RemoteToRemoteStrategy::AgentForwardScp);
                     }
                     Ok(false) => {
-                        log::info!("ssh-agent 不含目标密钥，跳过 agent forwarding");
+                        log::info!(
+                            "ssh-agent 可达但未加载目标密钥 {}，跳过 agent forwarding",
+                            path.display()
+                        );
                     }
                     Err(e) => {
                         log::info!("ssh-agent 不可用 ({}), 跳过 agent forwarding", e);
                     }
                 }
+            } else {
+                log::info!("目标私钥带 passphrase，跳过 agent forwarding（agent 内密钥应已解锁）");
             }
 
-            // 3b 次选：临时上传目标私钥，在源端 scp 直连
+            // 3b 次选：临时上传目标已配置的私钥
             if passphrase.is_none() {
-                strategies.push(RemoteToRemoteStrategy::TempKeyScp);
+                log::info!(
+                    "候选策略: 临时密钥 + scp 直连，使用目标配置密钥 {}（数据不经 DeepTerm）",
+                    path.display()
+                );
+                strategies.push(RemoteToRemoteStrategy::TempKeyScp {
+                    key_path: path.clone(),
+                });
             } else {
                 log::info!("目标私钥含 passphrase，不能用于远程 scp 直连");
             }
         }
+        Ok(ResolvedAuthMethod::Agent) | Ok(ResolvedAuthMethod::Auto) => {
+            // 1) 若本机 agent 可达且至少有一把身份，agent forwarding 让源端 scp 自动尝试。
+            match crate::ssh::agent::agent_is_available() {
+                Ok(true) => {
+                    log::info!(
+                        "目标使用 Agent/Auto 认证，本机 ssh-agent 可用且含身份，优先使用 agent forwarding + scp（数据不经 DeepTerm）"
+                    );
+                    strategies.push(RemoteToRemoteStrategy::AgentForwardScp);
+                }
+                Ok(false) => {
+                    log::info!(
+                        "目标使用 Agent/Auto 认证，但本机 ssh-agent 未加载任何密钥，跳过 agent forwarding"
+                    );
+                }
+                Err(e) => {
+                    log::info!(
+                        "目标使用 Agent/Auto 认证，但本机 ssh-agent 不可达 ({}), 跳过 agent forwarding",
+                        e
+                    );
+                }
+            }
+            // 2) 优先复用连接时已认过的那把密钥：DeepTerm 连接目标时（src/ssh/auth.rs
+            //    ::try_default_keys）若落在 ~/.ssh 默认密钥的某一把上，会把该 (config->key_path)
+            //    记入进程内缓存。此时它就是源端 scp 唯一需要的，不再枚举其它 default key。
+            if let Some(cached) = crate::ssh::auth::lookup_authenticated_key(destination_config) {
+                log::info!(
+                    "候选策略: 临时密钥 + scp 直连，复用连接时认过的密钥 {}（数据不经 DeepTerm）",
+                    cached.display()
+                );
+                strategies.push(RemoteToRemoteStrategy::TempKeyScp { key_path: cached });
+            } else {
+                // 兜底：尚未连过目标，或连接时用的是 agent（不走磁盘密钥）—— 只能枚举
+                // 本机默认密钥，按 try_default_keys 顺序。第一把不行自动降到下一把。
+                let default_keys = usable_default_keys();
+                if default_keys.is_empty() {
+                    log::info!(
+                        "本机 ~/.ssh 中没有可用的默认密钥（无 passphrase 且可解析），无法走临时密钥 scp"
+                    );
+                } else {
+                    for key_path in default_keys {
+                        log::info!(
+                            "候选策略: 临时密钥 + scp 直连，使用本机默认密钥 {}（数据不经 DeepTerm）",
+                            key_path.display()
+                        );
+                        strategies.push(RemoteToRemoteStrategy::TempKeyScp { key_path });
+                    }
+                }
+            }
+        }
         Ok(ResolvedAuthMethod::Password { .. }) => {
             log::info!("目标服务器使用密码认证，远程 scp 不安全，降级到流式传输");
-        }
-        Ok(ResolvedAuthMethod::Agent) => {
-            log::info!("目标服务器使用 Agent 认证，无具体密钥路径可直连");
-        }
-        Ok(ResolvedAuthMethod::Auto) => {
-            log::info!("目标服务器使用自动认证，无法构造 scp 参数");
         }
         Err(e) => {
             log::warn!("解析目标服务器认证方式失败: {}", e);
@@ -717,7 +846,20 @@ fn detect_transfer_strategies(
     }
 
     // 兜底：流式传输永远可用
+    if !strategies.contains(&RemoteToRemoteStrategy::StreamViaLocal) {
+        if strategies.is_empty() {
+            log::warn!(
+                "没有可用的直连策略，只能走流式传输（数据将经 DeepTerm 内存中转，速度受限）"
+            );
+        } else {
+            log::debug!("追加流式传输作为兜底策略");
+        }
+    }
     strategies.push(RemoteToRemoteStrategy::StreamViaLocal);
+    log::info!(
+        "最终远程到远程传输策略顺序: {:?}",
+        strategies
+    );
     strategies
 }
 
@@ -768,8 +910,17 @@ fn copy_via_agent_forward_scp(
         dst_path = shell_single_quote(destination_path),
     );
 
-    log::info!("执行 agent forwarding + scp");
+    log::info!(
+        "执行 agent forwarding + scp: src={} dst={}@{}:{} recurse={} port={}",
+        remote_path,
+        destination_config.username,
+        destination_config.host,
+        destination_path,
+        is_directory,
+        destination_config.port
+    );
 
+    let started = std::time::Instant::now();
     let cmd_result =
         source_session.execute_command_with_agent_forward(&scp_cmd, 3600, |data: &[u8]| {
             // scp 本身不直接报字节进度；此处预留给未来替换为 `rsync --info=progress2`。
@@ -779,13 +930,20 @@ fn copy_via_agent_forward_scp(
         })?;
 
     if cmd_result.success() {
-        log::info!("agent forwarding + scp 传输成功");
+        let elapsed = started.elapsed();
         // scp 没有报告传输字节数；在成功后用源端 metadata 补齐 summary/progress。
         let total = if is_directory {
             remote_total_size(source_session, remote_path)
         } else {
             source_session.metadata(remote_path)?.size
         };
+        let secs = elapsed.as_secs_f64().max(0.001);
+        log::info!(
+            "agent forwarding + scp 传输成功: {} 字节 / {:.2}s ≈ {:.2} MiB/s",
+            total,
+            secs,
+            (total as f64) / secs / (1024.0 * 1024.0)
+        );
         if let Some(p) = progress {
             p.fetch_add(total, Ordering::Relaxed);
         }
@@ -820,6 +978,32 @@ fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
+/// 返回本机 `~/.ssh` 下可直接用于 `scp -i` 的默认密钥列表（按算法偏好排序）。
+///
+/// 筛选条件：
+/// - 文件存在且能读。
+/// - 能通过 `russh::keys::load_secret_key(path, None)` 解析 —— 这相当于"没有
+///   passphrase"或"OpenSSH 格式允许无密码解密"；否则 scp 会在远程端阻塞等输入。
+///
+/// 顺序与 [`crate::ssh::find_default_ssh_keys`] 保持一致（ed25519 > rsa > ecdsa > dsa），
+/// 这样 scp 的尝试顺序与 DeepTerm 自己连接时的 `try_default_keys` 顺序一致。
+fn usable_default_keys() -> Vec<PathBuf> {
+    let mut result: Vec<PathBuf> = Vec::new();
+    for key_path in crate::ssh::find_default_ssh_keys() {
+        match russh::keys::load_secret_key(&key_path, None) {
+            Ok(_) => result.push(key_path),
+            Err(e) => {
+                log::debug!(
+                    "默认密钥 {} 不能无 passphrase 加载，跳过 scp 直连候选: {}",
+                    key_path.display(),
+                    e
+                );
+            }
+        }
+    }
+    result
+}
+
 /// 递归统计远程路径（文件或目录）的总字节数。
 ///
 /// 仅用于 scp 直连路径事后补齐进度，失败时返回 0 以免阻塞 summary 生成——
@@ -847,80 +1031,56 @@ fn remote_total_size(session: &mut sftp_fs::BlockingSftpSession, path: &str) -> 
 }
 
 /// 通过 **临时密钥 + scp** 实现服务器直连（方案 3b）。
-/// 将目标服务器的私钥临时上传到源服务器，在源服务器执行 scp 命令直接传输到目标。
+/// 将一把本地可读的私钥临时上传到源服务器，在源服务器执行 scp 命令直接传输到目标。
+///
+/// 调用方负责选择 `key_path`：可以是目标连接配置里的密钥，也可以是
+/// `~/.ssh` 下的默认密钥（当目标使用 Agent/Auto 认证、且 ssh-agent 空时，DeepTerm
+/// 自己连接时也是用同一把默认密钥认过的 —— 同一把密钥就能让 scp 直接认过）。
+///
+/// # 密钥生命周期
+///
+/// 由 [`scp_key_lease`] 模块管理：同一组 `(源, 目标, 本地 key)` 的并发 / 连续
+/// 传输任务复用同一份远端临时密钥。引用计数归零（最后一个任务结束）时才
+/// 同步清理源端目录和本地临时文件。详见 `scp_key_lease.rs` 的文档注释。
 ///
 /// # 安全措施
 ///
-/// - 在源服务器创建权限受限的临时目录（`chmod 700`），避免 `/tmp/` 下文件被其他用户读取
-/// - 传输完成后 `rm -rf` 整个临时目录，不留下密钥文件
-/// - 本地临时密钥文件写入后先用零覆盖再删除，降低磁盘残留风险
-/// - 密钥数据在内存中使用 `Vec<u8>` 并在使用后以零填充
-/// - 使用 `StrictHostKeyChecking=accept-new` 替代 `no`，拒绝已变更的主机密钥
-/// - 不支持带密码短语的私钥（远程端无 TTY 输入密码）
+/// - 仅支持无 passphrase 的私钥（远程端无 TTY 输入密码）；调用方应预筛。
+/// - 在源服务器创建权限受限的临时目录（`chmod 700`），文件 `chmod 600`。
+/// - 所有活跃租约引用归零后 `rm -rf` 临时目录；本地临时文件同时用零覆盖再删。
+/// - 进程启动后每个源端首次使用时兜底清扫 60 分钟前的 `.deepterm-scp-*` 残留。
+/// - 使用 `StrictHostKeyChecking=accept-new` 替代 `no`，拒绝已变更的主机密钥。
 fn copy_via_remote_scp(
     source_session: &mut sftp_fs::BlockingSftpSession,
+    source_config: &SshConnectionConfig,
     remote_path: &str,
     destination_config: &SshConnectionConfig,
     destination_path: &str,
+    key_path: &Path,
     is_directory: bool,
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     check_cancelled(cancelled)?;
 
-    // 1. 获取目标服务器的认证信息（仅支持无密码短语的密钥认证）
-    let resolved_auth = resolve_auth_method(&destination_config.auth_method)?;
-    let (key_path, passphrase) = match &resolved_auth {
-        ResolvedAuthMethod::PrivateKey {
-            path, passphrase, ..
-        } => (path.clone(), passphrase.clone()),
-        _ => bail!("远程 scp 仅支持密钥认证"),
-    };
+    // 调用方（`detect_transfer_strategies` 内部）负责筛出可解析的无 passphrase 密钥；
+    // 这里不再重新解析 auth_method —— Agent/Auto 认证下也无 auth 可解析。
+    log::debug!("远程 scp 使用本地密钥: {}", key_path.display());
 
-    if passphrase.is_some() {
-        bail!(
-            "带密码短语的私钥暂不支持远程 scp 直连传输（远程端无 TTY 输入密码），已自动回退到流式传输"
-        );
-    }
+    // 申请租约：命中则 ref_count + 1 并直接复用；未命中则上传 + 登记。
+    let lease = crate::file_transfer::scp_key_lease::acquire_lease(
+        source_session,
+        source_config,
+        destination_config,
+        key_path,
+        cancelled,
+    )?;
+    let remote_key_path = lease.remote_key_path().to_string();
 
-    // 2. 读取私钥文件内容（使用 Vec<u8> 便于后续内存清零）
-    let mut key_bytes = std::fs::read(&key_path)
-        .with_context(|| format!("读取目标服务器私钥失败: {:?}", key_path))?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let transfer_id = rand::random::<u32>();
-
-    // 3. 在源服务器上创建权限受限的临时目录（避免 /tmp/ 下直接被其他用户读取）
-    let temp_dir_name = format!(".deepterm-transfer-{}-{}", timestamp, transfer_id);
-    let remote_temp_dir = format!("/tmp/{}", temp_dir_name);
-    source_session
-        .execute_command(&format!("mkdir -m 700 {}", remote_temp_dir), 5)
-        .map_err(|e| anyhow!("在源服务器创建临时目录失败: {}", e))?;
-
-    let remote_key_path = format!("{}/id_key", remote_temp_dir);
-    let local_temp_path = std::env::temp_dir().join(&temp_dir_name);
-
-    // 4. 写入本地临时文件
-    std::fs::write(&local_temp_path, &key_bytes).with_context(|| "写入本地临时密钥文件失败")?;
-
-    // 5. 上传私钥到源服务器的临时目录
-    source_session
-        .upload_file_from_local_with_cancel(&local_temp_path, &remote_key_path, cancelled)
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&local_temp_path);
-            let _ = source_session.execute_command(&format!("rm -rf {}", remote_temp_dir), 5);
-            anyhow!("上传临时密钥到源服务器失败: {}", e)
-        })?;
-
-    // 6. 构建 scp 命令
-    //    accept-new：接受新主机密钥但拒绝已变更的密钥（比 no 更安全）
-    //    UserKnownHostsFile=/dev/null：不在源服务器上持久化主机密钥
-    //    -p：保留权限与时间戳（目录场景下尤其重要）
+    // 构建 scp 命令
+    //   accept-new：接受新主机密钥但拒绝已变更的密钥（比 no 更安全）
+    //   UserKnownHostsFile=/dev/null：不在源服务器上持久化主机密钥
+    //   -p：保留权限与时间戳（目录场景下尤其重要）
     let dest_host = format!(
         "{}@{}",
         destination_config.username, destination_config.host
@@ -952,31 +1112,37 @@ fn copy_via_remote_scp(
         dst_path = shell_single_quote(destination_path),
     );
 
-    log::info!("执行远程 scp{}", if is_directory { " -r" } else { "" });
+    log::info!(
+        "执行远程 scp{}（临时密钥）: src={} dst={}@{}:{} port={}",
+        if is_directory { " -r" } else { "" },
+        remote_path,
+        destination_config.username,
+        destination_config.host,
+        destination_path,
+        destination_config.port
+    );
 
-    // 7. 执行远程 scp 命令（给予较长的超时时间）
+    let started = std::time::Instant::now();
     let result = source_session.execute_command(&scp_cmd, 3600);
+    // 注意：lease 此时仍在作用域内，Drop 会在本函数返回后触发 ref_count - 1。
+    // 归零时同步执行 `rm -rf` + 本地清理；否则由最后一个引用者负责。
 
-    // 8. 清理远程临时目录（无论成功失败都清理）
-    let _cleanup = source_session.execute_command(&format!("rm -rf {}", remote_temp_dir), 10);
-
-    // 9. 安全清理本地临时文件：用零覆盖后删除，降低磁盘残留风险
-    let _ = std::fs::write(&local_temp_path, &vec![0u8; key_bytes.len()]);
-    let _ = std::fs::remove_file(&local_temp_path);
-
-    // 10. 内存中的密钥数据清零
-    key_bytes.fill(0);
-
-    // 11. 检查结果
     match result {
         Ok(cmd_result) => {
             if cmd_result.success() {
-                log::info!("远程 scp 传输成功");
+                let elapsed = started.elapsed();
                 let total = if is_directory {
                     remote_total_size(source_session, remote_path)
                 } else {
                     source_session.metadata(remote_path)?.size
                 };
+                let secs = elapsed.as_secs_f64().max(0.001);
+                log::info!(
+                    "远程 scp 传输成功（临时密钥）: {} 字节 / {:.2}s ≈ {:.2} MiB/s",
+                    total,
+                    secs,
+                    (total as f64) / secs / (1024.0 * 1024.0)
+                );
                 if let Some(p) = progress {
                     p.fetch_add(total, Ordering::Relaxed);
                 }

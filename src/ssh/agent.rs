@@ -3,6 +3,7 @@
 //! 本模块只做 **只读** 查询：
 //! - 检查本机是否有可用的 ssh-agent（`SSH_AUTH_SOCK` 存在且可连接）。
 //! - 检查指定私钥对应的公钥指纹是否已加载到 agent 中。
+//! - 粗粒度探活：agent 是否可达、内部是否有任何身份。
 //!
 //! 不会主动 `ssh-add` 加载密钥，避免意外修改用户的 agent 状态。
 
@@ -13,6 +14,34 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key;
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
+
+/// 判断本机 ssh-agent 是否可用（可连接），以及里面是否至少有一把身份。
+///
+/// 当目标服务器的认证方式是 `Agent` / `Auto`（没有具体密钥路径）时，
+/// 只要本机 agent 里有任意一把 identity，就有机会通过 agent forwarding
+/// 让源端 `scp` 鉴权到目标 —— 是否真的能认过由 scp 自行尝试并报错即可。
+///
+/// 返回：
+/// - `Ok(true)`：agent 可达且 `request_identities` 至少有 1 把 key。
+/// - `Ok(false)`：agent 可达但未加载任何 key。
+/// - `Err(_)`：agent 不可达（通常是 `SSH_AUTH_SOCK` 未设置或 socket 连不上）。
+pub fn agent_is_available() -> anyhow::Result<bool> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow!("创建临时 runtime 失败: {}", e))?;
+
+    rt.block_on(async move {
+        let mut client = AgentClient::connect_env()
+            .await
+            .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))?;
+        let identities = client
+            .request_identities()
+            .await
+            .map_err(|e| anyhow!("ssh-agent 列出密钥失败: {}", e))?;
+        Ok(!identities.is_empty())
+    })
+}
 
 /// 判断本机 ssh-agent 是否可用 **且** 已加载 `key_path` 对应的私钥。
 ///

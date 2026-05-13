@@ -2,6 +2,7 @@ mod conflict;
 mod endpoint;
 mod manager;
 mod request;
+mod scp_key_lease;
 mod view;
 
 pub use conflict::{

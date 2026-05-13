@@ -1,9 +1,44 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
 use russh::client::{AuthResult, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
 #[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
 
 use crate::ssh::config::SshConnectionConfig;
+
+/// 进程内缓存：记录"DeepTerm 连接 `<user>@<host>:<port>` 时，最终是哪一把磁盘密钥认过的"。
+///
+/// 用于 [`crate::file_transfer`] 的远程到远程 scp 直连：当目标使用 `Agent`/`Auto`
+/// 且 ssh-agent 没有可用身份时，DeepTerm 自己会回退到 `~/.ssh` 默认密钥认证；
+/// 此时同一把磁盘密钥就是源端 scp 唯一需要的。把它直接复用即可，避免再把所有默认
+/// 密钥都丢给 scp 试一遍（每次失败都要一次完整握手）。
+fn auth_key_cache() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auth_cache_key(config: &SshConnectionConfig) -> String {
+    format!("{}@{}:{}", config.username, config.host, config.port)
+}
+
+/// 记录一次成功的"磁盘密钥 → 目标"认证关系。
+pub fn record_authenticated_key(config: &SshConnectionConfig, path: &Path) {
+    if let Ok(mut map) = auth_key_cache().lock() {
+        map.insert(auth_cache_key(config), path.to_path_buf());
+    }
+}
+
+/// 查询某个目标最近一次认证成功用的磁盘密钥。
+pub fn lookup_authenticated_key(config: &SshConnectionConfig) -> Option<PathBuf> {
+    auth_key_cache()
+        .lock()
+        .ok()?
+        .get(&auth_cache_key(config))
+        .cloned()
+}
 
 /// Try SSH Agent authentication, falling back to default keys if unavailable.
 ///
@@ -83,9 +118,24 @@ pub async fn try_default_keys<H: russh::client::Handler>(
     handle: &mut Handle<H>,
     config: &SshConnectionConfig,
 ) -> anyhow::Result<AuthResult> {
-    let default_keys = crate::ssh::find_default_ssh_keys();
+    let mut default_keys = crate::ssh::find_default_ssh_keys();
     if default_keys.is_empty() {
         return Err(anyhow::anyhow!("自动认证失败：~/.ssh 中未找到密钥文件"));
+    }
+
+    // 若之前对同一目标成功认证过某把磁盘密钥，把它挪到最前面。避免每次新建 SFTP
+    // session（文件浏览器、文件传输都会触发）时都要先对着错误密钥走一个 RTT。
+    if let Some(cached) = lookup_authenticated_key(config) {
+        if let Some(idx) = default_keys.iter().position(|p| p == &cached) {
+            if idx != 0 {
+                let hit = default_keys.remove(idx);
+                default_keys.insert(0, hit);
+                log::info!(
+                    "复用上次认证过的密钥 {:?}，优先尝试",
+                    default_keys[0]
+                );
+            }
+        }
     }
 
     let hash_alg = handle
@@ -113,6 +163,7 @@ pub async fn try_default_keys<H: russh::client::Handler>(
         {
             Ok(result) if result.success() => {
                 log::info!("默认密钥认证成功 ({:?})", key_path);
+                record_authenticated_key(config, key_path);
                 return Ok(result);
             }
             Ok(_) => {
