@@ -583,6 +583,11 @@ impl Workspace {
             request.destination
         );
 
+        if request.is_noop() {
+            log::info!("Transfer is noop (source == destination), skipping");
+            return;
+        }
+
         let transfer_id = self.next_transfer_id;
         self.next_transfer_id += 1;
         let cancelled = Arc::new(AtomicBool::new(false));

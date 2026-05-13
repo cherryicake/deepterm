@@ -232,6 +232,9 @@ impl TransferManager {
             let destination_path =
                 resolve_local_conflict(&desired_path, conflict_policy, resolver)?
                     .ok_or_else(|| anyhow!("transfer skipped"))?;
+            if source_path == destination_path {
+                return Ok(TransferSummary::from_metadata(&metadata));
+            }
             return copy_local_file_to_path(source_path, &destination_path, cancelled);
         }
 
@@ -239,6 +242,9 @@ impl TransferManager {
             let destination_root =
                 resolve_local_conflict(&desired_path, conflict_policy, resolver)?
                     .ok_or_else(|| anyhow!("transfer skipped"))?;
+            if source_path == destination_root {
+                return Ok(TransferSummary::from_metadata(&metadata));
+            }
             prevent_local_recursive_copy(source_path, &destination_root)?;
             return copy_local_dir_to_path(
                 source_path,
@@ -273,6 +279,10 @@ impl TransferManager {
             resolver,
         )?
         .ok_or_else(|| anyhow!("transfer skipped"))?;
+
+        if source_path == destination_path {
+            return Ok(TransferSummary::from_metadata(&metadata));
+        }
 
         if metadata.is_dir() {
             prevent_local_recursive_copy(source_path, &destination_path)?;
@@ -419,6 +429,9 @@ impl TransferManager {
                 let destination_path =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
+                if remote_path == destination_path {
+                    return Ok(TransferSummary::from_remote_metadata(&metadata));
+                }
                 return copy_remote_file_to_remote_path(
                     session,
                     remote_path,
@@ -432,6 +445,9 @@ impl TransferManager {
                 let destination_root =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
+                if remote_path == destination_root {
+                    return Ok(TransferSummary::from_remote_metadata(&metadata));
+                }
                 prevent_remote_recursive_copy(remote_path, &destination_root)?;
                 session.create_dir_all(&destination_root)?;
                 return copy_remote_dir_to_remote_path(
@@ -465,9 +481,16 @@ impl TransferManager {
         sftp_fs::with_cached_session(ssh_config, |session| {
             let metadata = session.metadata(remote_path)?;
             session.create_dir_all(destination_dir)?;
+            if is_remote_noop_move(remote_path, destination_dir) {
+                return Ok(TransferSummary::from_remote_metadata(&metadata));
+            }
             let destination_path =
                 resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                     .ok_or_else(|| anyhow!("transfer skipped"))?;
+
+            if remote_path == destination_path {
+                return Ok(TransferSummary::from_remote_metadata(&metadata));
+            }
 
             if metadata.kind == RemoteFileKind::Directory {
                 prevent_remote_recursive_copy(remote_path, &destination_path)?;

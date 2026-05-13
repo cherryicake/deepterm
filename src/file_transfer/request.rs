@@ -53,6 +53,40 @@ pub struct TransferRequest {
 }
 
 impl TransferRequest {
+    /// 所有源文件是否已在目标位置（无需实际传输）
+    pub fn is_noop(&self) -> bool {
+        if self.sources.is_empty() {
+            return true;
+        }
+        self.sources.iter().all(|source| {
+            if !source.is_same_device(&self.destination) {
+                return false;
+            }
+            match (source, &self.destination) {
+                (FileEndpoint::Local { path: src }, FileEndpoint::Local { path: dst }) => {
+                    src == dst || src.parent().is_some_and(|parent| parent == dst)
+                }
+                (
+                    FileEndpoint::Remote { path: src, .. },
+                    FileEndpoint::Remote { path: dst, .. },
+                ) => {
+                    let src = src.trim_end_matches('/');
+                    let dst = dst.trim_end_matches('/');
+                    if src == dst {
+                        return true;
+                    }
+                    if let Some(pos) = src.rfind('/') {
+                        let parent = if pos == 0 { "/" } else { &src[..pos] };
+                        parent == dst
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub fn from_drag_payload(payload: FileDragPayload, destination: FileEndpoint) -> Self {
         let operation = if payload
             .sources
