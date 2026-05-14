@@ -201,6 +201,16 @@ pub fn init_global_registry() -> CommandRegistry {
         handler_id: CommandHandlerId("log_only"),
     });
     registry.register(BuiltinCommand {
+        name: "/scp",
+        description: "Copy files between configured hosts or local (e.g. /scp alice:/etc/hosts bob:/tmp/).",
+        icon: Icon::Server,
+        availability: Availability::Always,
+        argument: ArgumentType::Required {
+            hint: "src dst",
+        },
+        handler_id: CommandHandlerId("scp_transfer"),
+    });
+    registry.register(BuiltinCommand {
         name: "/new-component",
         description: "Create new GPUI components. Use when building components or UI elements.",
         icon: Icon::Plus,

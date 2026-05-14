@@ -11,8 +11,10 @@ use gpui::{
     UTF16Selection, Window, actions, div, point, px,
 };
 use gpui::{KeyBinding, prelude::*};
+use unicode_width::UnicodeWidthStr;
 
 use crate::file_browser::FileBrowserTarget;
+use crate::file_transfer::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::ssh_view::connect::Event::Reconnect;
 /// Events emitted by TerminalView
@@ -24,6 +26,8 @@ pub enum Event {
     OpenFileBrowser { target: FileBrowserTarget },
     /// Open a file in the editor
     OpenFile { path: String },
+    /// 发起一次文件传输（由 /scp 等内建命令触发）
+    StartTransfer { request: TransferRequest },
     /// SSH 重新连接请求
     SshReconnect { config: SshConnectionConfig },
     /// 远程操作系统已检测到
@@ -193,6 +197,13 @@ impl SshCheckOutcome {
     }
 }
 
+/// 浮窗垂直锚点：贴住光标的哪一边。
+///
+/// 当光标在窗口顶部、下方有空间时用 `Top`，浮窗顶端贴近光标，列表向下展开；
+/// 当光标在窗口底部、上方有空间时用 `Bottom`，浮窗底端贴近光标，列表从下往上增长。
+/// 这两种锚点都保证「靠近光标的一边」始终贴合光标行。
+use crate::builtin_commands::OverlayAnchor;
+
 impl TerminalView {
     /// 处理 SSH 连接异常断开事件
     fn handle_ssh_abnormal_disconnect(&self, cx: &mut Context<Self>) {
@@ -252,8 +263,7 @@ impl TerminalView {
     /// Keeps the caret solid for `PAUSE_DELAY` so typing never produces
     /// a mid-stroke blank frame.
     fn pause_blink(&self, cx: &mut Context<Self>) {
-        self.blink_manager
-            .update(cx, |blink, cx| blink.pause(cx));
+        self.blink_manager.update(cx, |blink, cx| blink.pause(cx));
     }
 
     /// Returns whether the cursor should currently be painted. Failing the
@@ -358,8 +368,7 @@ impl TerminalView {
             );
 
             let blink_manager = cx.new(|_| BlinkCursor::new());
-            let blink_subscriptions =
-                vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
+            let blink_subscriptions = vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
 
             let mut this = Self {
                 terminal: terminal_clone,
@@ -492,8 +501,7 @@ impl TerminalView {
             );
 
             let blink_manager = cx.new(|_| BlinkCursor::new());
-            let blink_subscriptions =
-                vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
+            let blink_subscriptions = vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
 
             let mut this = Self {
                 terminal: terminal_clone,
@@ -797,27 +805,145 @@ impl TerminalView {
 
     /// 计算建议浮层在终端内的绘制位置。
     ///
-    /// 浮层锚定在光标下一行，和命令输入所在的提示位置保持邻近。
-    fn builtin_command_overlay_position(&self, cx: &App) -> Pixels {
+    /// 浮层是 `div().relative().size_full()` 的子元素，使用 `.absolute().top().left()`
+    /// 定位，因此返回的坐标必须是**相对父级**的偏移，绝不能掺入 `terminal_bounds.bounds.origin`
+    /// 那一份窗口绝对坐标，否则会把面板偏移加两遍。
+    ///
+    /// 终端内容只在水平方向有 `TERMINAL_HORIZONTAL_PADDING` 的 padding（见
+    /// `terminal_element::terminal_content_bounds`），垂直方向无内边距。
+    ///
+    /// 返回 `(anchor, left)`：当 `anchor` 为 [`OverlayAnchor::Top`] 时浮窗用 `.top()` 锚定、
+    /// 列表向下展开；当为 [`OverlayAnchor::Bottom`] 时浮窗用 `.bottom()` 锚定、
+    /// 列表从下往上贴着光标增长（光标在窗口底部时使用，避免被裁切）。
+    fn builtin_command_overlay_position(
+        &self,
+        cx: &App,
+        anchor_cells: f32,
+        overlay_width: f32,
+        overlay_height: f32,
+    ) -> (OverlayAnchor, Pixels) {
+        const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
+
         let term = self.terminal.read(cx);
         let content = term.last_content();
         let bounds = term.terminal_bounds;
-        let cursor_line_in_viewport = content.cursor.line.0 + content.display_offset as i32;
-        let overlay_row = (cursor_line_in_viewport + 1).max(0) as f32;
+        let cursor_row_in_viewport = content.cursor.line.0.max(0) as f32;
+        let cursor_col = content.cursor.column.0 as f32;
 
-        let top = px((overlay_row * bounds.line_height.as_f32()).floor()) + px(6.0);
+        let cell_w = bounds.cell_width.as_f32();
+        let line_h = bounds.line_height.as_f32();
 
-        top
+        // 相对父级 (relative div = 终端元素整体) 的光标坐标
+        let cursor_left =
+            TERMINAL_HORIZONTAL_PADDING + ((cursor_col + anchor_cells) * cell_w).floor();
+        let cursor_top = (cursor_row_in_viewport * line_h).floor();
+
+        // 父级宽高：terminal_bounds 是去掉左右 padding 后的内容区，加回两侧 padding 即父级尺寸
+        let parent_width = bounds.bounds.size.width.as_f32() + 2.0 * TERMINAL_HORIZONTAL_PADDING;
+        let parent_height = bounds.bounds.size.height.as_f32();
+
+        const GAP: f32 = 2.0;
+        const VIEWPORT_GUTTER: f32 = 6.0;
+        const RIGHT_GUTTER: f32 = 16.0;
+
+        let cursor_bottom = cursor_top + line_h;
+        let space_below = parent_height - cursor_bottom;
+        let space_above = cursor_top;
+
+        // 优先在光标下方紧贴一行；下方放不下且上方更宽裕 ⇒ 切到上方锚点（列表从下往上增长）。
+        // 这样光标贴近窗口底部时，浮窗顶端不会被裁，靠近光标的一边始终贴合。
+        let anchor = if space_below >= overlay_height + GAP + VIEWPORT_GUTTER {
+            // 下方足够 ⇒ 用 top
+            let top = cursor_bottom + GAP;
+            OverlayAnchor::Top(px(top))
+        } else if space_above >= overlay_height + GAP + VIEWPORT_GUTTER {
+            // 上方足够 ⇒ 用 bottom，距离父容器底部的偏移 = 父高度 - 光标行顶端 + GAP
+            let bottom = (parent_height - cursor_top) + GAP;
+            OverlayAnchor::Bottom(px(bottom))
+        } else if space_below >= space_above {
+            // 都放不下，下方略宽：top 贴底，列表内部 max_h 处理裁切
+            let top = (parent_height - overlay_height - VIEWPORT_GUTTER).max(cursor_bottom + GAP);
+            OverlayAnchor::Top(px(top.max(VIEWPORT_GUTTER)))
+        } else {
+            // 都放不下，上方略宽：bottom 贴顶
+            let bottom = (parent_height - cursor_top + GAP).max(VIEWPORT_GUTTER);
+            OverlayAnchor::Bottom(px(bottom))
+        };
+
+        let max_left = (parent_width - overlay_width - RIGHT_GUTTER).max(0.0);
+        let left = cursor_left.max(0.0).min(max_left);
+
+        (anchor, px(left))
+    }
+
+    fn builtin_command_path_anchor_cells(&self) -> f32 {
+        let Some(buffer) = self.builtin_command_manager.query() else {
+            return 0.0;
+        };
+        if !self.builtin_command_manager.is_argument_input() {
+            return 0.0;
+        }
+
+        let anchor_byte = self
+            .scp_path_anchor_byte(buffer)
+            .or_else(|| self.generic_path_anchor_byte(buffer))
+            .unwrap_or(0);
+        UnicodeWidthStr::width(&buffer[..anchor_byte.min(buffer.len())]) as f32
+    }
+
+    fn generic_path_anchor_byte(&self, buffer: &str) -> Option<usize> {
+        let command_end = buffer.find(char::is_whitespace)?;
+        let args_start = buffer[command_end..]
+            .char_indices()
+            .find_map(|(offset, c)| (!c.is_whitespace()).then_some(command_end + offset))
+            .unwrap_or(buffer.len());
+        let args = &buffer[args_start..];
+        let (dir_part, _) = crate::builtin_commands::PathCompletionEngine::split_path_prefix(args);
+        Some(args_start + dir_part.len())
+    }
+
+    fn scp_path_anchor_byte(&self, buffer: &str) -> Option<usize> {
+        if buffer.split_whitespace().next()? != "/scp" {
+            return None;
+        }
+
+        let query = crate::builtin_commands::scp_completion::analyse(buffer)?;
+        let raw_token = &buffer[query.token_start..query.token_end];
+        match query.phase {
+            crate::builtin_commands::ScpCompletionPhase::HostOrLocal { prefix } => {
+                if prefix.starts_with('/')
+                    || prefix.starts_with('.')
+                    || prefix.starts_with('~')
+                    || prefix.contains('/')
+                {
+                    let (dir_part, _) =
+                        crate::builtin_commands::PathCompletionEngine::split_path_prefix(&prefix);
+                    Some(query.token_start + dir_part.len().min(raw_token.len()))
+                } else {
+                    Some(query.token_start)
+                }
+            }
+            crate::builtin_commands::ScpCompletionPhase::RemotePath { prefix, .. } => {
+                let colon =
+                    crate::builtin_commands::scp_completion::first_unquoted_colon(raw_token)?;
+                let path_start = query.token_start + colon + 1;
+                let (dir_part, _) =
+                    crate::builtin_commands::PathCompletionEngine::split_path_prefix(&prefix);
+                Some(path_start + dir_part.len().min(buffer.len().saturating_sub(path_start)))
+            }
+        }
     }
 
     /// 渲染内建命令建议浮层，并把鼠标选择转成一次显式补全。
     fn render_builtin_command_overlay(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let top = self.builtin_command_overlay_position(cx);
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
         let view = cx.entity().clone();
 
         if self.builtin_command_manager.is_argument_input() {
+            let anchor_cells = self.builtin_command_path_anchor_cells();
+            let (anchor, left) =
+                self.builtin_command_overlay_position(cx, anchor_cells, 320.0, 336.0);
             // 参数输入阶段：渲染路径补全浮层
             let path_completions = self.builtin_command_manager.path_completions.clone();
             let selected_index = self.builtin_command_manager.path_selected_index;
@@ -825,7 +951,8 @@ impl TerminalView {
             crate::builtin_commands::render_path_overlay(
                 &path_completions,
                 selected_index,
-                top,
+                anchor,
+                left,
                 theme,
                 is_dark,
                 move |index, _window, cx| {
@@ -836,6 +963,7 @@ impl TerminalView {
             )
             .into_any_element()
         } else {
+            let (anchor, _) = self.builtin_command_overlay_position(cx, 0.0, 640.0, 460.0);
             // 命令名输入阶段：渲染命令建议浮层
             let suggestions = self.builtin_command_manager.suggestions();
             let selected_index = self.builtin_command_manager.selected_index();
@@ -843,7 +971,7 @@ impl TerminalView {
             crate::builtin_commands::render_overlay(
                 suggestions,
                 selected_index,
-                top,
+                anchor,
                 theme,
                 is_dark,
                 move |index, _window, cx| {
@@ -990,6 +1118,10 @@ impl TerminalView {
                 cx.emit(Event::OpenFile { path });
                 true
             }
+            Some(CommandResult::StartTransfer { request }) => {
+                cx.emit(Event::StartTransfer { request });
+                true
+            }
             Some(CommandResult::Log { .. }) => {
                 // LogOnly 命令不需要发射事件
                 true
@@ -998,6 +1130,12 @@ impl TerminalView {
             Some(CommandResult::Error { message }) => {
                 log::warn!("Command error: {}", message);
                 self.show_toast(message, cx);
+                true
+            }
+            Some(CommandResult::FallThrough { shell_command }) => {
+                // Handler 做完副作用 / 预处理，把（原始或改写过的）文本交给 shell
+                let to_send = shell_command.unwrap_or_else(|| command_line.to_string());
+                self.send_command_line_to_shell(&to_send, cx);
                 true
             }
             None => false,
@@ -1049,8 +1187,128 @@ impl TerminalView {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut BuiltinCommandManager),
     ) {
+        // 同步"本机端 cwd"：本地终端用 shell 进程实时 cwd（lsof / /proc），
+        // 远程终端用 DeepTerm 进程的初始工作目录。补全引擎拿到的 cwd 必须是
+        // 当前终端 shell 的实际位置，而不是 DeepTerm 启动时所在的项目目录。
+        let local_cwd = if self.ssh_config.is_some() {
+            self.working_directory.clone()
+        } else {
+            let pid = self.terminal.read(cx).child_process_id;
+            pid.and_then(crate::builtin_commands::PathResolver::query_process_working_directory)
+                .or_else(|| self.working_directory.clone())
+        };
+        self.builtin_command_manager.set_local_cwd(local_cwd);
+
+        // 进入 /scp 之前先把保存的 SSH 连接注入管理器，供 host / 远端目录补全使用。
+        // 调用点可能很多（每次输入字符），所以仅在当前缓冲以 `/scp` 开头时才加载。
+        let should_refresh_hosts = self
+            .builtin_command_manager
+            .query()
+            .map(|q| q.trim_start().starts_with("/scp"))
+            .unwrap_or(false);
+        if should_refresh_hosts {
+            let configs = crate::ssh::config::SshGlobalConfig::load().saved_connections;
+            self.builtin_command_manager.set_ssh_configs(configs);
+        }
+
         f(&mut self.builtin_command_manager);
+
+        // 远端目录按需加载：如果管理器标记为"loading"，取出请求并后台读取
+        while let Some(request) = self.builtin_command_manager.pending_remote_request() {
+            self.spawn_remote_dir_load(request, cx);
+        }
+
         cx.notify();
+    }
+
+    /// 后台读取远端目录并把结果回写到 `BuiltinCommandManager`。
+    fn spawn_remote_dir_load(
+        &self,
+        request: crate::builtin_commands::RemoteCompletionRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = crate::ssh::config::SshGlobalConfig::load().saved_connections;
+        let Some(config) = saved.iter().find(|c| c.id() == request.config_id).cloned() else {
+            // 配置已删：直接回传空列表避免死等
+            let config_id = request.config_id.clone();
+            let dir = request.absolute_dir.clone();
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| {
+                    this.builtin_command_manager.apply_remote_dir_result(
+                        config_id,
+                        dir,
+                        Err("未找到 SSH 配置".into()),
+                    );
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        };
+        let abs_dir = request.absolute_dir.clone();
+        let cfg_id = request.config_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let abs_dir_task = abs_dir.clone();
+            let config_task = config.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let effective = if abs_dir_task == "~" {
+                        crate::ssh::sftp_fs::with_cached_session(&config_task, |session| {
+                            session
+                                .canonicalize(".")
+                                .or_else(|_| session.canonicalize("~"))
+                        })
+                        .unwrap_or_else(|_| "/".to_string())
+                    } else {
+                        abs_dir_task
+                    };
+                    let entries = crate::ssh::sftp_fs::read_dir(&config_task, &effective);
+                    (effective, entries)
+                })
+                .await;
+
+            let (canonical_dir, read) = result;
+            let payload = match read {
+                Ok(entries) => {
+                    let list: Vec<crate::builtin_commands::RemoteEntrySnapshot> = entries
+                        .into_iter()
+                        .map(|e| crate::builtin_commands::RemoteEntrySnapshot {
+                            is_directory: matches!(
+                                e.kind,
+                                crate::ssh::sftp_fs::RemoteFileKind::Directory
+                            ),
+                            full_path: e.path,
+                            name: e.name,
+                        })
+                        .collect();
+                    Ok(list)
+                }
+                Err(err) => Err(format!("{}", err)),
+            };
+            this.update(cx, |this, cx| {
+                // canonical 与 original 都写一次，避免 prefix 用 "~" 查不到
+                let original_dir = abs_dir.clone();
+                let duplicated = canonical_dir != original_dir;
+                this.builtin_command_manager.apply_remote_dir_result(
+                    cfg_id.clone(),
+                    original_dir,
+                    payload.clone(),
+                );
+                if duplicated {
+                    this.builtin_command_manager.apply_remote_dir_result(
+                        cfg_id,
+                        canonical_dir,
+                        payload,
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 显示 Toast 错误通知
@@ -1171,8 +1429,8 @@ impl TerminalView {
             return false;
         }
 
-        // 根据当前输入阶段决定行为
-        let is_argument_phase = self.builtin_command_manager.is_argument_input();
+        // 当前输入阶段（为未来可能的分支保留；Tab 目前统一用于切换高亮）
+        let _is_argument_phase = self.builtin_command_manager.is_argument_input();
 
         match key {
             "up" => {
@@ -1184,14 +1442,11 @@ impl TerminalView {
                 true
             }
             "tab" => {
+                // Tab / Shift+Tab 仅在补全列表中切换高亮，不直接插入。
                 if modifiers.shift {
                     self.mutate_builtin_command(cx, BuiltinCommandManager::select_previous);
-                } else if is_argument_phase {
-                    // 参数输入阶段：路径补全
-                    self.mutate_builtin_command(cx, BuiltinCommandManager::complete_path);
                 } else {
-                    // 命令名输入阶段：命令补全
-                    self.mutate_builtin_command(cx, BuiltinCommandManager::complete);
+                    self.mutate_builtin_command(cx, BuiltinCommandManager::select_next);
                 }
                 true
             }
@@ -1207,8 +1462,32 @@ impl TerminalView {
                 true
             }
             "enter" | "return" => {
-                if self.builtin_command_manager.is_dismissed() {
-                    // 用户已取消，直接将命令发送给 shell
+                // 回车的三段语义（参考 Warp 的渐进补全流程）：
+                //  A. 浮层 visible 且**有高亮项** ⇒ 应用补全；之后判断该命令是否还需更多
+                //     参数，是则追加空格触发下一阶段浮层（auto-advance），否则 hide 浮层。
+                //  B. 浮层 visible 但**未高亮**（用户没按 ↓/Tab） ⇒ 仅关浮层，不补全也不
+                //     提交；用户接着输入字符会自动重开浮层。
+                //  C. 浮层 hidden（HiddenAfterPick / DismissedUntilReset） ⇒ 提交命令。
+                let mgr = &self.builtin_command_manager;
+                let overlay_visible_with_results =
+                    !mgr.is_overlay_hidden() && mgr.should_render_overlay();
+                let has_highlight = mgr.has_active_completion();
+
+                if has_highlight {
+                    let is_arg = mgr.is_argument_input();
+                    self.mutate_builtin_command(cx, |manager| {
+                        if is_arg {
+                            manager.complete_path();
+                        } else {
+                            manager.complete();
+                        }
+                        manager.advance_after_pick();
+                    });
+                } else if overlay_visible_with_results {
+                    // B：用户没选任何项，只是想关掉浮层
+                    self.mutate_builtin_command(cx, BuiltinCommandManager::hide_overlay);
+                } else if self.builtin_command_manager.is_dismissed() {
+                    // 用户已显式 ESC 取消，直接把命令发给 shell
                     self.send_builtin_command_to_shell(cx);
                 } else {
                     self.submit_builtin_command(false, cx);
@@ -1804,8 +2083,7 @@ impl Render for TerminalView {
                         )
                     })
                     .when(
-                        self.builtin_command_manager.is_active()
-                            && !self.builtin_command_manager.is_dismissed(),
+                        self.builtin_command_manager.should_render_overlay(),
                         |this| this.child(self.render_builtin_command_overlay(cx)),
                     )
                     .when(self.toast_message.is_some(), |this| {

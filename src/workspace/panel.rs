@@ -142,6 +142,8 @@ pub struct Panel {
     pub is_solo: bool,
     /// Whether this panel is currently selected
     pub is_selected: bool,
+    /// 鼠标是否悬停在 Panel 上（控制标题栏按钮显隐）
+    is_hovered: bool,
     /// Content displayed in this panel
     content: PanelContent,
     /// Temporary file browser rendered over terminal content.
@@ -181,6 +183,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::Text(content_text),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -223,6 +226,12 @@ impl Panel {
                     cx.emit(PanelEvent::OpenFile {
                         panel_id: close_panel_id.clone(),
                         path: path.clone(),
+                    });
+                }
+                TerminalViewEvent::StartTransfer { request } => {
+                    cx.emit(PanelEvent::TransferRequested {
+                        panel_id: close_panel_id.clone(),
+                        request: request.clone(),
                     });
                 }
                 TerminalViewEvent::SshReconnect { config } => {
@@ -268,6 +277,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::Terminal(terminal_view),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -300,6 +310,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::Terminal(terminal_view),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -331,6 +342,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::Terminal(terminal_view),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -364,6 +376,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::FileBrowser(file_browser_view),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -390,6 +403,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::Editor(editor_state),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -417,6 +431,7 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_hovered: false,
             content: PanelContent::SettingsHubView(settings_hub_view),
             file_browser_overlay: None,
             file_browser_overlay_subscription: None,
@@ -785,74 +800,76 @@ impl Panel {
                     })
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
-            .child(
-                // 右侧按钮组：广播按钮 + 关闭按钮
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        // 广播按钮 - 开启/关闭终端输入广播功能
-                        div()
-                            .id(format!("broadcast-btn-{}", panel_id))
-                            .w_5()
-                            .h_5()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .when(broadcast_enabled, |this| this.bg(theme.accent))
-                            .when(!broadcast_enabled, |this| {
-                                this.hover(move |style| style.bg(theme.title_bar_hover))
-                            })
-                            .cursor_pointer()
-                            .child(
-                                svg()
-                                    .size(px(14.0))
-                                    .text_color(if broadcast_enabled {
-                                        theme.accent_foreground
-                                    } else {
-                                        theme.icon_muted
-                                    })
-                                    .path(Icon::BroadcastInput.path()),
-                            )
-                            .on_click(cx.listener(
-                                move |_this, _event: &gpui::ClickEvent, _window, cx| {
-                                    cx.emit(PanelEvent::BroadcastToggle {
-                                        panel_id: panel_id_for_broadcast.clone(),
-                                    });
-                                    cx.stop_propagation();
-                                },
-                            )),
-                    )
-                    .child(
-                        // 关闭按钮
-                        div()
-                            .id(format!("close-btn-{}", panel_id))
-                            .w_5()
-                            .h_5()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .hover(move |style| style.bg(theme.title_bar_hover))
-                            .cursor_pointer()
-                            .child(
-                                svg()
-                                    .size(px(14.0))
-                                    .text_color(theme.icon_muted)
-                                    .path(Icon::WindowClose.path()),
-                            )
-                            .on_click(cx.listener(
-                                move |_this, _event: &gpui::ClickEvent, _window, cx| {
-                                    cx.emit(PanelEvent::Close {
-                                        panel_id: panel_id_for_close.clone(),
-                                    });
-                                    cx.stop_propagation();
-                                },
-                            )),
-                    ),
-            )
+            .when(self.is_hovered, |this| {
+                this.child(
+                    // 右侧按钮组：广播按钮 + 关闭按钮
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            // 广播按钮 - 开启/关闭终端输入广播功能
+                            div()
+                                .id(format!("broadcast-btn-{}", panel_id))
+                                .w_5()
+                                .h_5()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .when(broadcast_enabled, |this| this.bg(theme.accent))
+                                .when(!broadcast_enabled, |this| {
+                                    this.hover(move |style| style.bg(theme.title_bar_hover))
+                                })
+                                .cursor_pointer()
+                                .child(
+                                    svg()
+                                        .size(px(14.0))
+                                        .text_color(if broadcast_enabled {
+                                            theme.accent_foreground
+                                        } else {
+                                            theme.icon_muted
+                                        })
+                                        .path(Icon::BroadcastInput.path()),
+                                )
+                                .on_click(cx.listener(
+                                    move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                                        cx.emit(PanelEvent::BroadcastToggle {
+                                            panel_id: panel_id_for_broadcast.clone(),
+                                        });
+                                        cx.stop_propagation();
+                                    },
+                                )),
+                        )
+                        .child(
+                            // 关闭按钮
+                            div()
+                                .id(format!("close-btn-{}", panel_id))
+                                .w_5()
+                                .h_5()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .hover(move |style| style.bg(theme.title_bar_hover))
+                                .cursor_pointer()
+                                .child(
+                                    svg()
+                                        .size(px(14.0))
+                                        .text_color(theme.icon_muted)
+                                        .path(Icon::WindowClose.path()),
+                                )
+                                .on_click(cx.listener(
+                                    move |_this, _event: &gpui::ClickEvent, _window, cx| {
+                                        cx.emit(PanelEvent::Close {
+                                            panel_id: panel_id_for_close.clone(),
+                                        });
+                                        cx.stop_propagation();
+                                    },
+                                )),
+                        ),
+                )
+            })
     }
 
     /// 渲染内容区域
@@ -1107,6 +1124,12 @@ impl Render for Panel {
                     }])
             })
             .rounded(px(12.0))
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if *hovered != this.is_hovered {
+                    this.is_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_col()
             .overflow_hidden()

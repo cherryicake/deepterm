@@ -1,14 +1,34 @@
 use std::path::{Path, PathBuf};
 
+/// 补全项的语义分类
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// 本地文件 / 远端文件
+    File,
+    /// 本地目录 / 远端目录
+    Directory,
+    /// 已保存主机条目（用于 `/scp` host 前缀阶段）
+    Host,
+}
+
 /// 路径补全项
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathCompletionItem {
-    /// 显示名称（文件名/目录名）
+    /// 显示名称（文件名/目录名/主机名）
     pub name: String,
-    /// 完整路径
+    /// 完整路径（Host 条目用空路径占位）
     pub path: PathBuf,
-    /// 是否为目录
+    /// 兼容字段：对 `File/Directory` 分别对应 false/true；对 Host 条目为 false
     pub is_directory: bool,
+    /// 条目种类
+    pub kind: CompletionKind,
+    /// 描述信息（可选，用于 UI 次要文字，比如 host_label / 显示名）
+    pub description: Option<String>,
+    /// 外部补全引擎（如 `/scp`）计算出的"替换文本"
+    ///
+    /// 若为 `Some`，BuiltinCommandManager 会直接用该文本替换整个 token；
+    /// 否则退化为按 `name` / 父目录前缀拼接的传统行为。
+    pub replacement: Option<String>,
 }
 
 /// 文件系统路径补全引擎
@@ -123,6 +143,13 @@ impl PathCompletionEngine {
                     name,
                     path,
                     is_directory,
+                    kind: if is_directory {
+                        CompletionKind::Directory
+                    } else {
+                        CompletionKind::File
+                    },
+                    description: None,
+                    replacement: None,
                 })
             })
             .collect();

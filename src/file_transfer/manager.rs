@@ -47,6 +47,12 @@ impl TransferManager {
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
         let mut summary = TransferSummary::default();
+        // rename_to 仅在单源文件场景下生效；多源时退化为"按源名拼接目录"的原有行为。
+        let rename_to = if request.sources.len() == 1 {
+            request.rename_to.clone()
+        } else {
+            None
+        };
         for source in request.sources {
             check_cancelled(&cancelled)?;
             summary.merge(Self::transfer_one(
@@ -54,6 +60,7 @@ impl TransferManager {
                 &request.destination,
                 request.operation,
                 request.conflict_policy,
+                rename_to.as_deref(),
                 &cancelled,
                 progress.as_deref(),
                 resolver,
@@ -68,6 +75,7 @@ impl TransferManager {
         destination: &FileEndpoint,
         operation: TransferOperation,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
@@ -82,6 +90,7 @@ impl TransferManager {
                 &path,
                 destination_dir,
                 conflict_policy,
+                rename_to,
                 cancelled,
                 resolver,
             ),
@@ -94,6 +103,7 @@ impl TransferManager {
                 &path,
                 destination_dir,
                 conflict_policy,
+                rename_to,
                 cancelled,
                 resolver,
             ),
@@ -109,6 +119,7 @@ impl TransferManager {
                     ssh_config,
                     destination_dir,
                     conflict_policy,
+                    rename_to,
                     cancelled,
                     progress,
                     resolver,
@@ -132,6 +143,7 @@ impl TransferManager {
                     &remote_path,
                     destination_dir,
                     conflict_policy,
+                    rename_to,
                     cancelled,
                     progress,
                     resolver,
@@ -158,6 +170,7 @@ impl TransferManager {
                     &remote_path,
                     destination_dir,
                     conflict_policy,
+                    rename_to,
                     cancelled,
                     progress,
                     resolver,
@@ -177,6 +190,7 @@ impl TransferManager {
                 &remote_path,
                 destination_dir,
                 conflict_policy,
+                rename_to,
                 cancelled,
                 progress,
                 resolver,
@@ -197,6 +211,7 @@ impl TransferManager {
                     destination_config,
                     destination_dir,
                     conflict_policy,
+                    rename_to,
                     cancelled,
                     progress,
                     resolver,
@@ -215,6 +230,7 @@ impl TransferManager {
         source_path: &Path,
         destination_dir: &Path,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
@@ -226,7 +242,8 @@ impl TransferManager {
             .with_context(|| format!("unable to inspect {}", source_path.display()))?;
         fs::create_dir_all(destination_dir)?;
         let file_name = local_file_name(source_path)?;
-        let desired_path = destination_dir.join(file_name);
+        let effective_name = rename_to.unwrap_or(&file_name);
+        let desired_path = destination_dir.join(effective_name);
 
         if metadata.is_file() {
             let destination_path =
@@ -239,6 +256,8 @@ impl TransferManager {
         }
 
         if metadata.is_dir() {
+            // 目录场景忽略 rename_to，按源名拼目标目录根
+            let desired_path = destination_dir.join(&file_name);
             let destination_root =
                 resolve_local_conflict(&desired_path, conflict_policy, resolver)?
                     .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -262,6 +281,7 @@ impl TransferManager {
         source_path: &Path,
         destination_dir: &Path,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
@@ -273,8 +293,15 @@ impl TransferManager {
             return Ok(TransferSummary::default());
         }
 
+        let file_name = local_file_name(source_path)?;
+        // 目录 move 保留源名；文件 move 允许 rename_to 覆盖
+        let effective_name = if metadata.is_file() {
+            rename_to.unwrap_or(&file_name)
+        } else {
+            file_name.as_str()
+        };
         let destination_path = resolve_local_conflict(
-            &destination_dir.join(local_file_name(source_path)?),
+            &destination_dir.join(effective_name),
             conflict_policy,
             resolver,
         )?
@@ -295,6 +322,7 @@ impl TransferManager {
                     source_path,
                     destination_dir,
                     conflict_policy,
+                    rename_to,
                     cancelled,
                     resolver,
                 )?;
@@ -309,6 +337,7 @@ impl TransferManager {
         ssh_config: &SshConnectionConfig,
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
@@ -317,12 +346,13 @@ impl TransferManager {
         let metadata = fs::metadata(source_path)
             .with_context(|| format!("unable to inspect {}", source_path.display()))?;
         let file_name = local_file_name(source_path)?;
-        let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
+        let effective_name = rename_to.unwrap_or(&file_name);
 
         sftp_fs::with_cached_session(ssh_config, |session| {
             session.create_dir_all(destination_dir)?;
 
             if metadata.is_file() {
+                let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
                 let destination_path =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -336,6 +366,8 @@ impl TransferManager {
             }
 
             if metadata.is_dir() {
+                // 目录场景忽略 rename_to，按源名拼接
+                let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
                 let destination_root =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -360,6 +392,7 @@ impl TransferManager {
         remote_path: &str,
         destination_dir: &Path,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
@@ -367,12 +400,13 @@ impl TransferManager {
         check_cancelled(cancelled)?;
         fs::create_dir_all(destination_dir)?;
         let file_name = remote_file_name(remote_path)?;
-        let desired_path = destination_dir.join(file_name);
+        let effective_name = rename_to.unwrap_or(&file_name);
 
         sftp_fs::with_cached_session(ssh_config, |session| {
             let metadata = session.metadata(remote_path)?;
 
             if metadata.kind == RemoteFileKind::File {
+                let desired_path = destination_dir.join(effective_name);
                 let destination_path =
                     resolve_local_conflict(&desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -386,6 +420,7 @@ impl TransferManager {
             }
 
             if metadata.kind == RemoteFileKind::Directory {
+                let desired_path = destination_dir.join(&file_name);
                 let destination_root =
                     resolve_local_conflict(&desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -410,13 +445,14 @@ impl TransferManager {
         remote_path: &str,
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
-        let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
+        let effective_name = rename_to.unwrap_or(&file_name);
         if is_remote_noop_move(remote_path, destination_dir) {
             return Ok(TransferSummary::default());
         }
@@ -426,6 +462,7 @@ impl TransferManager {
             session.create_dir_all(destination_dir)?;
 
             if metadata.kind == RemoteFileKind::File {
+                let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
                 let destination_path =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -442,6 +479,7 @@ impl TransferManager {
             }
 
             if metadata.kind == RemoteFileKind::Directory {
+                let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
                 let destination_root =
                     resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                         .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -470,13 +508,13 @@ impl TransferManager {
         remote_path: &str,
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
-        let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
 
         sftp_fs::with_cached_session(ssh_config, |session| {
             let metadata = session.metadata(remote_path)?;
@@ -484,6 +522,12 @@ impl TransferManager {
             if is_remote_noop_move(remote_path, destination_dir) {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
             }
+            let effective_name = if metadata.kind == RemoteFileKind::File {
+                rename_to.unwrap_or(&file_name)
+            } else {
+                file_name.as_str()
+            };
+            let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
             let destination_path =
                 resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
                     .ok_or_else(|| anyhow!("transfer skipped"))?;
@@ -504,6 +548,7 @@ impl TransferManager {
                         remote_path,
                         destination_dir,
                         conflict_policy,
+                        rename_to,
                         cancelled,
                         progress,
                         resolver,
@@ -521,17 +566,24 @@ impl TransferManager {
         destination_config: &SshConnectionConfig,
         destination_dir: &str,
         conflict_policy: ConflictPolicy,
+        rename_to: Option<&str>,
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
         resolver: Option<&dyn ConflictResolver>,
     ) -> anyhow::Result<TransferSummary> {
         check_cancelled(cancelled)?;
         let file_name = remote_file_name(remote_path)?;
-        let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
 
         sftp_fs::with_cached_session(source_config, |source_session| {
             let metadata = source_session.metadata(remote_path)?;
             let is_directory = metadata.kind == RemoteFileKind::Directory;
+            // 目录场景忽略 rename_to，按源名拼接
+            let effective_name = if is_directory {
+                file_name.as_str()
+            } else {
+                rename_to.unwrap_or(&file_name)
+            };
+            let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
 
             // 先确保目标父目录存在（scp 要求父目录存在；流式路径也需要）
             sftp_fs::with_cached_session(destination_config, |destination_session| {

@@ -149,13 +149,12 @@ pub fn render_transfer_panel(
     }
 
     // 使用主题中定义的通知弹窗背景色，确保在任意主题下都能与终端背景做明显区分。
-    let panel_bg = theme.notification_background;
     Some(
         div()
             .w(px(PANEL_WIDTH))
             .max_h(px(PANEL_MAX_HEIGHT))
             .rounded(px(12.0))
-            .bg(panel_bg)
+            .bg(theme.notification_background)
             .shadow_lg()
             .flex()
             .flex_col()

@@ -1929,10 +1929,10 @@ impl Workspace {
 
                         let resize_div = div()
                             .when(is_horizontal, |this| {
-                                this.w(px(8.0)).h_full().cursor_col_resize()
+                                this.w(px(12.0)).h_full().cursor_col_resize()
                             })
                             .when(!is_horizontal, |this| {
-                                this.h(px(8.0)).w_full().cursor_row_resize()
+                                this.h(px(12.0)).w_full().cursor_row_resize()
                             })
                             .flex()
                             .items_center()
@@ -2071,9 +2071,10 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .pl(px(6.0))
-                    .pr(px(6.0))
-                    .pb(px(6.0))
+                    .pt(px(2.0))
+                    .pl(px(8.0))
+                    .pr(px(8.0))
+                    .pb(px(8.0))
                     .when_some(active_container, |this, container| {
                         this.child(self.render_split_container(container, &[], cx))
                     }),

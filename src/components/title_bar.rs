@@ -449,7 +449,7 @@ impl TitleBar {
         let popover = gpui::deferred(
             div()
                 .absolute()
-                .top(px(46.0))
+                .top(px(44.0))
                 .right(px(14.0))
                 .child(animated_panel),
         )

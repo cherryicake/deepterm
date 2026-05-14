@@ -743,6 +743,12 @@ async fn connect_sftp(
     let sftp = SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| anyhow!("初始化 SFTP 会话失败: {}", e))?;
+    // 高级 `SftpSession` 默认 response timeout 是 10 秒，长文件传输过程中偶发的
+    // TCP 停顿 / 服务端忙会直接把 in-flight 请求从表里清掉，随后服务端响应
+    // 到达就报 `Packet X for unknown recipient` 并把整条传输拖崩。与 bulk 通道
+    // 保持一致放到 300s —— 上层 TransferManager 自己用 `cancelled: AtomicBool`
+    // 做取消，不依赖这个死等时长。
+    sftp.set_timeout(300).await;
     Ok((handle, sftp))
 }
 
