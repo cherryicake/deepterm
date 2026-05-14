@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use gpui::Entity;
 
 use crate::builtin_commands::registry::{BuiltinCommand, CommandHandlerId};
+use crate::builtin_commands::scp_completion::is_local_keyword_str;
 use crate::builtin_commands::{ArgumentParser, LocalPathContext, PathResolver};
 use crate::file_browser::FileBrowserTarget;
 use crate::file_transfer::{ConflictPolicy, FileEndpoint, TransferOperation, TransferRequest};
@@ -376,7 +377,7 @@ fn parse_scp_token(
             let path = unquote_raw(path_raw);
 
             // 关键字 `Local` 始终指向运行 DeepTerm 的本机
-            if is_local_keyword(&host) {
+            if is_local_keyword_str(&host) {
                 return Ok(ScpEndpointSpec {
                     endpoint: resolve_local_endpoint(&path, ctx),
                     trailing_slash,
@@ -391,7 +392,7 @@ fn parse_scp_token(
                     names.join(", ")
                 )),
                 HostMatch::One(config) => {
-                    let resolved = resolve_remote_path(&path, config.clone(), ctx);
+                    let resolved = resolve_remote_path_with_cwd(&path, config.clone(), None);
                     Ok(ScpEndpointSpec {
                         endpoint: resolved,
                         trailing_slash,
@@ -445,28 +446,13 @@ fn resolve_host_token(
     ctx: &CommandContext,
     saved_configs: &[SshConnectionConfig],
 ) -> Option<FileEndpoint> {
-    if is_local_keyword(host_part) {
+    if is_local_keyword_str(host_part) {
         return Some(resolve_local_endpoint(path_part, ctx));
     }
     if let HostMatch::One(config) = match_host(host_part, saved_configs) {
-        return Some(resolve_remote_path(path_part, config.clone(), ctx));
+        return Some(resolve_remote_path_with_cwd(path_part, config.clone(), None));
     }
     None
-}
-
-/// 关键字 `Local`（不区分大小写）—— 始终指向运行 DeepTerm 的本机。
-///
-/// 同时识别"用户级别名"形式 `xxx@localhost` / `xxx@127.0.0.1` —— 这是补全
-/// 写入命令行的标准形态，回写后必须仍能被 parse 识别为本机。
-pub fn is_local_keyword(token: &str) -> bool {
-    if token.eq_ignore_ascii_case("local") {
-        return true;
-    }
-    if let Some((_, host_part)) = token.split_once('@') {
-        let host_lc = host_part.to_lowercase();
-        return host_lc == "localhost" || host_lc == "127.0.0.1" || host_lc == "::1";
-    }
-    false
 }
 
 fn resolve_local_endpoint(raw: &str, ctx: &CommandContext) -> FileEndpoint {
@@ -479,17 +465,8 @@ fn resolve_local_endpoint(raw: &str, ctx: &CommandContext) -> FileEndpoint {
     }
 }
 
-fn resolve_remote_path(
-    path_part: &str,
-    ssh_config: SshConnectionConfig,
-    _ctx: &CommandContext,
-) -> FileEndpoint {
-    // 显式 `host:path` 的远端解析：相对路径以登录家目录为基准（与 scp CLI 一致）。
-    resolve_remote_path_with_cwd(path_part, ssh_config, None)
-}
-
 /// 远端路径解析的统一实现。`base_cwd` 提供"当前所在目录"用于解析裸的相对路径
-/// （例如远程终端里直接写 `xx/yy.tar`），`None` 则按登录家目录处理。
+/// （例如远程终端里直接写 `xx/yy.tar`），`None` 则按登录家目录处理（与 scp CLI 一致）。
 fn resolve_remote_path_with_cwd(
     path_part: &str,
     ssh_config: SshConnectionConfig,

@@ -387,9 +387,7 @@ pub fn match_hosts_by_prefix<'a>(
 
 /// 关键字 `Local` 在命令行中实际用的字面量：`<当前用户>@localhost`。
 pub fn local_replacement_token() -> String {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".to_string());
+    let user = crate::ssh::get_current_username().unwrap_or_else(|| "user".to_string());
     format!("{}@localhost", user)
 }
 

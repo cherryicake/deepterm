@@ -773,7 +773,6 @@ impl BuiltinCommandManager {
                             &file_prefix,
                             &canonical_host,
                             prefix,
-                            &absolute_dir,
                         );
                     }
                     Some(RemoteDirCacheEntry::Failed(err)) => {
@@ -966,7 +965,6 @@ fn build_remote_completions(
     file_prefix: &str,
     host_token: &str,
     current_path_prefix: &str,
-    dir_used: &str,
 ) -> Vec<PathCompletionItem> {
     let prefix_lower = file_prefix.to_lowercase();
     // 传给 split_path_prefix 的"目录部分"应当与用户已经输入的内容保持字面一致
@@ -1019,7 +1017,6 @@ fn build_remote_completions(
         })
         .collect();
 
-    let _ = dir_used;
     // 目录优先，同类按字母序
     items.sort_by(|a, b| match (b.1, a.1) {
         (true, false) => std::cmp::Ordering::Greater,
@@ -1565,7 +1562,6 @@ mod tests {
             "",          // file_prefix
             "my host",   // host_token（含空格）
             "/home/me/", // current_path_prefix（光标处字面量）
-            "/home/me",  // dir_used
         );
         assert_eq!(items.len(), 1);
         let replacement = items[0].replacement.clone().unwrap();
@@ -1598,7 +1594,6 @@ mod tests {
             "",
             "deploy@1.2.3.4:2222", // user@host:port
             "/tmp/",
-            "/tmp",
         );
         assert_eq!(items.len(), 1);
         let r = items[0].replacement.clone().unwrap();
