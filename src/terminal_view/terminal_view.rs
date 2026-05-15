@@ -815,27 +815,39 @@ impl TerminalView {
     /// 返回 `(anchor, left)`：当 `anchor` 为 [`OverlayAnchor::Top`] 时浮窗用 `.top()` 锚定、
     /// 列表向下展开；当为 [`OverlayAnchor::Bottom`] 时浮窗用 `.bottom()` 锚定、
     /// 列表从下往上贴着光标增长（光标在窗口底部时使用，避免被裁切）。
+    ///
+    /// `visual_extra_rows` 与 `visual_col` 表示由内建命令缓冲文本换行后导致的
+    /// 视觉光标偏移：当文本超过终端列宽自动折行时，浮窗应贴着用户**视觉上**看到的
+    /// 光标行，而不是 PTY 光标行（否则会盖在用户正在输入的最后一行上）。
     fn builtin_command_overlay_position(
         &self,
         cx: &App,
         anchor_cells: f32,
         overlay_width: f32,
         overlay_height: f32,
+        visual_extra_rows: usize,
+        visual_col: usize,
     ) -> (OverlayAnchor, Pixels) {
         const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
 
         let term = self.terminal.read(cx);
         let content = term.last_content();
         let bounds = term.terminal_bounds;
-        let cursor_row_in_viewport = content.cursor.line.0.max(0) as f32;
-        let cursor_col = content.cursor.column.0 as f32;
+        let cursor_row_in_viewport =
+            content.cursor.line.0.max(0) as f32 + visual_extra_rows as f32;
+        // 当文本未换行时延用原有的 cursor_col + anchor_cells 偏移；换行后视觉光标列
+        // 从 0 重新开始，anchor 也基于视觉列。
+        let cursor_col = if visual_extra_rows == 0 {
+            content.cursor.column.0 as f32 + anchor_cells
+        } else {
+            visual_col as f32
+        };
 
         let cell_w = bounds.cell_width.as_f32();
         let line_h = bounds.line_height.as_f32();
 
         // 相对父级 (relative div = 终端元素整体) 的光标坐标
-        let cursor_left =
-            TERMINAL_HORIZONTAL_PADDING + ((cursor_col + anchor_cells) * cell_w).floor();
+        let cursor_left = TERMINAL_HORIZONTAL_PADDING + (cursor_col * cell_w).floor();
         let cursor_top = (cursor_row_in_viewport * line_h).floor();
 
         // 父级宽高：terminal_bounds 是去掉左右 padding 后的内容区，加回两侧 padding 即父级尺寸
@@ -940,10 +952,20 @@ impl TerminalView {
         let is_dark = cx.theme().appearance.is_dark();
         let view = cx.entity().clone();
 
+        // 内建命令缓冲在面板内可能因列宽不足自动换行，浮窗需要贴着视觉光标行而非
+        // PTY 光标行，否则会覆盖用户正在输入的最后一行。
+        let (visual_extra_rows, visual_col) = self.builtin_command_visual_cursor(cx);
+
         if self.builtin_command_manager.is_argument_input() {
             let anchor_cells = self.builtin_command_path_anchor_cells();
-            let (anchor, left) =
-                self.builtin_command_overlay_position(cx, anchor_cells, 320.0, 336.0);
+            let (anchor, left) = self.builtin_command_overlay_position(
+                cx,
+                anchor_cells,
+                320.0,
+                336.0,
+                visual_extra_rows,
+                visual_col,
+            );
             // 参数输入阶段：渲染路径补全浮层
             let path_completions = self.builtin_command_manager.path_completions.clone();
             let selected_index = self.builtin_command_manager.path_selected_index;
@@ -963,7 +985,14 @@ impl TerminalView {
             )
             .into_any_element()
         } else {
-            let (anchor, _) = self.builtin_command_overlay_position(cx, 0.0, 640.0, 460.0);
+            let (anchor, _) = self.builtin_command_overlay_position(
+                cx,
+                0.0,
+                640.0,
+                460.0,
+                visual_extra_rows,
+                visual_col,
+            );
             // 命令名输入阶段：渲染命令建议浮层
             let suggestions = self.builtin_command_manager.suggestions();
             let selected_index = self.builtin_command_manager.selected_index();
@@ -982,6 +1011,26 @@ impl TerminalView {
             )
             .into_any_element()
         }
+    }
+
+    /// 推算内建命令文本换行后的视觉光标偏移。
+    ///
+    /// 返回 `(extra_rows, visual_col)`：
+    /// - `extra_rows`：相对 PTY 光标行向下偏移的视觉行数（未换行时为 0）；
+    /// - `visual_col`：换行后视觉光标所在列；未换行时调用方应继续使用 PTY 列。
+    fn builtin_command_visual_cursor(&self, cx: &App) -> (usize, usize) {
+        let builtin = self.builtin_command_text();
+        let ime = self.ime_text();
+        if builtin.is_empty() && ime.is_empty() {
+            return (0, 0);
+        }
+        let term = self.terminal.read(cx);
+        let bounds = term.terminal_bounds;
+        let cols = bounds.num_columns();
+        let cursor_col = term.last_content().cursor.column.0;
+        let wrapped =
+            crate::terminal_view::overlay_wrap::wrap_overlay_text(builtin, ime, cursor_col, cols);
+        (wrapped.cursor_row, wrapped.cursor_col)
     }
 
     /// Clears the marked (pre-edit) text state.
