@@ -98,6 +98,15 @@ pub(crate) fn init(cx: &mut App) {
 /// 广播输入回调类型 - 用于将输入广播给其他终端
 pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
 
+/// 当前鼠标悬停的可点击链接信息。
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoveredLink {
+    pub url: SharedString,
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+}
+
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     terminal_subscription: Option<Subscription>,
@@ -139,6 +148,8 @@ pub struct TerminalView {
     ssh_connect_hide_task: Option<Task<()>>,
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
+    /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
+    pub hovered_link: Option<HoveredLink>,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
     /// Flattened render data reused across frames when nothing changed.
@@ -393,6 +404,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                hovered_link: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -526,6 +538,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                hovered_link: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -2000,7 +2013,13 @@ impl Render for TerminalView {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context(CONTEXT)
-            .cursor(CursorStyle::IBeam)
+            .cursor(
+                if self.hovered_link.is_some() {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::IBeam
+                },
+            )
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 this.copy(cx);
             }))
@@ -2013,6 +2032,20 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    #[cfg(target_os = "macos")]
+                    let is_cmd = event.modifiers.platform;
+                    #[cfg(not(target_os = "macos"))]
+                    let is_cmd = event.modifiers.control;
+
+                    if is_cmd {
+                        if let Some(ref link) = this.hovered_link {
+                            if let Err(e) = open::that(link.url.as_ref()) {
+                                log::warn!("Failed to open URL '{}': {}", link.url, e);
+                            }
+                            return;
+                        }
+                    }
+
                     this.selecting = true;
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_down(event, cx);
@@ -2035,6 +2068,47 @@ impl Render for TerminalView {
                 // to prevent terminal applications like tmux from receiving spurious drag events.
                 if cx.has_active_drag() {
                     return;
+                }
+
+                // Detect link modifier key state (Cmd on macOS, Ctrl elsewhere)
+                #[cfg(target_os = "macos")]
+                let modifiers_pressed = event.modifiers.platform;
+                #[cfg(not(target_os = "macos"))]
+                let modifiers_pressed = event.modifiers.control;
+
+                // URL hover detection (only when modifier is held)
+                let link = if modifiers_pressed {
+                    this.terminal.update(cx, |terminal, _cx| {
+                        let position = event.position - terminal.terminal_bounds.bounds.origin;
+                        let cell_width = terminal.terminal_bounds.cell_width;
+                        let line_height = terminal.terminal_bounds.line_height;
+                        let content = terminal.last_content();
+
+                        if position.x < px(0.0) || position.y < px(0.0) {
+                            return None;
+                        }
+                        let col = (position.x.as_f32() / cell_width.as_f32()).floor() as usize;
+                        let row = (position.y.as_f32() / line_height.as_f32()).floor() as usize;
+                        if col >= content.cols || row >= content.rows {
+                            return None;
+                        }
+                        terminal
+                            .url_range_at_viewport_position(row, col)
+                            .map(|(url, start_col, end_col)| HoveredLink {
+                                url: url.into(),
+                                row,
+                                start_col,
+                                end_col,
+                            })
+                    })
+                } else {
+                    None
+                };
+
+                let link_changed = this.hovered_link != link;
+                this.hovered_link = link;
+                if link_changed {
+                    cx.notify();
                 }
 
                 this.terminal.update(cx, |terminal, cx| {

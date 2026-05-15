@@ -25,8 +25,8 @@ use futures::{
 };
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point, Size,
-    Task, Window, px,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, Pixels, Point,
+    SharedString, Size, Task, Window, px,
 };
 
 use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal, platform::detect_local_os};
@@ -35,6 +35,7 @@ use crate::ssh::{
     platform::RemoteOS,
 };
 use crate::terminal::clipboard::{handle_osc52, parse_osc52};
+use crate::terminal::link_detector::UrlRange;
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -206,6 +207,8 @@ pub struct TerminalContent {
     pub total_lines: usize,
     /// Visible viewport lines (cached to avoid extra mutex lock)
     pub viewport_lines: usize,
+    /// Per-row URL ranges detected in the current content.
+    pub url_ranges: Vec<Vec<UrlRange>>,
 }
 
 impl Default for TerminalContent {
@@ -222,6 +225,7 @@ impl Default for TerminalContent {
             rows: 24,
             total_lines: 24,
             viewport_lines: 24,
+            url_ranges: Vec::new(),
         }
     }
 }
@@ -1184,6 +1188,15 @@ impl Terminal {
         // Cache line counts while we already hold the lock (avoids extra mutex grabs per frame)
         self.last_content.total_lines = term.total_lines();
         self.last_content.viewport_lines = term.screen_lines();
+
+        // Detect URLs per visible row
+        self.last_content.url_ranges.clear();
+        self.last_content.url_ranges.reserve(row_ranges.len());
+        for (start, end) in row_ranges.iter() {
+            let row_cells = &cells[*start..*end];
+            let ranges = crate::terminal::link_detector::detect_urls_in_line(row_cells);
+            self.last_content.url_ranges.push(ranges);
+        }
     }
 
     pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -1266,6 +1279,26 @@ impl Terminal {
 
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
+    }
+
+    /// Find a URL at the given viewport position.
+    /// Find a URL range at the given viewport position.
+    /// Returns (url, start_col, end_col) if found.
+    pub fn url_range_at_viewport_position(
+        &self,
+        viewport_row: usize,
+        col: usize,
+    ) -> Option<(SharedString, usize, usize)> {
+        let content = &self.last_content;
+        if viewport_row >= content.url_ranges.len() {
+            return None;
+        }
+        for range in &content.url_ranges[viewport_row] {
+            if col >= range.start_col && col < range.end_col {
+                return Some((range.url.clone().into(), range.start_col, range.end_col));
+            }
+        }
+        None
     }
 
     /// Get the total number of lines in the terminal including scrollback history

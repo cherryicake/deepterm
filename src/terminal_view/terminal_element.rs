@@ -4,7 +4,7 @@ use crate::settings_hub::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
-use crate::terminal_view::terminal_view::TerminalView;
+use crate::terminal_view::terminal_view::{HoveredLink, TerminalView};
 use crate::theme::{ActiveTheme, TerminalTheme};
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
@@ -109,6 +109,9 @@ pub struct RowRenderCache {
     pub selection_cols: Option<Vec<usize>>,
     pub box_cells: Option<Vec<BoxDrawingCell>>,
     pub background_spans: Option<Vec<BackgroundSpan>>,
+    /// Last hovered URL column range used to build `layout`. When this changes,
+    /// the cached layout must be invalidated so underline styles are recomputed.
+    pub hovered_url_cols: Option<(usize, usize)>,
 }
 
 /// 盒子绘制字符 / 块元素单元格。
@@ -148,6 +151,9 @@ pub struct FlattenedRenderCache {
     pub background_spans: Arc<[BackgroundSpan]>,
     pub selection_cells: Arc<[(usize, usize)]>,
     pub metrics: Option<RenderMetricsSignature>,
+    /// Tracks the hovered link state that produced this cache so we can
+    /// detect changes and rebuild when the user moves between URLs.
+    pub hovered_link: Option<HoveredLink>,
 }
 
 /// CursorLayout - simplified implementation inspired by Zed's CursorLayout
@@ -373,8 +379,30 @@ impl TerminalElement {
         cell: &IndexedCell,
         text_style: &TextStyle,
         terminal_theme: &TerminalTheme,
+        is_hovered_url: bool,
     ) -> TextRun {
         let (fg, _bg) = rendered_cell_colors(&cell.cell);
+        let underline = if is_hovered_url {
+            Some(gpui::UnderlineStyle {
+                color: Some(terminal_theme.named_color(
+                    alacritty_terminal::vte::ansi::NamedColor::Blue,
+                )),
+                thickness: px(1.0),
+                wavy: false,
+            })
+        } else if cell
+            .cell
+            .flags
+            .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
+        {
+            Some(gpui::UnderlineStyle {
+                color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
+                thickness: px(1.0),
+                wavy: false,
+            })
+        } else {
+            None
+        };
         TextRun {
             len: cell.cell.c.len_utf8(),
             font: Font {
@@ -402,19 +430,7 @@ impl TerminalElement {
             // Backgrounds are painted separately as spans; keeping this None avoids
             // duplicate background work inside text painting.
             background_color: None,
-            underline: if cell
-                .cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
-            {
-                Some(gpui::UnderlineStyle {
-                    color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
-                    thickness: px(1.0),
-                    wavy: false,
-                })
-            } else {
-                None
-            },
+            underline,
             strikethrough: None,
         }
     }
@@ -450,6 +466,7 @@ impl TerminalElement {
         let full_entry = Self::layout_row(
             row_idx,
             row_cells.iter(),
+            None,
             window,
             text_style,
             font_size,
@@ -495,6 +512,7 @@ impl TerminalElement {
     fn layout_row<'a>(
         row_idx: usize,
         cells: impl IntoIterator<Item = &'a IndexedCell>,
+        hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
         text_style: &TextStyle,
         font_size: Pixels,
@@ -506,6 +524,10 @@ impl TerminalElement {
 
         for cell in cells {
             let ch = cell.cell.c;
+            let col = cell.point.column.0;
+            let is_hovered_url = hovered_url_cols
+                .map(|(start, end)| col >= start && col < end)
+                .unwrap_or(false);
 
             if ch == '\0' {
                 Self::flush_text_batch(
@@ -531,7 +553,7 @@ impl TerminalElement {
                 continue;
             }
 
-            let cell_style = Self::text_run_for_cell(cell, text_style, terminal_theme);
+            let cell_style = Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
             let is_space = ch == ' ';
 
             match current_batch.as_mut() {
@@ -744,6 +766,7 @@ impl TerminalElement {
         cached_runs: &[BatchedTextRun],
         cells: &'a [IndexedCell],
         range: (usize, usize),
+        hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
         text_style: &TextStyle,
         font_size: Pixels,
@@ -798,6 +821,7 @@ impl TerminalElement {
         let dirty_entry = Self::layout_row(
             row_idx,
             dirty_cells,
+            hovered_url_cols,
             window,
             text_style,
             font_size,
@@ -1087,9 +1111,13 @@ impl Element for TerminalElement {
             viewport_lines,
             viewport_cols: terminal_bounds.num_columns(),
         };
+        let hovered_link = self.view.read(cx).hovered_link.clone();
+        let hovered_link_changed = cached_flattened.hovered_link != hovered_link;
+
         let rebuild_flattened_cache = theme_changed
             || cache_resized
             || selection_changed
+            || hovered_link_changed
             || has_dirty_rows
             || cached_flattened.metrics != Some(metrics_signature)
             || cached_flattened.runs.is_empty();
@@ -1107,8 +1135,25 @@ impl Element for TerminalElement {
             } else {
                 &[]
             };
+            let hovered_url_cols = {
+                let view = self.view.read(cx);
+                view.hovered_link.as_ref().and_then(|link| {
+                    if link.row == row_idx {
+                        Some((link.start_col, link.end_col))
+                    } else {
+                        None
+                    }
+                })
+            };
 
             let row_cache = &mut row_caches[row_idx];
+
+            // Invalidate cached layout when the hovered URL range on this row changes,
+            // so that underline styles are recomputed even if terminal content is clean.
+            if row_cache.hovered_url_cols != hovered_url_cols {
+                row_cache.layout = None;
+                row_cache.hovered_url_cols = hovered_url_cols;
+            }
 
             if is_dirty || row_cache.layout.is_none() {
                 dirty_count += 1;
@@ -1120,6 +1165,7 @@ impl Element for TerminalElement {
                         &cached_entry.runs,
                         row_cells,
                         range,
+                        hovered_url_cols,
                         window,
                         &text_style,
                         font_size,
@@ -1134,6 +1180,7 @@ impl Element for TerminalElement {
                         Self::layout_row(
                             row_idx,
                             row_cells.iter(),
+                            hovered_url_cols,
                             window,
                             &text_style,
                             font_size,
@@ -1145,6 +1192,7 @@ impl Element for TerminalElement {
                     Self::layout_row(
                         row_idx,
                         row_cells.iter(),
+                        hovered_url_cols,
                         window,
                         &text_style,
                         font_size,
@@ -1273,6 +1321,7 @@ impl Element for TerminalElement {
                 background_spans: Arc::from(background_spans),
                 selection_cells: Arc::from(selection_cells),
                 metrics: Some(metrics_signature),
+                hovered_link,
             };
             self.view.update(cx, |view, _cx| {
                 view.row_render_cache = row_caches;
