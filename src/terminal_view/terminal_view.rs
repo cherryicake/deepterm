@@ -1728,10 +1728,12 @@ impl TerminalView {
                     }
                 }
                 _ if input_bytes.is_some() => {
-                    // Only set can_start_builtin_command to false if the input is not '/'
-                    // This allows starting a builtin command with '/' even after other characters
+                    // 输入 '/' 时重置标志，确保内建命令模式能正常启动；
+                    // 输入其他字符时设为 false，避免行中误触发
                     if let Some(ref bytes) = input_bytes {
-                        if bytes != b"/" {
+                        if bytes == b"/" {
+                            self.can_start_builtin_command = true;
+                        } else {
                             self.can_start_builtin_command = false;
                         }
                     }
