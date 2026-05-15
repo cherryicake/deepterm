@@ -155,6 +155,35 @@ pub struct Panel {
 }
 
 impl Panel {
+    /// 创建 Panel 的通用字段初始化（避免每个 new_* 重复写 is_hovered 等）
+    fn new_common(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        content: PanelContent,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            panel_id: panel_id.into(),
+            workspace_id: workspace_id.into(),
+            focus_handle: cx.focus_handle(),
+            drag_preview: None,
+            active_tab_id,
+            active_tab_label,
+            ssh_config_id: None,
+            remote_os: None,
+            is_solo: false,
+            is_selected: false,
+            is_hovered: false,
+            content,
+            file_browser_overlay: None,
+            file_browser_overlay_subscription: None,
+            file_browser_content_subscription: None,
+            broadcast_enabled: false,
+        }
+    }
+
     /// Creates a new panel with text content.
     ///
     /// # Arguments
@@ -171,25 +200,14 @@ impl Panel {
     ) -> Self {
         let panel_id = panel_id.into();
         let content_text = format!("Panel: {}", panel_id);
-
-        Self {
+        Self::new_common(
             panel_id,
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+            workspace_id,
             active_tab_id,
-            active_tab_label: None,
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::Text(content_text),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: None,
-            broadcast_enabled: false,
-        }
+            None,
+            PanelContent::Text(content_text),
+            cx,
+        )
     }
 
     /// Creates a new panel with a terminal view.
@@ -266,24 +284,14 @@ impl Panel {
         let panel_id = panel_id.into();
         let terminal_view = TerminalView::new(cx);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
-        Self {
+        Self::new_common(
             panel_id,
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+            workspace_id,
             active_tab_id,
             active_tab_label,
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::Terminal(terminal_view),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: None,
-            broadcast_enabled: false,
-        }
+            PanelContent::Terminal(terminal_view),
+            cx,
+        )
     }
 
     /// Creates a new panel with a terminal view using a specific command.
@@ -299,24 +307,14 @@ impl Panel {
         let panel_id = panel_id.into();
         let terminal_view = TerminalView::new_with_command(cx, command, args);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
-        Self {
+        Self::new_common(
             panel_id,
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+            workspace_id,
             active_tab_id,
             active_tab_label,
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::Terminal(terminal_view),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: None,
-            broadcast_enabled: false,
-        }
+            PanelContent::Terminal(terminal_view),
+            cx,
+        )
     }
 
     /// Creates a new panel with an SSH remote terminal view.
@@ -365,24 +363,16 @@ impl Panel {
             },
         );
 
-        Self {
-            panel_id: panel_id.into(),
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+        let mut panel = Self::new_common(
+            panel_id,
+            workspace_id,
             active_tab_id,
-            active_tab_label: Some("Files".into()),
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::FileBrowser(file_browser_view),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: Some(subscription),
-            broadcast_enabled: false,
-        }
+            Some("Files".into()),
+            PanelContent::FileBrowser(file_browser_view),
+            cx,
+        );
+        panel.file_browser_content_subscription = Some(subscription);
+        panel
     }
 
     pub fn with_editor(
@@ -392,24 +382,14 @@ impl Panel {
         editor_state: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
-            panel_id: panel_id.into(),
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+        Self::new_common(
+            panel_id,
+            workspace_id,
             active_tab_id,
-            active_tab_label: Some("Editor".into()),
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::Editor(editor_state),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: None,
-            broadcast_enabled: false,
-        }
+            Some("Editor".into()),
+            PanelContent::Editor(editor_state),
+            cx,
+        )
     }
 
     /// Creates a new panel with a HostsHubView (sidebar + center content).
@@ -420,24 +400,14 @@ impl Panel {
         settings_hub_view: Entity<SettingsHubView>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
-            panel_id: panel_id.into(),
-            workspace_id: workspace_id.into(),
-            focus_handle: cx.focus_handle(),
-            drag_preview: None,
+        Self::new_common(
+            panel_id,
+            workspace_id,
             active_tab_id,
-            active_tab_label: Some("Hosts".into()),
-            ssh_config_id: None,
-            remote_os: None,
-            is_solo: false,
-            is_selected: false,
-            is_hovered: false,
-            content: PanelContent::SettingsHubView(settings_hub_view),
-            file_browser_overlay: None,
-            file_browser_overlay_subscription: None,
-            file_browser_content_subscription: None,
-            broadcast_enabled: false,
-        }
+            Some("Hosts".into()),
+            PanelContent::SettingsHubView(settings_hub_view),
+            cx,
+        )
     }
 
     pub fn show_file_browser_overlay(

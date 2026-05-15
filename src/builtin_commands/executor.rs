@@ -506,14 +506,14 @@ fn split_destination(
                 .filter(|n| !n.is_empty());
             match file_name {
                 Some(name) => {
-                    let parent = path.parent().map(PathBuf::from).unwrap_or_else(|| {
-                        // 路径没有 parent（例如 "/" 或 ""），降级为目录语义
-                        path.clone()
-                    });
-                    if parent.as_os_str().is_empty() {
-                        (FileEndpoint::Local { path }, None)
-                    } else {
-                        (FileEndpoint::Local { path: parent }, Some(name))
+                    let parent = path.parent().filter(|p| {
+                        // 相对路径如 "a.txt" 的 parent 是 ""（空路径），
+                        // 此时应视为当前目录，不能返回空 parent 否则后续拼接丢失目录语义
+                        !p.as_os_str().is_empty()
+                    }).map(PathBuf::from);
+                    match parent {
+                        Some(parent) => (FileEndpoint::Local { path: parent }, Some(name)),
+                        None => (FileEndpoint::Local { path: PathBuf::from(".") }, Some(name)),
                     }
                 }
                 None => (FileEndpoint::Local { path }, None),

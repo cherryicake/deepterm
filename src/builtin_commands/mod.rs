@@ -94,6 +94,8 @@ pub struct BuiltinCommandManager {
     /// 远端目录读取缓存：key 为 `(host id, 绝对目录路径)`，
     /// value 是条目列表或错误字符串
     remote_dir_cache: HashMap<(String, String), RemoteDirCacheEntry>,
+    /// 远端目录缓存的访问顺序（LRU），用于限制缓存大小
+    remote_dir_cache_lru: Vec<(String, String)>,
     /// 已经向外部发起、等待结果的远端目录请求集合
     pending_remote_keys: HashMap<(String, String), bool>,
     /// `/scp` 第二段是否处于"等待远端结果"状态
@@ -137,6 +139,7 @@ impl BuiltinCommandManager {
             cwd: std::env::current_dir().ok(),
             ssh_saved_configs: Arc::new(Vec::new()),
             remote_dir_cache: HashMap::new(),
+            remote_dir_cache_lru: Vec::new(),
             pending_remote_keys: HashMap::new(),
             is_loading_remote: false,
         }
@@ -168,7 +171,15 @@ impl BuiltinCommandManager {
             Ok(list) => RemoteDirCacheEntry::Entries(list),
             Err(err) => RemoteDirCacheEntry::Failed(err),
         };
+        // 更新 LRU：先移除旧位置，再插入到末尾（最新）
+        self.remote_dir_cache_lru.retain(|k| k != &key);
+        self.remote_dir_cache_lru.push(key.clone());
         self.remote_dir_cache.insert(key.clone(), value);
+        // LRU 淘汰：限制缓存最多 128 个条目
+        while self.remote_dir_cache_lru.len() > 128 {
+            let oldest = self.remote_dir_cache_lru.remove(0);
+            self.remote_dir_cache.remove(&oldest);
+        }
         self.pending_remote_keys.remove(&key);
         self.refresh_path_completions();
     }
@@ -378,9 +389,9 @@ impl BuiltinCommandManager {
 
     /// 判断当前缓冲在补全后是否应当 auto-advance 到下一个参数 token。
     ///
-    /// 规则：
-    /// 1. 必须是 `/scp`（目前唯一多 token 内建命令）
-    /// 2. 缓冲已存在的 token 数 < 2（还有空位）
+    /// 规则（通用化，支持任意多参数命令）：
+    /// 1. 当前命令必须存在且需要参数
+    /// 2. 缓冲已存在的 token 数 < 命令期望参数个数（还有空位）
     /// 3. 末尾不是空白（紧跟着已经是一个完整 token；否则 update(" ") 会把空白叠倍）
     /// 4. 末尾不是目录尾斜杠 `/`（用户还在该 token 内展开子目录）
     /// 5. 末尾不是 host 分隔符 `:`（host 刚补全完成，path 部分还没开始输入）
@@ -388,7 +399,11 @@ impl BuiltinCommandManager {
         let Some(buffer) = self.query() else {
             return false;
         };
-        if !is_scp_command(buffer) {
+        let Some(cmd) = self.resolved_command.as_ref() else {
+            return false;
+        };
+        // 命令不需要参数时不 advance
+        if cmd.argument == ArgumentType::None {
             return false;
         }
         // 末尾空白意味着此前已经处于"下一参数空位"阶段，不需要再加
@@ -768,6 +783,9 @@ impl BuiltinCommandManager {
 
                 match self.remote_dir_cache.get(&key).cloned() {
                     Some(RemoteDirCacheEntry::Entries(entries)) => {
+                        // 更新 LRU：命中后移到末尾（最新）
+                        self.remote_dir_cache_lru.retain(|k| k != &key);
+                        self.remote_dir_cache_lru.push(key.clone());
                         self.path_completions = build_remote_completions(
                             &entries,
                             &file_prefix,
@@ -1026,15 +1044,19 @@ fn build_remote_completions(
     items.into_iter().map(|(item, _)| item).collect()
 }
 
+/// 判断字符串是否需要 shell 引号包裹（含空格、制表符或引号字符）。
 fn needs_shell_quote(s: &str) -> bool {
     s.chars().any(|c| matches!(c, ' ' | '\t' | '"' | '\''))
 }
 
 /// host token 在拼到 `host:path` 时若自身含 `:`（带端口）或空格 / 引号，
 /// 必须整体引号化；否则 `first_unquoted_colon` 会切错。
+///
+/// 复用 `shell_quote`：当 host 含 `:` 时强制加引号（即使不含空格），
+/// 因为 `first_unquoted_colon` 会把 `user@host:port` 中的 `:` 识别为分隔符。
 fn quote_host_token(host: &str) -> String {
-    if host.contains(':') || needs_shell_quote(host) {
-        // 含 `:` 但不含空格/引号时，`shell_quote` 不会包引号 —— 直接手动包
+    if host.contains(':') {
+        // 强制引号包裹（shell_quote 对纯 ASCII 无空格字符串不会加引号）
         let mut out = String::with_capacity(host.len() + 2);
         out.push('"');
         for c in host.chars() {
@@ -1046,7 +1068,7 @@ fn quote_host_token(host: &str) -> String {
         out.push('"');
         out
     } else {
-        host.to_string()
+        scp_completion::shell_quote(host)
     }
 }
 

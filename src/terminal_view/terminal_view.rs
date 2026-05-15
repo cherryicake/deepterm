@@ -1229,7 +1229,7 @@ impl TerminalView {
     ) {
         let saved = crate::ssh::config::SshGlobalConfig::load().saved_connections;
         let Some(config) = saved.iter().find(|c| c.id() == request.config_id).cloned() else {
-            // 配置已删：直接回传空列表避免死等
+            // 配置已删：直接回传空列表避免死等，并提示用户刷新配置
             let config_id = request.config_id.clone();
             let dir = request.absolute_dir.clone();
             cx.spawn(async move |this, cx| {
@@ -1237,7 +1237,7 @@ impl TerminalView {
                     this.builtin_command_manager.apply_remote_dir_result(
                         config_id,
                         dir,
-                        Err("未找到 SSH 配置".into()),
+                        Err("SSH 配置已被删除或修改，请刷新连接列表后重试".into()),
                     );
                     cx.notify();
                 })

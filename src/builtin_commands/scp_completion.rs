@@ -146,7 +146,12 @@ pub fn first_unquoted_colon(raw_token: &str) -> Option<usize> {
                     mode = QuoteMode::Single;
                     idx += 1;
                 }
-                '\\' if idx + 1 < total => idx += 2,
+                '\\' if idx + 1 < total => {
+                    // 反斜杠转义：跳过反斜杠本身，保留下一个字符原样。
+                    // 关键：如果下一个字符是 ':'，那这个 ':' 是被转义的，
+                    // 不应被视为 host/path 分隔符。
+                    idx += 2;
+                }
                 _ => idx += 1,
             },
             QuoteMode::Double => match c {
@@ -243,6 +248,8 @@ pub fn analyse(buffer: &str) -> Option<ScpCompletionQuery> {
         .last()
         .map(char::is_whitespace)
         .unwrap_or(false);
+    // 光标在空白处：只有当前已填满两个参数时才不可补全；
+    // 若只有一个参数（如 `/scp alice:/a `），应允许继续补第二个参数。
     if last_is_space && tokens.len() >= 2 {
         return None;
     }
@@ -303,13 +310,13 @@ pub fn is_local_keyword_str(token: &str) -> bool {
     false
 }
 
-/// 按 host 前缀匹配已保存连接 + 保留关键字 `Local`。
+/// 按 host 子串匹配已保存连接 + 保留关键字 `Local`。
 ///
 /// 匹配规则（大小写不敏感）：
 /// 0. 关键字 `Local`（始终指向本机）
-/// 1. nickname prefix
-/// 2. host prefix
-/// 3. host_label prefix（`user@host[:port]`）
+/// 1. nickname 子串
+/// 2. host 子串
+/// 3. host_label 子串（`user@host[:port]`）
 ///
 /// 输出统一格式：
 /// - `display`：匹配源（用于次要文字，例如保留 nickname 让用户认得）
@@ -325,7 +332,7 @@ pub fn match_hosts_by_prefix<'a>(
 
     // 0) 保留关键字 `Local`：始终排在最前
     let local_replacement = local_replacement_token();
-    if "local".starts_with(&prefix_lc) || local_replacement.to_lowercase().starts_with(&prefix_lc) {
+    if "local".contains(&prefix_lc) || local_replacement.to_lowercase().contains(&prefix_lc) {
         out.push(ScpHostSuggestion {
             config: None,
             display: "Local".to_string(),
@@ -334,10 +341,10 @@ pub fn match_hosts_by_prefix<'a>(
         });
     }
 
-    // 1) nickname 前缀
+    // 1) nickname 子串
     for cfg in saved {
         if let Some(nick) = cfg.nickname.as_deref() {
-            if nick.to_lowercase().starts_with(&prefix_lc) {
+            if nick.to_lowercase().contains(&prefix_lc) {
                 let id = cfg.id();
                 if pushed_ids.insert(id) {
                     out.push(ScpHostSuggestion {
@@ -351,9 +358,9 @@ pub fn match_hosts_by_prefix<'a>(
         }
     }
 
-    // 2) host 字段前缀
+    // 2) host 字段子串
     for cfg in saved {
-        if cfg.host.to_lowercase().starts_with(&prefix_lc) {
+        if cfg.host.to_lowercase().contains(&prefix_lc) {
             let id = cfg.id();
             if pushed_ids.insert(id) {
                 out.push(ScpHostSuggestion {
@@ -369,7 +376,7 @@ pub fn match_hosts_by_prefix<'a>(
     // 3) host_label：`user@host[:port]` —— 包含带端口主机
     for cfg in saved {
         let label = cfg.host_label();
-        if label.to_lowercase().starts_with(&prefix_lc) {
+        if label.to_lowercase().contains(&prefix_lc) {
             let id = cfg.id();
             if pushed_ids.insert(id) {
                 out.push(ScpHostSuggestion {
