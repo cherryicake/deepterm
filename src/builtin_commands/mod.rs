@@ -377,13 +377,17 @@ impl BuiltinCommandManager {
 
     /// 补全成功后由外层调用：根据当前缓冲是否还需更多参数决定下一步：
     /// - 还需更多参数（且选中项不是目录） ⇒ 追加空格 → 下一阶段浮层自动重弹
-    /// - 已经满了 / 选中目录（用户还在该 token 内继续展开）⇒ 隐藏浮层
+    /// - 已经满了 / 选中目录（用户还在该 token 内继续展开）⇒ 保持浮层可见
     pub fn advance_after_pick(&mut self) {
         if self.should_advance_to_next_arg() {
             // `update(" ")` 同时把 overlay 切回 Visible 并触发 refresh_state
             self.update(" ");
         } else {
-            self.hide_overlay();
+            // 目录选中后保持浮层展开，让用户继续选择子目录
+            let is_dir_expanding = self.query().map_or(false, |b| b.ends_with('/'));
+            if !is_dir_expanding {
+                self.hide_overlay();
+            }
         }
     }
 
@@ -527,6 +531,7 @@ impl BuiltinCommandManager {
     /// 应用当前选中的路径补全。
     ///
     /// 将当前路径参数替换为选中的完整路径。无选中时为 no-op。
+    /// 若选中的是目录，替换后自动刷新该目录下的补全列表（保持浮层展开）。
     pub fn complete_path(&mut self) {
         let Some(selected) = self.selected_path_completion().cloned() else {
             return;
@@ -548,6 +553,13 @@ impl BuiltinCommandManager {
                     state.set_buffer(next);
                     self.path_selected_index = None;
                     self.refresh_path_completions();
+                    // 若选中的是目录，保持浮层可见并自动选中第一项
+                    if selected.is_directory {
+                        self.overlay = OverlayState::Visible;
+                        if !self.path_completions.is_empty() {
+                            self.path_selected_index = Some(0);
+                        }
+                    }
                     return;
                 }
             }
@@ -577,6 +589,14 @@ impl BuiltinCommandManager {
         state.set_buffer(new_input);
         self.path_selected_index = None;
         self.refresh_path_completions();
+
+        // 若选中的是目录，保持浮层可见并自动选中第一项，方便用户继续选择
+        if selected.is_directory {
+            self.overlay = OverlayState::Visible;
+            if !self.path_completions.is_empty() {
+                self.path_selected_index = Some(0);
+            }
+        }
     }
 
     /// 按外部交互（如鼠标点击）直接设置选中项。
@@ -882,20 +902,18 @@ fn build_host_or_local_completions(
         }
     }
 
-    // 本地路径补全（只在有具体 prefix 时给出；空 prefix 时仅展示主机）
-    if !prefix.is_empty() {
-        for item in PathCompletionEngine::complete(prefix, cwd) {
-            let replacement = compose_local_replacement(prefix, &item);
-            items.push(PathCompletionItem {
-                replacement: Some(replacement),
-                description: Some(if item.is_directory {
-                    "Directory".to_string()
-                } else {
-                    item.path.to_string_lossy().into_owned()
-                }),
-                ..item
-            });
-        }
+    // 本地路径补全（空 prefix 时列出当前目录，方便用户直接选择本地文件）
+    for item in PathCompletionEngine::complete(prefix, cwd) {
+        let replacement = compose_local_replacement(prefix, &item);
+        items.push(PathCompletionItem {
+            replacement: Some(replacement),
+            description: Some(if item.is_directory {
+                "Directory".to_string()
+            } else {
+                item.path.to_string_lossy().into_owned()
+            }),
+            ..item
+        });
     }
 
     items
@@ -1717,10 +1735,10 @@ mod tests {
         manager.advance_after_pick();
         // 不应加空格
         assert_eq!(manager.query(), Some("/scp Local:/tmp/"));
-        // 浮层仍 visible —— 留给该目录的子项展开（可被外层主动 hide）
+        // 浮层保持 Visible —— 让用户继续选择子目录
         assert_eq!(
             manager.overlay_state(),
-            super::OverlayState::HiddenAfterPick
+            super::OverlayState::Visible
         );
     }
 
