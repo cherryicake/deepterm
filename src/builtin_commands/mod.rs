@@ -1471,7 +1471,8 @@ mod tests {
     fn fake_builtin_command_specs_are_available_for_prompt() {
         let registry = super::global_registry();
         assert!(registry.find("/open-file").is_some());
-        assert!(registry.find("/open-repo").is_some());
+        assert!(registry.find("/open").is_some());
+        assert!(registry.find("/scp").is_some());
     }
 
     #[test]

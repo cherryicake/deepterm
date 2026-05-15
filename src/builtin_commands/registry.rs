@@ -155,54 +155,6 @@ pub fn init_global_registry() -> CommandRegistry {
         handler_id: CommandHandlerId("open_file"),
     });
     registry.register(BuiltinCommand {
-        name: "/open-repo",
-        description: "Switch to another indexed repository.",
-        icon: Icon::Host,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-skill",
-        description: "Inspect an installed skill definition.",
-        icon: Icon::KeyShield,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-rules",
-        description: "View global and project agent rules.",
-        icon: Icon::SettingsHub,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-code-review",
-        description: "Open the code review workspace.",
-        icon: Icon::Plus,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-mcp-servers",
-        description: "Inspect configured MCP servers.",
-        icon: Icon::Server,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-project-rules",
-        description: "Open the project rules file (AGENTS.md).",
-        icon: Icon::Host,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
         name: "/scp",
         description: "Copy files between configured hosts or local (e.g. /scp alice:/etc/hosts bob:/tmp/).",
         icon: Icon::Server,
@@ -211,30 +163,6 @@ pub fn init_global_registry() -> CommandRegistry {
             hint: "src dst",
         },
         handler_id: CommandHandlerId("scp_transfer"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/new-component",
-        description: "Create new GPUI components. Use when building components or UI elements.",
-        icon: Icon::Plus,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/generate-component-story",
-        description: "Create story examples for components.",
-        icon: Icon::Loader,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/generate-component-documentation",
-        description: "Generate documentation for new components.",
-        icon: Icon::Loader,
-        availability: Availability::Always,
-        argument: ArgumentType::None,
-        handler_id: CommandHandlerId("log_only"),
     });
 
     registry
