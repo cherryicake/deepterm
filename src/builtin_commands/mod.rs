@@ -1542,7 +1542,6 @@ where
                                 CompletionKind::Host => crate::assets::Icon::Host.path(),
                                 CompletionKind::File => crate::assets::Icon::File.path(),
                             };
-                            let description = item.description.clone();
                             div()
                                 .w_full()
                                 .h(px(28.0))
@@ -1590,19 +1589,6 @@ where
                                         .text_color(theme.text)
                                         .child(item.name.clone()),
                                 )
-                                .when_some(description, |this, desc| {
-                                    this.child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .truncate()
-                                            .text_size(px(12.5))
-                                            .text_color(theme.text_muted)
-                                            .child(desc),
-                                    )
-                                })
                         }),
                 ),
         )
