@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{IntoElement, ParentElement, Styled};
+use gpui::{IntoElement, ParentElement, StatefulInteractiveElement, Styled};
 use gpui::{MouseButton, Pixels, div, px, svg};
 
 use crate::theme::UiTheme;
@@ -1523,8 +1523,10 @@ where
         })
         .child(
             div()
-                .max_h(px(320.0))
-                .overflow_hidden()
+                .id("path-completion-list")
+                .max_h(px(272.0))
+                .overflow_y_scroll()
+                .px(px(6.0))
                 .flex()
                 .flex_col()
                 .children(
@@ -1543,13 +1545,12 @@ where
                             let description = item.description.clone();
                             div()
                                 .w_full()
-                                .h(px(32.0))
-                                .mx(px(6.0))
+                                .h(px(28.0))
                                 .px(px(10.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(10.0))
-                                .rounded(px(8.0))
+                                .rounded(px(6.0))
                                 .cursor_pointer()
                                 .bg(if is_selected {
                                     theme.accent.opacity(if is_dark { 0.18 } else { 0.12 })

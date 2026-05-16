@@ -975,7 +975,7 @@ impl TerminalView {
                 cx,
                 anchor_cells,
                 320.0,
-                336.0,
+                288.0,
                 visual_extra_rows,
                 visual_col,
             );
