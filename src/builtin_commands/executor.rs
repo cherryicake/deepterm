@@ -192,7 +192,9 @@ impl CommandHandler for OpenFileHandler {
             crate::builtin_commands::PathCompletionEngine::parse_line_column(raw_path);
 
         let path = if ctx.is_remote {
-            PathResolver::resolve_remote(&path_part, None).unwrap_or_else(|| path_part.to_string())
+            // 远程终端：相对路径以 OSC 7 报上来的 cwd 为基准，与补全侧一致
+            PathResolver::resolve_remote(&path_part, ctx.remote_cwd.as_deref())
+                .unwrap_or_else(|| path_part.to_string())
         } else {
             let local_ctx = LocalPathContext {
                 working_directory: ctx.working_directory.clone(),
@@ -728,6 +730,34 @@ mod tests {
         match result {
             CommandResult::OpenFile { path } => {
                 assert_eq!(path, "/home/user/project/src/main.rs");
+            }
+            _ => panic!("Expected OpenFile result"),
+        }
+    }
+
+    #[test]
+    fn test_open_file_handler_remote_uses_terminal_cwd() {
+        // 远程终端：相对路径应当以 OSC 7 报上来的 cwd 为基准，
+        // 与补全侧"裸路径跟随当前终端"对齐。
+        use crate::ssh::config::AuthMethod;
+        let handler = OpenFileHandler;
+        let cfg =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
+        let result = handler.execute(
+            Some("logs/app.log"),
+            CommandContext {
+                terminal_view: None,
+                working_directory: None,
+                process_cwd: None,
+                remote_cwd: Some("/srv/app".to_string()),
+                is_remote: true,
+                ssh_config: Some(cfg),
+            },
+        );
+
+        match result {
+            CommandResult::OpenFile { path } => {
+                assert_eq!(path, "/srv/app/logs/app.log");
             }
             _ => panic!("Expected OpenFile result"),
         }

@@ -91,6 +91,13 @@ pub struct BuiltinCommandManager {
     cwd: Option<PathBuf>,
     /// `/scp` 时用到的 SSH 连接列表（由外部刷新注入）
     ssh_saved_configs: Arc<Vec<crate::ssh::SshConnectionConfig>>,
+    /// 当前终端若是远程 SSH 终端，这里保存其连接配置；本地终端为 `None`。
+    /// `/scp` 在没有显式 host 的 token 上会以这里为基准走 SFTP，
+    /// 使得"裸路径补全跟随当前终端所在主机"。
+    terminal_ssh: Option<crate::ssh::SshConnectionConfig>,
+    /// 远程终端通过 OSC 7 报上来的实时 cwd（绝对路径）。
+    /// 用于把"裸相对路径"在补全侧拼成绝对 SFTP 路径。本地终端为 `None`。
+    terminal_remote_cwd: Option<String>,
     /// 远端目录读取缓存：key 为 `(host id, 绝对目录路径)`，
     /// value 是条目列表或错误字符串
     remote_dir_cache: HashMap<(String, String), RemoteDirCacheEntry>,
@@ -138,6 +145,8 @@ impl BuiltinCommandManager {
             resolved_command: None,
             cwd: std::env::current_dir().ok(),
             ssh_saved_configs: Arc::new(Vec::new()),
+            terminal_ssh: None,
+            terminal_remote_cwd: None,
             remote_dir_cache: HashMap::new(),
             remote_dir_cache_lru: Vec::new(),
             pending_remote_keys: HashMap::new(),
@@ -148,6 +157,22 @@ impl BuiltinCommandManager {
     /// 注入 SSH 保存连接列表。外部应在 `/scp` 模式启动前刷新一次即可。
     pub fn set_ssh_configs(&mut self, configs: Vec<crate::ssh::SshConnectionConfig>) {
         self.ssh_saved_configs = Arc::new(configs);
+    }
+
+    /// 注入"当前终端"的连接信息。
+    ///
+    /// - 本地终端：`ssh = None`、`remote_cwd = None`
+    /// - 远程终端：`ssh = Some(...)`，`remote_cwd` 取 OSC 7 报上来的实时 cwd
+    ///
+    /// 设置后，`/scp` 在没有显式 host 的 token 上会跟随当前终端所在主机：
+    /// 远程终端走 SFTP 列出远端目录，本地终端走本机文件系统。
+    pub fn set_terminal_context(
+        &mut self,
+        ssh: Option<crate::ssh::SshConnectionConfig>,
+        remote_cwd: Option<String>,
+    ) {
+        self.terminal_ssh = ssh;
+        self.terminal_remote_cwd = remote_cwd;
     }
 
     /// 注入"本机端"的工作目录基准。
@@ -553,12 +578,9 @@ impl BuiltinCommandManager {
                     state.set_buffer(next);
                     self.path_selected_index = None;
                     self.refresh_path_completions();
-                    // 若选中的是目录，保持浮层可见并自动选中第一项
+                    // 选中目录后保持浮层可见，但不预选 —— 用户需主动按 ↑/↓/Tab 才能选中
                     if selected.is_directory {
                         self.overlay = OverlayState::Visible;
-                        if !self.path_completions.is_empty() {
-                            self.path_selected_index = Some(0);
-                        }
                     }
                     return;
                 }
@@ -590,12 +612,9 @@ impl BuiltinCommandManager {
         self.path_selected_index = None;
         self.refresh_path_completions();
 
-        // 若选中的是目录，保持浮层可见并自动选中第一项，方便用户继续选择
+        // 选中目录后保持浮层可见，但不预选 —— 用户需主动按 ↑/↓/Tab 才能选中
         if selected.is_directory {
             self.overlay = OverlayState::Visible;
-            if !self.path_completions.is_empty() {
-                self.path_selected_index = Some(0);
-            }
         }
     }
 
@@ -728,16 +747,23 @@ impl BuiltinCommandManager {
             return;
         }
 
-        // 通用单参数本地补全
-        self.is_loading_remote = false;
+        // 通用单参数补全：在远程终端时跟随当前 SSH 主机走 SFTP
+        // —— 与 `/scp` 裸路径分支一致，使补全起点始终是终端实际所在的 cwd。
         let args = query
             .trim_start()
             .splitn(2, |c: char| c.is_whitespace())
             .nth(1)
             .unwrap_or("")
             .trim_start();
-        // 空 prefix 时直接列出当前工作目录（参考截图：/scp 后空格即出建议）
         let effective_prefix = if args.is_empty() { "" } else { args };
+
+        if let Some(terminal_cfg) = self.terminal_ssh.clone() {
+            self.refresh_bare_remote_completions(effective_prefix, terminal_cfg, None);
+            return;
+        }
+
+        // 本地终端：列出本机文件
+        self.is_loading_remote = false;
         self.path_completions =
             PathCompletionEngine::complete(effective_prefix, self.cwd.as_deref());
         self.path_selected_index = None;
@@ -753,14 +779,30 @@ impl BuiltinCommandManager {
 
         match &query.phase {
             ScpCompletionPhase::HostOrLocal { prefix } => {
-                self.path_completions = build_host_or_local_completions(
-                    prefix,
-                    self.cwd.as_deref(),
-                    &self.ssh_saved_configs,
-                );
+                // 远程终端：host 候选 + 当前终端的远程文件；
+                // 本地终端：host 候选 + 本机文件。
+                if let Some(terminal_cfg) = self.terminal_ssh.clone() {
+                    let mut items = build_host_only_completions(
+                        prefix,
+                        &self.ssh_saved_configs,
+                    );
+                    items.extend(self.compute_bare_remote_completion_items(
+                        prefix,
+                        terminal_cfg,
+                        None,
+                    ));
+                    self.path_completions = items;
+                    self.path_selected_index = None;
+                } else {
+                    self.path_completions = build_host_or_local_completions(
+                        prefix,
+                        self.cwd.as_deref(),
+                        &self.ssh_saved_configs,
+                    );
+                }
             }
             ScpCompletionPhase::RemotePath { host_token, prefix } => {
-                // 关键字 `Local` —— 走本机路径补全
+                // 关键字 `Local` —— 始终指向"运行 DeepTerm 的本机"
                 if scp_completion::is_local_keyword_str(host_token) {
                     self.path_completions =
                         build_local_path_completions(prefix, host_token, self.cwd.as_deref());
@@ -809,7 +851,7 @@ impl BuiltinCommandManager {
                         self.path_completions = build_remote_completions(
                             &entries,
                             &file_prefix,
-                            &canonical_host,
+                            Some(canonical_host.as_str()),
                             prefix,
                         );
                     }
@@ -839,6 +881,62 @@ impl BuiltinCommandManager {
             }
         }
         self.path_selected_index = None;
+    }
+
+    /// `/scp` 在"远程终端 + 没有显式 host"时的补全：直接走当前终端 SSH 的 SFTP，
+    /// replacement 写裸路径（不加 `host:` 前缀），保持"裸路径跟随当前终端所在主机"。
+    ///
+    /// `extra_host_quoted` 是供未来扩展用的可选 host 前缀；当前调用方传 `None`。
+    fn refresh_bare_remote_completions(
+        &mut self,
+        prefix: &str,
+        terminal_cfg: crate::ssh::SshConnectionConfig,
+        extra_host_quoted: Option<&str>,
+    ) {
+        self.path_completions =
+            self.compute_bare_remote_completion_items(prefix, terminal_cfg, extra_host_quoted);
+        self.path_selected_index = None;
+    }
+
+    /// 与 `refresh_bare_remote_completions` 同语义，但只返回 items，由调用方负责合并 / 写回。
+    /// 用于 HostOrLocal 阶段把 host 候选与当前终端远程文件拼到一起。
+    fn compute_bare_remote_completion_items(
+        &mut self,
+        prefix: &str,
+        terminal_cfg: crate::ssh::SshConnectionConfig,
+        extra_host_quoted: Option<&str>,
+    ) -> Vec<PathCompletionItem> {
+        let base_cwd = self.terminal_remote_cwd.as_deref();
+        let (absolute_dir, file_prefix) = split_remote_dir_for_bare(prefix, base_cwd);
+        let key = (terminal_cfg.id(), absolute_dir.clone());
+
+        match self.remote_dir_cache.get(&key).cloned() {
+            Some(RemoteDirCacheEntry::Entries(entries)) => {
+                self.remote_dir_cache_lru.retain(|k| k != &key);
+                self.remote_dir_cache_lru.push(key.clone());
+                build_remote_completions(&entries, &file_prefix, extra_host_quoted, prefix)
+            }
+            Some(RemoteDirCacheEntry::Failed(err)) => vec![PathCompletionItem {
+                name: "无法读取远端目录".to_string(),
+                path: PathBuf::new(),
+                is_directory: false,
+                kind: CompletionKind::File,
+                description: Some(err),
+                replacement: None,
+            }],
+            None => {
+                self.is_loading_remote = true;
+                self.pending_remote_keys.entry(key).or_insert(false);
+                vec![PathCompletionItem {
+                    name: "读取远端目录中…".to_string(),
+                    path: PathBuf::new(),
+                    is_directory: false,
+                    kind: CompletionKind::File,
+                    description: Some(absolute_dir),
+                    replacement: None,
+                }]
+            }
+        }
     }
 
     /// 获取参数提示文本（如 "file_path"）。
@@ -873,6 +971,31 @@ fn build_host_or_local_completions(
     cwd: Option<&std::path::Path>,
     saved: &[crate::ssh::SshConnectionConfig],
 ) -> Vec<PathCompletionItem> {
+    let mut items: Vec<PathCompletionItem> = build_host_only_completions(prefix, saved);
+
+    // 本地路径补全（空 prefix 时列出当前目录，方便用户直接选择本地文件）
+    for item in PathCompletionEngine::complete(prefix, cwd) {
+        let replacement = compose_local_replacement(prefix, &item);
+        items.push(PathCompletionItem {
+            replacement: Some(replacement),
+            description: Some(if item.is_directory {
+                "Directory".to_string()
+            } else {
+                item.path.to_string_lossy().into_owned()
+            }),
+            ..item
+        });
+    }
+
+    items
+}
+
+/// 仅生成 host 候选（含 `Local` 关键字 + 已保存连接），不附本机/远端文件。
+/// 远程终端的 HostOrLocal 阶段会用它先列 host，再追加 SFTP 远程文件。
+fn build_host_only_completions(
+    prefix: &str,
+    saved: &[crate::ssh::SshConnectionConfig],
+) -> Vec<PathCompletionItem> {
     let mut items: Vec<PathCompletionItem> = Vec::new();
 
     // 主机：按 prefix 匹配；prefix 以 `/` 或 `~` 开头则跳过主机匹配（明显是路径）
@@ -900,20 +1023,6 @@ fn build_host_or_local_completions(
                 replacement: Some(replacement),
             });
         }
-    }
-
-    // 本地路径补全（空 prefix 时列出当前目录，方便用户直接选择本地文件）
-    for item in PathCompletionEngine::complete(prefix, cwd) {
-        let replacement = compose_local_replacement(prefix, &item);
-        items.push(PathCompletionItem {
-            replacement: Some(replacement),
-            description: Some(if item.is_directory {
-                "Directory".to_string()
-            } else {
-                item.path.to_string_lossy().into_owned()
-            }),
-            ..item
-        });
     }
 
     items
@@ -995,18 +1104,68 @@ fn split_remote_dir_and_prefix(prefix: &str) -> (String, String) {
     }
 }
 
+/// `split_remote_dir_and_prefix` 的"裸路径"版本：当远程终端没有显式 host 时，
+/// 用户在打的相对路径（如 `log`、`./logs/foo`）应当以**当前 shell 的 cwd** 为基准，
+/// 而不是登录家目录。绝对路径与 `~/...` 维持原有语义。
+fn split_remote_dir_for_bare(prefix: &str, base_cwd: Option<&str>) -> (String, String) {
+    let base = base_cwd.unwrap_or("~");
+    if prefix.is_empty() {
+        return (base.to_string(), String::new());
+    }
+    if let Some(stripped) = prefix.strip_prefix("~/") {
+        // `~/...` 显式指家目录，下钻：dir/file 拆分以 home 为根
+        let (dir, file) = split_relative(stripped);
+        let dir_full = if dir.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", dir.trim_end_matches('/'))
+        };
+        return (dir_full, file);
+    }
+    if prefix == "~" {
+        return ("~".to_string(), String::new());
+    }
+    if prefix.starts_with('/') {
+        // 绝对路径：跟原来同样规则
+        return split_remote_dir_and_prefix(prefix);
+    }
+    // 相对路径（含 `./xx`）：以 base_cwd 为根拼出绝对目录前缀
+    let stripped = prefix.strip_prefix("./").unwrap_or(prefix);
+    let (rel_dir, file) = split_relative(stripped);
+    let dir_full = if rel_dir.is_empty() {
+        base.to_string()
+    } else {
+        crate::ssh::sftp_fs::join_remote_path(base, rel_dir.trim_end_matches('/'))
+    };
+    (dir_full, file)
+}
+
+/// 把"无前导斜杠的相对路径"拆成 `(dir_part_without_trailing_slash, file_prefix)`。
+fn split_relative(rel: &str) -> (String, String) {
+    if let Some(pos) = rel.rfind('/') {
+        (rel[..pos].to_string(), rel[pos + 1..].to_string())
+    } else {
+        (String::new(), rel.to_string())
+    }
+}
+
 /// 用加载到的远端条目构造 PathCompletionItem 列表。
+///
+/// `host_token = Some(...)`：作为 `host:path` 的 host 前缀写入 replacement
+/// （用于已经输入了 `host:` 的 RemotePath 阶段）。
+/// `host_token = None`：replacement 为裸路径，不带 `host:` 前缀
+/// （远程终端的 HostOrLocal 阶段：用户直接打路径，跟随当前终端所在主机）。
 fn build_remote_completions(
     entries: &[RemoteEntrySnapshot],
     file_prefix: &str,
-    host_token: &str,
+    host_token: Option<&str>,
     current_path_prefix: &str,
 ) -> Vec<PathCompletionItem> {
     let prefix_lower = file_prefix.to_lowercase();
     // 传给 split_path_prefix 的"目录部分"应当与用户已经输入的内容保持字面一致
     // —— 否则补全后的路径会跟光标处前缀不一致
     let (dir_part_literal, _) = PathCompletionEngine::split_path_prefix(current_path_prefix);
-    let host_quoted = quote_host_token(host_token);
+    let host_quoted = host_token.map(quote_host_token);
     let mut items: Vec<(PathCompletionItem, bool)> = entries
         .iter()
         .filter_map(|entry| {
@@ -1023,13 +1182,16 @@ fn build_remote_completions(
                 format!("{}{}", dir_part_literal, entry.name)
             };
             // host 和 path 独立量化，`:` 必须留在引号外，否则 `first_unquoted_colon`
-            // 会把整段识别成本地路径。
+            // 会把整段识别成本地路径。裸路径模式下若整体含空格仍需引号包裹。
             let path_quoted = if needs_shell_quote(&new_path_segment) {
                 scp_completion::shell_quote(&new_path_segment)
             } else {
                 new_path_segment.clone()
             };
-            let replacement = format!("{}:{}", host_quoted, path_quoted);
+            let replacement = match host_quoted.as_deref() {
+                Some(h) => format!("{}:{}", h, path_quoted),
+                None => path_quoted,
+            };
             let description = if entry.is_directory {
                 Some("Directory".to_string())
             } else {
@@ -1600,9 +1762,9 @@ mod tests {
         }];
         let items = super::build_remote_completions(
             &entries,
-            "",          // file_prefix
-            "my host",   // host_token（含空格）
-            "/home/me/", // current_path_prefix（光标处字面量）
+            "",                  // file_prefix
+            Some("my host"),     // host_token（含空格）
+            "/home/me/",         // current_path_prefix（光标处字面量）
         );
         assert_eq!(items.len(), 1);
         let replacement = items[0].replacement.clone().unwrap();
@@ -1633,7 +1795,7 @@ mod tests {
         let items = super::build_remote_completions(
             &entries,
             "",
-            "deploy@1.2.3.4:2222", // user@host:port
+            Some("deploy@1.2.3.4:2222"), // user@host:port
             "/tmp/",
         );
         assert_eq!(items.len(), 1);
@@ -1657,6 +1819,115 @@ mod tests {
         assert_eq!(nickname_hit.display, "alice");
         // replacement 统一为 user@host
         assert_eq!(nickname_hit.replacement, "root@1.2.3.4");
+    }
+
+    #[test]
+    fn bare_remote_completion_uses_terminal_cwd_and_writes_naked_path() {
+        // 远程终端 + 没有显式 host 的 token：补全应当走 SFTP 列出当前 shell 的 cwd，
+        // replacement 为裸路径（不带 host:），与"裸路径跟随当前终端"一致。
+        use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+        let cfg =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
+        let cfg_id = cfg.id();
+
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_terminal_context(Some(cfg.clone()), Some("/srv/app".to_string()));
+        manager.update("/scp lo");
+
+        // 第一次刷新会标记 loading，并把 (cfg_id, "/srv/app") 这把 key 注入待加载队列
+        assert!(manager.is_loading_remote);
+        let req = manager
+            .pending_remote_request()
+            .expect("pending remote request must be issued");
+        assert_eq!(req.config_id, cfg_id);
+        assert_eq!(req.absolute_dir, "/srv/app");
+
+        // 模拟 SFTP 加载完成
+        manager.apply_remote_dir_result(
+            cfg_id.clone(),
+            "/srv/app".to_string(),
+            Ok(vec![
+                super::RemoteEntrySnapshot {
+                    name: "logs".to_string(),
+                    is_directory: true,
+                    full_path: "/srv/app/logs".to_string(),
+                },
+                super::RemoteEntrySnapshot {
+                    name: "log.txt".to_string(),
+                    is_directory: false,
+                    full_path: "/srv/app/log.txt".to_string(),
+                },
+            ]),
+        );
+
+        // 远程终端 HostOrLocal：host 候选（含 Local 关键字）排在前，
+        // 后面才是 SFTP 列出的远程文件。
+        let names: Vec<&str> = manager
+            .path_completions
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"logs") && names.contains(&"log.txt"),
+            "expected remote files in completion list, got {:?}",
+            names
+        );
+
+        // 找出 logs/ 与 log.txt 的条目，验证 replacement 是裸路径（不带 host: 前缀）
+        let logs = manager
+            .path_completions
+            .iter()
+            .find(|i| i.name == "logs" && i.is_directory)
+            .expect("logs/ entry");
+        assert_eq!(logs.replacement.as_deref(), Some("logs/"));
+        let log_txt = manager
+            .path_completions
+            .iter()
+            .find(|i| i.name == "log.txt")
+            .expect("log.txt entry");
+        assert_eq!(log_txt.replacement.as_deref(), Some("log.txt"));
+    }
+
+    #[test]
+    fn bare_local_completion_in_local_terminal_keeps_host_listing() {
+        // 本地终端不应改变行为：HostOrLocal 仍然能列出本机文件 + 已保存主机
+        let mut manager = BuiltinCommandManager::new();
+        // 没有 set_terminal_context ⇒ ssh = None ⇒ 走原有 build_host_or_local_completions
+        manager.update("/scp ");
+        // 至少应有本地条目；不强求具体文件名（依赖 cwd）
+        // —— 关键是不能进入 loading_remote 分支
+        assert!(!manager.is_loading_remote);
+    }
+
+    #[test]
+    fn path_overlay_starts_without_highlight() {
+        // 路径建议浮层弹出时不应预选任何项 —— 用户必须主动按 ↑/↓/Tab 才能选中。
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/open ");
+        assert!(manager.is_argument_input());
+        assert_eq!(manager.selected_path_index(), None);
+    }
+
+    #[test]
+    fn dir_pick_keeps_overlay_but_does_not_preselect() {
+        // /open 选中目录后浮层保持可见，但不应自动选中第一项。
+        // 用 Local 关键字模拟"本机目录补全 + 选中目录"路径，规避对真实 fs 的依赖。
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp Local:/");
+        // 保证 path_completions 非空再走 complete_path：直接构造一个 Directory 项
+        manager.path_completions = vec![super::PathCompletionItem {
+            name: "etc".to_string(),
+            path: std::path::PathBuf::from("/etc"),
+            is_directory: true,
+            kind: super::CompletionKind::Directory,
+            description: None,
+            replacement: Some("Local:/etc/".to_string()),
+        }];
+        manager.path_selected_index = Some(0); // 用户已主动选中
+        manager.complete_path();
+        // 选中目录后浮层应当 Visible，但不应再自动预选
+        assert_eq!(manager.overlay_state(), super::OverlayState::Visible);
+        assert_eq!(manager.selected_path_index(), None);
     }
 
     // ── 渐进补全流程 ────────────────────────────────────────────────────────

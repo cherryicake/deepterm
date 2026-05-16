@@ -1261,6 +1261,22 @@ impl TerminalView {
         };
         self.builtin_command_manager.set_local_cwd(local_cwd);
 
+        // 注入"当前终端"的连接上下文：
+        // - 本地终端 → ssh = None
+        // - 远程终端 → ssh = Some(...)，remote_cwd 取 OSC 7 上报的实时路径
+        // 这样 `/scp` 没有显式 host 的 token 会跟随当前终端所在主机
+        // （远程终端走 SFTP 列远端目录，本地终端列本机文件）。
+        let terminal_remote_cwd = if self.ssh_config.is_some() {
+            self.terminal
+                .read(cx)
+                .remote_working_directory()
+                .map(String::from)
+        } else {
+            None
+        };
+        self.builtin_command_manager
+            .set_terminal_context(self.ssh_config.clone(), terminal_remote_cwd);
+
         // 进入 /scp 之前先把保存的 SSH 连接注入管理器，供 host / 远端目录补全使用。
         // 调用点可能很多（每次输入字符），所以仅在当前缓冲以 `/scp` 开头时才加载。
         let should_refresh_hosts = self
