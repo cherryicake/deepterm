@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{IntoElement, ParentElement, StatefulInteractiveElement, Styled};
-use gpui::{MouseButton, Pixels, div, px, svg};
+use gpui::{MouseButton, Pixels, ScrollHandle, div, px, svg};
 
 use crate::theme::UiTheme;
 
@@ -107,6 +107,9 @@ pub struct BuiltinCommandManager {
     pending_remote_keys: HashMap<(String, String), bool>,
     /// `/scp` 第二段是否处于"等待远端结果"状态
     pub is_loading_remote: bool,
+    /// 路径补全浮层的滚动句柄：键盘 / Tab 切换选中项时调用
+    /// `scroll_to_item` 把选中行带回可视区域，避免被列表区裁掉。
+    path_scroll_handle: ScrollHandle,
 }
 
 /// 远端目录在补全缓存中的状态
@@ -151,6 +154,7 @@ impl BuiltinCommandManager {
             remote_dir_cache_lru: Vec::new(),
             pending_remote_keys: HashMap::new(),
             is_loading_remote: false,
+            path_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -489,10 +493,12 @@ impl BuiltinCommandManager {
             EntryPhase::ArgumentInput => {
                 let total = self.path_completions.len();
                 if total > 0 {
-                    self.path_selected_index = Some(match self.path_selected_index {
+                    let next = match self.path_selected_index {
                         None => 0,
                         Some(i) => (i + 1) % total,
-                    });
+                    };
+                    self.path_selected_index = Some(next);
+                    self.path_scroll_handle.scroll_to_item(next);
                 }
             }
         }
@@ -514,11 +520,13 @@ impl BuiltinCommandManager {
             EntryPhase::ArgumentInput => {
                 let total = self.path_completions.len();
                 if total > 0 {
-                    self.path_selected_index = Some(match self.path_selected_index {
+                    let prev = match self.path_selected_index {
                         None => total - 1,
                         Some(0) => total - 1,
                         Some(i) => i - 1,
-                    });
+                    };
+                    self.path_selected_index = Some(prev);
+                    self.path_scroll_handle.scroll_to_item(prev);
                 }
             }
         }
@@ -634,7 +642,9 @@ impl BuiltinCommandManager {
         self.path_selected_index = if total == 0 {
             None
         } else {
-            Some(index.min(total - 1))
+            let clamped = index.min(total - 1);
+            self.path_scroll_handle.scroll_to_item(clamped);
+            Some(clamped)
         };
     }
 
@@ -666,6 +676,11 @@ impl BuiltinCommandManager {
             return None;
         }
         self.path_selected_index.map(|i| i.min(total - 1))
+    }
+
+    /// 路径补全浮层共享的滚动句柄，供 [`render_path_overlay`] `.track_scroll()` 使用。
+    pub fn path_scroll_handle(&self) -> &ScrollHandle {
+        &self.path_scroll_handle
     }
 
     /// 根据当前缓冲区文本重算所有状态。
@@ -856,26 +871,12 @@ impl BuiltinCommandManager {
                         );
                     }
                     Some(RemoteDirCacheEntry::Failed(err)) => {
-                        self.path_completions = vec![PathCompletionItem {
-                            name: "无法读取远端目录".to_string(),
-                            path: PathBuf::new(),
-                            is_directory: false,
-                            kind: CompletionKind::File,
-                            description: Some(err),
-                            replacement: None,
-                        }];
+                        self.path_completions = vec![remote_dir_failed_item(err)];
                     }
                     None => {
                         self.is_loading_remote = true;
                         self.pending_remote_keys.entry(key).or_insert(false);
-                        self.path_completions = vec![PathCompletionItem {
-                            name: "读取远端目录中…".to_string(),
-                            path: PathBuf::new(),
-                            is_directory: false,
-                            kind: CompletionKind::File,
-                            description: Some(absolute_dir),
-                            replacement: None,
-                        }];
+                        self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
                     }
                 }
             }
@@ -916,25 +917,11 @@ impl BuiltinCommandManager {
                 self.remote_dir_cache_lru.push(key.clone());
                 build_remote_completions(&entries, &file_prefix, extra_host_quoted, prefix)
             }
-            Some(RemoteDirCacheEntry::Failed(err)) => vec![PathCompletionItem {
-                name: "无法读取远端目录".to_string(),
-                path: PathBuf::new(),
-                is_directory: false,
-                kind: CompletionKind::File,
-                description: Some(err),
-                replacement: None,
-            }],
+            Some(RemoteDirCacheEntry::Failed(err)) => vec![remote_dir_failed_item(err)],
             None => {
                 self.is_loading_remote = true;
                 self.pending_remote_keys.entry(key).or_insert(false);
-                vec![PathCompletionItem {
-                    name: "读取远端目录中…".to_string(),
-                    path: PathBuf::new(),
-                    is_directory: false,
-                    kind: CompletionKind::File,
-                    description: Some(absolute_dir),
-                    replacement: None,
-                }]
+                vec![remote_dir_loading_item(absolute_dir)]
             }
         }
     }
@@ -965,6 +952,65 @@ fn is_scp_command(buffer: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 远端目录尚未加载时的占位补全项。
+fn remote_dir_loading_item(absolute_dir: String) -> PathCompletionItem {
+    placeholder_item("读取远端目录中…", absolute_dir)
+}
+
+/// 远端目录读取失败时的占位补全项。
+fn remote_dir_failed_item(err: String) -> PathCompletionItem {
+    placeholder_item("无法读取远端目录", err)
+}
+
+fn placeholder_item(name: &str, description: String) -> PathCompletionItem {
+    PathCompletionItem {
+        name: name.to_string(),
+        path: PathBuf::new(),
+        is_directory: false,
+        kind: CompletionKind::File,
+        description: Some(description),
+        icon: None,
+        replacement: None,
+    }
+}
+
+/// Host 条目展示在 IP 右侧的次要文字（nickname / `Local` 标签）；
+/// 文件 / 目录条目返回 `None`，让 UI 只渲染文件名。
+fn host_description(item: &PathCompletionItem) -> Option<String> {
+    if item.kind != CompletionKind::Host {
+        return None;
+    }
+    item.description.clone()
+}
+
+/// 估算路径补全浮层应当占用的宽度，让最长的"name + 描述"在 UI 边界以内完整展示。
+///
+/// 以字符宽度粗算（monospace 13.5px ≈ 8.5px/char、proportional 12.5px ≈ 7px/char），
+/// 再加上 padding/icon/gap 的固定开销。算出的值会被 [`OVERLAY_MIN_WIDTH`] /
+/// [`OVERLAY_MAX_WIDTH`] 夹紧，避免极端情况撑爆窗口。
+fn estimate_overlay_width(items: &[PathCompletionItem]) -> f32 {
+    // 横向布局：padding(10*2) + icon(16) + icon→name gap(10) + name→desc gap(10) + 余量(12)
+    const FIXED_CHROME: f32 = 10.0 + 10.0 + 16.0 + 10.0 + 12.0;
+    const NAME_CHAR: f32 = 8.5;
+    const DESC_CHAR: f32 = 7.0;
+
+    let needed = items
+        .iter()
+        .map(|item| {
+            let name_w = item.name.chars().count() as f32 * NAME_CHAR;
+            let desc_w = host_description(item)
+                .map(|d| 10.0 + d.chars().count() as f32 * DESC_CHAR)
+                .unwrap_or(0.0);
+            FIXED_CHROME + name_w + desc_w
+        })
+        .fold(OVERLAY_MIN_WIDTH, f32::max);
+
+    needed.min(OVERLAY_MAX_WIDTH)
+}
+
+const OVERLAY_MIN_WIDTH: f32 = 320.0;
+const OVERLAY_MAX_WIDTH: f32 = 900.0;
+
 /// `HostOrLocal` 阶段：合并"匹配的主机"与"本地路径补全"为一份列表。
 fn build_host_or_local_completions(
     prefix: &str,
@@ -983,6 +1029,7 @@ fn build_host_or_local_completions(
             } else {
                 item.path.to_string_lossy().into_owned()
             }),
+            icon: None,
             ..item
         });
     }
@@ -1020,6 +1067,7 @@ fn build_host_only_completions(
                 is_directory: false,
                 kind: CompletionKind::Host,
                 description,
+                icon: suggestion.icon,
                 replacement: Some(replacement),
             });
         }
@@ -1068,6 +1116,7 @@ fn build_local_path_completions(
             } else {
                 item.path.to_string_lossy().into_owned()
             }),
+            icon: None,
             replacement: Some(replacement),
         });
     }
@@ -1208,6 +1257,7 @@ fn build_remote_completions(
                         CompletionKind::File
                     },
                     description,
+                    icon: None,
                     replacement: Some(replacement),
                 },
                 entry.is_directory,
@@ -1500,18 +1550,19 @@ pub fn render_path_overlay<F>(
     left: Pixels,
     theme: UiTheme,
     is_dark: bool,
+    scroll_handle: &ScrollHandle,
     on_pick: F,
 ) -> impl IntoElement
 where
     F: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
 {
     let on_pick = Rc::new(on_pick);
+    let overlay_width = estimate_overlay_width(completions);
 
     // 紧贴命令行光标的圆角弹层。当 `anchor` 为 `Bottom` 时浮窗底端贴近光标，
-    // 列表从下往上贴着光标增长。
+    // 列表从下往上贴着光标增长。宽度按最长建议项估算（夹紧到 320–900px）。
     apply_overlay_anchor(div().absolute().left(left), anchor)
-        .min_w(px(320.0))
-        .max_w(px(640.0))
+        .w(px(overlay_width))
         .rounded(px(12.0))
         .bg(theme.notification_background)
         .shadow_lg()
@@ -1526,6 +1577,7 @@ where
                 .id("path-completion-list")
                 .max_h(px(272.0))
                 .overflow_y_scroll()
+                .track_scroll(scroll_handle)
                 .px(px(6.0))
                 .flex()
                 .flex_col()
@@ -1537,11 +1589,13 @@ where
                         .map(move |(index, item)| {
                             let on_pick = on_pick.clone();
                             let is_selected = Some(index) == selected_index;
-                            let icon_path = match item.kind {
-                                CompletionKind::Directory => crate::assets::Icon::Folder.path(),
-                                CompletionKind::Host => crate::assets::Icon::Host.path(),
-                                CompletionKind::File => crate::assets::Icon::File.path(),
-                            };
+                            let icon_path = item.icon
+                                .map(|i| i.path())
+                                .unwrap_or_else(|| match item.kind {
+                                    CompletionKind::Directory => crate::assets::Icon::Folder.path(),
+                                    CompletionKind::Host => crate::assets::Icon::Host.path(),
+                                    CompletionKind::File => crate::assets::Icon::File.path(),
+                                });
                             div()
                                 .w_full()
                                 .h(px(28.0))
@@ -1588,6 +1642,24 @@ where
                                         .text_size(px(13.5))
                                         .text_color(theme.text)
                                         .child(item.name.clone()),
+                                )
+                                // 仅 Host 条目附带 nickname / 描述（"This machine"、保存的别名等）；
+                                // 文件 / 目录条目只显示文件名
+                                .when_some(
+                                    host_description(&item),
+                                    |this, desc| {
+                                        this.child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.text_muted)
+                                                .child(desc),
+                                        )
+                                    },
                                 )
                         }),
                 ),
@@ -1908,6 +1980,7 @@ mod tests {
             is_directory: true,
             kind: super::CompletionKind::Directory,
             description: None,
+            icon: None,
             replacement: Some("Local:/etc/".to_string()),
         }];
         manager.path_selected_index = Some(0); // 用户已主动选中

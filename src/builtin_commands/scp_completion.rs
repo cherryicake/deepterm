@@ -13,7 +13,9 @@
 //!    - `LocalPath { prefix }`：token 没有 `:`，按本地路径补全。
 //! 3. 给出替换文本：补全命中后，用新的 token 拼回原缓冲区。
 
+use crate::assets::Icon;
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::platform::{RemoteOS, detect_local_os};
 
 /// 一次 shell 风格 token 的解析结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,7 +332,7 @@ pub fn match_hosts_by_prefix<'a>(
     let mut out: Vec<ScpHostSuggestion<'a>> = Vec::new();
     let mut pushed_ids = std::collections::HashSet::new();
 
-    // 0) 保留关键字 `Local`：始终排在最前
+    // 0) 保留关键字 `Local`：始终排在最前，使用本机 OS 图标
     let local_replacement = local_replacement_token();
     if "local".contains(&prefix_lc) || local_replacement.to_lowercase().contains(&prefix_lc) {
         out.push(ScpHostSuggestion {
@@ -338,58 +340,58 @@ pub fn match_hosts_by_prefix<'a>(
             display: "Local".to_string(),
             replacement: local_replacement,
             kind: HostSuggestionKind::Local,
+            icon: Some(detect_local_os().icon()),
         });
     }
 
     // 1) nickname 子串
     for cfg in saved {
         if let Some(nick) = cfg.nickname.as_deref() {
-            if nick.to_lowercase().contains(&prefix_lc) {
-                let id = cfg.id();
-                if pushed_ids.insert(id) {
-                    out.push(ScpHostSuggestion {
-                        config: Some(cfg),
-                        display: nick.to_string(),
-                        replacement: cfg.host_label(),
-                        kind: HostSuggestionKind::Nickname,
-                    });
-                }
+            if nick.to_lowercase().contains(&prefix_lc) && pushed_ids.insert(cfg.id()) {
+                out.push(ScpHostSuggestion {
+                    config: Some(cfg),
+                    display: nick.to_string(),
+                    replacement: cfg.host_label(),
+                    kind: HostSuggestionKind::Nickname,
+                    icon: icon_for_config(cfg),
+                });
             }
         }
     }
 
     // 2) host 字段子串
     for cfg in saved {
-        if cfg.host.to_lowercase().contains(&prefix_lc) {
-            let id = cfg.id();
-            if pushed_ids.insert(id) {
-                out.push(ScpHostSuggestion {
-                    config: Some(cfg),
-                    display: cfg.host.clone(),
-                    replacement: cfg.host_label(),
-                    kind: HostSuggestionKind::Host,
-                });
-            }
+        if cfg.host.to_lowercase().contains(&prefix_lc) && pushed_ids.insert(cfg.id()) {
+            out.push(ScpHostSuggestion {
+                config: Some(cfg),
+                display: cfg.host.clone(),
+                replacement: cfg.host_label(),
+                kind: HostSuggestionKind::Host,
+                icon: icon_for_config(cfg),
+            });
         }
     }
 
     // 3) host_label：`user@host[:port]` —— 包含带端口主机
     for cfg in saved {
         let label = cfg.host_label();
-        if label.to_lowercase().contains(&prefix_lc) {
-            let id = cfg.id();
-            if pushed_ids.insert(id) {
-                out.push(ScpHostSuggestion {
-                    config: Some(cfg),
-                    display: label.clone(),
-                    replacement: label,
-                    kind: HostSuggestionKind::Label,
-                });
-            }
+        if label.to_lowercase().contains(&prefix_lc) && pushed_ids.insert(cfg.id()) {
+            out.push(ScpHostSuggestion {
+                config: Some(cfg),
+                display: label.clone(),
+                replacement: label,
+                kind: HostSuggestionKind::Label,
+                icon: icon_for_config(cfg),
+            });
         }
     }
 
     out
+}
+
+/// 根据已保存连接的 `os` 字段解析对应图标；未配置 OS 时返回 `None`。
+fn icon_for_config(cfg: &SshConnectionConfig) -> Option<Icon> {
+    cfg.os.as_deref().map(RemoteOS::from_id).map(RemoteOS::icon)
 }
 
 /// 关键字 `Local` 在命令行中实际用的字面量：`<当前用户>@localhost`。
@@ -407,6 +409,8 @@ pub struct ScpHostSuggestion<'a> {
     /// 写入命令行的 host 部分，统一为 `user@host[:port]`；`Local` 为 `user@localhost`
     pub replacement: String,
     pub kind: HostSuggestionKind,
+    /// 操作系统图标：Local 使用本机 OS 图标；其他来自已保存连接的 `os` 字段
+    pub icon: Option<Icon>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

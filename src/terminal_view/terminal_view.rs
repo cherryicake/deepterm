@@ -982,6 +982,7 @@ impl TerminalView {
             // 参数输入阶段：渲染路径补全浮层
             let path_completions = self.builtin_command_manager.path_completions.clone();
             let selected_index = self.builtin_command_manager.path_selected_index;
+            let scroll_handle = self.builtin_command_manager.path_scroll_handle().clone();
 
             crate::builtin_commands::render_path_overlay(
                 &path_completions,
@@ -990,6 +991,7 @@ impl TerminalView {
                 left,
                 theme,
                 is_dark,
+                &scroll_handle,
                 move |index, _window, cx| {
                     view.update(cx, |this, cx| {
                         this.mutate_builtin_command(cx, |manager| manager.pick_path(index));

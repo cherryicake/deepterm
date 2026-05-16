@@ -24,6 +24,8 @@ pub struct PathCompletionItem {
     pub kind: CompletionKind,
     /// 描述信息（可选，用于 UI 次要文字，比如 host_label / 显示名）
     pub description: Option<String>,
+    /// 操作系统图标（Host 条目使用，根据远端 OS 选择对应图标）
+    pub icon: Option<crate::assets::Icon>,
     /// 外部补全引擎（如 `/scp`）计算出的"替换文本"
     ///
     /// 若为 `Some`，BuiltinCommandManager 会直接用该文本替换整个 token；
@@ -149,6 +151,7 @@ impl PathCompletionEngine {
                         CompletionKind::File
                     },
                     description: None,
+                    icon: None,
                     replacement: None,
                 })
             })
