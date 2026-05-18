@@ -32,6 +32,7 @@ pub struct FontSettingsView {
     _subscriptions: Vec<gpui::Subscription>,
     font_size_valid: bool,
     line_height_valid: bool,
+    compact: bool,
 }
 
 impl FontSettingsView {
@@ -134,6 +135,7 @@ impl FontSettingsView {
                 _subscriptions: Vec::new(),
                 font_size_valid: true,
                 line_height_valid: true,
+                compact: false,
             };
 
             view.load_system_fonts(window, cx);
@@ -208,6 +210,10 @@ impl FontSettingsView {
         self._subscriptions.push(lh_subscription);
     }
 
+    pub fn set_compact(&mut self, compact: bool) {
+        self.compact = compact;
+    }
+
     fn load_system_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.font_select.update(cx, |select, cx| {
             let default_font = platform_default_font_family().to_string();
@@ -237,7 +243,17 @@ impl Focusable for FontSettingsView {
 }
 
 impl Render for FontSettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.compact {
+            self.render_compact(window, cx)
+        } else {
+            self.render_full(window, cx)
+        }
+    }
+}
+
+impl FontSettingsView {
+    fn render_full(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
         let error_color = gpui::rgb(0xef4444);
 
@@ -360,5 +376,88 @@ impl Render for FontSettingsView {
                     ),
                 ),
         )
+    }
+
+    fn render_compact(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = cx.theme().ui;
+        let error_color = gpui::rgb(0xef4444);
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("Terminal Font Family"),
+                    )
+                    .child(self.font_select.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("Font Weight"),
+                    )
+                    .child(self.weight_select.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("Font Size (px)"),
+                    )
+                    .child(EditorInput::new(&self.font_size_input).macos26())
+                    .when(!self.font_size_valid, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(error_color)
+                                .child("Value must be between 6 and 72"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child("Line Height (ratio)"),
+                    )
+                    .child(EditorInput::new(&self.line_height_input).macos26())
+                    .when(!self.line_height_valid, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(error_color)
+                                .child("Value must be between 0.8 and 3.0"),
+                        )
+                    }),
+            )
     }
 }

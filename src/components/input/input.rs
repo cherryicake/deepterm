@@ -15,6 +15,7 @@ pub struct EditorInput {
     state: Entity<InputState>,
     disabled: bool,
     transparent: bool,
+    macos26: bool,
     size: Size,
     mask_toggle: bool,
 }
@@ -25,9 +26,15 @@ impl EditorInput {
             state: state.clone(),
             disabled: false,
             transparent: false,
+            macos26: false,
             size: Size::default(),
             mask_toggle: false,
         }
+    }
+
+    pub fn macos26(mut self) -> Self {
+        self.macos26 = true;
+        self
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
@@ -208,19 +215,35 @@ impl RenderOnce for EditorInput {
                         .min_w(px(0.0))
                         .line_height(LINE_HEIGHT)
                         .when(!self.transparent, |this| {
-                            this.h(px(36.0))
-                                .pl(px(10.0))
-                                .pr(input_pr)
-                                .py(input_py)
-                                .gap(px(8.0))
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(if is_focused {
-                                    theme.border_strong
-                                } else {
-                                    theme.border
-                                })
-                                .bg(theme.app_background)
+                            if self.macos26 {
+                                this.h(px(32.0))
+                                    .pl(px(10.0))
+                                    .pr(input_pr)
+                                    .py(input_py)
+                                    .gap(px(8.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(if is_focused {
+                                        theme.accent
+                                    } else {
+                                        theme.border
+                                    })
+                                    .bg(theme.elevated_background)
+                            } else {
+                                this.h(px(36.0))
+                                    .pl(px(10.0))
+                                    .pr(input_pr)
+                                    .py(input_py)
+                                    .gap(px(8.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(if is_focused {
+                                        theme.border_strong
+                                    } else {
+                                        theme.border
+                                    })
+                                    .bg(theme.app_background)
+                            }
                         })
                         .when(self.transparent, |this| this.h_full())
                         .flex()

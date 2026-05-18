@@ -2,9 +2,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{AnimationExt, ScrollHandle, StatefulInteractiveElement, Window, div, px};
+use gpui::{AnimationExt, Entity, ScrollHandle, StatefulInteractiveElement, Window, div, px};
 
 use crate::assets::Icon;
+use crate::settings_hub::font_view::FontSettingsView;
 use crate::theme::{ActiveTheme, ThemeState};
 
 const SIDEBAR_WIDTH: f32 = 260.0;
@@ -54,6 +55,7 @@ impl SidebarMenuSection {
 pub enum SidebarView {
     Menu,
     Theme,
+    Font,
 }
 
 /// macOS 风格侧边栏组件
@@ -69,6 +71,8 @@ pub struct MacosSidebar {
     sections: Vec<SidebarMenuSection>,
     current_view: SidebarView,
     theme_scroll_handle: ScrollHandle,
+    font_scroll_handle: ScrollHandle,
+    font_view: Option<Entity<FontSettingsView>>,
 }
 
 impl MacosSidebar {
@@ -105,6 +109,8 @@ impl MacosSidebar {
             ],
             current_view: SidebarView::Menu,
             theme_scroll_handle: ScrollHandle::new(),
+            font_scroll_handle: ScrollHandle::new(),
+            font_view: None,
         }
     }
 
@@ -161,6 +167,11 @@ impl MacosSidebar {
         &self.current_view
     }
 
+    /// 设置字体设置视图
+    pub fn set_font_view(&mut self, view: Entity<FontSettingsView>) {
+        self.font_view = Some(view);
+    }
+
     /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
     pub fn render_sidebar<F>(&self, cx: &gpui::App, on_select: F) -> impl IntoElement
     where
@@ -192,6 +203,7 @@ impl MacosSidebar {
         let content = match self.current_view {
             SidebarView::Menu => self.render_menu_content(cx, on_select.clone(), is_dark, theme),
             SidebarView::Theme => self.render_theme_content(cx, on_select.clone(), is_dark, theme),
+            SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme),
         };
 
         let inner = div()
@@ -586,6 +598,81 @@ impl MacosSidebar {
                     .flex()
                     .flex_col()
                     .child(theme_list),
+            )
+    }
+
+    fn render_font_content<F>(
+        &self,
+        _cx: &gpui::App,
+        on_select: Rc<F>,
+        is_dark: bool,
+        theme: crate::theme::UiTheme,
+    ) -> gpui::Div
+    where
+        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
+    {
+        // 顶部导航栏
+        let header = div()
+            .w_full()
+            .h(px(36.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(4.0))
+            .mb(px(8.0))
+            .child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(999.0))
+                    .bg(Self::button_bg(is_dark))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(Self::button_bg_hover(is_dark)))
+                    .child(
+                        gpui::svg()
+                            .size(px(16.0))
+                            .path(Icon::ChevronLeft.path())
+                            .text_color(theme.text),
+                    )
+                    .on_mouse_down(gpui::MouseButton::Left, {
+                        let on_select = on_select.clone();
+                        move |_, window, cx| on_select("__back", window, cx)
+                    }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child("字体"),
+            )
+            .child(div().w(px(28.0)));
+
+        let font_content = self
+            .font_view
+            .clone()
+            .map(|view| view.into_any_element())
+            .unwrap_or_else(|| div().into_any_element());
+
+        div()
+            .w_full()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("font-scroll")
+                    .track_scroll(&self.font_scroll_handle)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(font_content),
             )
     }
 

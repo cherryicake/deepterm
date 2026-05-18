@@ -21,6 +21,7 @@ use gpui::{
 
 use crate::components::macos_sidebar::MacosSidebar;
 use crate::components::title_bar::TitleBar;
+use crate::settings_hub::font_view::FontSettingsView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::ToggleSidebar;
@@ -61,11 +62,18 @@ impl AppWindow {
             ws.set_ssh_picker(ssh_picker.clone(), cx);
         });
 
+        let mut sidebar = MacosSidebar::new();
+        let font_settings_view = FontSettingsView::new(window, cx);
+        font_settings_view.update(cx, |view, _cx| {
+            view.set_compact(true);
+        });
+        sidebar.set_font_view(font_settings_view);
+
         Self {
             title_bar,
             workspace,
             ssh_picker,
-            sidebar: MacosSidebar::new(),
+            sidebar,
             _sidebar_hide_task: None,
         }
     }
@@ -133,6 +141,11 @@ impl Render for AppWindow {
                                         this.sidebar.select_item(id);
                                         this.sidebar.navigate_to(
                                             crate::components::macos_sidebar::SidebarView::Theme);
+                                    }
+                                    "font" => {
+                                        this.sidebar.select_item(id);
+                                        this.sidebar.navigate_to(
+                                            crate::components::macos_sidebar::SidebarView::Font);
                                     }
                                     "__back" => {
                                         this.sidebar.go_back();
