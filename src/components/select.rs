@@ -227,23 +227,29 @@ impl Render for Select {
                 div()
                     .id(("select-item", ix))
                     .w_full()
-                    .py(px(6.0))
-                    .pl(px(6.0))
-                    .pr(px(8.0))
+                    .py(px(5.0))
+                    .pl(px(10.0))
+                    .pr(px(10.0))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
                     .cursor_pointer()
-                    .rounded(px(4.0))
+                    .rounded(px(6.0))
                     .when(is_highlighted, |d| {
-                        d.bg(theme_accent.opacity(if cx.theme().appearance.is_dark() {
-                            0.18
-                        } else {
-                            0.10
-                        }))
+                        d.bg(theme_accent)
+                            .text_color(theme.accent_foreground)
                     })
-                    .when(!is_highlighted && !is_selected, |d| {
-                        d.hover(|s| s.bg(theme.tab_hover_background))
+                    .when(!is_highlighted, |d| {
+                        d.when(is_selected, |d| {
+                            d.bg(theme_accent.opacity(if cx.theme().appearance.is_dark() {
+                                0.85
+                            } else {
+                                0.12
+                            }))
+                        })
+                        .when(!is_selected, |d| {
+                            d.hover(|s| s.bg(theme.tab_hover_background))
+                        })
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -257,19 +263,33 @@ impl Render for Select {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .child(
                                 div()
-                                    .w(px(2.0))
-                                    .h(px(12.0))
-                                    .rounded_full()
-                                    .bg(theme_accent)
-                                    .when(!is_selected, |d| d.opacity(0.0)),
+                                    .w(px(14.0))
+                                    .h(px(14.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(if is_highlighted {
+                                                theme.accent_foreground
+                                            } else if is_selected {
+                                                theme_accent
+                                            } else {
+                                                gpui::transparent_black()
+                                            })
+                                            .child("✓"),
+                                    ),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(if is_selected {
+                                    .text_color(if is_highlighted {
+                                        theme.accent_foreground
+                                    } else if is_selected {
                                         theme_text
                                     } else {
                                         theme_text_muted
@@ -280,9 +300,13 @@ impl Render for Select {
                     .when(subtitle.as_ref().map_or(false, |s| !s.is_empty()), |d| {
                         d.child(
                             div()
-                                .pl(px(8.0))
+                                .pl(px(22.0))
                                 .text_xs()
-                                .text_color(theme_text_muted)
+                                .text_color(if is_highlighted {
+                                    theme.accent_foreground.opacity(0.8)
+                                } else {
+                                    theme_text_muted
+                                })
                                 .child(subtitle.unwrap().to_string()),
                         )
                     })
@@ -359,15 +383,15 @@ impl Render for Select {
                                     div()
                                         .occlude()
                                         .mt(px(4.0))
-                                        .bg(theme.panel_background)
+                                        .bg(theme.elevated_background)
                                         .border_1()
                                         .border_color(theme.border)
-                                        .rounded(px(6.0))
+                                        .rounded(px(10.0))
                                         .shadow_md()
-                                        .p(px(4.0))
+                                        .p(px(6.0))
                                         .flex()
                                         .flex_col()
-                                        .gap(px(4.0))
+                                        .gap(px(2.0))
                                         .key_context("Select")
                                         .on_key_down(cx.listener(
                                             |this, event: &KeyDownEvent, _, cx| {
@@ -392,10 +416,10 @@ impl Render for Select {
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(6.0))
-                                                    .rounded(px(4.0))
+                                                    .rounded(px(6.0))
                                                     .border_1()
                                                     .border_color(theme.border)
-                                                    .bg(theme.app_background)
+                                                    .bg(theme.panel_background)
                                                     .child(
                                                         svg()
                                                             .size(px(12.0))
@@ -419,7 +443,7 @@ impl Render for Select {
                                                 .track_scroll(&scroll_handle)
                                                 .flex()
                                                 .flex_col()
-                                                .gap(px(1.0))
+                                                .gap(px(2.0))
                                                 .children(item_elements),
                                         ),
                                 )
