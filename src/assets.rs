@@ -64,6 +64,7 @@ pub enum Icon {
     Workspace,
     Bell,
     Reveal,
+    Sidebar,
 }
 
 impl Icon {
@@ -105,6 +106,7 @@ impl Icon {
             Icon::Workspace => SharedString::new_static("icons/workspace.svg"),
             Icon::Bell => SharedString::new_static("icons/bell.svg"),
             Icon::Reveal => SharedString::new_static("icons/reveal.svg"),
+            Icon::Sidebar => SharedString::new_static("icons/sidebar.svg"),
         }
     }
 }

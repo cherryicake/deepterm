@@ -762,7 +762,7 @@ impl Render for TabBar {
                     .child(
                         div()
                             .id("hostshub-btn")
-                            .h(px(28.0))
+                            .h(px(30.0))
                             .px(px(12.0))
                             .flex()
                             .flex_shrink_0()
@@ -791,7 +791,7 @@ impl Render for TabBar {
                             })
                             .child(
                                 svg()
-                                    .size(px(14.0))
+                                    .size(px(16.0))
                                     .text_color(if is_settingshub_active {
                                         theme.text
                                     } else {
@@ -946,7 +946,7 @@ impl Render for TabBar {
                                         children.push(
                                             div()
                                                 .id(format!("panel-drop-preview-{index}"))
-                                                .h(px(28.0))
+                                                .h(px(30.0))
                                                 .px(px(12.0))
                                                 .flex()
                                                 .flex_shrink_0()
@@ -997,7 +997,7 @@ impl Render for TabBar {
 
                                     let tab_inner = div()
                                         .id(tab_id.clone())
-                                        .h(px(28.0))
+                                        .h(px(30.0))
                                         .px(px(12.0))
                                         .flex()
                                         .flex_shrink_0()
@@ -1130,7 +1130,7 @@ impl Render for TabBar {
                                         .when_some(icon, |this, icon| {
                                             this.child(
                                                 svg()
-                                                    .size(px(14.0))
+                                                    .size(px(18.0))
                                                     .text_color(if is_active {
                                                         theme.text
                                                     } else {
@@ -1240,8 +1240,8 @@ impl Render for TabBar {
                     .child(
                         div()
                             .id("new-tab-btn")
-                            .w(px(28.0))
-                            .h(px(28.0))
+                            .w(px(32.0))
+                            .h(px(30.0))
                             .flex()
                             .flex_shrink_0()
                             .ml_1()
@@ -1254,7 +1254,7 @@ impl Render for TabBar {
                             .hover(move |style| style.bg(theme.tab_hover_background))
                             .child(
                                 svg()
-                                    .size(px(14.0))
+                                    .size(px(16.0))
                                     .text_color(theme.icon_muted)
                                     .path(Icon::Plus.path()),
                             )

@@ -16,11 +16,15 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window, actions, div,
+    AnimationExt, App, Context, ElementId, Entity, IntoElement, KeyBinding, MouseButton,
+    ParentElement, Render, Window, actions, div, px,
 };
 
+use crate::components::macos_sidebar::MacosSidebar;
 use crate::components::title_bar::TitleBar;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
+use crate::theme::ActiveTheme;
+use crate::workspace::ToggleSidebar;
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::Workspace;
 
@@ -29,11 +33,15 @@ actions!(app, [Quit, NewWindow]);
 
 const CONTEXT: &str = "AppWindow";
 
-/// Root component that contains title bar and workspace
+/// Root component that contains title bar, sidebar and workspace
 pub struct AppWindow {
     title_bar: Entity<TitleBar>,
     workspace: Entity<Workspace>,
     ssh_picker: Entity<SshPicker>,
+    sidebar_visible: bool,
+    sidebar_animating_out: bool,
+    sidebar_epoch: u32,
+    _sidebar_hide_task: Option<gpui::Task<()>>,
 }
 
 impl AppWindow {
@@ -64,6 +72,10 @@ impl AppWindow {
             title_bar,
             workspace,
             ssh_picker,
+            sidebar_visible: true,
+            sidebar_animating_out: false,
+            sidebar_epoch: 0,
+            _sidebar_hide_task: None,
         }
     }
 
@@ -81,14 +93,60 @@ impl AppWindow {
             picker.toggle(window, cx);
         });
     }
+
+    /// 切换侧边栏显示/隐藏
+    fn toggle_sidebar(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
+        if self.sidebar_visible {
+            self.sidebar_visible = false;
+            self.sidebar_animating_out = true;
+            self.sidebar_epoch = self.sidebar_epoch.wrapping_add(1);
+            let entity = cx.entity();
+            self._sidebar_hide_task = Some(cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250 + 40))
+                    .await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.sidebar_animating_out = false;
+                    cx.notify();
+                });
+            }));
+        } else {
+            self.sidebar_visible = true;
+            self.sidebar_animating_out = false;
+            self._sidebar_hide_task = None;
+            self.sidebar_epoch = self.sidebar_epoch.wrapping_add(1);
+        }
+        cx.notify();
+    }
 }
 
 impl Render for AppWindow {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let is_macos = cfg!(target_os = "macos");
+        let text_muted = theme.text;
+
+        // 侧边栏 toggle 按钮的位置：跟随侧边栏开合在 "侧边栏右上角" 与
+        // "红绿灯右侧" 之间平滑切换。
+        // - 打开时：按钮位于侧边栏面板右上角内侧（距左 228px）
+        // - 关闭时：按钮位于窗口左上角红绿灯右侧（距左 84px）
+        const BUTTON_LEFT_OPEN: f32 = 228.0;
+        const BUTTON_LEFT_CLOSED: f32 = 84.0;
+        // 红绿灯 侧边栏按钮 TittleBar 三者中心对齐到 y=22（TitleBar 44px / 2）：
+        const BUTTON_TOP: f32 = 12.0;
+        const SIDEBAR_ANIM_ENTER_MS: u64 = 300;
+        const SIDEBAR_ANIM_EXIT_MS: u64 = 250;
+        // sidebar 关闭后，TitleBar 容器需要左移让出红绿灯 + 按钮空间。
+        // 红绿灯结束 ~82px、按钮 84..112、再留 8px 间距 => TabBar 起点 = 120。
+        // sidebar 打开时该 padding 归零，TabBar 紧贴 sidebar 右边缘。
+        const TITLE_BAR_EXTRA_PAD: f32 = 120.0;
+
         div()
             .size_full()
+            .bg(theme.app_background)
             .flex()
-            .flex_col()
+            .flex_row()
+            .relative()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ShowSshPicker, window, cx| {
                 this.show_ssh_picker(window, cx);
@@ -96,17 +154,118 @@ impl Render for AppWindow {
             .on_action(cx.listener(|_this, _: &NewWindow, _window, cx| {
                 WindowManager::open_window(cx);
             }))
-            // Title bar for window management
-            .child(self.title_bar.clone())
-            // Workspace content
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(window, cx);
+            }))
+            // 侧边栏（上边界距窗口顶部 8px，左/下距边界 8px，右侧紧贴 workspace）
+            .when(self.sidebar_visible || self.sidebar_animating_out, |this| {
+                this.child(div().pl(px(8.0)).pt(px(8.0)).mb(px(8.0)).child(
+                    MacosSidebar::new().render_animated(
+                        self.sidebar_visible,
+                        self.sidebar_epoch,
+                        cx,
+                    ),
+                ))
+            })
+            // 右侧区域：title bar + workspace
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(self.workspace.clone()),
+                    .min_w_0()
+                    // sidebar 关闭后，TitleBar 起始位置需要为按钮让出空间，
+                    // 避免 TabBar 与按钮重叠。这里给 title-bar 容器加一段
+                    // 动画 padding，开合时与 sidebar 宽度动画同步过渡。
+                    .child({
+                        let (start_pl, end_pl, dur_ms) = if is_macos {
+                            if self.sidebar_visible {
+                                (TITLE_BAR_EXTRA_PAD, 0.0, SIDEBAR_ANIM_ENTER_MS)
+                            } else {
+                                (0.0, TITLE_BAR_EXTRA_PAD, SIDEBAR_ANIM_EXIT_MS)
+                            }
+                        } else {
+                            (0.0, 0.0, 0)
+                        };
+                        let pad_anim_id: ElementId =
+                            ("titlebar-pad-anim", self.sidebar_epoch).into();
+                        let title_bar = self.title_bar.clone();
+                        if is_macos {
+                            div().child(title_bar).with_animation(
+                                pad_anim_id,
+                                gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
+                                    .with_easing(gpui::ease_in_out),
+                                move |this, delta| {
+                                    let current = start_pl + (end_pl - start_pl) * delta;
+                                    this.pl(px(current))
+                                },
+                            )
+                        } else {
+                            div().child(title_bar).with_animation(
+                                pad_anim_id,
+                                gpui::Animation::new(std::time::Duration::from_millis(1))
+                                    .with_easing(gpui::ease_in_out),
+                                move |this, _| this,
+                            )
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(self.workspace.clone()),
+                    ),
             )
+            // macOS 侧边栏开关按钮：始终渲染并跟随侧边栏宽度动画位移。
+            // 视觉上属于侧边栏组件，但用 absolute 浮在标题栏区域之上，
+            // 这样侧边栏关闭时按钮自然落到红绿灯右侧。
+            .when(is_macos, |this| {
+                let (start_left, end_left, duration_ms) = if self.sidebar_visible {
+                    (BUTTON_LEFT_CLOSED, BUTTON_LEFT_OPEN, SIDEBAR_ANIM_ENTER_MS)
+                } else {
+                    (BUTTON_LEFT_OPEN, BUTTON_LEFT_CLOSED, SIDEBAR_ANIM_EXIT_MS)
+                };
+                let anim_id: ElementId = ("sidebar-toggle-anim", self.sidebar_epoch).into();
+                this.child(
+                    div()
+                        .id(("sidebar-toggle-btn", self.sidebar_epoch))
+                        .absolute()
+                        .top(px(BUTTON_TOP))
+                        .left(px(start_left))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(36.))
+                        .h(px(22.))
+                        .rounded(px(12.0))
+                        .text_color(text_muted)
+                        .hover(|style| style.bg(theme.title_bar_hover))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_sidebar(window, cx);
+                            }),
+                        )
+                        .child(
+                            gpui::svg()
+                                .size(px(20.0))
+                                .text_color(text_muted)
+                                .path(crate::assets::Icon::Sidebar.path()),
+                        )
+                        .with_animation(
+                            anim_id,
+                            gpui::Animation::new(std::time::Duration::from_millis(duration_ms))
+                                .with_easing(gpui::ease_in_out),
+                            move |this, delta| {
+                                let current = start_left + (end_left - start_left) * delta;
+                                this.left(px(current))
+                            },
+                        ),
+                )
+            })
             // SSH picker overlay
             .child(self.ssh_picker.clone())
     }

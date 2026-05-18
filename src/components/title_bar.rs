@@ -19,10 +19,10 @@ use crate::file_transfer::{
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
-pub const TITLE_BAR_HEIGHT: Pixels = px(38.);
+pub const TITLE_BAR_HEIGHT: Pixels = px(44.);
 
 #[cfg(target_os = "macos")]
-const TITLE_BAR_LEFT_PADDING: Pixels = px(80.);
+const TITLE_BAR_LEFT_PADDING: Pixels = px(8.);
 
 #[cfg(not(target_os = "macos"))]
 const TITLE_BAR_LEFT_PADDING: Pixels = px(6.);
@@ -175,7 +175,7 @@ impl TitleBar {
         TitlebarOptions {
             title: None,
             appears_transparent: true,
-            traffic_light_position: Some(gpui::point(px(9.0), px(12.0))),
+            traffic_light_position: Some(gpui::point(px(15.0), px(16.0))),
         }
     }
 

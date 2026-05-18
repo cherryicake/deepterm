@@ -6,6 +6,7 @@ pub mod input;
 pub mod menu;
 pub mod resize_handle;
 pub mod select;
+pub mod macos_sidebar;
 pub mod sidebar;
 pub mod spinner;
 pub mod split_view;

@@ -5,3 +5,6 @@ pub mod template;
 pub mod window_manager;
 pub mod workspace;
 pub(crate) use workspace::init;
+
+use gpui::actions;
+actions!(workspace_actions, [ToggleSidebar]);
