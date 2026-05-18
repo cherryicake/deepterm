@@ -427,7 +427,7 @@ impl FontSettingsView {
                             .text_color(theme.text_muted)
                             .child("Font Size (px)"),
                     )
-                    .child(EditorInput::new(&self.font_size_input).macos26())
+                    .child(EditorInput::new(&self.font_size_input))
                     .when(!self.font_size_valid, |d| {
                         d.child(
                             div()
@@ -449,7 +449,7 @@ impl FontSettingsView {
                             .text_color(theme.text_muted)
                             .child("Line Height (ratio)"),
                     )
-                    .child(EditorInput::new(&self.line_height_input).macos26())
+                    .child(EditorInput::new(&self.line_height_input))
                     .when(!self.line_height_valid, |d| {
                         d.child(
                             div()

@@ -304,7 +304,7 @@ impl Render for Select {
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.app_background)
+                    .bg(theme.panel_background)
                     .cursor_pointer()
                     .track_focus(&focus_handle)
                     .on_mouse_down(
