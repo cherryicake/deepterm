@@ -143,7 +143,7 @@ impl SimpleHighlighter {
     pub fn styles(
         &mut self,
         range: &Range<usize>,
-        theme: &crate::highlighter::HighlightTheme,
+        theme: &crate::components::input::highlighter::HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         let query = match &self.query {
             Some(q) => q,
@@ -378,7 +378,7 @@ fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::highlighter::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
+    use crate::components::input::highlighter::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
     use crate::theme::ThemeAppearance;
 
     fn test_theme() -> HighlightTheme {
@@ -387,12 +387,12 @@ mod tests {
             appearance: ThemeAppearance::Dark,
             style: HighlightThemeStyle {
                 syntax: SyntaxColors {
-                    keyword: Some(crate::highlighter::ThemeStyle::color(gpui::red())),
-                    type_: Some(crate::highlighter::ThemeStyle::color(gpui::blue())),
-                    function: Some(crate::highlighter::ThemeStyle::color(gpui::green())),
-                    number: Some(crate::highlighter::ThemeStyle::color(gpui::yellow())),
-                    string: Some(crate::highlighter::ThemeStyle::color(gpui::blue())),
-                    comment: Some(crate::highlighter::ThemeStyle::color(gpui::red())),
+                    keyword: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::red())),
+                    type_: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::blue())),
+                    function: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::green())),
+                    number: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::yellow())),
+                    string: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::blue())),
+                    comment: Some(crate::components::input::highlighter::ThemeStyle::color(gpui::red())),
                     ..Default::default()
                 },
                 ..Default::default()

@@ -6,7 +6,7 @@ use gpui::{App, Global, Hsla, SharedString, WindowAppearance, rgb};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::highlighter::{
+use crate::components::input::highlighter::{
     HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
 };
 

@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use crate::{highlighter::languages, theme::ThemeAppearance};
+use crate::{components::input::highlighter::languages, theme::ThemeAppearance};
 
 pub(super) const HIGHLIGHT_NAMES: [&str; 40] = [
     "attribute",
@@ -520,7 +520,7 @@ impl LanguageRegistry {
 
 #[cfg(test)]
 mod tests {
-    use crate::highlighter::LanguageConfig;
+    use crate::components::input::highlighter::LanguageConfig;
 
     #[test]
     fn test_registry() {

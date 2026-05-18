@@ -25,9 +25,9 @@ use crate::components::input::movement::MoveDirection;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
-use crate::highlighter::DiagnosticSet;
+use crate::components::input::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
-use crate::highlighter::LanguageRegistry;
+use crate::components::input::highlighter::LanguageRegistry;
 use lsp_types::Position;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
@@ -2033,7 +2033,7 @@ impl InputState {
                     // Compute injection layers in the background to avoid blocking the
                     // main thread with combined-injection parsing (e.g. PHP, HTML+JS/CSS).
                     let injection_layers = if let Some(data) = injection_data {
-                        crate::highlighter::SyntaxHighlighter::compute_injection_layers(
+                        crate::components::input::highlighter::SyntaxHighlighter::compute_injection_layers(
                             data, &new_tree, &text,
                         )
                     } else {
