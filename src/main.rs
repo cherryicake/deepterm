@@ -119,12 +119,19 @@ impl Render for AppWindow {
                 this.toggle_sidebar(window, cx);
             }))
             .when(self.sidebar.should_render(), |this| {
+                let sidebar = self.sidebar.clone();
+                let entity = cx.entity();
                 this.child(
                     div()
                         .pl(px(8.0))
                         .pt(px(8.0))
                         .mb(px(8.0))
-                        .child(self.sidebar.render_sidebar(cx)),
+                        .child(sidebar.render_sidebar(cx, move |id, _window, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.sidebar.select_item(id);
+                                cx.notify();
+                            });
+                        })),
                 )
             })
             .child(self.sidebar.render_main_area(
