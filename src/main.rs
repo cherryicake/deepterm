@@ -128,7 +128,19 @@ impl Render for AppWindow {
                         .mb(px(8.0))
                         .child(sidebar.render_sidebar(cx, move |id, _window, cx| {
                             let _ = entity.update(cx, |this, cx| {
-                                this.sidebar.select_item(id);
+                                match id {
+                                    "themes" => {
+                                        this.sidebar.select_item(id);
+                                        this.sidebar.navigate_to(
+                                            crate::components::macos_sidebar::SidebarView::Theme);
+                                    }
+                                    "__back" => {
+                                        this.sidebar.go_back();
+                                    }
+                                    _ => {
+                                        this.sidebar.select_item(id);
+                                    }
+                                }
                                 cx.notify();
                             });
                         })),
