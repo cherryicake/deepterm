@@ -220,7 +220,7 @@ impl RenderOnce for EditorInput {
                                 } else {
                                     theme.border
                                 })
-                                .bg(theme.panel_background)
+                                .bg(theme.tab_hover_background)
                         })
                         .when(self.transparent, |this| this.h_full())
                         .flex()
