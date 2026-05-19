@@ -13,7 +13,7 @@ actions!(
 );
 
 use crate::assets::Icon;
-use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
+use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon as ButtonIconType, Sizable};
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -468,21 +468,29 @@ impl HostsView {
             )
     }
 
-    /// Render action buttons (NEW HOST, TERMINAL, CONNECT HOSTS)
+    /// Render action buttons (NEW HOST, NEW KEY, NEW IDENTITY, TERMINAL, CONNECT HOSTS)
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
         div()
             .w_full()
-            .h(px(20.0))
+            .h(px(28.0))
             .px(px(16.0))
             .flex()
             .items_center()
             .gap(px(8.0))
             .child(
-                // NEW HOST button using Button component
+                // NEW HOST button - accent color
                 Button::new("new-host-btn")
                     .label("NEW HOST")
                     .icon(ButtonIconType::new("icons/plus.svg"))
                     .small()
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.accent)
+                            .foreground(theme.accent_foreground)
+                            .hover(theme.accent_hover)
+                            .active(theme.accent.opacity(0.8)),
+                    )
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         if let Some(ref callback) = this.on_new_host_click {
                             callback(cx);
@@ -490,11 +498,50 @@ impl HostsView {
                     })),
             )
             .child(
-                // TERMINAL button using Button component
+                // NEW KEY button - accent color (blue)
+                Button::new("new-key-btn")
+                    .label("NEW KEY")
+                    .icon(ButtonIconType::new("icons/key.svg").small())
+                    .small()
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.accent)
+                            .foreground(theme.accent_foreground)
+                            .hover(theme.accent_hover)
+                            .active(theme.accent.opacity(0.8)),
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_key_click {
+                            callback(cx, None);
+                        }
+                    })),
+            )
+            .child(
+                // NEW IDENTITY button - success/green color
+                Button::new("new-identity-btn")
+                    .label("NEW IDENTITY")
+                    .icon(ButtonIconType::new("icons/user.svg").small())
+                    .small()
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(theme.success)
+                            .foreground(theme.success_foreground)
+                            .hover(theme.success.opacity(0.8))
+                            .active(theme.success.opacity(0.7)),
+                    )
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_identity_click {
+                            callback(cx);
+                        }
+                    })),
+            )
+            .child(
+                // TERMINAL button - secondary/ghost
                 Button::new("terminal-btn")
                     .label("TERMINAL")
                     .icon(ButtonIconType::new("icons/terminal.svg"))
                     .small()
+                    .secondary()
                     .on_click(cx.listener(|this, _event, window, cx| {
                         if let Some(ref workspace) = this.workspace {
                             workspace.update(cx, |w, cx| {
@@ -504,10 +551,11 @@ impl HostsView {
                     })),
             )
             .child(
-                // CONNECT HOSTS button using Button component
+                // CONNECT HOSTS button - primary
                 Button::new("connect-hosts-btn")
                     .label("CONNECT HOSTS")
                     .small()
+                    .primary()
                     .on_click(cx.listener(|this, _event, window, cx| {
                         // Connect to selected hosts or show picker
                         let selected_ids: Vec<_> = this.selected_host_ids.iter().cloned().collect();
@@ -992,49 +1040,6 @@ impl HostsView {
             )
     }
 
-    /// Render keychain action buttons (NEW KEY, NEW IDENTITY)
-    fn render_keychain_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w_full()
-            .h(px(28.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                Button::new("new-key-btn")
-                    .label("NEW KEY")
-                    .icon(ButtonIconType::new("icons/plus.svg").small())
-                    .small()
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(ref callback) = this.on_new_key_click {
-                            callback(cx, None);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("new-identity-btn")
-                    .label("NEW IDENTITY")
-                    .icon(ButtonIconType::new("icons/plus.svg").small())
-                    .small()
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(ref callback) = this.on_new_identity_click {
-                            callback(cx);
-                        }
-                    })),
-            )
-    }
-
-    /// Render a keychain section header
-    fn render_keychain_section_header(&self, title: &str, _count: usize, cx: &App) -> impl IntoElement {
-        div().flex().items_center().child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(cx.theme().ui.text_muted)
-                .child(title.to_string()),
-        )
-    }
-
     /// Render keychain items grid
     fn render_keychain_grid(
         &self,
@@ -1071,17 +1076,10 @@ impl HostsView {
             .px(px(CONTENT_PADDING_PX))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.text_muted)
-                            .child(format!("Keys ({})", keys.len())),
-                    )
-                    .child(self.render_keychain_action_buttons(cx)),
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(format!("Keys ({})", keys.len())),
             )
             .child(self.render_keychain_grid(&keys, Icon::KeyShield, theme.accent, cx))
     }
