@@ -131,9 +131,6 @@ impl Render for AppWindow {
                 let entity = cx.entity();
                 this.child(
                     div()
-                        .pl(px(8.0))
-                        .pt(px(8.0))
-                        .mb(px(8.0))
                         .child(sidebar.render_sidebar(cx, move |id, _window, cx| {
                             let _ = entity.update(cx, |this, cx| {
                                 match id {

@@ -11,10 +11,10 @@ use crate::theme::{ActiveTheme, ThemeState};
 const SIDEBAR_WIDTH: f32 = 260.0;
 const ANIMATION_ENTER_MS: u64 = 300;
 const ANIMATION_EXIT_MS: u64 = 250;
-const BUTTON_LEFT_OPEN: f32 = 228.0;
+const BUTTON_LEFT_OPEN: f32 = 220.0;
 const BUTTON_LEFT_CLOSED: f32 = 84.0;
 const BUTTON_TOP: f32 = 12.0;
-const TITLE_BAR_EXTRA_PAD: f32 = 108.0;
+const TITLE_BAR_EXTRA_PAD: f32 = 116.0;
 
 /// 侧边栏菜单项
 #[derive(Clone)]
@@ -207,7 +207,6 @@ impl MacosSidebar {
         };
 
         let inner = div()
-            .w(px(target_width))
             .h_full()
             .rounded(px(12.0))
             .bg(Self::glass_bg(is_dark))
@@ -221,11 +220,20 @@ impl MacosSidebar {
             .pr(px(12.0))
             .child(content);
 
+        // 控制侧边栏整体轮廓
+        let padded = div()
+            .w(px(target_width))
+            .pl(px(8.0))
+            .pt(px(8.0))
+            .pb(px(8.0))
+            .h_full()
+            .child(inner);
+
         div()
             .id((anim_id, self.epoch))
             .h_full()
             .overflow_hidden()
-            .child(inner)
+            .child(padded)
             .with_animation(
                 (anim_key, self.epoch),
                 gpui::Animation::new(Duration::from_millis(duration_ms))
@@ -476,14 +484,16 @@ impl MacosSidebar {
 
             // ANSI normal & bright
             let ansi_top = div().flex().gap(px(2.0)).children(
-                preview_colors[..8].iter().copied().map(|color| {
-                    div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)
-                }),
+                preview_colors[..8]
+                    .iter()
+                    .copied()
+                    .map(|color| div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)),
             );
             let ansi_bottom = div().flex().gap(px(2.0)).children(
-                preview_colors[8..].iter().copied().map(|color| {
-                    div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)
-                }),
+                preview_colors[8..]
+                    .iter()
+                    .copied()
+                    .map(|color| div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)),
             );
 
             let color_preview = div()
@@ -502,7 +512,9 @@ impl MacosSidebar {
                 .p(px(10.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
-                .when(is_active, |this| this.bg(theme.accent).text_color(theme.accent_foreground))
+                .when(is_active, |this| {
+                    this.bg(theme.accent).text_color(theme.accent_foreground)
+                })
                 .when(!is_active, |this| {
                     this.hover(|style| style.bg(Self::hover_bg(is_dark)))
                         .text_color(theme.text)
@@ -693,14 +705,14 @@ impl MacosSidebar {
         div()
             .id(("sidebar-toggle-btn", self.epoch))
             .absolute()
-            .top(px(BUTTON_TOP))
+            .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
             .left(px(start_left))
             .flex()
             .items_center()
             .justify_center()
             .w(px(36.))
-            .h(px(22.))
-            .rounded(px(12.0))
+            .h(px(if self.visible { 22. } else { 30. }))
+            .rounded(px(999.0))
             .text_color(theme.text)
             .hover(|style| style.bg(theme.title_bar_hover))
             .cursor_pointer()
