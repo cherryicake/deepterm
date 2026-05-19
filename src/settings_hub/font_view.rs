@@ -278,11 +278,11 @@ impl FontSettingsView {
                                 .text_xl()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text)
-                                .child("Fonts"),
+                                .child("字体"),
                         )
                         .child(
                             div().text_sm().text_color(theme.text_muted).child(
-                                "Customize the terminal font family, size, and line height.",
+                                "自定义终端字体、大小和行高。",
                             ),
                         ),
                 )
@@ -300,12 +300,12 @@ impl FontSettingsView {
                                         .flex()
                                         .flex_col()
                                         .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child("Terminal Font Family"),
-                                        )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child("终端字体"),
+                                )
                                         .child(self.font_select.clone()),
                                 ),
                             )
@@ -320,7 +320,7 @@ impl FontSettingsView {
                                             div()
                                                 .text_xs()
                                                 .text_color(theme.text_muted)
-                                                .child("Font Weight"),
+                                                .child("字重"),
                                         )
                                         .child(self.weight_select.clone()),
                                 ),
@@ -336,7 +336,7 @@ impl FontSettingsView {
                                             div()
                                                 .text_xs()
                                                 .text_color(theme.text_muted)
-                                                .child("Font Size (px)"),
+                                                .child("字体大小 (px)"),
                                         )
                                         .child(EditorInput::new(&self.font_size_input))
                                         .when(!self.font_size_valid, |d| {
@@ -360,7 +360,7 @@ impl FontSettingsView {
                                             div()
                                                 .text_xs()
                                                 .text_color(theme.text_muted)
-                                                .child("Line Height (ratio)"),
+                                                .child("行高 (倍率)"),
                                         )
                                         .child(EditorInput::new(&self.line_height_input))
                                         .when(!self.line_height_valid, |d| {
@@ -397,7 +397,7 @@ impl FontSettingsView {
                         div()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Terminal Font Family"),
+                            .child("终端字体"),
                     )
                     .child(self.font_select.clone()),
             )
@@ -411,7 +411,7 @@ impl FontSettingsView {
                         div()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Font Weight"),
+                            .child("字重"),
                     )
                     .child(self.weight_select.clone()),
             )
@@ -425,7 +425,7 @@ impl FontSettingsView {
                         div()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Font Size (px)"),
+                            .child("字体大小 (px)"),
                     )
                     .child(EditorInput::new(&self.font_size_input))
                     .when(!self.font_size_valid, |d| {
@@ -447,7 +447,7 @@ impl FontSettingsView {
                         div()
                             .text_xs()
                             .text_color(theme.text_muted)
-                            .child("Line Height (ratio)"),
+                            .child("行高 (倍率)"),
                     )
                     .child(EditorInput::new(&self.line_height_input))
                     .when(!self.line_height_valid, |d| {

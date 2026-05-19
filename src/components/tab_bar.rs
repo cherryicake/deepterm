@@ -124,7 +124,7 @@ impl Render for DragPreview {
                     .px(px(TAB_DRAG_PREVIEW_PADDING_X_PX))
                     .flex()
                     .items_center()
-                    .rounded(px(7.0))
+                    .rounded(px(8.0))
                     .bg(theme.elevated_background)
                     .border_1()
                     .border_color(theme.border_strong)
@@ -769,7 +769,7 @@ impl Render for TabBar {
                             .items_center()
                             .justify_center()
                             .gap(px(6.0))
-                            .rounded(px(6.0))
+                            .rounded(px(8.0))
                             .border_1()
                             .border_color(if is_settingshub_active {
                                 theme.border
@@ -952,7 +952,7 @@ impl Render for TabBar {
                                                 .flex_shrink_0()
                                                 .items_center()
                                                 .gap(px(6.0))
-                                                .rounded(px(6.0))
+                                                .rounded(px(8.0))
                                                 .border_1()
                                                 .border_color(theme.border_strong.opacity(0.55))
                                                 .bg(theme.tab_hover_background.opacity(0.6))
@@ -1003,9 +1003,9 @@ impl Render for TabBar {
                                         .flex_shrink_0()
                                         .items_center()
                                         .gap(px(6.0))
-                                        .rounded(px(6.0))
-                                        .border_1()
-                                        .border_color(if is_active {
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(if is_active {
                                             theme.border
                                         } else {
                                             theme.transparent()

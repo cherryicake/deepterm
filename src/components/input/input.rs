@@ -213,13 +213,7 @@ impl RenderOnce for EditorInput {
                                 .pr(input_pr)
                                 .py(input_py)
                                 .gap(px(8.0))
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(if is_focused {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                })
+                                .rounded(px(8.0))
                                 .bg(theme.tab_hover_background)
                         })
                         .when(self.transparent, |this| this.h_full())

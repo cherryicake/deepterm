@@ -102,8 +102,8 @@ impl MacosSidebar {
                 SidebarMenuSection::new(
                     Some("偏好设置"),
                     vec![
-                        SidebarMenuItem::new("themes", "主题", Some(Icon::Folder)),
-                        SidebarMenuItem::new("font", "字体", Some(Icon::Eye)),
+                        SidebarMenuItem::new("themes", "主题", Some(Icon::Theme)),
+                        SidebarMenuItem::new("font", "字体", Some(Icon::Font)),
                     ],
                 ),
             ],
