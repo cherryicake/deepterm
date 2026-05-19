@@ -1,10 +1,11 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, ScrollHandle, SharedString,
-    Window, actions, div, px, svg,
+    App, Context, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    ScrollHandle, SharedString, Window, actions, div, px, svg,
 };
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 actions!(
     host_actions,
@@ -16,7 +17,7 @@ use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
-use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
+use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore};
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::theme::ActiveTheme;
@@ -178,6 +179,12 @@ pub struct HostsView {
     context_menu_host_id: Option<SharedString>, // Track which host was right-clicked
     left_sidebar_width: f32,
     right_sidebar_width: f32,
+    // Keychain items
+    keychain_items: Vec<KeychainItem>,
+    selected_keychain_item_id: Option<String>,
+    on_new_key_click: Option<Box<dyn Fn(&mut App, Option<PathBuf>) + Send + Sync>>,
+    on_new_identity_click: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
+    on_edit_keychain_item_click: Option<Box<dyn Fn(&mut App, KeychainItem) + Send + Sync>>,
 }
 
 impl HostsView {
@@ -236,6 +243,11 @@ impl HostsView {
                 context_menu_host_id: None,
                 left_sidebar_width: 0.0,
                 right_sidebar_width: 0.0,
+                keychain_items: Self::load_keychain_items(),
+                selected_keychain_item_id: None,
+                on_new_key_click: None,
+                on_new_identity_click: None,
+                on_edit_keychain_item_click: None,
             }
         })
     }
@@ -254,6 +266,41 @@ impl HostsView {
         self.search_query = SharedString::new_static("");
         self.search_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
+    }
+
+    /// Load keychain items from store
+    fn load_keychain_items() -> Vec<KeychainItem> {
+        KeychainStore::load_or_default().items
+    }
+
+    /// Refresh keychain items
+    pub fn refresh_items(&mut self, cx: &mut Context<Self>) {
+        self.keychain_items = Self::load_keychain_items();
+        cx.notify();
+    }
+
+    /// Set callback for NEW KEY button
+    pub fn on_new_key_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut App, Option<PathBuf>) + Send + Sync + 'static,
+    {
+        self.on_new_key_click = Some(Box::new(callback));
+    }
+
+    /// Set callback for NEW IDENTITY button
+    pub fn on_new_identity_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut App) + Send + Sync + 'static,
+    {
+        self.on_new_identity_click = Some(Box::new(callback));
+    }
+
+    /// Set callback for editing a keychain item
+    pub fn on_edit_keychain_item_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut App, KeychainItem) + Send + Sync + 'static,
+    {
+        self.on_edit_keychain_item_click = Some(Box::new(callback));
     }
 
     /// Update search query and filter hosts
@@ -485,7 +532,11 @@ impl HostsView {
             .items_center()
             .gap(px(12.0))
             .rounded(px(10.0))
-            .bg(theme.elevated_background)
+            .bg(icon_color.opacity(if cx.theme().appearance.is_dark() {
+                0.08
+            } else {
+                0.05
+            }))
             .border_1()
             .border_color(theme.border)
             .cursor_pointer()
@@ -593,7 +644,11 @@ impl HostsView {
                 0.10
             })
         } else {
-            theme.elevated_background
+            icon_color.opacity(if cx.theme().appearance.is_dark() {
+                0.08
+            } else {
+                0.05
+            })
         };
         let border_color = if is_selected {
             theme.accent
@@ -837,6 +892,224 @@ impl HostsView {
             // Add invisible placeholders to maintain grid alignment
             .children((0..placeholder_count).map(|_| div().w_full().h(px(64.0)).into_any_element()))
     }
+
+    /// Render a keychain item card
+    fn render_keychain_card(
+        &self,
+        item: &KeychainItem,
+        icon: Icon,
+        icon_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let is_selected = self.selected_keychain_item_id.as_ref() == Some(&item.id);
+        let item_id = item.id.clone();
+        let item_for_callback = item.clone();
+
+        div()
+            .id(format!("keychain-card-{}", item.id))
+            .w_full()
+            .h(px(64.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .rounded(px(10.0))
+            .bg(if is_selected {
+                theme.accent.opacity(if cx.theme().appearance.is_dark() {
+                    0.18
+                } else {
+                    0.10
+                })
+            } else {
+                icon_color.opacity(if cx.theme().appearance.is_dark() {
+                    0.08
+                } else {
+                    0.05
+                })
+            })
+            .border_1()
+            .border_color(if is_selected {
+                theme.accent
+            } else {
+                theme.border
+            })
+            .cursor_pointer()
+            .hover(|style| {
+                if is_selected {
+                    style
+                } else {
+                    style.bg(theme.tab_hover_background)
+                }
+            })
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.selected_keychain_item_id = Some(item_id.clone());
+                    if let Some(ref callback) = this.on_edit_keychain_item_click {
+                        callback(cx, item_for_callback.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(40.0))
+                    .h(px(40.0))
+                    .rounded(px(8.0))
+                    .bg(icon_color)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .size(px(20.0))
+                            .path(icon.path())
+                            .text_color(theme.accent_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .truncate()
+                            .child(item.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_subtle)
+                            .child(item.subtitle()),
+                    ),
+            )
+    }
+
+    /// Render keychain action buttons (NEW KEY, NEW IDENTITY)
+    fn render_keychain_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w_full()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                Button::new("new-key-btn")
+                    .label("NEW KEY")
+                    .icon(ButtonIconType::new("icons/plus.svg").small())
+                    .small()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_key_click {
+                            callback(cx, None);
+                        }
+                    })),
+            )
+            .child(
+                Button::new("new-identity-btn")
+                    .label("NEW IDENTITY")
+                    .icon(ButtonIconType::new("icons/plus.svg").small())
+                    .small()
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        if let Some(ref callback) = this.on_new_identity_click {
+                            callback(cx);
+                        }
+                    })),
+            )
+    }
+
+    /// Render a keychain section header
+    fn render_keychain_section_header(&self, title: &str, _count: usize, cx: &App) -> impl IntoElement {
+        div().flex().items_center().child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(cx.theme().ui.text_muted)
+                .child(title.to_string()),
+        )
+    }
+
+    /// Render keychain items grid
+    fn render_keychain_grid(
+        &self,
+        items: &[&KeychainItem],
+        icon: Icon,
+        icon_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .grid()
+            .grid_cols(2)
+            .gap(px(GRID_GAP_PX))
+            .children(items.iter().map(|item| {
+                self.render_keychain_card(item, icon, icon_color, cx)
+                    .into_any_element()
+            }))
+    }
+
+    /// Render the Keys section
+    fn render_keys_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let keys: Vec<&KeychainItem> = self
+            .keychain_items
+            .iter()
+            .filter(|item| item.kind == KeychainItemKind::Key)
+            .collect();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(GRID_GAP_PX))
+            .px(px(CONTENT_PADDING_PX))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_muted)
+                            .child(format!("Keys ({})", keys.len())),
+                    )
+                    .child(self.render_keychain_action_buttons(cx)),
+            )
+            .child(self.render_keychain_grid(&keys, Icon::KeyShield, theme.accent, cx))
+    }
+
+    /// Render the Identities section
+    fn render_identities_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let identities: Vec<&KeychainItem> = self
+            .keychain_items
+            .iter()
+            .filter(|item| item.kind == KeychainItemKind::Identity)
+            .collect();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(GRID_GAP_PX))
+            .px(px(CONTENT_PADDING_PX))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child(format!("Identities ({})", identities.len())),
+            )
+            .child(self.render_keychain_grid(&identities, Icon::Host, theme.success, cx))
+    }
 }
 
 impl Focusable for HostsView {
@@ -861,6 +1134,15 @@ impl Render for HostsView {
             .size_full()
             .relative()
             .bg(theme.panel_background)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                if let Some(path) = paths.paths().first() {
+                    this.selected_keychain_item_id = None;
+                    if let Some(ref callback) = this.on_new_key_click {
+                        callback(cx, Some(path.clone()));
+                    }
+                    log::info!("Dropped key path into hosts view: {:?}", path);
+                }
+            }))
             // Register context menu actions
             .on_action(cx.listener(|this, _: &ConnectHost, window, cx| {
                 // Connect to all selected hosts
@@ -950,7 +1232,11 @@ impl Render for HostsView {
                     // Groups section
                     .child(self.render_groups_section(cx))
                     // Hosts section
-                    .child(self.render_hosts_section(window, cx)),
+                    .child(self.render_hosts_section(window, cx))
+                    // Keys section
+                    .child(self.render_keys_section(cx))
+                    // Identities section
+                    .child(self.render_identities_section(cx)),
             )
             // Fixed header (rendered last = highest z-order, covers scrolled content)
             .child(

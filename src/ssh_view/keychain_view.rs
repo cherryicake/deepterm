@@ -288,7 +288,11 @@ impl KeychainView {
                     0.10
                 })
             } else {
-                theme.elevated_background
+                icon_color.opacity(if cx.theme().appearance.is_dark() {
+                    0.08
+                } else {
+                    0.05
+                })
             })
             .border_1()
             .border_color(if is_selected {
@@ -446,22 +450,6 @@ impl Render for KeychainView {
             .flex()
             .flex_col()
             .gap(px(12.0))
-            .child(
-                div()
-                    .px(px(16.0))
-                    .pt(px(8.0))
-                    .text_base()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child("Keychain"),
-            )
-            .child(
-                div()
-                    .px(px(16.0))
-                    .text_sm()
-                    .text_color(theme.text_subtle)
-                    .child("Create and reuse SSH keys and password identities."),
-            )
             .child(div().px(px(16.0)).child(self.render_action_buttons(cx)))
             .child(
                 div()

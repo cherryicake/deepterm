@@ -9,7 +9,7 @@ use crate::ssh::config::SshConnectionConfig;
 const RIGHT_SIDEBAR_WIDTH: f32 = 360.0;
 use crate::ssh_view::host_form::HostForm;
 use crate::ssh_view::hosts_view::HostsView;
-use crate::ssh_view::keychain_view::{KeychainEditor, KeychainView};
+use crate::ssh_view::keychain_view::KeychainEditor;
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
@@ -22,7 +22,6 @@ enum RightSidebarContent {
 /// SSH New Tab 视图 - 合并 Hosts 和 Keychain 页面
 pub struct SshNewTabView {
     hosts_view: Entity<HostsView>,
-    keychain_view: Entity<KeychainView>,
     host_form: Entity<HostForm>,
     keychain_editor: Entity<KeychainEditor>,
     right_sidebar_visible: bool,
@@ -44,13 +43,11 @@ impl SshNewTabView {
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let hosts_view = HostsView::new_with_workspace(window, cx, workspace.clone());
-            let keychain_view = KeychainView::new(window, cx);
             let host_form = HostForm::new(window, cx);
             let keychain_editor = KeychainEditor::new(window, cx);
 
             let mut view = Self {
                 hosts_view,
-                keychain_view,
                 host_form,
                 keychain_editor,
                 right_sidebar_visible: false,
@@ -88,10 +85,10 @@ impl SshNewTabView {
             });
         });
 
-        // KeychainView NEW KEY 回调
+        // HostsView NEW KEY 回调
         let view_entity_for_new_key = cx.entity();
-        self.keychain_view.update(cx, |keychain_view, _cx| {
-            keychain_view.on_new_key_click(move |app, path| {
+        self.hosts_view.update(cx, |hosts_view, _cx| {
+            hosts_view.on_new_key_click(move |app, path| {
                 view_entity_for_new_key.update(app, |view, cx| {
                     view.keychain_editor.update(cx, |editor, cx| {
                         if let Some(path) = path.clone() {
@@ -105,10 +102,10 @@ impl SshNewTabView {
             });
         });
 
-        // KeychainView NEW IDENTITY 回调
+        // HostsView NEW IDENTITY 回调
         let view_entity_for_new_identity = cx.entity();
-        self.keychain_view.update(cx, |keychain_view, _cx| {
-            keychain_view.on_new_identity_click(move |app| {
+        self.hosts_view.update(cx, |hosts_view, _cx| {
+            hosts_view.on_new_identity_click(move |app| {
                 view_entity_for_new_identity.update(app, |view, cx| {
                     view.keychain_editor.update(cx, |editor, cx| {
                         editor.start_new_identity(cx);
@@ -118,10 +115,10 @@ impl SshNewTabView {
             });
         });
 
-        // KeychainView 编辑 item 回调
+        // HostsView 编辑 keychain item 回调
         let view_entity_for_edit_keychain = cx.entity();
-        self.keychain_view.update(cx, |keychain_view, _cx| {
-            keychain_view.on_edit_item_click(move |app, item| {
+        self.hosts_view.update(cx, |hosts_view, _cx| {
+            hosts_view.on_edit_keychain_item_click(move |app, item| {
                 view_entity_for_edit_keychain.update(app, |view, cx| {
                     view.keychain_editor.update(cx, |editor, cx| {
                         editor.load_item(&item, cx);
@@ -156,7 +153,7 @@ impl SshNewTabView {
         // KeychainEditor 回调
         let view_entity_for_keychain_cancel = cx.entity();
         let view_entity_for_keychain_save = cx.entity();
-        let keychain_view_for_refresh = self.keychain_view.clone();
+        let hosts_view_for_keychain_refresh = self.hosts_view.clone();
 
         self.keychain_editor.update(cx, |editor, _cx| {
             editor.on_cancel(move |app| {
@@ -166,8 +163,8 @@ impl SshNewTabView {
             });
 
             editor.on_saved(move |app| {
-                keychain_view_for_refresh.update(app, |keychain_view, cx| {
-                    keychain_view.refresh_items(cx);
+                hosts_view_for_keychain_refresh.update(app, |hosts_view, cx| {
+                    hosts_view.refresh_items(cx);
                 });
                 view_entity_for_keychain_save.update(app, |view, cx| {
                     view.close_right_sidebar(cx);
@@ -264,23 +261,7 @@ impl Render for SshNewTabView {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(self.hosts_view.clone()),
-                    )
-                    .child(div().h(px(1.0)).bg(theme.border))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(self.keychain_view.clone()),
-                    ),
+                    .child(self.hosts_view.clone()),
             )
             .when(render_sidebar, |this| {
                 this.child(
