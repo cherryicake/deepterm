@@ -275,7 +275,7 @@ impl KeychainView {
         div()
             .id(format!("keychain-card-{}", item.id))
             .w_full()
-            .h(px(64.0))
+            .h(px(76.0))
             .px(px(12.0))
             .flex()
             .items_center()

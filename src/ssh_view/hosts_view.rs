@@ -579,7 +579,7 @@ impl HostsView {
         div()
             .id(format!("group-{}", group.id))
             .w(px(280.0))
-            .h(px(56.0))
+            .h(px(76.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -597,8 +597,8 @@ impl HostsView {
             .child(
                 // Group icon
                 div()
-                    .w(px(36.0))
-                    .h(px(36.0))
+                    .w(px(44.0))
+                    .h(px(44.0))
                     .rounded(px(8.0))
                     .bg(icon_color)
                     .flex()
@@ -606,7 +606,7 @@ impl HostsView {
                     .justify_center()
                     .child(
                         svg()
-                            .size(px(20.0))
+                            .size(px(24.0))
                             .path(Icon::Server.path())
                             .text_color(theme.accent_foreground),
                     ),
@@ -712,7 +712,7 @@ impl HostsView {
         div()
             .id(format!("host-{}", host.id))
             .w_full()
-            .h(px(74.0))
+            .h(px(76.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -797,8 +797,8 @@ impl HostsView {
             .child(
                 // Host icon
                 div()
-                    .w(px(40.0))
-                    .h(px(40.0))
+                    .w(px(44.0))
+                    .h(px(44.0))
                     .rounded(px(8.0))
                     .bg(icon_color)
                     .flex()
@@ -806,7 +806,7 @@ impl HostsView {
                     .justify_center()
                     .child(
                         svg()
-                            .size(px(22.0))
+                            .size(px(24.0))
                             .path(host.os_icon.unwrap_or(Icon::Linux).path())
                             .text_color(theme.accent_foreground),
                     ),
@@ -960,7 +960,7 @@ impl HostsView {
         div()
             .id(format!("keychain-card-{}", item.id))
             .w_full()
-            .h(px(74.0))
+            .h(px(76.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -1005,8 +1005,8 @@ impl HostsView {
             )
             .child(
                 div()
-                    .w(px(40.0))
-                    .h(px(40.0))
+                    .w(px(44.0))
+                    .h(px(44.0))
                     .rounded(px(8.0))
                     .bg(icon_color)
                     .flex()
@@ -1014,7 +1014,7 @@ impl HostsView {
                     .justify_center()
                     .child(
                         svg()
-                            .size(px(20.0))
+                            .size(px(24.0))
                             .path(icon.path())
                             .text_color(theme.accent_foreground),
                     ),
@@ -1070,7 +1070,7 @@ impl HostsView {
                 self.render_keychain_card(item, icon, icon_color, cx)
                     .into_any_element()
             }))
-            .children((0..placeholder_count).map(|_| div().w_full().h(px(64.0)).into_any_element()))
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(74.0)).into_any_element()))
     }
 
     /// Render the Keys section

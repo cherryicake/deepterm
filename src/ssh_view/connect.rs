@@ -221,7 +221,7 @@ impl Render for SshConnectView {
             .flex()
             .items_start()
             .justify_center()
-            .pt(px(80.0))
+            .pt(px(76.0))
             .child(
                 div()
                     .flex()

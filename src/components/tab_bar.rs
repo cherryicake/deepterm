@@ -911,9 +911,9 @@ impl Render for TabBar {
                                         .flex_shrink_0()
                                         .items_center()
                                         .gap(px(6.0))
-                                    .rounded(px(8.0))
-                                    .border_1()
-                                    .border_color(if is_active {
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(if is_active {
                                             theme.border
                                         } else {
                                             theme.transparent()
@@ -1038,7 +1038,7 @@ impl Render for TabBar {
                                         .when_some(icon, |this, icon| {
                                             this.child(
                                                 svg()
-                                                    .size(px(18.0))
+                                                    .size(px(16.0))
                                                     .text_color(if is_active {
                                                         theme.text
                                                     } else {
