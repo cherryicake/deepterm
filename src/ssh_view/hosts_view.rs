@@ -13,7 +13,9 @@ actions!(
 );
 
 use crate::assets::Icon;
-use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon as ButtonIconType, Sizable};
+use crate::components::button::{
+    Button, ButtonCustomVariant, ButtonVariants, Icon as ButtonIconType, Sizable,
+};
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -25,8 +27,8 @@ use crate::workspace::workspace::Workspace;
 
 // Layout constants
 const GRID_GAP_PX: f32 = 12.0;
-const MIN_CARD_WIDTH_PX: f32 = 260.0;
-const CONTENT_PADDING_PX: f32 = 16.0;
+const MIN_CARD_WIDTH_PX: f32 = 320.0;
+const CONTENT_PADDING_PX: f32 = 24.0;
 
 /// Host connection type
 #[derive(Clone, Debug, PartialEq)]
@@ -418,30 +420,36 @@ impl HostsView {
         (hosts, groups, config.saved_connections)
     }
 
-    /// Render the search bar
+    /// Render the search bar (matches picker.rs search style, 600px centered)
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
+        let is_dark = cx.theme().appearance.is_dark();
+        // Background matching macos_sidebar theme search box
+        let search_bg = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.08)
+        } else {
+            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.06)
+        };
+        // Match picker.rs PANEL_WIDTH = 600.0
+        const SEARCH_WIDTH: f32 = 600.0;
         div()
             .w_full()
-            .h(px(40.0))
-            .px(px(16.0))
+            .px(px(12.0))
+            .py(px(12.0))
             .flex()
-            .items_center()
+            .justify_center()
             .child(
-                // Search input with background - CONNECT button inside
                 div()
-                    .flex_1()
+                    .w(px(SEARCH_WIDTH))
                     .h(px(36.0))
-                    .pl(px(12.0))
-                    .pr(px(6.0))
-                    .rounded(px(8.0))
-                    .bg(theme.elevated_background)
-                    .border_1()
-                    .border_color(theme.border)
+                    .px(px(12.0))
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap(px(8.0))
+                    .bg(search_bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(8.0))
                     .child(
                         // Search icon
                         div().w(px(16.0)).h(px(16.0)).child(
@@ -456,14 +464,11 @@ impl HostsView {
                         EditorInput::new(&self.search_input).transparent(),
                     )
                     .child(
-                        // Connect button inside search box using Button component
-                        Button::new("search-connect-btn")
-                            .label("CONNECT")
-                            .small()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                // Trigger SSH picker or connection
-                                cx.dispatch_action(&ShowSshPicker);
-                            })),
+                        // Shortcut hint
+                        div()
+                            .text_color(theme.text_subtle)
+                            .text_size(px(12.0))
+                            .child("⌘+K"),
                     ),
             )
     }
@@ -471,99 +476,99 @@ impl HostsView {
     /// Render action buttons (NEW HOST, NEW KEY, NEW IDENTITY, TERMINAL, CONNECT HOSTS)
     fn render_action_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        div()
-            .w_full()
-            .h(px(28.0))
-            .px(px(16.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                // NEW HOST button - accent color
-                Button::new("new-host-btn")
-                    .label("NEW HOST")
-                    .icon(ButtonIconType::new("icons/plus.svg"))
-                    .small()
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(theme.accent)
-                            .foreground(theme.accent_foreground)
-                            .hover(theme.accent_hover)
-                            .active(theme.accent.opacity(0.8)),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(ref callback) = this.on_new_host_click {
-                            callback(cx);
-                        }
-                    })),
-            )
-            .child(
-                // NEW KEY button - accent color (blue)
-                Button::new("new-key-btn")
-                    .label("NEW KEY")
-                    .icon(ButtonIconType::new("icons/key.svg").small())
-                    .small()
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(theme.accent)
-                            .foreground(theme.accent_foreground)
-                            .hover(theme.accent_hover)
-                            .active(theme.accent.opacity(0.8)),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(ref callback) = this.on_new_key_click {
-                            callback(cx, None);
-                        }
-                    })),
-            )
-            .child(
-                // NEW IDENTITY button - success/green color
-                Button::new("new-identity-btn")
-                    .label("NEW IDENTITY")
-                    .icon(ButtonIconType::new("icons/user.svg").small())
-                    .small()
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(theme.success)
-                            .foreground(theme.success_foreground)
-                            .hover(theme.success.opacity(0.8))
-                            .active(theme.success.opacity(0.7)),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        if let Some(ref callback) = this.on_new_identity_click {
-                            callback(cx);
-                        }
-                    })),
-            )
-            .child(
-                // TERMINAL button - secondary/ghost
-                Button::new("terminal-btn")
-                    .label("TERMINAL")
-                    .icon(ButtonIconType::new("icons/terminal.svg"))
-                    .small()
-                    .secondary()
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        if let Some(ref workspace) = this.workspace {
-                            workspace.update(cx, |w, cx| {
-                                w.create_local_terminal(window, cx);
-                            });
-                        }
-                    })),
-            )
-            .child(
-                // CONNECT HOSTS button - primary
-                Button::new("connect-hosts-btn")
-                    .label("CONNECT HOSTS")
-                    .small()
-                    .primary()
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        // Connect to selected hosts or show picker
-                        let selected_ids: Vec<_> = this.selected_host_ids.iter().cloned().collect();
-                        for host_id in selected_ids {
-                            this.connect_to_host(&host_id, window, cx);
-                        }
-                    })),
-            )
+        // Unified button background matching macos_sidebar theme search box
+        let button_bg = if cx.theme().appearance.is_dark() {
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.08)
+        } else {
+            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.06)
+        };
+        let button_bg_hover = if cx.theme().appearance.is_dark() {
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.12)
+        } else {
+            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.10)
+        };
+        let button_variant = ButtonCustomVariant::new(cx)
+            .color(button_bg)
+            .foreground(theme.text)
+            .hover(button_bg_hover)
+            .active(button_bg);
+
+        div().w_full().px(px(12.0)).flex().justify_center().child(
+            div()
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    // NEW HOST button
+                    Button::new("new-host-btn")
+                        .label("NEW HOST")
+                        .icon(ButtonIconType::new("icons/plus.svg"))
+                        .small()
+                        .custom(button_variant.clone())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            if let Some(ref callback) = this.on_new_host_click {
+                                callback(cx);
+                            }
+                        })),
+                )
+                .child(
+                    // NEW KEY button
+                    Button::new("new-key-btn")
+                        .label("NEW KEY")
+                        .icon(ButtonIconType::new("icons/plus.svg"))
+                        .small()
+                        .custom(button_variant.clone())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            if let Some(ref callback) = this.on_new_key_click {
+                                callback(cx, None);
+                            }
+                        })),
+                )
+                .child(
+                    // NEW IDENTITY button
+                    Button::new("new-identity-btn")
+                        .label("NEW IDENTITY")
+                        .icon(ButtonIconType::new("icons/plus.svg"))
+                        .small()
+                        .custom(button_variant.clone())
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            if let Some(ref callback) = this.on_new_identity_click {
+                                callback(cx);
+                            }
+                        })),
+                )
+                .child(
+                    // TERMINAL button
+                    Button::new("terminal-btn")
+                        .label("TERMINAL")
+                        .icon(ButtonIconType::new("icons/terminal.svg"))
+                        .small()
+                        .custom(button_variant.clone())
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            if let Some(ref workspace) = this.workspace {
+                                workspace.update(cx, |w, cx| {
+                                    w.create_local_terminal(window, cx);
+                                });
+                            }
+                        })),
+                )
+                .child(
+                    // CONNECT HOSTS button
+                    Button::new("connect-hosts-btn")
+                        .label("CONNECT HOSTS")
+                        .small()
+                        .custom(button_variant)
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            // Connect to selected hosts or show picker
+                            let selected_ids: Vec<_> =
+                                this.selected_host_ids.iter().cloned().collect();
+                            for host_id in selected_ids {
+                                this.connect_to_host(&host_id, window, cx);
+                            }
+                        })),
+                ),
+        )
     }
 
     /// Render a group card
@@ -707,7 +712,7 @@ impl HostsView {
         div()
             .id(format!("host-{}", host.id))
             .w_full()
-            .h(px(64.0))
+            .h(px(74.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -813,13 +818,11 @@ impl HostsView {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .overflow_hidden()
                     .child(
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .truncate()
                             .child(host.name.to_string()),
                     )
                     .child(
@@ -938,7 +941,7 @@ impl HostsView {
                     .map(|host| self.render_host_card(host, window, cx).into_any_element()),
             )
             // Add invisible placeholders to maintain grid alignment
-            .children((0..placeholder_count).map(|_| div().w_full().h(px(64.0)).into_any_element()))
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(74.0)).into_any_element()))
     }
 
     /// Render a keychain item card
@@ -957,7 +960,7 @@ impl HostsView {
         div()
             .id(format!("keychain-card-{}", item.id))
             .w_full()
-            .h(px(64.0))
+            .h(px(74.0))
             .px(px(12.0))
             .flex()
             .items_center()
@@ -1022,13 +1025,11 @@ impl HostsView {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .overflow_hidden()
                     .child(
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .truncate()
                             .child(item.label.clone()),
                     )
                     .child(
@@ -1040,27 +1041,40 @@ impl HostsView {
             )
     }
 
-    /// Render keychain items grid
+    /// Render keychain items grid with responsive columns (same as hosts)
     fn render_keychain_grid(
         &self,
+        window: &mut Window,
         items: &[&KeychainItem],
         icon: Icon,
         icon_color: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let viewport_width = window.viewport_size().width.as_f32();
+        let cols = self.calculate_columns(viewport_width);
+
+        let item_count = items.len();
+        let remainder = item_count % (cols as usize);
+        let placeholder_count = if remainder == 0 {
+            0
+        } else {
+            (cols as usize) - remainder
+        };
+
         div()
             .w_full()
             .grid()
-            .grid_cols(2)
+            .grid_cols(cols)
             .gap(px(GRID_GAP_PX))
             .children(items.iter().map(|item| {
                 self.render_keychain_card(item, icon, icon_color, cx)
                     .into_any_element()
             }))
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(64.0)).into_any_element()))
     }
 
     /// Render the Keys section
-    fn render_keys_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_keys_section(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let keys: Vec<&KeychainItem> = self
             .keychain_items
@@ -1081,11 +1095,15 @@ impl HostsView {
                     .text_color(theme.text_muted)
                     .child(format!("Keys ({})", keys.len())),
             )
-            .child(self.render_keychain_grid(&keys, Icon::KeyShield, theme.accent, cx))
+            .child(self.render_keychain_grid(window, &keys, Icon::KeyShield, theme.accent, cx))
     }
 
     /// Render the Identities section
-    fn render_identities_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_identities_section(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme().ui;
         let identities: Vec<&KeychainItem> = self
             .keychain_items
@@ -1106,7 +1124,7 @@ impl HostsView {
                     .text_color(theme.text_muted)
                     .child(format!("Identities ({})", identities.len())),
             )
-            .child(self.render_keychain_grid(&identities, Icon::Host, theme.success, cx))
+            .child(self.render_keychain_grid(window, &identities, Icon::Host, theme.success, cx))
     }
 }
 
@@ -1119,8 +1137,8 @@ impl Focusable for HostsView {
 impl Render for HostsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        // Header height: search bar (40) + spacer (20) + action buttons (20) = 80px
-        const HEADER_HEIGHT: f32 = 80.0;
+        // Header height: search bar (60) + spacer (20) + action buttons (28) = 108px
+        const HEADER_HEIGHT: f32 = 108.0;
         // Persistent gap between action buttons bottom and scroll content
         const CONTENT_TOP_GAP: f32 = 16.0;
         // Total height the fixed header occupies (includes the gap)
@@ -1223,18 +1241,27 @@ impl Render for HostsView {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
+                    .items_center()
                     .gap(px(24.0))
                     // Top padding = total header area (header + gap), so content always starts below
                     .pt(px(TOTAL_HEADER_HEIGHT))
                     .pb(px(16.0))
-                    // Groups section
-                    .child(self.render_groups_section(cx))
-                    // Hosts section
-                    .child(self.render_hosts_section(window, cx))
-                    // Keys section
-                    .child(self.render_keys_section(cx))
-                    // Identities section
-                    .child(self.render_identities_section(cx)),
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(1200.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(24.0))
+                            // Groups section
+                            .child(self.render_groups_section(cx))
+                            // Hosts section
+                            .child(self.render_hosts_section(window, cx))
+                            // Keys section
+                            .child(self.render_keys_section(window, cx))
+                            // Identities section
+                            .child(self.render_identities_section(window, cx)),
+                    ),
             )
             // Fixed header (rendered last = highest z-order, covers scrolled content)
             .child(
