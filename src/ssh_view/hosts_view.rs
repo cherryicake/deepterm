@@ -15,7 +15,6 @@ use crate::assets::Icon;
 use crate::components::button::{Button, Icon as ButtonIconType, Sizable};
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
-use crate::settings_hub::settings_view::{LEFT_SIDEBAR_WIDTH, RIGHT_SIDEBAR_WIDTH};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
@@ -177,6 +176,8 @@ pub struct HostsView {
     on_edit_host_click: Option<Box<dyn Fn(&mut App, SshConnectionConfig) + Send + Sync>>,
     selected_host_ids: HashSet<SharedString>,
     context_menu_host_id: Option<SharedString>, // Track which host was right-clicked
+    left_sidebar_width: f32,
+    right_sidebar_width: f32,
 }
 
 impl HostsView {
@@ -233,6 +234,8 @@ impl HostsView {
                 on_edit_host_click: None,
                 selected_host_ids: HashSet::new(),
                 context_menu_host_id: None,
+                left_sidebar_width: 0.0,
+                right_sidebar_width: 0.0,
             }
         })
     }
@@ -757,13 +760,19 @@ impl HostsView {
             )
     }
 
+    /// Set sidebar widths for layout calculations
+    pub fn set_sidebar_widths(&mut self, left: f32, right: f32) {
+        self.left_sidebar_width = left;
+        self.right_sidebar_width = right;
+    }
+
     /// Calculate the number of columns based on available width
     /// Accounts for sidebars (left: ~200px, right: ~300px when visible)
     fn calculate_columns(&self, available_width: f32) -> u16 {
         // Account for left sidebar, right sidebar, and padding
         // Each sidebar has ~12px outer padding
         let sidebar_padding = 24.0 + 24.0; // left + right outer paddings
-        let sidebar_width = LEFT_SIDEBAR_WIDTH + RIGHT_SIDEBAR_WIDTH + sidebar_padding;
+        let sidebar_width = self.left_sidebar_width + self.right_sidebar_width + sidebar_padding;
         let content_padding = CONTENT_PADDING_PX * 2.0;
         let effective_width = available_width - sidebar_width - content_padding;
 

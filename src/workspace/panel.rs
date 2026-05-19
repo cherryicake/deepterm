@@ -11,7 +11,7 @@ use crate::file_browser::{
     FileBrowserEvent, FileBrowserTarget, FileBrowserView, RemoteFileBrowserView,
 };
 use crate::file_transfer::TransferRequest;
-use crate::settings_hub::settings_view::{SettingsHubLeftSidebar, SettingsHubView};
+use crate::ssh_view::new_tab::SshNewTabView;
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
@@ -102,10 +102,8 @@ pub enum PanelContent {
     Text(String),
     /// Terminal panel
     Terminal(Entity<TerminalView>),
-    /// SettingsHub sidebar panel
-    SettingsHubSidebar(Entity<SettingsHubLeftSidebar>),
-    /// SettingsHub full view (sidebar + center content)
-    SettingsHubView(Entity<SettingsHubView>),
+    /// SSH New Tab view (merged hosts + keychain)
+    SshNewTab(Entity<SshNewTabView>),
     /// Local file browser
     FileBrowser(Entity<FileBrowserView>),
     /// Remote file browser
@@ -392,20 +390,21 @@ impl Panel {
         )
     }
 
-    /// Creates a new panel with a HostsHubView (sidebar + center content).
-    pub fn with_hostshub_view(
+    /// Creates a new panel with an SshNewTabView (merged hosts + keychain).
+    pub fn with_ssh_new_tab(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
         active_tab_id: Option<SharedString>,
-        settings_hub_view: Entity<SettingsHubView>,
+        active_tab_label: Option<SharedString>,
+        new_tab_view: Entity<SshNewTabView>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_common(
             panel_id,
             workspace_id,
             active_tab_id,
-            Some("Hosts".into()),
-            PanelContent::SettingsHubView(settings_hub_view),
+            active_tab_label,
+            PanelContent::SshNewTab(new_tab_view),
             cx,
         )
     }
@@ -682,9 +681,8 @@ impl Panel {
             PanelContent::RemoteFileBrowser(file_browser) => {
                 Some(file_browser.read(cx).focus_handle(cx))
             }
-            PanelContent::SettingsHubSidebar(sidebar) => Some(sidebar.read(cx).focus_handle(cx)),
-            PanelContent::SettingsHubView(settings_hub_view) => {
-                Some(settings_hub_view.read(cx).focus_handle(cx))
+            PanelContent::SshNewTab(new_tab_view) => {
+                Some(new_tab_view.read(cx).focus_handle(cx))
             }
             PanelContent::Editor(editor_view) => Some(editor_view.read(cx).focus_handle(cx)),
             _ => None,
@@ -856,21 +854,12 @@ impl Panel {
                 )
             }
             PanelContent::Terminal(terminal_view) => div().flex_1().child(terminal_view.clone()),
-            PanelContent::SettingsHubSidebar(settingshub_sidebar) => {
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .p(px(6.0))
-                    .child(settingshub_sidebar.clone())
-                    // 右侧填充区域（可放置其他内容）
-                    .child(div().flex_1())
-            }
-            PanelContent::SettingsHubView(settings_hub_view) => div()
+            PanelContent::SshNewTab(new_tab_view) => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .child(settings_hub_view.clone()),
+                .child(new_tab_view.clone()),
+
             PanelContent::FileBrowser(file_browser_view) => div()
                 .flex_1()
                 .min_h_0()
@@ -1067,11 +1056,7 @@ impl Render for Panel {
         div()
             .id(format!("panel-{}", self.panel_id))
             .size_full()
-            // SettingsHub Panel 使用透明背景以显示毛玻璃效果
-            .when(
-                !matches!(self.content, PanelContent::SettingsHubSidebar(_)),
-                |this| this.bg(theme.panel_background),
-            )
+            .bg(theme.panel_background)
             .when(!is_solo, |this| {
                 // 选中时边框颜色加深，未选中时让边框更接近背景色，仅微微可见
                 let border_color = if is_selected {

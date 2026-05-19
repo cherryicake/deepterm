@@ -13,9 +13,6 @@ use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
 use gpui::svg;
 
-/// 特殊标签页ID常量
-pub const HOSTS_HUB_TAB_ID: &str = "__hostshub__";
-
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraggedTab {
@@ -190,7 +187,6 @@ pub struct TabBar {
     on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
-    on_settingshub_click: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
     on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
     on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
@@ -230,7 +226,6 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
-            on_settingshub_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -268,7 +263,6 @@ impl TabBar {
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
-            on_settingshub_click: None,
             on_tab_reorder: None,
             on_tab_split: None,
             on_tab_merge: None,
@@ -306,13 +300,6 @@ impl TabBar {
         F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_new_tab = Some(Rc::new(callback));
-    }
-
-    pub fn on_settingshub_click<F>(&mut self, callback: F)
-    where
-        F: Fn(&mut Window, &mut App) + Send + Sync + 'static,
-    {
-        self.on_settingshub_click = Some(Rc::new(callback));
     }
 
     pub fn on_tab_reorder<F>(&mut self, callback: F)
@@ -390,15 +377,6 @@ impl TabBar {
         let changed = self.active_tab_id.as_ref() != Some(&new_id);
         if changed {
             self.active_tab_id = Some(new_id);
-            cx.notify();
-        }
-    }
-
-    /// 设置 HostsHub 标签为激活状态
-    pub fn set_hostshub_active(&mut self, cx: &mut Context<Self>) {
-        let settings_id = SharedString::from(HOSTS_HUB_TAB_ID);
-        if self.active_tab_id.as_ref() != Some(&settings_id) {
-            self.active_tab_id = Some(settings_id);
             cx.notify();
         }
     }
@@ -677,13 +655,10 @@ impl Render for TabBar {
         let on_tab_click = self.on_tab_click.clone();
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
-        let on_settingshub_click = self.on_settingshub_click.clone();
         let on_tab_reorder = self.on_tab_reorder.clone();
         let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
         let animation_epoch = self.reorder_animation_epoch;
-        let is_settingshub_active =
-            self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(HOSTS_HUB_TAB_ID);
         let panel_drop_preview = self.panel_drop_preview.clone();
 
         // 根据溢出状态决定布局模式
@@ -758,73 +733,6 @@ impl Render for TabBar {
                         .absolute()
                         .size_full()
                     })
-                    // SettingsHub 按钮 - 固定在左侧，不参与滚动
-                    .child(
-                        div()
-                            .id("hostshub-btn")
-                            .h(px(30.0))
-                            .px(px(12.0))
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(if is_settingshub_active {
-                                theme.border
-                            } else {
-                                theme.transparent()
-                            })
-                            .cursor_pointer()
-                            .bg(if is_settingshub_active {
-                                theme.tab_active_background
-                            } else {
-                                theme.tab_inactive_background
-                            })
-                            .hover(move |style| {
-                                if !is_settingshub_active {
-                                    style.bg(theme.tab_hover_background)
-                                } else {
-                                    style
-                                }
-                            })
-                            .child(
-                                svg()
-                                    .size(px(16.0))
-                                    .text_color(if is_settingshub_active {
-                                        theme.text
-                                    } else {
-                                        theme.icon
-                                    })
-                                    .path(Icon::SettingsHub.path()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(if is_settingshub_active {
-                                        gpui::FontWeight::SEMIBOLD
-                                    } else {
-                                        gpui::FontWeight::NORMAL
-                                    })
-                                    .text_color(if is_settingshub_active {
-                                        theme.text
-                                    } else {
-                                        theme.text_muted
-                                    })
-                                    .child("HostsHub"),
-                            )
-                            .on_click(cx.listener(move |_, _, window, cx| {
-                                if let Some(ref callback) = on_settingshub_click {
-                                    callback(window, cx);
-                                }
-                            }))
-                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            }),
-                    )
-                    // 分割线 - 在 SettingsHub 和 Tab 列表之间
-                    .child(div().h(px(20.0)).w(px(1.0)).bg(theme.border).mx(px(4.0)))
                     // 标签列表容器（包含所有标签和新建按钮）
                     .child(
                         div()

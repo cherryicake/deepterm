@@ -16,7 +16,7 @@ pub mod workspace;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, IntoElement, KeyBinding,
-    ParentElement, Render, Window, actions, div, px,
+    ParentElement, Render, Window, actions, div,
 };
 
 use crate::components::macos_sidebar::MacosSidebar;

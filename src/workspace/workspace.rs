@@ -17,18 +17,19 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+use crate::assets::Icon;
 use crate::components::input::InputState;
-use crate::components::tab_bar::{DraggedTab, HOSTS_HUB_TAB_ID, TabBar, TabItem};
+use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
     TransferTaskState, TransferTaskStatus, quick_total_size, transfer_item_name, transfer_label,
 };
-use crate::settings_hub::settings_view::SettingsHubView;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
+use crate::ssh_view::new_tab::SshNewTabView;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
@@ -275,13 +276,65 @@ impl Workspace {
     /// 设置该 workspace 使用的 SSH picker
     pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>, cx: &mut Context<Self>) {
         self.ssh_picker = Some(picker.clone());
+        let workspace = cx.entity();
         self.tab_bar.update(cx, |tab_bar, _cx| {
             tab_bar.on_new_tab(move |window, cx| {
-                picker.update(cx, |picker, cx| {
-                    picker.toggle(window, cx);
+                let workspace = workspace.clone();
+                workspace.update(cx, |_this, cx| {
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.create_new_tab(window, cx);
+                    });
                 });
             });
         });
+    }
+
+    /// 创建 New Tab
+    pub fn create_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let label = "New Tab";
+        let workspace_entity = cx.entity();
+        let panel = cx.new(|cx| {
+            let new_tab_view = SshNewTabView::new_with_workspace(window, cx, Some(workspace_entity));
+            Panel::with_ssh_new_tab(
+                format!("panel-{}", self.next_panel_id),
+                self.workspace_id.clone(),
+                Some(format!("tab-{}", self.next_tab_id).into()),
+                Some(label.into()),
+                new_tab_view,
+                cx,
+            )
+        });
+        self.next_panel_id += 1;
+
+        let tab_id = format!("tab-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+
+        self.tabs.insert(
+            tab_id.clone(),
+            TabInfo::new_normal(&tab_id, label, panel.clone()),
+        );
+
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(TabItem::new(&tab_id, label).with_icon(Some(Icon::PlusCircleFull)), cx)
+        });
+
+        let subscription =
+            cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
+                this.handle_panel_event(event, window, cx);
+            });
+        self.panel_subscriptions
+            .insert(panel.read(cx).panel_id.to_string(), subscription);
+
+        self.active_tab_id = tab_id.clone();
+        self.switch_to_tab(&tab_id, cx);
+
+        cx.defer_in(window, move |_, window, cx| {
+            if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
+                window.focus(&handle, cx);
+            }
+        });
+
+        cx.notify();
     }
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
@@ -408,18 +461,6 @@ impl Workspace {
                 }
             });
 
-            // 设置 SettingsHub 点击事件
-            tab_bar.on_settingshub_click({
-                let workspace = workspace.clone();
-                move |window, cx| {
-                    let workspace = workspace.clone();
-                    window.defer(cx, move |window, cx| {
-                        workspace.update(cx, |this, cx| {
-                            this.show_hostshub_panel(window, cx);
-                        });
-                    });
-                }
-            });
         });
     }
 
@@ -1415,69 +1456,6 @@ impl Workspace {
         } else {
             eprintln!("[WORKSPACE] TabBar overflow resolved");
         }
-    }
-
-    /// 显示 hostshub panel
-    /// 当点击 HostsHub 标签时调用，显示SettingsHubView（包含左侧边栏和中心内容）中的Host配置内容
-    fn show_hostshub_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 防止重复创建 SettingsHub Panel
-        if self.active_tab_id == HOSTS_HUB_TAB_ID {
-            return;
-        }
-
-        // 清理已存在的 SettingsHub panel（如果有）
-        if self.tabs.remove(HOSTS_HUB_TAB_ID).is_some() {
-            self.panel_subscriptions.remove(HOSTS_HUB_TAB_ID);
-        }
-
-        // 设置 HostsHub 为激活状态
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.set_hostshub_active(cx);
-        });
-
-        // 创建完整的 SettingsHubView（包含左侧边栏和中心内容）
-        let workspace_entity = cx.entity();
-        let settings_hub_view =
-            SettingsHubView::new_with_workspace(window, cx, Some(workspace_entity));
-
-        // 设置 HostsView 的回调
-        settings_hub_view.update(cx, |view, cx| {
-            view.setup_callbacks(cx);
-        });
-
-        // 创建带有 SettingsHubView 的 Panel
-        let hostshub_panel = cx.new(|cx| {
-            Panel::with_hostshub_view(
-                format!("hosthub-panel-{}", self.next_panel_id),
-                self.workspace_id.clone(),
-                Some(HOSTS_HUB_TAB_ID.into()),
-                settings_hub_view,
-                cx,
-            )
-        });
-        self.next_panel_id += 1;
-
-        // 更新当前活动的容器为 SettingsHub Panel
-        self.active_tab_id = HOSTS_HUB_TAB_ID.to_string();
-
-        // 存储 SettingsHub panel（使用特殊的 key）
-        self.tabs.insert(
-            HOSTS_HUB_TAB_ID.to_string(),
-            TabInfo::new_normal(HOSTS_HUB_TAB_ID, "Hosts", hostshub_panel.clone()),
-        );
-
-        // 订阅 SettingsHub panel 的事件
-        let subscription = cx.subscribe_in(
-            &hostshub_panel,
-            window,
-            |this, _, event: &PanelEvent, window, cx| {
-                this.handle_panel_event(event, window, cx);
-            },
-        );
-        self.panel_subscriptions
-            .insert(HOSTS_HUB_TAB_ID.to_string(), subscription);
-
-        cx.notify();
     }
 
     fn show_file_browser_panel(

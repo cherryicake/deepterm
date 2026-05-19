@@ -68,6 +68,7 @@ pub enum Icon {
     Sidebar,
     Theme,
     Font,
+    PlusCircleFull,
 }
 
 impl Icon {
@@ -113,6 +114,7 @@ impl Icon {
             Icon::Sidebar => SharedString::new_static("icons/sidebar.svg"),
             Icon::Theme => SharedString::new_static("icons/theme.svg"),
             Icon::Font => SharedString::new_static("icons/font.svg"),
+            Icon::PlusCircleFull => SharedString::new_static("icons/plus.circle.full.svg"),
         }
     }
 }
