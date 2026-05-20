@@ -512,7 +512,6 @@ struct ButtonVariantStyle {
     border: Hsla,
     fg: Hsla,
     underline: bool,
-    shadow: bool,
 }
 
 impl ButtonVariant {
@@ -581,28 +580,17 @@ impl ButtonVariant {
         matches!(self, Self::Link)
     }
 
-    fn shadow(&self, outline: bool, _: &App) -> bool {
-        match self {
-            Self::Default => !outline,
-            Self::Primary | Self::Secondary | Self::Danger => outline,
-            Self::Custom(c) => c.shadow,
-            _ => false,
-        }
-    }
-
     fn normal(&self, outline: bool, cx: &App) -> ButtonVariantStyle {
         let bg = self.bg_color(outline, cx);
         let border = self.border_color(outline, cx);
         let fg = self.text_color(outline, cx);
         let underline = self.underline(cx);
-        let shadow = self.shadow(outline, cx);
 
         ButtonVariantStyle {
             bg,
             border,
             fg,
             underline,
-            shadow,
         }
     }
 
@@ -624,14 +612,12 @@ impl ButtonVariant {
         let border = self.border_color(outline, cx);
         let fg = self.text_color(outline, cx);
         let underline = self.underline(cx);
-        let shadow = self.shadow(outline, cx);
 
         ButtonVariantStyle {
             bg,
             border,
             fg,
             underline,
-            shadow,
         }
     }
 
@@ -655,14 +641,12 @@ impl ButtonVariant {
             _ => self.text_color(outline, cx),
         };
         let underline = self.underline(cx);
-        let shadow = self.shadow(outline, cx);
 
         ButtonVariantStyle {
             bg,
             border,
             fg,
             underline,
-            shadow,
         }
     }
 
@@ -686,14 +670,12 @@ impl ButtonVariant {
             _ => self.text_color(outline, cx),
         };
         let underline = self.underline(cx);
-        let shadow = self.shadow(outline, cx);
 
         ButtonVariantStyle {
             bg,
             border,
             fg,
             underline,
-            shadow,
         }
     }
 
@@ -719,14 +701,12 @@ impl ButtonVariant {
         };
 
         let underline = self.underline(cx);
-        let shadow = false;
 
         ButtonVariantStyle {
             bg,
             border,
             fg,
             underline,
-            shadow,
         }
     }
 }

@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    App, Context, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement, Render,
     ScrollHandle, SharedString, Window, actions, div, px, svg,
 };
 
@@ -21,7 +21,6 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore};
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
-use crate::ssh_view::picker::ShowSshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
@@ -35,8 +34,6 @@ const CONTENT_PADDING_PX: f32 = 24.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostType {
     Ssh,
-    #[allow(dead_code)]
-    Telnet,
 }
 
 /// Host information
@@ -99,7 +96,6 @@ impl Host {
     pub fn subtitle(&self) -> String {
         let protocol = match self.host_type {
             HostType::Ssh => "ssh",
-            HostType::Telnet => "telnet",
         };
 
         match (&self.username, &self.auth_label) {

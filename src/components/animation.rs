@@ -21,7 +21,6 @@ impl Default for AnimationConfig {
 /// 面板动画包装器
 pub struct AnimatedPanel {
     content: Option<gpui::AnyElement>,
-    animation_config: AnimationConfig,
     is_visible: bool,
     opacity: f32,
     focus_handle: FocusHandle,
@@ -32,7 +31,6 @@ impl AnimatedPanel {
         let focus_handle = cx.focus_handle();
         cx.new(|_cx| Self {
             content: None,
-            animation_config: AnimationConfig::default(),
             is_visible: true,
             opacity: 1.0,
             focus_handle,
@@ -92,18 +90,14 @@ impl Render for AnimatedPanel {
 
 /// 标签切换动画
 pub struct TabSwitchAnimation {
-    from_index: usize,
-    to_index: usize,
     progress: f32,
     focus_handle: FocusHandle,
 }
 
 impl TabSwitchAnimation {
-    pub fn new(from: usize, to: usize, cx: &mut App) -> Entity<Self> {
+    pub fn new(_from: usize, _to: usize, cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         cx.new(|_cx| Self {
-            from_index: from,
-            to_index: to,
             progress: 0.0,
             focus_handle,
         })

@@ -92,7 +92,6 @@ impl RenderOnce for EditorInput {
         });
 
         let state = self.state.read(cx);
-        let is_focused = state.focus_handle.is_focused(window) && !state.disabled;
         let is_multi_line = state.mode.is_multi_line();
         let theme = cx.theme().ui;
         const LINE_HEIGHT: gpui::Rems = gpui::Rems(1.25);

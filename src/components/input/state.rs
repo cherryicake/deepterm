@@ -581,7 +581,10 @@ impl InputState {
 
     #[inline]
     pub fn diagnostics(&self) -> Option<&DiagnosticSet> {
-        self.mode.diagnostics()
+        match &self.mode {
+            InputMode::CodeEditor { diagnostics, .. } => Some(diagnostics),
+            _ => None,
+        }
     }
 
     #[inline]

@@ -259,17 +259,6 @@ impl TerminalView {
         }
     }
 
-    /// Override the blink policy. Exposed so that settings/UI can flip the
-    /// behaviour at runtime without recreating the view.
-    #[allow(dead_code)]
-    pub fn set_blink_setting(&mut self, setting: TerminalBlink, cx: &mut Context<Self>) {
-        if self.blink_setting == setting {
-            return;
-        }
-        self.blink_setting = setting;
-        self.sync_blink_manager(self.was_focused, cx);
-    }
-
     /// Called on every key event that reaches the terminal input path.
     /// Keeps the caret solid for `PAUSE_DELAY` so typing never produces
     /// a mid-stroke blank frame.

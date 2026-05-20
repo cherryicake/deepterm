@@ -6,7 +6,7 @@ use gpui::{App, SharedString, Task};
 use ropey::Rope;
 
 use super::display_map::DisplayMap;
-use crate::components::input::{InputEdit, RopeExt as _, TabSize};
+use crate::components::input::{InputEdit, RopeExt as _};
 use crate::components::input::highlighter::DiagnosticSet;
 use crate::components::input::highlighter::SyntaxHighlighter;
 
@@ -22,7 +22,6 @@ pub(crate) enum InputMode {
     /// A plain text input mode.
     PlainText {
         multi_line: bool,
-        tab: TabSize,
         rows: usize,
     },
     /// An auto grow input mode.
@@ -34,12 +33,10 @@ pub(crate) enum InputMode {
     /// A code editor input mode.
     CodeEditor {
         multi_line: bool,
-        tab: TabSize,
         rows: usize,
         /// Show line number
         line_number: bool,
         language: SharedString,
-        indent_guides: bool,
         folding: bool,
         highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
         diagnostics: DiagnosticSet,
@@ -53,13 +50,11 @@ impl Default for InputMode {
     }
 }
 
-#[allow(unused)]
 impl InputMode {
     /// Create a plain input mode with default settings.
     pub(super) fn plain_text() -> Self {
         InputMode::PlainText {
             multi_line: false,
-            tab: TabSize::default(),
             rows: 1,
         }
     }
@@ -69,11 +64,9 @@ impl InputMode {
         InputMode::CodeEditor {
             rows: 2,
             multi_line: true,
-            tab: TabSize::default(),
             language: language.into(),
             highlighter: Rc::new(RefCell::new(None)),
             line_number: true,
-            indent_guides: true,
             folding: true,
             diagnostics: DiagnosticSet::new(&Rope::new()),
             parse_task: Rc::new(RefCell::new(None)),
@@ -180,28 +173,6 @@ impl InputMode {
         .max(1)
     }
 
-    /// At least 1 row be return.
-    #[allow(unused)]
-    pub(crate) fn min_rows(&self) -> usize {
-        match self {
-            InputMode::AutoGrow { min_rows, .. } => *min_rows,
-            _ => 1,
-        }
-        .max(1)
-    }
-
-    #[allow(unused)]
-    pub(crate) fn max_rows(&self) -> usize {
-        if !self.is_multi_line() {
-            return 1;
-        }
-
-        match self {
-            InputMode::AutoGrow { max_rows, .. } => *max_rows,
-            _ => usize::MAX,
-        }
-    }
-
     /// Return false if the mode is not [`InputMode::CodeEditor`].
     #[inline]
     pub(crate) fn line_number(&self) -> bool {
@@ -226,7 +197,7 @@ impl InputMode {
         text: &Rope,
         new_text: &str,
         force: bool,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Option<PendingBackgroundParse> {
         match &self {
             InputMode::CodeEditor {
@@ -295,14 +266,6 @@ impl InputMode {
         }
     }
 
-    #[allow(unused)]
-    pub(super) fn diagnostics(&self) -> Option<&DiagnosticSet> {
-        match self {
-            InputMode::CodeEditor { diagnostics, .. } => Some(diagnostics),
-            _ => None,
-        }
-    }
-
     pub(super) fn diagnostics_mut(&mut self) -> Option<&mut DiagnosticSet> {
         match self {
             InputMode::CodeEditor { diagnostics, .. } => Some(diagnostics),
@@ -325,7 +288,7 @@ mod tests {
 
     use crate::components::input::highlighter::DiagnosticSet;
 
-    use super::{InputMode, TabSize};
+    use super::InputMode;
 
     #[test]
     fn test_code_editor() {
@@ -334,17 +297,13 @@ mod tests {
         assert_eq!(mode.is_multi_line(), true);
         assert_eq!(mode.is_single_line(), false);
         assert_eq!(mode.line_number(), true);
-        assert_eq!(mode.max_rows(), usize::MAX);
-        assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), true);
 
         let mode = InputMode::CodeEditor {
             multi_line: false,
             line_number: true,
-            indent_guides: true,
             folding: true,
             rows: 0,
-            tab: Default::default(),
             language: "rust".into(),
             highlighter: Default::default(),
             diagnostics: DiagnosticSet::new(&Rope::new()),
@@ -354,8 +313,6 @@ mod tests {
         assert_eq!(mode.is_multi_line(), false);
         assert_eq!(mode.is_single_line(), true);
         assert_eq!(mode.line_number(), false);
-        assert_eq!(mode.max_rows(), 1);
-        assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), false);
     }
 
@@ -363,7 +320,6 @@ mod tests {
     fn test_plain() {
         let mode = InputMode::PlainText {
             multi_line: true,
-            tab: TabSize::default(),
             rows: 5,
         };
         assert_eq!(mode.is_code_editor(), false);
@@ -371,16 +327,12 @@ mod tests {
         assert_eq!(mode.is_single_line(), false);
         assert_eq!(mode.line_number(), false);
         assert_eq!(mode.rows(), 5);
-        assert_eq!(mode.max_rows(), usize::MAX);
-        assert_eq!(mode.min_rows(), 1);
 
         let mode = InputMode::plain_text();
         assert_eq!(mode.is_code_editor(), false);
         assert_eq!(mode.is_multi_line(), false);
         assert_eq!(mode.is_single_line(), true);
         assert_eq!(mode.line_number(), false);
-        assert_eq!(mode.max_rows(), 1);
-        assert_eq!(mode.min_rows(), 1);
     }
 
     #[test]
@@ -391,8 +343,21 @@ mod tests {
         assert_eq!(mode.is_single_line(), false);
         assert_eq!(mode.line_number(), false);
         assert_eq!(mode.rows(), 2);
-        assert_eq!(mode.max_rows(), 5);
-        assert_eq!(mode.min_rows(), 2);
+
+        mode.set_rows(4);
+        assert_eq!(mode.rows(), 4);
+
+        mode.set_rows(1);
+        assert_eq!(mode.rows(), 2);
+
+        mode.set_rows(10);
+        assert_eq!(mode.rows(), 5);
+    }
+
+    #[test]
+    fn test_max_rows() {
+        let mut mode = InputMode::auto_grow(2, 5);
+        assert_eq!(mode.rows(), 2);
 
         mode.set_rows(4);
         assert_eq!(mode.rows(), 4);

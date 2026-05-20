@@ -49,15 +49,6 @@ impl ConnectStage {
         }
     }
 
-    /// 获取阶段显示名称（与 Stepper 标签一致）
-    fn label(&self) -> &'static str {
-        match self {
-            ConnectStage::Handshake => "SSH",
-            ConnectStage::Authentication => "Auth",
-            ConnectStage::Session => "Session",
-        }
-    }
-
     /// 获取下一个阶段
     pub fn next(&self) -> Option<ConnectStage> {
         match self {
@@ -170,15 +161,6 @@ impl SshConnectView {
             message: message.into(),
         };
         cx.notify();
-    }
-
-    fn spinner_dots(&self) -> &'static str {
-        match self.frame % 4 {
-            0 => "   ",
-            1 => ".  ",
-            2 => ".. ",
-            _ => "...",
-        }
     }
 
     /// 处理重新连接

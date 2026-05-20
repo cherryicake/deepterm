@@ -1,4 +1,3 @@
-use gpui::SharedString;
 use ropey::RopeSlice;
 
 #[derive(Debug, Copy, Clone)]
@@ -17,14 +16,6 @@ impl Default for TabSize {
 }
 
 impl TabSize {
-    pub(super) fn to_string(&self) -> SharedString {
-        if self.hard_tabs {
-            "\t".into()
-        } else {
-            " ".repeat(self.tab_size).into()
-        }
-    }
-
     pub fn indent_count(&self, line: &RopeSlice) -> usize {
         let mut count = 0;
         for ch in line.chars() {

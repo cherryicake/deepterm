@@ -223,7 +223,7 @@ impl Workspace {
         let workspace_id = format!("workspace-{}", uuid::Uuid::new_v4());
 
         // 初始化tabs信息
-        let mut tabs = HashMap::new();
+        let tabs = HashMap::new();
 
         // tab-0 对应 panel-0 - 使用 New Tab 页面
         // 先创建 workspace，再使用 workspace entity 创建 panel

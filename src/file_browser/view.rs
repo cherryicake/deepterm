@@ -27,7 +27,6 @@ use crate::theme::ActiveTheme;
 const COLUMN_DEFAULT_WIDTH: f32 = 240.0;
 const HEADER_HEIGHT: f32 = 46.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
-const LIST_HEADER_HEIGHT: f32 = 26.0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FileEntryKind {

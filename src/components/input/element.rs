@@ -1012,7 +1012,7 @@ impl Element for TextElement {
             style.size.height = relative(1.).into();
             if state.mode.is_auto_grow() {
                 // Auto grow to let height match to rows, but not exceed max rows.
-                let rows = state.mode.max_rows().min(state.mode.rows());
+                let rows = state.mode.rows();
                 style.min_size.height = (rows * line_height).into();
             } else {
                 style.min_size.height = line_height.into();

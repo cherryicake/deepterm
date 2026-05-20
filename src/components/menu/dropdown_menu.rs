@@ -1,5 +1,5 @@
 use gpui::{
-    Context, Corner, ElementId, InteractiveElement, IntoElement, RenderOnce, SharedString, Window,
+    Context, Corner, ElementId, InteractiveElement, IntoElement, RenderOnce, Window,
 };
 
 use crate::components::button::Selectable;
@@ -26,10 +26,8 @@ pub trait DropdownMenu: Selectable + InteractiveElement + IntoElement + 'static 
 }
 
 pub struct DropdownMenuPopover<T: Selectable + IntoElement + 'static> {
-    id: ElementId,
     anchor: Corner,
     trigger: T,
-    builder: std::rc::Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
 }
 
 impl<T> DropdownMenuPopover<T>
@@ -37,16 +35,14 @@ where
     T: Selectable + IntoElement + 'static,
 {
     fn new(
-        id: ElementId,
+        _id: ElementId,
         anchor: impl Into<Corner>,
         trigger: T,
-        builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+        _builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> Self {
         Self {
-            id: SharedString::from(format!("dropdown-menu:{:?}", id)).into(),
             anchor: anchor.into(),
             trigger,
-            builder: std::rc::Rc::new(builder),
         }
     }
 

@@ -152,9 +152,6 @@ impl ConnectionInfo {
 struct ActiveConnection {
     /// 连接信息
     info: ConnectionInfo,
-    /// 断开连接的接收器（保留供未来使用）
-    #[allow(dead_code)]
-    disconnect_rx: async_channel::Receiver<()>,
 }
 
 /// SSH 连接管理器
@@ -163,9 +160,6 @@ pub struct SshConnectionManager {
     connections: Mutex<HashMap<String, ActiveConnection>>,
     /// 连接状态变更回调
     event_handlers: Mutex<Vec<Box<dyn Fn(ConnectionEvent) + Send + Sync>>>,
-    /// 全局配置（保留供未来使用）
-    #[allow(dead_code)]
-    client_config: Arc<crate::ssh::SshClientConfig>,
 }
 
 impl SshConnectionManager {
@@ -174,16 +168,14 @@ impl SshConnectionManager {
         Self {
             connections: Mutex::new(HashMap::new()),
             event_handlers: Mutex::new(Vec::new()),
-            client_config: Arc::new(crate::ssh::SshClientConfig::default()),
         }
     }
 
     /// 创建带配置的连接管理器
-    pub fn with_config(client_config: crate::ssh::SshClientConfig) -> Self {
+    pub fn with_config(_client_config: crate::ssh::SshClientConfig) -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
             event_handlers: Mutex::new(Vec::new()),
-            client_config: Arc::new(client_config),
         }
     }
 
@@ -218,7 +210,7 @@ impl SshConnectionManager {
         });
 
         // 创建断开信号通道
-        let (disconnect_tx, disconnect_rx) = async_channel::bounded(1);
+        let (disconnect_tx, _disconnect_rx) = async_channel::bounded(1);
 
         // 尝试建立连接
         // 注意：当前使用 SshPtyTerminal（ssh_pty.rs）直接创建 PTY 连接
@@ -230,7 +222,6 @@ impl SshConnectionManager {
 
                 let active_conn = ActiveConnection {
                     info: info.clone(),
-                    disconnect_rx,
                 };
 
                 // 存储连接
@@ -253,7 +244,6 @@ impl SshConnectionManager {
 
                 let active_conn = ActiveConnection {
                     info: info.clone(),
-                    disconnect_rx,
                 };
 
                 self.connections

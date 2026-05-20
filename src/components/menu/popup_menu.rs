@@ -8,7 +8,7 @@ use gpui::{
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
     WeakEntity, Window, actions, anchored, div, prelude::FluentBuilder, px, rems,
 };
-use gpui::{ClickEvent, MouseDownEvent, OwnedMenuItem, Point, Subscription};
+use gpui::{ClickEvent, MouseDownEvent, Point, Subscription};
 use std::rc::Rc;
 
 const CONTEXT: &str = "PopupMenu";
@@ -256,27 +256,6 @@ impl PopupMenuItem {
         matches!(self, PopupMenuItem::Separator)
     }
 
-    fn has_left_icon(&self, check_side: Side) -> bool {
-        match self {
-            PopupMenuItem::Item { icon, checked, .. } => {
-                icon.is_some() || (check_side.is_left() && *checked)
-            }
-            PopupMenuItem::ElementItem { icon, checked, .. } => {
-                icon.is_some() || (check_side.is_left() && *checked)
-            }
-            PopupMenuItem::Submenu { icon, .. } => icon.is_some(),
-            _ => false,
-        }
-    }
-
-    #[inline]
-    fn is_checked(&self) -> bool {
-        match self {
-            PopupMenuItem::Item { checked, .. } => *checked,
-            PopupMenuItem::ElementItem { checked, .. } => *checked,
-            _ => false,
-        }
-    }
 }
 
 /// Side for check icon placement
@@ -307,7 +286,6 @@ pub struct PopupMenu {
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
     bounds: Bounds<Pixels>,
-    size: Size,
     check_side: Side,
 
     /// The parent menu of this menu, if this is a submenu
@@ -337,7 +315,6 @@ impl PopupMenu {
             scrollable: false,
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
-            size: Size::default(),
             submenu_anchor: (Corner::TopLeft, Pixels::ZERO),
             _subscriptions: vec![],
         }
@@ -667,12 +644,6 @@ impl PopupMenu {
         self
     }
 
-    /// Use small size, the menu item will have smaller height.
-    pub(crate) fn small(mut self) -> Self {
-        self.size = Size::Small;
-        self
-    }
-
     fn add_menu_item(
         &mut self,
         label: impl Into<SharedString>,
@@ -688,42 +659,6 @@ impl PopupMenu {
                 .checked(checked)
                 .action(action),
         );
-        self
-    }
-
-    pub(super) fn with_menu_items<I>(
-        mut self,
-        items: impl IntoIterator<Item = I>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self
-    where
-        I: Into<OwnedMenuItem>,
-    {
-        for item in items {
-            match item.into() {
-                OwnedMenuItem::Action {
-                    name,
-                    action,
-                    checked,
-                    ..
-                } => self = self.menu_with_check(name, checked, action.boxed_clone()),
-                OwnedMenuItem::Separator => {
-                    self = self.separator();
-                }
-                OwnedMenuItem::Submenu(submenu) => {
-                    self = self.submenu(submenu.name, window, cx, move |menu, window, cx| {
-                        menu.with_menu_items(submenu.items.clone(), window, cx)
-                    })
-                }
-                OwnedMenuItem::SystemMenu(_) => {}
-            }
-        }
-
-        if self.menu_items.len() > 20 {
-            self.scrollable = true;
-        }
-
         self
     }
 
@@ -999,34 +934,6 @@ impl PopupMenu {
         self.handle_dismiss(&e.position, window, cx);
     }
 
-    fn render_key_binding(
-        &self,
-        action: Option<Box<dyn Action>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let action = action?;
-
-        // Simplified key binding rendering - just return the action name
-        // In a full implementation, this would look up the actual key binding
-        Some(div().child(action.name()))
-    }
-
-    fn render_icon(
-        has_icon: bool,
-        checked: bool,
-        _icon: Option<Icon>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if !has_icon {
-            return None;
-        }
-
-        // Simplified icon rendering
-        // In a full implementation, this would render the actual icon
-        Some(div().when(checked, |this| this.child("✓")))
-    }
 
     #[inline]
     fn max_width(&self) -> Pixels {
@@ -1055,7 +962,6 @@ impl PopupMenu {
         &self,
         ix: usize,
         item: &PopupMenuItem,
-        _options: RenderOptions,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> MenuItemElement {
@@ -1202,13 +1108,6 @@ impl Focusable for PopupMenu {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RenderOptions {
-    has_left_icon: bool,
-    check_side: Side,
-    radius: Pixels,
-}
-
 impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_submenu_menu_anchor(window);
@@ -1221,18 +1120,8 @@ impl Render for PopupMenu {
             window_half_height.min(px(450.))
         });
 
-        let has_left_icon = self
-            .menu_items
-            .iter()
-            .any(|item| item.has_left_icon(self.check_side));
-
         let max_width = self.max_width();
         let theme = cx.theme().ui;
-        let options = RenderOptions {
-            has_left_icon,
-            check_side: self.check_side,
-            radius: px(6.),
-        };
 
         // Liquid glass effect: outer shadow + inner highlight border
         div()
@@ -1298,7 +1187,7 @@ impl Render for PopupMenu {
                                                 )
                                                 .into_any_element()
                                         } else {
-                                            self.render_item(ix, item, options, window, cx)
+                                            self.render_item(ix, item, window, cx)
                                                 .into_any_element()
                                         }
                                     }),

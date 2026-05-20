@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, px,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div,
 };
 use crate::components::sidebar::Sidebar;
 use crate::ssh::config::SshConnectionConfig;
@@ -10,7 +10,6 @@ const RIGHT_SIDEBAR_WIDTH: f32 = 360.0;
 use crate::ssh_view::host_form::HostForm;
 use crate::ssh_view::hosts_view::HostsView;
 use crate::ssh_view::keychain_view::KeychainEditor;
-use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,7 +239,6 @@ impl Focusable for SshNewTabView {
 
 impl Render for SshNewTabView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         let show_right_sidebar = self.right_sidebar_visible;
         let render_sidebar = self.right_sidebar_rendered;
         let sidebar_content = match self.right_sidebar_content {
