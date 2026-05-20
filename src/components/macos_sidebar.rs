@@ -202,6 +202,20 @@ impl MacosSidebar {
     where
         F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
     {
+        // 完全收起且不在动画中时，渲染一个宽度为 0 的占位，
+        // 保证 Sidebar 始终参与 flex 布局，避免条件渲染导致 MainArea 位置跳变。
+        if !self.should_render() {
+            return div()
+                .id(("macos-sidebar-placeholder", self.epoch))
+                .h_full()
+                .w(px(0.0))
+                .with_animation(
+                    ("sidebar-placeholder", self.epoch),
+                    gpui::Animation::new(Duration::from_millis(0)),
+                    |this, _| this,
+                );
+        }
+
         let target_width = SIDEBAR_WIDTH;
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;

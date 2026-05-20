@@ -186,9 +186,7 @@ impl Render for AppWindow {
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_sidebar(window, cx);
             }))
-            .when(self.sidebar.should_render(), |this| {
-                this.child(self.render_sidebar(cx))
-            })
+            .child(self.render_sidebar(cx))
             .child(self.render_main_area(cx))
             .when(cfg!(target_os = "macos"), |this| {
                 this.child(self.render_sidebar_toggle(cx))
