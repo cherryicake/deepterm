@@ -27,7 +27,8 @@ use crate::workspace::workspace::Workspace;
 
 // Layout constants
 const GRID_GAP_PX: f32 = 12.0;
-const MIN_CARD_WIDTH_PX: f32 = 320.0;
+const MIN_CARD_WIDTH_PX: f32 = 280.0;
+const MAX_CARD_WIDTH_PX: f32 = 360.0;
 const CONTENT_PADDING_PX: f32 = 24.0;
 
 /// Host connection type
@@ -578,7 +579,8 @@ impl HostsView {
 
         div()
             .id(format!("group-{}", group.id))
-            .w(px(280.0))
+            .w(px(MIN_CARD_WIDTH_PX))
+            .max_w(px(MAX_CARD_WIDTH_PX))
             .h(px(76.0))
             .px(px(12.0))
             .flex()
@@ -712,6 +714,8 @@ impl HostsView {
         div()
             .id(format!("host-{}", host.id))
             .w_full()
+            .min_w(px(MIN_CARD_WIDTH_PX))
+            .max_w(px(MAX_CARD_WIDTH_PX))
             .h(px(76.0))
             .px(px(12.0))
             .flex()
@@ -873,18 +877,22 @@ impl HostsView {
     }
 
     /// Calculate the number of columns based on available width
-    /// Accounts for sidebars (left: ~200px, right: ~300px when visible)
     fn calculate_columns(&self, available_width: f32) -> u16 {
-        // Account for left sidebar, right sidebar, and padding
-        // Each sidebar has ~12px outer padding
-        let sidebar_padding = 24.0 + 24.0; // left + right outer paddings
-        let sidebar_width = self.left_sidebar_width + self.right_sidebar_width + sidebar_padding;
-        let content_padding = CONTENT_PADDING_PX * 2.0;
-        let effective_width = available_width - sidebar_width - content_padding;
+        const MAX_CONTENT_WIDTH: f32 = 1200.0;
+
+        // HostsView sits in SshNewTabView's flex_1 area; when right sidebar is open,
+        // the remaining width is reduced by the sidebar width.
+        let hosts_view_width = available_width - self.left_sidebar_width - self.right_sidebar_width;
+
+        // Content container has max_w(1200.0), so cap to that to avoid over-counting columns
+        let content_width = hosts_view_width.max(0.0).min(MAX_CONTENT_WIDTH);
+
+        // Subtract section padding (24px on each side)
+        let grid_width = (content_width - CONTENT_PADDING_PX * 2.0).max(0.0);
 
         // Calculate max possible columns
         let max_cols =
-            ((effective_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
+            ((grid_width + GRID_GAP_PX) / (MIN_CARD_WIDTH_PX + GRID_GAP_PX)).floor() as u16;
 
         // Clamp to at least 1 column
         max_cols.max(1)
@@ -941,7 +949,7 @@ impl HostsView {
                     .map(|host| self.render_host_card(host, window, cx).into_any_element()),
             )
             // Add invisible placeholders to maintain grid alignment
-            .children((0..placeholder_count).map(|_| div().w_full().h(px(74.0)).into_any_element()))
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(76.0)).into_any_element()))
     }
 
     /// Render a keychain item card
@@ -960,6 +968,8 @@ impl HostsView {
         div()
             .id(format!("keychain-card-{}", item.id))
             .w_full()
+            .min_w(px(MIN_CARD_WIDTH_PX))
+            .max_w(px(MAX_CARD_WIDTH_PX))
             .h(px(76.0))
             .px(px(12.0))
             .flex()
@@ -1070,7 +1080,8 @@ impl HostsView {
                 self.render_keychain_card(item, icon, icon_color, cx)
                     .into_any_element()
             }))
-            .children((0..placeholder_count).map(|_| div().w_full().h(px(74.0)).into_any_element()))
+            // Add invisible placeholders to maintain grid alignment
+            .children((0..placeholder_count).map(|_| div().w_full().h(px(76.0)).into_any_element()))
     }
 
     /// Render the Keys section
