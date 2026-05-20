@@ -91,6 +91,9 @@ pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        #[cfg(target_os = "windows")]
+        KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
+        #[cfg(not(target_os = "windows"))]
         KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
     ]);
 }

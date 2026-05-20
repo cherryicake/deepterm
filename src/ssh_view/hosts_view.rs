@@ -465,7 +465,7 @@ impl HostsView {
                         div()
                             .text_color(theme.text_subtle)
                             .text_size(px(12.0))
-                            .child("⌘+K"),
+                            .child(if cfg!(target_os = "windows") { "Ctrl+K" } else { "⌘+K" }),
                     ),
             )
     }

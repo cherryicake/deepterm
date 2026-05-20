@@ -218,6 +218,9 @@ fn main() {
             crate::builtin_commands::executor::init_global_executor();
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
+                #[cfg(target_os = "windows")]
+                KeyBinding::new("ctrl-k", ShowSshPicker, None),
+                #[cfg(not(target_os = "windows"))]
                 KeyBinding::new("cmd-k", ShowSshPicker, None),
                 KeyBinding::new("cmd-n", NewWindow, None),
             ]);

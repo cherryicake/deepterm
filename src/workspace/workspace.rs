@@ -41,6 +41,9 @@ pub(crate) fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     // 使用 None 作为 context，让这些快捷键全局有效
     cx.bind_keys([
+        #[cfg(target_os = "windows")]
+        KeyBinding::new("ctrl-l", NewLocalTerminal, None),
+        #[cfg(not(target_os = "windows"))]
         KeyBinding::new("cmd-l", NewLocalTerminal, None),
         KeyBinding::new("cmd-w", CloseSelectedPanel, None),
     ]);
