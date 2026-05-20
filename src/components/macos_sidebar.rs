@@ -726,10 +726,18 @@ impl MacosSidebar {
         F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     {
         let theme = cx.theme().ui;
-        let (start_left, end_left, duration_ms) = if self.visible {
-            (BUTTON_LEFT_CLOSED, BUTTON_LEFT_OPEN, ANIMATION_ENTER_MS)
+        let button_left_closed = if cfg!(target_os = "macos") {
+            BUTTON_LEFT_CLOSED
         } else {
-            (BUTTON_LEFT_OPEN, BUTTON_LEFT_CLOSED, ANIMATION_EXIT_MS)
+            // Windows/Linux 没有交通灯按钮，关闭时距离左边缘 8px
+            8.0
+        };
+        // 侧边栏打开时，按钮位置所有平台一致
+        let button_left_open = BUTTON_LEFT_OPEN;
+        let (start_left, end_left, duration_ms) = if self.visible {
+            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
+        } else {
+            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
         };
 
         div()

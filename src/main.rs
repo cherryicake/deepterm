@@ -117,7 +117,7 @@ impl AppWindow {
         }))
     }
 
-    /// 渲染侧边栏切换按钮（macOS 专用）
+    /// 渲染侧边栏切换按钮
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         self.sidebar.render_toggle_button(
             cx,
@@ -131,30 +131,33 @@ impl AppWindow {
     /// 渲染右侧主内容区域（TitleBar + Workspace）。
     /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
     fn render_main_area(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        const TITLE_BAR_EXTRA_PAD: f32 = 116.0;
+        const TITLE_BAR_EXTRA_PAD_MACOS: f32 = 116.0;
+        const TITLE_BAR_EXTRA_PAD_WIN: f32 = 44.0;
         const SIDEBAR_ENTER_MS: u64 = 300;
         const SIDEBAR_EXIT_MS: u64 = 250;
 
-        let animated_title_bar = if cfg!(target_os = "macos") {
-            let (start_pl, end_pl, dur_ms) = if self.sidebar.is_visible() {
-                (TITLE_BAR_EXTRA_PAD, 0.0, SIDEBAR_ENTER_MS)
+        // macOS: 关闭时需为交通灯留出空间；打开后按钮移入 sidebar，padding 恢复。
+        // Windows/Linux: 关闭时按钮在左边缘（8px），需为按钮留出空间；打开后按钮移入 sidebar，padding 恢复。
+        let (start_pl, end_pl, dur_ms) = if cfg!(target_os = "macos") {
+            if self.sidebar.is_visible() {
+                (TITLE_BAR_EXTRA_PAD_MACOS, 0.0, SIDEBAR_ENTER_MS)
             } else {
-                (0.0, TITLE_BAR_EXTRA_PAD, SIDEBAR_EXIT_MS)
-            };
-            div().child(self.title_bar.clone()).with_animation(
-                ("titlebar-pad-anim", self.sidebar.animation_epoch()),
-                gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
-                    .with_easing(gpui::ease_in_out),
-                move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
-            )
+                (0.0, TITLE_BAR_EXTRA_PAD_MACOS, SIDEBAR_EXIT_MS)
+            }
         } else {
-            div().child(self.title_bar.clone()).with_animation(
-                ("titlebar-pad-anim", self.sidebar.animation_epoch()),
-                gpui::Animation::new(std::time::Duration::from_millis(1))
-                    .with_easing(gpui::ease_in_out),
-                move |this, _| this,
-            )
+            if self.sidebar.is_visible() {
+                (TITLE_BAR_EXTRA_PAD_WIN, 0.0, SIDEBAR_ENTER_MS)
+            } else {
+                (0.0, TITLE_BAR_EXTRA_PAD_WIN, SIDEBAR_EXIT_MS)
+            }
         };
+
+        let animated_title_bar = div().child(self.title_bar.clone()).with_animation(
+            ("titlebar-pad-anim", self.sidebar.animation_epoch()),
+            gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
+                .with_easing(gpui::ease_in_out),
+            move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
+        );
 
         div()
             .flex()
@@ -188,9 +191,7 @@ impl Render for AppWindow {
             }))
             .child(self.render_sidebar(cx))
             .child(self.render_main_area(cx))
-            .when(cfg!(target_os = "macos"), |this| {
-                this.child(self.render_sidebar_toggle(cx))
-            })
+            .child(self.render_sidebar_toggle(cx))
             .child(self.ssh_picker.clone())
     }
 }

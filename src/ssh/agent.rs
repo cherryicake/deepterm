@@ -15,6 +15,28 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key;
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(unix)]
+async fn create_agent_client() -> Result<AgentClient<UnixStream>, anyhow::Error> {
+    AgentClient::connect_env()
+        .await
+        .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))
+}
+
+#[cfg(windows)]
+async fn create_agent_client() -> Result<AgentClient<NamedPipeClient>, anyhow::Error> {
+    let path = std::env::var("SSH_AUTH_SOCK")
+        .map_err(|_| anyhow!("SSH_AUTH_SOCK 未设置"))?;
+    AgentClient::connect_named_pipe(&path)
+        .await
+        .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))
+}
+
 /// 判断本机 ssh-agent 是否可用（可连接），以及里面是否至少有一把身份。
 ///
 /// 当目标服务器的认证方式是 `Agent` / `Auto`（没有具体密钥路径）时，
@@ -32,9 +54,7 @@ pub fn agent_is_available() -> anyhow::Result<bool> {
         .map_err(|e| anyhow!("创建临时 runtime 失败: {}", e))?;
 
     rt.block_on(async move {
-        let mut client = AgentClient::connect_env()
-            .await
-            .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))?;
+        let mut client = create_agent_client().await?;
         let identities = client
             .request_identities()
             .await
@@ -69,9 +89,7 @@ pub fn agent_has_key(key_path: &Path) -> anyhow::Result<bool> {
         .map_err(|e| anyhow!("创建临时 runtime 失败: {}", e))?;
 
     let has = rt.block_on(async move {
-        let mut client = AgentClient::connect_env()
-            .await
-            .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))?;
+        let mut client = create_agent_client().await?;
         let identities = client
             .request_identities()
             .await
