@@ -14,7 +14,6 @@ const ANIMATION_EXIT_MS: u64 = 250;
 const BUTTON_LEFT_OPEN: f32 = 220.0;
 const BUTTON_LEFT_CLOSED: f32 = 84.0;
 const BUTTON_TOP: f32 = 12.0;
-const TITLE_BAR_EXTRA_PAD: f32 = 116.0;
 
 /// 侧边栏菜单项
 #[derive(Clone)]
@@ -170,6 +169,32 @@ impl MacosSidebar {
     /// 设置字体设置视图
     pub fn set_font_view(&mut self, view: Entity<FontSettingsView>) {
         self.font_view = Some(view);
+    }
+
+    /// 处理侧边栏菜单项点击，统一封装导航逻辑。
+    pub fn handle_item_select(&mut self, id: &str) {
+        match id {
+            "themes" => {
+                self.select_item(id);
+                self.navigate_to(SidebarView::Theme);
+            }
+            "font" => {
+                self.select_item(id);
+                self.navigate_to(SidebarView::Font);
+            }
+            "__back" => self.go_back(),
+            _ => self.select_item(id),
+        }
+    }
+
+    /// 当前是否可见（用于外部组件判断动画方向）。
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// 当前动画 epoch（用于外部组件同步动画）。
+    pub fn animation_epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
@@ -729,42 +754,6 @@ impl MacosSidebar {
                     .with_easing(gpui::ease_in_out),
                 move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
             )
-    }
-
-    /// 将 TitleBar 和 Workspace 包装成右侧主内容区域，并应用侧边栏开关时的
-    /// padding 补偿动画。
-    pub fn render_main_area(
-        &self,
-        title_bar: impl IntoElement,
-        workspace: impl IntoElement,
-        _cx: &gpui::App,
-    ) -> impl IntoElement {
-        let animated_title_bar = if cfg!(target_os = "macos") {
-            let (start_pl, end_pl, dur_ms) = if self.visible {
-                (TITLE_BAR_EXTRA_PAD, 0.0, ANIMATION_ENTER_MS)
-            } else {
-                (0.0, TITLE_BAR_EXTRA_PAD, ANIMATION_EXIT_MS)
-            };
-            div().child(title_bar).with_animation(
-                ("titlebar-pad-anim", self.epoch),
-                gpui::Animation::new(Duration::from_millis(dur_ms)).with_easing(gpui::ease_in_out),
-                move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
-            )
-        } else {
-            div().child(title_bar).with_animation(
-                ("titlebar-pad-anim", self.epoch),
-                gpui::Animation::new(Duration::from_millis(1)).with_easing(gpui::ease_in_out),
-                move |this, _| this,
-            )
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .child(animated_title_bar)
-            .child(div().flex_1().min_h_0().overflow_hidden().child(workspace))
     }
 
     fn glass_bg(is_dark: bool) -> gpui::Hsla {

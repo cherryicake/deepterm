@@ -15,8 +15,8 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, IntoElement, KeyBinding,
-    ParentElement, Render, Window, actions, div,
+    AnimationExt, App, Context, Entity, IntoElement, KeyBinding,
+    ParentElement, Render, Window, actions, div, px,
 };
 
 use crate::components::macos_sidebar::MacosSidebar;
@@ -94,7 +94,7 @@ impl AppWindow {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(250 + 40))
                     .await;
-                let _ = entity.update(cx, |this, cx| {
+                entity.update(cx, |this, cx| {
                     this.sidebar.finish_animation();
                     cx.notify();
                 });
@@ -103,6 +103,66 @@ impl AppWindow {
             self._sidebar_hide_task = None;
         }
         cx.notify();
+    }
+
+    /// 渲染侧边栏区域
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = self.sidebar.clone();
+        let entity = cx.entity();
+        div().child(sidebar.render_sidebar(cx, move |id, _window, cx| {
+            entity.update(cx, |this, cx| {
+                this.sidebar.handle_item_select(id);
+                cx.notify();
+            });
+        }))
+    }
+
+    /// 渲染侧边栏切换按钮（macOS 专用）
+    fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sidebar.render_toggle_button(
+            cx,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_sidebar(window, cx);
+            }),
+        )
+    }
+
+    /// 渲染右侧主内容区域（TitleBar + Workspace）。
+    /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
+    fn render_main_area(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        const TITLE_BAR_EXTRA_PAD: f32 = 116.0;
+        const SIDEBAR_ENTER_MS: u64 = 300;
+        const SIDEBAR_EXIT_MS: u64 = 250;
+
+        let animated_title_bar = if cfg!(target_os = "macos") {
+            let (start_pl, end_pl, dur_ms) = if self.sidebar.is_visible() {
+                (TITLE_BAR_EXTRA_PAD, 0.0, SIDEBAR_ENTER_MS)
+            } else {
+                (0.0, TITLE_BAR_EXTRA_PAD, SIDEBAR_EXIT_MS)
+            };
+            div().child(self.title_bar.clone()).with_animation(
+                ("titlebar-pad-anim", self.sidebar.animation_epoch()),
+                gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
+                    .with_easing(gpui::ease_in_out),
+                move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
+            )
+        } else {
+            div().child(self.title_bar.clone()).with_animation(
+                ("titlebar-pad-anim", self.sidebar.animation_epoch()),
+                gpui::Animation::new(std::time::Duration::from_millis(1))
+                    .with_easing(gpui::ease_in_out),
+                move |this, _| this,
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .child(animated_title_bar)
+            .child(div().flex_1().min_h_0().overflow_hidden().child(self.workspace.clone()))
     }
 }
 
@@ -127,49 +187,11 @@ impl Render for AppWindow {
                 this.toggle_sidebar(window, cx);
             }))
             .when(self.sidebar.should_render(), |this| {
-                let sidebar = self.sidebar.clone();
-                let entity = cx.entity();
-                this.child(
-                    div()
-                        .child(sidebar.render_sidebar(cx, move |id, _window, cx| {
-                            let _ = entity.update(cx, |this, cx| {
-                                match id {
-                                    "themes" => {
-                                        this.sidebar.select_item(id);
-                                        this.sidebar.navigate_to(
-                                            crate::components::macos_sidebar::SidebarView::Theme);
-                                    }
-                                    "font" => {
-                                        this.sidebar.select_item(id);
-                                        this.sidebar.navigate_to(
-                                            crate::components::macos_sidebar::SidebarView::Font);
-                                    }
-                                    "__back" => {
-                                        this.sidebar.go_back();
-                                    }
-                                    _ => {
-                                        this.sidebar.select_item(id);
-                                    }
-                                }
-                                cx.notify();
-                            });
-                        })),
-                )
+                this.child(self.render_sidebar(cx))
             })
-            .child(self.sidebar.render_main_area(
-                self.title_bar.clone(),
-                self.workspace.clone(),
-                cx,
-            ))
+            .child(self.render_main_area(cx))
             .when(cfg!(target_os = "macos"), |this| {
-                this.child(self.sidebar.render_toggle_button(
-                    cx,
-                    cx.listener(|this, _, _window, cx| {
-                        cx.stop_propagation();
-                        this.sidebar.toggle();
-                        cx.notify();
-                    }),
-                ))
+                this.child(self.render_sidebar_toggle(cx))
             })
             .child(self.ssh_picker.clone())
     }
