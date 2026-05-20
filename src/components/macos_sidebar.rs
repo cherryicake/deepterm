@@ -136,11 +136,6 @@ impl MacosSidebar {
         self.animating_out = false;
     }
 
-    /// 当前是否处于可见或正在退出的状态（需要渲染）。
-    pub fn should_render(&self) -> bool {
-        self.visible || self.animating_out
-    }
-
     /// 选中指定 ID 的菜单项。
     pub fn select_item(&mut self, id: &str) {
         self.selected_id = Some(id.to_string());
@@ -198,22 +193,17 @@ impl MacosSidebar {
     }
 
     /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
-    pub fn render_sidebar<F>(&self, cx: &gpui::App, on_select: F) -> impl IntoElement
+    /// 完全收起时返回宽度为 0 的占位，保证始终参与 flex 布局。
+    pub fn render_sidebar<F>(&self, cx: &gpui::App, on_select: F) -> gpui::AnyElement
     where
         F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
     {
-        // 完全收起且不在动画中时，渲染一个宽度为 0 的占位，
-        // 保证 Sidebar 始终参与 flex 布局，避免条件渲染导致 MainArea 位置跳变。
-        if !self.should_render() {
+        if !self.visible && !self.animating_out {
             return div()
                 .id(("macos-sidebar-placeholder", self.epoch))
                 .h_full()
                 .w(px(0.0))
-                .with_animation(
-                    ("sidebar-placeholder", self.epoch),
-                    gpui::Animation::new(Duration::from_millis(0)),
-                    |this, _| this,
-                );
+                .into_any_element();
         }
 
         let target_width = SIDEBAR_WIDTH;
@@ -282,6 +272,7 @@ impl MacosSidebar {
                     this.w(px(width.max(0.0)))
                 },
             )
+            .into_any_element()
     }
 
     fn render_menu_content<F>(
