@@ -497,11 +497,11 @@ impl Render for TitleBar {
             .flex_row()
             .items_center()
             .h(TITLE_BAR_HEIGHT)
-            // macOS: 非全屏时留出红绿灯按钮位置，全屏时占据全部宽度
+            // macOS 非全屏时为交通灯留出基础边距；其余情况统一使用 8px
             .when(is_macos && !is_fullscreen, |this| {
                 this.pl(TITLE_BAR_LEFT_PADDING)
             })
-            .when(is_macos && is_fullscreen, |this| this.pl_3())
+            .when(is_macos && is_fullscreen, |this| this.pl(TITLE_BAR_LEFT_PADDING))
             .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
             .bg(theme.app_background)
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
