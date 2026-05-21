@@ -3,6 +3,7 @@ name = "deepterm"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+build = "build.rs"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed.git" }
@@ -90,6 +91,7 @@ libc = "0.2"
 russh = "0.59.0"
 
 [target.'cfg(windows)'.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed.git", features = ["windows-manifest"] }
 windows = { version = "0.52", features = [
   "Win32_System_Console",
   "Win32_Foundation",
@@ -129,6 +131,9 @@ long_description = """
 DeepTerm is a modern terminal emulator built with Rust and GPUI.
 Supports local terminals and SSH remote connections.
 """
+
+[build-dependencies]
+embed-resource = "2"
 
 [features]
 default = ["tree-sitter-languages"]

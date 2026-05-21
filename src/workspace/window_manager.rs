@@ -37,6 +37,8 @@ impl WindowManager {
                 #[cfg(not(target_os = "macos"))]
                 is_movable: true,
                 window_background: WindowBackgroundAppearance::Blurred,
+                show: false,
+                focus: false,
                 ..Default::default()
             },
             |window, cx| {
@@ -46,6 +48,9 @@ impl WindowManager {
                     window_handle.update(cx, |app, cx| {
                         app.setup_initial_focus(window, cx);
                     });
+                    // 窗口内容初始化完成后，再显示并激活窗口
+                    // 避免 Windows 上启动时出现空白窗口/闪烁问题
+                    window.activate_window();
                 });
                 app_window
             },

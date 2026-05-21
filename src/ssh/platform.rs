@@ -236,9 +236,13 @@ pub fn detect_wsl_os(command: &str, args: &[String]) -> RemoteOS {
     // No -d arg: try to detect default WSL distro
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
         // Use `wsl --list --verbose` to find the default distro (marked with *)
         if let Ok(output) = std::process::Command::new("wsl.exe")
             .args(["--list", "--verbose"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             if output.status.success() {

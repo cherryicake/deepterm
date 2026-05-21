@@ -69,10 +69,21 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
     }
 }
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// 检测命令是否可用
 fn is_command_available(cmd: &str, args: &[&str]) -> bool {
-    std::process::Command::new(cmd)
-        .args(args)
+    let mut command = std::process::Command::new(cmd);
+    command.args(args);
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -112,9 +123,13 @@ fn scan_windows_terminals() -> Vec<LocalTerminalOption> {
     ));
 
     // WSL 发行版
-    if let Ok(output) = std::process::Command::new("wsl.exe")
-        .args(["--list", "--quiet"])
-        .output()
+    let mut wsl_cmd = std::process::Command::new("wsl.exe");
+    wsl_cmd.args(["--list", "--quiet"]);
+    #[cfg(windows)]
+    {
+        wsl_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = wsl_cmd.output()
     {
         if output.status.success() {
             let output_str = decode_wsl_output(&output.stdout);

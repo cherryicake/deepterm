@@ -1,4 +1,6 @@
 #![cfg_attr(target_family = "wasm", no_main)]
+// 在 Windows Release 构建时隐藏控制台窗口，避免双击启动时弹出终端
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 pub mod assets;
 pub mod builtin_commands;
