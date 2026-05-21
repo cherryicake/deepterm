@@ -721,15 +721,21 @@ impl MacosSidebar {
     /// 渲染切换按钮（含位移动画）。
     ///
     /// 事件处理器通过 `on_toggle` 传入，调用者通常使用 `cx.listener` 构造。
-    pub fn render_toggle_button<F>(&self, cx: &gpui::App, on_toggle: F) -> impl IntoElement
+    /// `is_fullscreen` 用于 macOS 全屏模式：此时没有交通灯按钮，无需额外左偏移。
+    pub fn render_toggle_button<F>(
+        &self,
+        cx: &gpui::App,
+        is_fullscreen: bool,
+        on_toggle: F,
+    ) -> impl IntoElement
     where
         F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     {
         let theme = cx.theme().ui;
-        let button_left_closed = if cfg!(target_os = "macos") {
+        let button_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
             BUTTON_LEFT_CLOSED
         } else {
-            // Windows/Linux 没有交通灯按钮，关闭时距离左边缘 8px
+            // Windows/Linux 没有交通灯按钮；macOS 全屏时也没有
             8.0
         };
         // 侧边栏打开时，按钮位置所有平台一致

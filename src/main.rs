@@ -118,9 +118,10 @@ impl AppWindow {
     }
 
     /// 渲染侧边栏切换按钮
-    fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_toggle(&self, window: &gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sidebar.render_toggle_button(
             cx,
+            window.is_fullscreen(),
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.toggle_sidebar(window, cx);
@@ -130,23 +131,28 @@ impl AppWindow {
 
     /// 渲染右侧主内容区域（TitleBar + Workspace）。
     /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
-    fn render_main_area(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main_area(&self, window: &gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
         const TITLE_BAR_EXTRA_PAD_MACOS: f32 = 116.0;
         const TITLE_BAR_EXTRA_PAD_WIN: f32 = 44.0;
         const SIDEBAR_ENTER_MS: u64 = 300;
         const SIDEBAR_EXIT_MS: u64 = 250;
 
-        // macOS: 关闭时需为交通灯留出空间；打开后按钮移入 sidebar，padding 恢复。
-        // Windows/Linux: 关闭时按钮在左边缘（8px），需为按钮留出空间；打开后按钮移入 sidebar，padding 恢复。
-        let (start_pl, end_pl, dur_ms) = if cfg!(target_os = "macos") {
-            if self.sidebar.is_visible() {
+        let is_fullscreen = window.is_fullscreen();
+
+        // macOS 非全屏: 关闭时需为交通灯+toggle 按钮留出空间(116px)；
+        //   打开后按钮移入 sidebar，padding 恢复。
+        // macOS 全屏 / Windows / Linux: 关闭时 toggle 按钮在左边缘(8px)，
+        //   需为按钮留出 44px 空间；打开后按钮移入 sidebar，padding 恢复。
+        let needs_traffic_pad = cfg!(target_os = "macos") && !is_fullscreen;
+        let (start_pl, end_pl, dur_ms) = if self.sidebar.is_visible() {
+            if needs_traffic_pad {
                 (TITLE_BAR_EXTRA_PAD_MACOS, 0.0, SIDEBAR_ENTER_MS)
             } else {
-                (0.0, TITLE_BAR_EXTRA_PAD_MACOS, SIDEBAR_EXIT_MS)
+                (TITLE_BAR_EXTRA_PAD_WIN, 0.0, SIDEBAR_ENTER_MS)
             }
         } else {
-            if self.sidebar.is_visible() {
-                (TITLE_BAR_EXTRA_PAD_WIN, 0.0, SIDEBAR_ENTER_MS)
+            if needs_traffic_pad {
+                (0.0, TITLE_BAR_EXTRA_PAD_MACOS, SIDEBAR_EXIT_MS)
             } else {
                 (0.0, TITLE_BAR_EXTRA_PAD_WIN, SIDEBAR_EXIT_MS)
             }
@@ -170,7 +176,7 @@ impl AppWindow {
 }
 
 impl Render for AppWindow {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
 
         div()
@@ -190,8 +196,8 @@ impl Render for AppWindow {
                 this.toggle_sidebar(window, cx);
             }))
             .child(self.render_sidebar(cx))
-            .child(self.render_main_area(cx))
-            .child(self.render_sidebar_toggle(cx))
+            .child(self.render_main_area(window, cx))
+            .child(self.render_sidebar_toggle(window, cx))
             .child(self.ssh_picker.clone())
     }
 }
