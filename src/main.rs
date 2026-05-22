@@ -7,7 +7,7 @@ pub mod builtin_commands;
 pub mod components;
 pub mod file_browser;
 pub mod file_transfer;
-mod settings_hub;
+mod sidebar_view;
 pub mod ssh;
 pub mod ssh_view;
 pub mod terminal;
@@ -23,7 +23,7 @@ use gpui::{
 
 use crate::components::macos_sidebar::MacosSidebar;
 use crate::components::title_bar::TitleBar;
-use crate::settings_hub::font_view::FontSettingsView;
+use crate::sidebar_view::font_view::FontSettingsView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::ToggleSidebar;
@@ -226,7 +226,7 @@ fn main() {
         .with_assets(Assets)
         .run(|cx: &mut App| {
             theme::init(cx);
-            settings_hub::font_settings::FontState::init(cx);
+            sidebar_view::font_settings::FontState::init(cx);
             components::init(cx);
             terminal_view::init(cx);
             workspace::init(cx);

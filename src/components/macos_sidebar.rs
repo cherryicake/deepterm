@@ -5,9 +5,10 @@ use gpui::prelude::*;
 use gpui::{AnimationExt, Entity, ScrollHandle, StatefulInteractiveElement, Window, div, px};
 
 use crate::assets::Icon;
-use crate::settings_hub::font_view::FontSettingsView;
-use crate::ssh_view::hosts_view::HostsView;
-use crate::theme::{ActiveTheme, ThemeState};
+use crate::sidebar_view::font_view::FontSettingsView;
+use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
+use crate::sidebar_view::{host_view, theme_view};
+use crate::theme::ActiveTheme;
 
 const SIDEBAR_WIDTH: f32 = 260.0;
 const ANIMATION_ENTER_MS: u64 = 300;
@@ -235,17 +236,21 @@ impl MacosSidebar {
         // 根据当前视图渲染不同内容
         let content = match self.current_view {
             SidebarView::Menu => self.render_menu_content(cx, on_select.clone(), is_dark, theme),
-            SidebarView::Theme => self.render_theme_content(cx, on_select.clone(), is_dark, theme),
+            SidebarView::Theme => {
+                theme_view::render_theme_sidebar(cx, on_select.clone(), is_dark, theme, &self.theme_scroll_handle)
+            }
             SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme),
-            SidebarView::Host => self.render_host_content(cx, on_select.clone(), is_dark, theme),
+            SidebarView::Host => {
+                host_view::render_host_sidebar(cx, on_select.clone(), is_dark, theme, &self.host_scroll_handle, self.selected_id.as_deref())
+            }
         };
 
         let inner = div()
             .h_full()
             .rounded(px(12.0))
-            .bg(Self::glass_bg(is_dark))
+            .bg(glass_bg(is_dark))
             .border(px(0.5))
-            .border_color(Self::border_color(is_dark))
+            .border_color(border_color(is_dark))
             .flex()
             .flex_col()
             .pt(px(48.0))
@@ -308,7 +313,7 @@ impl MacosSidebar {
                 this.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .when(!is_homepage_selected, |this| {
-                this.hover(|style| style.bg(Self::hover_bg(is_dark)))
+                        this.hover(|style| style.bg(hover_bg(is_dark)))
                     .text_color(theme.text)
             })
             .child(
@@ -380,7 +385,7 @@ impl MacosSidebar {
                         this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
                     .when(!is_selected, |this| {
-                        this.hover(|style| style.bg(Self::hover_bg(is_dark)))
+                this.hover(|style| style.bg(hover_bg(is_dark)))
                             .text_color(theme.text)
                     })
                     .child(
@@ -425,229 +430,6 @@ impl MacosSidebar {
         menu_content
     }
 
-    fn render_theme_content<F>(
-        &self,
-        cx: &gpui::App,
-        on_select: Rc<F>,
-        is_dark: bool,
-        theme: crate::theme::UiTheme,
-    ) -> gpui::Div
-    where
-        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
-    {
-        let active_theme_id = ThemeState::global(cx).active_theme_id().to_string();
-        let themes = ThemeState::themes(cx).to_vec();
-
-        // 顶部导航栏
-        let header = div()
-            .w_full()
-            .h(px(36.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .px(px(4.0))
-            .mb(px(8.0))
-            .child(
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(Self::button_bg(is_dark))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(Self::button_bg_hover(is_dark)))
-                    .child(
-                        gpui::svg()
-                            .size(px(16.0))
-                            .path(Icon::ChevronLeft.path())
-                            .text_color(theme.text),
-                    )
-                    .on_mouse_down(gpui::MouseButton::Left, {
-                        let on_select = on_select.clone();
-                        move |_, window, cx| on_select("__back", window, cx)
-                    }),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child("主题"),
-            )
-            .child(div().w(px(28.0)));
-
-        // 搜索框
-        let search_box = div()
-            .w_full()
-            .h(px(32.0))
-            .flex()
-            .items_center()
-            .px(px(10.0))
-            .gap(px(6.0))
-            .rounded(px(8.0))
-            .bg(Self::hover_bg(is_dark))
-            .mb(px(12.0))
-            .child(
-                gpui::svg()
-                    .size(px(14.0))
-                    .path(Icon::MagnifyingGlass.path())
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child("搜索主题"),
-            );
-
-        // 主题列表 —— 直接复制 settings_view.rs 的 render_theme_card 色块布局，等比缩小
-        let mut theme_list = div().w_full().flex().flex_col().gap(px(2.0));
-
-        for (index, theme_item) in themes.iter().enumerate() {
-            let is_active = theme_item.id == active_theme_id;
-            let theme_id = theme_item.id.clone();
-            let preview_colors = theme_item.terminal.preview_colors();
-
-            // 第一行：仅 accent 色块，比 ANSI 色块大 1.5 倍
-            let accent_preview = div()
-                .w(px(14.0))
-                .h(px(14.0))
-                .rounded(px(4.0))
-                .bg(theme_item.ui.accent);
-
-            // ANSI normal & bright
-            let ansi_top = div().flex().gap(px(2.0)).children(
-                preview_colors[..8]
-                    .iter()
-                    .copied()
-                    .map(|color| div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)),
-            );
-            let ansi_bottom = div().flex().gap(px(2.0)).children(
-                preview_colors[8..]
-                    .iter()
-                    .copied()
-                    .map(|color| div().w(px(9.0)).h(px(9.0)).rounded(px(2.0)).bg(color)),
-            );
-
-            let color_preview = div()
-                .flex()
-                .flex_shrink_0()
-                .flex_col()
-                .items_center()
-                .gap(px(2.0))
-                .child(accent_preview)
-                .child(ansi_top)
-                .child(ansi_bottom);
-
-            let row = div()
-                .id(("theme-item", index))
-                .w_full()
-                .p(px(10.0))
-                .rounded(px(8.0))
-                .cursor_pointer()
-                .when(is_active, |this| {
-                    this.bg(theme.accent).text_color(theme.accent_foreground)
-                })
-                .when(!is_active, |this| {
-                    this.hover(|style| style.bg(Self::hover_bg(is_dark)))
-                        .text_color(theme.text)
-                })
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap(px(10.0))
-                .child(color_preview)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(if is_active {
-                                            theme.accent_foreground
-                                        } else {
-                                            theme.text
-                                        })
-                                        .child(theme_item.name.clone()),
-                                )
-                                .when(is_active, |this| {
-                                    this.child(
-                                        div()
-                                            .px(px(6.0))
-                                            .h(px(18.0))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(999.0))
-                                            .bg(theme.accent_foreground)
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(theme.accent)
-                                                    .child("当前"),
-                                            ),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .text_size(px(10.0))
-                                .line_height(px(14.0))
-                                .h(px(28.0))
-                                .overflow_hidden()
-                                .text_color(if is_active {
-                                    theme.accent_foreground.opacity(0.7)
-                                } else {
-                                    theme.text_muted
-                                })
-                                .child(theme_item.description.clone()),
-                        ),
-                )
-                .on_click({
-                    let theme_id = theme_id.clone();
-                    move |_, _window, cx| {
-                        ThemeState::set_active(&theme_id, cx);
-                    }
-                });
-
-            theme_list = theme_list.child(row);
-        }
-
-        div()
-            .w_full()
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(search_box)
-            .child(
-                div()
-                    .id("theme-scroll")
-                    .track_scroll(&self.theme_scroll_handle)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .child(theme_list),
-            )
-    }
-
     fn render_font_content<F>(
         &self,
         _cx: &gpui::App,
@@ -675,9 +457,9 @@ impl MacosSidebar {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(Self::button_bg(is_dark))
+                    .bg(button_bg(is_dark))
                     .cursor_pointer()
-                    .hover(|style| style.bg(Self::button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(is_dark)))
                     .child(
                         gpui::svg()
                             .size(px(16.0))
@@ -720,200 +502,6 @@ impl MacosSidebar {
                     .flex()
                     .flex_col()
                     .child(font_content),
-            )
-    }
-
-    fn render_host_content<F>(
-        &self,
-        cx: &gpui::App,
-        on_select: Rc<F>,
-        is_dark: bool,
-        theme: crate::theme::UiTheme,
-    ) -> gpui::Div
-    where
-        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
-    {
-        let (hosts, _, _) = HostsView::load_hosts_from_config();
-
-        // 顶部导航栏
-        let header = div()
-            .w_full()
-            .h(px(36.0))
-            .flex()
-            .items_center()
-            .justify_between()
-            .px(px(4.0))
-            .mb(px(8.0))
-            .child(
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(Self::button_bg(is_dark))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(Self::button_bg_hover(is_dark)))
-                    .child(
-                        gpui::svg()
-                            .size(px(16.0))
-                            .path(Icon::ChevronLeft.path())
-                            .text_color(theme.text),
-                    )
-                    .on_mouse_down(gpui::MouseButton::Left, {
-                        let on_select = on_select.clone();
-                        move |_, window, cx| on_select("__back", window, cx)
-                    }),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child("Host"),
-            )
-            .child(div().w(px(28.0)));
-
-        // 搜索框
-        let search_box = div()
-            .w_full()
-            .h(px(32.0))
-            .flex()
-            .items_center()
-            .px(px(10.0))
-            .gap(px(6.0))
-            .rounded(px(8.0))
-            .bg(Self::hover_bg(is_dark))
-            .mb(px(12.0))
-            .child(
-                gpui::svg()
-                    .size(px(14.0))
-                    .path(Icon::MagnifyingGlass.path())
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child("搜索主机"),
-            );
-
-        // Host 列表
-        let mut host_list = div().w_full().flex().flex_col();
-
-        for (index, host) in hosts.iter().enumerate() {
-            let icon_color = host.icon_color.to_hsla(cx);
-            let host_id = host.id.to_string();
-            let is_selected = self.selected_id.as_deref() == Some(&host_id);
-
-            let row = div()
-                .id(("host-item", index))
-                .w_full()
-                .h(px(52.0))
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .rounded(px(8.0))
-                .cursor_pointer()
-                .when(is_selected, |this| {
-                    this.bg(theme.accent).text_color(theme.accent_foreground)
-                })
-                .when(!is_selected, |this| {
-                    this.hover(|style| style.bg(Self::hover_bg(is_dark)))
-                        .text_color(theme.text)
-                })
-                .child(
-                    div()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .rounded(px(8.0))
-                        .bg(if is_selected {
-                            theme.accent_foreground
-                        } else {
-                            icon_color
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            gpui::svg()
-                                .size(px(16.0))
-                                .path(host.os_icon.unwrap_or(Icon::Linux).path())
-                                .text_color(if is_selected {
-                                    theme.accent
-                                } else {
-                                    theme.accent_foreground
-                                }),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .justify_center()
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(if is_selected {
-                                            theme.accent_foreground
-                                        } else {
-                                            theme.text
-                                        })
-                                        .child(host.name.to_string()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .text_size(px(10.0))
-                                .line_height(px(14.0))
-                                .text_color(if is_selected {
-                                    theme.accent_foreground.opacity(0.7)
-                                } else {
-                                    theme.text_muted
-                                })
-                                .child(host.subtitle()),
-                        ),
-                )
-                .on_click({
-                    let on_select = on_select.clone();
-                    let id = host_id.clone();
-                    move |_, window, cx| on_select(&id, window, cx)
-                });
-
-            host_list = host_list.child(row);
-        }
-
-        div()
-            .w_full()
-            .h_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(search_box)
-            .child(
-                div()
-                    .id("host-scroll")
-                    .track_scroll(&self.host_scroll_handle)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .child(host_list),
             )
     }
 
@@ -972,46 +560,6 @@ impl MacosSidebar {
                     .with_easing(gpui::ease_in_out),
                 move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
             )
-    }
-
-    fn glass_bg(is_dark: bool) -> gpui::Hsla {
-        if is_dark {
-            gpui::Hsla::from(gpui::rgb(0x2C2C2E)).opacity(0.85)
-        } else {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.85)
-        }
-    }
-
-    fn border_color(is_dark: bool) -> gpui::Hsla {
-        if is_dark {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.14)
-        } else {
-            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.08)
-        }
-    }
-
-    fn hover_bg(is_dark: bool) -> gpui::Hsla {
-        if is_dark {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.08)
-        } else {
-            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.06)
-        }
-    }
-
-    fn button_bg(is_dark: bool) -> gpui::Hsla {
-        if is_dark {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.10)
-        } else {
-            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.06)
-        }
-    }
-
-    fn button_bg_hover(is_dark: bool) -> gpui::Hsla {
-        if is_dark {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.15)
-        } else {
-            gpui::Hsla::from(gpui::rgb(0x000000)).opacity(0.10)
-        }
     }
 }
 

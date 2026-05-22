@@ -6,7 +6,7 @@ use gpui::{
 
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::select::Select;
-use crate::settings_hub::font_settings::{
+use crate::sidebar_view::font_settings::{
     FontState, clean_font_choice, format_font_choice, platform_default_font_family,
 };
 use crate::theme::ActiveTheme;

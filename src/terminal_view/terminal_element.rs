@@ -1,6 +1,6 @@
 //! Terminal element for rendering
 
-use crate::settings_hub::font_settings::{FontState, platform_default_fallbacks};
+use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::convert_alacritty_color;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
@@ -984,7 +984,7 @@ impl Element for TerminalElement {
         let line_height = font_size * settings.terminal_line_height;
 
         let font_family =
-            crate::settings_hub::font_settings::clean_font_choice(&settings.terminal_font_family)
+            crate::sidebar_view::font_settings::clean_font_choice(&settings.terminal_font_family)
                 .to_string()
                 .into();
         let font_fallbacks = Some(platform_default_fallbacks());
