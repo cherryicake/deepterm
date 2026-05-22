@@ -63,7 +63,28 @@ where
                 .text_color(theme.text)
                 .child("Host"),
         )
-        .child(div().w(px(28.0)));
+        .child(
+            div()
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(999.0))
+                .bg(button_bg(is_dark))
+                .cursor_pointer()
+                .hover(|style| style.bg(button_bg_hover(is_dark)))
+                .child(
+                    gpui::svg()
+                        .size(px(12.0))
+                        .path(Icon::Plus.path())
+                        .text_color(theme.text),
+                )
+                .on_mouse_down(MouseButton::Left, {
+                    let on_select = on_select.clone();
+                    move |_, window, cx| on_select("__add", window, cx)
+                }),
+        );
 
     // 搜索框
     let search_box = div()
