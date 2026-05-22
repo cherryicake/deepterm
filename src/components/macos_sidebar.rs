@@ -91,12 +91,8 @@ impl MacosSidebar {
                     )],
                 ),
                 SidebarMenuSection::new(
-                    Some("iCloud 标签页"),
-                    vec![SidebarMenuItem::new(
-                        "iphone",
-                        "周松的 iPhone",
-                        Some(Icon::Host),
-                    )],
+                    Some("已保存"),
+                    vec![SidebarMenuItem::new("host", "Host", Some(Icon::Host))],
                 ),
                 SidebarMenuSection::new(
                     Some("偏好设置"),

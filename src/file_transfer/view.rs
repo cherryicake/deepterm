@@ -238,21 +238,40 @@ fn render_transfer_list_item(
                 .text_color(theme.text)
                 .child(display_name),
         )
-        .when(is_running && total_bytes > 0, |this| {
-            this.child(
-                div()
-                    .w_full()
-                    .h(px(4.0))
-                    .rounded(px(2.0))
-                    .bg(theme.border.opacity(0.5))
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(progress_ratio as f32))
-                            .rounded(px(2.0))
-                            .bg(rgb(0x3b82f6)),
-                    ),
-            )
+        .when(is_running, |this| {
+            if total_bytes > 0 {
+                // 确定进度：已知总大小
+                this.child(
+                    div()
+                        .w_full()
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(theme.border.opacity(0.5))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(progress_ratio as f32))
+                                .rounded(px(2.0))
+                                .bg(rgb(0x3b82f6)),
+                        ),
+                )
+            } else {
+                // 不确定进度：总大小未知（如远程源文件元数据获取失败）
+                this.child(
+                    div()
+                        .w_full()
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(theme.border.opacity(0.5))
+                        .child(
+                            div()
+                                .h_full()
+                                .w_full()
+                                .rounded(px(2.0))
+                                .bg(gpui::Hsla::from(rgb(0x3b82f6)).opacity(0.5)),
+                        ),
+                )
+            }
         })
         .child(
             div()

@@ -824,6 +824,10 @@ impl Workspace {
                     summary.files_transferred,
                     summary.bytes_transferred
                 );
+                // quick_total_size 异步计算失败时 total_bytes 可能为 0，用实际传输字节回填
+                if task.total_bytes == 0 {
+                    task.total_bytes = summary.bytes_transferred;
+                }
                 task.status = TransferTaskStatus::Completed {
                     files: summary.files_transferred,
                     bytes: summary.bytes_transferred,

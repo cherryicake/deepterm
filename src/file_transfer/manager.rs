@@ -977,6 +977,7 @@ fn copy_via_agent_forward_scp(
          -o StrictHostKeyChecking=accept-new \
          -o UserKnownHostsFile=/dev/null \
          -o LogLevel=ERROR \
+         -o ConnectTimeout=10 \
          '{src}' '{dst_host}:{dst_path}'",
         recurse = recurse,
         port_arg = port_arg,
@@ -1178,6 +1179,7 @@ fn copy_via_remote_scp(
          -o StrictHostKeyChecking=accept-new \
          -o UserKnownHostsFile=/dev/null \
          -o LogLevel=ERROR \
+         -o ConnectTimeout=10 \
          -i '{key}' '{src}' '{dst_host}:{dst_path}'",
         recurse = recurse,
         port_flag = port_flag,
