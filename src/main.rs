@@ -111,12 +111,21 @@ impl AppWindow {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.sidebar.clone();
         let entity = cx.entity();
-        div().child(sidebar.render_sidebar(cx, move |id, _window, cx| {
-            entity.update(cx, |this, cx| {
-                this.sidebar.handle_item_select(id);
-                cx.notify();
-            });
-        }))
+        let workspace = self.workspace.clone();
+        div().child(sidebar.render_sidebar(
+            cx,
+            move |id, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.sidebar.handle_item_select(id);
+                    cx.notify();
+                });
+            },
+            move |config, window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    ws.create_ssh_terminal_with_config(config, window, cx);
+                });
+            },
+        ))
     }
 
     /// 渲染侧边栏切换按钮

@@ -209,9 +209,10 @@ impl MacosSidebar {
 
     /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
     /// 完全收起时返回宽度为 0 的占位，保证始终参与 flex 布局。
-    pub fn render_sidebar<F>(&self, cx: &gpui::App, on_select: F) -> gpui::AnyElement
+    pub fn render_sidebar<F, G>(&self, cx: &gpui::App, on_select: F, on_double_click: G) -> gpui::AnyElement
     where
         F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
+        G: Fn(&crate::ssh::config::SshConnectionConfig, &mut Window, &mut gpui::App) + 'static,
     {
         if !self.visible && !self.animating_out {
             return div()
@@ -225,6 +226,7 @@ impl MacosSidebar {
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
         let on_select = Rc::new(on_select);
+        let on_double_click = Rc::new(on_double_click);
 
         let (anim_id, anim_key, duration_ms, width_fn): (&str, &str, u64, Box<dyn Fn(f32) -> f32>) =
             if self.visible {
@@ -251,7 +253,7 @@ impl MacosSidebar {
             }
             SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme),
             SidebarView::Host => {
-                host_view::render_host_sidebar(cx, on_select.clone(), is_dark, theme, &self.host_scroll_handle, self.selected_id.as_deref())
+                host_view::render_host_sidebar(cx, on_select.clone(), on_double_click.clone(), is_dark, theme, &self.host_scroll_handle, self.selected_id.as_deref())
             }
             SidebarView::Keychain => {
                 keychain_view::render_keychain_sidebar(cx, on_select.clone(), is_dark, theme, &self.keychain_scroll_handle, self.selected_id.as_deref())

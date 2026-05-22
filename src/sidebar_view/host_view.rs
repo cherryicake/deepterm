@@ -5,13 +5,15 @@ use gpui::prelude::*;
 
 use crate::assets::Icon;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
+use crate::ssh::config::SshConnectionConfig;
 use crate::ssh_view::hosts_view::HostsView;
 use crate::theme::ActiveTheme;
 
 /// 渲染 Host 侧边栏视图
-pub fn render_host_sidebar<F>(
+pub fn render_host_sidebar<F, G>(
     cx: &App,
     on_select: Rc<F>,
+    on_double_click: Rc<G>,
     is_dark: bool,
     theme: crate::theme::UiTheme,
     scroll_handle: &ScrollHandle,
@@ -19,8 +21,9 @@ pub fn render_host_sidebar<F>(
 ) -> gpui::Div
 where
     F: Fn(&str, &mut Window, &mut App) + 'static,
+    G: Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static,
 {
-    let (hosts, _, _) = HostsView::load_hosts_from_config();
+    let (hosts, _, configs) = HostsView::load_hosts_from_config();
 
     // 顶部导航栏
     let header = div()
@@ -93,6 +96,7 @@ where
         let icon_color = host.icon_color.to_hsla(cx);
         let host_id = host.id.to_string();
         let is_selected = selected_id == Some(&host_id);
+        let host_config = configs.iter().find(|c| c.id() == host_id).cloned();
 
         let row = div()
             .id(("host-item", index))
@@ -177,8 +181,17 @@ where
             )
             .on_click({
                 let on_select = on_select.clone();
+                let on_double_click = on_double_click.clone();
                 let id = host_id.clone();
-                move |_, window, cx| on_select(&id, window, cx)
+                move |event, window, cx| {
+                    if event.click_count() == 1 {
+                        on_select(&id, window, cx);
+                    } else if event.click_count() == 2 {
+                        if let Some(ref config) = host_config {
+                            on_double_click(config, window, cx);
+                        }
+                    }
+                }
             });
 
         host_list = host_list.child(row);
