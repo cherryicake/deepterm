@@ -7,7 +7,7 @@ use gpui::{AnimationExt, Entity, ScrollHandle, StatefulInteractiveElement, Windo
 use crate::assets::Icon;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
-use crate::sidebar_view::{host_view, theme_view};
+use crate::sidebar_view::{host_view, keychain_view, theme_view};
 use crate::theme::ActiveTheme;
 
 const SIDEBAR_WIDTH: f32 = 260.0;
@@ -58,6 +58,7 @@ pub enum SidebarView {
     Theme,
     Font,
     Host,
+    Keychain,
 }
 
 /// macOS 风格侧边栏组件
@@ -75,6 +76,7 @@ pub struct MacosSidebar {
     theme_scroll_handle: ScrollHandle,
     font_scroll_handle: ScrollHandle,
     host_scroll_handle: ScrollHandle,
+    keychain_scroll_handle: ScrollHandle,
     font_view: Option<Entity<FontSettingsView>>,
 }
 
@@ -96,7 +98,10 @@ impl MacosSidebar {
                 ),
                 SidebarMenuSection::new(
                     Some("已保存"),
-                    vec![SidebarMenuItem::new("host", "Host", Some(Icon::Host))],
+                    vec![
+                        SidebarMenuItem::new("host", "Host", Some(Icon::Host)),
+                        SidebarMenuItem::new("keychain", "Keychain", Some(Icon::KeyShield)),
+                    ],
                 ),
                 SidebarMenuSection::new(
                     Some("偏好设置"),
@@ -110,6 +115,7 @@ impl MacosSidebar {
             theme_scroll_handle: ScrollHandle::new(),
             font_scroll_handle: ScrollHandle::new(),
             host_scroll_handle: ScrollHandle::new(),
+            keychain_scroll_handle: ScrollHandle::new(),
             font_view: None,
         }
     }
@@ -182,6 +188,10 @@ impl MacosSidebar {
                 self.select_item(id);
                 self.navigate_to(SidebarView::Host);
             }
+            "keychain" => {
+                self.select_item(id);
+                self.navigate_to(SidebarView::Keychain);
+            }
             "__back" => self.go_back(),
             _ => self.select_item(id),
         }
@@ -242,6 +252,9 @@ impl MacosSidebar {
             SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme),
             SidebarView::Host => {
                 host_view::render_host_sidebar(cx, on_select.clone(), is_dark, theme, &self.host_scroll_handle, self.selected_id.as_deref())
+            }
+            SidebarView::Keychain => {
+                keychain_view::render_keychain_sidebar(cx, on_select.clone(), is_dark, theme, &self.keychain_scroll_handle, self.selected_id.as_deref())
             }
         };
 
