@@ -1043,11 +1043,9 @@ impl Element for TerminalElement {
                 .last_content()
                 .mode
                 .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
-            let selection_range = if !mouse_mode {
-                terminal_snapshot.selection_range()
-            } else {
-                None
-            };
+            // Always render local selection, even in mouse mode, so that
+            // double/triple-click selections are visible inside tmux/vim.
+            let selection_range = terminal_snapshot.selection_range();
             let cursor_cell = terminal_snapshot.last_content().cursor_cell.clone();
             (
                 dirty_rows,

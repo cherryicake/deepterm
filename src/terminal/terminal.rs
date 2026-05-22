@@ -1336,6 +1336,38 @@ impl Terminal {
             self.last_content.display_offset,
         );
 
+        // Double/triple click: always create a local selection and copy immediately,
+        // even in mouse mode (tmux, vim, etc.) so that copy works reliably over SSH.
+        if e.button == gpui::MouseButton::Left && e.click_count >= 2 {
+            let (point, side) = grid_point_and_side(
+                position,
+                self.terminal_bounds,
+                self.last_content.display_offset,
+            );
+
+            let selection_type = match e.click_count {
+                2 => Some(SelectionType::Semantic),
+                3 => Some(SelectionType::Lines),
+                _ => None,
+            };
+
+            if let Some(sel_type) = selection_type {
+                let mut term = self.term.lock();
+                let selection = Selection::new(sel_type, point, side);
+                term.selection = Some(selection);
+                self.selection_phase = SelectionPhase::Started;
+                drop(term);
+
+                // Copy to clipboard immediately on double/triple click
+                let term = self.term.lock();
+                if let Some(text) = term.selection_to_string() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                cx.emit(Event::SelectionsChanged);
+            }
+            return;
+        }
+
         if self.mouse_mode(e.modifiers.shift) {
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode)
@@ -1353,8 +1385,6 @@ impl Terminal {
                 let selection_type = match e.click_count {
                     0 => return,
                     1 => Some(SelectionType::Simple),
-                    2 => Some(SelectionType::Semantic),
-                    3 => Some(SelectionType::Lines),
                     _ => None,
                 };
 
@@ -1373,6 +1403,15 @@ impl Terminal {
         // Convert to local coordinates relative to terminal bounds
         let position = e.position - self.terminal_bounds.bounds.origin;
 
+        // Copy selection on mouse up regardless of mouse mode, so that
+        // drag-to-extend after a double/triple click also copies reliably.
+        if e.button == gpui::MouseButton::Left && self.selection_phase != SelectionPhase::Ended {
+            let term = self.term.lock();
+            if let Some(text) = term.selection_to_string() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+
         if self.mouse_mode(e.modifiers.shift) {
             let point = grid_point(
                 position,
@@ -1385,20 +1424,15 @@ impl Terminal {
             {
                 self.write(&bytes);
             }
-        } else {
-            if e.button == gpui::MouseButton::Left {
-                let term = self.term.lock();
-                if let Some(text) = term.selection_to_string() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-            }
         }
 
         self.selection_phase = SelectionPhase::Ended;
     }
 
     pub fn mouse_drag(&mut self, e: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        if !self.mouse_mode(e.modifiers.shift) && self.selection_phase != SelectionPhase::Ended {
+        // Allow extending local selection regardless of mouse mode, so that
+        // double/triple-click selections can be dragged even inside tmux.
+        if self.selection_phase != SelectionPhase::Ended {
             self.selection_phase = SelectionPhase::Selecting;
             // Convert to local coordinates relative to terminal bounds
             let position = e.position - self.terminal_bounds.bounds.origin;
