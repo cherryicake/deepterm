@@ -218,8 +218,8 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
-        // 创建初始tab - New Tab（不显示编号）
-        let initial_tab_items = vec![TabItem::new("tab-0", "New Tab").with_icon(Some(Icon::PlusCircleFull))];
+        // 创建初始tab - Start Tab（不显示编号）
+        let initial_tab_items = vec![TabItem::new("tab-0", "Start Tab").with_icon(Some(Icon::PlusCircleFull))];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 生成唯一的workspace ID（先创建，确保与Panel一致）
@@ -228,7 +228,7 @@ impl Workspace {
         // 初始化tabs信息
         let tabs = HashMap::new();
 
-        // tab-0 对应 panel-0 - 使用 New Tab 页面
+        // tab-0 对应 panel-0 - 使用 Start Tab 页面
         // 先创建 workspace，再使用 workspace entity 创建 panel
         let workspace = cx.new(|cx| {
             let mut workspace = Self {
@@ -237,7 +237,7 @@ impl Workspace {
                 active_tab_id: "tab-0".to_string(),
                 next_tab_id: 1,
                 next_panel_id: 1,
-                local_terminal_count: 0, // 初始为New Tab页面，从0开始计数
+                local_terminal_count: 0, // 初始为Start Tab页面，从0开始计数
                 workspace_index: 0,      // 从0开始计数
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
@@ -255,7 +255,7 @@ impl Workspace {
             workspace
         });
 
-        // 使用 workspace entity 创建初始 New Tab panel
+        // 使用 workspace entity 创建初始 Start Tab panel
         let workspace_entity = workspace.clone();
         let panel_0 = cx.new(|cx| {
             let new_tab_view = SshNewTabView::new_with_workspace(window, cx, Some(workspace_entity));
@@ -263,7 +263,7 @@ impl Workspace {
                 "panel-0",
                 workspace_id,
                 Some("tab-0".into()),
-                Some("New Tab".into()),
+                Some("Start Tab".into()),
                 new_tab_view,
                 cx,
             )
@@ -272,7 +272,7 @@ impl Workspace {
         workspace.update(cx, |workspace, _cx| {
             workspace.tabs.insert(
                 "tab-0".to_string(),
-                TabInfo::new_normal("tab-0", "New Tab", panel_0),
+                TabInfo::new_normal("tab-0", "Start Tab", panel_0),
             );
         });
 
@@ -288,22 +288,19 @@ impl Workspace {
     /// 设置该 workspace 使用的 SSH picker
     pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>, cx: &mut Context<Self>) {
         self.ssh_picker = Some(picker.clone());
-        let workspace = cx.entity();
+        let picker = picker.clone();
         self.tab_bar.update(cx, |tab_bar, _cx| {
             tab_bar.on_new_tab(move |window, cx| {
-                let workspace = workspace.clone();
-                workspace.update(cx, |_this, cx| {
-                    cx.defer_in(window, move |this, window, cx| {
-                        this.create_new_tab(window, cx);
-                    });
+                picker.update(cx, |picker, cx| {
+                    picker.toggle(window, cx);
                 });
             });
         });
     }
 
-    /// 创建 New Tab
+    /// 创建 Start Tab
     pub fn create_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let label = "New Tab";
+        let label = "Start Tab";
         let workspace_entity = cx.entity();
         let panel = cx.new(|cx| {
             let new_tab_view = SshNewTabView::new_with_workspace(window, cx, Some(workspace_entity));
@@ -1720,7 +1717,7 @@ impl Workspace {
         }
     }
 
-    /// 检查当前活动tab是否是New Tab页面
+    /// 检查当前活动tab是否是Start Tab页面
     fn is_current_tab_new_tab(&self, cx: &App) -> bool {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             if let Some(panel) = tab_info.container.get_panel_entity(cx) {
@@ -1790,7 +1787,7 @@ impl Workspace {
         });
     }
 
-    /// 创建本地终端Tab（如果在New Tab页面则替换当前tab）
+    /// 创建本地终端Tab（如果在Start Tab页面则替换当前tab）
     pub fn create_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.generate_terminal_tab_name();
         let panel = cx.new(|cx| {
@@ -1810,7 +1807,7 @@ impl Workspace {
         }
     }
 
-    /// 使用指定命令创建本地终端Tab（如果在New Tab页面则替换当前tab）
+    /// 使用指定命令创建本地终端Tab（如果在Start Tab页面则替换当前tab）
     pub fn create_local_terminal_with_command(
         &mut self,
         command: &str,
@@ -1838,7 +1835,7 @@ impl Workspace {
         }
     }
 
-    /// 使用指定配置创建 SSH 终端（如果在New Tab页面则替换当前tab）
+    /// 使用指定配置创建 SSH 终端（如果在Start Tab页面则替换当前tab）
     pub fn create_ssh_terminal_with_config(
         &mut self,
         config: &SshConnectionConfig,
