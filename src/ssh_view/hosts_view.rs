@@ -339,7 +339,7 @@ impl HostsView {
     }
 
     /// Load hosts and groups from SSH config file, returning hosts, groups, and configs
-    fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
+    pub fn load_hosts_from_config() -> (Vec<Host>, Vec<HostGroup>, Vec<SshConnectionConfig>) {
         let config = SshGlobalConfig::load();
         let keychain = KeychainStore::load_or_default();
 
