@@ -307,24 +307,23 @@ impl NewHostForm {
 
     // ─── Rendering helpers ───────────────────────────────────────────
 
-    fn render_header(&self,
-        cx: &App,
-    ) -> impl IntoElement {
+    fn render_header(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
         div()
             .w_full()
-            .pb(px(20.))
+            .pb(px(16.))
             .border_b_1()
             .border_color(theme.border)
             .child(
                 div()
-                    .text_lg()
+                    .text_xl()
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.text)
                     .child("New Host"),
             )
             .child(
                 div()
+                    .mt(px(4.))
                     .text_sm()
                     .text_color(theme.text_muted)
                     .child("Add a new SSH host configuration"),
@@ -350,10 +349,10 @@ impl NewHostForm {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(16.))
+            .gap(px(12.))
             .child(
                 div()
-                    .w(px(140.))
+                    .w(px(120.))
                     .flex()
                     .justify_end()
                     .child(
@@ -366,21 +365,17 @@ impl NewHostForm {
             .child(div().flex_1().min_w_0().child(control))
     }
 
-    fn render_section_title(
-        &self,
-        title: &str,
-        cx: &App,
-    ) -> impl IntoElement {
+    fn render_section_title(&self, title: &str, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
         div()
             .w_full()
-            .pt(px(8.))
-            .pb(px(4.))
+            .pt(px(4.))
+            .pb(px(2.))
             .child(
                 div()
                     .text_xs()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_muted)
+                    .text_color(theme.text_subtle)
                     .child(title.to_string()),
             )
     }
@@ -435,18 +430,20 @@ impl NewHostForm {
             .flex_row()
             .justify_end()
             .gap(px(8.))
-            .pt(px(12.))
+            .pt(px(16.))
             .border_t_1()
             .border_color(cx.theme().ui.border)
             .child(
                 Button::new("new-host-cancel")
                     .label("Cancel")
+                    .rounded(px(6.))
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
             .child(
                 Button::new("new-host-save")
                     .label("Save")
                     .success()
+                    .rounded(px(6.))
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
     }
@@ -466,10 +463,10 @@ impl Render for NewHostForm {
             .id("new-host-form-macos")
             .track_focus(&self.focus_handle)
             .w_full()
-            .p(px(24.))
+            .p(px(20.))
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(10.))
             .child(self.render_header(cx))
             .children(self.render_message(cx).into_iter())
             // ── Basic Info ──
@@ -495,10 +492,10 @@ impl Render for NewHostForm {
                     .w_full()
                     .flex()
                     .flex_row()
-                    .gap(px(16.))
+                    .gap(px(12.))
                     .child(
                         div()
-                            .w(px(140.))
+                            .w(px(120.))
                             .flex()
                             .justify_end()
                             .child(
@@ -508,11 +505,11 @@ impl Render for NewHostForm {
                                     .child("Port"),
                             ),
                     )
-                    .child(div().w(px(80.)).child(EditorInput::new(&self.port_input)))
-                    .child(div().flex_1().min_w_0())
+                    .child(div().w(px(72.)).child(EditorInput::new(&self.port_input)))
+                    .child(div().w(px(12.)))
                     .child(
                         div()
-                            .w(px(140.))
+                            .w(px(120.))
                             .flex()
                             .justify_end()
                             .child(
@@ -576,7 +573,7 @@ impl Render for NewHostForm {
                 this.child(
                     div()
                         .w_full()
-                        .pl(px(156.))
+                        .pl(px(132.))
                         .child(
                             div()
                                 .text_sm()
