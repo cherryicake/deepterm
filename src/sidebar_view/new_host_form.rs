@@ -351,7 +351,7 @@ impl NewHostForm {
             .gap(px(12.))
             .child(
                 div()
-                    .w(px(120.))
+                    .w(px(90.))
                     .flex()
                     .justify_end()
                     .child(
@@ -500,10 +500,10 @@ impl Render for NewHostForm {
                             .flex_row()
                             .items_center()
                             .gap(px(12.))
-                            .w(px(160.))
+                            .w(px(210.))
                             .child(
                                 div()
-                                    .w(px(120.))
+                                    .w(px(90.))
                                     .flex()
                                     .justify_end()
                                     .child(
@@ -513,7 +513,7 @@ impl Render for NewHostForm {
                                             .child("端口"),
                                     ),
                             )
-                            .child(div().w(px(28.)).child(EditorInput::new(&self.port_input))),
+                            .child(div().w(px(60.)).child(EditorInput::new(&self.port_input))),
                     )
                     // Username group (takes remaining space)
                     .child(
@@ -526,7 +526,7 @@ impl Render for NewHostForm {
                             .min_w(px(260.))
                             .child(
                                 div()
-                                    .w(px(120.))
+                                    .w(px(90.))
                                     .flex()
                                     .justify_end()
                                     .child(
