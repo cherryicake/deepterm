@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
+use gpui::{div, px, relative, rgb, App, ClickEvent, Context, Div, MouseButton, Window};
 
 use crate::assets::Icon;
 use crate::file_browser::shared::format_size;
@@ -29,6 +29,7 @@ pub enum TransferTaskStatus {
     Completed { files: usize, bytes: u64 },
     Failed(String),
     Cancelled,
+    Skipped,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,8 @@ pub struct TransferTaskState {
     pub(crate) bytes_transferred: Arc<AtomicU64>,
     pub total_bytes: u64,
     pub started_at: Instant,
+    /// 实时状态消息（如 scp 执行过程中的详细状态）
+    pub status_message: Arc<Mutex<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,8 +181,56 @@ fn render_transfer_list_item(
     let is_running = matches!(task.status, TransferTaskStatus::Running);
     let total_bytes = task.total_bytes;
 
-    let status_line = if let Some(action) = hover {
+    let status_color = match &task.status {
+        TransferTaskStatus::Failed(_) => theme.error,
+        TransferTaskStatus::Cancelled => theme.warning,
+        _ => theme.text_subtle,
+    };
+
+    let is_transferring = is_running && transferred > 0;
+
+    // 进度条：运行中始终显示（确定或不确定）
+    let progress_bar = if total_bytes > 0 {
+        let ratio = (transferred as f64 / total_bytes as f64).clamp(0.0, 0.98);
+        div()
+            .w_full()
+            .h(px(4.0))
+            .rounded(px(2.0))
+            .bg(theme.border.opacity(0.5))
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(ratio as f32))
+                    .rounded(px(2.0))
+                    .bg(rgb(0x3b82f6)),
+            )
+    } else {
+        // 总大小未知：显示一个短条，避免全宽看起来像已完成
+        div()
+            .w_full()
+            .h(px(4.0))
+            .rounded(px(2.0))
+            .bg(theme.border.opacity(0.5))
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(0.15))
+                    .rounded(px(2.0))
+                    .bg(gpui::Hsla::from(rgb(0x3b82f6)).opacity(0.5)),
+            )
+    };
+
+    // 单行状态文本：连接提示 / 网速 / 结果 在同一行位置切换
+    let status_text = if let Some(action) = hover {
         action.hint_text().to_string()
+    } else if is_running && !is_transferring {
+        // 连接尝试阶段：显示策略提示（如 "直连(agent forwarding)..."）
+        let msg = task.status_message.lock().unwrap();
+        if msg.is_empty() {
+            "准备中...".to_string()
+        } else {
+            msg.clone()
+        }
     } else {
         match &task.status {
             TransferTaskStatus::Running => {
@@ -210,14 +261,8 @@ fn render_transfer_list_item(
             TransferTaskStatus::Completed { bytes, .. } => format_size(*bytes),
             TransferTaskStatus::Failed(error) => format!("失败: {}", trim_error(error)),
             TransferTaskStatus::Cancelled => "已取消".to_string(),
+            TransferTaskStatus::Skipped => "已跳过".to_string(),
         }
-    };
-
-    // 进度条：仅运行中显示
-    let progress_ratio = if total_bytes > 0 {
-        (transferred as f64 / total_bytes as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
     };
 
     let display_name = truncate_middle_preserving_suffix(&task.item_name, 56);
@@ -238,41 +283,7 @@ fn render_transfer_list_item(
                 .text_color(theme.text)
                 .child(display_name),
         )
-        .when(is_running, |this| {
-            if total_bytes > 0 {
-                // 确定进度：已知总大小
-                this.child(
-                    div()
-                        .w_full()
-                        .h(px(4.0))
-                        .rounded(px(2.0))
-                        .bg(theme.border.opacity(0.5))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(relative(progress_ratio as f32))
-                                .rounded(px(2.0))
-                                .bg(rgb(0x3b82f6)),
-                        ),
-                )
-            } else {
-                // 不确定进度：总大小未知（如远程源文件元数据获取失败）
-                this.child(
-                    div()
-                        .w_full()
-                        .h(px(4.0))
-                        .rounded(px(2.0))
-                        .bg(theme.border.opacity(0.5))
-                        .child(
-                            div()
-                                .h_full()
-                                .w_full()
-                                .rounded(px(2.0))
-                                .bg(gpui::Hsla::from(rgb(0x3b82f6)).opacity(0.5)),
-                        ),
-                )
-            }
-        })
+        .child(progress_bar)
         .child(
             div()
                 .min_w_0()
@@ -280,8 +291,8 @@ fn render_transfer_list_item(
                 .whitespace_nowrap()
                 .truncate()
                 .text_xs()
-                .text_color(theme.text_subtle)
-                .child(status_line),
+                .text_color(status_color)
+                .child(status_text),
         );
 
     let cancel_button = div()
@@ -461,7 +472,7 @@ fn format_duration_remaining(secs: u64) -> String {
 }
 
 fn trim_error(error: &str) -> String {
-    const MAX: usize = 80;
+    const MAX: usize = 120;
     if error.chars().count() <= MAX {
         error.to_string()
     } else {

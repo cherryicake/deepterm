@@ -26,6 +26,7 @@ use crate::file_transfer::{
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
     TransferTaskState, TransferTaskStatus, quick_total_size, transfer_item_name, transfer_label,
 };
+use crate::file_transfer::TransferStatusReporter;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
@@ -648,6 +649,13 @@ impl Workspace {
         let is_done = Arc::new(AtomicBool::new(false));
         let is_done_for_task = is_done.clone();
 
+        let status_message = Arc::new(Mutex::new(String::new()));
+        let total_bytes_for_reporter = Arc::new(AtomicU64::new(0));
+        let reporter = TaskStatusReporter {
+            status_message: status_message.clone(),
+            total_bytes: total_bytes_for_reporter.clone(),
+        };
+
         self.transfer_tasks.push(TransferTaskState {
             id: transfer_id,
             label: transfer_label(&request),
@@ -657,6 +665,7 @@ impl Workspace {
             bytes_transferred: progress.clone(),
             total_bytes: 0,
             started_at: std::time::Instant::now(),
+            status_message,
         });
         cx.notify();
 
@@ -671,7 +680,10 @@ impl Workspace {
                 let _ = entity.update(cx, |this, cx| {
                     if let Some(task) = this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
                     {
-                        task.total_bytes = total_bytes;
+                        let transferred = task.bytes_transferred.load(Ordering::Relaxed);
+                        if transferred <= total_bytes || task.total_bytes == 0 {
+                            task.total_bytes = total_bytes;
+                        }
                         cx.notify();
                     }
                 });
@@ -754,11 +766,12 @@ impl Workspace {
         .detach();
 
         let task = cx.background_executor().spawn(async move {
-            let result = TransferManager::execute_blocking_with_cancel_and_progress_and_resolver(
+            let result = TransferManager::execute_blocking_with_cancel_and_progress_and_resolver_and_reporter(
                 request,
                 task_cancelled,
                 Some(progress),
                 Some(resolver_ref.as_ref()),
+                Some(&reporter),
             );
             is_done_for_task.store(true, Ordering::Relaxed);
             result
@@ -784,8 +797,13 @@ impl Workspace {
                     break;
                 }
                 if let Some(entity) = weak.upgrade() {
+                    let tb = total_bytes_for_reporter.load(Ordering::Relaxed);
                     let _ = entity.update(cx, |this, cx| {
-                        if this.transfer_tasks.iter().any(|t| t.id == transfer_id) {
+                        if let Some(task) = this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
+                        {
+                            if tb > 0 && task.total_bytes == 0 {
+                                task.total_bytes = tb;
+                            }
                             cx.notify();
                         }
                     });
@@ -811,8 +829,9 @@ impl Workspace {
 
         match result {
             Ok(summary) if summary.files_transferred == 0 && summary.bytes_transferred == 0 => {
-                // 空操作（如拖拽到同一文件夹），直接移除任务不显示
-                self.remove_transfer_task(transfer_id, cx);
+                // 空操作（如拖拽到同一文件夹），标记为已跳过
+                task.status = TransferTaskStatus::Skipped;
+                cx.notify();
                 return;
             }
             Ok(summary) => {
@@ -821,8 +840,7 @@ impl Workspace {
                     summary.files_transferred,
                     summary.bytes_transferred
                 );
-                // quick_total_size 异步计算失败时 total_bytes 可能为 0，用实际传输字节回填
-                if task.total_bytes == 0 {
+                if task.total_bytes < summary.bytes_transferred {
                     task.total_bytes = summary.bytes_transferred;
                 }
                 task.status = TransferTaskStatus::Completed {
@@ -2055,6 +2073,22 @@ impl Workspace {
                     .children(elements)
             }
         }
+    }
+}
+
+/// 将 scp 过程状态实时写入任务共享状态，供 UI 渲染线程读取。
+struct TaskStatusReporter {
+    status_message: Arc<Mutex<String>>,
+    total_bytes: Arc<AtomicU64>,
+}
+
+impl TransferStatusReporter for TaskStatusReporter {
+    fn report(&self, message: String) {
+        let mut guard = self.status_message.lock().unwrap();
+        *guard = message;
+    }
+    fn set_total_bytes(&self, bytes: u64) {
+        self.total_bytes.store(bytes, Ordering::Relaxed);
     }
 }
 

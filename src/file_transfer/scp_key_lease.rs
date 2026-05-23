@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::utils::shell_single_quote;
+
 use anyhow::{Context as _, anyhow, bail};
 
 use crate::ssh::SshConnectionConfig;
@@ -370,6 +372,3 @@ fn create_lease(
     })
 }
 
-fn shell_single_quote(value: &str) -> String {
-    value.replace('\'', "'\\''")
-}
