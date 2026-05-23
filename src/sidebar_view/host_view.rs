@@ -8,9 +8,9 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::modal::Modal;
+use crate::sidebar_view::new_host_form::NewHostForm;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::SshConnectionConfig;
-use crate::ssh_view::host_form::HostForm;
 use crate::ssh_view::hosts_view::HostsView;
 use crate::theme::ActiveTheme;
 
@@ -19,7 +19,7 @@ pub struct HostView {
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     selected_id: Option<SharedString>,
-    host_form: Option<Entity<HostForm>>,
+    host_form: Option<Entity<NewHostForm>>,
     show_modal: bool,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
@@ -58,12 +58,12 @@ impl HostView {
 
     fn open_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.host_form.is_none() {
-            self.host_form = Some(HostForm::new(window, cx));
+            self.host_form = Some(NewHostForm::new(window, cx));
         }
         let form = self.host_form.as_ref().unwrap().clone();
         let entity = cx.entity().clone();
         form.update(cx, |form, _cx| {
-            form.reset_form(_cx);
+            form.reset(_cx);
             let entity_clone = entity.clone();
             form.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
