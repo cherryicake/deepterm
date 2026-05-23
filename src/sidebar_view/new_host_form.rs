@@ -99,8 +99,22 @@ impl NewHostForm {
                 .collect();
             let auth_type_select =
                 Select::new(window, cx, auth_labels, AuthType::Password.display_name());
+
+            let entity = cx.entity();
             auth_type_select.update(cx, |select, _cx| {
                 select.searchable(false);
+                select.on_select(move |label, _index, cx| {
+                    let auth_type = match label.as_ref() {
+                        "Password" => AuthType::Password,
+                        "Private Key" => AuthType::PrivateKey,
+                        "SSH Agent" => AuthType::Agent,
+                        _ => AuthType::Password,
+                    };
+                    cx.update_entity(&entity, |this: &mut NewHostForm, _cx| {
+                        this.auth_type = auth_type;
+                        _cx.notify();
+                    });
+                });
             });
 
             Self {
