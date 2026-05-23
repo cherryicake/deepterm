@@ -492,34 +492,53 @@ impl Render for NewHostForm {
                     .w_full()
                     .flex()
                     .flex_row()
-                    .gap(px(12.))
+                    .items_center()
+                    .gap(px(16.))
+                    // Port group
                     .child(
                         div()
-                            .w(px(120.))
                             .flex()
-                            .justify_end()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .w(px(204.))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(theme.text)
-                                    .child("Port"),
-                            ),
+                                    .w(px(120.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.text)
+                                            .child("Port"),
+                                    ),
+                            )
+                            .child(div().flex_1().child(EditorInput::new(&self.port_input))),
                     )
-                    .child(div().w(px(72.)).child(EditorInput::new(&self.port_input)))
-                    .child(div().w(px(12.)))
+                    // Username group (takes remaining space)
                     .child(
                         div()
-                            .w(px(120.))
                             .flex()
-                            .justify_end()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .flex_1()
+                            .min_w(px(200.))
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(theme.text)
-                                    .child("Username *"),
-                            ),
-                    )
-                    .child(div().flex_1().min_w_0().child(EditorInput::new(&self.username_input))),
+                                    .w(px(120.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.text)
+                                            .child("Username *"),
+                                    ),
+                            )
+                            .child(div().flex_1().child(EditorInput::new(&self.username_input))),
+                    ),
             )
             // ── Authentication ──
             .child(self.render_section_title("Authentication", cx))
