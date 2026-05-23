@@ -880,7 +880,6 @@ impl Render for HostForm {
             .id("new-host-form")
             .track_focus(&self.focus_handle)
             .w_full()
-            .h_full()
             .p(px(16.0))
             .flex()
             .flex_col()

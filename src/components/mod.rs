@@ -4,6 +4,7 @@ pub mod button;
 pub mod drag_drop;
 pub mod input;
 pub mod menu;
+pub mod modal;
 pub mod resize_handle;
 pub mod select;
 pub mod macos_sidebar;
@@ -20,4 +21,5 @@ pub mod title_bar;
 pub fn init(cx: &mut App) {
     input::init(cx);
     menu::init(cx);
+    modal::init(cx);
 }

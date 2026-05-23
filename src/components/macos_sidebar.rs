@@ -7,6 +7,7 @@ use gpui::{AnimationExt, Entity, ScrollHandle, StatefulInteractiveElement, Windo
 use crate::assets::Icon;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
+use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::{host_view, keychain_view, theme_view};
 use crate::theme::ActiveTheme;
 
@@ -78,6 +79,7 @@ pub struct MacosSidebar {
     host_scroll_handle: ScrollHandle,
     keychain_scroll_handle: ScrollHandle,
     font_view: Option<Entity<FontSettingsView>>,
+    host_view: Option<Entity<HostView>>,
 }
 
 impl MacosSidebar {
@@ -117,6 +119,7 @@ impl MacosSidebar {
             host_scroll_handle: ScrollHandle::new(),
             keychain_scroll_handle: ScrollHandle::new(),
             font_view: None,
+            host_view: None,
         }
     }
 
@@ -173,6 +176,11 @@ impl MacosSidebar {
         self.font_view = Some(view);
     }
 
+    /// 设置 Host 视图
+    pub fn set_host_view(&mut self, view: Entity<HostView>) {
+        self.host_view = Some(view);
+    }
+
     /// 处理侧边栏菜单项点击，统一封装导航逻辑。
     pub fn handle_item_select(&mut self, id: &str) {
         match id {
@@ -226,7 +234,7 @@ impl MacosSidebar {
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
         let on_select = Rc::new(on_select);
-        let on_double_click = Rc::new(on_double_click);
+        let _on_double_click = Rc::new(on_double_click);
 
         let (anim_id, anim_key, duration_ms, width_fn): (&str, &str, u64, Box<dyn Fn(f32) -> f32>) =
             if self.visible {
@@ -245,21 +253,6 @@ impl MacosSidebar {
                 )
             };
 
-        // 根据当前视图渲染不同内容
-        let content = match self.current_view {
-            SidebarView::Menu => self.render_menu_content(cx, on_select.clone(), is_dark, theme),
-            SidebarView::Theme => {
-                theme_view::render_theme_sidebar(cx, on_select.clone(), is_dark, theme, &self.theme_scroll_handle)
-            }
-            SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme),
-            SidebarView::Host => {
-                host_view::render_host_sidebar(cx, on_select.clone(), on_double_click.clone(), is_dark, theme, &self.host_scroll_handle, self.selected_id.as_deref())
-            }
-            SidebarView::Keychain => {
-                keychain_view::render_keychain_sidebar(cx, on_select.clone(), is_dark, theme, &self.keychain_scroll_handle, self.selected_id.as_deref())
-            }
-        };
-
         let inner = div()
             .h_full()
             .rounded(px(12.0))
@@ -272,7 +265,19 @@ impl MacosSidebar {
             .pb(px(16.0))
             .pl(px(12.0))
             .pr(px(12.0))
-            .child(content);
+            .child(match self.current_view {
+                SidebarView::Menu => self.render_menu_content(cx, on_select.clone(), is_dark, theme).into_any_element(),
+                SidebarView::Theme => {
+                    theme_view::render_theme_sidebar(cx, on_select.clone(), is_dark, theme, &self.theme_scroll_handle).into_any_element()
+                }
+                SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme).into_any_element(),
+                SidebarView::Host => {
+                    self.host_view.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element())
+                }
+                SidebarView::Keychain => {
+                    keychain_view::render_keychain_sidebar(cx, on_select.clone(), is_dark, theme, &self.keychain_scroll_handle, self.selected_id.as_deref()).into_any_element()
+                }
+            });
 
         // 控制侧边栏整体轮廓
         let padded = div()

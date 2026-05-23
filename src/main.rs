@@ -17,13 +17,14 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, Entity, IntoElement, KeyBinding,
-    ParentElement, Render, Window, actions, div, px,
+    AnimationExt, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
+    actions, div, px,
 };
 
 use crate::components::macos_sidebar::MacosSidebar;
 use crate::components::title_bar::TitleBar;
 use crate::sidebar_view::font_view::FontSettingsView;
+use crate::sidebar_view::host_view::HostView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::ToggleSidebar;
@@ -42,10 +43,11 @@ pub struct AppWindow {
     ssh_picker: Entity<SshPicker>,
     sidebar: MacosSidebar,
     _sidebar_hide_task: Option<gpui::Task<()>>,
+    host_view: Entity<HostView>,
 }
 
 impl AppWindow {
-    pub fn new(window: &mut Window, cx: &mut App) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace = Workspace::new(window, cx);
 
         let tab_bar = workspace.read(cx).tab_bar.clone();
@@ -71,12 +73,34 @@ impl AppWindow {
         });
         sidebar.set_font_view(font_settings_view);
 
+        // 创建 HostView 并设置回调
+        let host_view = HostView::new(window, cx);
+        let entity = cx.entity();
+        host_view.update(cx, |hv, _cx| {
+            hv.on_select(move |id, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.sidebar.handle_item_select(id);
+                    cx.notify();
+                });
+            });
+        });
+        let workspace_for_host = workspace.clone();
+        host_view.update(cx, |hv, _cx| {
+            hv.on_connect(move |config, window, cx| {
+                workspace_for_host.update(cx, |ws, cx| {
+                    ws.create_ssh_terminal_with_config(config, window, cx);
+                });
+            });
+        });
+        sidebar.set_host_view(host_view.clone());
+
         Self {
             title_bar,
             workspace,
             ssh_picker,
             sidebar,
             _sidebar_hide_task: None,
+            host_view,
         }
     }
 
@@ -111,7 +135,6 @@ impl AppWindow {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.sidebar.clone();
         let entity = cx.entity();
-        let workspace = self.workspace.clone();
         div().child(sidebar.render_sidebar(
             cx,
             move |id, _window, cx| {
@@ -121,15 +144,18 @@ impl AppWindow {
                 });
             },
             move |config, window, cx| {
-                workspace.update(cx, |ws, cx| {
-                    ws.create_ssh_terminal_with_config(config, window, cx);
-                });
+                // HostView 内部已处理双击连接，此回调保留但不再用于 Host 视图
+                let _ = (config, window, cx);
             },
         ))
     }
 
     /// 渲染侧边栏切换按钮
-    fn render_sidebar_toggle(&self, window: &gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_toggle(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         self.sidebar.render_toggle_button(
             cx,
             window.is_fullscreen(),
@@ -190,7 +216,13 @@ impl AppWindow {
             .flex_1()
             .min_w_0()
             .child(animated_title_bar)
-            .child(div().flex_1().min_h_0().overflow_hidden().child(self.workspace.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.workspace.clone()),
+            )
     }
 }
 
@@ -198,7 +230,7 @@ impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
 
-        div()
+        let mut root = div()
             .size_full()
             .bg(theme.app_background)
             .flex()
@@ -206,7 +238,8 @@ impl Render for AppWindow {
             .relative()
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ShowSshPicker, window, cx| {
-                this.ssh_picker.update(cx, |picker, cx| picker.toggle(window, cx));
+                this.ssh_picker
+                    .update(cx, |picker, cx| picker.toggle(window, cx));
             }))
             .on_action(cx.listener(|_this, _: &NewWindow, _window, cx| {
                 WindowManager::open_window(cx);
@@ -217,7 +250,14 @@ impl Render for AppWindow {
             .child(self.render_sidebar(cx))
             .child(self.render_main_area(window, cx))
             .child(self.render_sidebar_toggle(window, cx))
-            .child(self.ssh_picker.clone())
+            .child(self.ssh_picker.clone());
+
+        // Host Modal 必须在窗口根节点渲染，才能全屏居中，不被侧边栏裁剪。
+        if let Some(modal) = self.host_view.update(cx, |hv, cx| hv.build_modal(cx)) {
+            root = root.child(modal);
+        }
+
+        root
     }
 }
 
