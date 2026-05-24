@@ -171,6 +171,7 @@ impl RenderOnce for Modal {
             .id("modal-panel")
             .flex()
             .flex_col()
+            .items_center()
             .bg(theme.elevated_background)
             .border_1()
             .border_color(theme.border)

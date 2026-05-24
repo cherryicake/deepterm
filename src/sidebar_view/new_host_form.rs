@@ -12,9 +12,7 @@ use crate::components::input::{EditorInput, InputState};
 use crate::components::select::Select;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
-use crate::ssh::keychain::{
-    KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor,
-};
+use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
 use crate::theme::ActiveTheme;
 
 /// 认证方式类型
@@ -69,11 +67,9 @@ impl NewHostForm {
             let focus_handle = cx.focus_handle();
             let default_username = get_current_username().unwrap_or_default();
 
-            let nickname_input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("我的服务器"));
-            let hostname_input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("192.168.1.100 或 example.com")
-            });
+            let nickname_input = cx.new(|cx| InputState::new(window, cx).placeholder("我的服务器"));
+            let hostname_input = cx
+                .new(|cx| InputState::new(window, cx).placeholder("192.168.1.100 或 example.com"));
             let port_input = cx.new(|cx| InputState::new(window, cx));
             port_input.update(cx, |input, cx| input.set_text("22", cx));
             let username_input = cx.new(|cx| InputState::new(window, cx));
@@ -194,7 +190,11 @@ impl NewHostForm {
     }
 
     fn build_auth_method(
-        &self, username: &str, host_label: &str, cx: &Context<Self>) -> Result<AuthMethod, String> {
+        &self,
+        username: &str,
+        host_label: &str,
+        cx: &Context<Self>,
+    ) -> Result<AuthMethod, String> {
         let credential_label = self.credential_label_input.read(cx).value().to_string();
         let password = self.password_input.read(cx).value().to_string();
         let key_path = self.key_path_input.read(cx).value().to_string();
@@ -211,11 +211,7 @@ impl NewHostForm {
             AuthType::Password => {
                 if !password.trim().is_empty() {
                     let keychain_id = store
-                        .create_identity(
-                            &label,
-                            Some(username.to_string()),
-                            &password,
-                        )
+                        .create_identity(&label, Some(username.to_string()), &password)
                         .map_err(|err| format!("保存凭据失败: {}", err))?;
                     Ok(AuthMethod::password_ref(keychain_id))
                 } else {
@@ -230,8 +226,7 @@ impl NewHostForm {
                             PathBuf::from(key_path.trim()),
                             None,
                             classify_key_flavor(PathBuf::from(key_path.trim()).as_path(), None),
-                            (!key_passphrase.trim().is_empty())
-                                .then_some(key_passphrase.as_str()),
+                            (!key_passphrase.trim().is_empty()).then_some(key_passphrase.as_str()),
                         )
                         .map_err(|err| format!("保存密钥失败: {}", err))?;
                     Ok(AuthMethod::key_ref(keychain_id))
@@ -256,7 +251,12 @@ impl NewHostForm {
         let nickname = self.nickname_input.read(cx).value().to_string();
         let hostname = self.hostname_input.read(cx).value().to_string();
         let username = self.username_input.read(cx).value().to_string();
-        let port = self.port_input.read(cx).value().parse::<u16>().unwrap_or(22);
+        let port = self
+            .port_input
+            .read(cx)
+            .value()
+            .parse::<u16>()
+            .unwrap_or(22);
 
         let host_label = if nickname.trim().is_empty() {
             format!("{}@{}", username.trim(), hostname.trim())
@@ -354,30 +354,20 @@ impl NewHostForm {
                     .w(px(90.))
                     .flex()
                     .justify_end()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.text)
-                            .child(label_text),
-                    ),
+                    .child(div().text_sm().text_color(theme.text).child(label_text)),
             )
             .child(div().flex_1().min_w_0().child(control))
     }
 
     fn render_section_title(&self, title: &str, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        div()
-            .w_full()
-            .pt(px(4.))
-            .pb(px(2.))
-            .pl(px(90.))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_subtle)
-                    .child(title.to_string()),
-            )
+        div().w_full().pt(px(4.)).pb(px(2.)).pl(px(90.)).child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_subtle)
+                .child(title.to_string()),
+        )
     }
 
     fn render_message(&self, cx: &App) -> Option<impl IntoElement> {
@@ -462,7 +452,7 @@ impl Render for NewHostForm {
         div()
             .id("new-host-form-macos")
             .track_focus(&self.focus_handle)
-            .w_full()
+            .w(px(480.))
             .p(px(20.))
             .flex()
             .flex_col()
@@ -471,22 +461,8 @@ impl Render for NewHostForm {
             .children(self.render_message(cx).into_iter())
             // ── Basic Info ──
             .child(self.render_section_title("基本信息", cx))
-            .child(
-                self.render_row(
-                    "昵称",
-                    false,
-                    EditorInput::new(&self.nickname_input),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_row(
-                    "地址",
-                    true,
-                    EditorInput::new(&self.hostname_input),
-                    cx,
-                ),
-            )
+            .child(self.render_row("昵称", false, EditorInput::new(&self.nickname_input), cx))
+            .child(self.render_row("地址", true, EditorInput::new(&self.hostname_input), cx))
             .child(
                 div()
                     .w_full()
@@ -507,12 +483,7 @@ impl Render for NewHostForm {
                                     .w(px(90.))
                                     .flex()
                                     .justify_end()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.text)
-                                            .child("端口"),
-                                    ),
+                                    .child(div().text_sm().text_color(theme.text).child("端口")),
                             )
                             .child(div().w(px(60.)).child(EditorInput::new(&self.port_input))),
                     )
@@ -526,79 +497,57 @@ impl Render for NewHostForm {
                             .flex_1()
                             .min_w(px(260.))
                             .child(
-                                div()
-                                    .w(px(90.))
-                                    .flex()
-                                    .justify_end()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.text)
-                                            .child("用户名 *"),
-                                    ),
+                                div().w(px(90.)).flex().justify_end().child(
+                                    div().text_sm().text_color(theme.text).child("用户名 *"),
+                                ),
                             )
                             .child(div().flex_1().child(EditorInput::new(&self.username_input))),
                     ),
             )
             // ── Authentication ──
             .child(self.render_section_title("认证", cx))
-            .child(
-                self.render_row(
-                    "方式",
-                    false,
-                    self.auth_type_select.clone(),
-                    cx,
-                ),
-            )
-            .when(matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey), |this| {
-                this.child(
-                    self.render_row(
+            .child(self.render_row("方式", false, self.auth_type_select.clone(), cx))
+            .when(
+                matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey),
+                |this| {
+                    this.child(self.render_row(
                         "标签",
                         false,
                         EditorInput::new(&self.credential_label_input),
                         cx,
-                    ),
-                )
-            })
+                    ))
+                },
+            )
             .when(matches!(self.auth_type, AuthType::Password), |this| {
-                this.child(
-                    self.render_row(
-                        "密码",
-                        false,
-                        EditorInput::new(&self.password_input).mask_toggle(),
-                        cx,
-                    ),
-                )
+                this.child(self.render_row(
+                    "密码",
+                    false,
+                    EditorInput::new(&self.password_input).mask_toggle(),
+                    cx,
+                ))
             })
             .when(matches!(self.auth_type, AuthType::PrivateKey), |this| {
-                this.child(
-                    self.render_row(
-                        "密钥路径",
-                        false,
-                        EditorInput::new(&self.key_path_input),
-                        cx,
-                    ),
-                )
-                .child(
-                    self.render_row(
-                        "密钥密码",
-                        false,
-                        EditorInput::new(&self.key_passphrase_input).mask_toggle(),
-                        cx,
-                    ),
-                )
+                this.child(self.render_row(
+                    "密钥路径",
+                    false,
+                    EditorInput::new(&self.key_path_input),
+                    cx,
+                ))
+                .child(self.render_row(
+                    "密钥密码",
+                    false,
+                    EditorInput::new(&self.key_passphrase_input).mask_toggle(),
+                    cx,
+                ))
             })
             .when(matches!(self.auth_type, AuthType::Agent), |this| {
                 this.child(
-                    div()
-                        .w_full()
-                        .pl(px(132.))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.text_muted)
-                                .child("使用 SSH Agent 认证。"),
-                        ),
+                    div().w_full().pl(px(132.)).child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.text_muted)
+                            .child("使用 SSH Agent 认证。"),
+                    ),
                 )
             })
             // ── Footer ──
