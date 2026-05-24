@@ -16,7 +16,7 @@ use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classi
 use crate::theme::ActiveTheme;
 
 /// 认证方式类型
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuthType {
     Password,
     PrivateKey,
@@ -55,6 +55,7 @@ pub struct NewHostForm {
     credential_label_input: Entity<InputState>,
     auth_type: AuthType,
     auth_type_select: Entity<Select>,
+
     error_message: Option<String>,
     success_message: Option<String>,
     on_cancel: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
@@ -542,12 +543,6 @@ impl Render for NewHostForm {
                     "密钥路径",
                     false,
                     EditorInput::new(&self.key_path_input),
-                    cx,
-                ))
-                .child(self.render_row(
-                    "密钥密码",
-                    false,
-                    EditorInput::new(&self.key_passphrase_input).mask_toggle(),
                     cx,
                 ))
             })
