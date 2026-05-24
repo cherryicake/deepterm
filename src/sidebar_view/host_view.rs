@@ -8,7 +8,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::modal::Modal;
-use crate::sidebar_view::new_host_form::NewHostForm;
+use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh_view::hosts_view::HostsView;
@@ -27,16 +27,14 @@ pub struct HostView {
 
 impl HostView {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| {
-            Self {
-                focus_handle: cx.focus_handle(),
-                scroll_handle: ScrollHandle::new(),
-                selected_id: None,
-                host_form: None,
-                show_modal: false,
-                on_select: None,
-                on_connect: None,
-            }
+        cx.new(|cx| Self {
+            focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
+            selected_id: None,
+            host_form: None,
+            show_modal: false,
+            on_select: None,
+            on_connect: None,
         })
     }
 
@@ -217,7 +215,8 @@ impl Render for HostView {
         for (index, host) in hosts.iter().enumerate() {
             let icon_color = host.icon_color.to_hsla(cx);
             let host_id = host.id.to_string();
-            let is_selected = self.selected_id.as_ref().map(|s| s.as_ref()) == Some(host_id.as_str());
+            let is_selected =
+                self.selected_id.as_ref().map(|s| s.as_ref()) == Some(host_id.as_str());
             let host_config = configs.iter().find(|c| c.id() == host_id).cloned();
 
             let row = div()

@@ -9,7 +9,7 @@ use gpui::{
 
 use crate::components::button::{Button, ButtonVariants};
 use crate::components::input::{EditorInput, InputState};
-use crate::components::select::Select;
+use crate::components::macos_select::MacosSelect;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
@@ -54,7 +54,7 @@ pub struct NewHostForm {
     key_passphrase_input: Entity<InputState>,
     credential_label_input: Entity<InputState>,
     auth_type: AuthType,
-    auth_type_select: Entity<Select>,
+    auth_type_select: Entity<MacosSelect>,
 
     error_message: Option<String>,
     success_message: Option<String>,
@@ -95,11 +95,10 @@ impl NewHostForm {
                 .map(|a| a.display_name().into())
                 .collect();
             let auth_type_select =
-                Select::new(window, cx, auth_labels, AuthType::Password.display_name());
+                MacosSelect::new(window, cx, auth_labels, AuthType::Password.display_name());
 
             let entity = cx.entity();
             auth_type_select.update(cx, |select, _cx| {
-                select.searchable(false);
                 select.on_select(move |label, _index, cx| {
                     let auth_type = match label.as_ref() {
                         "密码" => AuthType::Password,
@@ -518,7 +517,27 @@ impl Render for NewHostForm {
             )
             // ── Authentication ──
             .child(self.render_section_title("认证", cx))
-            .child(self.render_row("方式", false, self.auth_type_select.clone(), cx))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                            div()
+                                .w(px(60.))
+                                .flex()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.text)
+                                        .child("方式"),
+                                ),
+                    )
+                    .child(self.auth_type_select.clone()),
+            )
             .when(
                 matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey),
                 |this| {

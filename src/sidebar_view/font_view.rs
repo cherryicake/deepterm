@@ -5,7 +5,7 @@ use gpui::{
 };
 
 use crate::components::input::{EditorInput, InputEvent, InputState};
-use crate::components::select::Select;
+use crate::components::macos_select::MacosSelect;
 use crate::sidebar_view::font_settings::{
     FontState, clean_font_choice, format_font_choice, platform_default_font_family,
 };
@@ -25,8 +25,8 @@ const WEIGHT_OPTIONS: &[(FontWeight, &str)] = &[
 
 pub struct FontSettingsView {
     focus_handle: FocusHandle,
-    font_select: Entity<Select>,
-    weight_select: Entity<Select>,
+    font_select: Entity<MacosSelect>,
+    weight_select: Entity<MacosSelect>,
     font_size_input: Entity<InputState>,
     line_height_input: Entity<InputState>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -73,7 +73,7 @@ impl FontSettingsView {
                 current_family.clone()
             };
 
-            let font_select = Select::new(window, cx, default_fonts, selected_label);
+            let font_select = MacosSelect::new(window, cx, default_fonts, selected_label);
             font_select.update(cx, |select, _cx| {
                 select.on_select(move |family, _index, cx| {
                     let family = clean_font_choice(&family.to_string()).to_string();
@@ -94,9 +94,8 @@ impl FontSettingsView {
                 .map(|(_, label)| (*label).to_string())
                 .unwrap_or("Normal".to_string());
 
-            let weight_select = Select::new(window, cx, weight_labels, selected_weight_label);
+            let weight_select = MacosSelect::new(window, cx, weight_labels, selected_weight_label);
             weight_select.update(cx, |select, _cx| {
-                select.searchable(false);
                 select.on_select(move |label, _index, cx| {
                     if let Some((weight, _)) =
                         WEIGHT_OPTIONS.iter().find(|(_, l)| *l == label.as_ref())
@@ -378,6 +377,30 @@ impl FontSettingsView {
         )
     }
 
+    fn render_compact_row(&self, label: &str, control: impl IntoElement, cx: &App) -> gpui::Div {
+        let theme = cx.theme().ui;
+        let label = label.to_string();
+        div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .child(
+                div()
+                    .w(px(80.))
+                    .flex()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.text_muted)
+                            .child(label),
+                    ),
+            )
+            .child(control)
+    }
+
     fn render_compact(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
         let error_color = gpui::rgb(0xef4444);
@@ -387,77 +410,79 @@ impl FontSettingsView {
             .flex()
             .flex_col()
             .gap_4()
+            .child(self.render_compact_row("终端字体", self.font_select.clone(), cx))
+            .child(self.render_compact_row("字重", self.weight_select.clone(), cx))
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("终端字体"),
+                            .w(px(80.))
+                            .flex()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child("字体大小 (px)"),
+                            ),
                     )
-                    .child(self.font_select.clone()),
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(EditorInput::new(&self.font_size_input))
+                            .when(!self.font_size_valid, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(error_color)
+                                        .child("Value must be between 6 and 72"),
+                                )
+                            }),
+                    ),
             )
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px(4.0))
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("字重"),
+                            .w(px(80.))
+                            .flex()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child("行高 (倍率)"),
+                            ),
                     )
-                    .child(self.weight_select.clone()),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("字体大小 (px)"),
-                    )
-                    .child(EditorInput::new(&self.font_size_input))
-                    .when(!self.font_size_valid, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(error_color)
-                                .child("Value must be between 6 and 72"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child("行高 (倍率)"),
-                    )
-                    .child(EditorInput::new(&self.line_height_input))
-                    .when(!self.line_height_valid, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(error_color)
-                                .child("Value must be between 0.8 and 3.0"),
-                        )
-                    }),
+                            .w(px(140.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(EditorInput::new(&self.line_height_input))
+                            .when(!self.line_height_valid, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(error_color)
+                                        .child("Value must be between 0.8 and 3.0"),
+                                )
+                            }),
+                    ),
             )
     }
 }

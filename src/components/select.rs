@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, Pixels,
-    Render, ScrollHandle, SharedString, Window, anchored, canvas, deferred, div, px, svg,
+    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, Pixels, Render, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
+    div, px, svg,
 };
 
 use crate::assets::Icon;
@@ -198,13 +199,13 @@ impl Focusable for Select {
 }
 
 impl Render for Select {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let is_open = self.is_open;
         let indices = self.filtered_item_indices(cx);
         let selected = self.selected_item.clone();
         let trigger_bounds = self.trigger_bounds.clone();
-        let bounds = trigger_bounds.get();
+        let _bounds = trigger_bounds.get();
 
         let theme_accent = theme.accent;
         let theme_text = theme.text;
@@ -226,7 +227,6 @@ impl Render for Select {
                 let subtitle = self.item_subtitles.get(item_idx).cloned();
                 div()
                     .id(("select-item", ix))
-                    .w_full()
                     .h(px(32.0))
                     .px(px(10.0))
                     .flex()
@@ -257,7 +257,6 @@ impl Render for Select {
                     )
                     .child(
                         div()
-                            .w_full()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -313,11 +312,11 @@ impl Render for Select {
             .collect();
 
         div()
-            .w_full()
             .relative()
+            .items_start()
             .child(
                 div()
-                    .w_full()
+                    .id("select-trigger")
                     .h(px(32.0))
                     .px(px(10.0))
                     .flex()
@@ -371,14 +370,18 @@ impl Render for Select {
             .when(is_open, move |this| {
                 this.child(
                     deferred(
-                        anchored().snap_to_window_with_margin(px(8.)).child(
+                        anchored()
+                            .anchor(gpui::Corner::TopLeft)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(
                             div()
+                                .id("select-dropdown")
                                 .occlude()
-                                .w(bounds.size.width + px(2.))
                                 .child(
                                     div()
                                         .occlude()
-                                        .mt(px(4.0))
+                                        .absolute()
+                                        .top(-(px(42.0) + if self.searchable { px(34.0) } else { px(0.0) } + px(highlighted as f32 * 34.0)))
                                         .bg(theme.panel_background)
                                         .border_1()
                                         .border_color(theme.border)
@@ -432,7 +435,7 @@ impl Render for Select {
                                                 .id("select-list")
                                                 .flex_1()
                                                 .min_h_0()
-                                                .max_h(px(240.0))
+                                                .max_h(window.window_bounds().get_bounds().size.height - px(32.0))
                                                 .overflow_y_scroll()
                                                 .track_scroll(&scroll_handle)
                                                 .flex()
@@ -444,7 +447,7 @@ impl Render for Select {
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx))),
                         ),
                     )
-                    .with_priority(1),
+                    .with_priority(101),
                 )
             })
     }
