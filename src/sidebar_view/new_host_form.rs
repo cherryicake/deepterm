@@ -370,6 +370,7 @@ impl NewHostForm {
             .w_full()
             .pt(px(4.))
             .pb(px(2.))
+            .pl(px(90.))
             .child(
                 div()
                     .text_xs()
@@ -480,7 +481,7 @@ impl Render for NewHostForm {
             )
             .child(
                 self.render_row(
-                    "主机地址",
+                    "地址",
                     true,
                     EditorInput::new(&self.hostname_input),
                     cx,

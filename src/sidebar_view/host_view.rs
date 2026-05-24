@@ -93,7 +93,7 @@ impl HostView {
         let entity = cx.entity();
         Some(
             Modal::new("host-modal")
-                .width(px(480.))
+                .width(px(540.))
                 .max_height(px(700.))
                 .on_close(move |_window, cx| {
                     entity.update(cx, |this, cx| {
