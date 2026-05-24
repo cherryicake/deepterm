@@ -351,7 +351,7 @@ impl NewHostForm {
             .gap(px(12.))
             .child(
                 div()
-                    .w(px(90.))
+                    .w(px(60.))
                     .flex()
                     .justify_end()
                     .child(div().text_sm().text_color(theme.text).child(label_text)),
@@ -361,7 +361,7 @@ impl NewHostForm {
 
     fn render_section_title(&self, title: &str, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        div().w_full().pt(px(4.)).pb(px(2.)).pl(px(90.)).child(
+        div().w_full().pt(px(4.)).pb(px(2.))            .pl(px(60.)).child(
             div()
                 .text_xs()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -477,15 +477,20 @@ impl Render for NewHostForm {
                             .flex_row()
                             .items_center()
                             .gap(px(12.))
-                            .w(px(210.))
+                            .w(px(140.))
                             .child(
                                 div()
-                                    .w(px(90.))
+                                    .w(px(60.))
                                     .flex()
                                     .justify_end()
-                                    .child(div().text_sm().text_color(theme.text).child("端口")),
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.text)
+                                            .child("端口"),
+                                    ),
                             )
-                            .child(div().w(px(60.)).child(EditorInput::new(&self.port_input))),
+                            .child(div().w(px(68.)).child(EditorInput::new(&self.port_input))),
                     )
                     // Username group (takes remaining space)
                     .child(
@@ -495,11 +500,18 @@ impl Render for NewHostForm {
                             .items_center()
                             .gap(px(12.))
                             .flex_1()
-                            .min_w(px(260.))
+                            .min_w(px(300.))
                             .child(
-                                div().w(px(90.)).flex().justify_end().child(
-                                    div().text_sm().text_color(theme.text).child("用户名 *"),
-                                ),
+                                div()
+                                    .w(px(60.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.text)
+                                            .child("用户名 *"),
+                                    ),
                             )
                             .child(div().flex_1().child(EditorInput::new(&self.username_input))),
                     ),
@@ -542,7 +554,7 @@ impl Render for NewHostForm {
             })
             .when(matches!(self.auth_type, AuthType::Agent), |this| {
                 this.child(
-                    div().w_full().pl(px(132.)).child(
+                    div().w_full().pl(px(72.)).child(
                         div()
                             .text_sm()
                             .text_color(theme.text_muted)
