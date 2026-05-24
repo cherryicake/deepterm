@@ -337,11 +337,7 @@ impl NewHostForm {
         _cx: &App,
     ) -> impl IntoElement {
         let theme = _cx.theme().ui;
-        let label_text = if required {
-            format!("{} *", label)
-        } else {
-            label.to_string()
-        };
+        let label_text = label.to_string();
 
         div()
             .w_full()
@@ -361,13 +357,17 @@ impl NewHostForm {
 
     fn render_section_title(&self, title: &str, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        div().w_full().pt(px(4.)).pb(px(2.))            .pl(px(60.)).child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text_subtle)
-                .child(title.to_string()),
-        )
+        div()
+            .w_full()
+            .pt(px(4.))
+            .pb(px(2.))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_subtle)
+                    .child(title.to_string()),
+            )
     }
 
     fn render_message(&self, cx: &App) -> Option<impl IntoElement> {
@@ -462,7 +462,7 @@ impl Render for NewHostForm {
             // ── Basic Info ──
             .child(self.render_section_title("基本信息", cx))
             .child(self.render_row("昵称", false, EditorInput::new(&self.nickname_input), cx))
-            .child(self.render_row("地址", true, EditorInput::new(&self.hostname_input), cx))
+            .child(self.render_row("地址", false, EditorInput::new(&self.hostname_input), cx))
             .child(
                 div()
                     .w_full()
@@ -510,7 +510,7 @@ impl Render for NewHostForm {
                                         div()
                                             .text_sm()
                                             .text_color(theme.text)
-                                            .child("用户名 *"),
+                                            .child("用户名"),
                                     ),
                             )
                             .child(div().flex_1().child(EditorInput::new(&self.username_input))),
