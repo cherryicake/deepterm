@@ -492,15 +492,14 @@ impl Render for NewHostForm {
                             )
                             .child(div().w(px(68.)).child(EditorInput::new(&self.port_input))),
                     )
-                    // Username group (takes remaining space)
+                    // Username group (fixed width to align with above)
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(12.))
-                            .flex_1()
-                            .min_w(px(300.))
+                            .w(px(324.))
                             .child(
                                 div()
                                     .w(px(60.))
