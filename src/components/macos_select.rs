@@ -328,7 +328,7 @@ impl Render for MacosSelect {
                             .bg(theme.tab_hover_background)
                             .child(
                                 svg()
-                                    .size(px(10.0))
+                                    .size(px(12.0))
                                     .path(Icon::ChevronUpDown.path())
                                     .text_color(theme.icon),
                             ),
@@ -352,54 +352,63 @@ impl Render for MacosSelect {
                             .anchor(gpui::Corner::TopLeft)
                             .snap_to_window_with_margin(px(8.))
                             .child(
-                            div()
-                                .id("macos-select-dropdown")
-                                .occlude()
-                                .child(
-                                    div()
-                                        .occlude()
-                                        .absolute()
-                                        .top(-(px(30.0) + px(highlighted as f32 * 26.0)))
-                                        .bg(theme.panel_background)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .rounded(px(10.0))
-                                        .shadow_md()
-                                        .p(px(6.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.0))
-                                        .key_context("MacosSelect")
-                                        .on_key_down(cx.listener(
-                                            |this, event: &KeyDownEvent, _, cx| {
-                                                match event.keystroke.key.as_str() {
-                                                    "down" => this.move_highlight(1, cx),
-                                                    "up" => this.move_highlight(-1, cx),
-                                                    "enter" | "return" => {
-                                                        this.confirm_highlighted(cx)
+                                div()
+                                    .id("macos-select-dropdown")
+                                    .occlude()
+                                    .child(
+                                        div()
+                                            .occlude()
+                                            .absolute()
+                                            .top(-(px(30.0) + px(highlighted as f32 * 26.0)))
+                                            .bg(theme.panel_background)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .rounded(px(10.0))
+                                            .shadow_md()
+                                            .p(px(6.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .key_context("MacosSelect")
+                                            .on_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, _, cx| {
+                                                    match event.keystroke.key.as_str() {
+                                                        "down" => this.move_highlight(1, cx),
+                                                        "up" => this.move_highlight(-1, cx),
+                                                        "enter" | "return" => {
+                                                            this.confirm_highlighted(cx)
+                                                        }
+                                                        "escape" => this.close(cx),
+                                                        _ => {}
                                                     }
-                                                    "escape" => this.close(cx),
-                                                    _ => {}
-                                                }
-                                            },
-                                        ))
-                                        .track_focus(&focus_handle)
-                                        .child(
-                                            div()
-                                                .id("macos-select-list")
-                                                .flex_1()
-                                                .min_h_0()
-                                                .max_h(window.window_bounds().get_bounds().size.height - px(32.0))
-                                                .overflow_y_scroll()
-                                                .track_scroll(&scroll_handle)
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(2.0))
-                                                .children(item_elements),
-                                        ),
-                                )
-                                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx))),
-                        ),
+                                                },
+                                            ))
+                                            .track_focus(&focus_handle)
+                                            .child(
+                                                div()
+                                                    .id("macos-select-list")
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .max_h(
+                                                        window
+                                                            .window_bounds()
+                                                            .get_bounds()
+                                                            .size
+                                                            .height
+                                                            - px(32.0),
+                                                    )
+                                                    .overflow_y_scroll()
+                                                    .track_scroll(&scroll_handle)
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(2.0))
+                                                    .children(item_elements),
+                                            ),
+                                    )
+                                    .on_mouse_down_out(
+                                        cx.listener(|this, _, _, cx| this.close(cx)),
+                                    ),
+                            ),
                     )
                     .with_priority(101),
                 )

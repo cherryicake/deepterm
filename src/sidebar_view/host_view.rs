@@ -93,6 +93,7 @@ impl HostView {
             Modal::new("host-modal")
                 .width(px(540.))
                 .max_height(px(700.))
+                .top_padding(px(120.))
                 .on_close(move |_window, cx| {
                     entity.update(cx, |this, cx| {
                         this.show_modal = false;

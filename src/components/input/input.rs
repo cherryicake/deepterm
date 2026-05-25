@@ -207,13 +207,16 @@ impl RenderOnce for EditorInput {
                         .min_w(px(0.0))
                         .line_height(LINE_HEIGHT)
                         .when(!self.transparent, |this| {
-                            this.h(px(32.0))
+                            this.h(px(28.0))
                                 .pl(px(10.0))
                                 .pr(input_pr)
                                 .py(input_py)
                                 .gap(px(8.0))
-                                .rounded(px(8.0))
+                                .rounded(px(12.0))
                                 .bg(theme.tab_hover_background)
+                                .when(state.focus_handle.is_focused(window), |this| {
+                                    this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
+                                })
                         })
                         .when(self.transparent, |this| this.h_full())
                         .flex()

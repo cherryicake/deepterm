@@ -184,6 +184,9 @@ pub struct Button {
     border_edges: Edges<bool>,
     size: Size,
     compact: bool,
+    custom_height: Option<Pixels>,
+    custom_width: Option<Pixels>,
+    custom_px: Option<Pixels>,
     tooltip: Option<(SharedString, Option<Rc<Box<dyn Action>>>)>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     on_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
@@ -212,6 +215,9 @@ impl Button {
             on_hover: None,
             loading: false,
             compact: false,
+            custom_height: None,
+            custom_width: None,
+            custom_px: None,
             outline: false,
             children: Vec::new(),
             tab_index: 0,
@@ -258,6 +264,24 @@ impl Button {
     /// Set the button to compact mode
     pub fn compact(mut self) -> Self {
         self.compact = true;
+        self
+    }
+
+    /// Set a custom height for the button, overriding the size-based default.
+    pub fn height(mut self, height: impl Into<Pixels>) -> Self {
+        self.custom_height = Some(height.into());
+        self
+    }
+
+    /// Set a custom width for the button.
+    pub fn width(mut self, width: impl Into<Pixels>) -> Self {
+        self.custom_width = Some(width.into());
+        self
+    }
+
+    /// Set a custom horizontal padding for the button, overriding the size-based default.
+    pub fn px(mut self, px: impl Into<Pixels>) -> Self {
+        self.custom_px = Some(px.into());
         self
     }
 
@@ -391,24 +415,31 @@ impl RenderOnce for Button {
             .when(!style.no_padding(), |this| {
                 if self.label.is_none() && self.children.is_empty() {
                     // Icon Button
-                    match self.size {
-                        Size::Size(px_val) => this.size(px_val),
-                        Size::XSmall => this.size(px(24.0)),
-                        Size::Small => this.size(px(28.0)),
-                        Size::Medium => this.size(px(36.0)),
-                        Size::Large => this.size(px(44.0)),
+                    if let Some(h) = self.custom_height {
+                        this.size(h)
+                    } else {
+                        match self.size {
+                            Size::Size(px_val) => this.size(px_val),
+                            Size::XSmall => this.size(px(24.0)),
+                            Size::Small => this.size(px(28.0)),
+                            Size::Medium => this.size(px(36.0)),
+                            Size::Large => this.size(px(44.0)),
+                        }
                     }
                 } else {
                     // Normal Button
+                    let h = self.custom_height;
+                    let px_val = self.custom_px;
                     match self.size {
-                        Size::Size(_) => this.h(px(36.0)).px(px(12.0)),
-                        Size::XSmall => this.h(px(24.0)).px(px(6.0)),
-                        Size::Small => this.h(px(28.0)).px(px(10.0)),
-                        Size::Medium => this.h(px(36.0)).px(px(16.0)),
-                        Size::Large => this.h(px(44.0)).px(px(20.0)),
+                        Size::Size(_) => this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(12.0))),
+                        Size::XSmall => this.h(h.unwrap_or(px(24.0))).px(px_val.unwrap_or(px(6.0))),
+                        Size::Small => this.h(h.unwrap_or(px(28.0))).px(px_val.unwrap_or(px(10.0))),
+                        Size::Medium => this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(16.0))),
+                        Size::Large => this.h(h.unwrap_or(px(44.0))).px(px_val.unwrap_or(px(20.0))),
                     }
                 }
             })
+            .when_some(self.custom_width, |this, w| this.w(w))
             .when(self.border_corners.top_left, |this| this.rounded_tl(radius))
             .when(self.border_corners.top_right, |this| {
                 this.rounded_tr(radius)

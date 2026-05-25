@@ -49,6 +49,7 @@ pub struct Modal {
     min_height: Option<Pixels>,
     padding: Option<Pixels>,
     rounded: Option<Pixels>,
+    top_padding: Option<Pixels>,
     children: Vec<AnyElement>,
     close_on_backdrop: bool,
     close_on_escape: bool,
@@ -69,6 +70,7 @@ impl Modal {
             min_height: None,
             padding: Some(px(24.0)),
             rounded: Some(px(16.0)),
+            top_padding: None,
             children: Vec::new(),
             close_on_backdrop: true,
             close_on_escape: true,
@@ -121,6 +123,13 @@ impl Modal {
     /// Set the border radius of the modal panel. Default is `px(16.0)`.
     pub fn rounded(mut self, rounded: impl Into<Pixels>) -> Self {
         self.rounded = Some(rounded.into());
+        self
+    }
+
+    /// Set the top padding of the modal panel to position it lower from the top.
+    /// When set, the modal will be aligned to the top with this padding instead of centered.
+    pub fn top_padding(mut self, top: impl Into<Pixels>) -> Self {
+        self.top_padding = Some(top.into());
         self
     }
 
@@ -198,6 +207,7 @@ impl RenderOnce for Modal {
             .occlude()
             .children(self.children);
 
+        let has_top_padding = self.top_padding.is_some();
         deferred(
             div()
                 .id(self.id)
@@ -205,8 +215,11 @@ impl RenderOnce for Modal {
                 .inset_0()
                 .size_full()
                 .flex()
-                .items_center()
                 .justify_center()
+                .when(has_top_padding, |this| {
+                    this.items_start().when_some(self.top_padding, |this, t| this.pt(t))
+                })
+                .when(!has_top_padding, |this| this.items_center())
                 .child(
                     // Backdrop layer
                     div()

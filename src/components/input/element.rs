@@ -1035,7 +1035,6 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let style = window.text_style();
-        let text_size = style.font_size.to_pixels(window.rem_size());
 
         let state = self.state.read(cx);
         let line_height = window.line_height();
@@ -1059,6 +1058,12 @@ impl Element for TextElement {
         let text = state.text.clone();
         let is_empty = text.len() == 0;
         let placeholder = self.placeholder.clone();
+
+        let text_size = if is_empty && state.placeholder_font_size.is_some() {
+            state.placeholder_font_size.unwrap()
+        } else {
+            style.font_size.to_pixels(window.rem_size())
+        };
 
         let mut text_style = window.text_style();
         let fg = cx

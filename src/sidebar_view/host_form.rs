@@ -7,7 +7,7 @@ use gpui::{
     px,
 };
 
-use crate::components::button::{Button, ButtonVariants};
+use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -68,9 +68,16 @@ impl NewHostForm {
             let focus_handle = cx.focus_handle();
             let default_username = get_current_username().unwrap_or_default();
 
-            let nickname_input = cx.new(|cx| InputState::new(window, cx).placeholder("我的服务器"));
-            let hostname_input = cx
-                .new(|cx| InputState::new(window, cx).placeholder("192.168.1.100 或 example.com"));
+            let nickname_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("我的服务器")
+                    .placeholder_font_size(px(13.0))
+            });
+            let hostname_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("192.168.1.100 或 example.com")
+                    .placeholder_font_size(px(13.0))
+            });
             let port_input = cx.new(|cx| InputState::new(window, cx));
             port_input.update(cx, |input, cx| input.set_text("22", cx));
             let username_input = cx.new(|cx| InputState::new(window, cx));
@@ -78,17 +85,25 @@ impl NewHostForm {
             let password_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("保存到系统钥匙串")
+                    .placeholder_font_size(px(13.0))
                     .masked(true)
             });
-            let key_path_input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_ed25519"));
+            let key_path_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("~/.ssh/id_ed25519")
+                    .placeholder_font_size(px(13.0))
+            });
             let key_passphrase_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("可选的密钥密码")
+                    .placeholder_font_size(px(13.0))
                     .masked(true)
             });
-            let credential_label_input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("DeepTerm 自动生成标签"));
+            let credential_label_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("DeepTerm 自动生成标签")
+                    .placeholder_font_size(px(13.0))
+            });
 
             let auth_labels: Vec<SharedString> = AuthType::all()
                 .into_iter()
@@ -311,8 +326,6 @@ impl NewHostForm {
         div()
             .w_full()
             .pb(px(16.))
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 div()
                     .text_xl()
@@ -357,17 +370,13 @@ impl NewHostForm {
 
     fn render_section_title(&self, title: &str, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
-        div()
-            .w_full()
-            .pt(px(4.))
-            .pb(px(2.))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_subtle)
-                    .child(title.to_string()),
-            )
+        div().w_full().pt(px(4.)).pb(px(2.)).child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_subtle)
+                .child(title.to_string()),
+        )
     }
 
     fn render_message(&self, cx: &App) -> Option<impl IntoElement> {
@@ -376,34 +385,17 @@ impl NewHostForm {
             Some(
                 div()
                     .w_full()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .bg(theme.error_background)
-                    .border_1()
-                    .border_color(theme.error)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.error_foreground)
-                            .child(err.clone()),
-                    )
+                    .child(div().text_sm().text_color(theme.error).child(err.clone()))
                     .into_any_element(),
             )
         } else if let Some(ref succ) = self.success_message {
             Some(
                 div()
                     .w_full()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .bg(theme.success_background)
-                    .border_1()
-                    .border_color(theme.success)
                     .child(
                         div()
                             .text_sm()
-                            .text_color(theme.success_foreground)
+                            .text_color(theme.success)
                             .child(succ.clone()),
                     )
                     .into_any_element(),
@@ -421,19 +413,23 @@ impl NewHostForm {
             .justify_end()
             .gap(px(8.))
             .pt(px(16.))
-            .border_t_1()
-            .border_color(cx.theme().ui.border)
             .child(
                 Button::new("new-host-cancel")
                     .label("取消")
-                    .rounded(px(6.))
+                    .rounded(px(12.))
+                    .with_size(ButtonSize::Small)
+                    .width(px(80.))
+                    .px(px(14.))
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
             .child(
                 Button::new("new-host-save")
                     .label("保存")
                     .success()
-                    .rounded(px(6.))
+                    .rounded(px(12.))
+                    .with_size(ButtonSize::Small)
+                    .width(px(80.))
+                    .px(px(14.))
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
     }
@@ -483,12 +479,7 @@ impl Render for NewHostForm {
                                     .w(px(60.))
                                     .flex()
                                     .justify_end()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.text)
-                                            .child("端口"),
-                                    ),
+                                    .child(div().text_sm().text_color(theme.text).child("端口")),
                             )
                             .child(div().w(px(68.)).child(EditorInput::new(&self.port_input))),
                     )
@@ -505,12 +496,7 @@ impl Render for NewHostForm {
                                     .w(px(60.))
                                     .flex()
                                     .justify_end()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.text)
-                                            .child("用户名"),
-                                    ),
+                                    .child(div().text_sm().text_color(theme.text).child("用户名")),
                             )
                             .child(div().flex_1().child(EditorInput::new(&self.username_input))),
                     ),
@@ -525,16 +511,11 @@ impl Render for NewHostForm {
                     .items_center()
                     .justify_between()
                     .child(
-                            div()
-                                .w(px(60.))
-                                .flex()
-                                .justify_end()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.text)
-                                        .child("方式"),
-                                ),
+                        div()
+                            .w(px(60.))
+                            .flex()
+                            .justify_end()
+                            .child(div().text_sm().text_color(theme.text).child("方式")),
                     )
                     .child(self.auth_type_select.clone()),
             )
