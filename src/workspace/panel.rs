@@ -1061,7 +1061,7 @@ impl Render for Panel {
                 let border_color = if is_selected {
                     theme.border_strong
                 } else {
-                    theme.border.opacity(0.85)
+                    theme.border
                 };
                 this.border_1()
                     .border_color(border_color)

@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -12,34 +11,32 @@ use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::get_current_username;
-use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore, classify_key_flavor};
+use crate::ssh::keychain::{KeychainItem, KeychainStore, classify_key_flavor};
 use crate::theme::ActiveTheme;
 
 /// 认证方式类型
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuthType {
-    Password,
-    PrivateKey,
     Agent,
+    PrivateKey,
+    Password,
 }
 
 impl AuthType {
     pub fn display_name(&self) -> &'static str {
         match self {
-            AuthType::Password => "密码",
-            AuthType::PrivateKey => "私钥",
             AuthType::Agent => "SSH Agent",
+            AuthType::PrivateKey => "私钥",
+            AuthType::Password => "密码",
         }
     }
 
     pub fn all() -> Vec<AuthType> {
-        vec![AuthType::Password, AuthType::PrivateKey, AuthType::Agent]
+        vec![AuthType::Agent, AuthType::PrivateKey, AuthType::Password]
     }
 }
 
-/// macOS 风格的 New Host 配置表单。
-///
-/// 布局参考 macOS 系统设置弹窗：
+/// Host配置表单
 /// - 标签在左（固定宽度，右对齐），控件在右
 /// - 分组标题 + 分割线
 /// - 底部按钮右对齐
@@ -55,6 +52,9 @@ pub struct NewHostForm {
     credential_label_input: Entity<InputState>,
     auth_type: AuthType,
     auth_type_select: Entity<MacosSelect>,
+    keychain_select: Entity<MacosSelect>,
+    keychain_options: Vec<(String, String)>,
+    selected_keychain_id: Option<String>,
 
     error_message: Option<String>,
     success_message: Option<String>,
@@ -110,25 +110,43 @@ impl NewHostForm {
                 .map(|a| a.display_name().into())
                 .collect();
             let auth_type_select =
-                MacosSelect::new(window, cx, auth_labels, AuthType::Password.display_name());
+                MacosSelect::new(window, cx, auth_labels, AuthType::Agent.display_name());
+
+            let keychain_select = MacosSelect::new(window, cx, vec![], "—");
 
             let entity = cx.entity();
             auth_type_select.update(cx, |select, _cx| {
+                let entity = entity.clone();
                 select.on_select(move |label, _index, cx| {
                     let auth_type = match label.as_ref() {
-                        "密码" => AuthType::Password,
-                        "私钥" => AuthType::PrivateKey,
                         "SSH Agent" => AuthType::Agent,
+                        "私钥" => AuthType::PrivateKey,
+                        "密码" => AuthType::Password,
                         _ => AuthType::Password,
                     };
-                    cx.update_entity(&entity, |this: &mut NewHostForm, _cx| {
+                    cx.update_entity(&entity, |this: &mut NewHostForm, cx| {
                         this.auth_type = auth_type;
-                        _cx.notify();
+                        this.refresh_keychain_options(cx);
+                        cx.notify();
                     });
                 });
             });
 
-            Self {
+            let entity2 = entity.clone();
+            keychain_select.update(cx, |select, _cx| {
+                select.on_select(move |_label, index, cx| {
+                    cx.update_entity(&entity2, |this: &mut NewHostForm, cx| {
+                        // index 0 是"新密码"/"新密钥"，不引用已有钥匙串项
+                        this.selected_keychain_id = index
+                            .checked_sub(1)
+                            .and_then(|i| this.keychain_options.get(i))
+                            .map(|(id, _)| id.clone());
+                        cx.notify();
+                    });
+                });
+            });
+
+            let mut this = Self {
                 focus_handle,
                 nickname_input,
                 hostname_input,
@@ -138,13 +156,18 @@ impl NewHostForm {
                 key_path_input,
                 key_passphrase_input,
                 credential_label_input,
-                auth_type: AuthType::Password,
+                auth_type: AuthType::Agent,
                 auth_type_select,
+                keychain_select,
+                keychain_options: Vec::new(),
+                selected_keychain_id: None,
                 error_message: None,
                 success_message: None,
                 on_cancel: None,
                 on_saved: None,
-            }
+            };
+            this.refresh_keychain_options(cx);
+            this
         })
     }
 
@@ -162,6 +185,35 @@ impl NewHostForm {
         self.on_saved = Some(Box::new(callback));
     }
 
+    fn refresh_keychain_options(&mut self, cx: &mut Context<Self>) {
+        let store = KeychainStore::load_or_default();
+        let items: Vec<&KeychainItem> = match self.auth_type {
+            AuthType::Password => store.identities(),
+            AuthType::PrivateKey => store.keys(),
+            AuthType::Agent => vec![],
+        };
+
+        let default_label = match self.auth_type {
+            AuthType::Password => "新密码",
+            AuthType::PrivateKey => "新密钥",
+            AuthType::Agent => "—",
+        };
+
+        let mut labels: Vec<SharedString> = vec![default_label.into()];
+        labels.extend(items.iter().map(|item| item.label.clone().into()));
+
+        self.keychain_options = items
+            .iter()
+            .map(|item| (item.id.clone(), item.label.clone()))
+            .collect();
+        self.selected_keychain_id = None;
+
+        self.keychain_select.update(cx, |select, cx| {
+            select.set_items(labels, cx);
+            select.set_selected(default_label, cx);
+        });
+    }
+
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.nickname_input.update(cx, |input, cx| input.clear(cx));
         self.hostname_input.update(cx, |input, cx| input.clear(cx));
@@ -176,10 +228,17 @@ impl NewHostForm {
             .update(cx, |input, cx| input.clear(cx));
         self.credential_label_input
             .update(cx, |input, cx| input.clear(cx));
-        self.auth_type = AuthType::Password;
+        self.auth_type = AuthType::Agent;
         self.auth_type_select.update(cx, |select, cx| {
-            select.set_selected(AuthType::Password.display_name(), cx);
+            select.set_selected(AuthType::Agent.display_name(), cx);
         });
+        self.keychain_select.update(cx, |select, cx| {
+            select.set_items(vec![], cx);
+            select.set_selected("—", cx);
+        });
+        self.keychain_options.clear();
+        self.selected_keychain_id = None;
+        self.refresh_keychain_options(cx);
         self.error_message = None;
         self.success_message = None;
         cx.notify();
@@ -210,6 +269,15 @@ impl NewHostForm {
         host_label: &str,
         cx: &Context<Self>,
     ) -> Result<AuthMethod, String> {
+        // 优先使用选中的钥匙串项
+        if let Some(ref id) = self.selected_keychain_id {
+            return match self.auth_type {
+                AuthType::Password => Ok(AuthMethod::password_ref(id)),
+                AuthType::PrivateKey => Ok(AuthMethod::key_ref(id)),
+                AuthType::Agent => Ok(AuthMethod::Agent),
+            };
+        }
+
         let credential_label = self.credential_label_input.read(cx).value().to_string();
         let password = self.password_input.read(cx).value().to_string();
         let key_path = self.key_path_input.read(cx).value().to_string();
@@ -345,7 +413,7 @@ impl NewHostForm {
     fn render_row(
         &self,
         label: &str,
-        required: bool,
+        _required: bool,
         control: impl IntoElement,
         _cx: &App,
     ) -> impl IntoElement {
@@ -418,7 +486,7 @@ impl NewHostForm {
                     .label("取消")
                     .rounded(px(12.))
                     .with_size(ButtonSize::Small)
-                    .width(px(80.))
+                    .width(px(86.))
                     .px(px(14.))
                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
@@ -428,7 +496,7 @@ impl NewHostForm {
                     .success()
                     .rounded(px(12.))
                     .with_size(ButtonSize::Small)
-                    .width(px(80.))
+                    .width(px(86.))
                     .px(px(14.))
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
@@ -522,6 +590,28 @@ impl Render for NewHostForm {
             .when(
                 matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey),
                 |this| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .w(px(60.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(div().text_sm().text_color(theme.text).child("钥匙串")),
+                            )
+                            .child(self.keychain_select.clone()),
+                    )
+                },
+            )
+            .when(
+                matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey)
+                    && self.selected_keychain_id.is_none(),
+                |this| {
                     this.child(self.render_row(
                         "标签",
                         false,
@@ -530,32 +620,29 @@ impl Render for NewHostForm {
                     ))
                 },
             )
-            .when(matches!(self.auth_type, AuthType::Password), |this| {
-                this.child(self.render_row(
-                    "密码",
-                    false,
-                    EditorInput::new(&self.password_input).mask_toggle(),
-                    cx,
-                ))
-            })
-            .when(matches!(self.auth_type, AuthType::PrivateKey), |this| {
-                this.child(self.render_row(
-                    "密钥路径",
-                    false,
-                    EditorInput::new(&self.key_path_input),
-                    cx,
-                ))
-            })
-            .when(matches!(self.auth_type, AuthType::Agent), |this| {
-                this.child(
-                    div().w_full().pl(px(72.)).child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child("使用 SSH Agent 认证。"),
-                    ),
-                )
-            })
+            .when(
+                matches!(self.auth_type, AuthType::Password) && self.selected_keychain_id.is_none(),
+                |this| {
+                    this.child(self.render_row(
+                        "密码",
+                        false,
+                        EditorInput::new(&self.password_input).mask_toggle(),
+                        cx,
+                    ))
+                },
+            )
+            .when(
+                matches!(self.auth_type, AuthType::PrivateKey)
+                    && self.selected_keychain_id.is_none(),
+                |this| {
+                    this.child(self.render_row(
+                        "密钥路径",
+                        false,
+                        EditorInput::new(&self.key_path_input),
+                        cx,
+                    ))
+                },
+            )
             // ── Footer ──
             .child(self.render_buttons(cx))
     }

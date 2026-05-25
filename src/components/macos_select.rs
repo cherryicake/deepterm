@@ -312,7 +312,6 @@ impl Render for MacosSelect {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .truncate()
-                            .max_w(px(92.))
                             .text_sm()
                             .text_color(theme.text)
                             .child(selected.to_string()),
