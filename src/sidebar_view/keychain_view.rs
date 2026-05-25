@@ -13,7 +13,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::Modal;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore};
-use crate::ssh_view::keychain_view::KeychainEditor;
+use crate::sidebar_view::keychain_editor::KeychainEditor;
 use crate::theme::ActiveTheme;
 
 actions!(
@@ -346,7 +346,7 @@ impl Render for KeychainSidebarView {
                 list = list.child(render_keychain_item_row(
                     item,
                     index + keys.len(),
-                    Icon::Host,
+                    Icon::PersonBadgeKey,
                     theme.success,
                     is_dark,
                     theme,

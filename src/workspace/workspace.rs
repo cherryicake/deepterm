@@ -17,7 +17,6 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::assets::Icon;
 use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
@@ -30,7 +29,6 @@ use crate::file_transfer::TransferStatusReporter;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
-use crate::ssh_view::new_tab::SshNewTabView;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
@@ -219,8 +217,9 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
-        // 创建初始tab - Start Tab（不显示编号）
-        let initial_tab_items = vec![TabItem::new("tab-0", "Start Tab").with_icon(Some(Icon::PlusCircleFull))];
+        // 创建初始tab - Local Terminal
+        let initial_label = "Local Terminal";
+        let initial_tab_items = vec![TabItem::new("tab-0", initial_label)];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 生成唯一的workspace ID（先创建，确保与Panel一致）
@@ -229,7 +228,6 @@ impl Workspace {
         // 初始化tabs信息
         let tabs = HashMap::new();
 
-        // tab-0 对应 panel-0 - 使用 Start Tab 页面
         // 先创建 workspace，再使用 workspace entity 创建 panel
         let workspace = cx.new(|cx| {
             let mut workspace = Self {
@@ -238,7 +236,7 @@ impl Workspace {
                 active_tab_id: "tab-0".to_string(),
                 next_tab_id: 1,
                 next_panel_id: 1,
-                local_terminal_count: 0, // 初始为Start Tab页面，从0开始计数
+                local_terminal_count: 1, // 初始已有一个本地终端
                 workspace_index: 0,      // 从0开始计数
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
@@ -256,16 +254,13 @@ impl Workspace {
             workspace
         });
 
-        // 使用 workspace entity 创建初始 Start Tab panel
-        let workspace_entity = workspace.clone();
+        // 创建初始本地终端 panel
         let panel_0 = cx.new(|cx| {
-            let new_tab_view = SshNewTabView::new_with_workspace(window, cx, Some(workspace_entity));
-            Panel::with_ssh_new_tab(
+            Panel::with_terminal(
                 "panel-0",
                 workspace_id,
                 Some("tab-0".into()),
-                Some("Start Tab".into()),
-                new_tab_view,
+                Some(initial_label.into()),
                 cx,
             )
         });
@@ -273,7 +268,7 @@ impl Workspace {
         workspace.update(cx, |workspace, _cx| {
             workspace.tabs.insert(
                 "tab-0".to_string(),
-                TabInfo::new_normal("tab-0", "Start Tab", panel_0),
+                TabInfo::new_normal("tab-0", initial_label, panel_0),
             );
         });
 
@@ -289,62 +284,19 @@ impl Workspace {
     /// 设置该 workspace 使用的 SSH picker
     pub fn set_ssh_picker(&mut self, picker: Entity<SshPicker>, cx: &mut Context<Self>) {
         self.ssh_picker = Some(picker.clone());
-        let picker = picker.clone();
+        let workspace = cx.entity();
         self.tab_bar.update(cx, |tab_bar, _cx| {
             tab_bar.on_new_tab(move |window, cx| {
-                picker.update(cx, |picker, cx| {
-                    picker.toggle(window, cx);
+                workspace.update(cx, |workspace, cx| {
+                    workspace.create_new_tab(window, cx);
                 });
             });
         });
     }
 
-    /// 创建 Start Tab
+    /// 创建新 Tab（本地终端）
     pub fn create_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let label = "Start Tab";
-        let workspace_entity = cx.entity();
-        let panel = cx.new(|cx| {
-            let new_tab_view = SshNewTabView::new_with_workspace(window, cx, Some(workspace_entity));
-            Panel::with_ssh_new_tab(
-                format!("panel-{}", self.next_panel_id),
-                self.workspace_id.clone(),
-                Some(format!("tab-{}", self.next_tab_id).into()),
-                Some(label.into()),
-                new_tab_view,
-                cx,
-            )
-        });
-        self.next_panel_id += 1;
-
-        let tab_id = format!("tab-{}", self.next_tab_id);
-        self.next_tab_id += 1;
-
-        self.tabs.insert(
-            tab_id.clone(),
-            TabInfo::new_normal(&tab_id, label, panel.clone()),
-        );
-
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.add_tab(TabItem::new(&tab_id, label).with_icon(Some(Icon::PlusCircleFull)), cx)
-        });
-
-        let subscription =
-            cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
-                this.handle_panel_event(event, window, cx);
-            });
-        self.panel_subscriptions
-            .insert(panel.read(cx).panel_id.to_string(), subscription);
-
-        self.active_tab_id = tab_id.clone();
-        self.switch_to_tab(&tab_id, cx);
-
-        cx.defer_in(window, move |_, window, cx| {
-            if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
-                window.focus(&handle, cx);
-            }
-        });
-
-        cx.notify();
+        self.create_local_terminal(window, cx);
     }
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
@@ -1735,77 +1687,7 @@ impl Workspace {
         }
     }
 
-    /// 检查当前活动tab是否是Start Tab页面
-    fn is_current_tab_new_tab(&self, cx: &App) -> bool {
-        if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
-            if let Some(panel) = tab_info.container.get_panel_entity(cx) {
-                return matches!(panel.read(cx).content(), PanelContent::SshNewTab(_));
-            }
-        }
-        false
-    }
-
-    /// 替换当前tab的内容为新的panel
-    fn replace_current_tab(
-        &mut self,
-        label: String,
-        panel: Entity<Panel>,
-        icon: Option<crate::assets::Icon>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let tab_id = self.active_tab_id.clone();
-        self.next_panel_id += 1;
-
-        // 设置正确的 workspace_id 和广播状态
-        let workspace_id = self.workspace_id.clone();
-        panel.update(cx, |p, cx| {
-            p.set_workspace_id(workspace_id);
-            p.set_broadcast_enabled(false, cx);
-        });
-
-        // 取消旧panel的订阅
-        if let Some(old_tab) = self.tabs.get(&tab_id) {
-            if let Some(old_panel) = old_tab.container.get_panel_entity(cx) {
-                let old_panel_id = old_panel.read(cx).panel_id.to_string();
-                self.panel_subscriptions.remove(&old_panel_id);
-            }
-        }
-
-        // 更新tab信息
-        self.tabs.insert(
-            tab_id.clone(),
-            TabInfo::new_normal(&tab_id, &label, panel.clone()),
-        );
-
-        // 更新tab_bar中的tab标题和图标
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            if let Some(tab) = tab_bar.tabs.iter_mut().find(|t| t.id == tab_id.as_str()) {
-                tab.label = label.into();
-                tab.icon = icon;
-            }
-            cx.notify();
-        });
-
-        // 订阅新panel的事件
-        let subscription =
-            cx.subscribe_in(&panel, window, |this, _, event: &PanelEvent, window, cx| {
-                this.handle_panel_event(event, window, cx);
-            });
-        self.panel_subscriptions
-            .insert(panel.read(cx).panel_id.to_string(), subscription);
-
-        self.sync_tab_broadcast_to_panels(&tab_id, cx);
-        cx.notify();
-
-        cx.defer_in(window, move |_, window, cx| {
-            if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
-                window.focus(&handle, cx);
-            }
-        });
-    }
-
-    /// 创建本地终端Tab（如果在Start Tab页面则替换当前tab）
+    /// 创建本地终端Tab
     pub fn create_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.generate_terminal_tab_name();
         let panel = cx.new(|cx| {
@@ -1818,14 +1700,10 @@ impl Workspace {
             )
         });
 
-        if self.is_current_tab_new_tab(cx) {
-            self.replace_current_tab(label, panel, None, window, cx);
-        } else {
-            self.add_terminal_tab(label, panel, None, window, cx);
-        }
+        self.add_terminal_tab(label, panel, None, window, cx);
     }
 
-    /// 使用指定命令创建本地终端Tab（如果在Start Tab页面则替换当前tab）
+    /// 使用指定命令创建本地终端Tab
     pub fn create_local_terminal_with_command(
         &mut self,
         command: &str,
@@ -1846,14 +1724,10 @@ impl Workspace {
             )
         });
 
-        if self.is_current_tab_new_tab(cx) {
-            self.replace_current_tab(label, panel, None, window, cx);
-        } else {
-            self.add_terminal_tab(label, panel, None, window, cx);
-        }
+        self.add_terminal_tab(label, panel, None, window, cx);
     }
 
-    /// 使用指定配置创建 SSH 终端（如果在Start Tab页面则替换当前tab）
+    /// 使用指定配置创建 SSH 终端
     pub fn create_ssh_terminal_with_config(
         &mut self,
         config: &SshConnectionConfig,
@@ -1883,11 +1757,7 @@ impl Workspace {
             )
         });
 
-        if self.is_current_tab_new_tab(cx) {
-            self.replace_current_tab(label, panel, initial_icon, window, cx);
-        } else {
-            self.add_terminal_tab(label, panel, initial_icon, window, cx);
-        }
+        self.add_terminal_tab(label, panel, initial_icon, window, cx);
     }
 
     /// 添加终端到Tab（通用方法）

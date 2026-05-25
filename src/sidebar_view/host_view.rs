@@ -14,7 +14,7 @@ use crate::components::modal::Modal;
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
-use crate::ssh_view::hosts_view::{ConnectHost, DeleteHost, DuplicateHost, EditHost, HostsView};
+use crate::sidebar_view::hosts_view::{ConnectHost, DeleteHost, DuplicateHost, EditHost, load_hosts_from_config};
 use crate::theme::ActiveTheme;
 
 /// Host 侧边栏视图组件，管理 Host 列表和 New Host Modal。
@@ -190,7 +190,7 @@ impl Render for HostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
-        let (hosts, _, configs) = HostsView::load_hosts_from_config();
+        let (hosts, configs) = load_hosts_from_config();
 
         let on_select = self.on_select.clone();
         let on_connect = self.on_connect.clone();

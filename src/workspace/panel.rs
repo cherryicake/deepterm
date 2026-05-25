@@ -12,7 +12,6 @@ use crate::file_browser::{
 };
 use crate::file_transfer::TransferRequest;
 use crate::ssh::platform::RemoteOS;
-use crate::ssh_view::new_tab::SshNewTabView;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
 
@@ -102,8 +101,6 @@ pub enum PanelContent {
     Text(String),
     /// Terminal panel
     Terminal(Entity<TerminalView>),
-    /// SSH New Tab view (merged hosts + keychain)
-    SshNewTab(Entity<SshNewTabView>),
     /// Local file browser
     FileBrowser(Entity<FileBrowserView>),
     /// Remote file browser
@@ -390,25 +387,6 @@ impl Panel {
         )
     }
 
-    /// Creates a new panel with an SshNewTabView (merged hosts + keychain).
-    pub fn with_ssh_new_tab(
-        panel_id: impl Into<String>,
-        workspace_id: impl Into<String>,
-        active_tab_id: Option<SharedString>,
-        active_tab_label: Option<SharedString>,
-        new_tab_view: Entity<SshNewTabView>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_common(
-            panel_id,
-            workspace_id,
-            active_tab_id,
-            active_tab_label,
-            PanelContent::SshNewTab(new_tab_view),
-            cx,
-        )
-    }
-
     pub fn show_file_browser_overlay(
         &mut self,
         target: FileBrowserTarget,
@@ -681,7 +659,6 @@ impl Panel {
             PanelContent::RemoteFileBrowser(file_browser) => {
                 Some(file_browser.read(cx).focus_handle(cx))
             }
-            PanelContent::SshNewTab(new_tab_view) => Some(new_tab_view.read(cx).focus_handle(cx)),
             PanelContent::Editor(editor_view) => Some(editor_view.read(cx).focus_handle(cx)),
             _ => None,
         }
@@ -853,11 +830,6 @@ impl Panel {
                 )
             }
             PanelContent::Terminal(terminal_view) => div().flex_1().child(terminal_view.clone()),
-            PanelContent::SshNewTab(new_tab_view) => div()
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
-                .child(new_tab_view.clone()),
 
             PanelContent::FileBrowser(file_browser_view) => div()
                 .flex_1()
