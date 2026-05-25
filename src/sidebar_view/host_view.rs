@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::prelude::*;
@@ -20,7 +21,7 @@ use crate::theme::ActiveTheme;
 pub struct HostView {
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
-    selected_id: Option<SharedString>,
+    selected_ids: HashSet<SharedString>,
     host_form: Option<Entity<NewHostForm>>,
     show_modal: bool,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
@@ -59,7 +60,7 @@ impl HostView {
             Self {
                 focus_handle,
                 scroll_handle,
-                selected_id: None,
+                selected_ids: HashSet::new(),
                 host_form: None,
                 show_modal: false,
                 on_select: None,
@@ -313,8 +314,7 @@ impl Render for HostView {
         for (index, host) in filtered_hosts.iter().enumerate() {
             let icon_color = host.icon_color.to_hsla(cx);
             let host_id = host.id.to_string();
-            let is_selected =
-                self.selected_id.as_ref().map(|s| s.as_ref()) == Some(host_id.as_str());
+            let is_selected = self.selected_ids.iter().any(|s| s.as_ref() == host_id);
             let host_config = configs.iter().find(|c| c.id() == host_id).cloned();
 
             let row = div()
@@ -398,16 +398,33 @@ impl Render for HostView {
                                 .child(host.subtitle()),
                         ),
                 )
-                .on_click({
+                .on_click(cx.listener({
                     let on_select = on_select.clone();
                     let on_connect = on_connect.clone();
+                    let host_config = host_config.clone();
                     let id = host_id.clone();
-                    move |event, window, cx| {
+                    move |this, event: &gpui::ClickEvent, window, cx| {
+                        let is_cmd_pressed = event.modifiers().secondary();
                         if event.click_count() == 1 {
+                            if is_cmd_pressed {
+                                let id_shared: SharedString = id.clone().into();
+                                if this.selected_ids.contains(&id_shared) {
+                                    this.selected_ids.remove(&id_shared);
+                                } else {
+                                    this.selected_ids.insert(id_shared);
+                                }
+                            } else {
+                                this.selected_ids.clear();
+                                this.selected_ids.insert(id.clone().into());
+                            }
                             if let Some(ref f) = on_select {
                                 f(&id, window, cx);
                             }
+                            cx.notify();
                         } else if event.click_count() == 2 {
+                            this.selected_ids.clear();
+                            this.selected_ids.insert(id.clone().into());
+                            cx.notify();
                             if let Some(ref config) = host_config {
                                 if let Some(ref f) = on_connect {
                                     f(config, window, cx);
@@ -415,35 +432,57 @@ impl Render for HostView {
                             }
                         }
                     }
-                })
+                }))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener({
                         let host_id = host_id.clone();
                         move |this, _, _, cx| {
                             this.context_menu_host_id = Some(host_id.clone().into());
+                            let id_shared: SharedString = host_id.clone().into();
+                            if !this.selected_ids.contains(&id_shared) {
+                                this.selected_ids.clear();
+                                this.selected_ids.insert(id_shared);
+                            }
                             cx.notify();
                         }
                     }),
                 )
                 .context_menu({
+                    let entity = cx.entity().clone();
                     use crate::components::button::Icon as MenuIcon;
                     move |menu: PopupMenu, _window, _cx| {
-                        menu.menu_with_icon(
-                            "Connect",
-                            MenuIcon::new("icons/link.svg"),
-                            Box::new(ConnectHost),
-                        )
-                        .separator()
-                        .menu_with_icon(
-                            "Edit",
-                            MenuIcon::new("icons/edit.svg"),
-                            Box::new(EditHost),
-                        )
-                        .menu("Duplicate", Box::new(DuplicateHost))
-                        .separator()
-                        .menu_with_icon(
-                            "Delete",
+                        let count = entity.read(_cx).selected_ids.len();
+                        let mut m = menu;
+                        let conn_label = if count == 1 {
+                            "Connect".to_string()
+                        } else {
+                            format!("Connect {} hosts", count)
+                        };
+                        m = m
+                            .menu_with_icon(
+                                &conn_label,
+                                MenuIcon::new("icons/link.svg"),
+                                Box::new(ConnectHost),
+                            )
+                            .separator();
+                        if count == 1 {
+                            m = m
+                                .menu_with_icon(
+                                    "Edit",
+                                    MenuIcon::new("icons/edit.svg"),
+                                    Box::new(EditHost),
+                                )
+                                .menu("Duplicate", Box::new(DuplicateHost))
+                                .separator();
+                        }
+                        let label = if count == 1 {
+                            "Delete".to_string()
+                        } else {
+                            format!("Delete {} hosts", count)
+                        };
+                        m.menu_with_icon(
+                            &label,
                             MenuIcon::new("icons/trash.svg"),
                             Box::new(DeleteHost),
                         )
@@ -464,8 +503,8 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &ConnectHost, window, cx| {
-                    let host_id = this.context_menu_host_id.clone();
-                    if let Some(id) = host_id {
+                    let ids: Vec<_> = this.selected_ids.iter().cloned().collect();
+                    for id in ids {
                         if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
                             if let Some(ref f) = on_connect_action {
                                 f(config, window, cx);
@@ -477,7 +516,8 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &EditHost, window, cx| {
-                    let host_id = this.context_menu_host_id.clone();
+                    let host_id = this.context_menu_host_id.clone()
+                        .or_else(|| this.selected_ids.iter().next().cloned());
                     if let Some(id) = host_id {
                         if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()).cloned() {
                             this.open_edit_modal(&config, window, cx);
@@ -488,8 +528,10 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &DuplicateHost, _window, _cx| {
-                    if let Some(ref host_id) = this.context_menu_host_id {
-                        if let Some(config) = configs_rc.iter().find(|c| c.id() == host_id.as_ref()) {
+                    let host_id = this.context_menu_host_id.clone()
+                        .or_else(|| this.selected_ids.iter().next().cloned());
+                    if let Some(id) = host_id {
+                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
                             let mut new_config = config.clone();
                             new_config.nickname = config.nickname.as_ref().map(|n| format!("{} (copy)", n));
                             if let Ok(mut global) = SshGlobalConfig::load_or_create() {
@@ -501,38 +543,53 @@ impl Render for HostView {
                 }
             }))
             .on_action(cx.listener(move |this, _: &DeleteHost, window, cx| {
-                let host_id = this.context_menu_host_id.clone();
-                if let Some(id) = host_id {
-                    let host_name = hosts.iter().find(|h| h.id.as_ref() == id.as_ref()).map(|h| h.name.to_string());
-                    let message = if let Some(name) = host_name {
+                let host_ids: Vec<_> = this.selected_ids.iter().cloned().collect();
+                if host_ids.is_empty() {
+                    return;
+                }
+                let count = host_ids.len();
+                let names: Vec<_> = host_ids
+                    .iter()
+                    .filter_map(|id| hosts.iter().find(|h| h.id.as_ref() == id.as_ref()).map(|h| h.name.to_string()))
+                    .collect();
+
+                let message = if count == 1 {
+                    if let Some(name) = names.first() {
                         format!("确定要删除主机 '{}' 吗？此操作不可撤销。", name)
                     } else {
                         "确定要删除该主机吗？此操作不可撤销。".to_string()
-                    };
-                    let weak = cx.weak_entity();
-                    let answer = window.prompt(
-                        gpui::PromptLevel::Warning,
-                        "确认删除",
-                        Some(&message),
-                        &["删除", "取消"],
-                        cx,
-                    );
-                    cx.spawn(async move |_, cx| {
-                        if let Ok(0) = answer.await {
-                            if let Some(entity) = weak.upgrade() {
-                                let _ = entity.update(cx, |this, cx| {
-                                    if let Ok(mut global) = SshGlobalConfig::load_or_create() {
-                                        global.remove_connection(&id);
-                                        let _ = global.save();
+                    }
+                } else {
+                    format!("确定要删除选中的 {} 个主机吗？此操作不可撤销。", count)
+                };
+
+                let weak = cx.weak_entity();
+                let ids_to_delete = host_ids.clone();
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    "确认删除",
+                    Some(&message),
+                    &["删除", "取消"],
+                    cx,
+                );
+                cx.spawn(async move |_, cx| {
+                    if let Ok(0) = answer.await {
+                        if let Some(entity) = weak.upgrade() {
+                            let _ = entity.update(cx, |this, cx| {
+                                if let Ok(mut global) = SshGlobalConfig::load_or_create() {
+                                    for id in &ids_to_delete {
+                                        global.remove_connection(id);
                                     }
-                                    this.context_menu_host_id = None;
-                                    cx.notify();
-                                });
-                            }
+                                    let _ = global.save();
+                                }
+                                this.selected_ids.clear();
+                                this.context_menu_host_id = None;
+                                cx.notify();
+                            });
                         }
-                    })
-                    .detach();
-                }
+                    }
+                })
+                .detach();
             }))
             .child(header)
             .child(search_box)

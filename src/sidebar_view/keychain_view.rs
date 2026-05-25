@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::prelude::*;
@@ -24,7 +25,7 @@ actions!(
 pub struct KeychainSidebarView {
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
-    selected_id: Option<SharedString>,
+    selected_ids: HashSet<SharedString>,
     editor: Option<Entity<KeychainEditor>>,
     show_modal: bool,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
@@ -61,7 +62,7 @@ impl KeychainSidebarView {
             Self {
                 focus_handle,
                 scroll_handle,
-                selected_id: None,
+                selected_ids: HashSet::new(),
                 editor: None,
                 show_modal: false,
                 on_select: None,
@@ -77,6 +78,33 @@ impl KeychainSidebarView {
         F: Fn(&str, &mut Window, &mut App) + 'static,
     {
         self.on_select = Some(Rc::new(callback));
+    }
+
+    fn open_new_key_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_none() {
+            self.editor = Some(KeychainEditor::new(window, cx));
+        }
+        let editor = self.editor.as_ref().unwrap().clone();
+        let entity = cx.entity().clone();
+        editor.update(cx, |ed, cx| {
+            ed.start_new_key(cx);
+            let entity_clone = entity.clone();
+            ed.on_cancel(move |cx| {
+                entity_clone.update(cx, |this, cx| {
+                    this.show_modal = false;
+                    cx.notify();
+                });
+            });
+            let entity_clone2 = entity.clone();
+            ed.on_saved(move |cx| {
+                entity_clone2.update(cx, |this, cx| {
+                    this.show_modal = false;
+                    cx.notify();
+                });
+            });
+        });
+        self.show_modal = true;
+        cx.notify();
     }
 
     fn open_edit_modal(
@@ -214,7 +242,29 @@ impl Render for KeychainSidebarView {
                     .text_color(theme.text)
                     .child("Keychain"),
             )
-            .child(div().w(px(28.0)));
+            .child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(999.0))
+                    .bg(button_bg(is_dark))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .child(
+                        gpui::svg()
+                            .size(px(12.0))
+                            .path(Icon::Plus.path())
+                            .text_color(theme.text),
+                    )
+                    .on_mouse_down(MouseButton::Left, {
+                        cx.listener(|this, _, window, cx| {
+                            this.open_new_key_modal(window, cx);
+                        })
+                    }),
+            );
 
         // 搜索框
         let search_box = div()
@@ -265,7 +315,7 @@ impl Render for KeychainSidebarView {
                     theme.accent,
                     is_dark,
                     theme,
-                    self.selected_id.as_ref().map(|s| s.as_ref()),
+                    &self.selected_ids,
                     on_select.clone(),
                     cx,
                 ));
@@ -300,7 +350,7 @@ impl Render for KeychainSidebarView {
                     theme.success,
                     is_dark,
                     theme,
-                    self.selected_id.as_ref().map(|s| s.as_ref()),
+                    &self.selected_ids,
                     on_select.clone(),
                     cx,
                 ));
@@ -314,7 +364,8 @@ impl Render for KeychainSidebarView {
             .flex_col()
             // Edit action
             .on_action(cx.listener(|this, _: &EditKeychainItem, window, cx| {
-                let item_id = this.context_menu_item_id.clone();
+                let item_id = this.context_menu_item_id.clone()
+                    .or_else(|| this.selected_ids.iter().next().cloned());
                 if let Some(id) = item_id {
                     let store = KeychainStore::load_or_default();
                     if let Some(item) = store.items.iter().find(|i| i.id == id.as_ref()) {
@@ -324,42 +375,52 @@ impl Render for KeychainSidebarView {
             }))
             // Delete action
             .on_action(cx.listener(|this, _: &DeleteKeychainItem, window, cx| {
-                let item_id = this.context_menu_item_id.clone();
-                if let Some(id) = item_id {
-                    let store = KeychainStore::load_or_default();
-                    let item_name = store
-                        .items
-                        .iter()
-                        .find(|i| i.id == id.as_ref())
-                        .map(|i| i.label.clone());
-                    let message = if let Some(name) = item_name {
+                let item_ids: Vec<_> = this.selected_ids.iter().cloned().collect();
+                if item_ids.is_empty() {
+                    return;
+                }
+                let count = item_ids.len();
+                let store = KeychainStore::load_or_default();
+                let names: Vec<_> = item_ids
+                    .iter()
+                    .filter_map(|id| store.items.iter().find(|i| i.id == id.as_ref()).map(|i| i.label.clone()))
+                    .collect();
+
+                let message = if count == 1 {
+                    if let Some(name) = names.first() {
                         format!("确定要删除 '{}' 吗？此操作不可撤销。", name)
                     } else {
                         "确定要删除该项吗？此操作不可撤销。".to_string()
-                    };
+                    }
+                } else {
+                    format!("确定要删除选中的 {} 项吗？此操作不可撤销。", count)
+                };
 
-                    let weak = cx.weak_entity();
-                    let answer = window.prompt(
-                        gpui::PromptLevel::Warning,
-                        "确认删除",
-                        Some(&message),
-                        &["删除", "取消"],
-                        cx,
-                    );
-                    cx.spawn(async move |_, cx| {
-                        if let Ok(0) = answer.await {
-                            if let Some(entity) = weak.upgrade() {
-                                let _ = entity.update(cx, |this, cx| {
-                                    let mut store = KeychainStore::load_or_default();
-                                    let _ = store.delete_item(&id);
-                                    this.context_menu_item_id = None;
-                                    cx.notify();
-                                });
-                            }
+                let weak = cx.weak_entity();
+                let ids_to_delete = item_ids.clone();
+                let answer = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    "确认删除",
+                    Some(&message),
+                    &["删除", "取消"],
+                    cx,
+                );
+                cx.spawn(async move |_, cx| {
+                    if let Ok(0) = answer.await {
+                        if let Some(entity) = weak.upgrade() {
+                            let _ = entity.update(cx, |this, cx| {
+                                let mut store = KeychainStore::load_or_default();
+                                for id in &ids_to_delete {
+                                    let _ = store.delete_item(id);
+                                }
+                                this.selected_ids.clear();
+                                this.context_menu_item_id = None;
+                                cx.notify();
+                            });
                         }
-                    })
-                    .detach();
-                }
+                    }
+                })
+                .detach();
             }))
             .child(header)
             .child(search_box)
@@ -384,12 +445,12 @@ fn render_keychain_item_row(
     icon_color: gpui::Hsla,
     is_dark: bool,
     theme: crate::theme::UiTheme,
-    selected_id: Option<&str>,
+    selected_ids: &HashSet<SharedString>,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     cx: &mut Context<KeychainSidebarView>,
 ) -> impl IntoElement {
     let item_id = item.id.clone();
-    let is_selected = selected_id == Some(item_id.as_str());
+    let is_selected = selected_ids.iter().any(|s| s.as_ref() == item_id);
 
     div()
         .id(("keychain-item", index))
@@ -472,38 +533,68 @@ fn render_keychain_item_row(
                         .child(item.subtitle()),
                 ),
         )
-        .on_click({
+        .on_click(cx.listener({
             let id = item_id.clone();
-            move |_, window, cx| {
-                if let Some(ref f) = on_select {
-                    f(&id, window, cx);
+            move |this, event: &gpui::ClickEvent, window, cx| {
+                let is_cmd_pressed = event.modifiers().secondary();
+                if event.click_count() == 1 {
+                    if is_cmd_pressed {
+                        // Cmd+click: toggle selection
+                        let item_shared: SharedString = id.clone().into();
+                        if this.selected_ids.contains(&item_shared) {
+                            this.selected_ids.remove(&item_shared);
+                        } else {
+                            this.selected_ids.insert(item_shared);
+                        }
+                    } else {
+                        // Normal click: clear all and select only this one
+                        this.selected_ids.clear();
+                        this.selected_ids.insert(id.clone().into());
+                    }
+                    if let Some(ref f) = on_select {
+                        f(&id, window, cx);
+                    }
+                    cx.notify();
                 }
             }
-        })
+        }))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener({
                 let item_id = item_id.clone();
-                move |this, _, _, cx| {
+                move |this, _event, _window, cx| {
                     this.context_menu_item_id = Some(item_id.clone().into());
-                    if this.selected_id.as_ref().map(|s| s.as_ref()) != Some(item_id.as_str()) {
-                        this.selected_id = Some(item_id.clone().into());
+                    let item_shared: SharedString = item_id.clone().into();
+                    if !this.selected_ids.contains(&item_shared) {
+                        this.selected_ids.clear();
+                        this.selected_ids.insert(item_shared);
                     }
                     cx.notify();
                 }
             }),
         )
         .context_menu({
+            let entity = cx.entity().clone();
             use crate::components::button::Icon as MenuIcon;
             move |menu: PopupMenu, _window, _cx| {
-                menu.menu_with_icon(
-                    "Edit",
-                    MenuIcon::new("icons/edit.svg"),
-                    Box::new(EditKeychainItem),
-                )
-                .separator()
-                .menu_with_icon(
-                    "Delete",
+                let count = entity.read(_cx).selected_ids.len();
+                let mut m = menu;
+                if count == 1 {
+                    m = m
+                        .menu_with_icon(
+                            "Edit",
+                            MenuIcon::new("icons/edit.svg"),
+                            Box::new(EditKeychainItem),
+                        )
+                        .separator();
+                }
+                let label = if count == 1 {
+                    "Delete".to_string()
+                } else {
+                    format!("Delete {} items", count)
+                };
+                m.menu_with_icon(
+                    &label,
                     MenuIcon::new("icons/trash.svg"),
                     Box::new(DeleteKeychainItem),
                 )

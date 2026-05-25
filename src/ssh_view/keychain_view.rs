@@ -378,7 +378,7 @@ impl KeychainView {
             .child(
                 // NEW KEY button using Button component
                 Button::new("new-key-btn")
-                    .label("NEW KEY")
+                    .label("新建密钥")
                     .icon(ButtonIconType::new("icons/plus.svg").small())
                     .small()
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -390,7 +390,7 @@ impl KeychainView {
             .child(
                 // NEW IDENTITY button using Button component
                 Button::new("new-identity-btn")
-                    .label("NEW IDENTITY")
+                    .label("新建身份")
                     .icon(ButtonIconType::new("icons/plus.svg").small())
                     .small()
                     .on_click(cx.listener(|this, _event, _window, cx| {
@@ -457,7 +457,7 @@ impl Render for KeychainView {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
-                    .child(self.render_section_header("Keys", keys.len(), cx))
+                    .child(self.render_section_header("密钥", keys.len(), cx))
                     .child(self.render_list_grid(&keys, Icon::KeyShield, theme.accent, cx)),
             )
             .child(
@@ -466,7 +466,7 @@ impl Render for KeychainView {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
-                    .child(self.render_section_header("Identities", identities.len(), cx))
+                    .child(self.render_section_header("身份", identities.len(), cx))
                     .child(self.render_list_grid(&identities, Icon::Host, theme.success, cx)),
             )
     }
@@ -495,16 +495,16 @@ impl KeychainEditor {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| Self {
             focus_handle: cx.focus_handle(),
-            label_input: cx.new(|cx| InputState::new(window, cx).placeholder("Add a label...")),
+            label_input: cx.new(|cx| InputState::new(window, cx).placeholder("添加标签...")),
             username_input: cx.new(|cx| InputState::new(window, cx).placeholder("root")),
             password_input: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Password")
+                    .placeholder("密码")
                     .masked(true)
             }),
             private_key_input: cx.new(|cx| {
                 MultilineTextArea::new(cx)
-                    .placeholder("Private key")
+                    .placeholder("私钥")
                     .height(112.0)
             }),
             draft_kind: KeychainItemKind::Key,
@@ -568,13 +568,13 @@ impl KeychainEditor {
                     Ok(Some(password)) => password,
                     Ok(None) => {
                         self.error_message = Some(
-                            "This identity has no password stored in system keychain.".to_string(),
+                            "该身份在系统钥匙串中没有存储密码。".to_string(),
                         );
                         String::new()
                     }
                     Err(err) => {
                         self.error_message =
-                            Some(format!("Failed to read system keychain: {}", err));
+                            Some(format!("读取系统钥匙串失败：{}", err));
                         String::new()
                     }
                 };
@@ -642,7 +642,7 @@ impl KeychainEditor {
                 self.original_private_key_text.clear();
                 self.private_key_input
                     .update(cx, |input, cx| input.clear(cx));
-                self.error_message = Some(format!("Failed to read private key: {}", err));
+                self.error_message = Some(format!("读取私钥失败：{}", err));
             }
         }
 
@@ -696,7 +696,7 @@ impl KeychainEditor {
                 files: true,
                 directories: false,
                 multiple: false,
-                prompt: Some("Import key file".into()),
+                prompt: Some("导入密钥文件".into()),
             });
             cx.spawn_in(window, async move |this, cx| {
                 let Ok(result) = picker.await else {
@@ -748,7 +748,7 @@ impl KeychainEditor {
         self.success_message = None;
 
         if label.trim().is_empty() {
-            self.error_message = Some("Label is required".to_string());
+            self.error_message = Some("标签为必填项".to_string());
             cx.notify();
             return;
         }
@@ -757,7 +757,7 @@ impl KeychainEditor {
         let result = match self.draft_kind {
             KeychainItemKind::Identity => {
                 if password.trim().is_empty() {
-                    Err(anyhow!("Password is required"))
+                    Err(anyhow!("密码为必填项"))
                 } else {
                     store.upsert_identity(
                         self.editing_item_id.as_deref(),
@@ -769,7 +769,7 @@ impl KeychainEditor {
             }
             KeychainItemKind::Key => {
                 if private_key_text.trim().is_empty() {
-                    Err(anyhow!("Private key is required"))
+                    Err(anyhow!("私钥为必填项"))
                 } else {
                     match self.persist_private_key_text(label.trim(), &private_key_text) {
                         Ok(final_path) => store.upsert_key(
@@ -788,7 +788,7 @@ impl KeychainEditor {
 
         match result {
             Ok(_) => {
-                self.success_message = Some("Keychain updated".to_string());
+                self.success_message = Some("密钥链已更新".to_string());
                 if let Some(ref callback) = self.on_saved {
                     callback(cx);
                 }
@@ -925,21 +925,76 @@ impl Render for KeychainEditor {
         let theme = cx.theme().ui;
         let title = if self.editing_item_id.is_some() {
             if self.draft_kind == KeychainItemKind::Key {
-                "Edit Key"
+                "编辑密钥"
             } else {
-                "Edit Identity"
+                "编辑身份"
             }
         } else if self.draft_kind == KeychainItemKind::Key {
-            "New Key"
+            "新建密钥"
         } else {
-            "New Identity"
+            "新建身份"
         };
 
         let subtitle = if self.draft_kind == KeychainItemKind::Key {
-            "File-backed SSH credential"
+            "基于文件的 SSH 凭据"
         } else {
-            "Password identity stored in system keychain"
+            "存储在系统钥匙串中的密码身份"
         };
+
+        let mut header = div()
+            .pb(px(12.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(title),
+            )
+            .child(div().text_xs().text_color(theme.text_muted).child(subtitle));
+
+        // 新建模式：在标题下方显示 Key / Identity 类型切换
+        if self.editing_item_id.is_none() {
+            header = header.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .gap(px(4.0))
+                    .mt(px(8.0))
+                    .child({
+                        let mut btn = Button::new("draft-kind-key")
+                            .label("密钥")
+                            .small();
+                        if self.draft_kind == KeychainItemKind::Key {
+                            btn = btn.success();
+                        } else {
+                            btn = btn.secondary();
+                        }
+                        btn.on_click(cx.listener(|this, _, _, cx| {
+                            if this.draft_kind != KeychainItemKind::Key {
+                                this.start_new_key(cx);
+                            }
+                        }))
+                    })
+                    .child({
+                        let mut btn = Button::new("draft-kind-identity")
+                            .label("身份")
+                            .small();
+                        if self.draft_kind == KeychainItemKind::Identity {
+                            btn = btn.success();
+                        } else {
+                            btn = btn.secondary();
+                        }
+                        btn.on_click(cx.listener(|this, _, _, cx| {
+                            if this.draft_kind != KeychainItemKind::Identity {
+                                this.start_new_identity(cx);
+                            }
+                        }))
+                    }),
+            );
+        }
 
         div()
             .id("keychain-editor")
@@ -950,29 +1005,16 @@ impl Render for KeychainEditor {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(
-                div()
-                    .pb(px(12.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(title),
-                    )
-                    .child(div().text_xs().text_color(theme.text_muted).child(subtitle)),
-            )
+            .child(header)
             .children(self.render_message(cx).into_iter())
-            .child(self.render_labeled_input("Label", &self.label_input, false, cx))
+            .child(self.render_labeled_input("标签", &self.label_input, false, cx))
             .when(self.draft_kind == KeychainItemKind::Identity, |this| {
-                this.child(self.render_labeled_input("Username", &self.username_input, false, cx))
-                    .child(self.render_labeled_input("Password", &self.password_input, true, cx))
+                this.child(self.render_labeled_input("用户名", &self.username_input, false, cx))
+                    .child(self.render_labeled_input("密码", &self.password_input, true, cx))
             })
             .when(self.draft_kind == KeychainItemKind::Key, |this| {
                 this.child(div().pt(px(4.0)).child(self.render_labeled_multiline_input(
-                    "Private key *",
+                    "私钥 *",
                     &self.private_key_input,
                     cx,
                 )))
@@ -980,7 +1022,7 @@ impl Render for KeychainEditor {
                     div().pt(px(8.0)).child(
                         // Import from key file button using Button component
                         Button::new("import-key-btn")
-                            .label("Import from key file")
+                            .label("从密钥文件导入")
                             .success()
                             .on_click(cx.listener(|this, _event, window, cx| {
                                 this.import_key_from_file(window, cx);
@@ -997,7 +1039,7 @@ impl Render for KeychainEditor {
                         // Cancel button using Button component
                         div()
                             .flex_1()
-                            .child(Button::new("cancel-btn").label("Cancel").on_click(
+                            .child(Button::new("cancel-btn").label("取消").on_click(
                                 cx.listener(|this, _event, _window, cx| {
                                     this.handle_cancel(cx);
                                 }),
@@ -1007,7 +1049,7 @@ impl Render for KeychainEditor {
                         // Save button using Button component
                         div().flex_1().child(
                             Button::new("save-btn")
-                                .label("Save")
+                                .label("保存")
                                 .success()
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.save_item(cx);
