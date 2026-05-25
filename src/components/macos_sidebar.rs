@@ -8,7 +8,8 @@ use crate::assets::Icon;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::host_view::HostView;
-use crate::sidebar_view::{host_view, keychain_view, theme_view};
+use crate::sidebar_view::keychain_view::KeychainSidebarView;
+use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 
 const SIDEBAR_WIDTH: f32 = 260.0;
@@ -80,6 +81,7 @@ pub struct MacosSidebar {
     keychain_scroll_handle: ScrollHandle,
     font_view: Option<Entity<FontSettingsView>>,
     host_view: Option<Entity<HostView>>,
+    keychain_view: Option<Entity<KeychainSidebarView>>,
 }
 
 impl MacosSidebar {
@@ -120,6 +122,7 @@ impl MacosSidebar {
             keychain_scroll_handle: ScrollHandle::new(),
             font_view: None,
             host_view: None,
+            keychain_view: None,
         }
     }
 
@@ -179,6 +182,11 @@ impl MacosSidebar {
     /// 设置 Host 视图
     pub fn set_host_view(&mut self, view: Entity<HostView>) {
         self.host_view = Some(view);
+    }
+
+    /// 设置 Keychain 视图
+    pub fn set_keychain_view(&mut self, view: Entity<KeychainSidebarView>) {
+        self.keychain_view = Some(view);
     }
 
     /// 处理侧边栏菜单项点击，统一封装导航逻辑。
@@ -275,7 +283,7 @@ impl MacosSidebar {
                     self.host_view.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element())
                 }
                 SidebarView::Keychain => {
-                    keychain_view::render_keychain_sidebar(cx, on_select.clone(), is_dark, theme, &self.keychain_scroll_handle, self.selected_id.as_deref()).into_any_element()
+                    self.keychain_view.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element())
                 }
             });
 

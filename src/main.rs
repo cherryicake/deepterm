@@ -25,6 +25,7 @@ use crate::components::macos_sidebar::MacosSidebar;
 use crate::components::title_bar::TitleBar;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
+use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::ToggleSidebar;
@@ -44,6 +45,7 @@ pub struct AppWindow {
     sidebar: MacosSidebar,
     _sidebar_hide_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
+    keychain_view: Entity<KeychainSidebarView>,
 }
 
 impl AppWindow {
@@ -94,6 +96,19 @@ impl AppWindow {
         });
         sidebar.set_host_view(host_view.clone());
 
+        // 创建 KeychainSidebarView 并设置回调
+        let keychain_view = KeychainSidebarView::new(window, cx);
+        let entity = cx.entity();
+        keychain_view.update(cx, |kv, _cx| {
+            kv.on_select(move |id, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    this.sidebar.handle_item_select(id);
+                    cx.notify();
+                });
+            });
+        });
+        sidebar.set_keychain_view(keychain_view.clone());
+
         Self {
             title_bar,
             workspace,
@@ -101,6 +116,7 @@ impl AppWindow {
             sidebar,
             _sidebar_hide_task: None,
             host_view,
+            keychain_view,
         }
     }
 
@@ -254,6 +270,11 @@ impl Render for AppWindow {
 
         // Host Modal 必须在窗口根节点渲染，才能全屏居中，不被侧边栏裁剪。
         if let Some(modal) = self.host_view.update(cx, |hv, cx| hv.build_modal(cx)) {
+            root = root.child(modal);
+        }
+
+        // Keychain Modal 同样在窗口根节点渲染
+        if let Some(modal) = self.keychain_view.update(cx, |kv, cx| kv.build_modal(cx)) {
             root = root.child(modal);
         }
 
