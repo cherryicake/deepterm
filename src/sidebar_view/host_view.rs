@@ -7,6 +7,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::Modal;
 use crate::sidebar_view::host_form::NewHostForm;
@@ -26,20 +27,48 @@ pub struct HostView {
     on_connect: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
     on_edit_host: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
     context_menu_host_id: Option<SharedString>,
+    search_input: Entity<InputState>,
+    search_query: SharedString,
 }
 
 impl HostView {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| Self {
-            focus_handle: cx.focus_handle(),
-            scroll_handle: ScrollHandle::new(),
-            selected_id: None,
-            host_form: None,
-            show_modal: false,
-            on_select: None,
-            on_connect: None,
-            on_edit_host: None,
-            context_menu_host_id: None,
+        cx.new(|cx| {
+            let focus_handle = cx.focus_handle();
+            let scroll_handle = ScrollHandle::new();
+
+            let search_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("搜索主机")
+                    .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
+            });
+
+            let subscription = cx.subscribe(
+                &search_input,
+                |this: &mut HostView, _, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        let text = this.search_input.read(cx).value().to_string();
+                        this.search_query = text.to_lowercase().into();
+                        cx.notify();
+                    }
+                },
+            );
+            std::mem::forget(subscription);
+
+            Self {
+                focus_handle,
+                scroll_handle,
+                selected_id: None,
+                host_form: None,
+                show_modal: false,
+                on_select: None,
+                on_connect: None,
+                on_edit_host: None,
+                context_menu_host_id: None,
+                search_input,
+                search_query: SharedString::new_static(""),
+            }
         })
     }
 
@@ -249,16 +278,39 @@ impl Render for HostView {
                     .text_color(theme.text_muted),
             )
             .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child("搜索主机"),
+                EditorInput::new(&self.search_input)
+                    .transparent(),
             );
+
+        // 根据搜索查询过滤 hosts（复用 hosts_view.rs 的过滤逻辑）
+        let query = self.search_query.as_ref();
+        let filtered_hosts: Vec<_> = if query.is_empty() {
+            hosts.iter().collect()
+        } else {
+            hosts
+                .iter()
+                .filter(|host| {
+                    host.name.to_lowercase().contains(query)
+                        || host
+                            .hostname
+                            .as_ref()
+                            .map_or(false, |h| h.to_lowercase().contains(query))
+                        || host
+                            .username
+                            .as_ref()
+                            .map_or(false, |u| u.to_lowercase().contains(query))
+                        || host
+                            .auth_label
+                            .as_ref()
+                            .map_or(false, |a| a.to_lowercase().contains(query))
+                })
+                .collect()
+        };
 
         // Host 列表
         let mut host_list = div().w_full().flex().flex_col();
 
-        for (index, host) in hosts.iter().enumerate() {
+        for (index, host) in filtered_hosts.iter().enumerate() {
             let icon_color = host.icon_color.to_hsla(cx);
             let host_id = host.id.to_string();
             let is_selected =
