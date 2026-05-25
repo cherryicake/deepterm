@@ -11,8 +11,8 @@ use crate::file_browser::{
     FileBrowserEvent, FileBrowserTarget, FileBrowserView, RemoteFileBrowserView,
 };
 use crate::file_transfer::TransferRequest;
-use crate::ssh_view::new_tab::SshNewTabView;
 use crate::ssh::platform::RemoteOS;
+use crate::ssh_view::new_tab::SshNewTabView;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
 
@@ -681,9 +681,7 @@ impl Panel {
             PanelContent::RemoteFileBrowser(file_browser) => {
                 Some(file_browser.read(cx).focus_handle(cx))
             }
-            PanelContent::SshNewTab(new_tab_view) => {
-                Some(new_tab_view.read(cx).focus_handle(cx))
-            }
+            PanelContent::SshNewTab(new_tab_view) => Some(new_tab_view.read(cx).focus_handle(cx)),
             PanelContent::Editor(editor_view) => Some(editor_view.read(cx).focus_handle(cx)),
             _ => None,
         }
@@ -734,6 +732,7 @@ impl Panel {
             .items_center()
             .justify_between()
             .cursor_move()
+            .bg(theme.app_background)
             .child(
                 // 标题栏左侧主区域都可拖拽（排除右侧控制按钮区域）
                 div()
@@ -1062,7 +1061,7 @@ impl Render for Panel {
                 let border_color = if is_selected {
                     theme.border_strong
                 } else {
-                    theme.border.opacity(0.35)
+                    theme.border.opacity(0.85)
                 };
                 this.border_1()
                     .border_color(border_color)
