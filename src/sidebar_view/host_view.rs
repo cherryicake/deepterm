@@ -7,11 +7,12 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::Modal;
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
-use crate::ssh::config::SshConnectionConfig;
-use crate::ssh_view::hosts_view::HostsView;
+use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
+use crate::ssh_view::hosts_view::{ConnectHost, DeleteHost, DuplicateHost, EditHost, HostsView};
 use crate::theme::ActiveTheme;
 
 /// Host 侧边栏视图组件，管理 Host 列表和 New Host Modal。
@@ -23,6 +24,8 @@ pub struct HostView {
     show_modal: bool,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
+    on_edit_host: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
+    context_menu_host_id: Option<SharedString>,
 }
 
 impl HostView {
@@ -35,6 +38,8 @@ impl HostView {
             show_modal: false,
             on_select: None,
             on_connect: None,
+            on_edit_host: None,
+            context_menu_host_id: None,
         })
     }
 
@@ -54,6 +59,14 @@ impl HostView {
         self.on_connect = Some(Rc::new(callback));
     }
 
+    /// 设置编辑主机回调。当用户右键菜单选择 Edit 时触发。
+    pub fn on_edit_host<F>(&mut self, callback: F)
+    where
+        F: Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static,
+    {
+        self.on_edit_host = Some(Rc::new(callback));
+    }
+
     fn open_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.host_form.is_none() {
             self.host_form = Some(NewHostForm::new(window, cx));
@@ -62,6 +75,38 @@ impl HostView {
         let entity = cx.entity().clone();
         form.update(cx, |form, _cx| {
             form.reset(_cx);
+            let entity_clone = entity.clone();
+            form.on_cancel(move |cx| {
+                entity_clone.update(cx, |this, cx| {
+                    this.show_modal = false;
+                    cx.notify();
+                });
+            });
+            let entity_clone2 = entity.clone();
+            form.on_saved(move |cx| {
+                entity_clone2.update(cx, |this, cx| {
+                    this.show_modal = false;
+                    cx.notify();
+                });
+            });
+        });
+        self.show_modal = true;
+        cx.notify();
+    }
+
+    fn open_edit_modal(
+        &mut self,
+        config: &SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.host_form.is_none() {
+            self.host_form = Some(NewHostForm::new(window, cx));
+        }
+        let form = self.host_form.as_ref().unwrap().clone();
+        let entity = cx.entity().clone();
+        form.update(cx, |form, cx| {
+            form.edit_config(config, cx);
             let entity_clone = entity.clone();
             form.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
@@ -318,16 +363,125 @@ impl Render for HostView {
                             }
                         }
                     }
+                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener({
+                        let host_id = host_id.clone();
+                        move |this, _, _, cx| {
+                            this.context_menu_host_id = Some(host_id.clone().into());
+                            cx.notify();
+                        }
+                    }),
+                )
+                .context_menu({
+                    use crate::components::button::Icon as MenuIcon;
+                    move |menu: PopupMenu, _window, _cx| {
+                        menu.menu_with_icon(
+                            "Connect",
+                            MenuIcon::new("icons/link.svg"),
+                            Box::new(ConnectHost),
+                        )
+                        .separator()
+                        .menu_with_icon(
+                            "Edit",
+                            MenuIcon::new("icons/edit.svg"),
+                            Box::new(EditHost),
+                        )
+                        .menu("Duplicate", Box::new(DuplicateHost))
+                        .separator()
+                        .menu_with_icon(
+                            "Delete",
+                            MenuIcon::new("icons/trash.svg"),
+                            Box::new(DeleteHost),
+                        )
+                    }
                 });
 
             host_list = host_list.child(row);
         }
+
+        let configs_rc = std::rc::Rc::new(configs.clone());
+        let on_connect_action = self.on_connect.clone();
 
         div()
             .w_full()
             .h_full()
             .flex()
             .flex_col()
+            .on_action(cx.listener({
+                let configs_rc = configs_rc.clone();
+                move |this, _: &ConnectHost, window, cx| {
+                    let host_id = this.context_menu_host_id.clone();
+                    if let Some(id) = host_id {
+                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
+                            if let Some(ref f) = on_connect_action {
+                                f(config, window, cx);
+                            }
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener({
+                let configs_rc = configs_rc.clone();
+                move |this, _: &EditHost, window, cx| {
+                    let host_id = this.context_menu_host_id.clone();
+                    if let Some(id) = host_id {
+                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()).cloned() {
+                            this.open_edit_modal(&config, window, cx);
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener({
+                let configs_rc = configs_rc.clone();
+                move |this, _: &DuplicateHost, _window, _cx| {
+                    if let Some(ref host_id) = this.context_menu_host_id {
+                        if let Some(config) = configs_rc.iter().find(|c| c.id() == host_id.as_ref()) {
+                            let mut new_config = config.clone();
+                            new_config.nickname = config.nickname.as_ref().map(|n| format!("{} (copy)", n));
+                            if let Ok(mut global) = SshGlobalConfig::load_or_create() {
+                                global.add_connection(new_config);
+                                let _ = global.save();
+                            }
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener(move |this, _: &DeleteHost, window, cx| {
+                let host_id = this.context_menu_host_id.clone();
+                if let Some(id) = host_id {
+                    let host_name = hosts.iter().find(|h| h.id.as_ref() == id.as_ref()).map(|h| h.name.to_string());
+                    let message = if let Some(name) = host_name {
+                        format!("确定要删除主机 '{}' 吗？此操作不可撤销。", name)
+                    } else {
+                        "确定要删除该主机吗？此操作不可撤销。".to_string()
+                    };
+                    let weak = cx.weak_entity();
+                    let answer = window.prompt(
+                        gpui::PromptLevel::Warning,
+                        "确认删除",
+                        Some(&message),
+                        &["删除", "取消"],
+                        cx,
+                    );
+                    cx.spawn(async move |_, cx| {
+                        if let Ok(0) = answer.await {
+                            if let Some(entity) = weak.upgrade() {
+                                let _ = entity.update(cx, |this, cx| {
+                                    if let Ok(mut global) = SshGlobalConfig::load_or_create() {
+                                        global.remove_connection(&id);
+                                        let _ = global.save();
+                                    }
+                                    this.context_menu_host_id = None;
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    })
+                    .detach();
+                }
+            }))
             .child(header)
             .child(search_box)
             .child(

@@ -328,6 +328,7 @@ pub struct InputState {
     pub(crate) text_align: TextAlign,
     pub(crate) placeholder: SharedString,
     pub(crate) placeholder_font_size: Option<Pixels>,
+    pub(crate) font_size: Option<Pixels>,
 
     /// A flag to indicate if we have a pending update to the text.
     ///
@@ -407,6 +408,7 @@ impl InputState {
             preferred_column: None,
             placeholder: SharedString::default(),
             placeholder_font_size: None,
+            font_size: None,
             text_align: TextAlign::Left,
             silent_replace_text: false,
             size: Size::default(),
@@ -474,6 +476,11 @@ impl InputState {
     /// Set placeholder font size
     pub fn placeholder_font_size(mut self, size: Pixels) -> Self {
         self.placeholder_font_size = Some(size);
+        self
+    }
+
+    pub fn font_size(mut self, size: Pixels) -> Self {
+        self.font_size = Some(size);
         self
     }
 

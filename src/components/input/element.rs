@@ -93,7 +93,7 @@ impl TextElement {
             }
             state.display_map.set_font(
                 window.text_style().font(),
-                window.text_style().font_size.to_pixels(window.rem_size()),
+                state.font_size.unwrap_or_else(|| window.text_style().font_size.to_pixels(window.rem_size())),
                 cx,
             );
             state.display_map.ensure_text_prepared(&state.text, cx);
@@ -1061,6 +1061,8 @@ impl Element for TextElement {
 
         let text_size = if is_empty && state.placeholder_font_size.is_some() {
             state.placeholder_font_size.unwrap()
+        } else if let Some(font_size) = state.font_size {
+            font_size
         } else {
             style.font_size.to_pixels(window.rem_size())
         };

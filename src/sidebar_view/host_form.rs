@@ -55,6 +55,7 @@ pub struct NewHostForm {
     keychain_select: Entity<MacosSelect>,
     keychain_options: Vec<(String, String)>,
     selected_keychain_id: Option<String>,
+    editing_config_id: Option<String>,
 
     error_message: Option<String>,
     success_message: Option<String>,
@@ -72,37 +73,43 @@ impl NewHostForm {
                 InputState::new(window, cx)
                     .placeholder("我的服务器")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
             });
             let hostname_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("192.168.1.100 或 example.com")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
             });
-            let port_input = cx.new(|cx| InputState::new(window, cx));
+            let port_input = cx.new(|cx| InputState::new(window, cx).font_size(px(13.0)));
             port_input.update(cx, |input, cx| input.set_text("22", cx));
-            let username_input = cx.new(|cx| InputState::new(window, cx));
+            let username_input = cx.new(|cx| InputState::new(window, cx).font_size(px(13.0)));
             username_input.update(cx, |input, cx| input.set_text(&default_username, cx));
             let password_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("保存到系统钥匙串")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
                     .masked(true)
             });
             let key_path_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("~/.ssh/id_ed25519")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
             });
             let key_passphrase_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("可选的密钥密码")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
                     .masked(true)
             });
             let credential_label_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("DeepTerm 自动生成标签")
                     .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
             });
 
             let auth_labels: Vec<SharedString> = AuthType::all()
@@ -161,6 +168,7 @@ impl NewHostForm {
                 keychain_select,
                 keychain_options: Vec::new(),
                 selected_keychain_id: None,
+                editing_config_id: None,
                 error_message: None,
                 success_message: None,
                 on_cancel: None,
@@ -238,9 +246,71 @@ impl NewHostForm {
         });
         self.keychain_options.clear();
         self.selected_keychain_id = None;
+        self.editing_config_id = None;
         self.refresh_keychain_options(cx);
         self.error_message = None;
         self.success_message = None;
+        cx.notify();
+    }
+
+    /// 加载已有配置到表单，进入编辑模式。
+    pub fn edit_config(&mut self, config: &SshConnectionConfig, cx: &mut Context<Self>) {
+        self.reset(cx);
+
+        self.nickname_input.update(cx, |input, cx| {
+            if let Some(ref nick) = config.nickname {
+                input.set_text(nick, cx);
+            } else {
+                input.clear(cx);
+            }
+        });
+        self.hostname_input
+            .update(cx, |input, cx| input.set_text(&config.host, cx));
+        self.port_input
+            .update(cx, |input, cx| input.set_text(&config.port.to_string(), cx));
+        self.username_input
+            .update(cx, |input, cx| input.set_text(&config.username, cx));
+
+        // 解析认证方式
+        let (auth_type, keychain_id) = match config.auth_method.clone() {
+            AuthMethod::Agent => (AuthType::Agent, None),
+            AuthMethod::PasswordRef { keychain_id } => (AuthType::Password, Some(keychain_id)),
+            AuthMethod::PrivateKeyRef { keychain_id } => (AuthType::PrivateKey, Some(keychain_id)),
+            AuthMethod::Password { password } => {
+                self.password_input
+                    .update(cx, |input, cx| input.set_text(&password, cx));
+                (AuthType::Password, None)
+            }
+            AuthMethod::PrivateKey { path, passphrase } => {
+                self.key_path_input.update(cx, |input, cx| {
+                    input.set_text(path.to_string_lossy().to_string(), cx);
+                });
+                if let Some(pp) = passphrase {
+                    self.key_passphrase_input
+                        .update(cx, |input, cx| input.set_text(pp, cx));
+                }
+                (AuthType::PrivateKey, None)
+            }
+            AuthMethod::Auto => (AuthType::Agent, None),
+        };
+
+        self.auth_type = auth_type;
+        self.auth_type_select.update(cx, |select, cx| {
+            select.set_selected(auth_type.display_name(), cx);
+        });
+
+        self.refresh_keychain_options(cx);
+
+        if let Some(ref id) = keychain_id {
+            self.selected_keychain_id = Some(id.clone());
+            if let Some((_, label)) = self.keychain_options.iter().find(|(k_id, _)| k_id == id) {
+                self.keychain_select.update(cx, |select, cx| {
+                    select.set_selected(label.clone(), cx);
+                });
+            }
+        }
+
+        self.editing_config_id = Some(config.id());
         cx.notify();
     }
 
@@ -356,14 +426,46 @@ impl NewHostForm {
             }
         };
 
-        let mut config = SshConnectionConfig::new(hostname.trim(), username.trim(), auth_method);
-        config = config.with_port(port);
-        if !nickname.trim().is_empty() {
-            config = config.with_nickname(nickname.trim());
-        }
-
         let mut global_config = SshGlobalConfig::load();
-        global_config.add_connection(config);
+
+        let saved = if let Some(ref editing_id) = self.editing_config_id {
+            // 编辑模式：更新已有配置
+            if let Some(pos) = global_config
+                .saved_connections
+                .iter()
+                .position(|c| &c.id() == editing_id)
+            {
+                let existing = &mut global_config.saved_connections[pos];
+                existing.host = hostname.trim().to_string();
+                existing.port = port;
+                existing.username = username.trim().to_string();
+                existing.auth_method = auth_method;
+                existing.nickname = if nickname.trim().is_empty() {
+                    None
+                } else {
+                    Some(nickname.trim().to_string())
+                };
+                true
+            } else {
+                false
+            }
+        } else {
+            // 新建模式
+            let mut config =
+                SshConnectionConfig::new(hostname.trim(), username.trim(), auth_method);
+            config = config.with_port(port);
+            if !nickname.trim().is_empty() {
+                config = config.with_nickname(nickname.trim());
+            }
+            global_config.add_connection(config);
+            true
+        };
+
+        if !saved {
+            self.error_message = Some("未找到要编辑的主机配置".to_string());
+            cx.notify();
+            return;
+        }
 
         match global_config.save() {
             Ok(()) => {
@@ -391,6 +493,11 @@ impl NewHostForm {
 
     fn render_header(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme().ui;
+        let (title, subtitle) = if self.editing_config_id.is_some() {
+            ("编辑主机", "修改 SSH 主机配置")
+        } else {
+            ("添加新主机", "添加 SSH 主机配置")
+        };
         div()
             .w_full()
             .pb(px(16.))
@@ -399,14 +506,14 @@ impl NewHostForm {
                     .text_xl()
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme.text)
-                    .child("新主机"),
+                    .child(title),
             )
             .child(
                 div()
                     .mt(px(4.))
                     .text_sm()
                     .text_color(theme.text_muted)
-                    .child("添加 SSH 主机配置"),
+                    .child(subtitle),
             )
     }
 
