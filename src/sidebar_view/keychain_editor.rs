@@ -214,10 +214,25 @@ impl KeychainEditor {
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| Self {
             focus_handle: cx.focus_handle(),
-            label_input: cx.new(|cx| InputState::new(window, cx).placeholder("添加标签...")),
-            username_input: cx.new(|cx| InputState::new(window, cx).placeholder("root")),
-            password_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("密码").masked(true)),
+            label_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("添加标签...")
+                    .placeholder_font_size(px(13.))
+                    .font_size(px(13.))
+            }),
+            username_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("root")
+                    .placeholder_font_size(px(13.))
+                    .font_size(px(13.))
+            }),
+            password_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("密码")
+                    .placeholder_font_size(px(13.))
+                    .font_size(px(13.))
+                    .masked(true)
+            }),
             private_key_input: cx
                 .new(|cx| MultilineTextArea::new(cx).placeholder("私钥").height(112.0)),
             draft_kind: KeychainItemKind::Key,
