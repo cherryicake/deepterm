@@ -6,11 +6,11 @@ use std::process::Command;
 use anyhow::anyhow;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, px,
+    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, px,
 };
 
-use crate::components::button::{Button, ButtonVariants, Sizable};
+use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,
@@ -216,16 +216,10 @@ impl KeychainEditor {
             focus_handle: cx.focus_handle(),
             label_input: cx.new(|cx| InputState::new(window, cx).placeholder("添加标签...")),
             username_input: cx.new(|cx| InputState::new(window, cx).placeholder("root")),
-            password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("密码")
-                    .masked(true)
-            }),
-            private_key_input: cx.new(|cx| {
-                MultilineTextArea::new(cx)
-                    .placeholder("私钥")
-                    .height(112.0)
-            }),
+            password_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("密码").masked(true)),
+            private_key_input: cx
+                .new(|cx| MultilineTextArea::new(cx).placeholder("私钥").height(112.0)),
             draft_kind: KeychainItemKind::Key,
             editing_item_id: None,
             dropped_key_path: None,
@@ -286,14 +280,11 @@ impl KeychainEditor {
                 let password = match store.get_password_secret(&item.id) {
                     Ok(Some(password)) => password,
                     Ok(None) => {
-                        self.error_message = Some(
-                            "该身份在系统钥匙串中没有存储密码。".to_string(),
-                        );
+                        self.error_message = Some("该身份在系统钥匙串中没有存储密码。".to_string());
                         String::new()
                     }
                     Err(err) => {
-                        self.error_message =
-                            Some(format!("读取系统钥匙串失败：{}", err));
+                        self.error_message = Some(format!("读取系统钥匙串失败：{}", err));
                         String::new()
                     }
                 };
@@ -671,7 +662,9 @@ impl Render for KeychainEditor {
                     .child({
                         let mut btn = Button::new("draft-kind-key")
                             .label("密钥")
-                            .small();
+                            .rounded(px(12.))
+                            .with_size(ButtonSize::Small)
+                            .width(px(68.0));
                         if self.draft_kind == KeychainItemKind::Key {
                             btn = btn.success();
                         } else {
@@ -686,7 +679,9 @@ impl Render for KeychainEditor {
                     .child({
                         let mut btn = Button::new("draft-kind-identity")
                             .label("身份")
-                            .small();
+                            .rounded(px(12.))
+                            .with_size(ButtonSize::Small)
+                            .width(px(68.0));
                         if self.draft_kind == KeychainItemKind::Identity {
                             btn = btn.success();
                         } else {
@@ -729,6 +724,8 @@ impl Render for KeychainEditor {
                         Button::new("import-key-btn")
                             .label("从密钥文件导入")
                             .success()
+                            .rounded(px(12.))
+                            .with_size(ButtonSize::Small)
                             .on_click(cx.listener(|this, _event, window, cx| {
                                 this.import_key_from_file(window, cx);
                             })),
@@ -742,13 +739,15 @@ impl Render for KeychainEditor {
                     .gap(px(8.0))
                     .child(
                         // Cancel button using Button component
-                        div()
-                            .flex_1()
-                            .child(Button::new("cancel-btn").label("取消").on_click(
-                                cx.listener(|this, _event, _window, cx| {
+                        div().flex_1().child(
+                            Button::new("cancel-btn")
+                                .label("取消")
+                                .rounded(px(12.))
+                                .with_size(ButtonSize::Small)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.handle_cancel(cx);
-                                }),
-                            )),
+                                })),
+                        ),
                     )
                     .child(
                         // Save button using Button component
@@ -756,6 +755,8 @@ impl Render for KeychainEditor {
                             Button::new("save-btn")
                                 .label("保存")
                                 .success()
+                                .rounded(px(12.))
+                                .with_size(ButtonSize::Small)
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.save_item(cx);
                                 })),

@@ -719,14 +719,17 @@ impl Render for TabBar {
                             |_, _, _| {},
                             move |bounds, _, _, cx| {
                                 let container_width: f32 = bounds.size.width.into();
-                                entity.update(cx, |this, cx| {
-                                    // 只在宽度变化超过 1px 时更新
-                                    if (this.measured_container_width - container_width).abs() > 1.0
-                                    {
-                                        this.measured_container_width = container_width;
-                                        this.update_overflow_state(cx);
-                                        cx.notify();
-                                    }
+                                let entity = entity.clone();
+                                cx.defer(move |cx| {
+                                    entity.update(cx, |this, cx| {
+                                        // 只在宽度变化超过 1px 时更新
+                                        if (this.measured_container_width - container_width).abs() > 1.0
+                                        {
+                                            this.measured_container_width = container_width;
+                                            this.update_overflow_state(cx);
+                                            cx.notify();
+                                        }
+                                    });
                                 });
                             },
                         )

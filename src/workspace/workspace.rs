@@ -288,7 +288,14 @@ impl Workspace {
         self.tab_bar.update(cx, |tab_bar, _cx| {
             tab_bar.on_new_tab(move |window, cx| {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.create_new_tab(window, cx);
+                    if let Some(ref picker) = workspace.ssh_picker {
+                        let picker = picker.clone();
+                        cx.defer_in(window, move |_, window, cx| {
+                            picker.update(cx, |picker, cx| {
+                                picker.show(window, cx);
+                            });
+                        });
+                    }
                 });
             });
         });
