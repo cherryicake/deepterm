@@ -1070,7 +1070,12 @@ impl Workspace {
                 .map(|os| os.icon());
 
             // 更新TabBar显示
-            let label = tab_info.label.clone();
+            let label = tab_info
+                .container
+                .get_first_panel()
+                .and_then(|p| p.read(cx).tab_label().map(|s| s.to_string()))
+                .unwrap_or_else(|| tab_info.label.clone());
+            tab_info.label = label.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
                 let tabs: Vec<TabItem> = tab_bar
                     .tabs
@@ -1116,6 +1121,9 @@ impl Workspace {
             return;
         }
 
+        // 预生成workspace标签，避免在借用self.tabs后再次借用self
+        let workspace_label = self.generate_workspace_label();
+
         // 获取被拖拽的tab信息
         let Some(dragged_tab_info) = self.tabs.remove(&dragged_tab_id) else {
             return;
@@ -1141,9 +1149,9 @@ impl Workspace {
         // 更新目标tab为Workspace类型
         target_tab_info.container = new_container;
         target_tab_info.tab_type = TabType::Workspace;
+        target_tab_info.label.clone_from(&workspace_label);
 
         // 更新TabBar显示（Workspace使用统一图标）
-        let workspace_label = self.generate_workspace_label();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
             // 更新目标tab的标签
