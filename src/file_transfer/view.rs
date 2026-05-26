@@ -556,18 +556,54 @@ pub fn endpoint_label(endpoint: &FileEndpoint) -> String {
 }
 
 pub fn quick_total_size(request: &TransferRequest) -> u64 {
-    use std::fs;
     request
         .sources
         .iter()
         .map(|source| match source {
-            FileEndpoint::Local { path } => fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0),
-            FileEndpoint::Remote { ssh_config, path } => {
-                crate::ssh::sftp_fs::metadata(ssh_config, path)
-                    .ok()
-                    .map(|m| m.size)
-                    .unwrap_or(0)
-            }
+            FileEndpoint::Local { path } => local_total_size(path),
+            FileEndpoint::Remote { ssh_config, path } => remote_total_size(ssh_config, path),
         })
         .sum()
+}
+
+fn local_total_size(path: &std::path::Path) -> u64 {
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if metadata.is_file() {
+        metadata.len()
+    } else if metadata.is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total += local_total_size(&entry.path());
+            }
+        }
+        total
+    } else {
+        0
+    }
+}
+
+fn remote_total_size(ssh_config: &crate::ssh::SshConnectionConfig, path: &str) -> u64 {
+    // 创建独立连接，避免与正在传输的任务竞争 cached session
+    let mut session = match crate::ssh::sftp_fs::BlockingSftpSession::connect(ssh_config) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let cmd = format!(
+        "du -sb {} 2>/dev/null || echo 0",
+        crate::file_transfer::utils::shell_single_quote(path)
+    );
+    match session.execute_command(&cmd, 30) {
+        Ok(result) if result.success() => result
+            .stdout
+            .trim()
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
