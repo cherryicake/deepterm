@@ -4,8 +4,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{IntoElement, ParentElement, StatefulInteractiveElement, Styled};
-use gpui::{MouseButton, Pixels, ScrollHandle, div, px, svg};
+use gpui::{Animation, AnimationExt as _, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Transformation};
+use gpui::{MouseButton, Pixels, ScrollHandle, div, ease_in_out, percentage, px, svg};
 
 use crate::theme::UiTheme;
 
@@ -954,7 +954,15 @@ fn is_scp_command(buffer: &str) -> bool {
 
 /// 远端目录尚未加载时的占位补全项。
 fn remote_dir_loading_item(absolute_dir: String) -> PathCompletionItem {
-    placeholder_item("读取远端目录中…", absolute_dir)
+    PathCompletionItem {
+        name: "读取远端目录中…".to_string(),
+        path: PathBuf::new(),
+        is_directory: false,
+        kind: CompletionKind::File,
+        description: Some(absolute_dir),
+        icon: Some(crate::assets::Icon::ProgressIndicator),
+        replacement: None,
+    }
 }
 
 /// 远端目录读取失败时的占位补全项。
@@ -1623,19 +1631,39 @@ where
                                     cx.stop_propagation();
                                     on_pick(index, window, cx);
                                 })
-                                .child(
-                                    div()
-                                        .w(px(16.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            svg()
-                                                .size(px(14.0))
-                                                .text_color(theme.text_muted)
-                                                .path(icon_path),
-                                        ),
-                                )
+                                .child({
+                                    let svg_element = svg()
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted)
+                                        .path(icon_path);
+                                    if item.icon == Some(crate::assets::Icon::ProgressIndicator) {
+                                        div()
+                                            .w(px(16.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(svg_element.with_animation(
+                                                "progress-rotate",
+                                                Animation::new(std::time::Duration::from_millis(
+                                                    1000,
+                                                ))
+                                                .repeat()
+                                                .with_easing(ease_in_out),
+                                                |this, delta| {
+                                                    this.with_transformation(
+                                                        Transformation::rotate(percentage(delta)),
+                                                    )
+                                                },
+                                            ))
+                                    } else {
+                                        div()
+                                            .w(px(16.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(svg_element)
+                                    }
+                                })
                                 .child(
                                     div()
                                         .font_family("monospace")

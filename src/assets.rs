@@ -51,6 +51,7 @@ pub enum Icon {
     Eye,
     EyeOff,
     Loader,
+    ProgressIndicator,
     // OS icons
     Macos,
     Ubuntu,
@@ -100,6 +101,7 @@ impl Icon {
             Icon::Eye => SharedString::new_static("icons/eye.svg"),
             Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
             Icon::Loader => SharedString::new_static("icons/loader.svg"),
+            Icon::ProgressIndicator => SharedString::new_static("icons/progress.indicator.svg"),
             Icon::Macos => SharedString::new_static("icons/macos.svg"),
             Icon::Ubuntu => SharedString::new_static("icons/ubuntu.svg"),
             Icon::Debian => SharedString::new_static("icons/debian.svg"),
