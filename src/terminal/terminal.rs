@@ -395,10 +395,26 @@ impl Terminal {
     }
 
     pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
-        // Choose a sensible default shell per platform. On Windows prefer `COMSPEC` or `cmd.exe`;
-        // on Unix-like systems prefer the `SHELL` env var or `/bin/sh`.
         let default_shell = if cfg!(windows) {
-            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+            if std::process::Command::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+            {
+                "powershell.exe".to_string()
+            } else if std::process::Command::new("pwsh.exe")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+            {
+                "pwsh.exe".to_string()
+            } else {
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+            }
         } else {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
         };
