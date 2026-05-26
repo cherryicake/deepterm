@@ -233,7 +233,7 @@ impl TabBar {
             on_overflow_changed: None,
             focus_handle,
             scroll_handle: ScrollHandle::new(),
-            last_overflow: None,
+            last_overflow: Some(false),
             measured_container_width: 0.0,
             reorder_preview: None,
             previous_reorder_preview: None,
@@ -270,7 +270,7 @@ impl TabBar {
             on_overflow_changed: None,
             focus_handle,
             scroll_handle: ScrollHandle::new(),
-            last_overflow: None,
+            last_overflow: Some(false),
             measured_container_width: 0.0,
             reorder_preview: None,
             previous_reorder_preview: None,
@@ -410,9 +410,10 @@ impl TabBar {
 
     /// 检查并更新溢出状态
     /// 当溢出状态变化时触发回调
-    pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) {
+    /// 返回 `true` 表示溢出状态发生了改变
+    pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) -> bool {
         if self.measured_container_width <= 0.0 {
-            return;
+            return false;
         }
 
         // 预估内容宽度：每个 tab 约 180px（包含 gap），加上 "+" 按钮 40px
@@ -428,6 +429,9 @@ impl TabBar {
             if let Some(ref callback) = self.on_overflow_changed {
                 callback(would_overflow, cx);
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -725,9 +729,14 @@ impl Render for TabBar {
                                         // 只在宽度变化超过 1px 时更新
                                         if (this.measured_container_width - container_width).abs() > 1.0
                                         {
+                                            let was_first = this.measured_container_width <= 0.0;
                                             this.measured_container_width = container_width;
-                                            this.update_overflow_state(cx);
-                                            cx.notify();
+                                            let overflow_changed = this.update_overflow_state(cx);
+                                            // 首次测量时不通知，避免初始布局稳定前的闪烁；
+                                            // 后续只在溢出状态变化时通知
+                                            if !was_first && overflow_changed {
+                                                cx.notify();
+                                            }
                                         }
                                     });
                                 });

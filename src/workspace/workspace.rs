@@ -219,7 +219,9 @@ impl Workspace {
 
         // 创建初始tab - Local Terminal
         let initial_label = "Local Terminal";
-        let initial_tab_items = vec![TabItem::new("tab-0", initial_label)];
+        let local_os_icon = Some(crate::ssh::platform::detect_local_os().icon());
+        let initial_tab_items =
+            vec![TabItem::new("tab-0", initial_label).with_icon(local_os_icon)];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 生成唯一的workspace ID（先创建，确保与Panel一致）
@@ -1697,6 +1699,7 @@ impl Workspace {
     /// 创建本地终端Tab
     pub fn create_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let label = self.generate_terminal_tab_name();
+        let icon = Some(crate::ssh::platform::detect_local_os().icon());
         let panel = cx.new(|cx| {
             Panel::with_terminal(
                 format!("panel-{}", self.next_panel_id),
@@ -1707,7 +1710,7 @@ impl Workspace {
             )
         });
 
-        self.add_terminal_tab(label, panel, None, window, cx);
+        self.add_terminal_tab(label, panel, icon, window, cx);
     }
 
     /// 使用指定命令创建本地终端Tab
@@ -1719,6 +1722,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let label = self.generate_terminal_tab_name();
+        let icon = if command.to_lowercase().contains("wsl") {
+            Some(crate::ssh::platform::detect_wsl_os(command, args).icon())
+        } else {
+            Some(crate::ssh::platform::detect_local_os().icon())
+        };
         let panel = cx.new(|cx| {
             Panel::with_terminal_command(
                 format!("panel-{}", self.next_panel_id),
@@ -1731,7 +1739,7 @@ impl Workspace {
             )
         });
 
-        self.add_terminal_tab(label, panel, None, window, cx);
+        self.add_terminal_tab(label, panel, icon, window, cx);
     }
 
     /// 使用指定配置创建 SSH 终端

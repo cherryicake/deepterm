@@ -561,6 +561,9 @@ impl Panel {
 
     /// 设置是否为唯一的panel
     pub fn set_solo(&mut self, is_solo: bool, cx: &mut Context<Self>) {
+        if self.is_solo == is_solo {
+            return;
+        }
         self.is_solo = is_solo;
         cx.notify();
     }
