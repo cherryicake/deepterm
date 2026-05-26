@@ -542,7 +542,7 @@ impl MacosSidebar {
         cx: &gpui::App,
         is_fullscreen: bool,
         on_toggle: F,
-    ) -> impl IntoElement
+    ) -> gpui::AnyElement
     where
         F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     {
@@ -561,11 +561,10 @@ impl MacosSidebar {
             (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
         };
 
-        div()
+        let button = div()
             .id(("sidebar-toggle-btn", self.epoch))
             .absolute()
             .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
-            .left(px(start_left))
             .flex()
             .items_center()
             .justify_center()
@@ -581,13 +580,22 @@ impl MacosSidebar {
                     .size(px(20.0))
                     .text_color(theme.text)
                     .path(crate::assets::Icon::Sidebar.path()),
-            )
-            .with_animation(
-                ("sidebar-toggle-anim", self.epoch),
-                gpui::Animation::new(Duration::from_millis(duration_ms))
-                    .with_easing(gpui::ease_in_out),
-                move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
-            )
+            );
+
+        // 初始状态（epoch == 0）直接应用最终位置，避免启动时出现一次从右向左的位移动画
+        if self.epoch == 0 {
+            button.left(px(end_left)).into_any_element()
+        } else {
+            button
+                .left(px(start_left))
+                .with_animation(
+                    ("sidebar-toggle-anim", self.epoch),
+                    gpui::Animation::new(Duration::from_millis(duration_ms))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
+                )
+                .into_any_element()
+        }
     }
 }
 
