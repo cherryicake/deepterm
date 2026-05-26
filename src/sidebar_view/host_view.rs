@@ -262,6 +262,7 @@ impl Render for HostView {
             );
 
         // 搜索框
+        let search_focused = self.search_input.read(cx).focus_handle(cx).is_focused(window);
         let search_box = div()
             .w_full()
             .h(px(32.0))
@@ -271,6 +272,9 @@ impl Render for HostView {
             .gap(px(6.0))
             .rounded(px(8.0))
             .bg(hover_bg(is_dark))
+            .when(search_focused, |this| {
+                this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
+            })
             .mb(px(12.0))
             .child(
                 gpui::svg()
