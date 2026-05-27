@@ -6,7 +6,7 @@ use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, Pixels, Render, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
-    div, px, svg,
+    div, point, px, svg,
 };
 
 use crate::assets::Icon;
@@ -372,6 +372,10 @@ impl Render for Select {
                     deferred(
                         anchored()
                             .anchor(gpui::Corner::TopLeft)
+                            .offset(point(
+                                px(0.0),
+                                -(px(42.0) + if self.searchable { px(34.0) } else { px(0.0) } + px(highlighted as f32 * 34.0)),
+                            ))
                             .snap_to_window_with_margin(px(8.))
                             .child(
                             div()
@@ -380,8 +384,6 @@ impl Render for Select {
                                 .child(
                                     div()
                                         .occlude()
-                                        .absolute()
-                                        .top(-(px(42.0) + if self.searchable { px(34.0) } else { px(0.0) } + px(highlighted as f32 * 34.0)))
                                         .bg(theme.panel_background)
                                         .border_1()
                                         .border_color(theme.border)

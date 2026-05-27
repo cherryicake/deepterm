@@ -6,7 +6,7 @@ use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, Pixels, Render, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
-    div, px, svg,
+    div, point, px, svg,
 };
 
 use crate::assets::Icon;
@@ -349,6 +349,10 @@ impl Render for MacosSelect {
                     deferred(
                         anchored()
                             .anchor(gpui::Corner::TopLeft)
+                            .offset(point(
+                                px(0.0),
+                                -(px(30.0) + px(highlighted as f32 * 26.0)),
+                            ))
                             .snap_to_window_with_margin(px(8.))
                             .child(
                                 div()
@@ -357,8 +361,6 @@ impl Render for MacosSelect {
                                     .child(
                                         div()
                                             .occlude()
-                                            .absolute()
-                                            .top(-(px(30.0) + px(highlighted as f32 * 26.0)))
                                             .bg(theme.panel_background)
                                             .border_1()
                                             .border_color(theme.border)
