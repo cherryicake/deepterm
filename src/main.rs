@@ -70,9 +70,6 @@ impl AppWindow {
 
         let mut sidebar = MacosSidebar::new();
         let font_settings_view = FontSettingsView::new(window, cx);
-        font_settings_view.update(cx, |view, _cx| {
-            view.set_compact(true);
-        });
         sidebar.set_font_view(font_settings_view);
 
         // 创建 HostView 并设置回调
@@ -221,14 +218,20 @@ impl AppWindow {
 
         // 初始状态（epoch == 0）直接应用最终 padding，避免打开时出现一次不必要的展开动画
         let animated_title_bar: gpui::AnyElement = if self.sidebar.animation_epoch() == 0 {
-            div().child(self.title_bar.clone()).pl(px(end_pl)).into_any_element()
+            div()
+                .child(self.title_bar.clone())
+                .pl(px(end_pl))
+                .into_any_element()
         } else {
-            div().child(self.title_bar.clone()).with_animation(
-                ("titlebar-pad-anim", self.sidebar.animation_epoch()),
-                gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
-                    .with_easing(gpui::ease_in_out),
-                move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
-            ).into_any_element()
+            div()
+                .child(self.title_bar.clone())
+                .with_animation(
+                    ("titlebar-pad-anim", self.sidebar.animation_epoch()),
+                    gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
+                )
+                .into_any_element()
         };
 
         div()

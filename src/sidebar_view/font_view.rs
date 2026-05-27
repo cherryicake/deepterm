@@ -32,7 +32,6 @@ pub struct FontSettingsView {
     _subscriptions: Vec<gpui::Subscription>,
     font_size_valid: bool,
     line_height_valid: bool,
-    compact: bool,
 }
 
 impl FontSettingsView {
@@ -134,7 +133,6 @@ impl FontSettingsView {
                 _subscriptions: Vec::new(),
                 font_size_valid: true,
                 line_height_valid: true,
-                compact: false,
             };
 
             view.load_system_fonts(window, cx);
@@ -209,10 +207,6 @@ impl FontSettingsView {
         self._subscriptions.push(lh_subscription);
     }
 
-    pub fn set_compact(&mut self, compact: bool) {
-        self.compact = compact;
-    }
-
     fn load_system_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.font_select.update(cx, |select, cx| {
             let default_font = platform_default_font_family().to_string();
@@ -233,149 +227,6 @@ impl FontSettingsView {
             }
         });
     }
-}
-
-impl Focusable for FontSettingsView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for FontSettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.compact {
-            self.render_compact(window, cx)
-        } else {
-            self.render_full(window, cx)
-        }
-    }
-}
-
-impl FontSettingsView {
-    fn render_full(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = cx.theme().ui;
-        let error_color = gpui::rgb(0xef4444);
-
-        div().size_full().flex().flex_col().overflow_hidden().child(
-            div()
-                .w_full()
-                .max_w(px(960.0))
-                .mx_auto()
-                .flex()
-                .flex_col()
-                .gap_5()
-                .p(px(24.0))
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xl()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.text)
-                                .child("字体"),
-                        )
-                        .child(
-                            div().text_sm().text_color(theme.text_muted).child(
-                                "自定义终端字体、大小和行高。",
-                            ),
-                        ),
-                )
-                .child(
-                    div().w_full().flex().flex_col().gap_4().child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .gap_4()
-                            .child(
-                                div().flex_1().child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.text_muted)
-                                        .child("终端字体"),
-                                )
-                                        .child(self.font_select.clone()),
-                                ),
-                            )
-                            .child(
-                                div().w(px(140.0)).child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child("字重"),
-                                        )
-                                        .child(self.weight_select.clone()),
-                                ),
-                            )
-                            .child(
-                                div().w(px(120.0)).child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child("字体大小 (px)"),
-                                        )
-                                        .child(EditorInput::new(&self.font_size_input))
-                                        .when(!self.font_size_valid, |d| {
-                                            d.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(error_color)
-                                                    .child("Value must be between 6 and 72"),
-                                            )
-                                        }),
-                                ),
-                            )
-                            .child(
-                                div().w(px(120.0)).child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.text_muted)
-                                                .child("行高 (倍率)"),
-                                        )
-                                        .child(EditorInput::new(&self.line_height_input))
-                                        .when(!self.line_height_valid, |d| {
-                                            d.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(error_color)
-                                                    .child("Value must be between 0.8 and 3.0"),
-                                            )
-                                        }),
-                                ),
-                            ),
-                    ),
-                ),
-        )
-    }
 
     fn render_compact_row(&self, label: &str, control: impl IntoElement, cx: &App) -> gpui::Div {
         let theme = cx.theme().ui;
@@ -391,17 +242,20 @@ impl FontSettingsView {
                 div()
                     .w(px(80.))
                     .flex()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.text_muted)
-                            .child(label),
-                    ),
+                    .child(div().text_xs().text_color(theme.text_muted).child(label)),
             )
             .child(control)
     }
+}
 
-    fn render_compact(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+impl Focusable for FontSettingsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for FontSettingsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let error_color = gpui::rgb(0xef4444);
 
@@ -421,15 +275,12 @@ impl FontSettingsView {
                     .justify_between()
                     .gap(px(8.))
                     .child(
-                        div()
-                            .w(px(80.))
-                            .flex()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text_muted)
-                                    .child("字体大小 (px)"),
-                            ),
+                        div().w(px(80.)).flex().child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child("字体大小 (px)"),
+                        ),
                     )
                     .child(
                         div()
@@ -457,15 +308,12 @@ impl FontSettingsView {
                     .justify_between()
                     .gap(px(8.))
                     .child(
-                        div()
-                            .w(px(80.))
-                            .flex()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.text_muted)
-                                    .child("行高 (倍率)"),
-                            ),
+                        div().w(px(80.)).flex().child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child("行高 (倍率)"),
+                        ),
                     )
                     .child(
                         div()
