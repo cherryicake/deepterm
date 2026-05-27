@@ -12,9 +12,11 @@ use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::Modal;
 use crate::sidebar_view::host_form::NewHostForm;
+use crate::sidebar_view::hosts_view::{
+    ConnectHost, DeleteHost, DuplicateHost, EditHost, load_hosts_from_config,
+};
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
-use crate::sidebar_view::hosts_view::{ConnectHost, DeleteHost, DuplicateHost, EditHost, load_hosts_from_config};
 use crate::theme::ActiveTheme;
 
 /// Host 侧边栏视图组件，管理 Host 列表和 New Host Modal。
@@ -262,7 +264,11 @@ impl Render for HostView {
             );
 
         // 搜索框
-        let search_focused = self.search_input.read(cx).focus_handle(cx).is_focused(window);
+        let search_focused = self
+            .search_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         let search_box = div()
             .w_full()
             .h(px(32.0))
@@ -270,7 +276,7 @@ impl Render for HostView {
             .items_center()
             .px(px(10.0))
             .gap(px(6.0))
-            .rounded(px(8.0))
+            .rounded(px(12.0))
             .bg(hover_bg(is_dark))
             .when(search_focused, |this| {
                 this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
@@ -282,10 +288,7 @@ impl Render for HostView {
                     .path(Icon::MagnifyingGlass.path())
                     .text_color(theme.text_muted),
             )
-            .child(
-                EditorInput::new(&self.search_input)
-                    .transparent(),
-            );
+            .child(EditorInput::new(&self.search_input).transparent());
 
         // 根据搜索查询过滤 hosts（复用 hosts_view.rs 的过滤逻辑）
         let query = self.search_query.as_ref();
@@ -520,10 +523,14 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &EditHost, window, cx| {
-                    let host_id = this.context_menu_host_id.clone()
+                    let host_id = this
+                        .context_menu_host_id
+                        .clone()
                         .or_else(|| this.selected_ids.iter().next().cloned());
                     if let Some(id) = host_id {
-                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()).cloned() {
+                        if let Some(config) =
+                            configs_rc.iter().find(|c| c.id() == id.as_ref()).cloned()
+                        {
                             this.open_edit_modal(&config, window, cx);
                         }
                     }
@@ -532,12 +539,15 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &DuplicateHost, _window, _cx| {
-                    let host_id = this.context_menu_host_id.clone()
+                    let host_id = this
+                        .context_menu_host_id
+                        .clone()
                         .or_else(|| this.selected_ids.iter().next().cloned());
                     if let Some(id) = host_id {
                         if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
                             let mut new_config = config.clone();
-                            new_config.nickname = config.nickname.as_ref().map(|n| format!("{} (copy)", n));
+                            new_config.nickname =
+                                config.nickname.as_ref().map(|n| format!("{} (copy)", n));
                             if let Ok(mut global) = SshGlobalConfig::load_or_create() {
                                 global.add_connection(new_config);
                                 let _ = global.save();
@@ -554,7 +564,12 @@ impl Render for HostView {
                 let count = host_ids.len();
                 let names: Vec<_> = host_ids
                     .iter()
-                    .filter_map(|id| hosts.iter().find(|h| h.id.as_ref() == id.as_ref()).map(|h| h.name.to_string()))
+                    .filter_map(|id| {
+                        hosts
+                            .iter()
+                            .find(|h| h.id.as_ref() == id.as_ref())
+                            .map(|h| h.name.to_string())
+                    })
                     .collect();
 
                 let message = if count == 1 {

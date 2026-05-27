@@ -292,7 +292,7 @@ impl Render for AppWindow {
 
 fn main() {
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+        .filter_level(log::LevelFilter::Debug)
         .filter_module("russh", log::LevelFilter::Warn)
         .init();
 

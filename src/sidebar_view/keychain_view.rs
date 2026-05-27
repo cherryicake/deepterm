@@ -11,15 +11,12 @@ use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::Modal;
+use crate::sidebar_view::keychain_editor::KeychainEditor;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore};
-use crate::sidebar_view::keychain_editor::KeychainEditor;
 use crate::theme::ActiveTheme;
 
-actions!(
-    keychain_actions,
-    [EditKeychainItem, DeleteKeychainItem]
-);
+actions!(keychain_actions, [EditKeychainItem, DeleteKeychainItem]);
 
 /// Keychain 侧边栏视图组件，管理 Keys/Identities 列表和编辑弹窗。
 pub struct KeychainSidebarView {
@@ -267,7 +264,11 @@ impl Render for KeychainSidebarView {
             );
 
         // 搜索框
-        let search_focused = self.search_input.read(cx).focus_handle(cx).is_focused(window);
+        let search_focused = self
+            .search_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         let search_box = div()
             .w_full()
             .h(px(32.0))
@@ -275,7 +276,7 @@ impl Render for KeychainSidebarView {
             .items_center()
             .px(px(10.0))
             .gap(px(6.0))
-            .rounded(px(8.0))
+            .rounded(px(12.0))
             .bg(hover_bg(is_dark))
             .when(search_focused, |this| {
                 this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
@@ -368,7 +369,9 @@ impl Render for KeychainSidebarView {
             .flex_col()
             // Edit action
             .on_action(cx.listener(|this, _: &EditKeychainItem, window, cx| {
-                let item_id = this.context_menu_item_id.clone()
+                let item_id = this
+                    .context_menu_item_id
+                    .clone()
                     .or_else(|| this.selected_ids.iter().next().cloned());
                 if let Some(id) = item_id {
                     let store = KeychainStore::load_or_default();
@@ -387,7 +390,13 @@ impl Render for KeychainSidebarView {
                 let store = KeychainStore::load_or_default();
                 let names: Vec<_> = item_ids
                     .iter()
-                    .filter_map(|id| store.items.iter().find(|i| i.id == id.as_ref()).map(|i| i.label.clone()))
+                    .filter_map(|id| {
+                        store
+                            .items
+                            .iter()
+                            .find(|i| i.id == id.as_ref())
+                            .map(|i| i.label.clone())
+                    })
                     .collect();
 
                 let message = if count == 1 {
