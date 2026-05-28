@@ -274,6 +274,11 @@ impl Workspace {
             );
         });
 
+        // 订阅初始 panel 的事件（之前的 subscribe_to_panels 调用时尚未有 panel）
+        workspace.update(cx, |workspace, cx| {
+            workspace.subscribe_to_panels(window, cx);
+        });
+
         workspace
     }
 

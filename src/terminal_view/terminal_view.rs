@@ -1557,7 +1557,18 @@ impl TerminalView {
                     });
                 } else if overlay_visible_with_results {
                     // B：用户没选任何项，只是想关掉浮层
-                    self.mutate_builtin_command(cx, BuiltinCommandManager::hide_overlay);
+                    // 但如果缓冲区第一个 token 精确匹配了某个注册命令，应该提交执行
+                    let first_token = self.builtin_command_manager
+                        .query()
+                        .and_then(|q| q.split_whitespace().next());
+                    let is_exact_command = first_token
+                        .and_then(|name| crate::builtin_commands::global_registry().find(name))
+                        .is_some();
+                    if is_exact_command {
+                        self.submit_builtin_command(false, cx);
+                    } else {
+                        self.mutate_builtin_command(cx, BuiltinCommandManager::hide_overlay);
+                    }
                 } else if self.builtin_command_manager.is_dismissed() {
                     // 用户已显式 ESC 取消，直接把命令发给 shell
                     self.send_builtin_command_to_shell(cx);
