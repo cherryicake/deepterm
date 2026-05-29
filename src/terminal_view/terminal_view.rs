@@ -1327,18 +1327,25 @@ impl TerminalView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let effective = if abs_dir_task == "~" {
-                        crate::ssh::sftp_fs::with_cached_session(&config_task, |session| {
+                    crate::ssh::sftp_fs::with_cached_session_once(&config_task, |session| {
+                        let effective = if abs_dir_task == "~" {
                             session
                                 .canonicalize(".")
                                 .or_else(|_| session.canonicalize("~"))
-                        })
-                        .unwrap_or_else(|_| "/".to_string())
-                    } else {
-                        abs_dir_task
-                    };
-                    let entries = crate::ssh::sftp_fs::read_dir(&config_task, &effective);
-                    (effective, entries)
+                                .unwrap_or_else(|_| "/".to_string())
+                        } else if let Some(rest) = abs_dir_task.strip_prefix("~/") {
+                            let home = session
+                                .canonicalize(".")
+                                .or_else(|_| session.canonicalize("~"))
+                                .unwrap_or_else(|_| "/".to_string());
+                            crate::ssh::sftp_fs::join_remote_path(&home, rest)
+                        } else {
+                            abs_dir_task.clone()
+                        };
+                        let entries = session.read_dir(&effective);
+                        Ok((effective, entries))
+                    })
+                    .unwrap_or_else(|err| (abs_dir_task, Err(err)))
                 })
                 .await;
 

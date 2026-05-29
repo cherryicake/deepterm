@@ -861,6 +861,10 @@ impl BuiltinCommandManager {
                         None => return false,
                     };
                     h.display.eq_ignore_ascii_case(host_token)
+                        || cfg.host_label().eq_ignore_ascii_case(host_token)
+                        || cfg
+                            .connection_string()
+                            .eq_ignore_ascii_case(host_token)
                         || cfg
                             .nickname
                             .as_deref()

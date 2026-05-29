@@ -678,6 +678,15 @@ pub fn with_cached_session<T>(
     }
 }
 
+pub fn with_cached_session_once<T>(
+    config: &SshConnectionConfig,
+    f: impl FnOnce(&mut BlockingSftpSession) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let key = cache_key(config);
+    let session = get_or_connect_session(config, &key)?;
+    f(&mut session.lock().unwrap())
+}
+
 impl Drop for BlockingSftpSession {
     fn drop(&mut self) {
         self.runtime.block_on(async {
