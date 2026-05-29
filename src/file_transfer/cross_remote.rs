@@ -610,86 +610,41 @@ fn copy_via_agent_forward_scp(
         destination_config.port
     );
 
-    // 启动后台进度监控线程：每秒轮询目标文件/目录大小，增量更新 progress
-    let stop_monitor = Arc::new(AtomicBool::new(false));
-    let progress_arc = progress.map(|p| Arc::new(AtomicU64::new(p.load(Ordering::Relaxed))));
-    let progress_handle = if let Some(p) = progress_arc.as_ref() {
-        let dest_cfg = destination_config.clone();
-        let dest_path = destination_path.to_string();
-        let p = p.clone();
-        let stop = stop_monitor.clone();
-        let mon_cancelled = cancelled.clone();
-        let is_dir = is_directory;
-        std::thread::Builder::new()
-            .name("scp-progress-monitor".into())
-            .spawn(move || {
-                let Ok(mut session) = sftp_fs::BlockingSftpSession::connect(&dest_cfg) else {
-                    return;
-                };
-                let mut last_size = 0u64;
-                loop {
-                    if stop.load(Ordering::Relaxed) || mon_cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    if is_dir {
-                        // 目录传输：用 du -sb 轮询目标目录总大小
-                        let cmd = format!(
-                            "du -sb {} 2>/dev/null || echo 0",
-                            crate::file_transfer::utils::shell_single_quote(&dest_path)
-                        );
-                        if let Ok(result) = session.execute_command(&cmd, 5) {
-                            if result.success() {
-                                if let Ok(size) = result.stdout.trim().parse::<u64>() {
-                                    if size > last_size {
-                                        p.fetch_add(size - last_size, Ordering::Relaxed);
-                                        last_size = size;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // 文件传输：直接轮询目标文件 metadata
-                        if let Ok(meta) = session.metadata(&dest_path) {
-                            if meta.size > last_size {
-                                p.fetch_add(meta.size - last_size, Ordering::Relaxed);
-                                last_size = meta.size;
-                            }
-                        }
-                    }
-                }
-            })
-            .ok()
-    } else {
-        None
-    };
-
+    // 后台进度监控：scp 执行期间每秒轮询目标大小，直接写入 UI 共享的 progress。
+    // 用 thread::scope 让监控线程借用真实的 &AtomicU64，无需中转 Arc（之前写到
+    // 临时 Arc 再在结束后对账，导致进度条整个传输期间不动、完成瞬间才跳变）。
     let started = std::time::Instant::now();
-    let cmd_result = source_session.execute_command_with_agent_forward_and_cancel(
-        &scp_cmd,
-        remote_scp_timeout_secs(),
-        cancelled,
-        |data: &[u8]| {
-            report_scp_stderr(reporter, data);
-            if !data.is_empty() && log::log_enabled!(log::Level::Trace) {
-                log::trace!("scp stderr: {}", String::from_utf8_lossy(data).trim_end());
-            }
-        },
-    );
-
-    // 停止后台进度监控线程
-    stop_monitor.store(true, Ordering::Relaxed);
-    if let Some(handle) = progress_handle {
-        let _ = handle.join();
-    }
-    // 将后台线程累计的进度写回原始 progress
-    if let (Some(p), Some(arc_p)) = (progress, progress_arc.as_ref()) {
-        let monitored = arc_p.load(Ordering::Relaxed);
-        let current = p.load(Ordering::Relaxed);
-        if monitored > current {
-            p.fetch_add(monitored - current, Ordering::Relaxed);
+    let stop_monitor = AtomicBool::new(false);
+    let cmd_result = std::thread::scope(|scope| {
+        if let Some(p) = progress {
+            let stop_ref = &stop_monitor;
+            let cancelled_ref: &AtomicBool = cancelled;
+            scope.spawn(move || {
+                monitor_dest_progress(
+                    destination_config,
+                    destination_path,
+                    is_directory,
+                    p,
+                    stop_ref,
+                    cancelled_ref,
+                );
+            });
         }
-    }
+        let r = source_session.execute_command_with_agent_forward_and_cancel(
+            &scp_cmd,
+            remote_scp_timeout_secs(),
+            cancelled,
+            |data: &[u8]| {
+                report_scp_stderr(reporter, data);
+                if !data.is_empty() && log::log_enabled!(log::Level::Trace) {
+                    log::trace!("scp stderr: {}", String::from_utf8_lossy(data).trim_end());
+                }
+            },
+        );
+        // 通知监控线程退出；scope 在闭包结束时自动 join
+        stop_monitor.store(true, Ordering::Relaxed);
+        r
+    });
 
     let cmd_result = cmd_result?;
 
@@ -758,6 +713,52 @@ fn usable_default_keys() -> Vec<PathBuf> {
         }
     }
     result
+}
+
+/// 后台进度监控：scp 执行期间，在一条独立 SSH 连接上每秒轮询目标文件/目录的
+/// 当前大小，并把增量写入 `progress`（UI 共享的同一个 atomic，从而实时更新进度条）。
+///
+/// - 文件：直接 `metadata().size`
+/// - 目录：`du -sb`（GNU coreutils 扩展，BSD/macOS/busybox 不支持 `-b`；不可用时
+///   `|| echo 0` 兜底，目录进度会停在 0，但不影响传输本身与最终对账）
+///
+/// `stop` 置位（scp 已返回）或 `cancelled` 置位时退出。
+fn monitor_dest_progress(
+    destination_config: &SshConnectionConfig,
+    destination_path: &str,
+    is_directory: bool,
+    progress: &AtomicU64,
+    stop: &AtomicBool,
+    cancelled: &AtomicBool,
+) {
+    let Ok(mut session) = sftp_fs::BlockingSftpSession::connect(destination_config) else {
+        return;
+    };
+    let mut last_size = 0u64;
+    loop {
+        if stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let size = if is_directory {
+            let cmd = format!(
+                "du -sb {} 2>/dev/null || echo 0",
+                shell_single_quote(destination_path)
+            );
+            match session.execute_command(&cmd, 5) {
+                Ok(result) if result.success() => result.stdout.trim().parse::<u64>().ok(),
+                _ => None,
+            }
+        } else {
+            session.metadata(destination_path).ok().map(|meta| meta.size)
+        };
+        if let Some(size) = size {
+            if size > last_size {
+                progress.fetch_add(size - last_size, Ordering::Relaxed);
+                last_size = size;
+            }
+        }
+    }
 }
 
 fn remote_total_size(session: &mut BlockingSftpSession, path: &str) -> u64 {
@@ -849,74 +850,29 @@ fn copy_via_remote_scp(
         destination_config.port
     );
 
-    // 启动后台进度监控线程：每秒轮询目标文件/目录大小，增量更新 progress
-    let stop_monitor = Arc::new(AtomicBool::new(false));
-    let progress_arc = progress.map(|p| Arc::new(AtomicU64::new(p.load(Ordering::Relaxed))));
-    let progress_handle = if let Some(p) = progress_arc.as_ref() {
-        let dest_cfg = destination_config.clone();
-        let dest_path = destination_path.to_string();
-        let p = p.clone();
-        let stop = stop_monitor.clone();
-        let mon_cancelled = cancelled.clone();
-        let is_dir = is_directory;
-        std::thread::Builder::new()
-            .name("scp-progress-monitor".into())
-            .spawn(move || {
-                let Ok(mut session) = sftp_fs::BlockingSftpSession::connect(&dest_cfg) else {
-                    return;
-                };
-                let mut last_size = 0u64;
-                loop {
-                    if stop.load(Ordering::Relaxed) || mon_cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    if is_dir {
-                        let cmd = format!(
-                            "du -sb {} 2>/dev/null || echo 0",
-                            crate::file_transfer::utils::shell_single_quote(&dest_path)
-                        );
-                        if let Ok(result) = session.execute_command(&cmd, 5) {
-                            if result.success() {
-                                if let Ok(size) = result.stdout.trim().parse::<u64>() {
-                                    if size > last_size {
-                                        p.fetch_add(size - last_size, Ordering::Relaxed);
-                                        last_size = size;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        if let Ok(meta) = session.metadata(&dest_path) {
-                            if meta.size > last_size {
-                                p.fetch_add(meta.size - last_size, Ordering::Relaxed);
-                                last_size = meta.size;
-                            }
-                        }
-                    }
-                }
-            })
-            .ok()
-    } else {
-        None
-    };
-
+    // 后台进度监控：同 copy_via_agent_forward_scp，借用真实 progress 直接写。
     let started = std::time::Instant::now();
-    let result = source_session.execute_command_with_cancel(&scp_cmd, remote_scp_timeout_secs(), cancelled);
-
-    // 停止后台进度监控线程
-    stop_monitor.store(true, Ordering::Relaxed);
-    if let Some(handle) = progress_handle {
-        let _ = handle.join();
-    }
-    // 将后台线程累计的进度写回原始 progress
-    if let (Some(p), Some(arc_p)) = (progress, progress_arc.as_ref()) {
-        let monitored = arc_p.load(Ordering::Relaxed);
-        let current = p.load(Ordering::Relaxed);
-        if monitored > current {
-            p.fetch_add(monitored - current, Ordering::Relaxed);
+    let stop_monitor = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        if let Some(p) = progress {
+            let stop_ref = &stop_monitor;
+            let cancelled_ref: &AtomicBool = cancelled;
+            scope.spawn(move || {
+                monitor_dest_progress(
+                    destination_config,
+                    destination_path,
+                    is_directory,
+                    p,
+                    stop_ref,
+                    cancelled_ref,
+                );
+            });
         }
-    }
+        let r =
+            source_session.execute_command_with_cancel(&scp_cmd, remote_scp_timeout_secs(), cancelled);
+        stop_monitor.store(true, Ordering::Relaxed);
+        r
+    });
 
     match result {
         Ok(cmd_result) => {

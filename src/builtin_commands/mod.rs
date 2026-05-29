@@ -105,6 +105,11 @@ pub struct BuiltinCommandManager {
     remote_dir_cache_lru: Vec<(String, String)>,
     /// 已经向外部发起、等待结果的远端目录请求集合
     pending_remote_keys: HashMap<(String, String), bool>,
+    /// 上次读取失败、尚未向用户展示过错误的远端目录 key → 错误信息。
+    /// cache-miss 分支会消费该标记显示一次错误占位（且不重新注册请求，避免
+    /// 失败→刷新→重新请求→再失败的无限循环）；下一次用户输入触发的刷新由于
+    /// 标记已被消费，会重新注册请求自动重试。
+    failed_remote_keys: HashMap<(String, String), String>,
     /// `/scp` 第二段是否处于"等待远端结果"状态
     pub is_loading_remote: bool,
     /// 路径补全浮层的滚动句柄：键盘 / Tab 切换选中项时调用
@@ -152,6 +157,7 @@ impl BuiltinCommandManager {
             remote_dir_cache: HashMap::new(),
             remote_dir_cache_lru: Vec::new(),
             pending_remote_keys: HashMap::new(),
+            failed_remote_keys: HashMap::new(),
             is_loading_remote: false,
             path_scroll_handle: ScrollHandle::new(),
         }
@@ -197,6 +203,8 @@ impl BuiltinCommandManager {
         let key = (config_id, absolute_dir);
         let should_refresh = match entries {
             Ok(new_items) => {
+                // 成功 ⇒ 清除可能残留的失败标记
+                self.failed_remote_keys.remove(&key);
                 // 对比缓存：有变化才更新
                 let changed = match self.remote_dir_cache.get(&key) {
                     Some(cached) => cached.items != new_items,
@@ -217,11 +225,17 @@ impl BuiltinCommandManager {
                 }
                 changed
             }
-            Err(_) => {
-                // 失败不缓存，也不触发刷新（避免无限重试循环）
-                self.remote_dir_cache.remove(&key);
-                self.remote_dir_cache_lru.retain(|k| k != &key);
-                false
+            Err(err) => {
+                // 失败不写正向缓存，但记录一次错误标记，让 cache-miss 分支把
+                // "正在加载" 收敛成错误占位（否则 UI 会永远停在加载中）。
+                // 仅当之前没有可用缓存时才清空已有缓存——避免一次后台刷新失败
+                // 就把先前成功列出的内容也抹掉。
+                if !self.remote_dir_cache.contains_key(&key) {
+                    self.failed_remote_keys.insert(key.clone(), err);
+                }
+                self.pending_remote_keys.remove(&key);
+                self.refresh_path_completions();
+                return;
             }
         };
         self.pending_remote_keys.remove(&key);
@@ -887,10 +901,16 @@ impl BuiltinCommandManager {
                         self.pending_remote_keys.entry(key).or_insert(false);
                     }
                     None => {
-                        // 无缓存：显示加载中，注册请求
-                        self.is_loading_remote = true;
-                        self.pending_remote_keys.entry(key).or_insert(false);
-                        self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
+                        if let Some(err) = self.failed_remote_keys.remove(&key) {
+                            // 上次读取失败：显示一次错误占位，不重新注册请求（断开重试循环）。
+                            // 下一次用户输入触发刷新时标记已消费，会重新注册请求自动重试。
+                            self.path_completions = vec![remote_dir_failed_item(err)];
+                        } else {
+                            // 无缓存：显示加载中，注册请求
+                            self.is_loading_remote = true;
+                            self.pending_remote_keys.entry(key).or_insert(false);
+                            self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
+                        }
                     }
                 }
             }
@@ -935,10 +955,15 @@ impl BuiltinCommandManager {
                 build_remote_completions(&cached.items, &file_prefix, extra_host_quoted, prefix)
             }
             None => {
-                // 无缓存：显示加载中
-                self.is_loading_remote = true;
-                self.pending_remote_keys.entry(key).or_insert(false);
-                vec![remote_dir_loading_item(absolute_dir)]
+                if let Some(err) = self.failed_remote_keys.remove(&key) {
+                    // 上次读取失败：一次性错误占位，不重新注册请求（断开重试循环）
+                    vec![remote_dir_failed_item(err)]
+                } else {
+                    // 无缓存：显示加载中
+                    self.is_loading_remote = true;
+                    self.pending_remote_keys.entry(key).or_insert(false);
+                    vec![remote_dir_loading_item(absolute_dir)]
+                }
             }
         }
     }
@@ -978,6 +1003,19 @@ fn remote_dir_loading_item(absolute_dir: String) -> PathCompletionItem {
         kind: CompletionKind::File,
         description: Some(absolute_dir),
         icon: Some(crate::assets::Icon::ProgressIndicator),
+        replacement: None,
+    }
+}
+
+/// 远端目录读取失败时的一次性占位补全项（不写缓存、不重新注册请求）。
+fn remote_dir_failed_item(err: String) -> PathCompletionItem {
+    PathCompletionItem {
+        name: "无法读取远端目录".to_string(),
+        path: PathBuf::new(),
+        is_directory: false,
+        kind: CompletionKind::File,
+        description: Some(err),
+        icon: None,
         replacement: None,
     }
 }
@@ -1973,6 +2011,55 @@ mod tests {
             .find(|i| i.name == "log.txt")
             .expect("log.txt entry");
         assert_eq!(log_txt.replacement.as_deref(), Some("log.txt"));
+    }
+
+    #[test]
+    fn remote_dir_failure_shows_error_then_retries_without_loop() {
+        // 远端目录读取失败时：① 收敛成错误占位（不再永远卡在"加载中"），
+        // ② 不重新注册请求（断开失败→刷新→重试的无限循环），
+        // ③ 下一次用户输入触发刷新时重新注册请求，自动重试。
+        use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+        let cfg =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
+        let cfg_id = cfg.id();
+
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_terminal_context(Some(cfg.clone()), Some("/srv/app".to_string()));
+        manager.update("/scp lo");
+
+        // 首次：标记 loading 并注册请求
+        assert!(manager.is_loading_remote);
+        let req = manager
+            .pending_remote_request()
+            .expect("first request issued");
+        assert_eq!(req.absolute_dir, "/srv/app");
+
+        // 模拟读取失败
+        manager.apply_remote_dir_result(
+            cfg_id.clone(),
+            "/srv/app".to_string(),
+            Err("权限不足".into()),
+        );
+
+        // ① 错误占位应出现在补全列表中（HostOrLocal 阶段它排在 host 候选之后）
+        let failed_item = manager
+            .path_completions
+            .iter()
+            .find(|i| i.name == "无法读取远端目录")
+            .expect("failure placeholder must be shown instead of staying on loading");
+        assert_eq!(failed_item.description.as_deref(), Some("权限不足"));
+        // ② 失败后不得再有挂起请求（否则就是无限重试）
+        assert!(
+            manager.pending_remote_request().is_none(),
+            "failure must not re-register a pending request"
+        );
+
+        // ③ 用户继续输入触发刷新 ⇒ 失败标记已消费，重新注册请求重试
+        manager.update("g");
+        let retry = manager
+            .pending_remote_request()
+            .expect("next input should retry");
+        assert_eq!(retry.absolute_dir, "/srv/app");
     }
 
     #[test]
