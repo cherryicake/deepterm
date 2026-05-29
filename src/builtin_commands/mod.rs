@@ -115,9 +115,20 @@ pub struct BuiltinCommandManager {
 /// 远端目录在补全缓存中的状态
 #[derive(Clone, Debug)]
 pub enum RemoteDirCacheEntry {
-    Entries(Vec<RemoteEntrySnapshot>),
-    Failed(String),
+    Entries {
+        items: Vec<RemoteEntrySnapshot>,
+        created_at: std::time::Instant,
+    },
+    Failed {
+        error: String,
+        created_at: std::time::Instant,
+    },
 }
+
+/// 成功读取的目录缓存有效期：30 秒
+const REMOTE_DIR_CACHE_TTL_OK: std::time::Duration = std::time::Duration::from_secs(30);
+/// 失败的目录缓存有效期：5 秒（快速重试）
+const REMOTE_DIR_CACHE_TTL_ERR: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 从外部异步加载后写入的远端条目快照
 #[derive(Clone, Debug)]
@@ -196,9 +207,16 @@ impl BuiltinCommandManager {
         entries: Result<Vec<RemoteEntrySnapshot>, String>,
     ) {
         let key = (config_id, absolute_dir);
+        let now = std::time::Instant::now();
         let value = match entries {
-            Ok(list) => RemoteDirCacheEntry::Entries(list),
-            Err(err) => RemoteDirCacheEntry::Failed(err),
+            Ok(list) => RemoteDirCacheEntry::Entries {
+                items: list,
+                created_at: now,
+            },
+            Err(err) => RemoteDirCacheEntry::Failed {
+                error: err,
+                created_at: now,
+            },
         };
         // 更新 LRU：先移除旧位置，再插入到末尾（最新）
         self.remote_dir_cache_lru.retain(|k| k != &key);
@@ -859,19 +877,37 @@ impl BuiltinCommandManager {
                 let canonical_host = host_cfg.host_label();
 
                 match self.remote_dir_cache.get(&key).cloned() {
-                    Some(RemoteDirCacheEntry::Entries(entries)) => {
-                        // 更新 LRU：命中后移到末尾（最新）
-                        self.remote_dir_cache_lru.retain(|k| k != &key);
-                        self.remote_dir_cache_lru.push(key.clone());
-                        self.path_completions = build_remote_completions(
-                            &entries,
-                            &file_prefix,
-                            Some(canonical_host.as_str()),
-                            prefix,
-                        );
+                    Some(RemoteDirCacheEntry::Entries { items, created_at }) => {
+                        if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_OK {
+                            // 缓存过期：删除旧条目，触发重新加载
+                            self.remote_dir_cache.remove(&key);
+                            self.remote_dir_cache_lru.retain(|k| k != &key);
+                            self.is_loading_remote = true;
+                            self.pending_remote_keys.entry(key).or_insert(false);
+                            self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
+                        } else {
+                            // 更新 LRU：命中后移到末尾（最新）
+                            self.remote_dir_cache_lru.retain(|k| k != &key);
+                            self.remote_dir_cache_lru.push(key.clone());
+                            self.path_completions = build_remote_completions(
+                                &items,
+                                &file_prefix,
+                                Some(canonical_host.as_str()),
+                                prefix,
+                            );
+                        }
                     }
-                    Some(RemoteDirCacheEntry::Failed(err)) => {
-                        self.path_completions = vec![remote_dir_failed_item(err)];
+                    Some(RemoteDirCacheEntry::Failed { error, created_at }) => {
+                        if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_ERR {
+                            // 失败缓存过期：允许重试
+                            self.remote_dir_cache.remove(&key);
+                            self.remote_dir_cache_lru.retain(|k| k != &key);
+                            self.is_loading_remote = true;
+                            self.pending_remote_keys.entry(key).or_insert(false);
+                            self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
+                        } else {
+                            self.path_completions = vec![remote_dir_failed_item(error)];
+                        }
                     }
                     None => {
                         self.is_loading_remote = true;
@@ -912,12 +948,30 @@ impl BuiltinCommandManager {
         let key = (terminal_cfg.id(), absolute_dir.clone());
 
         match self.remote_dir_cache.get(&key).cloned() {
-            Some(RemoteDirCacheEntry::Entries(entries)) => {
-                self.remote_dir_cache_lru.retain(|k| k != &key);
-                self.remote_dir_cache_lru.push(key.clone());
-                build_remote_completions(&entries, &file_prefix, extra_host_quoted, prefix)
+            Some(RemoteDirCacheEntry::Entries { items, created_at }) => {
+                if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_OK {
+                    self.remote_dir_cache.remove(&key);
+                    self.remote_dir_cache_lru.retain(|k| k != &key);
+                    self.is_loading_remote = true;
+                    self.pending_remote_keys.entry(key).or_insert(false);
+                    vec![remote_dir_loading_item(absolute_dir)]
+                } else {
+                    self.remote_dir_cache_lru.retain(|k| k != &key);
+                    self.remote_dir_cache_lru.push(key.clone());
+                    build_remote_completions(&items, &file_prefix, extra_host_quoted, prefix)
+                }
             }
-            Some(RemoteDirCacheEntry::Failed(err)) => vec![remote_dir_failed_item(err)],
+            Some(RemoteDirCacheEntry::Failed { error, created_at }) => {
+                if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_ERR {
+                    self.remote_dir_cache.remove(&key);
+                    self.remote_dir_cache_lru.retain(|k| k != &key);
+                    self.is_loading_remote = true;
+                    self.pending_remote_keys.entry(key).or_insert(false);
+                    vec![remote_dir_loading_item(absolute_dir)]
+                } else {
+                    vec![remote_dir_failed_item(error)]
+                }
+            }
             None => {
                 self.is_loading_remote = true;
                 self.pending_remote_keys.entry(key).or_insert(false);
