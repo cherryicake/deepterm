@@ -587,8 +587,10 @@ impl BlockingSftpSession {
             })
             .await;
 
-            // 确保通道关闭
-            let _ = channel.close().await;
+            // 取消时已在 timeout 内关闭 channel，避免重复 close
+            if !matches!(&result, Ok(Err(e)) if e.to_string().contains(TRANSFER_CANCELLED_MSG)) {
+                let _ = channel.close().await;
+            }
 
             match result {
                 Ok(Ok(())) => Ok(RemoteCommandResult {

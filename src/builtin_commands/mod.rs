@@ -218,10 +218,10 @@ impl BuiltinCommandManager {
                 changed
             }
             Err(_) => {
-                // 失败不缓存
+                // 失败不缓存，也不触发刷新（避免无限重试循环）
                 self.remote_dir_cache.remove(&key);
                 self.remote_dir_cache_lru.retain(|k| k != &key);
-                true
+                false
             }
         };
         self.pending_remote_keys.remove(&key);
