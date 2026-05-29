@@ -278,7 +278,8 @@ impl Render for MacosSelect {
 
         div()
             .relative()
-            .flex_none()
+            .flex_1()
+            .min_w_0()
             .items_start()
             .track_focus(&focus_handle)
             .child(
@@ -287,6 +288,8 @@ impl Render for MacosSelect {
                     .h(px(24.0))
                     .px(px(6.0))
                     .flex()
+                    .min_w_0()
+                    .overflow_hidden()
                     .items_center()
                     .justify_end()
                     .gap(px(12.0))

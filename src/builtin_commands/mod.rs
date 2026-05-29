@@ -114,24 +114,12 @@ pub struct BuiltinCommandManager {
 
 /// 远端目录在补全缓存中的状态
 #[derive(Clone, Debug)]
-pub enum RemoteDirCacheEntry {
-    Entries {
-        items: Vec<RemoteEntrySnapshot>,
-        created_at: std::time::Instant,
-    },
-    Failed {
-        error: String,
-        created_at: std::time::Instant,
-    },
+pub struct RemoteDirCacheEntry {
+    items: Vec<RemoteEntrySnapshot>,
 }
 
-/// 成功读取的目录缓存有效期：30 秒
-const REMOTE_DIR_CACHE_TTL_OK: std::time::Duration = std::time::Duration::from_secs(30);
-/// 失败的目录缓存有效期：5 秒（快速重试）
-const REMOTE_DIR_CACHE_TTL_ERR: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// 从外部异步加载后写入的远端条目快照
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteEntrySnapshot {
     pub name: String,
     pub is_directory: bool,
@@ -207,36 +195,44 @@ impl BuiltinCommandManager {
         entries: Result<Vec<RemoteEntrySnapshot>, String>,
     ) {
         let key = (config_id, absolute_dir);
-        let now = std::time::Instant::now();
-        let value = match entries {
-            Ok(list) => RemoteDirCacheEntry::Entries {
-                items: list,
-                created_at: now,
-            },
-            Err(err) => RemoteDirCacheEntry::Failed {
-                error: err,
-                created_at: now,
-            },
+        let should_refresh = match entries {
+            Ok(new_items) => {
+                // 对比缓存：有变化才更新
+                let changed = match self.remote_dir_cache.get(&key) {
+                    Some(cached) => cached.items != new_items,
+                    None => true,
+                };
+                if changed {
+                    self.remote_dir_cache.insert(
+                        key.clone(),
+                        RemoteDirCacheEntry { items: new_items },
+                    );
+                    // LRU 淘汰
+                    self.remote_dir_cache_lru.retain(|k| k != &key);
+                    self.remote_dir_cache_lru.push(key.clone());
+                    while self.remote_dir_cache_lru.len() > 128 {
+                        let oldest = self.remote_dir_cache_lru.remove(0);
+                        self.remote_dir_cache.remove(&oldest);
+                    }
+                }
+                changed
+            }
+            Err(_) => {
+                // 失败不缓存
+                self.remote_dir_cache.remove(&key);
+                self.remote_dir_cache_lru.retain(|k| k != &key);
+                true
+            }
         };
-        // 更新 LRU：先移除旧位置，再插入到末尾（最新）
-        self.remote_dir_cache_lru.retain(|k| k != &key);
-        self.remote_dir_cache_lru.push(key.clone());
-        self.remote_dir_cache.insert(key.clone(), value);
-        // LRU 淘汰：限制缓存最多 128 个条目
-        while self.remote_dir_cache_lru.len() > 128 {
-            let oldest = self.remote_dir_cache_lru.remove(0);
-            self.remote_dir_cache.remove(&oldest);
-        }
         self.pending_remote_keys.remove(&key);
-        self.refresh_path_completions();
+        if should_refresh {
+            self.refresh_path_completions();
+        }
     }
 
-    /// 如果 `/scp` 当前 token 需要远端目录数据但缓存中没有，返回需要加载的请求。
+    /// 如果 `/scp` 当前 token 有未完成的远端目录请求，返回需要加载的请求。
     /// 调用方负责在后台线程读取 SFTP，完成后回传到 `apply_remote_dir_result`。
     pub fn pending_remote_request(&mut self) -> Option<RemoteCompletionRequest> {
-        if !self.is_loading_remote {
-            return None;
-        }
         for ((cfg, dir), pending) in self.pending_remote_keys.iter_mut() {
             if !*pending {
                 *pending = true;
@@ -877,39 +873,21 @@ impl BuiltinCommandManager {
                 let canonical_host = host_cfg.host_label();
 
                 match self.remote_dir_cache.get(&key).cloned() {
-                    Some(RemoteDirCacheEntry::Entries { items, created_at }) => {
-                        if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_OK {
-                            // 缓存过期：删除旧条目，触发重新加载
-                            self.remote_dir_cache.remove(&key);
-                            self.remote_dir_cache_lru.retain(|k| k != &key);
-                            self.is_loading_remote = true;
-                            self.pending_remote_keys.entry(key).or_insert(false);
-                            self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
-                        } else {
-                            // 更新 LRU：命中后移到末尾（最新）
-                            self.remote_dir_cache_lru.retain(|k| k != &key);
-                            self.remote_dir_cache_lru.push(key.clone());
-                            self.path_completions = build_remote_completions(
-                                &items,
-                                &file_prefix,
-                                Some(canonical_host.as_str()),
-                                prefix,
-                            );
-                        }
-                    }
-                    Some(RemoteDirCacheEntry::Failed { error, created_at }) => {
-                        if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_ERR {
-                            // 失败缓存过期：允许重试
-                            self.remote_dir_cache.remove(&key);
-                            self.remote_dir_cache_lru.retain(|k| k != &key);
-                            self.is_loading_remote = true;
-                            self.pending_remote_keys.entry(key).or_insert(false);
-                            self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
-                        } else {
-                            self.path_completions = vec![remote_dir_failed_item(error)];
-                        }
+                    Some(cached) => {
+                        // 有缓存：立即显示，同时注册后台刷新请求
+                        self.remote_dir_cache_lru.retain(|k| k != &key);
+                        self.remote_dir_cache_lru.push(key.clone());
+                        self.path_completions = build_remote_completions(
+                            &cached.items,
+                            &file_prefix,
+                            Some(canonical_host.as_str()),
+                            prefix,
+                        );
+                        // 注册后台刷新（不设置 is_loading_remote，避免 UI 显示加载中）
+                        self.pending_remote_keys.entry(key).or_insert(false);
                     }
                     None => {
+                        // 无缓存：显示加载中，注册请求
                         self.is_loading_remote = true;
                         self.pending_remote_keys.entry(key).or_insert(false);
                         self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
@@ -948,31 +926,16 @@ impl BuiltinCommandManager {
         let key = (terminal_cfg.id(), absolute_dir.clone());
 
         match self.remote_dir_cache.get(&key).cloned() {
-            Some(RemoteDirCacheEntry::Entries { items, created_at }) => {
-                if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_OK {
-                    self.remote_dir_cache.remove(&key);
-                    self.remote_dir_cache_lru.retain(|k| k != &key);
-                    self.is_loading_remote = true;
-                    self.pending_remote_keys.entry(key).or_insert(false);
-                    vec![remote_dir_loading_item(absolute_dir)]
-                } else {
-                    self.remote_dir_cache_lru.retain(|k| k != &key);
-                    self.remote_dir_cache_lru.push(key.clone());
-                    build_remote_completions(&items, &file_prefix, extra_host_quoted, prefix)
-                }
-            }
-            Some(RemoteDirCacheEntry::Failed { error, created_at }) => {
-                if created_at.elapsed() > REMOTE_DIR_CACHE_TTL_ERR {
-                    self.remote_dir_cache.remove(&key);
-                    self.remote_dir_cache_lru.retain(|k| k != &key);
-                    self.is_loading_remote = true;
-                    self.pending_remote_keys.entry(key).or_insert(false);
-                    vec![remote_dir_loading_item(absolute_dir)]
-                } else {
-                    vec![remote_dir_failed_item(error)]
-                }
+            Some(cached) => {
+                // 有缓存：立即显示
+                self.remote_dir_cache_lru.retain(|k| k != &key);
+                self.remote_dir_cache_lru.push(key.clone());
+                // 注册后台刷新
+                self.pending_remote_keys.entry(key).or_insert(false);
+                build_remote_completions(&cached.items, &file_prefix, extra_host_quoted, prefix)
             }
             None => {
+                // 无缓存：显示加载中
                 self.is_loading_remote = true;
                 self.pending_remote_keys.entry(key).or_insert(false);
                 vec![remote_dir_loading_item(absolute_dir)]
@@ -1015,23 +978,6 @@ fn remote_dir_loading_item(absolute_dir: String) -> PathCompletionItem {
         kind: CompletionKind::File,
         description: Some(absolute_dir),
         icon: Some(crate::assets::Icon::ProgressIndicator),
-        replacement: None,
-    }
-}
-
-/// 远端目录读取失败时的占位补全项。
-fn remote_dir_failed_item(err: String) -> PathCompletionItem {
-    placeholder_item("无法读取远端目录", err)
-}
-
-fn placeholder_item(name: &str, description: String) -> PathCompletionItem {
-    PathCompletionItem {
-        name: name.to_string(),
-        path: PathBuf::new(),
-        is_directory: false,
-        kind: CompletionKind::File,
-        description: Some(description),
-        icon: None,
         replacement: None,
     }
 }
