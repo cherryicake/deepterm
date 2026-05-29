@@ -204,6 +204,7 @@ pub fn resolve_local_conflict(
     desired_path: &Path,
     conflict_policy: ConflictPolicy,
     resolver: Option<&dyn ConflictResolver>,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !desired_path.exists() {
         return Ok(Some(desired_path.to_path_buf()));
@@ -226,7 +227,7 @@ pub fn resolve_local_conflict(
                 response: tx,
             });
 
-            match wait_for_resolution(&rx)? {
+            match wait_for_resolution(&rx, cancelled)? {
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_path_buf())),
                 ConflictResolution::AutoRename => {
@@ -285,6 +286,7 @@ pub fn resolve_remote_conflict(
     desired_path: &str,
     conflict_policy: ConflictPolicy,
     resolver: Option<&dyn ConflictResolver>,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
     if !session.exists(desired_path)? {
         return Ok(Some(desired_path.to_string()));
@@ -304,7 +306,7 @@ pub fn resolve_remote_conflict(
                 response: tx,
             });
 
-            match wait_for_resolution(&rx)? {
+            match wait_for_resolution(&rx, cancelled)? {
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
                 ConflictResolution::AutoRename => {

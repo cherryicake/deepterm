@@ -1067,7 +1067,7 @@ fn build_host_only_completions(
             // host token 含 `:`（带端口）或空格 → 必须整体加引号，否则提交时
             // first_unquoted_colon 会在 `host:port` 之间切
             let quoted_host = quote_host_token(&suggestion.replacement);
-            let replacement = format!("{}:", quoted_host);
+            let replacement = format!("{}:~/", quoted_host);
             items.push(PathCompletionItem {
                 // 显示统一 user@host[:port]，让命令行预览与最终结果一致
                 name: suggestion.replacement.clone(),

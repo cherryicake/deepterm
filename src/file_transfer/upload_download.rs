@@ -35,7 +35,7 @@ pub fn upload_local_to_remote(
         if metadata.is_file() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
             let destination_path =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             return upload_local_file_to_remote_path(
                 session,
@@ -49,7 +49,7 @@ pub fn upload_local_to_remote(
         if metadata.is_dir() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
             let destination_root =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             session.create_dir_all(&destination_root)?;
             return upload_local_dir_to_remote_path(
@@ -99,7 +99,7 @@ pub fn upload_local_dir_to_remote_path(
 
         if metadata.is_file() {
             let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(upload_local_file_to_remote_path(
                 session,
@@ -110,7 +110,7 @@ pub fn upload_local_dir_to_remote_path(
             )?);
         } else if metadata.is_dir() {
             let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             session.create_dir_all(&destination_path)?;
             summary.merge(upload_local_dir_to_remote_path(
@@ -188,7 +188,7 @@ pub fn download_remote_to_local(
         if metadata.kind == RemoteFileKind::File {
             let desired_path = destination_dir.join(effective_name);
             let destination_path =
-                resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+                resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             return download_remote_file_to_local_path(
                 session,
@@ -202,7 +202,7 @@ pub fn download_remote_to_local(
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = destination_dir.join(&file_name);
             let destination_root =
-                resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+                resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             fs::create_dir_all(&destination_root)?;
             return download_remote_dir_to_local_path(
@@ -247,7 +247,7 @@ pub fn download_remote_dir_to_local_path(
 
         if entry.kind == RemoteFileKind::File {
             let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(download_remote_file_to_local_path(
                 session,
@@ -258,7 +258,7 @@ pub fn download_remote_dir_to_local_path(
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
             let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             fs::create_dir_all(&destination_path)?;
             summary.merge(download_remote_dir_to_local_path(

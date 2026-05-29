@@ -809,6 +809,9 @@ impl Workspace {
                 if task.total_bytes < summary.bytes_transferred {
                     task.total_bytes = summary.bytes_transferred;
                 }
+                // 确保进度条显示到 100%
+                task.bytes_transferred
+                    .store(summary.bytes_transferred, Ordering::Relaxed);
                 task.status = TransferTaskStatus::Completed {
                     files: summary.files_transferred,
                     bytes: summary.bytes_transferred,

@@ -35,7 +35,7 @@ pub fn copy_remote_to_same_remote(
         if metadata.kind == RemoteFileKind::File {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
             let destination_path =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             if remote_path == destination_path {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
@@ -52,7 +52,7 @@ pub fn copy_remote_to_same_remote(
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
             let destination_root =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             if remote_path == destination_root {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
@@ -100,7 +100,7 @@ pub fn move_remote_to_same_remote(
         };
         let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
         let destination_path =
-            resolve_remote_conflict(session, &desired_path, conflict_policy, resolver)?
+            resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
                 .ok_or_else(|| anyhow!("传输已跳过"))?;
 
         if remote_path == destination_path {
@@ -154,7 +154,7 @@ pub fn copy_remote_dir_to_remote_path(
 
         if entry.kind == RemoteFileKind::File {
             let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(copy_remote_file_to_remote_path(
                 session,
@@ -165,7 +165,7 @@ pub fn copy_remote_dir_to_remote_path(
             )?);
         } else if entry.kind == RemoteFileKind::Directory {
             let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver)?
+                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             session.create_dir_all(&destination_path)?;
             summary.merge(copy_remote_dir_to_remote_path(

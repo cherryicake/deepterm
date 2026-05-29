@@ -190,8 +190,13 @@ fn render_transfer_list_item(
     let is_transferring = is_running && transferred > 0;
 
     // 进度条：运行中始终显示（确定或不确定）
+    let is_completed = matches!(task.status, TransferTaskStatus::Completed { .. });
     let progress_bar = if total_bytes > 0 {
-        let ratio = (transferred as f64 / total_bytes as f64).clamp(0.0, 0.98);
+        let ratio = if is_completed {
+            1.0
+        } else {
+            (transferred as f64 / total_bytes as f64).clamp(0.0, 0.98)
+        };
         div()
             .w_full()
             .h(px(4.0))
@@ -258,7 +263,7 @@ fn render_transfer_list_item(
                 }
                 parts.join(" ")
             }
-            TransferTaskStatus::Completed { bytes, .. } => format_size(*bytes),
+            TransferTaskStatus::Completed { bytes, .. } => format!("传输完成 {}", format_size(*bytes)),
             TransferTaskStatus::Failed(error) => format!("失败: {}", trim_error(error)),
             TransferTaskStatus::Cancelled => "已取消".to_string(),
             TransferTaskStatus::Skipped => "已跳过".to_string(),

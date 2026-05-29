@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
+use super::TRANSFER_CANCELLED_MSG;
+
 /// 用户针对单个文件冲突做出的决策。
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConflictResolution {
@@ -87,12 +89,24 @@ impl ConflictResolver for SharedConflictResolver {
 
 /// 阻塞等待用户决策。
 /// 在后台线程中调用，通过通道同步等待 UI 层的响应。
+/// 每 100ms 检查一次 `cancelled`，为 true 时立即返回取消错误。
 pub fn wait_for_resolution(
     rx: &async_channel::Receiver<ConflictResolution>,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<ConflictResolution> {
-    match rx.recv_blocking() {
-        Ok(resolution) => Ok(resolution),
-        Err(_) => Err(anyhow::anyhow!("conflict resolver closed")),
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!(TRANSFER_CANCELLED_MSG));
+        }
+        match rx.try_recv() {
+            Ok(resolution) => return Ok(resolution),
+            Err(async_channel::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(async_channel::TryRecvError::Closed) => {
+                return Err(anyhow::anyhow!("conflict resolver closed"));
+            }
+        }
     }
 }
 

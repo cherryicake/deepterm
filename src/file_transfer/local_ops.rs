@@ -33,7 +33,7 @@ pub fn copy_local_to_local(
 
     if metadata.is_file() {
         let destination_path =
-            resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+            resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
                 .ok_or_else(|| anyhow!("传输已跳过"))?;
         if source_path == destination_path {
             return Ok(TransferSummary::from_metadata(&metadata));
@@ -44,7 +44,7 @@ pub fn copy_local_to_local(
     if metadata.is_dir() {
         let desired_path = destination_dir.join(&file_name);
         let destination_root =
-            resolve_local_conflict(&desired_path, conflict_policy, resolver)?
+            resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
                 .ok_or_else(|| anyhow!("传输已跳过"))?;
         if source_path == destination_root {
             return Ok(TransferSummary::from_metadata(&metadata));
@@ -88,6 +88,7 @@ pub fn move_local_to_local(
         &destination_dir.join(effective_name),
         conflict_policy,
         resolver,
+        cancelled,
     )?
     .ok_or_else(|| anyhow!("传输已跳过"))?;
 
@@ -145,7 +146,7 @@ pub fn copy_local_dir_to_path(
 
         if metadata.is_file() {
             let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(copy_local_file_to_path(
                 &source_path,
@@ -154,7 +155,7 @@ pub fn copy_local_dir_to_path(
             )?);
         } else if metadata.is_dir() {
             let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver)?
+                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
                     .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(copy_local_dir_to_path(
                 &source_path,

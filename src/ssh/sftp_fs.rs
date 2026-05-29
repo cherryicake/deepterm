@@ -458,12 +458,67 @@ impl BlockingSftpSession {
         command: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<RemoteCommandResult> {
+        self.execute_command_inner(command, timeout_secs, None, None::<&mut dyn FnMut(&[u8])>, false)
+    }
+
+    /// 带取消检查的远程命令执行。每 200ms 检查一次 `cancelled`，
+    /// 为 true 时关闭 SSH channel 并返回错误。
+    pub fn execute_command_with_cancel(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<RemoteCommandResult> {
+        self.execute_command_inner(command, timeout_secs, Some(cancelled), None::<&mut dyn FnMut(&[u8])>, false)
+    }
+
+    /// 在远程服务器上执行命令，并为该通道启用 **SSH agent forwarding**。
+    pub fn execute_command_with_agent_forward(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+        mut progress_cb: impl FnMut(&[u8]),
+    ) -> anyhow::Result<RemoteCommandResult> {
+        self.execute_command_inner(command, timeout_secs, None, Some(&mut progress_cb as &mut dyn FnMut(&[u8])), true)
+    }
+
+    /// 带取消检查的 agent forwarding 远程命令执行。
+    pub fn execute_command_with_agent_forward_and_cancel(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+        cancelled: &AtomicBool,
+        mut progress_cb: impl FnMut(&[u8]),
+    ) -> anyhow::Result<RemoteCommandResult> {
+        self.execute_command_inner(command, timeout_secs, Some(cancelled), Some(&mut progress_cb as &mut dyn FnMut(&[u8])), true)
+    }
+
+    /// 统一的远程命令执行核心方法。
+    ///
+    /// - `cancelled`: 可选的取消标志，每 200ms 检查一次
+    /// - `progress_cb`: 可选的 stderr 实时回调（用于 scp 进度解析）
+    /// - `agent_forward`: 是否启用 SSH agent forwarding
+    fn execute_command_inner(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+        cancelled: Option<&AtomicBool>,
+        mut progress_cb: Option<&mut dyn FnMut(&[u8])>,
+        agent_forward: bool,
+    ) -> anyhow::Result<RemoteCommandResult> {
         self.runtime.block_on(async {
             let mut channel = self
                 .handle
                 .channel_open_session()
                 .await
                 .map_err(|e| anyhow!("打开 SSH 会话通道失败: {}", e))?;
+
+            if agent_forward {
+                channel
+                    .agent_forward(true)
+                    .await
+                    .map_err(|e| anyhow!("请求 agent forwarding 失败: {}", e))?;
+            }
 
             // 不分配 PTY：避免终端转义字符干扰命令输出
             channel
@@ -479,11 +534,33 @@ impl BlockingSftpSession {
 
             let result = tokio::time::timeout(timeout, async {
                 loop {
-                    match channel.wait().await {
+                    let msg = match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        channel.wait(),
+                    )
+                    .await
+                    {
+                        Ok(msg) => msg,
+                        Err(_elapsed) => {
+                            // 200ms 超时：检查取消标志
+                            if let Some(c) = cancelled {
+                                if c.load(Ordering::Relaxed) {
+                                    let _ = channel.eof().await;
+                                    let _ = channel.close().await;
+                                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    match msg {
                         Some(russh::ChannelMsg::Data { data }) => {
                             stdout.extend_from_slice(&data);
                         }
                         Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
+                            if let Some(cb) = progress_cb.as_mut() {
+                                cb(&data);
+                            }
                             stderr.extend_from_slice(&data);
                         }
                         Some(russh::ChannelMsg::ExitStatus {
@@ -511,84 +588,6 @@ impl BlockingSftpSession {
             .await;
 
             // 确保通道关闭
-            let _ = channel.close().await;
-
-            match result {
-                Ok(Ok(())) => Ok(RemoteCommandResult {
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    exit_status,
-                }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(anyhow!("远程命令执行超时 ({}s)", timeout_secs)),
-            }
-        })
-    }
-
-    /// 在远程服务器上执行命令，并为该通道启用 **SSH agent forwarding**。
-    ///
-    /// 启用 agent forwarding 后，远程进程可以通过本机 ssh-agent 做鉴权，
-    /// 从而支持在源服务器上直接 `scp`/`rsync` 到目标服务器而无需把私钥
-    /// 搬到源端（方案 3a）。
-    ///
-    /// `progress_cb` 用于实时消费 stderr（scp `-v` / rsync `--info=progress2`
-    /// 都走 stderr），调用方可解析进度写入 `AtomicU64`。stdout 仍然完整收集
-    /// 并作为结果返回。
-    pub fn execute_command_with_agent_forward(
-        &mut self,
-        command: &str,
-        timeout_secs: u64,
-        mut progress_cb: impl FnMut(&[u8]),
-    ) -> anyhow::Result<RemoteCommandResult> {
-        self.runtime.block_on(async {
-            let mut channel = self
-                .handle
-                .channel_open_session()
-                .await
-                .map_err(|e| anyhow!("打开 SSH 会话通道失败: {}", e))?;
-
-            // 通知服务器此 channel 接受 agent forwarding
-            channel
-                .agent_forward(true)
-                .await
-                .map_err(|e| anyhow!("请求 agent forwarding 失败: {}", e))?;
-
-            channel
-                .exec(false, command)
-                .await
-                .map_err(|e| anyhow!("执行远程命令失败: {}", e))?;
-
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            let mut exit_status = None;
-
-            let timeout = tokio::time::Duration::from_secs(timeout_secs);
-
-            let result = tokio::time::timeout(timeout, async {
-                loop {
-                    match channel.wait().await {
-                        Some(russh::ChannelMsg::Data { data }) => {
-                            stdout.extend_from_slice(&data);
-                        }
-                        Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
-                            progress_cb(&data);
-                            stderr.extend_from_slice(&data);
-                        }
-                        Some(russh::ChannelMsg::ExitStatus {
-                            exit_status: status,
-                        }) => {
-                            exit_status = Some(status);
-                        }
-                        Some(russh::ChannelMsg::Eof) => {}
-                        Some(russh::ChannelMsg::Close) => break,
-                        None => break,
-                        _ => {}
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-
             let _ = channel.close().await;
 
             match result {

@@ -217,6 +217,7 @@ pub fn copy_remote_to_different_remote(
                     &desired_path,
                     conflict_policy,
                     resolver,
+                    cancelled,
                 )
             })?;
 
@@ -609,17 +610,88 @@ fn copy_via_agent_forward_scp(
         destination_config.port
     );
 
+    // 启动后台进度监控线程：每秒轮询目标文件/目录大小，增量更新 progress
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let progress_arc = progress.map(|p| Arc::new(AtomicU64::new(p.load(Ordering::Relaxed))));
+    let progress_handle = if let Some(p) = progress_arc.as_ref() {
+        let dest_cfg = destination_config.clone();
+        let dest_path = destination_path.to_string();
+        let p = p.clone();
+        let stop = stop_monitor.clone();
+        let mon_cancelled = cancelled.clone();
+        let is_dir = is_directory;
+        std::thread::Builder::new()
+            .name("scp-progress-monitor".into())
+            .spawn(move || {
+                let Ok(mut session) = sftp_fs::BlockingSftpSession::connect(&dest_cfg) else {
+                    return;
+                };
+                let mut last_size = 0u64;
+                loop {
+                    if stop.load(Ordering::Relaxed) || mon_cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if is_dir {
+                        // 目录传输：用 du -sb 轮询目标目录总大小
+                        let cmd = format!(
+                            "du -sb {} 2>/dev/null || echo 0",
+                            crate::file_transfer::utils::shell_single_quote(&dest_path)
+                        );
+                        if let Ok(result) = session.execute_command(&cmd, 5) {
+                            if result.success() {
+                                if let Ok(size) = result.stdout.trim().parse::<u64>() {
+                                    if size > last_size {
+                                        p.fetch_add(size - last_size, Ordering::Relaxed);
+                                        last_size = size;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // 文件传输：直接轮询目标文件 metadata
+                        if let Ok(meta) = session.metadata(&dest_path) {
+                            if meta.size > last_size {
+                                p.fetch_add(meta.size - last_size, Ordering::Relaxed);
+                                last_size = meta.size;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
+
     let started = std::time::Instant::now();
-    let cmd_result = source_session.execute_command_with_agent_forward(
+    let cmd_result = source_session.execute_command_with_agent_forward_and_cancel(
         &scp_cmd,
         remote_scp_timeout_secs(),
+        cancelled,
         |data: &[u8]| {
             report_scp_stderr(reporter, data);
             if !data.is_empty() && log::log_enabled!(log::Level::Trace) {
                 log::trace!("scp stderr: {}", String::from_utf8_lossy(data).trim_end());
             }
         },
-    )?;
+    );
+
+    // 停止后台进度监控线程
+    stop_monitor.store(true, Ordering::Relaxed);
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+    // 将后台线程累计的进度写回原始 progress
+    if let (Some(p), Some(arc_p)) = (progress, progress_arc.as_ref()) {
+        let monitored = arc_p.load(Ordering::Relaxed);
+        let current = p.load(Ordering::Relaxed);
+        if monitored > current {
+            p.fetch_add(monitored - current, Ordering::Relaxed);
+        }
+    }
+
+    let cmd_result = cmd_result?;
 
     if cmd_result.success() {
         let elapsed = started.elapsed();
@@ -637,7 +709,11 @@ fn copy_via_agent_forward_scp(
         );
         report_status(reporter, format!("完成 {:.2} MiB/s", (total as f64) / secs / (1024.0 * 1024.0)));
         if let Some(p) = progress {
-            p.fetch_add(total, Ordering::Relaxed);
+            // 修正最终进度（避免轮询偏差）
+            let current = p.load(Ordering::Relaxed);
+            if current < total {
+                p.fetch_add(total - current, Ordering::Relaxed);
+            }
         }
         if is_directory {
             Ok(TransferSummary {
@@ -773,8 +849,74 @@ fn copy_via_remote_scp(
         destination_config.port
     );
 
+    // 启动后台进度监控线程：每秒轮询目标文件/目录大小，增量更新 progress
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let progress_arc = progress.map(|p| Arc::new(AtomicU64::new(p.load(Ordering::Relaxed))));
+    let progress_handle = if let Some(p) = progress_arc.as_ref() {
+        let dest_cfg = destination_config.clone();
+        let dest_path = destination_path.to_string();
+        let p = p.clone();
+        let stop = stop_monitor.clone();
+        let mon_cancelled = cancelled.clone();
+        let is_dir = is_directory;
+        std::thread::Builder::new()
+            .name("scp-progress-monitor".into())
+            .spawn(move || {
+                let Ok(mut session) = sftp_fs::BlockingSftpSession::connect(&dest_cfg) else {
+                    return;
+                };
+                let mut last_size = 0u64;
+                loop {
+                    if stop.load(Ordering::Relaxed) || mon_cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if is_dir {
+                        let cmd = format!(
+                            "du -sb {} 2>/dev/null || echo 0",
+                            crate::file_transfer::utils::shell_single_quote(&dest_path)
+                        );
+                        if let Ok(result) = session.execute_command(&cmd, 5) {
+                            if result.success() {
+                                if let Ok(size) = result.stdout.trim().parse::<u64>() {
+                                    if size > last_size {
+                                        p.fetch_add(size - last_size, Ordering::Relaxed);
+                                        last_size = size;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(meta) = session.metadata(&dest_path) {
+                            if meta.size > last_size {
+                                p.fetch_add(meta.size - last_size, Ordering::Relaxed);
+                                last_size = meta.size;
+                            }
+                        }
+                    }
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
+
     let started = std::time::Instant::now();
-    let result = source_session.execute_command(&scp_cmd, remote_scp_timeout_secs());
+    let result = source_session.execute_command_with_cancel(&scp_cmd, remote_scp_timeout_secs(), cancelled);
+
+    // 停止后台进度监控线程
+    stop_monitor.store(true, Ordering::Relaxed);
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+    // 将后台线程累计的进度写回原始 progress
+    if let (Some(p), Some(arc_p)) = (progress, progress_arc.as_ref()) {
+        let monitored = arc_p.load(Ordering::Relaxed);
+        let current = p.load(Ordering::Relaxed);
+        if monitored > current {
+            p.fetch_add(monitored - current, Ordering::Relaxed);
+        }
+    }
 
     match result {
         Ok(cmd_result) => {
@@ -794,7 +936,11 @@ fn copy_via_remote_scp(
                 );
                 report_status(reporter, format!("完成 {:.2} MiB/s", (total as f64) / secs / (1024.0 * 1024.0)));
                 if let Some(p) = progress {
-                    p.fetch_add(total, Ordering::Relaxed);
+                    // 修正最终进度（避免轮询偏差）
+                    let current = p.load(Ordering::Relaxed);
+                    if current < total {
+                        p.fetch_add(total - current, Ordering::Relaxed);
+                    }
                 }
                 if is_directory {
                     Ok(TransferSummary {
@@ -852,6 +998,7 @@ pub fn copy_remote_dir_between_sessions(
                 &destination_path,
                 conflict_policy,
                 resolver,
+                cancelled,
             )?
             .ok_or_else(|| anyhow!("传输已跳过"))?;
             summary.merge(copy_remote_file_between_sessions(
@@ -868,6 +1015,7 @@ pub fn copy_remote_dir_between_sessions(
                 &destination_path,
                 conflict_policy,
                 resolver,
+                cancelled,
             )?
             .ok_or_else(|| anyhow!("传输已跳过"))?;
             destination_session.create_dir_all(&destination_path)?;
