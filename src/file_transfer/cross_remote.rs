@@ -672,8 +672,9 @@ fn copy_via_agent_forward_scp(
         }
         if is_directory {
             Ok(TransferSummary {
-                files_transferred: 0,
+                files_transferred: remote_total_files(source_session, remote_path),
                 bytes_transferred: total,
+                skipped: 0,
             })
         } else {
             Ok(TransferSummary::one_file(total))
@@ -771,6 +772,30 @@ fn remote_total_size(session: &mut BlockingSftpSession, path: &str) -> u64 {
                 for entry in session.read_dir(path)? {
                     total = total.saturating_add(match entry.kind {
                         RemoteFileKind::File => entry.size,
+                        RemoteFileKind::Directory => walk(session, &entry.path).unwrap_or(0),
+                        _ => 0,
+                    });
+                }
+                Ok(total)
+            }
+            _ => Ok(0),
+        }
+    }
+    walk(session, path).unwrap_or(0)
+}
+
+/// 统计远端路径下的普通文件数（用于 scp 直连传输后填充 summary 的 files_transferred，
+/// 否则目录传输 UI 永远显示 "0 个文件"）。符号链接 / 特殊文件不计入。
+fn remote_total_files(session: &mut BlockingSftpSession, path: &str) -> usize {
+    fn walk(session: &mut BlockingSftpSession, path: &str) -> anyhow::Result<usize> {
+        let meta = session.metadata(path)?;
+        match meta.kind {
+            RemoteFileKind::File => Ok(1),
+            RemoteFileKind::Directory => {
+                let mut total = 0usize;
+                for entry in session.read_dir(path)? {
+                    total = total.saturating_add(match entry.kind {
+                        RemoteFileKind::File => 1,
                         RemoteFileKind::Directory => walk(session, &entry.path).unwrap_or(0),
                         _ => 0,
                     });
@@ -900,8 +925,9 @@ fn copy_via_remote_scp(
                 }
                 if is_directory {
                     Ok(TransferSummary {
-                        files_transferred: 0,
+                        files_transferred: remote_total_files(source_session, remote_path),
                         bytes_transferred: total,
+                        skipped: 0,
                     })
                 } else {
                     Ok(TransferSummary::one_file(total))
@@ -949,42 +975,50 @@ pub fn copy_remote_dir_between_sessions(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            let destination_path = resolve_remote_conflict(
+            match resolve_remote_conflict(
                 destination_session,
                 &destination_path,
                 conflict_policy,
                 resolver,
                 cancelled,
-            )?
-            .ok_or_else(|| anyhow!("传输已跳过"))?;
-            summary.merge(copy_remote_file_between_sessions(
-                source_session,
-                &entry.path,
-                destination_session,
-                &destination_path,
-                cancelled,
-                progress,
-            )?);
+            )? {
+                Some(path) => summary.merge(copy_remote_file_between_sessions(
+                    source_session,
+                    &entry.path,
+                    destination_session,
+                    &path,
+                    cancelled,
+                    progress,
+                )?),
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
         } else if entry.kind == RemoteFileKind::Directory {
-            let destination_path = resolve_remote_conflict(
+            match resolve_remote_conflict(
                 destination_session,
                 &destination_path,
                 conflict_policy,
                 resolver,
                 cancelled,
-            )?
-            .ok_or_else(|| anyhow!("传输已跳过"))?;
-            destination_session.create_dir_all(&destination_path)?;
-            summary.merge(copy_remote_dir_between_sessions(
-                source_session,
-                &entry.path,
-                destination_session,
-                &destination_path,
-                conflict_policy,
-                cancelled,
-                progress,
-                resolver,
-            )?);
+            )? {
+                Some(path) => {
+                    destination_session.create_dir_all(&path)?;
+                    summary.merge(copy_remote_dir_between_sessions(
+                        source_session,
+                        &entry.path,
+                        destination_session,
+                        &path,
+                        conflict_policy,
+                        cancelled,
+                        progress,
+                        resolver,
+                    )?);
+                }
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else {
+            // 符号链接 / 特殊文件：计为跳过，避免 Move 误删源。
+            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
+            summary.merge(TransferSummary::one_skipped());
         }
     }
 

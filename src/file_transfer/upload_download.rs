@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{anyhow, Context as _};
 
 use crate::file_transfer::utils::{
     check_cancelled, remote_file_name, resolve_local_conflict, resolve_remote_conflict,
@@ -35,8 +35,10 @@ pub fn upload_local_to_remote(
         if metadata.is_file() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
             let destination_path =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             return upload_local_file_to_remote_path(
                 session,
                 source_path,
@@ -49,8 +51,10 @@ pub fn upload_local_to_remote(
         if metadata.is_dir() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
             let destination_root =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             session.create_dir_all(&destination_root)?;
             return upload_local_dir_to_remote_path(
                 session,
@@ -63,7 +67,9 @@ pub fn upload_local_to_remote(
             );
         }
 
-        bail!("不支持的本地文件类型: {}", source_path.display())
+        // 符号链接 / 特殊文件：计为跳过，避免 Move 误删源。
+        log::warn!("跳过不支持的本地文件类型: {}", source_path.display());
+        Ok(TransferSummary::one_skipped())
     })
 }
 
@@ -98,30 +104,32 @@ pub fn upload_local_dir_to_remote_path(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &file_name);
 
         if metadata.is_file() {
-            let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            summary.merge(upload_local_file_to_remote_path(
-                session,
-                &source_path,
-                &destination_path,
-                cancelled,
-                progress,
-            )?);
+            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => summary.merge(upload_local_file_to_remote_path(
+                    session, &source_path, &path, cancelled, progress,
+                )?),
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
         } else if metadata.is_dir() {
-            let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            session.create_dir_all(&destination_path)?;
-            summary.merge(upload_local_dir_to_remote_path(
-                session,
-                &source_path,
-                &destination_path,
-                conflict_policy,
-                cancelled,
-                progress,
-                resolver,
-            )?);
+            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => {
+                    session.create_dir_all(&path)?;
+                    summary.merge(upload_local_dir_to_remote_path(
+                        session,
+                        &source_path,
+                        &path,
+                        conflict_policy,
+                        cancelled,
+                        progress,
+                        resolver,
+                    )?);
+                }
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else {
+            // 符号链接 / 特殊文件：计为跳过，避免 Move 误删源。
+            log::warn!("跳过不支持的本地条目: {}", source_path.display());
+            summary.merge(TransferSummary::one_skipped());
         }
     }
 
@@ -188,8 +196,10 @@ pub fn download_remote_to_local(
         if metadata.kind == RemoteFileKind::File {
             let desired_path = destination_dir.join(effective_name);
             let destination_path =
-                resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             return download_remote_file_to_local_path(
                 session,
                 remote_path,
@@ -202,8 +212,10 @@ pub fn download_remote_to_local(
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = destination_dir.join(&file_name);
             let destination_root =
-                resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             fs::create_dir_all(&destination_root)?;
             return download_remote_dir_to_local_path(
                 session,
@@ -216,7 +228,9 @@ pub fn download_remote_to_local(
             );
         }
 
-        bail!("不支持的远程文件类型: {}", remote_path)
+        // 符号链接 / 设备文件等不支持的类型：计为跳过而非静默丢弃，避免 Move 误删源。
+        log::warn!("跳过不支持的远程文件类型 ({:?}): {}", metadata.kind, remote_path);
+        Ok(TransferSummary::one_skipped())
     })
 }
 
@@ -246,30 +260,32 @@ pub fn download_remote_dir_to_local_path(
         let destination_path = destination_dir.join(&entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            summary.merge(download_remote_file_to_local_path(
-                session,
-                &entry.path,
-                &destination_path,
-                cancelled,
-                progress,
-            )?);
+            match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => summary.merge(download_remote_file_to_local_path(
+                    session, &entry.path, &path, cancelled, progress,
+                )?),
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
         } else if entry.kind == RemoteFileKind::Directory {
-            let destination_path =
-                resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            fs::create_dir_all(&destination_path)?;
-            summary.merge(download_remote_dir_to_local_path(
-                session,
-                &entry.path,
-                &destination_path,
-                conflict_policy,
-                cancelled,
-                progress,
-                resolver,
-            )?);
+            match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => {
+                    fs::create_dir_all(&path)?;
+                    summary.merge(download_remote_dir_to_local_path(
+                        session,
+                        &entry.path,
+                        &path,
+                        conflict_policy,
+                        cancelled,
+                        progress,
+                        resolver,
+                    )?);
+                }
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else {
+            // 符号链接 / 设备文件等：计为跳过，保证 Move 不会因"看似全部成功"而删源。
+            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
+            summary.merge(TransferSummary::one_skipped());
         }
     }
 

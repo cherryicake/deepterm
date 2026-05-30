@@ -73,6 +73,24 @@ impl TransferManager {
         Ok(summary)
     }
 
+    /// Move 操作的删源守卫：仅当本次传输没有任何条目被跳过（`skipped == 0`）时，
+    /// 才执行删源闭包。否则保留源，避免把"用户选择跳过 / 不支持的符号链接"等
+    /// **没有真正复制过去**的内容连同源一起删掉，造成数据丢失。
+    fn remove_source_if_complete(
+        summary: &TransferSummary,
+        remove: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if summary.skipped == 0 {
+            remove()
+        } else {
+            log::warn!(
+                "移动操作有 {} 个条目被跳过，保留源不删除以防数据丢失",
+                summary.skipped
+            );
+            Ok(())
+        }
+    }
+
     fn transfer_one(
         source: FileEndpoint,
         destination: &FileEndpoint,
@@ -133,7 +151,9 @@ impl TransferManager {
                     resolver,
                 )?;
                 if operation == TransferOperation::Move {
-                    crate::file_transfer::utils::remove_local_source(&path)?;
+                    Self::remove_source_if_complete(&summary, || {
+                        crate::file_transfer::utils::remove_local_source(&path)
+                    })?;
                 }
                 Ok(summary)
             }
@@ -157,8 +177,10 @@ impl TransferManager {
                     resolver,
                 )?;
                 if operation == TransferOperation::Move {
-                    crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
-                        crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                    Self::remove_source_if_complete(&summary, || {
+                        crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
+                            crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                        })
                     })?;
                 }
                 Ok(summary)
@@ -228,8 +250,10 @@ impl TransferManager {
                     reporter,
                 )?;
                 if operation == TransferOperation::Move {
-                    crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
-                        crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                    Self::remove_source_if_complete(&summary, || {
+                        crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
+                            crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                        })
                     })?;
                 }
                 Ok(summary)

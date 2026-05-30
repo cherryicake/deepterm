@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail};
-
 use crate::file_transfer::utils::{
     check_cancelled, is_remote_noop_move, prevent_remote_recursive_copy,
     remove_remote_source, remote_file_name, resolve_remote_conflict, TransferSummary,
@@ -35,8 +33,10 @@ pub fn copy_remote_to_same_remote(
         if metadata.kind == RemoteFileKind::File {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
             let destination_path =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             if remote_path == destination_path {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
             }
@@ -52,8 +52,10 @@ pub fn copy_remote_to_same_remote(
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
             let destination_root =
-                resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
+                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
+                    Some(path) => path,
+                    None => return Ok(TransferSummary::one_skipped()),
+                };
             if remote_path == destination_root {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
             }
@@ -70,7 +72,9 @@ pub fn copy_remote_to_same_remote(
             );
         }
 
-        bail!("不支持的远程文件类型: {}", remote_path)
+        // 符号链接 / 特殊文件：计为跳过。
+        log::warn!("跳过不支持的远程文件类型 ({:?}): {}", metadata.kind, remote_path);
+        Ok(TransferSummary::one_skipped())
     })
 }
 
@@ -100,8 +104,11 @@ pub fn move_remote_to_same_remote(
         };
         let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
         let destination_path =
-            resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)?
-                .ok_or_else(|| anyhow!("传输已跳过"))?;
+            match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => path,
+                // 顶层冲突选择跳过：不移动、不删源。
+                None => return Ok(TransferSummary::one_skipped()),
+            };
 
         if remote_path == destination_path {
             return Ok(TransferSummary::from_remote_metadata(&metadata));
@@ -124,7 +131,16 @@ pub fn move_remote_to_same_remote(
                     progress,
                     resolver,
                 )?;
-                remove_remote_source(session, remote_path)?;
+                // 只有在没有任何条目被跳过时才删源，避免把未复制成功的内容连源一起删掉。
+                if summary.skipped == 0 {
+                    remove_remote_source(session, remote_path)?;
+                } else {
+                    log::warn!(
+                        "远程移动：有 {} 个条目被跳过，保留源 {} 不删除",
+                        summary.skipped,
+                        remote_path
+                    );
+                }
                 Ok(summary)
             }
         }
@@ -153,30 +169,32 @@ pub fn copy_remote_dir_to_remote_path(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            summary.merge(copy_remote_file_to_remote_path(
-                session,
-                &entry.path,
-                &destination_path,
-                cancelled,
-                progress,
-            )?);
+            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => summary.merge(copy_remote_file_to_remote_path(
+                    session, &entry.path, &path, cancelled, progress,
+                )?),
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
         } else if entry.kind == RemoteFileKind::Directory {
-            let destination_path =
-                resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)?
-                    .ok_or_else(|| anyhow!("传输已跳过"))?;
-            session.create_dir_all(&destination_path)?;
-            summary.merge(copy_remote_dir_to_remote_path(
-                session,
-                &entry.path,
-                &destination_path,
-                conflict_policy,
-                cancelled,
-                progress,
-                resolver,
-            )?);
+            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => {
+                    session.create_dir_all(&path)?;
+                    summary.merge(copy_remote_dir_to_remote_path(
+                        session,
+                        &entry.path,
+                        &path,
+                        conflict_policy,
+                        cancelled,
+                        progress,
+                        resolver,
+                    )?);
+                }
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else {
+            // 符号链接 / 特殊文件：计为跳过，避免 Move 误删源。
+            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
+            summary.merge(TransferSummary::one_skipped());
         }
     }
 

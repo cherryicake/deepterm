@@ -609,6 +609,8 @@ impl Workspace {
         self.next_transfer_id += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
         let task_cancelled = cancelled.clone();
+        // 供冲突对话框监听任务感知"取消"，避免取消后仍弹出/继续弹出冲突对话框。
+        let conflict_cancelled = cancelled.clone();
         let weak = cx.weak_entity();
         let bytes_transferred = Arc::new(AtomicU64::new(0));
         let progress = bytes_transferred.clone();
@@ -663,9 +665,44 @@ impl Workspace {
         shared_resolver.reset();
         let resolver_ref: Arc<dyn ConflictResolver> = shared_resolver.clone();
 
-        // UI 任务：监听冲突请求并弹出对话框
+        // UI 任务：监听冲突请求并弹出对话框。
+        // 持有传输的 `cancelled` 句柄，确保用户点取消后不再弹出（或继续弹出）冲突对话框 ——
+        // 否则后台传输已停止，detached 监听任务却仍会把排队的 prompt 渲染成原生对话框，
+        // 表现为"点取消后过段时间又冒出文件已存在弹窗"。
+        //
+        // 采用 100ms 轮询而非 `recv().await` 阻塞：监听任务自身持有 `shared_resolver`
+        // （内含 channel 发送端），若一直阻塞在 `recv()`，则传输正常结束后发送端不会全部
+        // 释放，channel 不关闭，任务永久泄漏。轮询让它能在「取消」或「传输完成」时及时退出。
+        let conflict_done = is_done.clone();
         cx.spawn(async move |_, cx| {
-            while let Ok(prompt) = conflict_rx.recv().await {
+            loop {
+                // 已取消：立即退出，不再处理任何 prompt。
+                if conflict_cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let prompt = match conflict_rx.try_recv() {
+                    Ok(prompt) => prompt,
+                    Err(async_channel::TryRecvError::Empty) => {
+                        // 没有待处理冲突：传输已结束则退出（释放发送端，避免任务泄漏），
+                        // 否则稍后再轮询。
+                        if conflict_done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(100))
+                            .await;
+                        continue;
+                    }
+                    Err(async_channel::TryRecvError::Closed) => break,
+                };
+
+                // 取出 prompt 后再确认一次：取消后绝不弹窗，直接回 Stop 让后台尽快收敛。
+                if conflict_cancelled.load(Ordering::Relaxed) {
+                    let _ = prompt.response.try_send(ConflictResolution::Stop);
+                    break;
+                }
+
                 // 检查是否已启用 "应用到全部"
                 if shared_resolver.has_cached_resolution() {
                     if let Some(resolution) = shared_resolver.get_cached_resolution() {
@@ -694,6 +731,13 @@ impl Workspace {
                     },
                     Err(_) => break,
                 };
+
+                // 对话框还开着的时候用户可能点了取消：此时把决策强制为 Stop，
+                // 并跳过后续的 "应用到全部" 二次对话框。
+                if conflict_cancelled.load(Ordering::Relaxed) {
+                    let _ = prompt.response.try_send(ConflictResolution::Stop);
+                    break;
+                }
 
                 let resolution = match button_index {
                     0 => ConflictResolution::Stop,
@@ -802,20 +846,26 @@ impl Workspace {
             }
             Ok(summary) => {
                 log::info!(
-                    "Transfer finished: {} files, {} bytes",
+                    "Transfer finished: {} files, {} bytes, {} skipped",
                     summary.files_transferred,
-                    summary.bytes_transferred
+                    summary.bytes_transferred,
+                    summary.skipped
                 );
-                if task.total_bytes < summary.bytes_transferred {
-                    task.total_bytes = summary.bytes_transferred;
-                }
-                // 确保进度条显示到 100%
+                // 完成时把 total 对齐到实际传输字节，保证进度条精确显示 100%
+                // （quick_total_size 只是预估，可能偏大导致进度条停在 <100%）。
+                task.total_bytes = summary.bytes_transferred;
                 task.bytes_transferred
                     .store(summary.bytes_transferred, Ordering::Relaxed);
                 task.status = TransferTaskStatus::Completed {
                     files: summary.files_transferred,
                     bytes: summary.bytes_transferred,
                 };
+                if summary.skipped > 0 {
+                    log::warn!(
+                        "传输完成但有 {} 个条目被跳过（冲突跳过 / 不支持的类型）",
+                        summary.skipped
+                    );
+                }
             }
             Err(error) if error.to_string().contains(TRANSFER_CANCELLED_MSG) => {
                 log::info!("Transfer cancelled");

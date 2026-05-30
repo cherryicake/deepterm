@@ -17,6 +17,9 @@ pub const TRANSFER_CANCELLED_MSG: &str = "transfer cancelled";
 pub struct TransferSummary {
     pub files_transferred: usize,
     pub bytes_transferred: u64,
+    /// 因冲突选择"跳过"、或遇到不支持的条目（符号链接 / 特殊文件）而未传输的条目数。
+    /// Move 操作只有在 `skipped == 0` 时才允许删除源，避免把未传输的内容连源一起删掉。
+    pub skipped: usize,
 }
 
 impl TransferSummary {
@@ -24,6 +27,16 @@ impl TransferSummary {
         Self {
             files_transferred: 1,
             bytes_transferred,
+            skipped: 0,
+        }
+    }
+
+    /// 记录一个被跳过的条目（冲突跳过 / 不支持的类型）。
+    pub fn one_skipped() -> Self {
+        Self {
+            files_transferred: 0,
+            bytes_transferred: 0,
+            skipped: 1,
         }
     }
 
@@ -46,6 +59,7 @@ impl TransferSummary {
     pub fn merge(&mut self, other: Self) {
         self.files_transferred = self.files_transferred.saturating_add(other.files_transferred);
         self.bytes_transferred = self.bytes_transferred.saturating_add(other.bytes_transferred);
+        self.skipped = self.skipped.saturating_add(other.skipped);
     }
 }
 
@@ -172,7 +186,9 @@ pub fn remove_remote_source(
     session: &mut sftp_fs::BlockingSftpSession,
     path: &str,
 ) -> anyhow::Result<()> {
-    let metadata = session.metadata(path)?;
+    // 用 symlink_metadata 不跟随符号链接：若 path 是指向目录的符号链接，
+    // 应当只删链接本身（remove_file），绝不能递归删除链接目标的内容。
+    let metadata = session.symlink_metadata(path)?;
     match metadata.kind {
         RemoteFileKind::File | RemoteFileKind::Symlink | RemoteFileKind::Other => {
             session.remove_file(path)?;
@@ -232,6 +248,9 @@ pub fn resolve_local_conflict(
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_path_buf())),
                 ConflictResolution::AutoRename => {
                     for index in 1..10_000 {
+                        if cancelled.load(Ordering::Relaxed) {
+                            bail!("{}", TRANSFER_CANCELLED_MSG);
+                        }
                         let candidate = renamed_local_candidate(desired_path, index);
                         if !candidate.exists() {
                             return Ok(Some(candidate));
@@ -247,6 +266,9 @@ pub fn resolve_local_conflict(
         }
         ConflictPolicy::AutoRename => {
             for index in 1..10_000 {
+                if cancelled.load(Ordering::Relaxed) {
+                    bail!("{}", TRANSFER_CANCELLED_MSG);
+                }
                 let candidate = renamed_local_candidate(desired_path, index);
                 if !candidate.exists() {
                     return Ok(Some(candidate));
@@ -311,6 +333,9 @@ pub fn resolve_remote_conflict(
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
                 ConflictResolution::AutoRename => {
                     for index in 1..10_000 {
+                        if cancelled.load(Ordering::Relaxed) {
+                            bail!("{}", TRANSFER_CANCELLED_MSG);
+                        }
                         let candidate = renamed_remote_candidate(desired_path, index)?;
                         if !session.exists(&candidate)? {
                             return Ok(Some(candidate));
@@ -326,6 +351,9 @@ pub fn resolve_remote_conflict(
         }
         ConflictPolicy::AutoRename => {
             for index in 1..10_000 {
+                if cancelled.load(Ordering::Relaxed) {
+                    bail!("{}", TRANSFER_CANCELLED_MSG);
+                }
                 let candidate = renamed_remote_candidate(desired_path, index)?;
                 if !session.exists(&candidate)? {
                     return Ok(Some(candidate));

@@ -116,6 +116,20 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 与 [`metadata`](Self::metadata) 相同，但**不跟随符号链接**：返回链接自身的属性。
+    /// 用于删源等需要区分"链接本身"与"链接目标"的场景，避免误删/误递归到目标。
+    pub fn symlink_metadata(&mut self, path: &str) -> anyhow::Result<RemoteFileMetadata> {
+        self.runtime.block_on(async {
+            let metadata = self.sftp.symlink_metadata(path).await?;
+            Ok(convert_metadata(
+                metadata.file_type(),
+                metadata.len(),
+                metadata.mtime,
+                metadata.permissions,
+            ))
+        })
+    }
+
     pub fn permissions(&mut self, path: &str) -> anyhow::Result<Option<u32>> {
         self.runtime.block_on(async {
             let metadata = self.sftp.metadata(path).await?;
