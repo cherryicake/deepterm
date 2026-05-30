@@ -842,6 +842,7 @@ impl TerminalElement {
         &self,
         builtin_text: &str,
         ime_text: &str,
+        builtin_cursor: usize,
         cursor_display_col: usize,
         cursor_line_in_viewport: i32,
         terminal_bounds: TerminalBounds,
@@ -863,6 +864,7 @@ impl TerminalElement {
         let wrapped = crate::terminal_view::overlay_wrap::wrap_overlay_text(
             builtin_text,
             ime_text,
+            builtin_cursor,
             cursor_display_col,
             cols,
         );
@@ -1452,16 +1454,18 @@ impl Element for TerminalElement {
 
         // Shape local overlay text for rendering at the shell prompt position.
         let input_overlay: Option<LocalOverlayLayout> = if cursor_in_viewport {
-            let (builtin_text, ime_text) = {
+            let (builtin_text, ime_text, builtin_cursor) = {
                 let view = self.view.read(cx);
                 (
                     view.builtin_command_text().to_string(),
                     view.ime_text().to_string(),
+                    view.builtin_command_cursor(),
                 )
             };
             self.shape_overlay_layout(
                 &builtin_text,
                 &ime_text,
+                builtin_cursor,
                 cursor_display_col as usize,
                 cursor_line_in_viewport,
                 terminal_bounds,

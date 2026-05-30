@@ -220,11 +220,22 @@ pub enum ScpCompletionPhase {
     RemotePath { host_token: String, prefix: String },
 }
 
-/// 分析 `/scp` 缓冲区的当前补全焦点。
+/// 分析 `/scp` 缓冲区的当前补全焦点（光标默认在末尾）。
 ///
-/// `buffer` 应当以 `/scp` 开头，后面跟 token。光标默认在末尾。
+/// `buffer` 应当以 `/scp` 开头，后面跟 token。
 /// 返回 `None` 表示还不在可补全的位置（比如刚敲完 `/scp `、两个 token 都输入完了也回车位置）。
 pub fn analyse(buffer: &str) -> Option<ScpCompletionQuery> {
+    analyse_at(buffer, buffer.len())
+}
+
+/// 与 [`analyse`] 相同，但显式给出光标字节偏移：补全焦点落在**光标所在的 token**，
+/// 而不是缓冲末尾的 token。这样当用户把光标移回前一个参数（如本地源路径）时，
+/// 弹窗会列出该参数对应的候选，而不是末尾参数（如远端目的）。
+///
+/// `cursor` 超出 `buffer` 长度时夹紧到末尾；光标落在命令名区域内时返回 `None`。
+pub fn analyse_at(buffer: &str, cursor: usize) -> Option<ScpCompletionQuery> {
+    let cursor = cursor.min(buffer.len());
+
     // 找到第一个空白作为命令名结束
     let after_cmd_offset = {
         let mut iter = buffer.char_indices();
@@ -236,6 +247,12 @@ pub fn analyse(buffer: &str) -> Option<ScpCompletionQuery> {
             }
         }
     };
+
+    // 光标仍在命令名区域（如 `/sc|p `）时不做路径补全
+    if cursor < after_cmd_offset {
+        return None;
+    }
+
     let args_area = &buffer[after_cmd_offset..];
     let tokens = shell_split_tokens(args_area, after_cmd_offset);
 
@@ -244,26 +261,23 @@ pub fn analyse(buffer: &str) -> Option<ScpCompletionQuery> {
         return None;
     }
 
-    // buffer 末尾是否以空白结尾（用于判断光标是否处于"下一个 token 的空位"）
-    let last_is_space = buffer
-        .chars()
-        .last()
-        .map(char::is_whitespace)
-        .unwrap_or(false);
-    // 光标在空白处：只有当前已填满两个参数时才不可补全；
-    // 若只有一个参数（如 `/scp alice:/a `），应允许继续补第二个参数。
-    if last_is_space && tokens.len() >= 2 {
-        return None;
-    }
+    // 找到光标所在 token：`start <= cursor <= end`。
+    // token 之间至少隔一个空白，故 `cursor == end(前)` 与 `cursor == start(后)`
+    // 不会同时命中两个 token（区间不重叠）。
+    let cursor_token = tokens
+        .iter()
+        .find(|t| cursor >= t.start && cursor <= t.end);
 
-    // 取光标所在 token 的范围与原始文本
-    let (token_start, token_end, raw_token): (usize, usize, &str) = if last_is_space {
-        let end = buffer.len();
-        (end, end, "")
-    } else if let Some(last) = tokens.last() {
-        (last.start, last.end, &buffer[last.start..last.end])
-    } else {
-        (buffer.len(), buffer.len(), "")
+    let (token_start, token_end, raw_token): (usize, usize, &str) = match cursor_token {
+        Some(t) => (t.start, t.end, &buffer[t.start..t.end]),
+        None => {
+            // 光标落在空白 / 空位：当前位置是一个空 token。
+            // 若两个参数都已填满，则没有可补的第三参数 ⇒ None。
+            if tokens.len() >= 2 {
+                return None;
+            }
+            (cursor, cursor, "")
+        }
     };
 
     // 用 "未去引号的冒号位置" 判断是否已经进入 RemotePath
@@ -491,6 +505,57 @@ mod tests {
     #[test]
     fn analyse_three_tokens_stops() {
         assert!(analyse("/scp a b c").is_none());
+    }
+
+    #[test]
+    fn analyse_at_targets_token_under_cursor() {
+        // 光标落在第一个参数（本地源）末尾，而末尾 token 是远端目的。
+        // 旧 analyse 会返回末尾 token；analyse_at 应返回光标处的本地源 token。
+        let buffer = "/scp Downloads/ root@1.2.3.4:~/";
+        let cursor = "/scp Downloads/".len(); // 光标在 "Downloads/" 之后的空格处
+        let q = analyse_at(buffer, cursor).unwrap();
+        match &q.phase {
+            ScpCompletionPhase::HostOrLocal { prefix } => {
+                assert_eq!(prefix, "Downloads/");
+            }
+            _ => panic!("expected HostOrLocal for local source token under cursor"),
+        }
+        assert_eq!(&buffer[q.token_start..q.token_end], "Downloads/");
+    }
+
+    #[test]
+    fn analyse_at_targets_second_token_when_cursor_there() {
+        let buffer = "/scp Downloads/ root@1.2.3.4:/tm";
+        // 光标在末尾（远端目的 token 内）
+        let q = analyse_at(buffer, buffer.len()).unwrap();
+        match &q.phase {
+            ScpCompletionPhase::RemotePath { host_token, prefix } => {
+                assert_eq!(host_token, "root@1.2.3.4");
+                assert_eq!(prefix, "/tm");
+            }
+            _ => panic!("expected RemotePath for dest token under cursor"),
+        }
+    }
+
+    #[test]
+    fn analyse_at_cursor_in_command_name_returns_none() {
+        // 光标还在 "/scp" 命令名里
+        assert!(analyse_at("/scp Downloads/", 2).is_none());
+    }
+
+    #[test]
+    fn analyse_at_cursor_in_middle_of_first_token() {
+        // 光标在 "Down|loads/"：仍应返回该 token（HostOrLocal），prefix 为完整 token
+        let buffer = "/scp Downloads/ root@1.2.3.4:~/";
+        let cursor = "/scp Down".len();
+        let q = analyse_at(buffer, cursor).unwrap();
+        match &q.phase {
+            ScpCompletionPhase::HostOrLocal { prefix } => {
+                assert_eq!(prefix, "Downloads/");
+            }
+            _ => panic!("expected HostOrLocal"),
+        }
+        assert_eq!(&buffer[q.token_start..q.token_end], "Downloads/");
     }
 
     #[test]

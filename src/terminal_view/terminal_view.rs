@@ -773,6 +773,11 @@ impl TerminalView {
         self.builtin_command_manager.query().unwrap_or_default()
     }
 
+    /// 内建命令缓冲内的光标字节偏移；无活跃输入时为 0（等同末尾）。
+    pub fn builtin_command_cursor(&self) -> usize {
+        self.builtin_command_manager.cursor().unwrap_or(0)
+    }
+
     /// Returns the current IME pre-edit text, if any.
     pub fn ime_text(&self) -> &str {
         self.ime_state
@@ -900,31 +905,30 @@ impl TerminalView {
         if !self.builtin_command_manager.is_argument_input() {
             return 0.0;
         }
+        let cursor = self.builtin_command_cursor();
 
         let anchor_byte = self
-            .scp_path_anchor_byte(buffer)
-            .or_else(|| self.generic_path_anchor_byte(buffer))
+            .scp_path_anchor_byte(buffer, cursor)
+            .or_else(|| self.generic_path_anchor_byte(buffer, cursor))
             .unwrap_or(0);
         UnicodeWidthStr::width(&buffer[..anchor_byte.min(buffer.len())]) as f32
     }
 
-    fn generic_path_anchor_byte(&self, buffer: &str) -> Option<usize> {
-        let command_end = buffer.find(char::is_whitespace)?;
-        let args_start = buffer[command_end..]
-            .char_indices()
-            .find_map(|(offset, c)| (!c.is_whitespace()).then_some(command_end + offset))
-            .unwrap_or(buffer.len());
-        let args = &buffer[args_start..];
-        let (dir_part, _) = crate::builtin_commands::PathCompletionEngine::split_path_prefix(args);
-        Some(args_start + dir_part.len())
+    fn generic_path_anchor_byte(&self, buffer: &str, cursor: usize) -> Option<usize> {
+        // 锚到光标所在参数 token 的目录前缀之后（与补全替换的起点一致）。
+        let (token_start, token_end) =
+            crate::builtin_commands::generic_arg_token_range_at(buffer, cursor);
+        let token = &buffer[token_start..token_end];
+        let (dir_part, _) = crate::builtin_commands::PathCompletionEngine::split_path_prefix(token);
+        Some(token_start + dir_part.len().min(token.len()))
     }
 
-    fn scp_path_anchor_byte(&self, buffer: &str) -> Option<usize> {
+    fn scp_path_anchor_byte(&self, buffer: &str, cursor: usize) -> Option<usize> {
         if buffer.split_whitespace().next()? != "/scp" {
             return None;
         }
 
-        let query = crate::builtin_commands::scp_completion::analyse(buffer)?;
+        let query = crate::builtin_commands::scp_completion::analyse_at(buffer, cursor)?;
         let raw_token = &buffer[query.token_start..query.token_end];
         match query.phase {
             crate::builtin_commands::ScpCompletionPhase::HostOrLocal { prefix } => {
@@ -975,10 +979,15 @@ impl TerminalView {
             let path_completions = self.builtin_command_manager.path_completions.clone();
             let selected_index = self.builtin_command_manager.path_selected_index;
             let scroll_handle = self.builtin_command_manager.path_scroll_handle().clone();
+            let history = self.builtin_command_manager.history_matches().to_vec();
+            let history_selected = self.builtin_command_manager.history_selected_index();
+            let view_history = view.clone();
 
             crate::builtin_commands::render_path_overlay(
                 &path_completions,
                 selected_index,
+                &history,
+                history_selected,
                 anchor,
                 left,
                 theme,
@@ -987,6 +996,11 @@ impl TerminalView {
                 move |index, _window, cx| {
                     view.update(cx, |this, cx| {
                         this.mutate_builtin_command(cx, |manager| manager.pick_path(index));
+                    });
+                },
+                move |index, _window, cx| {
+                    view_history.update(cx, |this, cx| {
+                        this.mutate_builtin_command(cx, |manager| manager.pick_history(index));
                     });
                 },
             )
@@ -1003,16 +1017,26 @@ impl TerminalView {
             // 命令名输入阶段：渲染命令建议浮层
             let suggestions = self.builtin_command_manager.suggestions();
             let selected_index = self.builtin_command_manager.selected_index();
+            let history = self.builtin_command_manager.history_matches().to_vec();
+            let history_selected = self.builtin_command_manager.history_selected_index();
+            let view_history = view.clone();
 
             crate::builtin_commands::render_overlay(
                 suggestions,
                 selected_index,
+                &history,
+                history_selected,
                 anchor,
                 theme,
                 is_dark,
                 move |index, _window, cx| {
                     view.update(cx, |this, cx| {
                         this.mutate_builtin_command(cx, |manager| manager.pick(index));
+                    });
+                },
+                move |index, _window, cx| {
+                    view_history.update(cx, |this, cx| {
+                        this.mutate_builtin_command(cx, |manager| manager.pick_history(index));
                     });
                 },
             )
@@ -1031,12 +1055,18 @@ impl TerminalView {
         if builtin.is_empty() && ime.is_empty() {
             return (0, 0);
         }
+        let cursor_byte = self.builtin_command_cursor();
         let term = self.terminal.read(cx);
         let bounds = term.terminal_bounds;
         let cols = bounds.num_columns();
         let cursor_col = term.last_content().cursor.column.0;
-        let wrapped =
-            crate::terminal_view::overlay_wrap::wrap_overlay_text(builtin, ime, cursor_col, cols);
+        let wrapped = crate::terminal_view::overlay_wrap::wrap_overlay_text(
+            builtin,
+            ime,
+            cursor_byte,
+            cursor_col,
+            cols,
+        );
         (wrapped.cursor_row, wrapped.cursor_col)
     }
 
@@ -1204,6 +1234,11 @@ impl TerminalView {
     fn submit_resolved_builtin_command(&mut self, command_line: String, cx: &mut Context<Self>) {
         self.finish_builtin_command_input(cx);
 
+        // 记录到命令历史（仅首 token 命中注册表的内建命令），供下次召回整行。
+        if crate::builtin_commands::find_builtin_command(&command_line).is_some() {
+            crate::builtin_commands::history::record_command(&command_line);
+        }
+
         if !self.execute_builtin_command(&command_line, cx) {
             self.send_command_line_to_shell(&command_line, cx);
         }
@@ -1282,6 +1317,12 @@ impl TerminalView {
             let configs = crate::ssh::config::SshGlobalConfig::load().saved_connections;
             self.builtin_command_manager.set_ssh_configs(configs);
         }
+
+        // 注入命令历史快照（内存克隆，不读盘），供补全弹窗召回历史整行。
+        // `mutate_builtin_command` 只在内建命令上下文被调用，故无条件注入即可；
+        // 注入须早于 `f()`，这样 `f()` 内部的 refresh_state 能用最新历史算 matches。
+        self.builtin_command_manager
+            .set_history(crate::builtin_commands::history::snapshot());
 
         f(&mut self.builtin_command_manager);
 
@@ -1501,6 +1542,55 @@ impl TerminalView {
                 return true;
             }
 
+            // ── 光标编辑组合键 ───────────────────────────────────────────────
+            // macOS 习惯：Opt+←/→ 按词移动、Opt+Backspace 删词、Cmd+←/→ 跳行首尾。
+            // 仅在「无 Ctrl」时启用，避免与上面的 Ctrl 导航冲突。
+            if !modifiers.control && !modifiers.function {
+                // Cmd（platform）+ ←/→：跳到行首 / 行尾
+                if modifiers.platform {
+                    match key {
+                        "left" => {
+                            self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_home);
+                            return true;
+                        }
+                        "right" => {
+                            self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_end);
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                // Opt（alt）+ ←/→：按词移动；Opt+Backspace：删词
+                if modifiers.alt {
+                    match key {
+                        "left" => {
+                            self.mutate_builtin_command(
+                                cx,
+                                BuiltinCommandManager::move_cursor_word_left,
+                            );
+                            return true;
+                        }
+                        "right" => {
+                            self.mutate_builtin_command(
+                                cx,
+                                BuiltinCommandManager::move_cursor_word_right,
+                            );
+                            return true;
+                        }
+                        "backspace" => {
+                            self.mutate_builtin_command(
+                                cx,
+                                BuiltinCommandManager::delete_word_backward,
+                            );
+                            self.can_start_builtin_command =
+                                !self.builtin_command_manager.is_active();
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             if self.should_swallow_builtin_command_key(event, cx) {
                 return true;
             }
@@ -1534,6 +1624,27 @@ impl TerminalView {
                 self.can_start_builtin_command = !self.builtin_command_manager.is_active();
                 true
             }
+            "delete" => {
+                self.mutate_builtin_command(cx, BuiltinCommandManager::delete_forward);
+                self.can_start_builtin_command = !self.builtin_command_manager.is_active();
+                true
+            }
+            "left" => {
+                self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_left);
+                true
+            }
+            "right" => {
+                self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_right);
+                true
+            }
+            "home" => {
+                self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_home);
+                true
+            }
+            "end" => {
+                self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_end);
+                true
+            }
             "escape" => {
                 self.clear_marked_text(cx);
                 // ESC 关闭命令列表 UI，标记 dismiss 状态，但保留输入
@@ -1553,15 +1664,20 @@ impl TerminalView {
                 let has_highlight = mgr.has_active_completion();
 
                 if has_highlight {
-                    let is_arg = mgr.is_argument_input();
-                    self.mutate_builtin_command(cx, |manager| {
-                        if is_arg {
-                            manager.complete_path();
-                        } else {
-                            manager.complete();
-                        }
-                        manager.advance_after_pick();
-                    });
+                    // 选中历史项 ⇒ 回填整行后收起浮层，等待用户再次回车提交（不 auto-advance）。
+                    if self.builtin_command_manager.history_selected_index().is_some() {
+                        self.mutate_builtin_command(cx, BuiltinCommandManager::complete_history);
+                    } else {
+                        let is_arg = mgr.is_argument_input();
+                        self.mutate_builtin_command(cx, |manager| {
+                            if is_arg {
+                                manager.complete_path();
+                            } else {
+                                manager.complete();
+                            }
+                            manager.advance_after_pick();
+                        });
+                    }
                 } else if overlay_visible_with_results {
                     // B：用户没选任何项，只是想关掉浮层
                     // 但如果缓冲区第一个 token 精确匹配了某个注册命令，应该提交执行

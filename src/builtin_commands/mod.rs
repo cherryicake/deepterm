@@ -6,12 +6,14 @@ use std::sync::Arc;
 use gpui::prelude::*;
 use gpui::{Animation, AnimationExt as _, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Transformation};
 use gpui::{MouseButton, Pixels, ScrollHandle, div, ease_in_out, percentage, px, svg};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::UiTheme;
 
 pub mod argument;
 pub mod command_model;
 pub mod executor;
+pub mod history;
 pub mod path_completion;
 pub mod path_resolver;
 pub mod registry;
@@ -20,6 +22,7 @@ pub mod suggestion_engine;
 pub use argument::{ArgumentError, ArgumentParser, ParsedArgument};
 pub use command_model::{BuiltinCommandModel, CommandEntryState, DetectedCommand};
 pub use executor::{CommandContext, CommandExecutor, CommandHandler, CommandResult};
+pub use history::{CommandHistory, HistoryEntry};
 pub use path_completion::{CompletionKind, PathCompletionEngine, PathCompletionItem};
 pub use path_resolver::{LocalPathContext, PathResolver, RemotePathContext};
 pub use registry::{
@@ -115,6 +118,26 @@ pub struct BuiltinCommandManager {
     /// 路径补全浮层的滚动句柄：键盘 / Tab 切换选中项时调用
     /// `scroll_to_item` 把选中行带回可视区域，避免被列表区裁掉。
     path_scroll_handle: ScrollHandle,
+    /// 注入的命令历史快照。外部在进入命令模式时刷新一次即可。
+    history: CommandHistory,
+    /// 当前输入对应的历史候选（refresh_state 时计算）。
+    /// 在两个阶段都置于补全列表顶部，索引区间 `[0..len)`。
+    history_matches: Vec<HistoryEntry>,
+    /// 历史候选的选中下标；`None` ⇒ 未选中历史项。
+    /// 与 `selected_index` / `path_selected_index` 互斥：选中历史时后两者为 `None`。
+    history_selected_index: Option<usize>,
+}
+
+/// 统一选中项：落在「历史段」还是「原候选段」。
+///
+/// 两个阶段的选中索引都按「历史在前、原候选在后」的组合空间编码：
+/// `[0..H)` 为历史候选，`[H..)` 为原候选（命令名 / 路径）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectedKind {
+    /// 历史候选下标（指向 `history_matches`）
+    History(usize),
+    /// 原候选下标（指向 `suggestions` 或 `path_completions`，已减去历史段偏移）
+    Base(usize),
 }
 
 /// 远端目录在补全缓存中的状态
@@ -160,12 +183,52 @@ impl BuiltinCommandManager {
             failed_remote_keys: HashMap::new(),
             is_loading_remote: false,
             path_scroll_handle: ScrollHandle::new(),
+            history: CommandHistory::default(),
+            history_matches: Vec::new(),
+            history_selected_index: None,
         }
     }
 
     /// 注入 SSH 保存连接列表。外部应在 `/scp` 模式启动前刷新一次即可。
     pub fn set_ssh_configs(&mut self, configs: Vec<crate::ssh::SshConnectionConfig>) {
         self.ssh_saved_configs = Arc::new(configs);
+    }
+
+    /// 注入命令历史快照。外部应在进入命令模式时刷新一次（来自 `history::snapshot()`）。
+    pub fn set_history(&mut self, history: CommandHistory) {
+        self.history = history;
+        // 历史变了 ⇒ 当前匹配可能失效，按现有缓冲重算
+        self.refresh_history_matches();
+    }
+
+    /// 当前输入对应的历史候选（置于补全列表顶部）。
+    pub fn history_matches(&self) -> &[HistoryEntry] {
+        &self.history_matches
+    }
+
+    /// 历史候选段是否非空（用于决定浮层是否渲染）。
+    pub fn has_history_matches(&self) -> bool {
+        !self.history_matches.is_empty()
+    }
+
+    /// 历史候选的选中下标（指向 `history_matches`）。
+    pub fn history_selected_index(&self) -> Option<usize> {
+        let total = self.history_matches.len();
+        if total == 0 {
+            return None;
+        }
+        self.history_selected_index.map(|i| i.min(total - 1))
+    }
+
+    /// 按当前缓冲重算历史候选；缓冲为空时清空。
+    fn refresh_history_matches(&mut self) {
+        let now = history::current_unix_secs();
+        self.history_matches = match self.query() {
+            Some(q) if !q.trim().is_empty() => self.history.matches(q, now),
+            _ => Vec::new(),
+        };
+        // 列表变化后 clamp 选中项
+        self.history_selected_index = self.history_selected_index();
     }
 
     /// 注入"当前终端"的连接信息。
@@ -289,6 +352,10 @@ impl BuiltinCommandManager {
         if self.overlay.is_hidden() {
             return false;
         }
+        // 选中了历史项 ⇒ 始终是可确认的有效补全
+        if self.history_selected_index().is_some() {
+            return true;
+        }
         match self.entry_phase {
             EntryPhase::CommandName => {
                 self.selected_index.is_some() && !self.suggestions.is_empty()
@@ -314,10 +381,13 @@ impl BuiltinCommandManager {
     }
 
     /// 浮层是否应当渲染：
-    /// - 命令模式启动；浮层 visible；当前阶段有可见候选项（loading/错误占位也算可见）
+    /// - 命令模式启动；浮层 visible；当前阶段有可见候选项（含历史段；loading/错误占位也算可见）
     pub fn should_render_overlay(&self) -> bool {
         if !self.is_active() || self.overlay.is_hidden() {
             return false;
+        }
+        if self.has_history_matches() {
+            return true;
         }
         match self.entry_phase {
             EntryPhase::CommandName => !self.suggestions.is_empty(),
@@ -350,7 +420,7 @@ impl BuiltinCommandManager {
         let was_dismissed = self.is_dismissed();
         let old_first_char = self.state.as_ref().and_then(|s| s.buffer().chars().next());
         if let Some(state) = self.state.as_mut() {
-            state.push_str(text);
+            state.insert(text);
         } else {
             self.state = Some(BuiltinCommandState::new(text.to_string()));
         }
@@ -373,15 +443,16 @@ impl BuiltinCommandManager {
         // 列表会因输入变化而刷新，重置高亮 —— 让用户按 ↓/Tab 重新选
         self.selected_index = None;
         self.path_selected_index = None;
+        self.history_selected_index = None;
         self.refresh_state();
     }
 
-    /// 删除最后一个字符。
+    /// 删除光标前一个字符（退格）。
     pub fn pop(&mut self) {
         let was_dismissed = self.is_dismissed();
         let mut should_clear = false;
         if let Some(state) = self.state.as_mut() {
-            state.pop();
+            state.delete_backward();
             should_clear = state.is_empty();
         }
         if should_clear {
@@ -399,7 +470,111 @@ impl BuiltinCommandManager {
         };
         self.selected_index = None;
         self.path_selected_index = None;
+        self.history_selected_index = None;
         self.refresh_state();
+    }
+
+    /// 删除光标后一个字符（Delete 键）。
+    pub fn delete_forward(&mut self) {
+        let mut should_clear = false;
+        let mut changed = false;
+        if let Some(state) = self.state.as_mut() {
+            changed = state.delete_forward();
+            should_clear = state.is_empty();
+        }
+        if !changed {
+            return;
+        }
+        if should_clear {
+            self.state = None;
+            self.entry_phase = EntryPhase::CommandName;
+            self.resolved_command = None;
+            self.path_completions.clear();
+            self.overlay = OverlayState::Visible;
+        }
+        self.selected_index = None;
+        self.path_selected_index = None;
+        self.history_selected_index = None;
+        self.refresh_state();
+    }
+
+    /// 删除光标前一个词（Opt+Backspace）。
+    pub fn delete_word_backward(&mut self) {
+        let was_dismissed = self.is_dismissed();
+        let mut should_clear = false;
+        let mut changed = false;
+        if let Some(state) = self.state.as_mut() {
+            changed = state.delete_word_backward();
+            should_clear = state.is_empty();
+        }
+        if !changed {
+            return;
+        }
+        if should_clear {
+            self.state = None;
+            self.entry_phase = EntryPhase::CommandName;
+            self.resolved_command = None;
+            self.path_completions.clear();
+        }
+        self.overlay = if should_clear || !was_dismissed {
+            OverlayState::Visible
+        } else {
+            OverlayState::DismissedUntilReset
+        };
+        self.selected_index = None;
+        self.path_selected_index = None;
+        self.history_selected_index = None;
+        self.refresh_state();
+    }
+
+    /// 光标左移一个字符。
+    pub fn move_cursor_left(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_left);
+    }
+
+    /// 光标右移一个字符。
+    pub fn move_cursor_right(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_right);
+    }
+
+    /// 光标按词左移（Opt+←）。
+    pub fn move_cursor_word_left(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_word_left);
+    }
+
+    /// 光标按词右移（Opt+→）。
+    pub fn move_cursor_word_right(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_word_right);
+    }
+
+    /// 光标移到行首（Home / Cmd+←）。
+    pub fn move_cursor_home(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_home);
+    }
+
+    /// 光标移到行尾（End / Cmd+→）。
+    pub fn move_cursor_end(&mut self) {
+        self.move_cursor_with(BuiltinCommandState::move_end);
+    }
+
+    /// 移动光标后，按新光标所在 token 重算补全列表（仅参数阶段需要）。
+    ///
+    /// 光标只是位置变化、不改写缓冲，所以不动命令名建议 / 历史匹配 / overlay 状态，
+    /// 只在参数阶段重刷路径补全，使弹窗跟随光标落到对应参数（如本地源 / 远端目的）。
+    fn move_cursor_with(&mut self, mv: impl FnOnce(&mut BuiltinCommandState) -> bool) {
+        let moved = self.state.as_mut().map(mv).unwrap_or(false);
+        if !moved {
+            return;
+        }
+        if self.entry_phase == EntryPhase::ArgumentInput {
+            self.path_selected_index = None;
+            self.refresh_path_completions();
+        }
+    }
+
+    /// 当前光标在缓冲中的字节偏移；无活跃输入时返回 `None`。
+    pub fn cursor(&self) -> Option<usize> {
+        self.state.as_ref().map(|s| s.cursor())
     }
 
     /// 清空命令状态，完全退出内建命令模式。
@@ -412,6 +587,8 @@ impl BuiltinCommandManager {
         self.path_completions.clear();
         self.path_selected_index = None;
         self.resolved_command = None;
+        self.history_matches.clear();
+        self.history_selected_index = None;
     }
 
     /// 标记为已取消（ESC）：隐藏浮层，且回车把缓冲原样下发 shell。
@@ -420,6 +597,7 @@ impl BuiltinCommandManager {
         self.overlay = OverlayState::DismissedUntilReset;
         self.selected_index = None;
         self.path_selected_index = None;
+        self.history_selected_index = None;
     }
 
     /// 仅隐藏浮层，不改变"是否走内建命令"的语义。
@@ -430,6 +608,7 @@ impl BuiltinCommandManager {
         self.overlay = OverlayState::HiddenAfterPick;
         self.selected_index = None;
         self.path_selected_index = None;
+        self.history_selected_index = None;
     }
 
     /// 补全成功后由外层调用：根据当前缓冲是否还需更多参数决定下一步：
@@ -504,60 +683,103 @@ impl BuiltinCommandManager {
         self.overlay
     }
 
-    /// 在建议列表中循环选择下一项。
-    ///
-    /// 当前未选中（`None`）时，第一次调用进入第 0 项，与"按下 ↓ 才开始选"的语义匹配。
-    pub fn select_next(&mut self) {
+    /// 当前阶段「原候选段」（命令名 / 路径）的条目数，不含历史段。
+    fn base_completion_len(&self) -> usize {
         match self.entry_phase {
-            EntryPhase::CommandName => {
-                let total = self.suggestions.len();
-                if total > 0 {
-                    self.selected_index = Some(match self.selected_index {
-                        None => 0,
-                        Some(i) => (i + 1) % total,
-                    });
+            EntryPhase::CommandName => self.suggestions.len(),
+            EntryPhase::ArgumentInput => self.path_completions.len(),
+        }
+    }
+
+    /// 组合列表的总条目数 = 历史段 + 原候选段。
+    fn combined_total(&self) -> usize {
+        self.history_matches.len() + self.base_completion_len()
+    }
+
+    /// 组合空间中的当前选中下标：`[0..H)` 为历史，`[H..)` 为原候选。
+    fn combined_selected(&self) -> Option<usize> {
+        let h = self.history_matches.len();
+        if let Some(i) = self.history_selected_index {
+            return Some(i.min(h.saturating_sub(1)));
+        }
+        let base = match self.entry_phase {
+            EntryPhase::CommandName => self.selected_index,
+            EntryPhase::ArgumentInput => self.path_selected_index,
+        }?;
+        Some(h + base)
+    }
+
+    /// 把组合空间下标拆分回「历史 / 原候选」两段并写入对应字段，必要时滚动。
+    fn set_combined_selected(&mut self, combined: usize) {
+        let h = self.history_matches.len();
+        if combined < h {
+            self.history_selected_index = Some(combined);
+            self.selected_index = None;
+            self.path_selected_index = None;
+        } else {
+            let base = combined - h;
+            self.history_selected_index = None;
+            match self.entry_phase {
+                EntryPhase::CommandName => {
+                    self.selected_index = Some(base);
                 }
-            }
-            EntryPhase::ArgumentInput => {
-                let total = self.path_completions.len();
-                if total > 0 {
-                    let next = match self.path_selected_index {
-                        None => 0,
-                        Some(i) => (i + 1) % total,
-                    };
-                    self.path_selected_index = Some(next);
-                    self.path_scroll_handle.scroll_to_item(next);
+                EntryPhase::ArgumentInput => {
+                    self.path_selected_index = Some(base);
+                    self.path_scroll_handle.scroll_to_item(base);
                 }
             }
         }
     }
 
-    /// 在建议列表中循环选择上一项。
-    pub fn select_previous(&mut self) {
-        match self.entry_phase {
-            EntryPhase::CommandName => {
-                let total = self.suggestions.len();
-                if total > 0 {
-                    self.selected_index = Some(match self.selected_index {
-                        None => total - 1,
-                        Some(0) => total - 1,
-                        Some(i) => i - 1,
-                    });
-                }
-            }
-            EntryPhase::ArgumentInput => {
-                let total = self.path_completions.len();
-                if total > 0 {
-                    let prev = match self.path_selected_index {
-                        None => total - 1,
-                        Some(0) => total - 1,
-                        Some(i) => i - 1,
-                    };
-                    self.path_selected_index = Some(prev);
-                    self.path_scroll_handle.scroll_to_item(prev);
-                }
-            }
+    /// 在组合列表（历史段 + 原候选段）中循环选择下一项。
+    ///
+    /// 当前未选中（`None`）时，第一次调用进入第 0 项，与"按下 ↓ 才开始选"的语义匹配。
+    pub fn select_next(&mut self) {
+        let total = self.combined_total();
+        if total == 0 {
+            return;
         }
+        let next = match self.combined_selected() {
+            None => 0,
+            Some(i) => (i + 1) % total,
+        };
+        self.set_combined_selected(next);
+    }
+
+    /// 在组合列表中循环选择上一项。
+    pub fn select_previous(&mut self) {
+        let total = self.combined_total();
+        if total == 0 {
+            return;
+        }
+        let prev = match self.combined_selected() {
+            None => total - 1,
+            Some(0) => total - 1,
+            Some(i) => i - 1,
+        };
+        self.set_combined_selected(prev);
+    }
+
+    /// 当前选中的历史候选（指向 `history_matches`）。
+    pub fn selected_history_entry(&self) -> Option<&HistoryEntry> {
+        let index = self.history_selected_index()?;
+        self.history_matches.get(index)
+    }
+
+    /// 应用当前选中的历史项：用其整行覆盖缓冲（光标落末尾），收起浮层等待回车提交。
+    /// 无选中历史项时为 no-op。
+    pub fn complete_history(&mut self) {
+        let Some(entry) = self.selected_history_entry().cloned() else {
+            return;
+        };
+        if let Some(state) = self.state.as_mut() {
+            state.set_buffer(entry.command_line.clone());
+        } else {
+            self.state = Some(BuiltinCommandState::new(entry.command_line.clone()));
+        }
+        // 回填整行后只收起浮层（HiddenAfterPick）：再次回车即提交，继续输入会重开浮层。
+        self.refresh_state();
+        self.hide_overlay();
     }
 
     /// 用当前选中项替换命令名前缀，同时保留已经输入的参数部分。
@@ -586,13 +808,14 @@ impl BuiltinCommandManager {
         self.overlay = OverlayState::Visible;
         self.selected_index = None;
         self.path_selected_index = None;
+        self.history_selected_index = None;
         self.refresh_state();
     }
 
     /// 应用当前选中的路径补全。
     ///
-    /// 将当前路径参数替换为选中的完整路径。无选中时为 no-op。
-    /// 若选中的是目录，替换后自动刷新该目录下的补全列表（保持浮层展开）。
+    /// 将**光标所在**的路径参数替换为选中的完整路径。无选中时为 no-op。
+    /// 替换后光标落到替换串末尾。若选中的是目录，刷新该目录下的补全列表（保持浮层展开）。
     pub fn complete_path(&mut self) {
         let Some(selected) = self.selected_path_completion().cloned() else {
             return;
@@ -602,16 +825,19 @@ impl BuiltinCommandManager {
         };
 
         let current_input = state.buffer().to_string();
+        let cursor = state.cursor();
 
         // `/scp` 走独立分支：补全项自带 `replacement`（可能含 host 前缀）
         if is_scp_command(&current_input) {
             if let Some(replacement) = selected.replacement.clone() {
-                if let Some(query) = scp_completion::analyse(&current_input) {
+                if let Some(query) = scp_completion::analyse_at(&current_input, cursor) {
                     let mut next = String::with_capacity(current_input.len() + replacement.len());
                     next.push_str(&current_input[..query.token_start]);
                     next.push_str(&replacement);
                     next.push_str(&current_input[query.token_end..]);
-                    state.set_buffer(next);
+                    // 光标落到替换串末尾（保持在被补全的 token 上，便于继续展开目录）
+                    let new_cursor = query.token_start + replacement.len();
+                    state.set_buffer_with_cursor(next, new_cursor);
                     self.path_selected_index = None;
                     self.refresh_path_completions();
                     // 选中目录后保持浮层可见，但不预选 —— 用户需主动按 ↑/↓/Tab 才能选中
@@ -623,28 +849,25 @@ impl BuiltinCommandManager {
             }
         }
 
-        // 分离命令名和参数
-        let mut parts = current_input.splitn(2, |c: char| c.is_whitespace());
-        let command_name = parts.next().unwrap_or("");
-        let args = parts.next().unwrap_or("");
+        // 通用命令：替换光标所在的参数 token（而非整行末尾）。
+        let (token_start, token_end) = generic_arg_token_range_at(&current_input, cursor);
+        let token = &current_input[token_start..token_end];
+        let (dir_part, _file_prefix) = PathCompletionEngine::split_path_prefix(token);
 
-        // 解析参数的目录前缀和文件名前缀
-        let (dir_part, _file_prefix) = PathCompletionEngine::split_path_prefix(args);
-
-        // 构建新的参数：目录前缀 + 选中的名称
-        let new_arg = if selected.is_directory {
+        // 构建新 token：目录前缀 + 选中的名称
+        let new_token = if selected.is_directory {
             format!("{}{}/", dir_part, selected.name)
         } else {
             format!("{}{}", dir_part, selected.name)
         };
 
-        let new_input = if new_arg.is_empty() {
-            command_name.to_string()
-        } else {
-            format!("{} {}", command_name, new_arg)
-        };
+        let mut next = String::with_capacity(current_input.len() + new_token.len());
+        next.push_str(&current_input[..token_start]);
+        next.push_str(&new_token);
+        next.push_str(&current_input[token_end..]);
+        let new_cursor = token_start + new_token.len();
 
-        state.set_buffer(new_input);
+        state.set_buffer_with_cursor(next, new_cursor);
         self.path_selected_index = None;
         self.refresh_path_completions();
 
@@ -688,6 +911,18 @@ impl BuiltinCommandManager {
         self.complete_path();
     }
 
+    /// 处理历史候选的显式选中（鼠标点击）：选中并立即回填整行。
+    pub fn pick_history(&mut self, index: usize) {
+        let total = self.history_matches.len();
+        if total == 0 {
+            return;
+        }
+        self.history_selected_index = Some(index.min(total - 1));
+        self.selected_index = None;
+        self.path_selected_index = None;
+        self.complete_history();
+    }
+
     /// 获取当前命令名建议的高亮索引（`None` ⇒ 未高亮）。
     pub fn selected_index(&self) -> Option<usize> {
         let total = self.suggestions.len();
@@ -721,6 +956,7 @@ impl BuiltinCommandManager {
             self.path_completions.clear();
             self.path_selected_index = None;
         }
+        self.refresh_history_matches();
     }
 
     /// 检测当前输入阶段。
@@ -783,39 +1019,35 @@ impl BuiltinCommandManager {
             self.is_loading_remote = false;
             return;
         };
+        // 补全焦点跟随光标所在 token；无活跃 state 时退化为末尾。
+        let cursor = self.cursor().unwrap_or(query.len());
 
         // `/scp` 专用分支：两个参数、可能是主机、远端目录
         if is_scp_command(&query) {
-            self.refresh_scp_completions(&query);
+            self.refresh_scp_completions(&query, cursor);
             return;
         }
 
-        // 通用单参数补全：在远程终端时跟随当前 SSH 主机走 SFTP
-        // —— 与 `/scp` 裸路径分支一致，使补全起点始终是终端实际所在的 cwd。
-        let args = query
-            .trim_start()
-            .splitn(2, |c: char| c.is_whitespace())
-            .nth(1)
-            .unwrap_or("")
-            .trim_start();
-        let effective_prefix = if args.is_empty() { "" } else { args };
+        // 通用单参数补全：取光标所在的参数 token（而非整行末尾），
+        // 这样光标移回前面也能列出对应目录。
+        let effective_prefix = generic_arg_prefix_at(&query, cursor);
 
         if let Some(terminal_cfg) = self.terminal_ssh.clone() {
-            self.refresh_bare_remote_completions(effective_prefix, terminal_cfg, None);
+            self.refresh_bare_remote_completions(&effective_prefix, terminal_cfg, None);
             return;
         }
 
         // 本地终端：列出本机文件
         self.is_loading_remote = false;
         self.path_completions =
-            PathCompletionEngine::complete(effective_prefix, self.cwd.as_deref());
+            PathCompletionEngine::complete(&effective_prefix, self.cwd.as_deref());
         self.path_selected_index = None;
     }
 
     /// `/scp` 补全主入口：按光标所在 token 的阶段分发。
-    fn refresh_scp_completions(&mut self, buffer: &str) {
+    fn refresh_scp_completions(&mut self, buffer: &str, cursor: usize) {
         self.is_loading_remote = false;
-        let Some(query) = scp_completion::analyse(buffer) else {
+        let Some(query) = scp_completion::analyse_at(buffer, cursor) else {
             self.path_completions.clear();
             return;
         };
@@ -996,6 +1228,43 @@ fn is_scp_command(buffer: &str) -> bool {
         .next()
         .map(|name| name == "/scp")
         .unwrap_or(false)
+}
+
+/// 通用命令（`/open` 等单参数命令）下，光标所在参数 token 的字节范围。
+///
+/// 把 `command_name` 之后的参数区按空白切分，返回包含 `cursor` 的那个 token 的
+/// `(start, end)`（绝对字节偏移）。光标落在空白 / 空位时返回 `(cursor, cursor)`，
+/// 表示一个空 token，从而补全当前目录。
+pub fn generic_arg_token_range_at(buffer: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(buffer.len());
+    // 命令名结束位置（第一个空白）
+    let after_cmd = buffer
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8());
+    let Some(after_cmd) = after_cmd else {
+        // 还没有空格：整段都是命令名，没有参数 token
+        return (buffer.len(), buffer.len());
+    };
+    if cursor < after_cmd {
+        // 光标还在命令名里
+        return (after_cmd, after_cmd);
+    }
+    let args_area = &buffer[after_cmd..];
+    let tokens = scp_completion::shell_split_tokens(args_area, after_cmd);
+    for t in &tokens {
+        if cursor >= t.start && cursor <= t.end {
+            return (t.start, t.end);
+        }
+    }
+    // 落在 token 之间的空白：空 token
+    (cursor, cursor)
+}
+
+/// 通用命令下，光标所在参数 token 去引号后的文本（作为补全前缀）。
+fn generic_arg_prefix_at(buffer: &str, cursor: usize) -> String {
+    let (start, end) = generic_arg_token_range_at(buffer, cursor);
+    scp_completion::unquote_raw(&buffer[start..end])
 }
 
 /// 远端目录尚未加载时的占位补全项。
@@ -1355,22 +1624,111 @@ fn quote_host_token(host: &str) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuiltinCommandState {
     buffer: String,
+    /// 光标字节偏移，恒落在字符（grapheme）边界。新建 / set_buffer 后等于 buffer.len()。
+    cursor: usize,
 }
 
 impl BuiltinCommandState {
-    /// 用初始文本创建命令缓冲区。
+    /// 用初始文本创建命令缓冲区，光标置于末尾。
     pub fn new(buffer: String) -> Self {
-        Self { buffer }
+        let cursor = buffer.len();
+        Self { buffer, cursor }
     }
 
-    /// 在缓冲区末尾追加文本。
-    pub fn push_str(&mut self, text: &str) {
-        self.buffer.push_str(text);
+    /// 在光标处插入文本，光标右移到插入串末尾。
+    pub fn insert(&mut self, text: &str) {
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
     }
 
-    /// 删除缓冲区末尾的一个字符。
-    pub fn pop(&mut self) {
-        self.buffer.pop();
+    /// 删除光标前一个 grapheme（退格），光标左移。返回是否删除了内容。
+    pub fn delete_backward(&mut self) -> bool {
+        let Some(prev) = self.prev_boundary(self.cursor) else {
+            return false;
+        };
+        self.buffer.replace_range(prev..self.cursor, "");
+        self.cursor = prev;
+        true
+    }
+
+    /// 删除光标后一个 grapheme（Delete 键）。返回是否删除了内容。
+    pub fn delete_forward(&mut self) -> bool {
+        let Some(next) = self.next_boundary(self.cursor) else {
+            return false;
+        };
+        self.buffer.replace_range(self.cursor..next, "");
+        true
+    }
+
+    /// 删除光标前的一个「词」（Opt+Backspace）。返回是否删除了内容。
+    pub fn delete_word_backward(&mut self) -> bool {
+        let target = self.prev_word_boundary(self.cursor);
+        if target == self.cursor {
+            return false;
+        }
+        self.buffer.replace_range(target..self.cursor, "");
+        self.cursor = target;
+        true
+    }
+
+    /// 光标左移一个 grapheme。返回是否发生移动。
+    pub fn move_left(&mut self) -> bool {
+        match self.prev_boundary(self.cursor) {
+            Some(prev) => {
+                self.cursor = prev;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 光标右移一个 grapheme。返回是否发生移动。
+    pub fn move_right(&mut self) -> bool {
+        match self.next_boundary(self.cursor) {
+            Some(next) => {
+                self.cursor = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 光标按词左移（Opt+←）。返回是否发生移动。
+    pub fn move_word_left(&mut self) -> bool {
+        let target = self.prev_word_boundary(self.cursor);
+        if target == self.cursor {
+            return false;
+        }
+        self.cursor = target;
+        true
+    }
+
+    /// 光标按词右移（Opt+→）。返回是否发生移动。
+    pub fn move_word_right(&mut self) -> bool {
+        let target = self.next_word_boundary(self.cursor);
+        if target == self.cursor {
+            return false;
+        }
+        self.cursor = target;
+        true
+    }
+
+    /// 光标移到行首（Home / Cmd+←）。返回是否发生移动。
+    pub fn move_home(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor = 0;
+        true
+    }
+
+    /// 光标移到行尾（End / Cmd+→）。返回是否发生移动。
+    pub fn move_end(&mut self) -> bool {
+        if self.cursor == self.buffer.len() {
+            return false;
+        }
+        self.cursor = self.buffer.len();
+        true
     }
 
     /// 判断缓冲区是否为空。
@@ -1383,9 +1741,102 @@ impl BuiltinCommandState {
         &self.buffer
     }
 
-    /// 替换整个缓冲内容
+    /// 当前光标字节偏移。
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// 替换整个缓冲内容，光标钉到末尾。
     pub fn set_buffer(&mut self, buffer: String) {
+        self.cursor = buffer.len();
         self.buffer = buffer;
+    }
+
+    /// 替换整个缓冲内容，并把光标显式置于 `cursor`（夹紧到合法字符边界范围内）。
+    pub fn set_buffer_with_cursor(&mut self, buffer: String, cursor: usize) {
+        let cursor = cursor.min(buffer.len());
+        // 夹紧到字符边界，避免落在 UTF-8 多字节序列中间。
+        let cursor = if buffer.is_char_boundary(cursor) {
+            cursor
+        } else {
+            buffer[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+        self.cursor = cursor;
+        self.buffer = buffer;
+    }
+
+    /// 光标左侧的一个 grapheme 边界（字节偏移），已在行首返回 `None`。
+    fn prev_boundary(&self, offset: usize) -> Option<usize> {
+        if offset == 0 {
+            return None;
+        }
+        self.buffer[..offset]
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(i, _)| i)
+    }
+
+    /// 光标右侧的一个 grapheme 边界（字节偏移），已在行尾返回 `None`。
+    fn next_boundary(&self, offset: usize) -> Option<usize> {
+        if offset >= self.buffer.len() {
+            return None;
+        }
+        self.buffer[offset..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(i, _)| offset + i)
+            .or(Some(self.buffer.len()))
+    }
+
+    /// 向左跳过空白后再跳过一段非空白，得到「词首」字节偏移。
+    fn prev_word_boundary(&self, offset: usize) -> usize {
+        let mut pos = offset;
+        // 先吃掉光标左侧的空白
+        while pos > 0 {
+            let prev = self.prev_boundary(pos).unwrap_or(0);
+            if self.buffer[prev..pos].chars().all(char::is_whitespace) {
+                pos = prev;
+            } else {
+                break;
+            }
+        }
+        // 再吃掉一段非空白
+        while pos > 0 {
+            let prev = self.prev_boundary(pos).unwrap_or(0);
+            if self.buffer[prev..pos].chars().any(char::is_whitespace) {
+                break;
+            }
+            pos = prev;
+        }
+        pos
+    }
+
+    /// 向右跳过非空白后再跳过一段空白，得到下一个「词尾」字节偏移。
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let len = self.buffer.len();
+        let mut pos = offset;
+        // 先吃掉一段非空白
+        while pos < len {
+            let next = self.next_boundary(pos).unwrap_or(len);
+            if self.buffer[pos..next].chars().any(char::is_whitespace) {
+                break;
+            }
+            pos = next;
+        }
+        // 再吃掉光标右侧的空白
+        while pos < len {
+            let next = self.next_boundary(pos).unwrap_or(len);
+            if self.buffer[pos..next].chars().all(char::is_whitespace) {
+                pos = next;
+            } else {
+                break;
+            }
+        }
+        pos
     }
 }
 
@@ -1476,25 +1927,149 @@ fn apply_overlay_anchor<E: gpui::Styled>(element: E, anchor: OverlayAnchor) -> E
     }
 }
 
+/// 把 `last_used`（unix 秒）转成人类可读的相对时间，用于历史条目右侧次要文字。
+fn relative_time_label(last_used: i64, now: i64) -> String {
+    let diff = (now - last_used).max(0);
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86_400)
+    }
+}
+
+/// 渲染「最近使用」历史分组的行集合，置于补全列表顶部。
+///
+/// `history_selected` 是历史段内的高亮下标（`None` ⇒ 历史段无高亮）。
+/// `on_pick_history(i)` 由外层提供，响应鼠标点击历史项第 `i` 条。
+fn render_history_rows<F>(
+    entries: &[HistoryEntry],
+    history_selected: Option<usize>,
+    theme: UiTheme,
+    is_dark: bool,
+    on_pick_history: Rc<F>,
+) -> Vec<gpui::AnyElement>
+where
+    F: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+{
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let now = history::current_unix_secs();
+    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(entries.len() + 1);
+
+    // 分组标题
+    rows.push(
+        div()
+            .px(px(8.0))
+            .py(px(2.0))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child("最近使用")
+            .into_any_element(),
+    );
+
+    for (index, entry) in entries.iter().enumerate() {
+        let on_pick = on_pick_history.clone();
+        let is_selected = Some(index) == history_selected;
+        let time_label = relative_time_label(entry.last_used, now);
+        rows.push(
+            div()
+                .w_full()
+                .h(px(26.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(if is_selected {
+                    theme.accent.opacity(if is_dark { 0.18 } else { 0.12 })
+                } else {
+                    gpui::transparent_black()
+                })
+                .when(!is_selected, |this| {
+                    this.hover(move |style| {
+                        style.bg(theme.accent.opacity(if is_dark { 0.10 } else { 0.06 }))
+                    })
+                })
+                .on_mouse_up(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_pick(index, window, cx);
+                })
+                .child(
+                    div()
+                        .w(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            svg()
+                                .size(px(12.0))
+                                .text_color(theme.icon_muted)
+                                .path(crate::assets::Icon::Reveal.path()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .truncate()
+                        .font_family("monospace")
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(entry.command_line.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(time_label),
+                )
+                .into_any_element(),
+        );
+    }
+
+    // 分隔线
+    rows.push(div().h(px(1.0)).my(px(2.0)).bg(theme.border).into_any_element());
+    rows
+}
+
 /// 渲染内建命令建议浮层。
 ///
 /// `selected_index` 为 `None` 时浮层弹出但所有项无高亮（用户尚未按 ↓/Tab）。
 /// `on_pick` 由外层提供，用来响应鼠标选中某一条建议。
-pub fn render_overlay<F>(
+#[allow(clippy::too_many_arguments)]
+pub fn render_overlay<F, H>(
     suggestions: Rc<[Arc<BuiltinCommand>]>,
     selected_index: Option<usize>,
+    history: &[HistoryEntry],
+    history_selected: Option<usize>,
     anchor: OverlayAnchor,
     theme: UiTheme,
     is_dark: bool,
     on_pick: F,
+    on_pick_history: H,
 ) -> impl IntoElement
 where
     F: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+    H: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
 {
     let on_pick = Rc::new(on_pick);
     let anchored_at_bottom = matches!(anchor, OverlayAnchor::Bottom(_));
 
-    let items_list = div().max_h(px(420.0)).children(
+    let history_rows =
+        render_history_rows(history, history_selected, theme, is_dark, Rc::new(on_pick_history));
+
+    let items_list = div()
+        .max_h(px(420.0))
+        .children(history_rows)
+        .children(
         suggestions
             .iter()
             .cloned()
@@ -1593,21 +2168,29 @@ where
 ///
 /// `selected_index` 为 `None` 时浮层弹出但所有项无高亮。
 /// `on_pick` 由外层提供，用来响应鼠标选中某一条路径建议。
-pub fn render_path_overlay<F>(
+#[allow(clippy::too_many_arguments)]
+pub fn render_path_overlay<F, H>(
     completions: &[PathCompletionItem],
     selected_index: Option<usize>,
+    history: &[HistoryEntry],
+    history_selected: Option<usize>,
     anchor: OverlayAnchor,
     left: Pixels,
     theme: UiTheme,
     is_dark: bool,
     scroll_handle: &ScrollHandle,
     on_pick: F,
+    on_pick_history: H,
 ) -> impl IntoElement
 where
     F: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+    H: Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
 {
     let on_pick = Rc::new(on_pick);
     let overlay_width = estimate_overlay_width(completions);
+
+    let history_rows =
+        render_history_rows(history, history_selected, theme, is_dark, Rc::new(on_pick_history));
 
     // 紧贴命令行光标的圆角弹层。当 `anchor` 为 `Bottom` 时浮窗底端贴近光标，
     // 列表从下往上贴着光标增长。宽度按最长建议项估算（夹紧到 320–900px）。
@@ -1631,6 +2214,7 @@ where
                 .px(px(6.0))
                 .flex()
                 .flex_col()
+                .children(history_rows)
                 .children(
                     completions
                         .iter()
@@ -1738,7 +2322,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BuiltinCommandManager, find_builtin_command, resolve_command_line};
+    use super::{BuiltinCommandManager, CommandHistory, find_builtin_command, resolve_command_line};
 
     #[test]
     fn parses_builtin_open_command() {
@@ -2219,5 +2803,156 @@ mod tests {
         manager.update("/scp root@1.2.3.4:");
         manager.advance_after_pick();
         assert_eq!(manager.query(), Some("/scp root@1.2.3.4:"));
+    }
+
+    // ── 光标编辑（cursor-aware buffer）─────────────────────────────────────────
+
+    #[test]
+    fn insert_at_cursor_after_moving_left() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp ab");
+        // 光标默认在末尾（7）
+        assert_eq!(manager.cursor(), Some(7));
+        manager.move_cursor_left(); // 光标到 6（"a" 与 "b" 之间）
+        assert_eq!(manager.cursor(), Some(6));
+        manager.update("X"); // 在光标处插入
+        assert_eq!(manager.query(), Some("/scp aXb"));
+        // 插入后光标落在插入串之后
+        assert_eq!(manager.cursor(), Some(7));
+    }
+
+    #[test]
+    fn delete_forward_removes_char_after_cursor() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp ab");
+        manager.move_cursor_left(); // 光标在 "a" 与 "b" 之间
+        manager.delete_forward(); // 删 "b"
+        assert_eq!(manager.query(), Some("/scp a"));
+    }
+
+    #[test]
+    fn backspace_deletes_before_cursor_in_middle() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp ab");
+        manager.move_cursor_left(); // 光标在 6
+        manager.pop(); // 删光标前的 "a"
+        assert_eq!(manager.query(), Some("/scp b"));
+        assert_eq!(manager.cursor(), Some(5));
+    }
+
+    #[test]
+    fn home_and_end_jump_to_edges() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp ab");
+        manager.move_cursor_home();
+        assert_eq!(manager.cursor(), Some(0));
+        manager.move_cursor_end();
+        assert_eq!(manager.cursor(), Some(7));
+    }
+
+    #[test]
+    fn word_motion_and_word_delete() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp foo bar");
+        // 末尾按词左移：跳过 "bar" 到其词首（位置 9）
+        manager.move_cursor_word_left();
+        assert_eq!(manager.cursor(), Some(9));
+        // 再按词左移：跳过 "foo " 到 "foo" 词首（位置 5）
+        manager.move_cursor_word_left();
+        assert_eq!(manager.cursor(), Some(5));
+        // 删词：删掉 "foo "（光标前一个词含尾随空格的处理由 prev_word_boundary 决定）
+        manager.move_cursor_end();
+        manager.delete_word_backward();
+        assert_eq!(manager.query(), Some("/scp foo "));
+    }
+
+    #[test]
+    fn cursor_moves_respect_cjk_grapheme_boundary() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp 中文");
+        // 末尾光标在 "/scp ".len()(5) + 6 = 11
+        assert_eq!(manager.cursor(), Some(11));
+        manager.move_cursor_left(); // 跨过 "文"（3 字节）
+        assert_eq!(manager.cursor(), Some(8));
+        manager.move_cursor_left(); // 跨过 "中"（3 字节）
+        assert_eq!(manager.cursor(), Some(5));
+    }
+
+    #[test]
+    fn completion_follows_cursor_to_local_source_token() {
+        // 复现截图场景：`/scp Downloads/ root@1.2.3.4:~/`，光标在本地源 token。
+        // 弹窗应列本地文件（HostOrLocal），而不是末尾远端目的 token 的远端目录。
+        let mut manager = BuiltinCommandManager::new();
+        manager.update("/scp Downloads/ root@1.2.3.4:~/");
+        // 把光标移回到 "Downloads/" 之后（本地源 token 末尾）
+        // 末尾长度 - "root@1.2.3.4:~/".len() - 1(空格) = "/scp Downloads/".len()
+        let target = "/scp Downloads/".len();
+        while manager.cursor().unwrap() > target {
+            manager.move_cursor_left();
+        }
+        assert_eq!(manager.cursor(), Some(target));
+        // 移动光标已触发参数阶段补全重算（move_cursor_with）。
+        // 不应进入远端加载（说明没把焦点落在 host:path 远端 token 上）
+        assert!(
+            !manager.is_loading_remote,
+            "cursor on local source must not trigger remote dir load"
+        );
+    }
+
+    // ── 历史候选选择与回填 ─────────────────────────────────────────────────────
+
+    fn manager_with_history(lines: &[&str]) -> BuiltinCommandManager {
+        let mut history = CommandHistory::default();
+        for (i, l) in lines.iter().enumerate() {
+            history.record(l, 100 + i as i64);
+        }
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_history(history);
+        manager
+    }
+
+    #[test]
+    fn history_matches_surface_in_command_name_phase() {
+        let mut manager = manager_with_history(&["/scp alice:/etc/hosts ./"]);
+        manager.update("/sc");
+        // 输入 /sc 时应召回历史 /scp 整行
+        assert_eq!(manager.history_matches().len(), 1);
+        assert!(manager.should_render_overlay());
+    }
+
+    #[test]
+    fn combined_selection_traverses_history_then_base() {
+        let mut manager = manager_with_history(&["/scp alice:/x ./"]);
+        manager.update("/sc");
+        // 第一次 ↓ 落在历史段第 0 项
+        manager.select_next();
+        assert_eq!(manager.history_selected_index(), Some(0));
+        assert_eq!(manager.selected_index(), None);
+        // 再 ↓ 进入原候选段（命令名建议）第 0 项
+        manager.select_next();
+        assert_eq!(manager.history_selected_index(), None);
+        assert_eq!(manager.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn complete_history_fills_whole_line() {
+        let mut manager = manager_with_history(&["/scp alice:/etc/hosts ./"]);
+        manager.update("/sc");
+        manager.select_next(); // 选中历史段第 0 项
+        assert!(manager.has_active_completion());
+        manager.complete_history();
+        // 整行回填，光标落末尾，浮层收起
+        assert_eq!(manager.query(), Some("/scp alice:/etc/hosts ./"));
+        assert_eq!(manager.cursor(), Some("/scp alice:/etc/hosts ./".len()));
+        assert_eq!(manager.overlay_state(), super::OverlayState::HiddenAfterPick);
+    }
+
+    #[test]
+    fn history_matches_surface_in_argument_phase() {
+        let mut manager = manager_with_history(&["/scp alice:/etc/hosts ./"]);
+        manager.update("/scp ali");
+        assert!(manager.is_argument_input());
+        // 整行子串匹配：输入 /scp ali 召回含 alice 的历史
+        assert_eq!(manager.history_matches().len(), 1);
     }
 }

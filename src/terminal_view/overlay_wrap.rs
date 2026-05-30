@@ -62,10 +62,15 @@ pub struct WrappedOverlay {
 
 /// 把 `builtin` + `ime` 折成多行视觉行布局，每行再切成段。
 ///
+/// `builtin_cursor` 是光标在 `builtin` 内的字节偏移（恒落在字符边界）：
+/// 等于 `builtin.len()` 时退化为「光标在末尾」，与历史行为一致；可指向中间任意字符边界。
+/// IME 预编辑文本始终接在 builtin 末尾渲染（与现有 IME 语义一致）。
+///
 /// `cols == 0`（极端窄面板）退化为单行单段，避免死循环。
 pub fn wrap_overlay_text(
     builtin: &str,
     ime: &str,
+    builtin_cursor: usize,
     start_col: usize,
     cols: usize,
 ) -> WrappedOverlay {
@@ -101,11 +106,14 @@ pub fn wrap_overlay_text(
     }
 
     let start_col = start_col.min(cols);
+    let builtin_cursor = builtin_cursor.min(builtin.len());
     let mut builder = LineBuilder::new(start_col);
     let mut lines: Vec<OverlayLine> = Vec::new();
     let mut builtin_done = false;
+    let mut cursor_locked = false;
     let mut cursor_row: usize = 0;
     let mut cursor_col: usize = start_col;
+    let mut consumed_builtin: usize = 0;
 
     let chars = builtin
         .chars()
@@ -115,10 +123,21 @@ pub fn wrap_overlay_text(
     for (is_ime, ch) in chars {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
 
-        // builtin → IME 切换：锁定光标位置（builtin 末尾）。
-        if is_ime && !builtin_done {
+        // 锁定光标：已消费的 builtin 字节数恰好等于光标偏移（在处理该字符之前）。
+        // 仅在 builtin 区段内判定；光标落在 builtin 末尾的情况由下方 IME 边界 / 收尾处理。
+        if !cursor_locked && !is_ime && consumed_builtin == builtin_cursor {
             cursor_row = lines.len();
             cursor_col = builder.col_cursor;
+            cursor_locked = true;
+        }
+
+        // builtin → IME 切换：切段；若光标恰在 builtin 末尾则在此锁定。
+        if is_ime && !builtin_done {
+            if !cursor_locked {
+                cursor_row = lines.len();
+                cursor_col = builder.col_cursor;
+                cursor_locked = true;
+            }
             builder.flush_open_segment();
             builtin_done = true;
         }
@@ -130,15 +149,19 @@ pub fn wrap_overlay_text(
         }
 
         builder.push_char(ch, w, is_ime);
+        if !is_ime {
+            consumed_builtin += ch.len_utf8();
+        }
     }
 
-    if !builtin_done {
+    // 光标落在 builtin 末尾且无 IME（或 builtin 为空）：在收尾处锁定。
+    if !cursor_locked {
         cursor_row = lines.len();
         cursor_col = builder.col_cursor;
     }
     lines.push(builder.finish());
 
-    // builtin 末尾恰好把行填满 → 光标跳到下一行 0 列（与 readline 行尾换行一致）。
+    // 光标恰好把行填满 → 跳到下一行 0 列（与 readline 行尾换行一致）。
     if cursor_col >= cols {
         cursor_row += 1;
         cursor_col = 0;
@@ -236,6 +259,11 @@ impl LineBuilder {
 mod tests {
     use super::*;
 
+    /// 测试辅助：光标默认落在 builtin 末尾，保持改造前的行为语义。
+    fn wrap(builtin: &str, ime: &str, start_col: usize, cols: usize) -> WrappedOverlay {
+        wrap_overlay_text(builtin, ime, builtin.len(), start_col, cols)
+    }
+
     fn assert_segments_cover(line: &OverlayLine) {
         let mut col = line.start_col;
         let mut builtin_cells = 0;
@@ -255,7 +283,7 @@ mod tests {
 
     #[test]
     fn wraps_to_single_line_when_within_cols() {
-        let r = wrap_overlay_text("/scp foo", "", 0, 80);
+        let r = wrap("/scp foo", "", 0, 80);
         assert_eq!(r.lines.len(), 1);
         assert_eq!(r.lines[0].text(), "/scp foo");
         assert_eq!(r.lines[0].start_col, 0);
@@ -268,7 +296,7 @@ mod tests {
     #[test]
     fn wraps_when_overflow() {
         // cols=10, "/scp /tmp/abcdef" 长度 16
-        let r = wrap_overlay_text("/scp /tmp/abcdef", "", 0, 10);
+        let r = wrap("/scp /tmp/abcdef", "", 0, 10);
         assert_eq!(r.lines.len(), 2);
         assert_eq!(r.lines[0].text(), "/scp /tmp/");
         assert_eq!(r.lines[0].start_col, 0);
@@ -281,13 +309,13 @@ mod tests {
     #[test]
     fn cjk_uses_two_cells_and_wraps_at_boundary() {
         // cols=4, builtin = "ab中" → "ab" 占 2 cell，"中" 占 2 cell，刚好填满 → 不换行
-        let r = wrap_overlay_text("ab中", "", 0, 4);
+        let r = wrap("ab中", "", 0, 4);
         assert_eq!(r.lines.len(), 1);
         assert_eq!(r.cursor_row, 1);
         assert_eq!(r.cursor_col, 0);
 
         // cols=3, "ab中" → "中" 放不下，应换行
-        let r = wrap_overlay_text("ab中", "", 0, 3);
+        let r = wrap("ab中", "", 0, 3);
         assert_eq!(r.lines.len(), 2);
         assert_eq!(r.lines[0].text(), "ab");
         assert_eq!(r.lines[1].text(), "中");
@@ -298,7 +326,7 @@ mod tests {
     #[test]
     fn zero_width_char_attached_without_advancing_column() {
         // U+200D ZWJ 宽度为 0
-        let r = wrap_overlay_text("a\u{200d}b", "", 0, 4);
+        let r = wrap("a\u{200d}b", "", 0, 4);
         assert_eq!(r.lines.len(), 1);
         assert_eq!(r.lines[0].text(), "a\u{200d}b");
         assert_eq!(r.cursor_col, 2);
@@ -306,7 +334,7 @@ mod tests {
 
     #[test]
     fn cursor_jumps_to_next_row_when_filling_cols() {
-        let r = wrap_overlay_text("/scp", "", 0, 4);
+        let r = wrap("/scp", "", 0, 4);
         assert_eq!(r.lines.len(), 1);
         assert_eq!(r.cursor_row, 1);
         assert_eq!(r.cursor_col, 0);
@@ -315,7 +343,7 @@ mod tests {
 
     #[test]
     fn ime_after_full_line_lands_on_next_row() {
-        let r = wrap_overlay_text("/scp", "中", 0, 4);
+        let r = wrap("/scp", "中", 0, 4);
         assert_eq!(r.lines.len(), 2);
         assert_eq!(r.lines[0].text(), "/scp");
         assert_eq!(r.lines[0].ime_cells, 0);
@@ -329,7 +357,7 @@ mod tests {
 
     #[test]
     fn ime_segment_can_span_multiple_rows() {
-        let r = wrap_overlay_text("ab", "cdefgh", 0, 4);
+        let r = wrap("ab", "cdefgh", 0, 4);
         assert_eq!(r.lines.len(), 2);
         assert_eq!(r.lines[0].text(), "abcd");
         assert_eq!(r.lines[0].builtin_cells, 2);
@@ -343,7 +371,7 @@ mod tests {
 
     #[test]
     fn start_col_offset_pushes_first_row() {
-        let r = wrap_overlay_text("abcdefgh", "", 5, 10);
+        let r = wrap("abcdefgh", "", 5, 10);
         assert_eq!(r.lines.len(), 2);
         assert_eq!(r.lines[0].start_col, 5);
         assert_eq!(r.lines[0].text(), "abcde");
@@ -355,7 +383,7 @@ mod tests {
 
     #[test]
     fn cols_zero_falls_back_to_single_line() {
-        let r = wrap_overlay_text("/scp foo", "", 0, 0);
+        let r = wrap("/scp foo", "", 0, 0);
         assert_eq!(r.lines.len(), 1);
         assert_eq!(r.lines[0].text(), "/scp foo");
         assert_eq!(r.cursor_row, 0);
@@ -364,7 +392,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_single_empty_line() {
-        let r = wrap_overlay_text("", "", 3, 10);
+        let r = wrap("", "", 3, 10);
         assert_eq!(r.lines.len(), 1);
         assert!(r.lines[0].segments.is_empty());
         assert_eq!(r.lines[0].start_col, 3);
@@ -374,14 +402,14 @@ mod tests {
 
     #[test]
     fn wide_char_wider_than_cols_still_lays_out() {
-        let r = wrap_overlay_text("中", "", 0, 1);
+        let r = wrap("中", "", 0, 1);
         assert!(!r.lines.is_empty());
     }
 
     #[test]
     fn wide_chars_each_get_their_own_segment() {
         // builtin="ab中文cd" → 段切分为 "ab" / "中" / "文" / "cd"
-        let r = wrap_overlay_text("ab中文cd", "", 0, 80);
+        let r = wrap("ab中文cd", "", 0, 80);
         assert_eq!(r.lines.len(), 1);
         let segs = &r.lines[0].segments;
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
@@ -400,7 +428,7 @@ mod tests {
     #[test]
     fn builtin_ime_boundary_splits_segments() {
         // builtin="ab", ime="cd" → 同一行，但 builtin 和 ime 各占一段
-        let r = wrap_overlay_text("ab", "cd", 0, 80);
+        let r = wrap("ab", "cd", 0, 80);
         assert_eq!(r.lines.len(), 1);
         let segs = &r.lines[0].segments;
         assert_eq!(segs.len(), 2);
@@ -414,7 +442,7 @@ mod tests {
     #[test]
     fn cjk_in_builtin_each_segment_aligned() {
         // builtin 含中文：cols=80, "ab中cd" → 段 "ab" / "中" / "cd"，光标在 builtin 末尾
-        let r = wrap_overlay_text("ab中cd", "", 0, 80);
+        let r = wrap("ab中cd", "", 0, 80);
         assert_eq!(r.lines.len(), 1);
         let texts: Vec<&str> = r.lines[0].segments.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, vec!["ab", "中", "cd"]);
@@ -424,7 +452,7 @@ mod tests {
 
     #[test]
     fn cols_zero_keeps_builtin_and_ime_separate_segments() {
-        let r = wrap_overlay_text("ab", "cd", 7, 0);
+        let r = wrap("ab", "cd", 7, 0);
         assert_eq!(r.lines.len(), 1);
         let segs = &r.lines[0].segments;
         assert_eq!(segs.len(), 2);
@@ -432,5 +460,56 @@ mod tests {
         assert!(!segs[0].is_ime);
         assert_eq!(segs[1].text, "cd");
         assert!(segs[1].is_ime);
+    }
+
+    // ── 光标在任意位置（cursor-aware）─────────────────────────────────────────
+
+    #[test]
+    fn cursor_at_start_lands_on_col_zero() {
+        let r = wrap_overlay_text("/scp foo", "", 0, 0, 80);
+        assert_eq!(r.cursor_row, 0);
+        assert_eq!(r.cursor_col, 0);
+    }
+
+    #[test]
+    fn cursor_in_middle_lands_between_chars() {
+        // "/scp foo"，光标在第 4 字节（"/scp" 之后、空格之前）
+        let r = wrap_overlay_text("/scp foo", "", 4, 0, 80);
+        assert_eq!(r.cursor_row, 0);
+        assert_eq!(r.cursor_col, 4);
+    }
+
+    #[test]
+    fn cursor_in_middle_after_wrap() {
+        // cols=10，"/scp /tmp/abcdef"（16 字节）光标在第 12 字节（第二视觉行内）
+        // 第一行 "/scp /tmp/"（10 列），第二行 "abcdef"；第 12 字节 = 第二行第 2 列
+        let r = wrap_overlay_text("/scp /tmp/abcdef", "", 12, 0, 10);
+        assert_eq!(r.cursor_row, 1);
+        assert_eq!(r.cursor_col, 2);
+    }
+
+    #[test]
+    fn cursor_before_cjk_char() {
+        // "ab中cd"：光标在第 2 字节（"中" 之前），应落在第 2 列
+        let r = wrap_overlay_text("ab中cd", "", 2, 0, 80);
+        assert_eq!(r.cursor_row, 0);
+        assert_eq!(r.cursor_col, 2);
+    }
+
+    #[test]
+    fn cursor_after_cjk_char() {
+        // "ab中cd"：光标在第 5 字节（"中" 之后），中文占 2 列 ⇒ 第 4 列
+        let r = wrap_overlay_text("ab中cd", "", 5, 0, 80);
+        assert_eq!(r.cursor_row, 0);
+        assert_eq!(r.cursor_col, 4);
+    }
+
+    #[test]
+    fn cursor_at_end_matches_helper_behavior() {
+        // 显式传 builtin.len() 与默认末尾行为应一致
+        let explicit = wrap_overlay_text("/scp foo", "", "/scp foo".len(), 0, 80);
+        let helper = wrap("/scp foo", "", 0, 80);
+        assert_eq!(explicit.cursor_row, helper.cursor_row);
+        assert_eq!(explicit.cursor_col, helper.cursor_col);
     }
 }
