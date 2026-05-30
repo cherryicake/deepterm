@@ -508,6 +508,11 @@ fn split_destination(
                 .filter(|n| !n.is_empty());
             match file_name {
                 Some(name) => {
+                    // `.` 是当前目录语义，不应被当作重命名目标。
+                    // 例如 `Local:.` / `./` 应当把 `.` 视为目录目的地，不做 rename。
+                    if name == "." {
+                        return (FileEndpoint::Local { path }, None);
+                    }
                     let parent = path.parent().filter(|p| {
                         // 相对路径如 "a.txt" 的 parent 是 ""（空路径），
                         // 此时应视为当前目录，不能返回空 parent 否则后续拼接丢失目录语义
@@ -531,6 +536,11 @@ fn split_destination(
             match name {
                 None => (FileEndpoint::Remote { ssh_config, path }, None),
                 Some(name) => {
+                    // `.` 是当前目录语义，不应被当作重命名目标。
+                    // 例如 `bob:.` / `bob:./` 应当把 `.` 视为目录目的地，不做 rename。
+                    if name == "." {
+                        return (FileEndpoint::Remote { ssh_config, path }, None);
+                    }
                     let parent = crate::ssh::sftp_fs::remote_parent(&path).unwrap_or_else(|| {
                         // path 是裸的 "."/"./x" 之类（没有前导 /）
                         if let Some(stripped) = path.strip_suffix(&format!("/{}", name)) {
@@ -1206,6 +1216,97 @@ mod tests {
             }
             _ => panic!("expected remote with port"),
         }
+    }
+
+    // ── split_destination tests ───────────────────────────────────────────────
+
+    #[test]
+    fn split_destination_local_dot_is_directory() {
+        // `Local:.` 应当把 `.` 视为目录目的地，不做 rename。
+        let endpoint = FileEndpoint::Local {
+            path: PathBuf::from("."),
+        };
+        let (dest, rename) = split_destination(endpoint, false);
+        match dest {
+            FileEndpoint::Local { path } => assert_eq!(path, PathBuf::from(".")),
+            _ => panic!("expected local"),
+        }
+        assert!(rename.is_none());
+    }
+
+    #[test]
+    fn split_destination_local_dot_slash_is_directory() {
+        // `./` 同样视为目录目的地。
+        let endpoint = FileEndpoint::Local {
+            path: PathBuf::from("./"),
+        };
+        let (dest, rename) = split_destination(endpoint, false);
+        match dest {
+            FileEndpoint::Local { path } => assert_eq!(path, PathBuf::from("./")),
+            _ => panic!("expected local"),
+        }
+        assert!(rename.is_none());
+    }
+
+    #[test]
+    fn split_destination_remote_dot_is_directory() {
+        // `bob:.` 应当把 `.` 视为目录目的地，不做 rename。
+        use crate::ssh::config::AuthMethod;
+        let ssh_config =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
+        let endpoint = FileEndpoint::Remote {
+            ssh_config,
+            path: ".".to_string(),
+        };
+        let (dest, rename) = split_destination(endpoint, false);
+        match dest {
+            FileEndpoint::Remote { path, .. } => assert_eq!(path, "."),
+            _ => panic!("expected remote"),
+        }
+        assert!(rename.is_none());
+    }
+
+    #[test]
+    fn split_destination_remote_dot_slash_is_directory() {
+        use crate::ssh::config::AuthMethod;
+        let ssh_config =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
+        let endpoint = FileEndpoint::Remote {
+            ssh_config,
+            path: "./".to_string(),
+        };
+        let (dest, rename) = split_destination(endpoint, false);
+        match dest {
+            FileEndpoint::Remote { path, .. } => assert_eq!(path, "./"),
+            _ => panic!("expected remote"),
+        }
+        assert!(rename.is_none());
+    }
+
+    #[test]
+    fn split_destination_local_normal_file() {
+        let endpoint = FileEndpoint::Local {
+            path: PathBuf::from("/tmp/a.txt"),
+        };
+        let (dest, rename) = split_destination(endpoint, false);
+        match dest {
+            FileEndpoint::Local { path } => assert_eq!(path, PathBuf::from("/tmp")),
+            _ => panic!("expected local"),
+        }
+        assert_eq!(rename.as_deref(), Some("a.txt"));
+    }
+
+    #[test]
+    fn split_destination_trailing_slash_means_no_rename() {
+        let endpoint = FileEndpoint::Local {
+            path: PathBuf::from("/tmp/a.txt"),
+        };
+        let (dest, rename) = split_destination(endpoint, true);
+        match dest {
+            FileEndpoint::Local { path } => assert_eq!(path, PathBuf::from("/tmp/a.txt")),
+            _ => panic!("expected local"),
+        }
+        assert!(rename.is_none());
     }
 }
 

@@ -415,3 +415,44 @@ pub fn copy_local_file_interruptible(
     destination.flush()?;
     Ok(transferred)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_single_quote_plain() {
+        assert_eq!(shell_single_quote("hello"), "hello");
+    }
+
+    #[test]
+    fn shell_single_quote_with_apostrophe() {
+        // foo'bar → 在单引号上下文中: 'foo'\''bar' → shell 得到 foo'bar
+        assert_eq!(shell_single_quote("foo'bar"), "foo'\\''bar");
+    }
+
+    #[test]
+    fn shell_single_quote_with_backslash() {
+        // 反斜杠在单引号内原样保留，不做转义
+        assert_eq!(shell_single_quote("foo\\bar"), "foo\\bar");
+    }
+
+    #[test]
+    fn shell_single_quote_with_backslash_and_apostrophe() {
+        // foo\'bar → 在单引号上下文中: 'foo\'bar' → shell 原样得到 foo\'bar
+        assert_eq!(shell_single_quote("foo\\'bar"), "foo\\'\\''bar");
+    }
+
+    #[test]
+    fn shell_single_quote_multiple_apostrophes() {
+        assert_eq!(
+            shell_single_quote("it's a test"),
+            "it'\\''s a test"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_empty() {
+        assert_eq!(shell_single_quote(""), "");
+    }
+}

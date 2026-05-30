@@ -598,7 +598,7 @@ fn remote_total_size(ssh_config: &crate::ssh::SshConnectionConfig, path: &str) -
         Err(_) => return 0,
     };
     let cmd = format!(
-        "du -sb {} 2>/dev/null || echo 0",
+        "du -sb '{}' 2>/dev/null || echo 0",
         crate::file_transfer::utils::shell_single_quote(path)
     );
     match session.execute_command(&cmd, 30) {

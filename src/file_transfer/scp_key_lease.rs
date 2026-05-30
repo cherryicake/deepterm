@@ -136,7 +136,7 @@ impl Drop for LeaseGuard {
 
 fn cleanup_lease(lease: &ScpKeyLease) {
     // 1. 源端 rm -rf 临时目录
-    let cmd = format!("rm -rf {}", shell_single_quote(&lease.remote_temp_dir));
+    let cmd = format!("rm -rf '{}'", shell_single_quote(&lease.remote_temp_dir));
     match sftp_fs::with_cached_session(&lease.source_config, |session| {
         session.execute_command(&cmd, 5)
     }) {
@@ -248,7 +248,7 @@ pub fn acquire_lease(
 }
 
 fn remote_key_alive(session: &mut BlockingSftpSession, remote_key_path: &str) -> bool {
-    let cmd = format!("test -f {} && echo ok", shell_single_quote(remote_key_path));
+    let cmd = format!("test -f '{}' && echo ok", shell_single_quote(remote_key_path));
     matches!(
         session.execute_command(&cmd, 5),
         Ok(r) if r.success() && r.stdout.trim() == "ok"
@@ -313,7 +313,7 @@ fn create_lease(
 
     source_session
         .execute_command(
-            &format!("mkdir -m 700 {}", shell_single_quote(&remote_temp_dir)),
+            &format!("mkdir -m 700 '{}'", shell_single_quote(&remote_temp_dir)),
             5,
         )
         .map_err(|e| anyhow!("源端创建临时目录失败: {}", e))?;
@@ -323,7 +323,7 @@ fn create_lease(
 
     if let Err(e) = std::fs::write(&local_temp_path, &key_bytes) {
         let _ = source_session.execute_command(
-            &format!("rm -rf {}", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);
@@ -338,7 +338,7 @@ fn create_lease(
         let _ = std::fs::write(&local_temp_path, vec![0u8; key_bytes.len()]);
         let _ = std::fs::remove_file(&local_temp_path);
         let _ = source_session.execute_command(
-            &format!("rm -rf {}", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);
@@ -346,13 +346,13 @@ fn create_lease(
     }
 
     if let Err(e) = source_session.execute_command(
-        &format!("chmod 600 {}", shell_single_quote(&remote_key_path)),
+        &format!("chmod 600 '{}'", shell_single_quote(&remote_key_path)),
         5,
     ) {
         let _ = std::fs::write(&local_temp_path, vec![0u8; key_bytes.len()]);
         let _ = std::fs::remove_file(&local_temp_path);
         let _ = source_session.execute_command(
-            &format!("rm -rf {}", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);

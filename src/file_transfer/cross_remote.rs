@@ -743,7 +743,7 @@ fn monitor_dest_progress(
         std::thread::sleep(std::time::Duration::from_secs(1));
         let size = if is_directory {
             let cmd = format!(
-                "du -sb {} 2>/dev/null || echo 0",
+                "du -sb '{}' 2>/dev/null || echo 0",
                 shell_single_quote(destination_path)
             );
             match session.execute_command(&cmd, 5) {
