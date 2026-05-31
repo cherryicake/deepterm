@@ -2,7 +2,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{AnimationExt, Entity, ScrollHandle, StatefulInteractiveElement, Window, div, px};
+use gpui::{
+    AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId, IntoElement,
+    LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, WeakEntity, Window, div, px,
+};
 
 use crate::assets::Icon;
 use crate::sidebar_view::font_view::FontSettingsView;
@@ -12,7 +15,6 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 
-pub const SIDEBAR_WIDTH: f32 = 260.0;
 pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
 const ANIMATION_ENTER_MS: u64 = 300;
@@ -66,9 +68,8 @@ pub enum SidebarView {
 
 /// macOS 风格侧边栏组件
 ///
-/// 封装了侧边栏的显隐状态、入场/退出动画、切换按钮和 TitleBar 补偿动画。
+/// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
 /// 内部包含多组菜单结构，支持选中高亮和点击回调。
-#[derive(Clone)]
 pub struct MacosSidebar {
     visible: bool,
     animating_out: bool,
@@ -83,6 +84,9 @@ pub struct MacosSidebar {
     font_view: Option<Entity<FontSettingsView>>,
     host_view: Option<Entity<HostView>>,
     keychain_view: Option<Entity<KeychainSidebarView>>,
+    width: f32,
+    resize_drag_x: Option<gpui::Pixels>,
+    app_window: Option<WeakEntity<crate::AppWindow>>,
 }
 
 impl MacosSidebar {
@@ -124,7 +128,51 @@ impl MacosSidebar {
             font_view: None,
             host_view: None,
             keychain_view: None,
+            width: SIDEBAR_MIN_WIDTH,
+            resize_drag_x: None,
+            app_window: None,
         }
+    }
+
+    /// 绑定 AppWindow 用于状态变化时通知父组件重绘
+    pub fn bind_app_window(&mut self, app_window: WeakEntity<crate::AppWindow>) {
+        self.app_window = Some(app_window);
+    }
+
+    /// 通知父级 AppWindow 重绘
+    pub fn notify_app_window(&self, cx: &mut App) {
+        if let Some(aw) = &self.app_window {
+            aw.update(cx, |_, cx| cx.notify()).ok();
+        }
+    }
+
+    /// 当前宽度
+    pub fn width(&self) -> f32 {
+        self.width
+    }
+
+    /// 开始拖拽调整宽度
+    pub fn start_resize(&mut self, pos: gpui::Pixels) {
+        self.resize_drag_x = Some(pos);
+    }
+
+    /// 更新拖拽位置
+    pub fn update_resize(&mut self, pos: gpui::Pixels) {
+        if let Some(start) = self.resize_drag_x {
+            let delta: f32 = (pos - start).into();
+            self.width = (self.width + delta).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+            self.resize_drag_x = Some(pos);
+        }
+    }
+
+    /// 结束拖拽
+    pub fn end_resize(&mut self) {
+        self.resize_drag_x = None;
+    }
+
+    /// 是否正在拖拽调整宽度
+    pub fn is_dragging(&self) -> bool {
+        self.resize_drag_x.is_some()
     }
 
     /// 切换侧边栏显隐。
@@ -132,6 +180,7 @@ impl MacosSidebar {
     /// 返回 `true` 表示侧边栏正在关闭，需要外部启动一个延迟任务
     /// 在动画结束后调用 [`Self::finish_animation`]；返回 `false` 表示正在打开。
     pub fn toggle(&mut self) -> bool {
+        self.end_resize();
         if self.visible {
             self.visible = false;
             self.animating_out = true;
@@ -224,120 +273,77 @@ impl MacosSidebar {
         self.epoch
     }
 
-    /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
-    /// 完全收起时返回宽度为 0 的占位，保证始终参与 flex 布局。
-    pub fn render_sidebar<F, G, R>(&self, width: f32, cx: &gpui::App, on_select: F, on_double_click: G, on_resize_start: R) -> gpui::AnyElement
+    /// 渲染侧边栏切换按钮（含位移动画）。
+    ///
+    /// 事件处理器通过 `on_toggle` 传入，调用者通常使用 `cx.listener` 构造。
+    /// `is_fullscreen` 用于 macOS 全屏模式：此时没有交通灯按钮，无需额外左偏移。
+    pub fn render_toggle_button<F>(
+        &self,
+        cx: &gpui::App,
+        is_fullscreen: bool,
+        on_toggle: F,
+    ) -> gpui::AnyElement
     where
-        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
-        G: Fn(&crate::ssh::config::SshConnectionConfig, &mut Window, &mut gpui::App) + 'static,
-        R: Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     {
-        if !self.visible && !self.animating_out {
-            return div()
-                .id(("macos-sidebar-placeholder", self.epoch))
-                .h_full()
-                .w(px(0.0))
-                .into_any_element();
-        }
-
-        let target_width = width;
-        let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
-        let on_select = Rc::new(on_select);
-        let _on_double_click = Rc::new(on_double_click);
+        let button_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
+            BUTTON_LEFT_CLOSED
+        } else {
+            // Windows/Linux 没有交通灯按钮；macOS 全屏时也没有
+            8.0
+        };
+        // 侧边栏打开时，按钮位置与 sidebar 右边缘保持固定间距
+        let button_left_open = self.width - 40.0;
+        let (start_left, end_left, duration_ms) = if self.visible {
+            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
+        } else {
+            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
+        };
 
-        let (anim_id, anim_key, duration_ms, width_fn): (&str, &str, u64, Box<dyn Fn(f32) -> f32>) =
-            if self.visible {
-                (
-                    "macos-sidebar-enter",
-                    "sidebar-enter",
-                    ANIMATION_ENTER_MS,
-                    Box::new(move |delta| target_width * delta),
-                )
-            } else {
-                (
-                    "macos-sidebar-exit",
-                    "sidebar-exit",
-                    ANIMATION_EXIT_MS,
-                    Box::new(move |delta| target_width * (1.0 - delta)),
-                )
-            };
-
-        let inner = div()
-            .h_full()
-            .rounded(px(12.0))
-            .bg(glass_bg(is_dark))
-            .border(px(0.5))
-            .border_color(border_color(is_dark))
-            .flex()
-            .flex_col()
-            .pt(px(48.0))
-            .pb(px(16.0))
-            .pl(px(12.0))
-            .pr(px(12.0))
-            .child(match self.current_view {
-                SidebarView::Menu => self.render_menu_content(cx, on_select.clone(), is_dark, theme).into_any_element(),
-                SidebarView::Theme => {
-                    theme_view::render_theme_sidebar(cx, on_select.clone(), is_dark, theme, &self.theme_scroll_handle).into_any_element()
-                }
-                SidebarView::Font => self.render_font_content(cx, on_select.clone(), is_dark, theme).into_any_element(),
-                SidebarView::Host => {
-                    self.host_view.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element())
-                }
-                SidebarView::Keychain => {
-                    self.keychain_view.clone().map(|v| v.into_any_element()).unwrap_or_else(|| div().into_any_element())
-                }
-            });
-
-        // Resize handle：贴 sidebar 右边缘，默认透明，hover 显淡色背景
-        let resize_handle = div()
+        let button = div()
+            .id(("sidebar-toggle-btn", self.epoch))
             .absolute()
-            .right(px(0.0))
-            .top(px(8.0))
-            .bottom(px(8.0))
-            .w(px(4.0))
-            .cursor_col_resize()
-            .hover(|style| style.bg(theme.drop_target.opacity(0.3)))
-            .on_mouse_down(gpui::MouseButton::Left, on_resize_start);
+            .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(36.))
+            .h(px(if self.visible { 22. } else { 30. }))
+            .rounded(px(999.0))
+            .text_color(theme.text)
+            .hover(|style| style.bg(theme.title_bar_hover))
+            .cursor_pointer()
+            .on_mouse_down(gpui::MouseButton::Left, on_toggle)
+            .child(
+                gpui::svg()
+                    .size(px(20.0))
+                    .text_color(theme.text)
+                    .path(crate::assets::Icon::Sidebar.path()),
+            );
 
-        // 控制侧边栏整体轮廓
-        let padded = div()
-            .w(px(target_width))
-            .pl(px(8.0))
-            .pt(px(8.0))
-            .pb(px(8.0))
-            .h_full()
-            .relative()
-            .child(inner)
-            .child(resize_handle);
-
-        div()
-            .id((anim_id, self.epoch))
-            .h_full()
-            .overflow_hidden()
-            .child(padded)
-            .with_animation(
-                (anim_key, self.epoch),
-                gpui::Animation::new(Duration::from_millis(duration_ms))
-                    .with_easing(gpui::ease_in_out),
-                move |this, delta| {
-                    let width = width_fn(delta);
-                    this.w(px(width.max(0.0)))
-                },
-            )
-            .into_any_element()
+        // 初始状态（epoch == 0）直接应用最终位置，避免启动时出现一次从右向左的位移动画
+        if self.epoch == 0 {
+            button.left(px(end_left)).into_any_element()
+        } else {
+            button
+                .left(px(start_left))
+                .with_animation(
+                    ("sidebar-toggle-anim", self.epoch),
+                    gpui::Animation::new(Duration::from_millis(duration_ms))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
+                )
+                .into_any_element()
+        }
     }
 
-    fn render_menu_content<F>(
+    fn render_menu_content(
         &self,
-        _cx: &gpui::App,
-        on_select: Rc<F>,
+        cx: &mut Context<Self>,
         is_dark: bool,
         theme: crate::theme::UiTheme,
-    ) -> gpui::Div
-    where
-        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
-    {
+    ) -> gpui::Div {
         let mut menu_content = div().w_full().flex().flex_col();
 
         // 起始页（顶部高亮项）
@@ -356,7 +362,7 @@ impl MacosSidebar {
                 this.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .when(!is_homepage_selected, |this| {
-                        this.hover(|style| style.bg(hover_bg(is_dark)))
+                this.hover(|style| style.bg(hover_bg(is_dark)))
                     .text_color(theme.text)
             })
             .child(
@@ -375,10 +381,10 @@ impl MacosSidebar {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child("起始页"),
             )
-            .on_click({
-                let on_select = on_select.clone();
-                move |_, window, cx| on_select("homepage", window, cx)
-            });
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.handle_item_select("homepage");
+                this.notify_app_window(cx);
+            }));
 
         menu_content = menu_content.child(homepage).child(div().h(px(16.0)));
 
@@ -428,7 +434,7 @@ impl MacosSidebar {
                         this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
                     .when(!is_selected, |this| {
-                this.hover(|style| style.bg(hover_bg(is_dark)))
+                        this.hover(|style| style.bg(hover_bg(is_dark)))
                             .text_color(theme.text)
                     })
                     .child(
@@ -458,11 +464,10 @@ impl MacosSidebar {
                                 .child(item.label.clone()),
                         ),
                     )
-                    .on_click({
-                        let on_select = on_select.clone();
-                        let id = item_id.clone();
-                        move |_, window, cx| on_select(&id, window, cx)
-                    });
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.handle_item_select(&item_id);
+                        this.notify_app_window(cx);
+                    }));
 
                 items_div = items_div.child(row);
             }
@@ -473,16 +478,12 @@ impl MacosSidebar {
         menu_content
     }
 
-    fn render_font_content<F>(
+    fn render_font_content(
         &self,
-        _cx: &gpui::App,
-        on_select: Rc<F>,
+        cx: &mut Context<Self>,
         is_dark: bool,
         theme: crate::theme::UiTheme,
-    ) -> gpui::Div
-    where
-        F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
-    {
+    ) -> gpui::Div {
         // 顶部导航栏
         let header = div()
             .w_full()
@@ -509,10 +510,10 @@ impl MacosSidebar {
                             .path(Icon::ChevronLeft.path())
                             .text_color(theme.text),
                     )
-                    .on_mouse_down(gpui::MouseButton::Left, {
-                        let on_select = on_select.clone();
-                        move |_, window, cx| on_select("__back", window, cx)
-                    }),
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _window, cx| {
+                        this.handle_item_select("__back");
+                        this.notify_app_window(cx);
+                    })),
             )
             .child(
                 div()
@@ -548,75 +549,232 @@ impl MacosSidebar {
             )
     }
 
-    /// 渲染切换按钮（含位移动画）。
-    ///
-    /// 事件处理器通过 `on_toggle` 传入，调用者通常使用 `cx.listener` 构造。
-    /// `is_fullscreen` 用于 macOS 全屏模式：此时没有交通灯按钮，无需额外左偏移。
-    pub fn render_toggle_button<F>(
+    fn render_theme_content(
         &self,
-        width: f32,
-        cx: &gpui::App,
-        is_fullscreen: bool,
-        on_toggle: F,
-    ) -> gpui::AnyElement
-    where
-        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    {
-        let theme = cx.theme().ui;
-        let button_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
-            BUTTON_LEFT_CLOSED
-        } else {
-            // Windows/Linux 没有交通灯按钮；macOS 全屏时也没有
-            8.0
-        };
-        // 侧边栏打开时，按钮位置与 sidebar 右边缘保持固定间距
-        let button_left_open = width - 40.0;
-        let (start_left, end_left, duration_ms) = if self.visible {
-            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
-        } else {
-            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
-        };
+        cx: &mut Context<Self>,
+        is_dark: bool,
+        theme: crate::theme::UiTheme,
+    ) -> gpui::Div {
+        let on_select = Rc::new({
+            let sidebar = cx.entity().downgrade();
+            move |id: &str, _window: &mut Window, cx: &mut App| {
+                if let Some(s) = sidebar.upgrade() {
+                    s.update(cx, |this, cx| {
+                        this.handle_item_select(id);
+                        this.notify_app_window(cx);
+                    });
+                }
+            }
+        });
+        theme_view::render_theme_sidebar(cx, on_select, is_dark, theme, &self.theme_scroll_handle)
+    }
 
-        let button = div()
-            .id(("sidebar-toggle-btn", self.epoch))
-            .absolute()
-            .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(36.))
-            .h(px(if self.visible { 22. } else { 30. }))
-            .rounded(px(999.0))
-            .text_color(theme.text)
-            .hover(|style| style.bg(theme.title_bar_hover))
-            .cursor_pointer()
-            .on_mouse_down(gpui::MouseButton::Left, on_toggle)
-            .child(
-                gpui::svg()
-                    .size(px(20.0))
-                    .text_color(theme.text)
-                    .path(crate::assets::Icon::Sidebar.path()),
-            );
+    fn render_host_content(&self) -> gpui::Div {
+        self.host_view
+            .clone()
+            .map(|view| div().w_full().h_full().child(view))
+            .unwrap_or_else(|| div().w_full().h_full())
+    }
 
-        // 初始状态（epoch == 0）直接应用最终位置，避免启动时出现一次从右向左的位移动画
-        if self.epoch == 0 {
-            button.left(px(end_left)).into_any_element()
-        } else {
-            button
-                .left(px(start_left))
-                .with_animation(
-                    ("sidebar-toggle-anim", self.epoch),
-                    gpui::Animation::new(Duration::from_millis(duration_ms))
-                        .with_easing(gpui::ease_in_out),
-                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
-                )
-                .into_any_element()
-        }
+    fn render_keychain_content(&self) -> gpui::Div {
+        self.keychain_view
+            .clone()
+            .map(|view| div().w_full().h_full().child(view))
+            .unwrap_or_else(|| div().w_full().h_full())
     }
 }
 
 impl Default for MacosSidebar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Render for MacosSidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible && !self.animating_out {
+            return div().h_full().w(px(0.0)).into_any_element();
+        }
+
+        let target_width = self.width;
+        let is_dark = cx.theme().appearance.is_dark();
+        let theme = cx.theme().ui;
+
+        let (anim_id, anim_key, duration_ms, width_fn): (&str, &str, u64, Box<dyn Fn(f32) -> f32>) =
+            if self.visible {
+                (
+                    "macos-sidebar-enter",
+                    "sidebar-enter",
+                    ANIMATION_ENTER_MS,
+                    Box::new(move |delta| target_width * delta),
+                )
+            } else {
+                (
+                    "macos-sidebar-exit",
+                    "sidebar-exit",
+                    ANIMATION_EXIT_MS,
+                    Box::new(move |delta| target_width * (1.0 - delta)),
+                )
+            };
+
+        let inner = div()
+            .h_full()
+            .rounded(px(12.0))
+            .bg(glass_bg(is_dark))
+            .border(px(0.5))
+            .border_color(border_color(is_dark))
+            .flex()
+            .flex_col()
+            .pt(px(48.0))
+            .pb(px(16.0))
+            .pl(px(12.0))
+            .pr(px(12.0))
+            .child(match self.current_view {
+                SidebarView::Menu => self.render_menu_content(cx, is_dark, theme).into_any_element(),
+                SidebarView::Theme => self.render_theme_content(cx, is_dark, theme).into_any_element(),
+                SidebarView::Font => self.render_font_content(cx, is_dark, theme).into_any_element(),
+                SidebarView::Host => self.render_host_content().into_any_element(),
+                SidebarView::Keychain => self.render_keychain_content().into_any_element(),
+            });
+
+        // Resize handle：贴 sidebar 右边缘，默认透明，hover 显淡色背景
+        let resize_handle = div()
+            .absolute()
+            .right(px(0.0))
+            .top(px(8.0))
+            .bottom(px(8.0))
+            .w(px(4.0))
+            .cursor_col_resize()
+            .hover(|style| style.bg(theme.drop_target.opacity(0.3)))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                this.start_resize(event.position.x);
+                cx.notify();
+                this.notify_app_window(cx);
+            }));
+
+        // 控制侧边栏整体轮廓
+        let padded = div()
+            .w(px(target_width))
+            .pl(px(8.0))
+            .pt(px(8.0))
+            .pb(px(8.0))
+            .h_full()
+            .relative()
+            .child(inner)
+            .child(resize_handle);
+
+        div()
+            .id((anim_id, self.epoch))
+            .h_full()
+            .overflow_hidden()
+            .child(padded)
+            .child(SidebarResizeElement {
+                sidebar: cx.entity().downgrade(),
+            })
+            .with_animation(
+                (anim_key, self.epoch),
+                gpui::Animation::new(Duration::from_millis(duration_ms))
+                    .with_easing(gpui::ease_in_out),
+                move |this, delta| {
+                    let width = width_fn(delta);
+                    this.w(px(width.max(0.0)))
+                },
+            )
+            .into_any_element()
+    }
+}
+
+/// 全局 resize 处理元素 - 在 paint 阶段注册全局鼠标事件
+struct SidebarResizeElement {
+    sidebar: WeakEntity<MacosSidebar>,
+}
+
+impl Element for SidebarResizeElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (window.request_layout(gpui::Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut (),
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> () {
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut (),
+        _prepaint_state: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(sidebar) = self.sidebar.upgrade() else {
+            return;
+        };
+
+        // 拖拽中全局覆盖光标样式，保持 resize 光标不变
+        if sidebar.read(cx).is_dragging() {
+            window.set_window_cursor_style(CursorStyle::ResizeColumn);
+        }
+
+        // 全局鼠标移动事件 - 处理 resize 拖拽
+        window.on_mouse_event({
+            let sidebar = sidebar.clone();
+            move |event: &MouseMoveEvent, _, _window, cx| {
+                sidebar.update(cx, |this, cx| {
+                    if this.is_dragging() {
+                        this.update_resize(event.position.x);
+                        cx.notify();
+                        this.notify_app_window(cx);
+                    }
+                });
+            }
+        });
+
+        // 全局鼠标释放事件 - 结束 resize 拖拽
+        window.on_mouse_event({
+            let sidebar = sidebar.clone();
+            move |_: &MouseUpEvent, _, _, cx| {
+                sidebar.update(cx, |this, cx| {
+                    if this.is_dragging() {
+                        this.end_resize();
+                        cx.notify();
+                        this.notify_app_window(cx);
+                    }
+                });
+            }
+        });
+    }
+}
+
+impl IntoElement for SidebarResizeElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
