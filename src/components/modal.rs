@@ -1,9 +1,10 @@
+use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, ElementId, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce, StatefulInteractiveElement,
-    StyleRefinement, Styled, Task, Window, actions, deferred, div, px, point, BoxShadow,
+    StyleRefinement, Styled, Task, Window, actions, deferred, div, linear, px, point, BoxShadow,
 };
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,11 +12,11 @@ use std::time::Duration;
 const CONTEXT: &str = "Modal";
 
 /// 弹窗进入动画时长（毫秒）。macOS sheet 由顶部轻柔落下、末段减速。
-const MODAL_ENTER_MS: u64 = 250;
+const MODAL_ENTER_MS: u64 = 340;
 /// 弹窗退出动画时长（毫秒）。向上快速收拢消失。
-const MODAL_EXIT_MS: u64 = 160;
+const MODAL_EXIT_MS: u64 = 200;
 /// 进入 / 退出动画的垂直位移（从上方滑入），像素。
-const MODAL_SLIDE_PX: f32 = 12.0;
+const MODAL_SLIDE_PX: f32 = 22.0;
 
 actions!(modal, [Cancel]);
 
@@ -94,16 +95,29 @@ impl ModalState {
     }
 }
 
-/// 进入缓动：ease-out-quint（快入慢停）。
-fn modal_enter_easing(t: f32) -> f32 {
+/// 进入时不透明度的「提前完成」比例：内容在动画走到 65% 时就已完全不透明，
+/// 余下时间只做位置滑动，避免「淡入与位移同步收尾」的拖沓感。macOS 的弹窗
+/// 也是内容很快变清晰、外形再轻微稳定到位。
+const MODAL_OPACITY_LEAD: f32 = 0.65;
+
+/// 进入动画下，给定线性时间进度 `t`，返回 (位置进度, 不透明度) ∈ [0,1]。
+/// 位置走 macOS 进入贝塞尔（全程平滑减速到位），不透明度提前收尾。
+fn modal_enter_progress(t: f32) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(5)
+    let pos = easing::macos_enter()(t);
+    let opacity = (t / MODAL_OPACITY_LEAD).clamp(0.0, 1.0);
+    // 不透明度本身也做一次平滑，避免线性淡入的生硬感。
+    let opacity = easing::standard()(opacity);
+    (pos, opacity)
 }
 
-/// 退出缓动：ease-in-cubic（慢起快收）。
-fn modal_exit_easing(t: f32) -> f32 {
+/// 退出动画下，返回 (位置进度, 不透明度)。位置走 ease-in 加速收拢，
+/// 不透明度更快淡出（在 75% 处归零），让面板「先消失、形随其后」。
+fn modal_exit_progress(t: f32) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
-    t * t * t
+    let pos = easing::macos_exit()(t);
+    let opacity = 1.0 - (t / 0.75).clamp(0.0, 1.0);
+    (pos, opacity)
 }
 
 /// A modal dialog component that renders a centered panel over a backdrop.
@@ -324,20 +338,22 @@ impl RenderOnce for Modal {
             .occlude()
             .children(self.children)
             // 面板：从上方 MODAL_SLIDE_PX 处淡入滑下（进入），或向上收拢淡出（退出）。
+            // 用线性时间驱动动画，曲线在 animator 内部应用，从而把「位置」与
+            // 「不透明度」解耦：不透明度提前收尾、位置全程平滑减速到位。
             .with_animation(
                 panel_anim_id,
-                Animation::new(Duration::from_millis(duration_ms)).with_easing(move |t| {
-                    if is_exit {
-                        modal_exit_easing(t)
+                Animation::new(Duration::from_millis(duration_ms)).with_easing(linear),
+                move |this, t| {
+                    let (pos, opacity) = if is_exit {
+                        modal_exit_progress(t)
                     } else {
-                        modal_enter_easing(t)
-                    }
-                }),
-                move |this, delta| {
-                    let (offset_y, opacity) = if is_exit {
-                        (-MODAL_SLIDE_PX * delta, 1.0 - delta)
+                        modal_enter_progress(t)
+                    };
+                    // pos: 进入时 0→1 表示「从上方滑到原位」；退出时 0→1 表示「从原位滑回上方」。
+                    let offset_y = if is_exit {
+                        -MODAL_SLIDE_PX * pos
                     } else {
-                        (-MODAL_SLIDE_PX * (1.0 - delta), delta)
+                        -MODAL_SLIDE_PX * (1.0 - pos)
                     };
                     this.top(px(offset_y)).opacity(opacity.clamp(0.0, 1.0))
                 },
@@ -374,17 +390,16 @@ impl RenderOnce for Modal {
                         })
                         .with_animation(
                             backdrop_anim_id,
-                            Animation::new(Duration::from_millis(duration_ms)).with_easing(
-                                move |t| {
-                                    if is_exit {
-                                        modal_exit_easing(t)
-                                    } else {
-                                        modal_enter_easing(t)
-                                    }
-                                },
-                            ),
-                            move |this, delta| {
-                                let opacity = if is_exit { 1.0 - delta } else { delta };
+                            Animation::new(Duration::from_millis(duration_ms))
+                                .with_easing(linear),
+                            move |this, t| {
+                                // 遮罩用标准平滑曲线，并比面板更早建立 / 更晚消散，
+                                // 营造「先暗下来、内容随后浮现」的层次感。
+                                let opacity = if is_exit {
+                                    1.0 - easing::macos_exit()(t)
+                                } else {
+                                    easing::standard()(t)
+                                };
                                 this.opacity(opacity.clamp(0.0, 1.0))
                             },
                         ),

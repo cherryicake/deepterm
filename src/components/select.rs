@@ -7,31 +7,36 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, App, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, SharedString, Task,
-    Window, anchored, canvas, deferred, div, point, px, svg,
+    Window, anchored, canvas, deferred, div, linear, point, px, svg,
 };
 
 use crate::assets::Icon;
+use crate::components::animation::easing;
 use crate::components::button::Size;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::theme::ActiveTheme;
 
 /// 下拉进入动画时长（毫秒）。
-const SELECT_ENTER_MS: u64 = 160;
+const SELECT_ENTER_MS: u64 = 200;
 /// 下拉退出动画时长（毫秒）。
-const SELECT_EXIT_MS: u64 = 110;
+const SELECT_EXIT_MS: u64 = 130;
 /// 进入 / 退出动画的垂直位移，像素。
-const SELECT_SLIDE_PX: f32 = 6.0;
+const SELECT_SLIDE_PX: f32 = 10.0;
 
-/// 进入缓动：ease-out-quint（快入慢停）。
-fn select_enter_easing(t: f32) -> f32 {
+/// 进入动画：返回 (位置进度, 不透明度)。位置全程平滑减速，不透明度提前收尾。
+fn select_enter_progress(t: f32) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(5)
+    let pos = easing::macos_enter()(t);
+    let opacity = easing::standard()((t / 0.6).clamp(0.0, 1.0));
+    (pos, opacity)
 }
 
-/// 退出缓动：ease-in-cubic（慢起快收）。
-fn select_exit_easing(t: f32) -> f32 {
+/// 退出动画：返回 (位置进度, 不透明度)。位置加速收拢，不透明度更快淡出。
+fn select_exit_progress(t: f32) -> (f32, f32) {
     let t = t.clamp(0.0, 1.0);
-    t * t * t
+    let pos = easing::macos_exit()(t);
+    let opacity = 1.0 - (t / 0.7).clamp(0.0, 1.0);
+    (pos, opacity)
 }
 
 /// A searchable select component with a trigger and an anchored popup list.
@@ -490,18 +495,17 @@ impl Render for Select {
                                         .with_animation(
                                             anim_id,
                                             Animation::new(Duration::from_millis(duration_ms))
-                                                .with_easing(move |t| {
-                                                    if is_exit {
-                                                        select_exit_easing(t)
-                                                    } else {
-                                                        select_enter_easing(t)
-                                                    }
-                                                }),
-                                            move |this, delta| {
-                                                let (offset_y, opacity) = if is_exit {
-                                                    (-SELECT_SLIDE_PX * delta, 1.0 - delta)
+                                                .with_easing(linear),
+                                            move |this, t| {
+                                                let (pos, opacity) = if is_exit {
+                                                    select_exit_progress(t)
                                                 } else {
-                                                    (-SELECT_SLIDE_PX * (1.0 - delta), delta)
+                                                    select_enter_progress(t)
+                                                };
+                                                let offset_y = if is_exit {
+                                                    -SELECT_SLIDE_PX * pos
+                                                } else {
+                                                    -SELECT_SLIDE_PX * (1.0 - pos)
                                                 };
                                                 this.top(px(offset_y))
                                                     .opacity(opacity.clamp(0.0, 1.0))
