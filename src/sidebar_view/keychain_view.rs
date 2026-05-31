@@ -10,7 +10,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
-use crate::components::modal::Modal;
+use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::keychain_editor::KeychainEditor;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore};
@@ -24,7 +24,7 @@ pub struct KeychainSidebarView {
     scroll_handle: ScrollHandle,
     selected_ids: HashSet<SharedString>,
     editor: Option<Entity<KeychainEditor>>,
-    show_modal: bool,
+    modal_state: ModalState,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     context_menu_item_id: Option<SharedString>,
     search_input: Entity<InputState>,
@@ -61,7 +61,7 @@ impl KeychainSidebarView {
                 scroll_handle,
                 selected_ids: HashSet::new(),
                 editor: None,
-                show_modal: false,
+                modal_state: ModalState::new(),
                 on_select: None,
                 context_menu_item_id: None,
                 search_input,
@@ -88,19 +88,17 @@ impl KeychainSidebarView {
             let entity_clone = entity.clone();
             ed.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
             let entity_clone2 = entity.clone();
             ed.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
         });
-        self.show_modal = true;
+        self.modal_state.open();
         cx.notify();
     }
 
@@ -120,24 +118,22 @@ impl KeychainSidebarView {
             let entity_clone = entity.clone();
             ed.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
             let entity_clone2 = entity.clone();
             ed.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
         });
-        self.show_modal = true;
+        self.modal_state.open();
         cx.notify();
     }
 
     pub fn build_modal(&mut self, cx: &mut Context<Self>) -> Option<Modal> {
-        if !self.show_modal {
+        if !self.modal_state.is_rendered() {
             return None;
         }
         let editor = self.editor.as_ref()?.clone();
@@ -147,10 +143,11 @@ impl KeychainSidebarView {
                 .width(px(540.))
                 .max_height(px(700.))
                 .top_padding(px(120.))
+                .closing(self.modal_state.is_closing())
+                .epoch(self.modal_state.epoch())
                 .on_close(move |_window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.show_modal = false;
-                        cx.notify();
+                        this.modal_state.close(cx, |this| &mut this.modal_state);
                     });
                 })
                 .child(editor),

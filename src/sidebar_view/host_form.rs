@@ -582,30 +582,31 @@ impl NewHostForm {
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w_full()
+            .mt_2()
             .flex()
-            .flex_row()
-            .justify_end()
-            .gap(px(8.))
-            .pt(px(16.))
+            .gap(px(8.0))
             .child(
-                Button::new("new-host-cancel")
-                    .label("取消")
-                    .rounded(px(12.))
-                    .with_size(ButtonSize::Small)
-                    .width(px(86.))
-                    .px(px(14.))
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                div().flex_1().child(
+                    Button::new("new-host-cancel")
+                        .label("取消")
+                        .rounded(px(12.))
+                        .with_size(ButtonSize::Small)
+                        // .width(px(86.))
+                        .px(px(14.))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                ),
             )
             .child(
-                Button::new("new-host-save")
-                    .label("保存")
-                    .success()
-                    .rounded(px(12.))
-                    .with_size(ButtonSize::Small)
-                    .width(px(86.))
-                    .px(px(14.))
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                div().flex_1().child(
+                    Button::new("new-host-save")
+                        .label("保存")
+                        .success()
+                        .rounded(px(12.))
+                        .with_size(ButtonSize::Small)
+                        // .width(px(86.))
+                        .px(px(14.))
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                ),
             )
     }
 }

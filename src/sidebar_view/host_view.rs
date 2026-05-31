@@ -10,7 +10,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
-use crate::components::modal::Modal;
+use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::hosts_view::{
     ConnectHost, DeleteHost, DuplicateHost, EditHost, load_hosts_from_config,
@@ -25,7 +25,7 @@ pub struct HostView {
     scroll_handle: ScrollHandle,
     selected_ids: HashSet<SharedString>,
     host_form: Option<Entity<NewHostForm>>,
-    show_modal: bool,
+    modal_state: ModalState,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
     on_edit_host: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
@@ -64,7 +64,7 @@ impl HostView {
                 scroll_handle,
                 selected_ids: HashSet::new(),
                 host_form: None,
-                show_modal: false,
+                modal_state: ModalState::new(),
                 on_select: None,
                 on_connect: None,
                 on_edit_host: None,
@@ -110,19 +110,17 @@ impl HostView {
             let entity_clone = entity.clone();
             form.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
             let entity_clone2 = entity.clone();
             form.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
         });
-        self.show_modal = true;
+        self.modal_state.open();
         cx.notify();
     }
 
@@ -142,26 +140,24 @@ impl HostView {
             let entity_clone = entity.clone();
             form.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
             let entity_clone2 = entity.clone();
             form.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.show_modal = false;
-                    cx.notify();
+                    this.modal_state.close(cx, |this| &mut this.modal_state);
                 });
             });
         });
-        self.show_modal = true;
+        self.modal_state.open();
         cx.notify();
     }
 
     /// 构造 Modal 弹窗元素。调用者（如 AppWindow）应在窗口根节点渲染它，
     /// 以确保 Modal 全屏居中，不被侧边栏等容器裁剪。
     pub fn build_modal(&mut self, cx: &mut Context<Self>) -> Option<Modal> {
-        if !self.show_modal {
+        if !self.modal_state.is_rendered() {
             return None;
         }
         let host_form = self.host_form.as_ref()?.clone();
@@ -171,10 +167,11 @@ impl HostView {
                 .width(px(540.))
                 .max_height(px(700.))
                 .top_padding(px(120.))
+                .closing(self.modal_state.is_closing())
+                .epoch(self.modal_state.epoch())
                 .on_close(move |_window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.show_modal = false;
-                        cx.notify();
+                        this.modal_state.close(cx, |this| &mut this.modal_state);
                     });
                 })
                 .child(host_form),

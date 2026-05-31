@@ -1,18 +1,109 @@
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, ElementId, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels,
-    RenderOnce, StatefulInteractiveElement, StyleRefinement, Styled, Window, actions, deferred,
-    div, px, point, BoxShadow,
+    Animation, AnimationExt as _, AnyElement, App, Context, ElementId, InteractiveElement,
+    IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce, StatefulInteractiveElement,
+    StyleRefinement, Styled, Task, Window, actions, deferred, div, px, point, BoxShadow,
 };
 use std::rc::Rc;
+use std::time::Duration;
 
 const CONTEXT: &str = "Modal";
+
+/// 弹窗进入动画时长（毫秒）。macOS sheet 由顶部轻柔落下、末段减速。
+const MODAL_ENTER_MS: u64 = 250;
+/// 弹窗退出动画时长（毫秒）。向上快速收拢消失。
+const MODAL_EXIT_MS: u64 = 160;
+/// 进入 / 退出动画的垂直位移（从上方滑入），像素。
+const MODAL_SLIDE_PX: f32 = 12.0;
 
 actions!(modal, [Cancel]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", Cancel, Some(CONTEXT))]);
+}
+
+/// 弹窗动画状态。封装「打开 / 关闭中 / 动画代次」与延迟卸载任务，
+/// 供调用方（如 HostView、KeychainView）持有，复用 macOS 风格的
+/// 「关闭时保持挂载直到退出动画结束」逻辑。
+#[derive(Default)]
+pub struct ModalState {
+    open: bool,
+    closing: bool,
+    epoch: u32,
+    /// 退出动画结束后清除 `closing` 的延迟任务。
+    _hide_task: Option<Task<()>>,
+}
+
+impl ModalState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 弹窗是否需要渲染（打开中或正在播放退出动画）。
+    pub fn is_rendered(&self) -> bool {
+        self.open || self.closing
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    /// 动画代次，作为动画元素 id 的一部分，确保动画从 delta=0 重新播放。
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// 打开弹窗，触发进入动画。调用方需自行 `cx.notify()`。
+    pub fn open(&mut self) {
+        self.closing = false;
+        self._hide_task = None;
+        self.open = true;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// 开始关闭：进入退出动画阶段并保持渲染，待动画结束后卸载。
+    /// `field` 用于在延迟任务里重新定位到所属实体中的 ModalState 字段。
+    pub fn close<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        field: fn(&mut T) -> &mut ModalState,
+    ) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        self.closing = true;
+        self.epoch = self.epoch.wrapping_add(1);
+        self._hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(MODAL_EXIT_MS + 40))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let state = field(this);
+                state.closing = false;
+                state._hide_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+}
+
+/// 进入缓动：ease-out-quint（快入慢停）。
+fn modal_enter_easing(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(5)
+}
+
+/// 退出缓动：ease-in-cubic（慢起快收）。
+fn modal_exit_easing(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t
 }
 
 /// A modal dialog component that renders a centered panel over a backdrop.
@@ -54,6 +145,10 @@ pub struct Modal {
     close_on_backdrop: bool,
     close_on_escape: bool,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    /// 是否正在播放退出动画。
+    closing: bool,
+    /// 动画代次，确保每次开/关从 delta=0 重新播放。
+    epoch: u32,
 }
 
 impl Modal {
@@ -75,6 +170,8 @@ impl Modal {
             close_on_backdrop: true,
             close_on_escape: true,
             on_close: None,
+            closing: false,
+            epoch: 0,
         }
     }
 
@@ -154,6 +251,19 @@ impl Modal {
         self.on_close = Some(Rc::new(handler));
         self
     }
+
+    /// 标记弹窗正在播放退出动画。由调用方根据 [`ModalState::is_closing`] 传入。
+    pub fn closing(mut self, closing: bool) -> Self {
+        self.closing = closing;
+        self
+    }
+
+    /// 设置动画代次，确保每次开/关从 delta=0 重新播放。
+    /// 由调用方根据 [`ModalState::epoch`] 传入。
+    pub fn epoch(mut self, epoch: u32) -> Self {
+        self.epoch = epoch;
+        self
+    }
 }
 
 impl ParentElement for Modal {
@@ -174,6 +284,13 @@ impl RenderOnce for Modal {
         let on_close = self.on_close.clone();
         let close_on_backdrop = self.close_on_backdrop;
         let close_on_escape = self.close_on_escape;
+
+        // 动画方向与时长：退出阶段反向播放且更快收拢。
+        let is_exit = self.closing;
+        let duration_ms = if is_exit { MODAL_EXIT_MS } else { MODAL_ENTER_MS };
+        let epoch = self.epoch;
+        let backdrop_anim_id: ElementId = ("modal-backdrop-anim", epoch).into();
+        let panel_anim_id: ElementId = ("modal-panel-anim", epoch).into();
 
         let has_max_h = self.max_height.is_some();
         let panel = div()
@@ -205,8 +322,28 @@ impl RenderOnce for Modal {
                 spread_radius: px(-8.),
             }])
             .occlude()
-            .children(self.children);
+            .children(self.children)
+            // 面板：从上方 MODAL_SLIDE_PX 处淡入滑下（进入），或向上收拢淡出（退出）。
+            .with_animation(
+                panel_anim_id,
+                Animation::new(Duration::from_millis(duration_ms)).with_easing(move |t| {
+                    if is_exit {
+                        modal_exit_easing(t)
+                    } else {
+                        modal_enter_easing(t)
+                    }
+                }),
+                move |this, delta| {
+                    let (offset_y, opacity) = if is_exit {
+                        (-MODAL_SLIDE_PX * delta, 1.0 - delta)
+                    } else {
+                        (-MODAL_SLIDE_PX * (1.0 - delta), delta)
+                    };
+                    this.top(px(offset_y)).opacity(opacity.clamp(0.0, 1.0))
+                },
+            );
 
+        let backdrop_opacity = theme.overlay_background.opacity(0.5);
         let has_top_padding = self.top_padding.is_some();
         deferred(
             div()
@@ -221,20 +358,36 @@ impl RenderOnce for Modal {
                 })
                 .when(!has_top_padding, |this| this.items_center())
                 .child(
-                    // Backdrop layer
+                    // Backdrop layer — 纯透明度淡入 / 淡出。
                     div()
                         .id("modal-backdrop")
                         .absolute()
                         .inset_0()
                         .size_full()
-                        .bg(theme.overlay_background.opacity(0.5))
+                        .bg(backdrop_opacity)
                         .when(close_on_backdrop, |this| {
                             this.on_click(move |_, window, cx| {
                                 if let Some(on_close) = &on_close {
                                     (on_close)(window, cx);
                                 }
                             })
-                        }),
+                        })
+                        .with_animation(
+                            backdrop_anim_id,
+                            Animation::new(Duration::from_millis(duration_ms)).with_easing(
+                                move |t| {
+                                    if is_exit {
+                                        modal_exit_easing(t)
+                                    } else {
+                                        modal_enter_easing(t)
+                                    }
+                                },
+                            ),
+                            move |this, delta| {
+                                let opacity = if is_exit { 1.0 - delta } else { delta };
+                                this.opacity(opacity.clamp(0.0, 1.0))
+                            },
+                        ),
                 )
                 .child(
                     // Content layer - centered panel

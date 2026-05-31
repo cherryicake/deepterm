@@ -1,18 +1,38 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, Pixels, Render, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
-    div, point, px, svg,
+    Animation, AnimationExt as _, App, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, SharedString, Task,
+    Window, anchored, canvas, deferred, div, point, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::button::Size;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::theme::ActiveTheme;
+
+/// 下拉进入动画时长（毫秒）。
+const SELECT_ENTER_MS: u64 = 160;
+/// 下拉退出动画时长（毫秒）。
+const SELECT_EXIT_MS: u64 = 110;
+/// 进入 / 退出动画的垂直位移，像素。
+const SELECT_SLIDE_PX: f32 = 6.0;
+
+/// 进入缓动：ease-out-quint（快入慢停）。
+fn select_enter_easing(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(5)
+}
+
+/// 退出缓动：ease-in-cubic（慢起快收）。
+fn select_exit_easing(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t
+}
 
 /// A searchable select component with a trigger and an anchored popup list.
 pub struct Select {
@@ -28,6 +48,10 @@ pub struct Select {
     scroll_handle: ScrollHandle,
     on_select: Option<Arc<dyn Fn(SharedString, usize, &mut App) + Send + Sync>>,
     trigger_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
+    /// 动画代次，确保每次开/关从 delta=0 重新播放。
+    anim_epoch: u32,
+    /// 退出动画结束后清除 `is_closing` 的延迟任务。
+    _close_task: Option<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -60,6 +84,8 @@ impl Select {
                 scroll_handle: ScrollHandle::new(),
                 on_select: None,
                 trigger_bounds: Rc::new(Cell::new(gpui::Bounds::default())),
+                anim_epoch: 0,
+                _close_task: None,
                 _subscriptions: Vec::new(),
             };
 
@@ -129,6 +155,9 @@ impl Select {
             self.close(cx);
         } else {
             self.is_open = true;
+            self.is_closing = false;
+            self._close_task = None;
+            self.anim_epoch = self.anim_epoch.wrapping_add(1);
             self.query_input
                 .update(cx, |input, cx| input.set_text("", cx));
             let indices = self.filtered_item_indices(cx);
@@ -142,15 +171,24 @@ impl Select {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        if !self.is_open {
+            return;
+        }
         self.is_open = false;
         self.is_closing = true;
+        self.anim_epoch = self.anim_epoch.wrapping_add(1);
         cx.notify();
-        let entity = cx.entity();
-        cx.defer(move |cx| {
-            _ = entity.update(cx, |this, _cx| {
+        // 退出动画结束后卸载下拉。略多留几毫秒以容忍帧调度抖动。
+        self._close_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECT_EXIT_MS + 40))
+                .await;
+            let _ = this.update(cx, |this, cx| {
                 this.is_closing = false;
+                this._close_task = None;
+                cx.notify();
             });
-        });
+        }));
     }
 
     fn confirm(&mut self, item: SharedString, item_idx: usize, cx: &mut Context<Self>) {
@@ -201,7 +239,9 @@ impl Focusable for Select {
 impl Render for Select {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let is_open = self.is_open;
+        let is_rendered = self.is_open || self.is_closing;
+        let is_exit = self.is_closing;
+        let anim_epoch = self.anim_epoch;
         let indices = self.filtered_item_indices(cx);
         let selected = self.selected_item.clone();
         let trigger_bounds = self.trigger_bounds.clone();
@@ -367,7 +407,9 @@ impl Render for Select {
                         .size_full()
                     }),
             )
-            .when(is_open, move |this| {
+            .when(is_rendered, move |this| {
+                let duration_ms = if is_exit { SELECT_EXIT_MS } else { SELECT_ENTER_MS };
+                let anim_id: gpui::ElementId = ("select-anim", anim_epoch).into();
                 this.child(
                     deferred(
                         anchored()
@@ -444,6 +486,26 @@ impl Render for Select {
                                                 .flex_col()
                                                 .gap(px(2.0))
                                                 .children(item_elements),
+                                        )
+                                        .with_animation(
+                                            anim_id,
+                                            Animation::new(Duration::from_millis(duration_ms))
+                                                .with_easing(move |t| {
+                                                    if is_exit {
+                                                        select_exit_easing(t)
+                                                    } else {
+                                                        select_enter_easing(t)
+                                                    }
+                                                }),
+                                            move |this, delta| {
+                                                let (offset_y, opacity) = if is_exit {
+                                                    (-SELECT_SLIDE_PX * delta, 1.0 - delta)
+                                                } else {
+                                                    (-SELECT_SLIDE_PX * (1.0 - delta), delta)
+                                                };
+                                                this.top(px(offset_y))
+                                                    .opacity(opacity.clamp(0.0, 1.0))
+                                            },
                                         ),
                                 )
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx))),
