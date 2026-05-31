@@ -15,7 +15,7 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 
-pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+pub const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
 const ANIMATION_ENTER_MS: u64 = 300;
 const ANIMATION_EXIT_MS: u64 = 250;
@@ -128,7 +128,7 @@ impl MacosSidebar {
             font_view: None,
             host_view: None,
             keychain_view: None,
-            width: SIDEBAR_MIN_WIDTH,
+            width: 280.0,
             resize_drag_x: None,
             app_window: None,
         }
