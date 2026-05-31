@@ -12,10 +12,11 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 
-const SIDEBAR_WIDTH: f32 = 260.0;
+pub const SIDEBAR_WIDTH: f32 = 260.0;
+pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
 const ANIMATION_ENTER_MS: u64 = 300;
 const ANIMATION_EXIT_MS: u64 = 250;
-const BUTTON_LEFT_OPEN: f32 = 220.0;
 const BUTTON_LEFT_CLOSED: f32 = 84.0;
 const BUTTON_TOP: f32 = 12.0;
 
@@ -225,10 +226,11 @@ impl MacosSidebar {
 
     /// 渲染侧边栏本体（含入场/退出动画、菜单内容）。
     /// 完全收起时返回宽度为 0 的占位，保证始终参与 flex 布局。
-    pub fn render_sidebar<F, G>(&self, cx: &gpui::App, on_select: F, on_double_click: G) -> gpui::AnyElement
+    pub fn render_sidebar<F, G, R>(&self, width: f32, cx: &gpui::App, on_select: F, on_double_click: G, on_resize_start: R) -> gpui::AnyElement
     where
         F: Fn(&str, &mut Window, &mut gpui::App) + 'static,
         G: Fn(&crate::ssh::config::SshConnectionConfig, &mut Window, &mut gpui::App) + 'static,
+        R: Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
     {
         if !self.visible && !self.animating_out {
             return div()
@@ -238,7 +240,7 @@ impl MacosSidebar {
                 .into_any_element();
         }
 
-        let target_width = SIDEBAR_WIDTH;
+        let target_width = width;
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
         let on_select = Rc::new(on_select);
@@ -287,6 +289,17 @@ impl MacosSidebar {
                 }
             });
 
+        // Resize handle：贴 sidebar 右边缘，默认透明，hover 显淡色背景
+        let resize_handle = div()
+            .absolute()
+            .right(px(0.0))
+            .top(px(8.0))
+            .bottom(px(8.0))
+            .w(px(4.0))
+            .cursor_col_resize()
+            .hover(|style| style.bg(theme.drop_target.opacity(0.3)))
+            .on_mouse_down(gpui::MouseButton::Left, on_resize_start);
+
         // 控制侧边栏整体轮廓
         let padded = div()
             .w(px(target_width))
@@ -294,7 +307,9 @@ impl MacosSidebar {
             .pt(px(8.0))
             .pb(px(8.0))
             .h_full()
-            .child(inner);
+            .relative()
+            .child(inner)
+            .child(resize_handle);
 
         div()
             .id((anim_id, self.epoch))
@@ -539,6 +554,7 @@ impl MacosSidebar {
     /// `is_fullscreen` 用于 macOS 全屏模式：此时没有交通灯按钮，无需额外左偏移。
     pub fn render_toggle_button<F>(
         &self,
+        width: f32,
         cx: &gpui::App,
         is_fullscreen: bool,
         on_toggle: F,
@@ -553,8 +569,8 @@ impl MacosSidebar {
             // Windows/Linux 没有交通灯按钮；macOS 全屏时也没有
             8.0
         };
-        // 侧边栏打开时，按钮位置所有平台一致
-        let button_left_open = BUTTON_LEFT_OPEN;
+        // 侧边栏打开时，按钮位置与 sidebar 右边缘保持固定间距
+        let button_left_open = width - 40.0;
         let (start_left, end_left, duration_ms) = if self.visible {
             (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
         } else {

@@ -21,7 +21,7 @@ use gpui::{
     actions, div, px,
 };
 
-use crate::components::macos_sidebar::MacosSidebar;
+use crate::components::macos_sidebar::{MacosSidebar, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH};
 use crate::components::title_bar::TitleBar;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
@@ -43,6 +43,8 @@ pub struct AppWindow {
     workspace: Entity<Workspace>,
     ssh_picker: Entity<SshPicker>,
     sidebar: MacosSidebar,
+    sidebar_width: f32,
+    sidebar_resize_drag_x: Option<gpui::Pixels>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
@@ -111,6 +113,8 @@ impl AppWindow {
             workspace,
             ssh_picker,
             sidebar,
+            sidebar_width: SIDEBAR_MIN_WIDTH,
+            sidebar_resize_drag_x: None,
             _sidebar_hide_task: None,
             host_view,
             keychain_view,
@@ -148,17 +152,31 @@ impl AppWindow {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = self.sidebar.clone();
         let entity = cx.entity();
+        let width = self.sidebar_width;
         div().child(sidebar.render_sidebar(
+            width,
             cx,
-            move |id, _window, cx| {
-                entity.update(cx, |this, cx| {
-                    this.sidebar.handle_item_select(id);
-                    cx.notify();
-                });
+            {
+                let entity = entity.clone();
+                move |id, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.sidebar.handle_item_select(id);
+                        cx.notify();
+                    });
+                }
             },
             move |config, window, cx| {
                 // HostView 内部已处理双击连接，此回调保留但不再用于 Host 视图
                 let _ = (config, window, cx);
+            },
+            {
+                let entity = entity.clone();
+                move |event, _window, cx| {
+                    entity.update(cx, |this, _cx| {
+                        this.sidebar_resize_drag_x = Some(event.position.x);
+                    });
+                    cx.stop_propagation();
+                }
             },
         ))
     }
@@ -170,6 +188,7 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.sidebar.render_toggle_button(
+            self.sidebar_width,
             cx,
             window.is_fullscreen(),
             cx.listener(|this, _, window, cx| {
@@ -275,6 +294,33 @@ impl Render for AppWindow {
             .child(self.render_main_area(window, cx))
             .child(self.render_sidebar_toggle(window, cx))
             .child(self.ssh_picker.clone());
+
+        // 侧边栏 resize 拖拽中：全屏覆盖层捕获鼠标事件，保持 cursor 为 col-resize
+        if self.sidebar_resize_drag_x.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .cursor_col_resize()
+                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                        if let Some(start_x) = this.sidebar_resize_drag_x {
+                            let delta: f32 = (event.position.x - start_x).into();
+                            let new_width = (this.sidebar_width + delta)
+                                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                            this.sidebar_width = new_width;
+                            this.sidebar_resize_drag_x = Some(event.position.x);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.sidebar_resize_drag_x = None;
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
 
         // Host Modal 必须在窗口根节点渲染，才能全屏居中，不被侧边栏裁剪。
         if let Some(modal) = self.host_view.update(cx, |hv, cx| hv.build_modal(cx)) {
