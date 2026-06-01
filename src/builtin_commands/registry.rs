@@ -137,7 +137,7 @@ pub fn init_global_registry() -> CommandRegistry {
     registry.register(BuiltinCommand {
         name: "/open",
         description: "Open DeepTerm's File Browser.",
-        icon: Icon::Folder,
+        icon: Icon::FolderOutline,
         availability: Availability::Always,
         argument: ArgumentType::Optional {
             hint: Some("file_path"),

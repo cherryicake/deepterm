@@ -2010,7 +2010,7 @@ where
                             svg()
                                 .size(px(12.0))
                                 .text_color(theme.icon_muted)
-                                .path(crate::assets::Icon::Reveal.path()),
+                                .path(crate::assets::Icon::Clock.path()),
                         ),
                 )
                 .child(

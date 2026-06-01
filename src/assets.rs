@@ -72,6 +72,8 @@ pub enum Icon {
     Font,
     PlusCircleFull,
     PersonBadgeKey,
+    Clock,
+    FolderOutline,
 }
 
 impl Icon {
@@ -121,6 +123,8 @@ impl Icon {
             Icon::Font => SharedString::new_static("icons/font.svg"),
             Icon::PlusCircleFull => SharedString::new_static("icons/plus.circle.full.svg"),
             Icon::PersonBadgeKey => SharedString::new_static("icons/person.badge.key.fill.svg"),
+            Icon::Clock => SharedString::new_static("icons/clock.svg"),
+            Icon::FolderOutline => SharedString::new_static("icons/folder.svg"),
         }
     }
 }
