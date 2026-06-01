@@ -7,7 +7,7 @@
 //! 不会出现字体字形带来的间隙或粗细不一致问题。
 //! 对应 Alacritty 的 `builtin_box_drawing = true` 配置项。
 
-use gpui::{Background, Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px, size};
+use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, fill, point, px, size};
 
 // ─── 线段编码方案 ─────────────────────────────────────────────────────────────
 // 每个盒子绘制字符用一个 u8 位域描述其四个方向的线段粗细：
@@ -508,8 +508,11 @@ fn quadrant_paint(
 
 /// 绘制圆角字符（╭╮╯╰，U+256D–U+2570）。
 ///
-/// 每个字符由两段直线 + 一段 1/4 圆弧组成，圆弧半径等于格子短边的一半，
-/// 使用 GPUI PathBuilder（基于 lyon）生成描边路径后通过 `window.paint_path` 渲染。
+/// 每个字符由两段直线 + 一段 1/4 圆弧组成，圆弧半径等于格子短边的一半。
+/// 为了保证圆角弧线与相邻直线段（由 `paint_segments` 用填充矩形绘制）
+/// 在视觉上颜色完全一致，本函数不使用描边（stroke），而是构建一个
+/// 1/4 圆环（annulus sector）的填充路径，通过 `window.paint_path` 以
+/// 填充模式渲染，从而避免描边抗锯齿带来的边缘半透明问题。
 ///
 /// 圆弧中心在格子中心向角落方向偏移 r 处，使弧线恰好与直线段平滑衔接：
 ///
@@ -519,14 +522,6 @@ fn quadrant_paint(
 ///   │         │        │          │
 ///   ▼         ▼        ▲          ▲
 /// ```
-///
-/// sweep / large_arc 参数对照（所有弧均为 small arc）：
-/// | char | lines   | sweep | 弧心方向      |
-/// |------|---------|-------|--------------|
-/// | ╭    | right+down | false | 右下 (hc+r, vc+r) |
-/// | ╮    | left+down  | true  | 左下 (hc-r, vc+r) |
-/// | ╯    | left+up    | false | 左上 (hc-r, vc-r) |
-/// | ╰    | right+up   | true  | 右上 (hc+r, vc-r) |
 fn paint_rounded_corner(
     code: u32,
     origin: Point<Pixels>,
@@ -538,49 +533,168 @@ fn paint_rounded_corner(
     let s = stroke(cell_w);
     let hc = px((cell_w.as_f32() / 2.0).floor());
     let vc = px((cell_h.as_f32() / 2.0).floor());
-    // 圆弧半径取格子短边的一半，保证圆弧能填满角落四分之一区域
     let r = hc.min(vc);
     let w = cell_w;
     let h = cell_h;
 
-    // 将格子局部坐标转换为窗口绝对坐标
     let abs = |lx: Pixels, ly: Pixels| -> Point<Pixels> { point(origin.x + lx, origin.y + ly) };
+    let mut paint = |quad: Bounds<Pixels>| window.paint_quad(fill(quad, color));
 
-    let mut builder = PathBuilder::stroke(s);
+    // 半径太小，退化为直角线段（与 paint_segments 的直线绘制方式一致）
+    if r < px(1.0) {
+        match code {
+            0x256D => {
+                paint(Bounds {
+                    origin: abs(hc, vc - s * 0.5),
+                    size: size(w - hc, s),
+                });
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, vc),
+                    size: size(s, h - vc),
+                });
+            }
+            0x256E => {
+                paint(Bounds {
+                    origin: abs(px(0.0), vc - s * 0.5),
+                    size: size(hc, s),
+                });
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, vc),
+                    size: size(s, h - vc),
+                });
+            }
+            0x256F => {
+                paint(Bounds {
+                    origin: abs(px(0.0), vc - s * 0.5),
+                    size: size(hc, s),
+                });
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, px(0.0)),
+                    size: size(s, vc),
+                });
+            }
+            0x2570 => {
+                paint(Bounds {
+                    origin: abs(hc, vc - s * 0.5),
+                    size: size(w - hc, s),
+                });
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, px(0.0)),
+                    size: size(s, vc),
+                });
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let r_out = r + s * 0.5;
+    let r_in = (r - s * 0.5).max(px(0.0));
+    let has_inner = r_in > px(0.0);
+
+    let mut builder = PathBuilder::fill();
 
     match code {
         // ╭ (256D)：right + down，弧心在右下 (hc+r, vc+r)
         0x256D => {
-            builder.move_to(abs(w, vc));
-            builder.line_to(abs(hc + r, vc));
-            builder.arc_to(point(r, r), px(0.0), false, false, abs(hc, vc + r));
-            builder.line_to(abs(hc, h));
+            if w > hc + r {
+                paint(Bounds {
+                    origin: abs(hc + r, vc - s * 0.5),
+                    size: size(w - (hc + r), s),
+                });
+            }
+            if h > vc + r {
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, vc + r),
+                    size: size(s, h - (vc + r)),
+                });
+            }
+            builder.move_to(abs(hc + r, vc - s * 0.5));
+            builder.arc_to(point(r_out, r_out), px(0.0), false, false, abs(hc - s * 0.5, vc + r));
+            if has_inner {
+                builder.line_to(abs(hc + s * 0.5, vc + r));
+                builder.arc_to(point(r_in, r_in), px(0.0), false, true, abs(hc + r, vc + s * 0.5));
+            } else {
+                builder.line_to(abs(hc + r, vc + r));
+            }
+            builder.line_to(abs(hc + r, vc - s * 0.5));
         }
         // ╮ (256E)：left + down，弧心在左下 (hc-r, vc+r)
         0x256E => {
-            builder.move_to(abs(px(0.0), vc));
-            builder.line_to(abs(hc - r, vc));
-            builder.arc_to(point(r, r), px(0.0), false, true, abs(hc, vc + r));
-            builder.line_to(abs(hc, h));
+            if hc > r {
+                paint(Bounds {
+                    origin: abs(px(0.0), vc - s * 0.5),
+                    size: size(hc - r, s),
+                });
+            }
+            if h > vc + r {
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, vc + r),
+                    size: size(s, h - (vc + r)),
+                });
+            }
+            builder.move_to(abs(hc - r, vc - s * 0.5));
+            builder.arc_to(point(r_out, r_out), px(0.0), false, true, abs(hc + s * 0.5, vc + r));
+            if has_inner {
+                builder.line_to(abs(hc - s * 0.5, vc + r));
+                builder.arc_to(point(r_in, r_in), px(0.0), false, false, abs(hc - r, vc + s * 0.5));
+            } else {
+                builder.line_to(abs(hc - r, vc + r));
+            }
+            builder.line_to(abs(hc - r, vc - s * 0.5));
         }
         // ╯ (256F)：left + up，弧心在左上 (hc-r, vc-r)
         0x256F => {
-            builder.move_to(abs(px(0.0), vc));
-            builder.line_to(abs(hc - r, vc));
-            builder.arc_to(point(r, r), px(0.0), false, false, abs(hc, vc - r));
-            builder.line_to(abs(hc, px(0.0)));
+            if hc > r {
+                paint(Bounds {
+                    origin: abs(px(0.0), vc - s * 0.5),
+                    size: size(hc - r, s),
+                });
+            }
+            if vc > r {
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, px(0.0)),
+                    size: size(s, vc - r),
+                });
+            }
+            builder.move_to(abs(hc - r, vc + s * 0.5));
+            builder.arc_to(point(r_out, r_out), px(0.0), false, false, abs(hc + s * 0.5, vc - r));
+            if has_inner {
+                builder.line_to(abs(hc - s * 0.5, vc - r));
+                builder.arc_to(point(r_in, r_in), px(0.0), false, true, abs(hc - r, vc - s * 0.5));
+            } else {
+                builder.line_to(abs(hc - r, vc - r));
+            }
+            builder.line_to(abs(hc - r, vc + s * 0.5));
         }
         // ╰ (2570)：right + up，弧心在右上 (hc+r, vc-r)
         0x2570 => {
-            builder.move_to(abs(w, vc));
-            builder.line_to(abs(hc + r, vc));
-            builder.arc_to(point(r, r), px(0.0), false, true, abs(hc, vc - r));
-            builder.line_to(abs(hc, px(0.0)));
+            if w > hc + r {
+                paint(Bounds {
+                    origin: abs(hc + r, vc - s * 0.5),
+                    size: size(w - (hc + r), s),
+                });
+            }
+            if vc > r {
+                paint(Bounds {
+                    origin: abs(hc - s * 0.5, px(0.0)),
+                    size: size(s, vc - r),
+                });
+            }
+            builder.move_to(abs(hc + r, vc + s * 0.5));
+            builder.arc_to(point(r_out, r_out), px(0.0), false, true, abs(hc - s * 0.5, vc - r));
+            if has_inner {
+                builder.line_to(abs(hc + s * 0.5, vc - r));
+                builder.arc_to(point(r_in, r_in), px(0.0), false, false, abs(hc + r, vc - s * 0.5));
+            } else {
+                builder.line_to(abs(hc + r, vc - r));
+            }
+            builder.line_to(abs(hc + r, vc + s * 0.5));
         }
         _ => return,
     }
 
     if let Ok(path) = builder.build() {
-        window.paint_path(path, Background::from(color));
+        window.paint_path(path, color);
     }
 }
