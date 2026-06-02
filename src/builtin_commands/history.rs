@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// 历史中保留的最大条目数，超出按 score 最低淘汰。
 const MAX_ENTRIES: usize = 200;
 /// 一次匹配最多返回的历史候选数。
-const MAX_MATCHES: usize = 8;
+const MAX_MATCHES: usize = 3;
 
 /// 单条历史记录。
 #[derive(Clone, Debug, Serialize, Deserialize)]
