@@ -1340,11 +1340,35 @@ impl Terminal {
         }
         let term = self.term.lock();
         let mode = term.mode();
-        mode.intersects(TermMode::MOUSE_MODE)
+        mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::VI)
+    }
+
+    fn clear_selection_for_mouse(&mut self) -> bool {
+        let mut term = self.term.lock();
+        let selection = term.selection.take();
+        selection.is_some_and(|selection| !selection.is_empty())
+    }
+
+    fn start_selection(&mut self, ty: SelectionType, point: AlacPoint, side: Side) {
+        let mut term = self.term.lock();
+        term.selection = Some(Selection::new(ty, point, side));
+        self.selection_phase = SelectionPhase::Started;
+    }
+
+    fn update_selection(&mut self, mut point: AlacPoint, side: Side) -> bool {
+        let mut term = self.term.lock();
+        let mut selection = match term.selection.take() {
+            Some(selection) => selection,
+            None => return false,
+        };
+
+        point.line = std::cmp::min(point.line, term.bottommost_line());
+        selection.update(point, side);
+        term.selection = Some(selection);
+        true
     }
 
     pub fn mouse_down(&mut self, e: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
-        // Convert to local coordinates relative to terminal bounds
         let position = e.position - self.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
@@ -1352,81 +1376,53 @@ impl Terminal {
             self.last_content.display_offset,
         );
 
-        // Double/triple click: always create a local selection and copy immediately,
-        // even in mouse mode (tmux, vim, etc.) so that copy works reliably over SSH.
-        if e.button == gpui::MouseButton::Left && e.click_count >= 2 {
-            let (point, side) = grid_point_and_side(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-            );
-
-            let selection_type = match e.click_count {
-                2 => Some(SelectionType::Semantic),
-                3 => Some(SelectionType::Lines),
-                _ => None,
-            };
-
-            if let Some(sel_type) = selection_type {
-                let mut term = self.term.lock();
-                let selection = Selection::new(sel_type, point, side);
-                term.selection = Some(selection);
-                self.selection_phase = SelectionPhase::Started;
-                drop(term);
-
-                // Copy to clipboard immediately on double/triple click
-                let term = self.term.lock();
-                if let Some(text) = term.selection_to_string() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-                cx.emit(Event::SelectionsChanged);
-            }
-            return;
-        }
-
         if self.mouse_mode(e.modifiers.shift) {
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode)
             {
                 self.write(&bytes);
             }
-        } else {
-            if let gpui::MouseButton::Left = e.button {
-                let (point, side) = grid_point_and_side(
-                    position,
-                    self.terminal_bounds,
-                    self.last_content.display_offset,
-                );
+            return;
+        }
 
-                let selection_type = match e.click_count {
-                    0 => return,
-                    1 => Some(SelectionType::Simple),
-                    _ => None,
-                };
+        if let gpui::MouseButton::Left = e.button {
+            let (point, side) = grid_point_and_side(
+                position,
+                self.terminal_bounds,
+                self.last_content.display_offset,
+            );
 
-                if let Some(sel_type) = selection_type {
-                    let mut term = self.term.lock();
-                    let selection = Selection::new(sel_type, point, side);
-                    term.selection = Some(selection);
-                    self.selection_phase = SelectionPhase::Started;
+            match e.click_count {
+                1 => {
+                    let cleared_non_empty_selection = self.clear_selection_for_mouse();
+                    self.start_selection(
+                        if e.modifiers.control {
+                            SelectionType::Block
+                        } else {
+                            SelectionType::Simple
+                        },
+                        point,
+                        side,
+                    );
+                    if cleared_non_empty_selection {
+                        cx.emit(Event::SelectionsChanged);
+                    }
+                }
+                2 if !e.modifiers.control => {
+                    self.start_selection(SelectionType::Semantic, point, side);
                     cx.emit(Event::SelectionsChanged);
                 }
+                3 if !e.modifiers.control => {
+                    self.start_selection(SelectionType::Lines, point, side);
+                    cx.emit(Event::SelectionsChanged);
+                }
+                _ => return,
             }
         }
     }
 
     pub fn mouse_up(&mut self, e: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
-        // Convert to local coordinates relative to terminal bounds
         let position = e.position - self.terminal_bounds.bounds.origin;
-
-        // Copy selection on mouse up regardless of mouse mode, so that
-        // drag-to-extend after a double/triple click also copies reliably.
-        if e.button == gpui::MouseButton::Left && self.selection_phase != SelectionPhase::Ended {
-            let term = self.term.lock();
-            if let Some(text) = term.selection_to_string() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-        }
 
         if self.mouse_mode(e.modifiers.shift) {
             let point = grid_point(
@@ -1440,30 +1436,35 @@ impl Terminal {
             {
                 self.write(&bytes);
             }
+            return;
+        }
+
+        if matches!(e.button, gpui::MouseButton::Left | gpui::MouseButton::Right) {
+            self.copy(cx);
         }
 
         self.selection_phase = SelectionPhase::Ended;
     }
 
     pub fn mouse_drag(&mut self, e: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        // Allow extending local selection regardless of mouse mode, so that
-        // double/triple-click selections can be dragged even inside tmux.
-        if self.selection_phase != SelectionPhase::Ended {
-            self.selection_phase = SelectionPhase::Selecting;
-            // Convert to local coordinates relative to terminal bounds
-            let position = e.position - self.terminal_bounds.bounds.origin;
-            let (point, side) = grid_point_and_side(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-            );
+        if self.selection_phase == SelectionPhase::Ended {
+            return;
+        }
 
-            let mut term = self.term.lock();
-            if let Some(mut selection) = term.selection.take() {
-                selection.update(point, side);
-                term.selection = Some(selection);
-                cx.emit(Event::SelectionsChanged);
-            }
+        if self.mouse_mode(e.modifiers.shift) {
+            return;
+        }
+
+        self.selection_phase = SelectionPhase::Selecting;
+        let position = e.position - self.terminal_bounds.bounds.origin;
+        let (point, side) = grid_point_and_side(
+            position,
+            self.terminal_bounds,
+            self.last_content.display_offset,
+        );
+
+        if self.update_selection(point, side) {
+            cx.emit(Event::SelectionsChanged);
         }
     }
 
@@ -1584,32 +1585,8 @@ impl Terminal {
         let Some(range) = self.selection_range() else {
             return false;
         };
-        let point_line = point.line.0;
-        let point_col = point.column.0;
 
-        // 确定选择范围的正常顺序
-        let (start, end) = if range.start.line <= range.end.line {
-            (range.start, range.end)
-        } else {
-            (range.end, range.start)
-        };
-
-        // 检查行范围
-        if point_line < start.line.0 || point_line > end.line.0 {
-            return false;
-        }
-
-        // 同一行的特殊情况
-        if start.line == end.line {
-            return point_col >= start.column.0 && point_col <= end.column.0;
-        }
-
-        // 多行选择的边界检查
-        match point_line.cmp(&start.line.0) {
-            std::cmp::Ordering::Equal => point_col >= start.column.0,
-            std::cmp::Ordering::Greater if point_line == end.line.0 => point_col <= end.column.0,
-            _ => true,
-        }
+        range.contains(*point)
     }
 
     pub fn clear_selection(&mut self) {
@@ -1680,7 +1657,7 @@ impl Terminal {
     // Copy/Paste
     pub fn copy(&mut self, cx: &mut Context<Self>) {
         let term = self.term.lock();
-        if let Some(text) = term.selection_to_string() {
+        if let Some(text) = term.selection_to_string().filter(|text| !text.is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }

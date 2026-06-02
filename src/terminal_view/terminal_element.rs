@@ -71,29 +71,7 @@ fn rendered_cell_colors(
 /// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
 #[inline]
 fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
-    let Some(range) = range else { return false };
-    let point_line = point.line.0;
-    let point_col = point.column.0;
-
-    let (start, end) = if range.start.line <= range.end.line {
-        (range.start, range.end)
-    } else {
-        (range.end, range.start)
-    };
-
-    if point_line < start.line.0 || point_line > end.line.0 {
-        return false;
-    }
-
-    if start.line == end.line {
-        return point_col >= start.column.0 && point_col <= end.column.0;
-    }
-
-    match point_line.cmp(&start.line.0) {
-        std::cmp::Ordering::Equal => point_col >= start.column.0,
-        std::cmp::Ordering::Greater if point_line == end.line.0 => point_col <= end.column.0,
-        _ => true,
-    }
+    range.as_ref().is_some_and(|range| range.contains(*point))
 }
 
 /// Cached per-row layout for one visible row.
@@ -384,9 +362,9 @@ impl TerminalElement {
         let (fg, _bg) = rendered_cell_colors(&cell.cell);
         let underline = if is_hovered_url {
             Some(gpui::UnderlineStyle {
-                color: Some(terminal_theme.named_color(
-                    alacritty_terminal::vte::ansi::NamedColor::Blue,
-                )),
+                color: Some(
+                    terminal_theme.named_color(alacritty_terminal::vte::ansi::NamedColor::Blue),
+                ),
                 thickness: px(1.0),
                 wavy: false,
             })
@@ -553,7 +531,8 @@ impl TerminalElement {
                 continue;
             }
 
-            let cell_style = Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
+            let cell_style =
+                Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
             let is_space = ch == ' ';
 
             match current_batch.as_mut() {
@@ -1613,8 +1592,10 @@ impl Element for TerminalElement {
             for (idx, row) in input_overlay.rows.iter().enumerate() {
                 let row_y = input_overlay.origin.y + *line_height * idx as f32;
                 for seg in row.segments.iter() {
-                    let seg_origin =
-                        point(input_overlay.origin.x + *cell_width * seg.start_col as f32, row_y);
+                    let seg_origin = point(
+                        input_overlay.origin.x + *cell_width * seg.start_col as f32,
+                        row_y,
+                    );
                     let _ = seg.shaped_line.paint(
                         seg_origin,
                         *line_height,
