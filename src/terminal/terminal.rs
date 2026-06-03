@@ -34,7 +34,6 @@ use crate::ssh::{
     keychain::{PreferredSshTransport, preferred_ssh_transport},
     platform::RemoteOS,
 };
-use crate::terminal::clipboard::{handle_osc52, parse_osc52};
 use crate::terminal::link_detector::UrlRange;
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -908,11 +907,7 @@ impl Terminal {
         Cow::Owned(result)
     }
 
-    fn try_handle_osc_sequence(&mut self, cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
-        if Self::try_handle_osc52(cx, osc_content) {
-            return true;
-        }
-
+    fn try_handle_osc_sequence(&mut self, _cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
         if Self::is_shell_prompt_osc(osc_content) {
             self.remote_shell_ready = true;
             return true;
@@ -929,29 +924,6 @@ impl Terminal {
         }
 
         false
-    }
-
-    /// 尝试处理 OSC 52 序列
-    /// 返回 true 如果成功处理，false 如果不是 OSC 52
-    fn try_handle_osc52(cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
-        // 快速检查 OSC 52 前缀 "52;" (避免不必要的 UTF-8 转换)
-        if osc_content.len() < 3
-            || osc_content[0] != b'5'
-            || osc_content[1] != b'2'
-            || osc_content[2] != b';'
-        {
-            return false;
-        }
-
-        // OSC 52 内容是 ASCII (base64)，可以安全地使用 from_utf8_unchecked
-        let content_str = unsafe { std::str::from_utf8_unchecked(osc_content) };
-
-        if let Some(operation) = parse_osc52(content_str) {
-            handle_osc52(cx, &operation);
-            true
-        } else {
-            false
-        }
     }
 
     fn is_shell_prompt_osc(osc_content: &[u8]) -> bool {
@@ -1076,11 +1048,9 @@ impl Terminal {
                 cx.emit(Event::CloseTerminal);
             }
             AlacTermEvent::ClipboardStore(_, data) => {
-                // 处理 OSC 52 剪贴板存储请求
                 cx.write_to_clipboard(ClipboardItem::new_string(data));
             }
             AlacTermEvent::ClipboardLoad(_clipboard_type, format) => {
-                // 响应剪贴板查询请求 (XTGETTCAP Ms)
                 let clipboard_content = cx
                     .read_from_clipboard()
                     .and_then(|item| item.text().map(|t| t.to_string()))

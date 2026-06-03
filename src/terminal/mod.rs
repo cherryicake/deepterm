@@ -1,4 +1,3 @@
-pub mod clipboard;
 pub mod link_detector;
 pub mod mappings;
 pub mod terminal;

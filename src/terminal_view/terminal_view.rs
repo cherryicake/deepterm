@@ -2152,18 +2152,29 @@ impl Render for TerminalView {
             self.scrollbar_hide_scheduled_at = None;
         }
 
+        let terminal_mouse_mode = self.terminal.read(cx).mouse_mode(false);
+
+        // 终端进入 mouse mode 时，鼠标事件已经由 ncurses、vim、tmux、lazygit 等 TUI 应用接管，
+        // 此时用户在屏幕上的拖拽并不是 DeepTerm 本地文本选择，而是需要原样转发给远端应用的终端鼠标协议。
+        // 参考 alacritty 的策略，这种场景下应显示普通箭头光标，而不是文本输入区域常用的 IBeam：
+        // 1. 箭头能更准确表达“当前由 TUI 应用处理鼠标交互”，避免误导用户以为是在选择宿主应用文本；
+        // 2. macOS 上一些全局划词/翻译工具会把 IBeam + 拖选识别为普通文本选择，并监听或改写系统剪切板；
+        // 3. OSC52 复制本身由远端 TUI 通过转义序列完成，若外部工具在拖选期间介入，会造成 DeepTerm 写入成功但 Cmd+V 得到旧内容。
+        // 因此只有在非 mouse mode、由 DeepTerm 自己负责本地终端选区时，才继续显示 IBeam。
+        let cursor_style = if self.hovered_link.is_some() {
+            CursorStyle::PointingHand
+        } else if terminal_mouse_mode {
+            CursorStyle::Arrow
+        } else {
+            CursorStyle::IBeam
+        };
+
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context(CONTEXT)
-            .cursor(
-                if self.hovered_link.is_some() {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::IBeam
-                },
-            )
+            .cursor(cursor_style)
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 this.copy(cx);
             }))
