@@ -35,13 +35,13 @@ keyring = { version = "3.6", features = ["apple-native"] }
 
 # Async runtime compatibility
 tokio = { version = "1", features = [
-  "rt",
-  "rt-multi-thread",
-  "io-util",
-  "fs",
-  "net",
-  "sync",
-  "time",
+    "rt",
+    "rt-multi-thread",
+    "io-util",
+    "fs",
+    "net",
+    "sync",
+    "time",
 ] }
 async-process = "2.3"
 async-io = "2.4"
@@ -62,8 +62,8 @@ unicode-width = "0.2"
 
 # Code Editor
 ropey = { version = "2.0.0-beta.1", features = [
-  "metric_lines_lf",
-  "metric_utf16",
+    "metric_lines_lf",
+    "metric_utf16",
 ] }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 smallvec = "1"
@@ -88,15 +88,21 @@ open = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-russh = "0.59.0"
+russh = "0.61.1"
 
 [target.'cfg(windows)'.dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", features = ["windows-manifest"] }
-windows = { version = "0.52", features = [
-  "Win32_System_Console",
-  "Win32_Foundation",
+gpui = { git = "https://github.com/zed-industries/zed.git", features = [
+    "windows-manifest",
 ] }
-russh = { version = "0.59.0", default-features = false, features = ["flate2", "ring", "rsa"] }
+windows = { version = "0.52", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+] }
+russh = { version = "0.61.1", default-features = false, features = [
+    "flate2",
+    "ring",
+    "rsa",
+] }
 
 [target.'cfg(windows)'.dependencies.gpui_platform]
 git = "https://github.com/zed-industries/zed.git"
@@ -104,19 +110,19 @@ git = "https://github.com/zed-industries/zed.git"
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig = "0.10"
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = [
-  "wayland",
-  "x11",
+    "wayland",
+    "x11",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", features = [
-  "font-kit",
+    "font-kit",
 ] }
 mach2 = "0.4"
 
-# [patch."https://github.com/zed-industries/zed.git"]
-# gpui = {path = "../zed/crates/gpui"}
-# gpui_macos = {path = "../zed/crates/gpui_macos"}
+[patch."https://github.com/zed-industries/zed.git"]
+gpui = { path = "../zed/crates/gpui" }
+gpui_macos = { path = "../zed/crates/gpui_macos" }
 
 [package.metadata.bundle]
 name = "DeepTerm"

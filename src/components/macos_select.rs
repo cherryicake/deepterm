@@ -323,7 +323,7 @@ impl Render for MacosSelect {
 
         div()
             .relative()
-            .flex_shrink()
+            .flex_shrink(1.0)
             .min_w_0()
             .max_w_full()
             .items_start()
@@ -399,7 +399,7 @@ impl Render for MacosSelect {
                 this.child(
                     deferred(
                         anchored()
-                            .anchor(gpui::Corner::TopLeft)
+                            .anchor(gpui::Anchor::TopLeft)
                             .offset(point(
                                 px(0.0),
                                 -(px(30.0) + px(highlighted as f32 * 26.0)),

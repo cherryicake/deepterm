@@ -772,7 +772,7 @@ async fn connect_sftp(
     // 到达就报 `Packet X for unknown recipient` 并把整条传输拖崩。与 bulk 通道
     // 保持一致放到 300s —— 上层 TransferManager 自己用 `cancelled: AtomicBool`
     // 做取消，不依赖这个死等时长。
-    sftp.set_timeout(300).await;
+    sftp.set_timeout(300);
     Ok((handle, sftp))
 }
 
@@ -794,7 +794,7 @@ async fn open_raw_sftp_session(
 
     let raw = RawSftpSession::new(channel.into_stream());
     // bulk 传输耗时远超默认 10s，放宽到 5 分钟；任意单个请求都不该超过这个值。
-    raw.set_timeout(300).await;
+    raw.set_timeout(300);
     raw.init()
         .await
         .map_err(|e| anyhow!("初始化 bulk SFTP 会话失败: {}", e))?;

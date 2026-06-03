@@ -334,6 +334,7 @@ impl RenderOnce for Modal {
                 offset: point(px(0.), px(8.)),
                 blur_radius: px(32.),
                 spread_radius: px(-8.),
+                inset: false,
             }])
             .occlude()
             .children(self.children)
