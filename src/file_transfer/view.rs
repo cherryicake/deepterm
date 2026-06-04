@@ -191,39 +191,25 @@ fn render_transfer_list_item(
 
     // 进度条：运行中始终显示（确定或不确定）
     let is_completed = matches!(task.status, TransferTaskStatus::Completed { .. });
-    let progress_bar = if total_bytes > 0 {
-        let ratio = if is_completed {
-            1.0
-        } else {
-            (transferred as f64 / total_bytes as f64).clamp(0.0, 0.98)
-        };
-        div()
-            .w_full()
-            .h(px(4.0))
-            .rounded(px(2.0))
-            .bg(theme.border.opacity(0.5))
-            .child(
-                div()
-                    .h_full()
-                    .w(relative(ratio as f32))
-                    .rounded(px(2.0))
-                    .bg(rgb(0x3b82f6)),
-            )
+    let ratio = if is_completed {
+        1.0
+    } else if total_bytes > 0 {
+        (transferred as f64 / total_bytes as f64).clamp(0.0, 0.98)
     } else {
-        // 总大小未知：显示一个短条，避免全宽看起来像已完成
-        div()
-            .w_full()
-            .h(px(4.0))
-            .rounded(px(2.0))
-            .bg(theme.border.opacity(0.5))
-            .child(
-                div()
-                    .h_full()
-                    .w(relative(0.15))
-                    .rounded(px(2.0))
-                    .bg(gpui::Hsla::from(rgb(0x3b82f6)).opacity(0.5)),
-            )
+        0.0
     };
+    let progress_bar = div()
+        .w_full()
+        .h(px(4.0))
+        .rounded(px(2.0))
+        .bg(theme.border.opacity(0.5))
+        .child(
+            div()
+                .h_full()
+                .w(relative(ratio as f32))
+                .rounded(px(2.0))
+                .bg(rgb(0x3b82f6)),
+        );
 
     // 单行状态文本：连接提示 / 网速 / 结果 在同一行位置切换
     let status_text = if let Some(action) = hover {
