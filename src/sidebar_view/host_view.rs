@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, ScrollHandle,
-    SharedString, Window, div, px,
+    App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    ScrollHandle, SharedString, Window, div, px,
 };
 
 use crate::assets::Icon;
@@ -13,7 +13,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::hosts_view::{
-    ConnectHost, DeleteHost, DuplicateHost, EditHost, load_hosts_from_config,
+    ConnectHost, CopyHostAddress, DeleteHost, EditHost, load_hosts_from_config,
 };
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
@@ -459,9 +459,9 @@ impl Render for HostView {
                         let count = entity.read(_cx).selected_ids.len();
                         let mut m = menu;
                         let conn_label = if count == 1 {
-                            "Connect".to_string()
+                            "连接".to_string()
                         } else {
-                            format!("Connect {} hosts", count)
+                            format!("连接 {} 台主机", count)
                         };
                         m = m
                             .menu_with_icon(
@@ -473,17 +473,21 @@ impl Render for HostView {
                         if count == 1 {
                             m = m
                                 .menu_with_icon(
-                                    "Edit",
+                                    "编辑",
                                     MenuIcon::new("icons/edit.svg"),
                                     Box::new(EditHost),
                                 )
-                                .menu("Duplicate", Box::new(DuplicateHost))
+                                .menu_with_icon(
+                                    "拷贝地址",
+                                    MenuIcon::new("icons/document.on.document.svg"),
+                                    Box::new(CopyHostAddress),
+                                )
                                 .separator();
                         }
                         let label = if count == 1 {
-                            "Delete".to_string()
+                            "删除".to_string()
                         } else {
-                            format!("Delete {} hosts", count)
+                            format!("删除 {} 台主机", count)
                         };
                         m.menu_with_icon(
                             &label,
@@ -535,20 +539,14 @@ impl Render for HostView {
             }))
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
-                move |this, _: &DuplicateHost, _window, _cx| {
+                move |this, _: &CopyHostAddress, _window, cx| {
                     let host_id = this
                         .context_menu_host_id
                         .clone()
                         .or_else(|| this.selected_ids.iter().next().cloned());
                     if let Some(id) = host_id {
                         if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
-                            let mut new_config = config.clone();
-                            new_config.nickname =
-                                config.nickname.as_ref().map(|n| format!("{} (copy)", n));
-                            if let Ok(mut global) = SshGlobalConfig::load_or_create() {
-                                global.add_connection(new_config);
-                                let _ = global.save();
-                            }
+                            cx.write_to_clipboard(ClipboardItem::new_string(config.host.clone()));
                         }
                     }
                 }

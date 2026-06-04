@@ -3,7 +3,7 @@ use gpui::actions;
 
 actions!(
     host_actions,
-    [ConnectHost, EditHost, DuplicateHost, DeleteHost]
+    [ConnectHost, EditHost, CopyHostAddress, DeleteHost]
 );
 
 use crate::assets::Icon;
