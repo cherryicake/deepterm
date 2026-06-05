@@ -2,6 +2,8 @@
 // 在 Windows Release 构建时隐藏控制台窗口，避免双击启动时弹出终端
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
+
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
@@ -21,7 +23,7 @@ use gpui::{
     actions, div, px,
 };
 
-use crate::components::macos_sidebar::MacosSidebar;
+use crate::components::macos_sidebar::{DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabItem};
 use crate::components::title_bar::TitleBar;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
@@ -40,7 +42,9 @@ const CONTEXT: &str = "AppWindow";
 /// Root component that contains title bar, sidebar and workspace
 pub struct AppWindow {
     title_bar: Entity<TitleBar>,
+    default_workspace: Entity<Workspace>,
     workspace: Entity<Workspace>,
+    tab_group_workspaces: HashMap<String, Entity<Workspace>>,
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
@@ -84,6 +88,18 @@ impl AppWindow {
             sidebar
         });
 
+        let app_window_for_tab_group = app_window.downgrade();
+        sidebar.update(cx, |sidebar, _cx| {
+            sidebar.on_tab_group_select(move |group_id, window, cx| {
+                if let Some(app_window) = app_window_for_tab_group.upgrade() {
+                    let group_id = group_id.to_string();
+                    app_window.update(cx, |this, cx| {
+                        this.switch_tab_group_workspace(&group_id, window, cx);
+                    });
+                }
+            });
+        });
+
         // 设置 HostView 回调
         let sidebar_for_host = sidebar.clone();
         host_view.update(cx, |hv, _cx| {
@@ -94,12 +110,16 @@ impl AppWindow {
                 });
             });
         });
-        let workspace_for_host = workspace.clone();
+        let app_window_for_host = app_window.downgrade();
         host_view.update(cx, |hv, _cx| {
             hv.on_connect(move |config, window, cx| {
-                workspace_for_host.update(cx, |ws, cx| {
-                    ws.create_ssh_terminal_with_config(config, window, cx);
-                });
+                if let Some(app_window) = app_window_for_host.upgrade() {
+                    app_window.update(cx, |this, cx| {
+                        this.workspace.update(cx, |ws, cx| {
+                            ws.create_ssh_terminal_with_config(config, window, cx);
+                        });
+                    });
+                }
             });
         });
 
@@ -116,7 +136,9 @@ impl AppWindow {
 
         Self {
             title_bar,
+            default_workspace: workspace.clone(),
             workspace,
+            tab_group_workspaces: HashMap::new(),
             ssh_picker,
             sidebar,
             _sidebar_hide_task: None,
@@ -130,6 +152,90 @@ impl AppWindow {
         self.workspace.update(cx, |workspace, cx| {
             workspace.set_initial_focus(window, cx);
         });
+    }
+
+    fn bind_active_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
+        self.workspace = workspace.clone();
+        self.title_bar.update(cx, |title_bar, cx| {
+            title_bar.set_workspace(workspace.clone(), cx);
+        });
+        self.ssh_picker.update(cx, |picker, _cx| {
+            picker.set_workspace(workspace.clone());
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_ssh_picker(self.ssh_picker.clone(), cx);
+        });
+        cx.notify();
+    }
+
+    fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {
+        let default_tabs = Self::sidebar_tabs_for_workspace(&self.default_workspace, cx);
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_tab_group_tabs(DEFAULT_TAB_GROUP_ID, default_tabs, cx);
+        });
+
+        for (group_id, workspace) in &self.tab_group_workspaces {
+            let tabs = Self::sidebar_tabs_for_workspace(workspace, cx);
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_tab_group_tabs(group_id.clone(), tabs, cx);
+            });
+        }
+    }
+
+    fn sidebar_tabs_for_workspace(
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Vec<SidebarTabItem> {
+        let tab_bar = workspace.read(cx).tab_bar.clone();
+        tab_bar
+            .read(cx)
+            .tabs
+            .iter()
+            .map(|tab| SidebarTabItem {
+                label: tab.label.to_string(),
+                icon: tab.icon,
+                active: tab_bar
+                    .read(cx)
+                    .active_tab_id()
+                    .map(|active_id| active_id == &tab.id)
+                    .unwrap_or(false),
+            })
+            .collect()
+    }
+
+    fn create_tab_group_workspace(
+        &mut self,
+        group_id: String,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = Workspace::new(window, cx);
+        self.tab_group_workspaces
+            .insert(group_id.clone(), workspace.clone());
+        self.bind_active_workspace(workspace, cx);
+    }
+
+    fn switch_tab_group_workspace(
+        &mut self,
+        group_id: &str,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if group_id == DEFAULT_TAB_GROUP_ID {
+            self.bind_active_workspace(self.default_workspace.clone(), cx);
+            return;
+        }
+
+        let workspace = if let Some(workspace) = self.tab_group_workspaces.get(group_id) {
+            workspace.clone()
+        } else {
+            let workspace = Workspace::new(window, cx);
+            self.tab_group_workspaces
+                .insert(group_id.to_string(), workspace.clone());
+            workspace
+        };
+
+        self.bind_active_workspace(workspace, cx);
     }
 
     /// 切换侧边栏显示/隐藏
@@ -181,10 +287,12 @@ impl AppWindow {
             window.is_fullscreen(),
             cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
-                this.sidebar.update(cx, |sidebar, cx| {
-                    sidebar.create_tab_group(window, cx);
+                let group_id = this.sidebar.update(cx, |sidebar, cx| {
+                    let group_id = sidebar.create_tab_group(window, cx);
                     cx.notify();
+                    group_id
                 });
+                this.create_tab_group_workspace(group_id, window, cx);
             }),
         )
     }
@@ -268,6 +376,7 @@ impl AppWindow {
 
 impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_sidebar_tab_groups(cx);
         let theme = cx.theme().ui;
 
         let mut root = div()

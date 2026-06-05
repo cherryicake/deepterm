@@ -101,6 +101,16 @@ impl TitleBar {
         self
     }
 
+    /// 切换 TitleBar 绑定的工作区，同时更新 TabBar 和任务观察订阅。
+    pub fn set_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
+        self.tab_bar = Some(workspace.read(cx).tab_bar.clone());
+        self._subscriptions.clear();
+        self.workspace = None;
+        self.last_seen_task_id = None;
+        self.bind_workspace(workspace.downgrade(), cx);
+        cx.notify();
+    }
+
     /// 绑定 workspace 弱引用并启动订阅 + 定时刷新，以便实时反馈传输进度。
     pub fn bind_workspace(&mut self, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) {
         if let Some(strong) = workspace.upgrade() {

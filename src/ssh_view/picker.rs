@@ -264,6 +264,10 @@ impl SshPicker {
         self
     }
 
+    pub fn set_workspace(&mut self, workspace: Entity<Workspace>) {
+        self.workspace = Some(workspace);
+    }
+
     fn load_configs() -> Vec<SshConnectionConfig> {
         SshGlobalConfig::load().saved_connections
     }
