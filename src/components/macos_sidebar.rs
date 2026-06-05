@@ -9,9 +9,9 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::sidebar_view::font_view::FontSettingsView;
-use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
+use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 
@@ -45,6 +45,7 @@ impl SidebarMenuItem {
 pub struct SidebarMenuSection {
     pub title: Option<String>,
     pub items: Vec<SidebarMenuItem>,
+    pub collapsed: bool,
 }
 
 impl SidebarMenuSection {
@@ -52,7 +53,12 @@ impl SidebarMenuSection {
         Self {
             title: title.map(|t| t.into()),
             items,
+            collapsed: false,
         }
+    }
+
+    pub fn toggle_collapsed(&mut self) {
+        self.collapsed = !self.collapsed;
     }
 }
 
@@ -390,15 +396,30 @@ impl MacosSidebar {
 
         // 分组菜单
         let mut item_index: usize = 0;
-        for section in &self.sections {
-            // 分组标题
+        for section_idx in 0..self.sections.len() {
+            let section = &self.sections[section_idx];
+
             if let Some(ref title) = section.title {
+                let is_collapsed = section.collapsed;
+                let chevron_icon = if is_collapsed {
+                    gpui::svg()
+                        .size(px(8.0))
+                        .path(Icon::ChevronRight.path())
+                        .text_color(theme.text_subtle)
+                } else {
+                    gpui::svg()
+                        .size(px(12.0))
+                        .path(Icon::ChevronDown.path())
+                        .text_color(theme.text_subtle)
+                };
+
                 menu_content = menu_content.child(
                     div()
                         .h(px(28.0))
                         .w_full()
                         .flex()
                         .items_center()
+                        .justify_between()
                         .px(px(8.0))
                         .pt_3()
                         .pb_3()
@@ -408,71 +429,95 @@ impl MacosSidebar {
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.text_subtle)
                                 .child(title.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(20.0))
+                                .h(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .child(chevron_icon)
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |this, _, _window, cx| {
+                                        if let Some(section) = this.sections.get_mut(section_idx) {
+                                            section.toggle_collapsed();
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
                         ),
                 );
             }
 
-            let mut items_div = div().w_full().flex().flex_col().gap(px(2.0));
-            for item in &section.items {
-                let item_id = item.id.clone();
-                let is_selected = self.selected_id.as_deref() == Some(&item_id);
-                let icon = item.icon.unwrap_or(Icon::Screen);
-                let current_index = item_index;
-                item_index += 1;
+            if !section.collapsed {
+                let mut items_div = div().w_full().flex().flex_col().gap(px(2.0));
+                for item in &section.items {
+                    let item_id = item.id.clone();
+                    let is_selected = self.selected_id.as_deref() == Some(&item_id);
+                    let icon = item.icon.unwrap_or(Icon::Screen);
+                    let current_index = item_index;
+                    item_index += 1;
 
-                let row = div()
-                    .id(("sidebar-item", current_index))
-                    .h(px(28.0))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .px(px(10.0))
-                    .gap(px(6.0))
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .when(is_selected, |this| {
-                        this.bg(theme.accent).text_color(theme.accent_foreground)
-                    })
-                    .when(!is_selected, |this| {
-                        this.hover(|style| style.bg(hover_bg(is_dark)))
-                            .text_color(theme.text)
-                    })
-                    .child(
-                        div()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(gpui::svg().size(px(14.0)).path(icon.path()).text_color(
-                                if is_selected {
-                                    theme.accent_foreground
-                                } else {
-                                    theme.text_muted
-                                },
-                            )),
-                    )
-                    .child(
-                        div().flex_1().child(
+                    let row = div()
+                        .id(("sidebar-item", current_index))
+                        .h(px(28.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .px(px(10.0))
+                        .gap(px(6.0))
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .when(is_selected, |this| {
+                            this.bg(theme.accent).text_color(theme.accent_foreground)
+                        })
+                        .when(!is_selected, |this| {
+                            this.hover(|style| style.bg(hover_bg(is_dark)))
+                                .text_color(theme.text)
+                        })
+                        .child(
                             div()
-                                .text_sm()
-                                .text_color(if is_selected {
-                                    theme.accent_foreground
-                                } else {
-                                    theme.text
-                                })
-                                .child(item.label.clone()),
-                        ),
-                    )
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.handle_item_select(&item_id);
-                        this.notify_app_window(cx);
-                    }));
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(gpui::svg().size(px(14.0)).path(icon.path()).text_color(
+                                    if is_selected {
+                                        theme.accent_foreground
+                                    } else {
+                                        theme.text_muted
+                                    },
+                                )),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if is_selected {
+                                        theme.accent_foreground
+                                    } else {
+                                        theme.text
+                                    })
+                                    .child(item.label.clone()),
+                            ),
+                        )
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.handle_item_select(&item_id);
+                            this.notify_app_window(cx);
+                        }));
 
-                items_div = items_div.child(row);
+                    items_div = items_div.child(row);
+                }
+
+                menu_content = menu_content.child(items_div);
             }
 
-            menu_content = menu_content.child(items_div).child(div().h(px(12.0)));
+            menu_content = menu_content.child(div().h(px(12.0)));
         }
 
         menu_content
@@ -506,14 +551,17 @@ impl MacosSidebar {
                     .hover(|style| style.bg(button_bg_hover(is_dark)))
                     .child(
                         gpui::svg()
-                            .size(px(16.0))
+                            .size(px(8.0))
                             .path(Icon::ChevronLeft.path())
                             .text_color(theme.text),
                     )
-                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _window, cx| {
-                        this.handle_item_select("__back");
-                        this.notify_app_window(cx);
-                    })),
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _window, cx| {
+                            this.handle_item_select("__back");
+                            this.notify_app_window(cx);
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -630,9 +678,15 @@ impl Render for MacosSidebar {
             .pl(px(12.0))
             .pr(px(12.0))
             .child(match self.current_view {
-                SidebarView::Menu => self.render_menu_content(cx, is_dark, theme).into_any_element(),
-                SidebarView::Theme => self.render_theme_content(cx, is_dark, theme).into_any_element(),
-                SidebarView::Font => self.render_font_content(cx, is_dark, theme).into_any_element(),
+                SidebarView::Menu => self
+                    .render_menu_content(cx, is_dark, theme)
+                    .into_any_element(),
+                SidebarView::Theme => self
+                    .render_theme_content(cx, is_dark, theme)
+                    .into_any_element(),
+                SidebarView::Font => self
+                    .render_font_content(cx, is_dark, theme)
+                    .into_any_element(),
                 SidebarView::Host => self.render_host_content().into_any_element(),
                 SidebarView::Keychain => self.render_keychain_content().into_any_element(),
             });
@@ -646,11 +700,14 @@ impl Render for MacosSidebar {
             .w(px(4.0))
             .cursor_col_resize()
             .hover(|style| style.bg(theme.drop_target.opacity(0.3)))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                this.start_resize(event.position.x);
-                cx.notify();
-                this.notify_app_window(cx);
-            }));
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.start_resize(event.position.x);
+                    cx.notify();
+                    this.notify_app_window(cx);
+                }),
+            );
 
         // 控制侧边栏整体轮廓
         let padded = div()

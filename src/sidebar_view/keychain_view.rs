@@ -216,7 +216,7 @@ impl Render for KeychainSidebarView {
                     .hover(|style| style.bg(button_bg_hover(is_dark)))
                     .child(
                         gpui::svg()
-                            .size(px(16.0))
+                            .size(px(8.0))
                             .path(Icon::ChevronLeft.path())
                             .text_color(theme.text),
                     )

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use gpui::{App, MouseButton, ScrollHandle, Window, div, px};
 use gpui::prelude::*;
+use gpui::{App, MouseButton, ScrollHandle, Window, div, px};
 
 use crate::assets::Icon;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
@@ -43,7 +43,7 @@ where
                 .hover(|style| style.bg(button_bg_hover(is_dark)))
                 .child(
                     gpui::svg()
-                        .size(px(16.0))
+                        .size(px(8.0))
                         .path(Icon::ChevronLeft.path())
                         .text_color(theme.text),
                 )

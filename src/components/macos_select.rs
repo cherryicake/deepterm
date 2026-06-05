@@ -376,9 +376,9 @@ impl Render for MacosSelect {
                             .bg(theme.tab_hover_background)
                             .child(
                                 svg()
-                                    .size(px(12.0))
+                                    .size(px(6.0))
                                     .path(Icon::ChevronUpDown.path())
-                                    .text_color(theme.icon),
+                                    .text_color(theme.text),
                             ),
                     )
                     .child({
@@ -394,16 +394,17 @@ impl Render for MacosSelect {
                     }),
             )
             .when(is_rendered, move |this| {
-                let duration_ms = if is_exit { SELECT_EXIT_MS } else { SELECT_ENTER_MS };
+                let duration_ms = if is_exit {
+                    SELECT_EXIT_MS
+                } else {
+                    SELECT_ENTER_MS
+                };
                 let anim_id: gpui::ElementId = ("macos-select-anim", anim_epoch).into();
                 this.child(
                     deferred(
                         anchored()
                             .anchor(gpui::Anchor::TopLeft)
-                            .offset(point(
-                                px(0.0),
-                                -(px(30.0) + px(highlighted as f32 * 26.0)),
-                            ))
+                            .offset(point(px(0.0), -(px(30.0) + px(highlighted as f32 * 26.0))))
                             .snap_to_window_with_margin(px(8.))
                             .child(
                                 div()
