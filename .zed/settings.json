@@ -1,0 +1,8 @@
+{
+  "language_overrides": {
+    "Python": {
+      "format_on_save": "off",
+      "formatter": "disabled"
+    }
+  }
+}
