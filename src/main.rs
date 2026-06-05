@@ -170,6 +170,25 @@ impl AppWindow {
         )
     }
 
+    /// 渲染新建标签页组按钮
+    fn render_new_tab_group_button(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.sidebar.read(cx).render_new_tab_group_button(
+            cx,
+            window.is_fullscreen(),
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.create_tab_group(window, cx);
+                    cx.notify();
+                });
+            }),
+        )
+    }
+
     /// 渲染右侧主内容区域（TitleBar + Workspace）。
     /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
     fn render_main_area(&self, window: &gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -270,6 +289,7 @@ impl Render for AppWindow {
             }))
             .child(self.sidebar.clone())
             .child(self.render_main_area(window, cx))
+            .child(self.render_new_tab_group_button(window, cx))
             .child(self.render_sidebar_toggle(window, cx))
             .child(self.ssh_picker.clone());
 

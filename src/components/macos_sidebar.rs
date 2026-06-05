@@ -4,11 +4,12 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
-    IntoElement, InteractiveElement, LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    WeakEntity, Window, div, ease_in_out, px,
+    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
+    Subscription, WeakEntity, Window, div, ease_in_out, px,
 };
 
 use crate::assets::Icon;
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
@@ -22,6 +23,22 @@ const ANIMATION_ENTER_MS: u64 = 300;
 const ANIMATION_EXIT_MS: u64 = 250;
 const BUTTON_LEFT_CLOSED: f32 = 84.0;
 const BUTTON_TOP: f32 = 12.0;
+const TAB_GROUP_SECTION_TITLE: &str = "标签页组";
+const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
+const SIDEBAR_ROW_GAP: f32 = 2.0;
+const SIDEBAR_ROW_ICON_BOX: f32 = 18.0;
+const SIDEBAR_ROW_ICON: f32 = 14.0;
+const SIDEBAR_ACTION_BOX: f32 = 20.0;
+const CHEVRON_RIGHT_SIZE: f32 = 8.0;
+const CHEVRON_DOWN_SIZE: f32 = 12.0;
+
+struct TabGroupItem {
+    id: String,
+    label: String,
+    collapsed: bool,
+    editing_input: Option<Entity<InputState>>,
+    editing_subscription: Option<Subscription>,
+}
 
 /// 侧边栏菜单项
 #[derive(Clone)]
@@ -83,6 +100,12 @@ pub struct MacosSidebar {
     epoch: u32,
     selected_id: Option<String>,
     sections: Vec<SidebarMenuSection>,
+    tab_groups: Vec<TabGroupItem>,
+    tab_groups_collapsed: bool,
+    tab_groups_epoch: u32,
+    tab_groups_hovered: bool,
+    hovered_tab_group_id: Option<String>,
+    next_tab_group_id: usize,
     section_epochs: Vec<u32>,
     hovered_section: Option<usize>,
     current_view: SidebarView,
@@ -107,14 +130,6 @@ impl MacosSidebar {
             selected_id: Some("homepage".to_string()),
             sections: vec![
                 SidebarMenuSection::new(
-                    Some("标签页组"),
-                    vec![SidebarMenuItem::new(
-                        "agent",
-                        "agent",
-                        Some(Icon::Workspace),
-                    )],
-                ),
-                SidebarMenuSection::new(
                     Some("已保存"),
                     vec![
                         SidebarMenuItem::new("host", "Host", Some(Icon::Host)),
@@ -129,7 +144,13 @@ impl MacosSidebar {
                     ],
                 ),
             ],
-            section_epochs: vec![0; 3],
+            tab_groups: Vec::new(),
+            tab_groups_collapsed: false,
+            tab_groups_epoch: 0,
+            tab_groups_hovered: false,
+            hovered_tab_group_id: None,
+            next_tab_group_id: 0,
+            section_epochs: vec![0; 2],
             hovered_section: None,
             current_view: SidebarView::Menu,
             theme_scroll_handle: ScrollHandle::new(),
@@ -274,6 +295,88 @@ impl MacosSidebar {
         }
     }
 
+    pub fn create_tab_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_all_tab_group_names(cx);
+
+        let id = format!("tab-group-{}", self.next_tab_group_id);
+        let label = if self.next_tab_group_id == 0 {
+            "未命名".to_string()
+        } else {
+            format!("未命名 {}", self.next_tab_group_id + 1)
+        };
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).font_size(px(15.0));
+            input.set_value(&label, window, cx);
+            input.selected_range = (0..input.text().len()).into();
+            input
+        });
+
+        let group_id = id.clone();
+        let subscription =
+            cx.subscribe(&input, move |this, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_tab_group_name(&group_id, cx);
+                }
+                _ => {}
+            });
+
+        self.next_tab_group_id += 1;
+        self.selected_id = Some(id.clone());
+        self.tab_groups.push(TabGroupItem {
+            id,
+            label,
+            collapsed: false,
+            editing_input: Some(input.clone()),
+            editing_subscription: Some(subscription),
+        });
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    }
+
+    fn commit_tab_group_name(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(group) = self.tab_groups.iter_mut().find(|group| group.id == id) else {
+            return;
+        };
+        let Some(input) = group.editing_input.take() else {
+            return;
+        };
+        group.editing_subscription.take();
+
+        let value = input.read(cx).text().to_string();
+        let value = value.trim();
+        if !value.is_empty() {
+            group.label = value.to_string();
+        }
+        cx.notify();
+    }
+
+    fn commit_all_tab_group_names(&mut self, cx: &mut Context<Self>) {
+        for group in &mut self.tab_groups {
+            let Some(input) = group.editing_input.take() else {
+                continue;
+            };
+
+            group.editing_subscription.take();
+            let value = input.read(cx).text().to_string();
+            let value = value.trim();
+            if !value.is_empty() {
+                group.label = value.to_string();
+            }
+        }
+    }
+
+    fn toggle_tab_group_collapsed(&mut self, id: &str) {
+        if let Some(group) = self.tab_groups.iter_mut().find(|group| group.id == id) {
+            group.collapsed = !group.collapsed;
+        }
+    }
+
+    fn toggle_tab_groups_section(&mut self) {
+        self.tab_groups_collapsed = !self.tab_groups_collapsed;
+        self.tab_groups_epoch = self.tab_groups_epoch.wrapping_add(1);
+    }
+
     /// 当前是否可见（用于外部组件判断动画方向）。
     pub fn is_visible(&self) -> bool {
         self.visible
@@ -282,6 +385,94 @@ impl MacosSidebar {
     /// 当前动画 epoch（用于外部组件同步动画）。
     pub fn animation_epoch(&self) -> u32 {
         self.epoch
+    }
+
+    fn render_top_icon_button<F>(
+        &self,
+        cx: &gpui::App,
+        is_fullscreen: bool,
+        offset_from_toggle: f32,
+        id: &'static str,
+        icon: Icon,
+        icon_size: f32,
+        on_mouse_down: F,
+    ) -> gpui::AnyElement
+    where
+        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    {
+        let theme = cx.theme().ui;
+        let toggle_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
+            BUTTON_LEFT_CLOSED
+        } else {
+            8.0
+        };
+        let toggle_left_open = self.width - 40.0;
+        let button_left_closed = toggle_left_closed - offset_from_toggle;
+        let button_left_open = toggle_left_open - offset_from_toggle;
+        let (start_left, end_left, duration_ms) = if self.visible {
+            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
+        } else {
+            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
+        };
+
+        let button = div()
+            .id((id, self.epoch))
+            .absolute()
+            .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(36.))
+            .h(px(if self.visible { 22. } else { 30. }))
+            .rounded(px(999.0))
+            .text_color(theme.text)
+            .hover(|style| style.bg(theme.title_bar_hover))
+            .cursor_pointer()
+            .on_mouse_down(gpui::MouseButton::Left, on_mouse_down)
+            .child(
+                gpui::svg()
+                    .size(px(icon_size))
+                    .text_color(theme.text)
+                    .path(icon.path()),
+            );
+
+        if self.epoch == 0 {
+            button.left(px(end_left)).into_any_element()
+        } else {
+            button
+                .left(px(start_left))
+                .with_animation(
+                    (id, self.epoch),
+                    gpui::Animation::new(Duration::from_millis(duration_ms))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
+                )
+                .into_any_element()
+        }
+    }
+
+    pub fn render_new_tab_group_button<F>(
+        &self,
+        cx: &gpui::App,
+        is_fullscreen: bool,
+        on_create: F,
+    ) -> gpui::AnyElement
+    where
+        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    {
+        if !self.visible {
+            return div().into_any_element();
+        }
+
+        self.render_top_icon_button(
+            cx,
+            is_fullscreen,
+            40.0,
+            "new-tab-group-btn",
+            Icon::PlusSquareOnSquare,
+            16.0,
+            on_create,
+        )
     }
 
     /// 渲染侧边栏切换按钮（含位移动画）。
@@ -297,56 +488,15 @@ impl MacosSidebar {
     where
         F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     {
-        let theme = cx.theme().ui;
-        let button_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
-            BUTTON_LEFT_CLOSED
-        } else {
-            // Windows/Linux 没有交通灯按钮；macOS 全屏时也没有
-            8.0
-        };
-        // 侧边栏打开时，按钮位置与 sidebar 右边缘保持固定间距
-        let button_left_open = self.width - 40.0;
-        let (start_left, end_left, duration_ms) = if self.visible {
-            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
-        } else {
-            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
-        };
-
-        let button = div()
-            .id(("sidebar-toggle-btn", self.epoch))
-            .absolute()
-            .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(36.))
-            .h(px(if self.visible { 22. } else { 30. }))
-            .rounded(px(999.0))
-            .text_color(theme.text)
-            .hover(|style| style.bg(theme.title_bar_hover))
-            .cursor_pointer()
-            .on_mouse_down(gpui::MouseButton::Left, on_toggle)
-            .child(
-                gpui::svg()
-                    .size(px(20.0))
-                    .text_color(theme.text)
-                    .path(crate::assets::Icon::Sidebar.path()),
-            );
-
-        // 初始状态（epoch == 0）直接应用最终位置，避免启动时出现一次从右向左的位移动画
-        if self.epoch == 0 {
-            button.left(px(end_left)).into_any_element()
-        } else {
-            button
-                .left(px(start_left))
-                .with_animation(
-                    ("sidebar-toggle-anim", self.epoch),
-                    gpui::Animation::new(Duration::from_millis(duration_ms))
-                        .with_easing(gpui::ease_in_out),
-                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
-                )
-                .into_any_element()
-        }
+        self.render_top_icon_button(
+            cx,
+            is_fullscreen,
+            0.0,
+            "sidebar-toggle-btn",
+            Icon::Sidebar,
+            20.0,
+            on_toggle,
+        )
     }
 
     fn render_menu_content(
@@ -397,7 +547,11 @@ impl MacosSidebar {
                 this.notify_app_window(cx);
             }));
 
-        menu_content = menu_content.child(homepage).child(div().h(px(16.0)));
+        menu_content = menu_content
+            .child(homepage)
+            .child(div().h(px(16.0)))
+            .child(self.render_tab_groups_section(cx, is_dark, theme))
+            .child(div().h(px(12.0)));
 
         // 分组菜单
         let mut item_index: usize = 0;
@@ -543,7 +697,11 @@ impl MacosSidebar {
                 let full_height = (section.items.len() as f32 * 30.0 - 2.0).max(0.0);
                 if section_epoch == 0 {
                     if section.collapsed {
-                        items_div.h(px(0.0)).overflow_hidden().opacity(0.0).into_any_element()
+                        items_div
+                            .h(px(0.0))
+                            .overflow_hidden()
+                            .opacity(0.0)
+                            .into_any_element()
                     } else {
                         items_div.into_any_element()
                     }
@@ -565,11 +723,7 @@ impl MacosSidebar {
                                 } else {
                                     full_height * delta
                                 };
-                                let opacity = if is_collapsed {
-                                    1.0 - delta
-                                } else {
-                                    delta
-                                };
+                                let opacity = if is_collapsed { 1.0 - delta } else { delta };
                                 this.h(px(height)).opacity(opacity)
                             },
                         )
@@ -585,6 +739,279 @@ impl MacosSidebar {
         }
 
         menu_content
+    }
+
+    fn render_tab_groups_section(
+        &self,
+        cx: &mut Context<Self>,
+        is_dark: bool,
+        theme: crate::theme::UiTheme,
+    ) -> gpui::Div {
+        let chevron_icon = if self.tab_groups_collapsed {
+            gpui::svg()
+                .size(px(CHEVRON_RIGHT_SIZE))
+                .path(Icon::ChevronRight.path())
+                .text_color(theme.text_subtle)
+        } else {
+            gpui::svg()
+                .size(px(CHEVRON_DOWN_SIZE))
+                .path(Icon::ChevronDown.path())
+                .text_color(theme.text_subtle)
+        };
+        let sidebar = cx.entity().downgrade();
+        let on_hover = move |hovered: &bool, _: &mut Window, cx: &mut App| {
+            if let Some(sidebar) = sidebar.upgrade() {
+                sidebar.update(cx, |this, cx| {
+                    this.tab_groups_hovered = *hovered;
+                    cx.notify();
+                });
+            }
+        };
+
+        let header = div()
+            .id("sidebar-tab-groups-header")
+            .h(px(28.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(8.0))
+            .pt_3()
+            .pb_3()
+            .on_hover(on_hover)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_subtle)
+                    .child(TAB_GROUP_SECTION_TITLE),
+            )
+            .child(
+                div()
+                    .id("sidebar-tab-groups-toggle")
+                    .size(px(SIDEBAR_ACTION_BOX))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .when(self.tab_groups_hovered, |this| this.child(chevron_icon))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_tab_groups_section();
+                            cx.notify();
+                            this.notify_app_window(cx);
+                        }),
+                    ),
+            );
+
+        let mut groups = div().w_full().flex().flex_col().gap(px(2.0));
+        for (index, group) in self.tab_groups.iter().enumerate() {
+            let group_id = group.id.clone();
+            let is_selected = self.selected_id.as_deref() == Some(group_id.as_str());
+            let icon_color = if is_selected {
+                theme.accent_foreground
+            } else {
+                theme.text_muted
+            };
+            let text_color = if is_selected {
+                theme.accent_foreground
+            } else {
+                theme.text
+            };
+            let editing_input = group.editing_input.clone();
+            let is_row_hovered = self.hovered_tab_group_id.as_deref() == Some(group_id.as_str());
+            let sidebar = cx.entity().downgrade();
+            let hover_group_id = group_id.clone();
+            let on_hover = move |hovered: &bool, _: &mut Window, cx: &mut App| {
+                if let Some(sidebar) = sidebar.upgrade() {
+                    let hover_group_id = hover_group_id.clone();
+                    sidebar.update(cx, |this, cx| {
+                        if *hovered {
+                            this.hovered_tab_group_id = Some(hover_group_id);
+                        } else if this.hovered_tab_group_id.as_deref()
+                            == Some(hover_group_id.as_str())
+                        {
+                            this.hovered_tab_group_id = None;
+                        }
+                        cx.notify();
+                    });
+                }
+            };
+
+            let mut row = div()
+                .id(("sidebar-tab-group", index))
+                .h(px(SIDEBAR_ROW_HEIGHT))
+                .w_full()
+                .flex()
+                .items_center()
+                .px(px(10.0))
+                .gap(px(6.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .on_hover(on_hover)
+                .when(is_selected, |this| {
+                    this.bg(theme.accent).text_color(theme.accent_foreground)
+                })
+                .when(!is_selected, |this| {
+                    this.hover(|style| style.bg(hover_bg(is_dark)))
+                        .text_color(theme.text)
+                })
+                .child(
+                    div()
+                        .size(px(SIDEBAR_ROW_ICON_BOX))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            gpui::svg()
+                                .size(px(SIDEBAR_ROW_ICON))
+                                .path(Icon::SquareOnSquare.path())
+                                .text_color(icon_color),
+                        ),
+                )
+                .child(match editing_input {
+                    Some(input) => div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .bg(hover_bg(is_dark))
+                        .border(px(2.0))
+                        .border_color(theme.accent.opacity(0.65))
+                        .overflow_hidden()
+                        .child(EditorInput::new(&input).transparent())
+                        .into_any_element(),
+                    None => div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(text_color)
+                        .child(group.label.clone())
+                        .into_any_element(),
+                });
+
+            if group.editing_input.is_none() {
+                row = row
+                    .child(
+                        div()
+                            .size(px(SIDEBAR_ACTION_BOX))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(is_row_hovered, |this| {
+                                this.child(
+                                    gpui::svg()
+                                        .size(px(SIDEBAR_ROW_ICON))
+                                        .path(Icon::EllipsisCircleFill.path())
+                                        .text_color(icon_color),
+                                )
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|_, _, _window, cx| {
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .size(px(SIDEBAR_ACTION_BOX))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(is_row_hovered, |this| {
+                                this.child(
+                                    gpui::svg()
+                                        .size(if group.collapsed {
+                                            px(CHEVRON_RIGHT_SIZE)
+                                        } else {
+                                            px(CHEVRON_DOWN_SIZE)
+                                        })
+                                        .path(if group.collapsed {
+                                            Icon::ChevronRight.path()
+                                        } else {
+                                            Icon::ChevronDown.path()
+                                        })
+                                        .text_color(theme.text_subtle),
+                                )
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener({
+                                    let group_id = group_id.clone();
+                                    move |this, _, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_tab_group_collapsed(&group_id);
+                                        cx.notify();
+                                        this.notify_app_window(cx);
+                                    }
+                                }),
+                            ),
+                    );
+            }
+
+            let row = row.on_click(cx.listener(move |this, _, _window, cx| {
+                this.handle_item_select(&group_id);
+                this.notify_app_window(cx);
+            }));
+
+            groups = groups.child(row);
+        }
+
+        let full_height =
+            (self.tab_groups.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP)
+                - SIDEBAR_ROW_GAP)
+                .max(0.0);
+        let groups_element: gpui::AnyElement = if self.tab_groups_epoch == 0 {
+            if self.tab_groups_collapsed {
+                groups
+                    .h(px(0.0))
+                    .overflow_hidden()
+                    .opacity(0.0)
+                    .into_any_element()
+            } else {
+                groups.into_any_element()
+            }
+        } else {
+            let is_collapsed = self.tab_groups_collapsed;
+            let start_height = if is_collapsed { full_height } else { 0.0 };
+            let start_opacity = if is_collapsed { 1.0 } else { 0.0 };
+
+            groups
+                .overflow_hidden()
+                .h(px(start_height))
+                .opacity(start_opacity)
+                .with_animation(
+                    ("tab-groups-content", self.tab_groups_epoch),
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                    move |this, delta| {
+                        let height = if is_collapsed {
+                            full_height * (1.0 - delta)
+                        } else {
+                            full_height * delta
+                        };
+                        let opacity = if is_collapsed { 1.0 - delta } else { delta };
+                        this.h(px(height)).opacity(opacity)
+                    },
+                )
+                .into_any_element()
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(groups_element)
     }
 
     fn render_font_content(
