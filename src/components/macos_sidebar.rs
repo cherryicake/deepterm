@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId, IntoElement,
-    LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, WeakEntity, Window, div, px,
+    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
+    IntoElement, InteractiveElement, LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
+    WeakEntity, Window, div, ease_in_out, px,
 };
 
 use crate::assets::Icon;
@@ -82,6 +83,8 @@ pub struct MacosSidebar {
     epoch: u32,
     selected_id: Option<String>,
     sections: Vec<SidebarMenuSection>,
+    section_epochs: Vec<u32>,
+    hovered_section: Option<usize>,
     current_view: SidebarView,
     theme_scroll_handle: ScrollHandle,
     font_scroll_handle: ScrollHandle,
@@ -126,6 +129,8 @@ impl MacosSidebar {
                     ],
                 ),
             ],
+            section_epochs: vec![0; 3],
+            hovered_section: None,
             current_view: SidebarView::Menu,
             theme_scroll_handle: ScrollHandle::new(),
             font_scroll_handle: ScrollHandle::new(),
@@ -399,8 +404,12 @@ impl MacosSidebar {
         for section_idx in 0..self.sections.len() {
             let section = &self.sections[section_idx];
 
+            let section_epoch = self.section_epochs.get(section_idx).copied().unwrap_or(0);
+
             if let Some(ref title) = section.title {
                 let is_collapsed = section.collapsed;
+                let is_hovered = self.hovered_section == Some(section_idx);
+
                 let chevron_icon = if is_collapsed {
                     gpui::svg()
                         .size(px(8.0))
@@ -413,8 +422,19 @@ impl MacosSidebar {
                         .text_color(theme.text_subtle)
                 };
 
+                let sidebar = cx.entity().downgrade();
+                let on_hover = move |hovered: &bool, _: &mut Window, cx: &mut App| {
+                    if let Some(sidebar) = sidebar.upgrade() {
+                        sidebar.update(cx, |this, cx| {
+                            this.hovered_section = if *hovered { Some(section_idx) } else { None };
+                            cx.notify();
+                        });
+                    }
+                };
+
                 menu_content = menu_content.child(
                     div()
+                        .id(format!("sidebar-section-header-{}", section_idx))
                         .h(px(28.0))
                         .w_full()
                         .flex()
@@ -423,6 +443,7 @@ impl MacosSidebar {
                         .px(px(8.0))
                         .pt_3()
                         .pb_3()
+                        .on_hover(on_hover)
                         .child(
                             div()
                                 .text_xs()
@@ -439,12 +460,17 @@ impl MacosSidebar {
                                 .justify_center()
                                 .rounded_full()
                                 .cursor_pointer()
-                                .child(chevron_icon)
+                                .when(is_hovered, |this| this.child(chevron_icon))
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     cx.listener(move |this, _, _window, cx| {
                                         if let Some(section) = this.sections.get_mut(section_idx) {
                                             section.toggle_collapsed();
+                                            if let Some(epoch) =
+                                                this.section_epochs.get_mut(section_idx)
+                                            {
+                                                *epoch = epoch.wrapping_add(1);
+                                            }
                                             cx.notify();
                                         }
                                     }),
@@ -453,69 +479,107 @@ impl MacosSidebar {
                 );
             }
 
-            if !section.collapsed {
-                let mut items_div = div().w_full().flex().flex_col().gap(px(2.0));
-                for item in &section.items {
-                    let item_id = item.id.clone();
-                    let is_selected = self.selected_id.as_deref() == Some(&item_id);
-                    let icon = item.icon.unwrap_or(Icon::Screen);
-                    let current_index = item_index;
-                    item_index += 1;
+            let mut items_div = div().w_full().flex().flex_col().gap(px(2.0));
+            for item in &section.items {
+                let item_id = item.id.clone();
+                let is_selected = self.selected_id.as_deref() == Some(&item_id);
+                let icon = item.icon.unwrap_or(Icon::Screen);
+                let current_index = item_index;
+                item_index += 1;
 
-                    let row = div()
-                        .id(("sidebar-item", current_index))
-                        .h(px(28.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .px(px(10.0))
-                        .gap(px(6.0))
-                        .rounded(px(8.0))
-                        .cursor_pointer()
-                        .when(is_selected, |this| {
-                            this.bg(theme.accent).text_color(theme.accent_foreground)
-                        })
-                        .when(!is_selected, |this| {
-                            this.hover(|style| style.bg(hover_bg(is_dark)))
-                                .text_color(theme.text)
-                        })
-                        .child(
+                let row = div()
+                    .id(("sidebar-item", current_index))
+                    .h(px(28.0))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .px(px(10.0))
+                    .gap(px(6.0))
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .when(is_selected, |this| {
+                        this.bg(theme.accent).text_color(theme.accent_foreground)
+                    })
+                    .when(!is_selected, |this| {
+                        this.hover(|style| style.bg(hover_bg(is_dark)))
+                            .text_color(theme.text)
+                    })
+                    .child(
+                        div()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(gpui::svg().size(px(14.0)).path(icon.path()).text_color(
+                                if is_selected {
+                                    theme.accent_foreground
+                                } else {
+                                    theme.text_muted
+                                },
+                            )),
+                    )
+                    .child(
+                        div().flex_1().child(
                             div()
-                                .w(px(18.0))
-                                .h(px(18.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(gpui::svg().size(px(14.0)).path(icon.path()).text_color(
-                                    if is_selected {
-                                        theme.accent_foreground
-                                    } else {
-                                        theme.text_muted
-                                    },
-                                )),
-                        )
-                        .child(
-                            div().flex_1().child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if is_selected {
-                                        theme.accent_foreground
-                                    } else {
-                                        theme.text
-                                    })
-                                    .child(item.label.clone()),
-                            ),
-                        )
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.handle_item_select(&item_id);
-                            this.notify_app_window(cx);
-                        }));
+                                .text_sm()
+                                .text_color(if is_selected {
+                                    theme.accent_foreground
+                                } else {
+                                    theme.text
+                                })
+                                .child(item.label.clone()),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.handle_item_select(&item_id);
+                        this.notify_app_window(cx);
+                    }));
 
-                    items_div = items_div.child(row);
-                }
-
-                menu_content = menu_content.child(items_div);
+                items_div = items_div.child(row);
             }
+
+            let animated_content: gpui::AnyElement = if section.title.is_some() {
+                let full_height = (section.items.len() as f32 * 30.0 - 2.0).max(0.0);
+                if section_epoch == 0 {
+                    if section.collapsed {
+                        items_div.h(px(0.0)).overflow_hidden().opacity(0.0).into_any_element()
+                    } else {
+                        items_div.into_any_element()
+                    }
+                } else {
+                    let is_collapsed = section.collapsed;
+                    let start_height = if is_collapsed { full_height } else { 0.0 };
+                    let start_opacity = if is_collapsed { 1.0 } else { 0.0 };
+
+                    items_div
+                        .overflow_hidden()
+                        .h(px(start_height))
+                        .opacity(start_opacity)
+                        .with_animation(
+                            format!("section-content-{}-{}", section_idx, section_epoch),
+                            Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                            move |this, delta| {
+                                let height = if is_collapsed {
+                                    full_height * (1.0 - delta)
+                                } else {
+                                    full_height * delta
+                                };
+                                let opacity = if is_collapsed {
+                                    1.0 - delta
+                                } else {
+                                    delta
+                                };
+                                this.h(px(height)).opacity(opacity)
+                            },
+                        )
+                        .into_any_element()
+                }
+            } else {
+                items_div.into_any_element()
+            };
+
+            menu_content = menu_content.child(animated_content);
 
             menu_content = menu_content.child(div().h(px(12.0)));
         }
