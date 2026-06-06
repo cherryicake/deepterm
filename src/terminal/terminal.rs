@@ -1446,13 +1446,27 @@ impl Terminal {
         self.last_content.total_lines = term.total_lines();
         self.last_content.viewport_lines = term.screen_lines();
 
-        // Detect URLs per visible row
-        self.last_content.url_ranges.clear();
-        self.last_content.url_ranges.reserve(row_ranges.len());
-        for (start, end) in row_ranges.iter() {
-            let row_cells = &cells[*start..*end];
-            let ranges = crate::terminal::link_detector::detect_urls_in_line(row_cells);
-            self.last_content.url_ranges.push(ranges);
+        let rebuild_all_urls =
+            force_full_damage || self.last_content.url_ranges.len() != row_ranges.len();
+        if rebuild_all_urls {
+            self.last_content.url_ranges.clear();
+            self.last_content.url_ranges.reserve(row_ranges.len());
+            for (start, end) in row_ranges.iter() {
+                let row_cells = &cells[*start..*end];
+                let ranges = crate::terminal::link_detector::detect_urls_in_line(row_cells);
+                self.last_content.url_ranges.push(ranges);
+            }
+        } else {
+            for (row_idx, dirty) in self.dirty_rows.iter().copied().enumerate() {
+                if !dirty {
+                    continue;
+                }
+                let Some((start, end)) = row_ranges.get(row_idx).copied() else {
+                    continue;
+                };
+                self.last_content.url_ranges[row_idx] =
+                    crate::terminal::link_detector::detect_urls_in_line(&cells[start..end]);
+            }
         }
     }
 
