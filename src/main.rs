@@ -177,7 +177,7 @@ impl AppWindow {
             workspace_subscriptions: HashMap::new(),
         };
 
-        this.subscribe_workspace_events(workspace.clone(), cx);
+        this.subscribe_workspace_events(workspace.clone(), window, cx);
         if let Some(session) = session {
             this.restore_tab_group_workspaces(session, cx);
         }
@@ -202,19 +202,26 @@ impl AppWindow {
         }));
     }
 
-    fn subscribe_workspace_events(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
+    fn subscribe_workspace_events(
+        &mut self,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entity_id = workspace.entity_id();
         if self.workspace_subscriptions.contains_key(&entity_id) {
             return;
         }
 
-        let subscription =
-            cx.subscribe(
-                &workspace,
-                |this, _, event: &WorkspaceEvent, cx| match event {
-                    WorkspaceEvent::SessionChanged => this.save_session(cx),
-                },
-            );
+        let subscription = cx.subscribe_in(
+            &workspace,
+            window,
+            |this, _, event: &WorkspaceEvent, _window, cx| match event {
+                WorkspaceEvent::SessionChanged => {
+                    this.defer_save_session(cx);
+                }
+            },
+        );
         self.workspace_subscriptions.insert(entity_id, subscription);
     }
 
@@ -339,7 +346,12 @@ impl AppWindow {
         });
     }
 
-    fn bind_active_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
+    fn bind_active_workspace(
+        &mut self,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.workspace = workspace.clone();
         self.title_bar.update(cx, |title_bar, cx| {
             title_bar.set_workspace(workspace.clone(), cx);
@@ -350,7 +362,7 @@ impl AppWindow {
         workspace.update(cx, |workspace, cx| {
             workspace.set_ssh_picker(self.ssh_picker.clone(), cx);
         });
-        self.subscribe_workspace_events(workspace, cx);
+        self.subscribe_workspace_events(workspace, window, cx);
         cx.notify();
     }
 
@@ -410,13 +422,13 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         let workspace = Workspace::new(window, cx);
-        self.subscribe_workspace_events(workspace.clone(), cx);
+        self.subscribe_workspace_events(workspace.clone(), window, cx);
         self.tab_group_workspaces.push(TabGroupWorkspace {
             id: group_id.clone(),
             workspace: Some(workspace.clone()),
             pending_session: None,
         });
-        self.bind_active_workspace(workspace, cx);
+        self.bind_active_workspace(workspace, window, cx);
         self.save_session(cx);
     }
 
@@ -427,7 +439,7 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         if group_id == DEFAULT_TAB_GROUP_ID {
-            self.bind_active_workspace(self.default_workspace.clone(), cx);
+            self.bind_active_workspace(self.default_workspace.clone(), window, cx);
             return;
         }
 
@@ -443,7 +455,7 @@ impl AppWindow {
                 .as_ref()
                 .and_then(|state| Workspace::from_session_state(state, window, cx))
                 .unwrap_or_else(|| Workspace::new(window, cx));
-            self.subscribe_workspace_events(workspace.clone(), cx);
+            self.subscribe_workspace_events(workspace.clone(), window, cx);
             if let Some(group) = self
                 .tab_group_workspaces
                 .iter_mut()
@@ -460,7 +472,7 @@ impl AppWindow {
             workspace
         };
 
-        self.bind_active_workspace(workspace, cx);
+        self.bind_active_workspace(workspace, window, cx);
         self.defer_save_session(cx);
     }
 

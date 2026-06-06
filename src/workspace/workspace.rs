@@ -721,6 +721,9 @@ impl Workspace {
             PanelEvent::BroadcastToggle { .. } => {
                 self.handle_broadcast_toggle(cx);
             }
+            PanelEvent::SessionChanged => {
+                cx.emit(WorkspaceEvent::SessionChanged);
+            }
         }
     }
 

@@ -96,6 +96,7 @@ pub enum PanelEvent {
     Selected { panel_id: String },
     /// 广播状态切换事件
     BroadcastToggle { panel_id: String },
+    SessionChanged,
 }
 
 /// Panel content type
@@ -227,7 +228,7 @@ impl Panel {
         let close_panel_id = panel_id.to_string();
         cx.subscribe(
             terminal_view,
-            move |this, _view, event: &TerminalViewEvent, cx| match event {
+            move |this, view, event: &TerminalViewEvent, cx| match event {
                 TerminalViewEvent::CloseTerminal => {
                     cx.emit(PanelEvent::Close {
                         panel_id: close_panel_id.clone(),
@@ -254,7 +255,12 @@ impl Panel {
                 TerminalViewEvent::SshReconnect { config } => {
                     // SSH 连接断开，创建新的终端视图进行重连
                     log::info!("Panel {}: SSH 连接断开，创建重连视图", close_panel_id);
-                    let new_terminal_view = TerminalView::new_ssh(cx, config);
+                    let remote_cwd = match view.read(cx).session_state(cx) {
+                        TerminalSessionState::Ssh { remote_cwd, .. } => remote_cwd,
+                        TerminalSessionState::Local { .. } => None,
+                    };
+                    let new_terminal_view =
+                        TerminalView::new_ssh_with_remote_cwd(cx, config, remote_cwd);
                     // 重新订阅新 TerminalView 的事件
                     Self::subscribe_terminal_events(&close_panel_id, &new_terminal_view, cx);
                     // 更新 panel 内容
@@ -267,6 +273,9 @@ impl Panel {
                         os: Some(*os),
                         ssh_config_id: this.ssh_config_id.clone(),
                     });
+                }
+                TerminalViewEvent::WorkingDirectoryChanged => {
+                    cx.emit(PanelEvent::SessionChanged);
                 }
             },
         )

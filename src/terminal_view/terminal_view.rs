@@ -32,6 +32,7 @@ pub enum Event {
     SshReconnect { config: SshConnectionConfig },
     /// 远程操作系统已检测到
     RemoteOsDetected { os: RemoteOS },
+    WorkingDirectoryChanged,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -152,6 +153,7 @@ pub struct TerminalView {
     ssh_connect_hide_task: Option<Task<()>>,
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
+    cached_working_directory: Option<String>,
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
@@ -303,6 +305,11 @@ impl TerminalView {
         }
     }
 
+    fn on_working_directory_changed(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        self.cached_working_directory = Some(cwd.to_string());
+        cx.emit(Event::WorkingDirectoryChanged);
+    }
+
     /// 处理 SSH 连接进度视图状态更新
     fn handle_ssh_connect_status(
         &mut self,
@@ -360,6 +367,9 @@ impl TerminalView {
                         this.check_remote_os(terminal.clone(), cx);
                         cx.notify();
                     }
+                    TerminalEvent::WorkingDirectoryChanged(cwd) => {
+                        this.on_working_directory_changed(cwd, cx);
+                    }
                     TerminalEvent::Bell => {}
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
@@ -398,6 +408,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                cached_working_directory: None,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 row_render_cache: Vec::new(),
@@ -514,6 +525,9 @@ impl TerminalView {
                         this.check_remote_os(terminal.clone(), cx);
                         cx.notify();
                     }
+                    TerminalEvent::WorkingDirectoryChanged(cwd) => {
+                        this.on_working_directory_changed(cwd, cx);
+                    }
                     TerminalEvent::Bell => {}
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
@@ -553,6 +567,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                cached_working_directory: None,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 row_render_cache: Vec::new(),
@@ -632,6 +647,9 @@ impl TerminalView {
                     }
                     cx.notify();
                 }
+                TerminalEvent::WorkingDirectoryChanged(cwd) => {
+                    this.on_working_directory_changed(cwd, cx);
+                }
                 TerminalEvent::Bell => {}
                 TerminalEvent::CloseTerminal => {
                     // 正常退出（用户执行 exit 命令），关闭 panel
@@ -674,7 +692,8 @@ impl TerminalView {
                 this.ssh_connect_view = Some(new_connect_view);
 
                 // 创建新的终端
-                let new_terminal = Terminal::new_ssh(cx, config);
+                let remote_cwd = this.current_remote_working_directory(cx);
+                let new_terminal = Terminal::new_ssh_with_remote_cwd(cx, config, remote_cwd);
                 this.terminal_subscription =
                     Some(this.subscribe_terminal_events(&new_terminal, cx));
                 this.terminal = new_terminal;
@@ -699,12 +718,7 @@ impl TerminalView {
         if let Some(config) = self.ssh_config.clone() {
             return TerminalSessionState::Ssh {
                 config,
-                remote_cwd: self.pending_remote_cwd_restore.clone().or_else(|| {
-                    self.terminal
-                        .read(cx)
-                        .reported_working_directory()
-                        .map(String::from)
-                }),
+                remote_cwd: self.current_remote_working_directory(cx),
             };
         }
 
@@ -717,6 +731,10 @@ impl TerminalView {
     }
 
     fn current_local_working_directory(&self, cx: &App) -> Option<PathBuf> {
+        if let Some(cwd) = self.cached_working_directory.as_deref() {
+            return Some(PathBuf::from(cwd));
+        }
+
         let terminal = self.terminal.read(cx);
         terminal
             .reported_working_directory()
@@ -727,6 +745,18 @@ impl TerminalView {
                 )
             })
             .or_else(|| self.working_directory.clone())
+    }
+
+    fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
+        self.cached_working_directory
+            .clone()
+            .or_else(|| {
+                self.terminal
+                    .read(cx)
+                    .reported_working_directory()
+                    .map(String::from)
+            })
+            .or_else(|| self.pending_remote_cwd_restore.clone())
     }
 
     pub fn title(&self) -> SharedString {
@@ -1214,9 +1244,7 @@ impl TerminalView {
     fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
         use crate::builtin_commands::executor::CommandResult;
         use crate::builtin_commands::executor::global_executor;
-        use crate::builtin_commands::{
-            ArgumentParser, CommandContext, PathResolver, global_registry,
-        };
+        use crate::builtin_commands::{ArgumentParser, CommandContext, global_registry};
 
         // 提取命令名和参数
         let command_name = command_line
@@ -1235,26 +1263,13 @@ impl TerminalView {
         // 查询 shell 进程的实时工作目录
         let (process_cwd, remote_cwd) = if self.ssh_config.is_some() {
             // 远程终端：通过 OSC 序列动态追踪
-            let remote_cwd = self
-                .terminal
-                .read(cx)
-                .reported_working_directory()
-                .map(String::from);
+            let remote_cwd = self.current_remote_working_directory(cx);
             (None, remote_cwd)
         } else {
             // 本地终端：优先使用 OSC 7 上报的 cwd。OSC 7 来自 shell prompt hook，
             // 能实时反映 shell 内建 `cd` 后的目录；进程 cwd 查询只作为兼容兜底，
             // 因为某些平台/场景下拿到的可能是启动 shell 或前台程序的旧目录。
-            let terminal = self.terminal.read(cx);
-            let process_cwd = terminal
-                .reported_working_directory()
-                .map(PathBuf::from)
-                .or_else(|| {
-                    terminal
-                        .child_process_id
-                        .and_then(PathResolver::query_process_working_directory)
-                })
-                .or_else(|| self.working_directory.clone());
+            let process_cwd = self.current_local_working_directory(cx);
             (process_cwd, None)
         };
 
@@ -1375,10 +1390,7 @@ impl TerminalView {
         // 这样 `/scp` 没有显式 host 的 token 会跟随当前终端所在主机
         // （远程终端走 SFTP 列远端目录，本地终端列本机文件）。
         let terminal_remote_cwd = if self.ssh_config.is_some() {
-            self.terminal
-                .read(cx)
-                .reported_working_directory()
-                .map(String::from)
+            self.current_remote_working_directory(cx)
         } else {
             None
         };

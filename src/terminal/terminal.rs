@@ -88,6 +88,7 @@ pub enum Event {
     Bell,
     Wakeup,
     SelectionsChanged,
+    WorkingDirectoryChanged(String),
     /// 终端应用通过 DEC 私有模式 ?12 或 CSI `Ps SP q` 改变了光标闪烁策略。
     /// `bool` 为 true 表示应用希望光标闪烁。
     BlinkChanged(bool),
@@ -1086,7 +1087,7 @@ impl Terminal {
 
     fn try_handle_osc_sequence(
         &mut self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
         osc_content: &[u8],
         require_local_osc7_host: bool,
     ) -> bool {
@@ -1097,7 +1098,15 @@ impl Terminal {
 
         if let Some(path) = Self::parse_working_directory_osc(osc_content, require_local_osc7_host)
         {
-            self.reported_working_directory = Some(path);
+            if self.reported_working_directory.as_deref() != Some(path.as_str()) {
+                log::info!(
+                    "OSC reported cwd changed: {:?} -> {}",
+                    self.reported_working_directory.as_deref(),
+                    path
+                );
+                self.reported_working_directory = Some(path.clone());
+                cx.emit(Event::WorkingDirectoryChanged(path));
+            }
             return true;
         }
 
