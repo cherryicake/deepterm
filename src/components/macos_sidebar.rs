@@ -5,12 +5,13 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    Subscription, WeakEntity, Window, div, ease_in_out, px,
+    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollHandle, Subscription, WeakEntity, Window, anchored, deferred, div, ease_in_out, px,
 };
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
+use crate::components::menu::{PopupMenu, PopupMenuItem};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
@@ -149,6 +150,11 @@ pub struct MacosSidebar {
     resize_drag_x: Option<gpui::Pixels>,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
+    tab_group_menu_open: bool,
+    tab_group_menu_group_id: Option<String>,
+    tab_group_popup_menu: Option<Entity<PopupMenu>>,
+    tab_group_menu_position: Option<gpui::Point<Pixels>>,
+    tab_group_menu_subscription: Option<Subscription>,
 }
 
 impl MacosSidebar {
@@ -197,6 +203,11 @@ impl MacosSidebar {
             resize_drag_x: None,
             app_window: None,
             on_tab_group_select: None,
+            tab_group_menu_open: false,
+            tab_group_menu_group_id: None,
+            tab_group_popup_menu: None,
+            tab_group_menu_position: None,
+            tab_group_menu_subscription: None,
         }
     }
 
@@ -467,6 +478,120 @@ impl MacosSidebar {
                 group.label = value.to_string();
             }
         }
+    }
+
+    fn rename_tab_group(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_all_tab_group_names(cx);
+
+        let Some(group) = self.tab_groups.iter_mut().find(|group| group.id == id) else {
+            return;
+        };
+
+        if group.editing_input.is_some() {
+            return;
+        }
+
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).font_size(px(15.0));
+            input.set_value(&group.label, window, cx);
+            input.selected_range = (0..input.text().len()).into();
+            input
+        });
+
+        let group_id = id.to_string();
+        let subscription =
+            cx.subscribe(&input, move |this, _, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_tab_group_name(&group_id, cx);
+                }
+                _ => {}
+            });
+
+        group.editing_input = Some(input.clone());
+        group.editing_subscription = Some(subscription);
+
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+
+        cx.notify();
+    }
+
+    fn delete_tab_group(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.tab_group_menu_group_id.as_deref() == Some(id) {
+            self.close_tab_group_menu(cx);
+        }
+
+        self.tab_groups.retain(|group| group.id != id);
+        self.tab_group_tabs.remove(id);
+
+        if self.selected_id.as_deref() == Some(id) {
+            self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
+        }
+
+        cx.notify();
+        self.notify_app_window(cx);
+    }
+
+    fn open_tab_group_menu(
+        &mut self,
+        group_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tab_group_menu(cx);
+
+        let rename_group_id = group_id.to_string();
+        let delete_group_id = group_id.to_string();
+        let sidebar = cx.entity().downgrade();
+        let sidebar2 = sidebar.clone();
+
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            menu.item(
+                PopupMenuItem::new("重新命名").on_click(move |_event, _window, cx| {
+                    if let Some(sidebar) = sidebar.upgrade() {
+                        sidebar.update(cx, |this, cx| {
+                            this.close_tab_group_menu(cx);
+                            this.rename_tab_group(&rename_group_id, _window, cx);
+                        });
+                    }
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("删除").on_click(move |_event, _window, cx| {
+                    if let Some(sidebar) = sidebar2.upgrade() {
+                        sidebar.update(cx, |this, cx| {
+                            this.close_tab_group_menu(cx);
+                            this.delete_tab_group(&delete_group_id, cx);
+                        });
+                    }
+                }),
+            )
+        });
+
+        let subscription = cx.subscribe(
+            &menu,
+            move |this, _, _: &gpui::DismissEvent, cx| {
+                this.close_tab_group_menu(cx);
+            },
+        );
+
+        self.tab_group_menu_open = true;
+        self.tab_group_menu_group_id = Some(group_id.to_string());
+        self.tab_group_menu_position = Some(window.mouse_position());
+        self.tab_group_popup_menu = Some(menu);
+        self.tab_group_menu_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    fn close_tab_group_menu(&mut self, cx: &mut Context<Self>) {
+        self.tab_group_menu_open = false;
+        self.tab_group_menu_group_id = None;
+        self.tab_group_popup_menu = None;
+        self.tab_group_menu_position = None;
+        self.tab_group_menu_subscription.take();
+        cx.notify();
     }
 
     fn toggle_tab_group_collapsed(&mut self, id: &str) -> Option<(CollapseEpochTarget, u32)> {
@@ -1137,8 +1262,12 @@ impl MacosSidebar {
                         })
                         .on_mouse_down(
                             gpui::MouseButton::Left,
-                            cx.listener(|_, _, _window, cx| {
-                                cx.stop_propagation();
+                            cx.listener({
+                                let group_id = group_id.clone();
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_tab_group_menu(&group_id, window, cx);
+                                }
                             }),
                         ),
                 );
@@ -1186,14 +1315,50 @@ impl MacosSidebar {
             );
         }
 
-        row.on_click(cx.listener(move |this, _, window, cx| {
-            this.handle_item_select(&group_id);
-            if let Some(callback) = this.on_tab_group_select.clone() {
-                callback(&group_id, window, cx);
-            }
-            this.notify_app_window(cx);
-        }))
-        .into_any_element()
+        let is_menu_open = self.tab_group_menu_open
+            && self.tab_group_menu_group_id.as_deref() == Some(group_id.as_str());
+
+        let click_group_id = group_id.clone();
+        let mut row = row
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.handle_item_select(&click_group_id);
+                if let Some(callback) = this.on_tab_group_select.clone() {
+                    callback(&click_group_id, window, cx);
+                }
+                this.notify_app_window(cx);
+            }))
+            .when(is_menu_open, |this| {
+                if let Some(menu) = self.tab_group_popup_menu.clone() {
+                    let position = self
+                        .tab_group_menu_position
+                        .unwrap_or(gpui::Point::default());
+                    this.child(
+                        deferred(
+                            anchored()
+                                .position(position)
+                                .anchor(gpui::Anchor::TopLeft)
+                                .snap_to_window_with_margin(px(8.))
+                                .child(menu),
+                        )
+                        .with_priority(100),
+                    )
+                } else {
+                    this
+                }
+            });
+
+        if show_more_action {
+            let right_click_group_id = group_id.clone();
+            row = row.on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_group_menu(&right_click_group_id, window, cx);
+                }),
+            );
+        }
+
+        row.into_any_element()
     }
 
     fn render_tab_group_tabs(

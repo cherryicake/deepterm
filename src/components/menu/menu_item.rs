@@ -92,7 +92,8 @@ impl RenderOnce for MenuItemElement {
             .id(self.id)
             .group(&self.group_name)
             .h(px(22.)) // Fixed height like macOS menu items
-            .px(px(12.)) // Horizontal padding for macOS style
+            .pl(px(12.))
+            .pr(px(6.))
             .text_sm()
             .text_color(theme.text)
             .relative()

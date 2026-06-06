@@ -1005,32 +1005,28 @@ impl PopupMenu {
                     })
                     .disabled(*disabled);
 
-                // Icon slot width for alignment
-                let icon_slot = div()
-                    .w(px(18.))
-                    .h(px(18.))
+                let mut content = div()
                     .flex()
-                    .items_center()
-                    .justify_center();
+                    .flex_row()
+                    .items_center();
 
-                // Render icon if present, otherwise empty placeholder
-                let icon_element: gpui::AnyElement = if let Some(icon) = icon {
-                    Icon::new(icon.path())
-                        .with_size(Size::XSmall)
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                };
+                if let Some(icon) = icon {
+                    content = content.gap(px(6.)).child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(icon.path())
+                                    .with_size(Size::XSmall)
+                                    .into_any_element(),
+                            ),
+                    );
+                }
 
-                this.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(icon_slot.child(icon_element))
-                        .child(div().child(label.clone())),
-                )
+                this.child(content.child(div().child(label.clone())))
             }
             PopupMenuItem::ElementItem {
                 render, disabled, ..
@@ -1051,22 +1047,26 @@ impl PopupMenu {
             } => {
                 let this = this.disabled(*disabled);
 
-                // Icon slot width for alignment
-                let icon_slot = div()
-                    .w(px(18.))
-                    .h(px(18.))
+                let mut content = div()
                     .flex()
-                    .items_center()
-                    .justify_center();
+                    .flex_row()
+                    .items_center();
 
-                // Render icon if present, otherwise empty placeholder
-                let icon_element: gpui::AnyElement = if let Some(icon) = icon {
-                    Icon::new(icon.path())
-                        .with_size(Size::XSmall)
-                        .into_any_element()
-                } else {
-                    div().into_any_element()
-                };
+                if let Some(icon) = icon {
+                    content = content.gap(px(6.)).child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(icon.path())
+                                    .with_size(Size::XSmall)
+                                    .into_any_element(),
+                            ),
+                    );
+                }
 
                 this.child(
                     div()
@@ -1075,15 +1075,7 @@ impl PopupMenu {
                         .items_center()
                         .justify_between()
                         .w_full()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(icon_slot.child(icon_element))
-                                .child(label.clone()),
-                        )
+                        .child(content.child(label.clone()))
                         .child(div().child("›")),
                 )
                 .when(selected, |this| {
@@ -1135,6 +1127,7 @@ impl Render for PopupMenu {
             .on_action(cx.listener(Self::dismiss))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .rounded(px(12.))
+            .occlude()
             // Inner menu container with highlight border
             .child(
                 div()
@@ -1144,8 +1137,9 @@ impl Render for PopupMenu {
                     .border_1()
                     .border_color(theme.border)
                     .rounded(px(12.))
-                    .py(px(6.)) // Increased vertical padding for first/last item distance
-                    .px(px(6.)) // Increased horizontal padding
+                    .py(px(6.))
+                    .pl(px(8.))
+                    .pr(px(4.))
                     .relative()
                     .occlude()
                     .child(
