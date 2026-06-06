@@ -270,17 +270,13 @@ impl AppWindow {
             })
             .collect();
 
-        let active_group_id = if session.active_group_id != DEFAULT_TAB_GROUP_ID {
-            DEFAULT_TAB_GROUP_ID
-        } else {
-            DEFAULT_TAB_GROUP_ID
-        };
+        let active_group_id = session.active_group_id;
 
         // 恢复 session 时 workspace/title bar 已切到 active group，但侧边栏本身
         // 不会自动收到用户点击事件。这里显式同步 selected_id，避免重启后出现
         // 内容区是某个标签页组、侧边栏却高亮“默认标签页组”的错位状态。
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.handle_item_select(active_group_id);
+            sidebar.handle_item_select(&active_group_id);
             cx.notify();
         });
 

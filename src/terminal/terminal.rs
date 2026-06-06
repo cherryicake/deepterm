@@ -989,7 +989,7 @@ impl Terminal {
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
     pub fn is_ssh_connected(&self) -> bool {
-        self.russh_handle.as_ref().map_or(true, |h| h.is_ready())
+        self.russh_handle.as_ref().map_or(false, |h| h.is_ready())
     }
 
     /// 检查 SSH 连接是否已失败
@@ -1441,10 +1441,6 @@ impl Terminal {
     }
 
     pub fn write(&mut self, data: &[u8]) {
-        if self.is_remote() {
-            self.remote_shell_ready = false;
-        }
-
         if let Some(ref sender) = self.sender {
             let msg = Msg::Input(Cow::Owned(data.to_vec()));
             let _ = sender.send(msg);

@@ -1251,6 +1251,19 @@ impl Workspace {
             tab_info.container.remove_panel(panel_id, cx)
         };
 
+        let Some(new_container) = new_container else {
+            self.tabs.remove(&target_tab_id);
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.remove_tab(&target_tab_id, cx);
+            });
+            if self.active_tab_id == target_tab_id {
+                self.activate_next_tab(cx);
+            }
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+            return;
+        };
+
         let panel_count = new_container.panel_count();
         // 更新container
         let tab_info = self.tabs.get_mut(&target_tab_id).unwrap();
@@ -1438,6 +1451,19 @@ impl Workspace {
         // 这样可以避免同一个panel在容器中出现两次
         let container_after_remove = tab_info.container.remove_panel(&dragged_panel.panel_id, cx);
 
+        let Some(container_after_remove) = container_after_remove else {
+            self.tabs.remove(&active_tab_id);
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.remove_tab(&active_tab_id, cx);
+            });
+            if self.active_tab_id == active_tab_id {
+                self.activate_next_tab(cx);
+            }
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+            return;
+        };
+
         // 创建包含被拖拽panel的容器
         let dragged_container = SplitContainer::Panel(dragged_panel_entity);
 
@@ -1538,6 +1564,19 @@ impl Workspace {
 
         // 从当前container中移除被拖拽的panel
         let new_container = tab_info.container.remove_panel(&dragged_panel.panel_id, cx);
+
+        let Some(new_container) = new_container else {
+            self.tabs.remove(&active_tab_id);
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.remove_tab(&active_tab_id, cx);
+            });
+            if self.active_tab_id == active_tab_id {
+                self.activate_next_tab(cx);
+            }
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+            return;
+        };
 
         // 更新原tab的container
         tab_info.container = new_container;

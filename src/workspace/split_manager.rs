@@ -240,16 +240,13 @@ impl SplitContainer {
         }
     }
 
-    /// 从容器中移除指定的panel
-    /// 返回新的容器，如果移除后只剩一个子容器，则提升该子容器
-    pub fn remove_panel(&self, panel_id: &str, cx: &App) -> Self {
+    pub fn remove_panel(&self, panel_id: &str, cx: &App) -> Option<Self> {
         match self {
             SplitContainer::Panel(panel) => {
                 if panel.read(cx).panel_id == panel_id {
-                    // 找到了要移除的panel，返回克隆（调用者应该处理这种情况）
-                    self.clone()
+                    None
                 } else {
-                    self.clone()
+                    Some(self.clone())
                 }
             }
             SplitContainer::Split {
@@ -261,30 +258,32 @@ impl SplitContainer {
                 let mut new_sizes = Vec::new();
 
                 for (i, child) in children.iter().enumerate() {
-                    // 检查这个child是否包含要移除的panel
                     if let SplitContainer::Panel(p) = child {
                         if p.read(cx).panel_id == panel_id {
-                            // 跳过这个panel
                             continue;
                         }
                     }
 
-                    let new_child = child.remove_panel(panel_id, cx);
-                    new_children.push(new_child);
-                    if let Some(size) = sizes.get(i) {
-                        new_sizes.push(*size);
+                    if let Some(new_child) = child.remove_panel(panel_id, cx) {
+                        new_children.push(new_child);
+                        if let Some(size) = sizes.get(i) {
+                            new_sizes.push(*size);
+                        }
                     }
                 }
 
-                // 如果只剩一个子容器，提升它
+                if new_children.is_empty() {
+                    return None;
+                }
+
                 if new_children.len() == 1 {
-                    new_children[0].clone()
+                    Some(new_children[0].clone())
                 } else {
-                    SplitContainer::Split {
+                    Some(SplitContainer::Split {
                         direction: *direction,
                         children: new_children,
                         sizes: new_sizes,
-                    }
+                    })
                 }
             }
         }
