@@ -18,7 +18,7 @@ pub use cross_remote::{NoopReporter, TransferStatusReporter};
 pub use endpoint::FileEndpoint;
 pub use manager::TransferManager;
 pub use request::{ConflictPolicy, FileDragPayload, TransferOperation, TransferRequest};
-pub use utils::{TransferSummary, TRANSFER_CANCELLED_MSG};
+pub use utils::{TRANSFER_CANCELLED_MSG, TransferSummary};
 pub use view::{
     TransferHoverAction, TransferTaskHandler, TransferTaskState, TransferTaskStatus,
     endpoint_label, quick_total_size, render_transfer_panel, transfer_item_name, transfer_label,

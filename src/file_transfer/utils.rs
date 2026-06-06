@@ -1,13 +1,13 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail};
 
 use crate::file_transfer::{
-    wait_for_resolution, ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver,
+    ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, wait_for_resolution,
 };
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
@@ -57,8 +57,12 @@ impl TransferSummary {
     }
 
     pub fn merge(&mut self, other: Self) {
-        self.files_transferred = self.files_transferred.saturating_add(other.files_transferred);
-        self.bytes_transferred = self.bytes_transferred.saturating_add(other.bytes_transferred);
+        self.files_transferred = self
+            .files_transferred
+            .saturating_add(other.files_transferred);
+        self.bytes_transferred = self
+            .bytes_transferred
+            .saturating_add(other.bytes_transferred);
         self.skipped = self.skipped.saturating_add(other.skipped);
     }
 }
@@ -230,8 +234,7 @@ pub fn resolve_local_conflict(
         ConflictPolicy::Overwrite => Ok(Some(desired_path.to_path_buf())),
         ConflictPolicy::Skip => Ok(None),
         ConflictPolicy::Ask => {
-            let resolver = resolver
-                .ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
+            let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
             let (tx, rx) = async_channel::bounded(1);
             let file_name = desired_path
                 .file_name()
@@ -256,10 +259,7 @@ pub fn resolve_local_conflict(
                             return Ok(Some(candidate));
                         }
                     }
-                    bail!(
-                        "无法为 {} 找到可用的文件名",
-                        desired_path.display()
-                    )
+                    bail!("无法为 {} 找到可用的文件名", desired_path.display())
                 }
                 ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
             }
@@ -274,10 +274,7 @@ pub fn resolve_local_conflict(
                     return Ok(Some(candidate));
                 }
             }
-            bail!(
-                "无法为 {} 找到可用的文件名",
-                desired_path.display()
-            )
+            bail!("无法为 {} 找到可用的文件名", desired_path.display())
         }
     }
 }
@@ -318,8 +315,7 @@ pub fn resolve_remote_conflict(
         ConflictPolicy::Overwrite => Ok(Some(desired_path.to_string())),
         ConflictPolicy::Skip => Ok(None),
         ConflictPolicy::Ask => {
-            let resolver = resolver
-                .ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
+            let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
             let (tx, rx) = async_channel::bounded(1);
             let file_name = remote_file_name(desired_path).unwrap_or_else(|_| "file".to_string());
             resolver.prompt(ConflictPrompt {
@@ -341,10 +337,7 @@ pub fn resolve_remote_conflict(
                             return Ok(Some(candidate));
                         }
                     }
-                    bail!(
-                        "无法为 {} 找到可用的远程文件名",
-                        desired_path
-                    )
+                    bail!("无法为 {} 找到可用的远程文件名", desired_path)
                 }
                 ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
             }
@@ -359,10 +352,7 @@ pub fn resolve_remote_conflict(
                     return Ok(Some(candidate));
                 }
             }
-            bail!(
-                "无法为 {} 找到可用的远程文件名",
-                desired_path
-            )
+            bail!("无法为 {} 找到可用的远程文件名", desired_path)
         }
     }
 }
@@ -445,10 +435,7 @@ mod tests {
 
     #[test]
     fn shell_single_quote_multiple_apostrophes() {
-        assert_eq!(
-            shell_single_quote("it's a test"),
-            "it'\\''s a test"
-        );
+        assert_eq!(shell_single_quote("it's a test"), "it'\\''s a test");
     }
 
     #[test]

@@ -155,11 +155,19 @@ impl PathResolver {
 
     #[cfg(target_os = "macos")]
     pub fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
-        let output = std::process::Command::new("lsof")
+        let output = std::process::Command::new("/usr/sbin/lsof")
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
+            .map_err(|error| {
+                log::warn!("Failed to run lsof for cwd query: {error}");
+                error
+            })
             .ok()?;
         if !output.status.success() {
+            log::warn!(
+                "lsof cwd query failed for pid {pid}: status {}",
+                output.status
+            );
             return None;
         }
 

@@ -444,7 +444,11 @@ mod tests {
         // builtin 含中文：cols=80, "ab中cd" → 段 "ab" / "中" / "cd"，光标在 builtin 末尾
         let r = wrap("ab中cd", "", 0, 80);
         assert_eq!(r.lines.len(), 1);
-        let texts: Vec<&str> = r.lines[0].segments.iter().map(|s| s.text.as_str()).collect();
+        let texts: Vec<&str> = r.lines[0]
+            .segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
         assert_eq!(texts, vec!["ab", "中", "cd"]);
         assert_eq!(r.cursor_col, 6);
         assert_segments_cover(&r.lines[0]);

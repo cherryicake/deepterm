@@ -2,7 +2,16 @@
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::{borrow::Cow, cell::Cell, path::PathBuf, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::Instant,
+};
 
 use alacritty_terminal::{
     Term,
@@ -94,6 +103,118 @@ impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
         self.0.unbounded_send(event).ok();
     }
+}
+
+fn env_value(env: &HashMap<String, String>, key: &str) -> Option<String> {
+    env.get(key).cloned().or_else(|| std::env::var(key).ok())
+}
+
+fn local_shell_name(program: &str) -> Option<&str> {
+    Path::new(program).file_name()?.to_str()
+}
+
+fn configure_local_shell_integration(
+    program: String,
+    mut args: Vec<String>,
+    env: &mut HashMap<String, String>,
+) -> tty::Shell {
+    let Some(shell_name) = local_shell_name(&program) else {
+        return tty::Shell::new(program, args);
+    };
+
+    let Some(root) = write_local_shell_integration_files() else {
+        return tty::Shell::new(program, args);
+    };
+
+    env.insert(
+        "DEEPTERM_RESOURCES_DIR".to_string(),
+        root.to_string_lossy().to_string(),
+    );
+
+    match shell_name {
+        "zsh" if args.is_empty() => {
+            // 对齐 Ghostty 的 zsh 自动注入模型：把 ZDOTDIR 指到 DeepTerm
+            // 资源目录，并把用户原来的 ZDOTDIR 保存在环境变量里。zsh 启动
+            // 时会自然读取该目录下的启动文件；这些 wrapper 再 source 用户
+            // 原本配置并加载 OSC 7 integration，全程不会向 PTY 写入脚本文本。
+            if let Some(old_zdotdir) = env_value(env, "ZDOTDIR") {
+                env.insert("DEEPTERM_ZSH_ZDOTDIR".to_string(), old_zdotdir);
+            }
+            env.insert(
+                "ZDOTDIR".to_string(),
+                root.join("shell-integration/zsh")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        "bash" if args.is_empty() => {
+            // 对齐 Ghostty 的 bash 自动注入模型：bash 先以 POSIX 模式启动，
+            // POSIX shell 会读取 ENV 指向的 integration 脚本。脚本随后关闭
+            // POSIX 模式并手动恢复 bash 原本的 profile/bashrc 加载流程。
+            // macOS 系统自带 /bin/bash 与 Ghostty 一样跳过自动注入，因为它的
+            // Apple patch 不可靠地支持这条 ENV/POSIX 启动路径。
+            if cfg!(target_os = "macos") && program == "/bin/bash" {
+                return tty::Shell::new(program, args);
+            }
+            if let Some(old_env) = env_value(env, "ENV") {
+                env.insert("DEEPTERM_BASH_ENV".to_string(), old_env);
+            }
+            env.insert(
+                "ENV".to_string(),
+                root.join("shell-integration/bash/deepterm.bash")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            env.insert("DEEPTERM_BASH_INJECT".to_string(), "1".to_string());
+            if env_value(env, "HISTFILE").is_none()
+                && let Some(home) = env_value(env, "HOME")
+            {
+                env.insert("HISTFILE".to_string(), format!("{home}/.bash_history"));
+                env.insert(
+                    "DEEPTERM_BASH_UNEXPORT_HISTFILE".to_string(),
+                    "1".to_string(),
+                );
+            }
+            args.push("--posix".to_string());
+        }
+        _ => {}
+    }
+
+    tty::Shell::new(program, args)
+}
+
+fn write_local_shell_integration_files() -> Option<PathBuf> {
+    let root = std::env::temp_dir().join("deepterm-shell-integration");
+    let bash_dir = root.join("shell-integration/bash");
+    let zsh_dir = root.join("shell-integration/zsh");
+    fs::create_dir_all(&bash_dir).ok()?;
+    fs::create_dir_all(&zsh_dir).ok()?;
+
+    // 关键点：这些文件直接来自 Ghostty 的 shell integration 资源结构，
+    // 只做 DeepTerm 命名适配。运行时复制资源文件，而不是手写/拼接 shell
+    // wrapper，避免 zsh/bash 启动语义和 Ghostty 分叉。
+    fs::write(
+        bash_dir.join("deepterm.bash"),
+        include_str!("../../assets/shell-integration/bash/deepterm.bash"),
+    )
+    .ok()?;
+    fs::write(
+        bash_dir.join("bash-preexec.sh"),
+        include_str!("../../assets/shell-integration/bash/bash-preexec.sh"),
+    )
+    .ok()?;
+    fs::write(
+        zsh_dir.join(".zshenv"),
+        include_str!("../../assets/shell-integration/zsh/.zshenv"),
+    )
+    .ok()?;
+    fs::write(
+        zsh_dir.join("deepterm-integration"),
+        include_str!("../../assets/shell-integration/zsh/deepterm-integration"),
+    )
+    .ok()?;
+
+    Some(root)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,7 +372,14 @@ pub struct Terminal {
     pty_master_fd: Option<i32>,
     /// 远程 shell 提示符是否已准备好。
     remote_shell_ready: bool,
-    remote_working_directory: Option<String>,
+    /// 终端通过 OSC 7 / CurrentDir 等序列主动上报的工作目录。
+    ///
+    /// 这里同时服务本地 PTY 与 SSH 终端：
+    /// - 本地 PTY 走 vendored vte/alacritty 的 OSC 7 事件，由 `PwdChanged` 写入。
+    /// - SSH 数据流先在 DeepTerm 侧截获 OSC，再复用同一套解析和保存逻辑。
+    /// 统一保存“终端自己声明的 cwd”，可以避免再用 `lsof`/进程 cwd 猜测 shell
+    /// 状态；后者无法稳定追踪 shell 内建 `cd` 后的实时目录。
+    reported_working_directory: Option<String>,
     /// 检测到的远程操作系统
     pub remote_os: Option<RemoteOS>,
     window_title: Option<String>,
@@ -367,7 +495,7 @@ impl Terminal {
                 shell_process_group_id,
                 pty_master_fd,
                 remote_shell_ready: false,
-                remote_working_directory: None,
+                reported_working_directory: None,
                 remote_os,
                 window_title: None,
                 sender: Some(notifier),
@@ -420,12 +548,15 @@ impl Terminal {
 
         let remote_os = Some(detect_local_os());
 
+        let mut env = crate::terminal::mappings::default_terminal_env();
+        let shell = configure_local_shell_integration(default_shell, Vec::new(), &mut env);
+
         Self::build_local_terminal(
             cx,
             tty::Options {
-                shell: Some(tty::Shell::new(default_shell, vec![])),
+                shell: Some(shell),
                 working_directory,
-                env: crate::terminal::mappings::default_terminal_env(),
+                env,
                 ..Default::default()
             },
             "Failed to create PTY".to_string(),
@@ -483,7 +614,7 @@ impl Terminal {
             shell_process_group_id: None,
             pty_master_fd: None,
             remote_shell_ready: false,
-            remote_working_directory: None,
+            reported_working_directory: None,
             remote_os: None,
             window_title: None,
             sender: None,
@@ -557,7 +688,7 @@ impl Terminal {
                 shell_process_group_id: None,
                 pty_master_fd: None,
                 remote_shell_ready: false,
-                remote_working_directory: None,
+                reported_working_directory: None,
                 remote_os: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
@@ -595,16 +726,30 @@ impl Terminal {
     /// - 连接期间缓存输入数据，连接成功后自动转发
     /// - 若 russh 连接失败，自动回退到 PTY + 系统 ssh 命令方式
     pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        Self::new_ssh_with_remote_cwd(cx, ssh_config, None)
+    }
+
+    pub fn new_ssh_with_remote_cwd(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+    ) -> Entity<Self> {
         match preferred_ssh_transport(&ssh_config.auth_method) {
             Ok(PreferredSshTransport::Pty) => {
                 log::info!("SSH: 该凭据类型使用系统 ssh PTY 模式");
-                Self::new_ssh_pty(cx, ssh_config)
+                Self::new_ssh_pty(cx, ssh_config, remote_cwd)
             }
-            Ok(PreferredSshTransport::Russh) | Err(_) => Self::new_ssh_russh(cx, ssh_config),
+            Ok(PreferredSshTransport::Russh) | Err(_) => {
+                Self::new_ssh_russh(cx, ssh_config, remote_cwd)
+            }
         }
     }
 
-    fn new_ssh_russh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+    fn new_ssh_russh(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+    ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let (driver_tx, driver_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -630,6 +775,7 @@ impl Terminal {
             initial_rows,
             listener.clone(),
             driver_listener,
+            remote_cwd,
         );
 
         // 创建终端实体（立即返回，不阻塞 GPUI）
@@ -648,7 +794,11 @@ impl Terminal {
         )
     }
 
-    fn new_ssh_pty(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+    fn new_ssh_pty(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+    ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let (_driver_tx, driver_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -660,14 +810,19 @@ impl Terminal {
             listener.clone(),
         )));
 
-        let pty_terminal =
-            match SshPtyTerminal::new(ssh_config, default_bounds, term.clone(), listener) {
-                Ok(pty_terminal) => pty_terminal,
-                Err(err) => {
-                    log::error!("SSH PTY 初始化失败: {}", err);
-                    return cx.new(|_cx| Self::create_error_terminal());
-                }
-            };
+        let pty_terminal = match SshPtyTerminal::new(
+            ssh_config,
+            default_bounds,
+            term.clone(),
+            listener,
+            remote_cwd,
+        ) {
+            Ok(pty_terminal) => pty_terminal,
+            Err(err) => {
+                log::error!("SSH PTY 初始化失败: {}", err);
+                return cx.new(|_cx| Self::create_error_terminal());
+            }
+        };
 
         let pty_input = pty_terminal.clone();
         let pty_resize = pty_terminal.clone();
@@ -742,7 +897,7 @@ impl Terminal {
                 shell_process_group_id: None,
                 pty_master_fd: None,
                 remote_shell_ready: false,
-                remote_working_directory: None,
+                reported_working_directory: None,
                 remote_os: None,
                 window_title: None,
                 sender: None,
@@ -821,8 +976,15 @@ impl Terminal {
         self.window_title.as_deref()
     }
 
+    pub fn reported_working_directory(&self) -> Option<&str> {
+        self.reported_working_directory.as_deref()
+    }
+
+    /// 兼容旧调用点：历史上这个值只来自 SSH OSC，所以 API 名称包含 remote。
+    /// 现在本地 PTY 也会通过 OSC 7 上报 cwd，新代码应优先使用
+    /// `reported_working_directory` 表达更准确的语义。
     pub fn remote_working_directory(&self) -> Option<&str> {
-        self.remote_working_directory.as_deref()
+        self.reported_working_directory()
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
@@ -840,10 +1002,19 @@ impl Terminal {
         self.russh_handle.as_ref()?.error_message()
     }
 
-    /// 处理从 SSH 接收的数据
-    pub fn process_ssh_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
+    /// 处理 PTY/SSH 原始输出。
+    ///
+    /// 所有原始 bytes 都先经过这里旁路识别 OSC 7，再继续喂给 alacritty 的 VTE
+    /// parser。这样不需要改 vte/alacritty 上游源码，也不会改变终端渲染数据流。
+    fn handle_pty_data(
+        &mut self,
+        data: &[u8],
+        require_local_osc7_host: bool,
+        cx: &mut Context<Self>,
+    ) {
         // 先拦截需要由应用层消费的 OSC 序列，比如 OSC 52 与 cwd 更新。
-        let filtered_data = self.extract_and_handle_osc_sequences(data, cx);
+        let filtered_data =
+            self.extract_and_handle_osc_sequences(data, require_local_osc7_host, cx);
 
         let mut term = self.term.lock();
         for byte in filtered_data.as_ref() {
@@ -853,6 +1024,11 @@ impl Terminal {
         // 标记内容已更新
         self.content_dirty = true;
         self.content_generation += 1;
+    }
+
+    /// 处理从 SSH 接收的数据
+    pub fn process_ssh_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
+        self.handle_pty_data(data, false, cx);
     }
 
     pub fn handle_remote_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
@@ -865,6 +1041,7 @@ impl Terminal {
     fn extract_and_handle_osc_sequences<'a>(
         &mut self,
         data: &'a [u8],
+        require_local_osc7_host: bool,
         cx: &mut Context<Self>,
     ) -> Cow<'a, [u8]> {
         // 快速路径: 检查是否包含 OSC 开始序列 (ESC ])
@@ -885,7 +1062,7 @@ impl Terminal {
 
             // 尝试提取完整 OSC 序列
             if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[osc_pos..]) {
-                if self.try_handle_osc_sequence(cx, osc_content) {
+                if self.try_handle_osc_sequence(cx, osc_content, require_local_osc7_host) {
                     // 已由应用层处理，跳过这个序列
                     pos = osc_pos + osc_end;
                     continue;
@@ -907,14 +1084,20 @@ impl Terminal {
         Cow::Owned(result)
     }
 
-    fn try_handle_osc_sequence(&mut self, _cx: &mut Context<Self>, osc_content: &[u8]) -> bool {
+    fn try_handle_osc_sequence(
+        &mut self,
+        _cx: &mut Context<Self>,
+        osc_content: &[u8],
+        require_local_osc7_host: bool,
+    ) -> bool {
         if Self::is_shell_prompt_osc(osc_content) {
             self.remote_shell_ready = true;
             return true;
         }
 
-        if let Some(path) = Self::parse_remote_working_directory_osc(osc_content) {
-            self.remote_working_directory = Some(path);
+        if let Some(path) = Self::parse_working_directory_osc(osc_content, require_local_osc7_host)
+        {
+            self.reported_working_directory = Some(path);
             return true;
         }
 
@@ -933,11 +1116,14 @@ impl Terminal {
             .is_some_and(|s| s.starts_with("133;A"))
     }
 
-    fn parse_remote_working_directory_osc(osc_content: &[u8]) -> Option<String> {
+    fn parse_working_directory_osc(
+        osc_content: &[u8],
+        require_local_osc7_host: bool,
+    ) -> Option<String> {
         let content = std::str::from_utf8(osc_content).ok()?.trim();
 
         if let Some(uri) = content.strip_prefix("7;") {
-            return Self::parse_osc7_file_uri(uri.trim());
+            return Self::parse_osc7_working_directory_uri(uri.trim(), require_local_osc7_host);
         }
 
         if let Some(path) = content.strip_prefix("1337;CurrentDir=") {
@@ -961,15 +1147,63 @@ impl Terminal {
         Some(os)
     }
 
-    fn parse_osc7_file_uri(uri: &str) -> Option<String> {
-        let path = if let Some(path) = uri.strip_prefix("file://") {
-            let slash_index = path.find('/')?;
-            &path[slash_index..]
+    fn parse_osc7_working_directory_uri(uri: &str, require_local_host: bool) -> Option<String> {
+        // OSC 7 常见有两种形态：
+        // - file://host/path：标准/通用格式，path 是 URL percent-encoding。
+        // - kitty-shell-cwd://host/path：Kitty/Ghostty 使用的格式，语义同样是 cwd。
+        //
+        // 和 Ghostty 一样，解析 URL 时保持“本地/远程上下文”分层：
+        // - 本地 PTY 通过 alacritty/vte 的 PwdChanged 进入，要求 host 是本机。
+        // - SSH 数据流通过 try_handle_osc_sequence 进入，host 属于远端，不做本机校验。
+        let (host, path) = if let Some(rest) = uri.strip_prefix("file://") {
+            Self::split_osc7_host_path(rest)?
+        } else if let Some(rest) = uri.strip_prefix("kitty-shell-cwd://") {
+            Self::split_osc7_host_path(rest)?
         } else {
-            uri
+            ("", uri)
         };
 
+        if require_local_host && !Self::is_local_osc7_host(host) {
+            log::warn!("Ignoring OSC 7 cwd from non-local host: {host}");
+            return None;
+        }
+
         Self::normalize_remote_working_directory(path)
+    }
+
+    fn split_osc7_host_path(value: &str) -> Option<(&str, &str)> {
+        let slash_index = value.find('/')?;
+        let (host, path) = value.split_at(slash_index);
+        Some((host, path))
+    }
+
+    fn is_local_osc7_host(host: &str) -> bool {
+        let host = host.trim();
+        if host.is_empty() {
+            return false;
+        }
+
+        if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+            return true;
+        }
+
+        std::process::Command::new("/bin/hostname")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|hostname| {
+                let hostname = hostname.trim();
+                host == hostname
+                    || hostname
+                        .split_once('.')
+                        .map(|(short, _)| host == short)
+                        .unwrap_or(false)
+                    || host
+                        .split_once('.')
+                        .map(|(short, _)| short == hostname)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     fn normalize_remote_working_directory(path: &str) -> Option<String> {
@@ -1674,3 +1908,80 @@ impl Terminal {
 }
 
 impl EventEmitter<Event> for Terminal {}
+
+#[cfg(test)]
+mod tests {
+    use super::Terminal;
+
+    #[test]
+    fn parses_file_scheme_osc7_cwd() {
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri(
+                "file://remote-host/home/alice/project",
+                false
+            ),
+            Some("/home/alice/project".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_kitty_shell_cwd_scheme() {
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri(
+                "kitty-shell-cwd://remote-host/tmp/build",
+                false
+            ),
+            Some("/tmp/build".to_string())
+        );
+    }
+
+    #[test]
+    fn decodes_percent_encoded_path_segments() {
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri(
+                "file://remote-host/Users/alice/My%20Project/%E4%B8%AD%E6%96%87",
+                false
+            ),
+            Some("/Users/alice/My Project/中文".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_relative_osc7_paths() {
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri("file://remote-host/../relative", false),
+            Some("/../relative".to_string())
+        );
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri("relative/path", false),
+            None
+        );
+    }
+
+    #[test]
+    fn local_context_requires_local_host() {
+        assert_eq!(
+            Terminal::parse_osc7_working_directory_uri(
+                "file://definitely-not-this-machine.local/tmp",
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_remote_working_directory_osc_variants() {
+        assert_eq!(
+            Terminal::parse_working_directory_osc(b"7;file://host/home/alice", false),
+            Some("/home/alice".to_string())
+        );
+        assert_eq!(
+            Terminal::parse_working_directory_osc(b"1337;CurrentDir=/var/www", false),
+            Some("/var/www".to_string())
+        );
+        assert_eq!(
+            Terminal::parse_working_directory_osc(b"633;P;Cwd=/opt/app", false),
+            Some("/opt/app".to_string())
+        );
+    }
+}

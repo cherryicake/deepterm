@@ -6,9 +6,9 @@ use gpui::{App, SharedString, Task};
 use ropey::Rope;
 
 use super::display_map::DisplayMap;
-use crate::components::input::{InputEdit, RopeExt as _};
 use crate::components::input::highlighter::DiagnosticSet;
 use crate::components::input::highlighter::SyntaxHighlighter;
+use crate::components::input::{InputEdit, RopeExt as _};
 
 pub(crate) struct PendingBackgroundParse {
     pub highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
@@ -20,10 +20,7 @@ pub(crate) struct PendingBackgroundParse {
 #[derive(Clone)]
 pub(crate) enum InputMode {
     /// A plain text input mode.
-    PlainText {
-        multi_line: bool,
-        rows: usize,
-    },
+    PlainText { multi_line: bool, rows: usize },
     /// An auto grow input mode.
     AutoGrow {
         rows: usize,

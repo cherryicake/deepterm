@@ -610,10 +610,22 @@ fn paint_rounded_corner(
                 });
             }
             builder.move_to(abs(hc + r, vc - s * 0.5));
-            builder.arc_to(point(r_out, r_out), px(0.0), false, false, abs(hc - s * 0.5, vc + r));
+            builder.arc_to(
+                point(r_out, r_out),
+                px(0.0),
+                false,
+                false,
+                abs(hc - s * 0.5, vc + r),
+            );
             if has_inner {
                 builder.line_to(abs(hc + s * 0.5, vc + r));
-                builder.arc_to(point(r_in, r_in), px(0.0), false, true, abs(hc + r, vc + s * 0.5));
+                builder.arc_to(
+                    point(r_in, r_in),
+                    px(0.0),
+                    false,
+                    true,
+                    abs(hc + r, vc + s * 0.5),
+                );
             } else {
                 builder.line_to(abs(hc + r, vc + r));
             }
@@ -634,10 +646,22 @@ fn paint_rounded_corner(
                 });
             }
             builder.move_to(abs(hc - r, vc - s * 0.5));
-            builder.arc_to(point(r_out, r_out), px(0.0), false, true, abs(hc + s * 0.5, vc + r));
+            builder.arc_to(
+                point(r_out, r_out),
+                px(0.0),
+                false,
+                true,
+                abs(hc + s * 0.5, vc + r),
+            );
             if has_inner {
                 builder.line_to(abs(hc - s * 0.5, vc + r));
-                builder.arc_to(point(r_in, r_in), px(0.0), false, false, abs(hc - r, vc + s * 0.5));
+                builder.arc_to(
+                    point(r_in, r_in),
+                    px(0.0),
+                    false,
+                    false,
+                    abs(hc - r, vc + s * 0.5),
+                );
             } else {
                 builder.line_to(abs(hc - r, vc + r));
             }
@@ -658,10 +682,22 @@ fn paint_rounded_corner(
                 });
             }
             builder.move_to(abs(hc - r, vc + s * 0.5));
-            builder.arc_to(point(r_out, r_out), px(0.0), false, false, abs(hc + s * 0.5, vc - r));
+            builder.arc_to(
+                point(r_out, r_out),
+                px(0.0),
+                false,
+                false,
+                abs(hc + s * 0.5, vc - r),
+            );
             if has_inner {
                 builder.line_to(abs(hc - s * 0.5, vc - r));
-                builder.arc_to(point(r_in, r_in), px(0.0), false, true, abs(hc - r, vc - s * 0.5));
+                builder.arc_to(
+                    point(r_in, r_in),
+                    px(0.0),
+                    false,
+                    true,
+                    abs(hc - r, vc - s * 0.5),
+                );
             } else {
                 builder.line_to(abs(hc - r, vc - r));
             }
@@ -682,10 +718,22 @@ fn paint_rounded_corner(
                 });
             }
             builder.move_to(abs(hc + r, vc + s * 0.5));
-            builder.arc_to(point(r_out, r_out), px(0.0), false, true, abs(hc - s * 0.5, vc - r));
+            builder.arc_to(
+                point(r_out, r_out),
+                px(0.0),
+                false,
+                true,
+                abs(hc - s * 0.5, vc - r),
+            );
             if has_inner {
                 builder.line_to(abs(hc + s * 0.5, vc - r));
-                builder.arc_to(point(r_in, r_in), px(0.0), false, false, abs(hc + r, vc - s * 0.5));
+                builder.arc_to(
+                    point(r_in, r_in),
+                    px(0.0),
+                    false,
+                    false,
+                    abs(hc + r, vc - s * 0.5),
+                );
             } else {
                 builder.line_to(abs(hc + r, vc - r));
             }

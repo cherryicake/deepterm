@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
+use crate::file_transfer::cross_remote::{self, TransferStatusReporter};
+use crate::file_transfer::utils::TransferSummary;
 use crate::file_transfer::{
     ConflictPolicy, ConflictResolver, FileEndpoint, TransferOperation, TransferRequest,
 };
-use crate::file_transfer::cross_remote::{self, TransferStatusReporter};
-use crate::file_transfer::utils::TransferSummary;
 
 pub struct TransferManager;
 
@@ -123,16 +123,14 @@ impl TransferManager {
                 FileEndpoint::Local {
                     path: destination_dir,
                 },
-            ) => {
-                crate::file_transfer::local_ops::copy_local_to_local(
-                    &path,
-                    destination_dir,
-                    conflict_policy,
-                    rename_to,
-                    cancelled,
-                    resolver,
-                )
-            }
+            ) => crate::file_transfer::local_ops::copy_local_to_local(
+                &path,
+                destination_dir,
+                conflict_policy,
+                rename_to,
+                cancelled,
+                resolver,
+            ),
             (
                 FileEndpoint::Local { path },
                 FileEndpoint::Remote {

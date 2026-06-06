@@ -3,7 +3,7 @@ use crate::components::button::{Icon, Size};
 use crate::components::menu::menu_item::MenuItemElement;
 use crate::theme::ActiveTheme;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Bounds, Context, Anchor, DismissEvent, Entity,
+    Action, Anchor, AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
     WeakEntity, Window, actions, anchored, div, prelude::FluentBuilder, px, rems,
@@ -255,7 +255,6 @@ impl PopupMenuItem {
     fn is_separator(&self) -> bool {
         matches!(self, PopupMenuItem::Separator)
     }
-
 }
 
 /// Side for check icon placement
@@ -934,7 +933,6 @@ impl PopupMenu {
     ) {
         self.handle_dismiss(&e.position, window, cx);
     }
-
 
     #[inline]
     fn max_width(&self) -> Pixels {

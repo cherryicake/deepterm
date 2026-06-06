@@ -436,10 +436,14 @@ impl RenderOnce for Button {
                     let h = self.custom_height;
                     let px_val = self.custom_px;
                     match self.size {
-                        Size::Size(_) => this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(12.0))),
+                        Size::Size(_) => {
+                            this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(12.0)))
+                        }
                         Size::XSmall => this.h(h.unwrap_or(px(24.0))).px(px_val.unwrap_or(px(6.0))),
                         Size::Small => this.h(h.unwrap_or(px(28.0))).px(px_val.unwrap_or(px(10.0))),
-                        Size::Medium => this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(16.0))),
+                        Size::Medium => {
+                            this.h(h.unwrap_or(px(36.0))).px(px_val.unwrap_or(px(16.0)))
+                        }
                         Size::Large => this.h(h.unwrap_or(px(44.0))).px(px_val.unwrap_or(px(20.0))),
                     }
                 }

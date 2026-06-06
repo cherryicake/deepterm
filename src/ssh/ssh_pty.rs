@@ -12,7 +12,7 @@ use alacritty_terminal::tty::{self, Options};
 
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
-use crate::ssh::remote_shell_tracking_snippet;
+use crate::ssh::remote_shell_tracking_command;
 use crate::terminal::TerminalBounds;
 use crate::terminal::terminal::ZedListener;
 
@@ -30,6 +30,7 @@ impl SshPtyTerminal {
         bounds: TerminalBounds,
         term: Arc<FairMutex<Term<ZedListener>>>,
         listener: ZedListener,
+        initial_cwd: Option<String>,
     ) -> anyhow::Result<Self> {
         log::info!("=== 创建 SSH PTY 终端 ===");
         log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
@@ -85,6 +86,9 @@ impl SshPtyTerminal {
 
         // 目标主机
         ssh_args.push(format!("{}@{}", config.username, config.host));
+        // 和 russh 路径保持一致：远程 shell integration 在远程 shell 启动前
+        // 通过 ssh command bootstrap 完成，不再登录后向远程 PTY 输入脚本。
+        ssh_args.push(remote_shell_tracking_command(initial_cwd.as_deref()));
 
         log::info!("SSH 命令: {} {:?}", ssh_program, ssh_args);
 
@@ -109,8 +113,6 @@ impl SshPtyTerminal {
         let pty = tty::new(&pty_options, window_size, 0)
             .map_err(|e| anyhow::anyhow!("创建 PTY 失败: {}", e))?;
 
-        // 创建事件循环
-        log::debug!("创建事件循环...");
         let event_loop = EventLoop::new(
             term, listener, pty, true,  // hold
             false, // ref_test
@@ -123,11 +125,6 @@ impl SshPtyTerminal {
         // 启动事件循环
         log::debug!("启动事件循环...");
         let _io_thread = event_loop.spawn();
-
-        // 注入跟踪脚本到已运行的 shell
-        let _ = sender.send(Msg::Input(std::borrow::Cow::Borrowed(
-            remote_shell_tracking_snippet().as_bytes(),
-        )));
 
         log::info!("SSH PTY 终端创建成功");
 

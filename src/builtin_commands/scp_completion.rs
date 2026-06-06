@@ -264,9 +264,7 @@ pub fn analyse_at(buffer: &str, cursor: usize) -> Option<ScpCompletionQuery> {
     // 找到光标所在 token：`start <= cursor <= end`。
     // token 之间至少隔一个空白，故 `cursor == end(前)` 与 `cursor == start(后)`
     // 不会同时命中两个 token（区间不重叠）。
-    let cursor_token = tokens
-        .iter()
-        .find(|t| cursor >= t.start && cursor <= t.end);
+    let cursor_token = tokens.iter().find(|t| cursor >= t.start && cursor <= t.end);
 
     let (token_start, token_end, raw_token): (usize, usize, &str) = match cursor_token {
         Some(t) => (t.start, t.end, &buffer[t.start..t.end]),

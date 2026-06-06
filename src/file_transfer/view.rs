@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui::prelude::*;
-use gpui::{div, px, relative, rgb, App, ClickEvent, Context, Div, MouseButton, Window};
+use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
 
 use crate::assets::Icon;
 use crate::file_browser::shared::format_size;
@@ -249,7 +249,9 @@ fn render_transfer_list_item(
                 }
                 parts.join(" ")
             }
-            TransferTaskStatus::Completed { bytes, .. } => format!("传输完成 {}", format_size(*bytes)),
+            TransferTaskStatus::Completed { bytes, .. } => {
+                format!("传输完成 {}", format_size(*bytes))
+            }
             TransferTaskStatus::Failed(error) => format!("失败: {}", trim_error(error)),
             TransferTaskStatus::Cancelled => "已取消".to_string(),
             TransferTaskStatus::Skipped => "已跳过".to_string(),

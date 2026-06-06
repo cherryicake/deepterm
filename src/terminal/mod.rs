@@ -4,5 +4,6 @@ pub mod terminal;
 
 pub use link_detector::UrlRange;
 pub use terminal::{
-    Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent, TerminalType,
+    DriverEvent, Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent,
+    TerminalType,
 };

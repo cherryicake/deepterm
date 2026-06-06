@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Context as _;
 
 use crate::file_transfer::utils::{
-    check_cancelled, copy_local_file_interruptible, is_local_noop_move,
-    prevent_local_recursive_copy, remove_local_source, resolve_local_conflict, temporary_local_path,
-    TransferSummary,
+    TransferSummary, check_cancelled, copy_local_file_interruptible, is_local_noop_move,
+    prevent_local_recursive_copy, remove_local_source, resolve_local_conflict,
+    temporary_local_path,
 };
 use crate::file_transfer::{ConflictPolicy, ConflictResolver};
 
@@ -163,7 +163,9 @@ pub fn copy_local_dir_to_path(
 
         if metadata.is_file() {
             match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
-                Some(path) => summary.merge(copy_local_file_to_path(&source_path, &path, cancelled)?),
+                Some(path) => {
+                    summary.merge(copy_local_file_to_path(&source_path, &path, cancelled)?)
+                }
                 None => summary.merge(TransferSummary::one_skipped()),
             }
         } else if metadata.is_dir() {
@@ -302,7 +304,11 @@ mod tests {
         assert_eq!(summary.files_transferred, 1, "b.txt 应被复制");
         // 源文件必须原样保留
         assert!(src_data.join("a.txt").exists(), "被跳过的源文件必须保留");
-        assert_eq!(fs::read(dst_data.join("a.txt")).unwrap(), b"OLD", "目标未被覆盖");
+        assert_eq!(
+            fs::read(dst_data.join("a.txt")).unwrap(),
+            b"OLD",
+            "目标未被覆盖"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -321,9 +327,15 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let resolver = StubResolver::new(ConflictResolution::Skip);
 
-        let summary =
-            move_local_to_local(&src_file, &dst, ConflictPolicy::Ask, None, &cancelled, Some(&resolver))
-                .unwrap();
+        let summary = move_local_to_local(
+            &src_file,
+            &dst,
+            ConflictPolicy::Ask,
+            None,
+            &cancelled,
+            Some(&resolver),
+        )
+        .unwrap();
 
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.files_transferred, 0);
@@ -392,7 +404,10 @@ mod tests {
         assert_eq!(summary.skipped, 0);
         // 原 dst/data/x.txt 保留，新内容进入 dst/data_副本/
         assert_eq!(fs::read(dst.join("data").join("x.txt")).unwrap(), b"OLD");
-        assert!(dst.join("data_副本").join("x.txt").exists(), "保留两者：应生成 _副本");
+        assert!(
+            dst.join("data_副本").join("x.txt").exists(),
+            "保留两者：应生成 _副本"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

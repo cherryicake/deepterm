@@ -472,7 +472,13 @@ impl BlockingSftpSession {
         command: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(command, timeout_secs, None, None::<&mut dyn FnMut(&[u8])>, false)
+        self.execute_command_inner(
+            command,
+            timeout_secs,
+            None,
+            None::<&mut dyn FnMut(&[u8])>,
+            false,
+        )
     }
 
     /// 带取消检查的远程命令执行。每 200ms 检查一次 `cancelled`，
@@ -483,7 +489,13 @@ impl BlockingSftpSession {
         timeout_secs: u64,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(command, timeout_secs, Some(cancelled), None::<&mut dyn FnMut(&[u8])>, false)
+        self.execute_command_inner(
+            command,
+            timeout_secs,
+            Some(cancelled),
+            None::<&mut dyn FnMut(&[u8])>,
+            false,
+        )
     }
 
     /// 在远程服务器上执行命令，并为该通道启用 **SSH agent forwarding**。
@@ -493,7 +505,13 @@ impl BlockingSftpSession {
         timeout_secs: u64,
         mut progress_cb: impl FnMut(&[u8]),
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(command, timeout_secs, None, Some(&mut progress_cb as &mut dyn FnMut(&[u8])), true)
+        self.execute_command_inner(
+            command,
+            timeout_secs,
+            None,
+            Some(&mut progress_cb as &mut dyn FnMut(&[u8])),
+            true,
+        )
     }
 
     /// 带取消检查的 agent forwarding 远程命令执行。
@@ -504,7 +522,13 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
         mut progress_cb: impl FnMut(&[u8]),
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(command, timeout_secs, Some(cancelled), Some(&mut progress_cb as &mut dyn FnMut(&[u8])), true)
+        self.execute_command_inner(
+            command,
+            timeout_secs,
+            Some(cancelled),
+            Some(&mut progress_cb as &mut dyn FnMut(&[u8])),
+            true,
+        )
     }
 
     /// 统一的远程命令执行核心方法。

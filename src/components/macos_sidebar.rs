@@ -59,6 +59,13 @@ pub struct SidebarTabItem {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarTabGroupState {
+    pub id: String,
+    pub label: String,
+    pub collapsed: bool,
+}
+
 /// 侧边栏菜单项
 #[derive(Clone)]
 pub struct SidebarMenuItem {
@@ -217,6 +224,50 @@ impl MacosSidebar {
         }
 
         self.tab_group_tabs.insert(group_id, tabs);
+        cx.notify();
+    }
+
+    pub fn tab_group_states(&self) -> Vec<SidebarTabGroupState> {
+        self.tab_groups
+            .iter()
+            .map(|group| SidebarTabGroupState {
+                id: group.id.clone(),
+                label: group.label.clone(),
+                collapsed: group.collapsed,
+            })
+            .collect()
+    }
+
+    pub fn restore_tab_groups(
+        &mut self,
+        groups: Vec<SidebarTabGroupState>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut seen_ids = std::collections::HashSet::new();
+        self.tab_groups = groups
+            .into_iter()
+            .filter(|group| seen_ids.insert(group.id.clone()))
+            .map(|group| TabGroupItem {
+                id: group.id,
+                label: group.label,
+                collapsed: group.collapsed,
+                collapse_epoch: 0,
+                editing_input: None,
+                editing_subscription: None,
+            })
+            .collect();
+        self.next_tab_group_id = self
+            .tab_groups
+            .iter()
+            .filter_map(|group| {
+                group
+                    .id
+                    .strip_prefix("tab-group-")
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+            })
+            .max()
+            .map(|max_id| max_id + 1)
+            .unwrap_or(0);
         cx.notify();
     }
 
@@ -934,8 +985,7 @@ impl MacosSidebar {
                     self.render_tab_group_tabs(&group_id, &tabs, theme),
                     group.collapsed,
                     group.collapse_epoch,
-                    (tabs.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP)
-                        - SIDEBAR_ROW_GAP)
+                    (tabs.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP) - SIDEBAR_ROW_GAP)
                         .max(0.0),
                     ("tab-group-tabs", index),
                 ));
@@ -955,8 +1005,7 @@ impl MacosSidebar {
             .sum::<usize>();
         let total_rows = visible_group_rows + visible_tab_rows;
         let full_height =
-            (total_rows as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP) - SIDEBAR_ROW_GAP)
-                .max(0.0);
+            (total_rows as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP) - SIDEBAR_ROW_GAP).max(0.0);
         let groups_element = Self::render_collapsible_content(
             groups,
             self.tab_groups_collapsed,
@@ -1129,11 +1178,7 @@ impl MacosSidebar {
                                 cx.notify();
                                 this.notify_app_window(cx);
                                 if let Some((target, epoch)) = collapse_epoch {
-                                    Self::reset_collapse_epoch_after_animation(
-                                        cx,
-                                        target,
-                                        epoch,
-                                    );
+                                    Self::reset_collapse_epoch_after_animation(cx, target, epoch);
                                 }
                             }
                         }),

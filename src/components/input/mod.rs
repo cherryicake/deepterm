@@ -4,8 +4,9 @@ pub(crate) mod change;
 pub mod history;
 
 pub mod blink_cursor;
-pub mod highlighter;pub mod display_map;
+pub mod display_map;
 pub mod element;
+pub mod highlighter;
 pub mod indent;
 pub mod input;
 pub mod mode;

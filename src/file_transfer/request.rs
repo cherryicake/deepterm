@@ -69,9 +69,9 @@ impl TransferRequest {
             if self.sources.len() == 1 {
                 if let Some(rename_to) = self.rename_to.as_deref() {
                     let src_name = match source {
-                        FileEndpoint::Local { path } => path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned()),
+                        FileEndpoint::Local { path } => {
+                            path.file_name().map(|n| n.to_string_lossy().into_owned())
+                        }
                         FileEndpoint::Remote { path, .. } => path
                             .trim_end_matches('/')
                             .rsplit('/')

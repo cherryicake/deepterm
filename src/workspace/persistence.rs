@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::workspace::session_state::AppSessionState;
 use crate::workspace::template::{WorkspaceState, WorkspaceTemplate};
 
 /// 持久化管理器
@@ -26,7 +27,11 @@ impl PersistenceManager {
     /// 获取配置目录路径
     fn get_config_dir() -> PathBuf {
         let home = dirs::home_dir().expect("Failed to get home directory");
-        home.join(".config").join("gpui-dock-demo")
+        home.join(".config").join("deepterm")
+    }
+
+    fn get_session_file_path(&self) -> PathBuf {
+        self.config_dir.join("session_state.json")
     }
 
     /// 获取状态文件路径
@@ -58,6 +63,28 @@ impl PersistenceManager {
         let json = fs::read_to_string(file_path)?;
         let state: WorkspaceState = serde_json::from_str(&json)?;
         Ok(state)
+    }
+
+    pub fn save_session(
+        &self,
+        session: &AppSessionState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file_path = self.get_session_file_path();
+        let json = serde_json::to_string_pretty(session)?;
+        fs::write(file_path, json)?;
+        Ok(())
+    }
+
+    pub fn load_session(&self) -> Result<Option<AppSessionState>, Box<dyn std::error::Error>> {
+        let file_path = self.get_session_file_path();
+
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let json = fs::read_to_string(file_path)?;
+        let session: AppSessionState = serde_json::from_str(&json)?;
+        Ok(Some(session))
     }
 
     /// 保存模板

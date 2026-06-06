@@ -2,9 +2,10 @@ use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, ElementId, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce, StatefulInteractiveElement,
-    StyleRefinement, Styled, Task, Window, actions, deferred, div, linear, px, point, BoxShadow,
+    Animation, AnimationExt as _, AnyElement, App, BoxShadow, Context, ElementId,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce,
+    StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, actions, deferred, div,
+    linear, point, px,
 };
 use std::rc::Rc;
 use std::time::Duration;
@@ -69,11 +70,7 @@ impl ModalState {
 
     /// 开始关闭：进入退出动画阶段并保持渲染，待动画结束后卸载。
     /// `field` 用于在延迟任务里重新定位到所属实体中的 ModalState 字段。
-    pub fn close<T: 'static>(
-        &mut self,
-        cx: &mut Context<T>,
-        field: fn(&mut T) -> &mut ModalState,
-    ) {
+    pub fn close<T: 'static>(&mut self, cx: &mut Context<T>, field: fn(&mut T) -> &mut ModalState) {
         if !self.open {
             return;
         }
@@ -258,10 +255,7 @@ impl Modal {
 
     /// Set a callback that is invoked when the modal is closed
     /// (either by backdrop click, Escape, or programmatically).
-    pub fn on_close(
-        mut self,
-        handler: impl Fn(&mut Window, &mut App) + 'static,
-    ) -> Self {
+    pub fn on_close(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_close = Some(Rc::new(handler));
         self
     }
@@ -301,7 +295,11 @@ impl RenderOnce for Modal {
 
         // 动画方向与时长：退出阶段反向播放且更快收拢。
         let is_exit = self.closing;
-        let duration_ms = if is_exit { MODAL_EXIT_MS } else { MODAL_ENTER_MS };
+        let duration_ms = if is_exit {
+            MODAL_EXIT_MS
+        } else {
+            MODAL_ENTER_MS
+        };
         let epoch = self.epoch;
         let backdrop_anim_id: ElementId = ("modal-backdrop-anim", epoch).into();
         let panel_anim_id: ElementId = ("modal-panel-anim", epoch).into();
@@ -371,7 +369,8 @@ impl RenderOnce for Modal {
                 .flex()
                 .justify_center()
                 .when(has_top_padding, |this| {
-                    this.items_start().when_some(self.top_padding, |this, t| this.pt(t))
+                    this.items_start()
+                        .when_some(self.top_padding, |this, t| this.pt(t))
                 })
                 .when(!has_top_padding, |this| this.items_center())
                 .child(
@@ -391,8 +390,7 @@ impl RenderOnce for Modal {
                         })
                         .with_animation(
                             backdrop_anim_id,
-                            Animation::new(Duration::from_millis(duration_ms))
-                                .with_easing(linear),
+                            Animation::new(Duration::from_millis(duration_ms)).with_easing(linear),
                             move |this, t| {
                                 // 遮罩用标准平滑曲线，并比面板更早建立 / 更晚消散，
                                 // 营造「先暗下来、内容随后浮现」的层次感。
@@ -418,15 +416,14 @@ impl RenderOnce for Modal {
                         .child(panel),
                 )
                 .when(close_on_escape, |this| {
-                    this.key_context(CONTEXT)
-                        .on_action({
-                            let on_close = self.on_close.clone();
-                            move |_: &Cancel, window: &mut Window, cx: &mut App| {
-                                if let Some(on_close) = &on_close {
-                                    (on_close)(window, cx);
-                                }
+                    this.key_context(CONTEXT).on_action({
+                        let on_close = self.on_close.clone();
+                        move |_: &Cancel, window: &mut Window, cx: &mut App| {
+                            if let Some(on_close) = &on_close {
+                                (on_close)(window, cx);
                             }
-                        })
+                        }
+                    })
                 }),
         )
         .with_priority(100)

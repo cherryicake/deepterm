@@ -93,7 +93,9 @@ impl TextElement {
             }
             state.display_map.set_font(
                 window.text_style().font(),
-                state.font_size.unwrap_or_else(|| window.text_style().font_size.to_pixels(window.rem_size())),
+                state
+                    .font_size
+                    .unwrap_or_else(|| window.text_style().font_size.to_pixels(window.rem_size())),
                 cx,
             );
             state.display_map.ensure_text_prepared(&state.text, cx);

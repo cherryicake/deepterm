@@ -47,74 +47,133 @@ pub use ssh_pty::SshPtyTerminal;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-const REMOTE_SHELL_TRACKING_SNIPPET: &str = r#"__deepterm_emit_prompt_state(){
-  printf '\033]133;A\007'
+const REMOTE_BASH_INTEGRATION: &str =
+    include_str!("../../assets/shell-integration/bash/deepterm.bash");
+const REMOTE_BASH_PREEXEC: &str =
+    include_str!("../../assets/shell-integration/bash/bash-preexec.sh");
+const REMOTE_ZSHENV: &str = include_str!("../../assets/shell-integration/zsh/.zshenv");
+const REMOTE_ZSH_INTEGRATION: &str =
+    include_str!("../../assets/shell-integration/zsh/deepterm-integration");
+
+fn append_remote_file(script: &mut String, path: &str, marker: &str, content: &str) {
+    script.push_str("cat > ");
+    script.push_str(path);
+    script.push_str(" <<'");
+    script.push_str(marker);
+    script.push_str("'\n");
+    script.push_str(content);
+    if !content.ends_with('\n') {
+        script.push('\n');
+    }
+    script.push_str(marker);
+    script.push('\n');
 }
-__deepterm_emit_cwd(){
-  host_name=$(hostname 2>/dev/null || printf '%s' localhost)
-  printf '\033]7;file://%s%s\007' "$host_name" "$PWD"
+
+fn shell_quote_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
-__deepterm_precmd(){
-  __deepterm_emit_prompt_state
-  __deepterm_emit_cwd
-}
-if [ -n "$ZSH_VERSION" ]; then
-  autoload -Uz add-zsh-hook >/dev/null 2>&1 || true
-  if typeset -f add-zsh-hook >/dev/null 2>&1; then
-    add-zsh-hook precmd __deepterm_precmd
-  elif [ -n "${precmd_functions+set}" ]; then
-    precmd_functions+=(__deepterm_precmd)
-  fi
-elif [ -n "$BASH_VERSION" ]; then
-  case ";${PROMPT_COMMAND-};" in
-    *";__deepterm_precmd;"*) ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__deepterm_precmd" ;;
-  esac
+
+pub fn remote_shell_tracking_command(initial_cwd: Option<&str>) -> String {
+    let mut script = String::new();
+    script.push_str(
+        r#"set +e
+__deepterm_root="${TMPDIR:-/tmp}/deepterm-shell-integration.$$"
+mkdir -p "$__deepterm_root/shell-integration/bash" "$__deepterm_root/shell-integration/zsh" 2>/dev/null
+"#,
+    );
+
+    append_remote_file(
+        &mut script,
+        "\"$__deepterm_root/shell-integration/bash/deepterm.bash\"",
+        "DEEPTERM_REMOTE_BASH",
+        REMOTE_BASH_INTEGRATION,
+    );
+    append_remote_file(
+        &mut script,
+        "\"$__deepterm_root/shell-integration/bash/bash-preexec.sh\"",
+        "DEEPTERM_REMOTE_BASH_PREEXEC",
+        REMOTE_BASH_PREEXEC,
+    );
+    append_remote_file(
+        &mut script,
+        "\"$__deepterm_root/shell-integration/zsh/.zshenv\"",
+        "DEEPTERM_REMOTE_ZSHENV",
+        REMOTE_ZSHENV,
+    );
+    append_remote_file(
+        &mut script,
+        "\"$__deepterm_root/shell-integration/zsh/deepterm-integration\"",
+        "DEEPTERM_REMOTE_ZSH_INTEGRATION",
+        REMOTE_ZSH_INTEGRATION,
+    );
+
+    script.push_str(
+        r#"
+chmod 600 "$__deepterm_root/shell-integration/bash/deepterm.bash" \
+  "$__deepterm_root/shell-integration/bash/bash-preexec.sh" \
+  "$__deepterm_root/shell-integration/zsh/.zshenv" \
+  "$__deepterm_root/shell-integration/zsh/deepterm-integration" 2>/dev/null
+
+__deepterm_os_id=""
+if [ -r /etc/os-release ]; then
+  __deepterm_os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+else
+  __deepterm_os_id=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
 fi
-__deepterm_precmd
-"#;
+printf '\033]1338;%s\007' "$__deepterm_os_id"
 
-pub fn remote_shell_tracking_command() -> String {
-    // Write tracking functions to a temp file and use --rcfile to source
-    // the user's normal config + tracking functions.
-    // This avoids `export -f` which is bash-specific and fails silently when
-    // the initial shell is /bin/sh (e.g. dash on Debian/Ubuntu).
-    format!(
-        "source /etc/profile >/dev/null 2>&1 || true\n\
-         export DEEPTERM_REMOTE_TRACKING=1\n\
-         export _DTF=$(mktemp /tmp/.deepterm.XXXXXX)\n\
-         cat > \"$_DTF\" << 'DEEPTERM_EOF'\n\
-         {}\
-         DEEPTERM_EOF\n\
-         export _DTRC=$(mktemp /tmp/.deepterm_rc.XXXXXX)\n\
-         cat > \"$_DTRC\" << 'DEEPTERM_RC_EOF'\n\
-         source /etc/profile 2>/dev/null\n\
-         [ -f /etc/bash.bashrc ] && source /etc/bash.bashrc 2>/dev/null\n\
-         for _f in ~/.bash_profile ~/.bash_login ~/.profile; do\n\
-           [ -f \"$_f\" ] && source \"$_f\" && break\n\
-         done\n\
-         [ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null\n\
-         source \"$_DTF\"\n\
-         unset _DTF _DTRC _f\n\
-         DEEPTERM_RC_EOF\n\
-         __deepterm_emit_os() {{\n\
-           local os_id=\"\"\n\
-           if [ -r /etc/os-release ]; then\n\
-             os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"')\n\
-           else\n\
-             os_id=$(uname -s | tr '[:upper:]' '[:lower:]')\n\
-           fi\n\
-           printf '\\033]1338;%s\\007' \"$os_id\"\n\
-         }}\n\
-         __deepterm_emit_os\n\
-         exec bash --rcfile \"$_DTRC\" -i",
-        REMOTE_SHELL_TRACKING_SNIPPET
-    )
-}
+"#,
+    );
 
-/// Returns just the tracking functions and hooks for injection into an already-running shell.
-pub fn remote_shell_tracking_snippet() -> &'static str {
-    REMOTE_SHELL_TRACKING_SNIPPET
+    if let Some(cwd) = initial_cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        // 远程恢复 cwd 发生在 shell 启动前，不写入 PTY 输入流，因此用户不会
+        // 在终端里看到 `cd ...`。这等价于给远程 shell 设置启动目录；若目录
+        // 不存在或无权限，忽略失败并回到远程默认目录。
+        script.push_str("__deepterm_initial_cwd=");
+        script.push_str(&shell_quote_single(cwd.trim()));
+        script.push_str(
+            r#"
+cd "$__deepterm_initial_cwd" 2>/dev/null || true
+unset __deepterm_initial_cwd
+
+"#,
+        );
+    }
+
+    script.push_str(
+        r#"
+__deepterm_shell="${SHELL:-/bin/sh}"
+__deepterm_shell_name="${__deepterm_shell##*/}"
+case "$__deepterm_shell_name" in
+  zsh)
+    if [ -n "${ZDOTDIR+x}" ]; then
+      export DEEPTERM_ZSH_ZDOTDIR="$ZDOTDIR"
+    fi
+    export DEEPTERM_RESOURCES_DIR="$__deepterm_root"
+    export ZDOTDIR="$__deepterm_root/shell-integration/zsh"
+    exec "$__deepterm_shell" -i
+    ;;
+  bash)
+    if [ -n "${ENV+x}" ]; then
+      export DEEPTERM_BASH_ENV="$ENV"
+    fi
+    export DEEPTERM_RESOURCES_DIR="$__deepterm_root"
+    export ENV="$__deepterm_root/shell-integration/bash/deepterm.bash"
+    export DEEPTERM_BASH_INJECT=1
+    if [ -z "${HISTFILE+x}" ] && [ -n "$HOME" ]; then
+      export HISTFILE="$HOME/.bash_history"
+      export DEEPTERM_BASH_UNEXPORT_HISTFILE=1
+    fi
+    exec "$__deepterm_shell" --posix -i
+    ;;
+  *)
+    exec "$__deepterm_shell" -i
+    ;;
+esac
+"#,
+    );
+
+    script
 }
 
 /// SSH 客户端配置
@@ -350,6 +409,7 @@ pub fn parse_ssh_target(target: &str) -> (String, String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_parse_ssh_target_full() {
@@ -382,5 +442,46 @@ mod tests {
         assert_eq!(KeyType::from_filename("id_ecdsa"), Some(KeyType::Ecdsa));
         assert_eq!(KeyType::from_filename("id_dsa"), Some(KeyType::Dss));
         assert_eq!(KeyType::from_filename("unknown"), None);
+    }
+
+    #[test]
+    fn remote_shell_tracking_command_uses_ghostty_style_resources() {
+        let command = remote_shell_tracking_command(Some("/tmp/deepterm cwd"));
+
+        assert!(command.contains("shell-integration/bash/deepterm.bash"));
+        assert!(command.contains("shell-integration/zsh/.zshenv"));
+        assert!(command.contains("DEEPTERM_BASH_INJECT"));
+        assert!(command.contains("DEEPTERM_ZSH_ZDOTDIR"));
+        assert!(command.contains("kitty-shell-cwd://"));
+        assert!(command.contains("__deepterm_initial_cwd='/tmp/deepterm cwd'"));
+        assert!(!command.contains("__deepterm_precmd(){"));
+        assert!(!command.contains("add-zsh-hook precmd __deepterm_precmd"));
+    }
+
+    #[test]
+    fn remote_shell_tracking_command_is_posix_shell_parseable() {
+        let command = remote_shell_tracking_command(Some("/tmp/deepterm cwd"));
+        let path = std::env::temp_dir().join(format!(
+            "deepterm-remote-bootstrap-{}.sh",
+            std::process::id()
+        ));
+
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(command.as_bytes()).unwrap();
+        }
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -59,6 +59,7 @@ use crate::terminal_view::terminal_element::{
 };
 use crate::terminal_view::terminal_scrollbar::TerminalScrollbar;
 use crate::theme::ActiveTheme;
+use crate::workspace::session_state::TerminalSessionState;
 
 // Define terminal actions
 actions!(terminal, [Copy, Paste, Clear, SelectAll]);
@@ -151,6 +152,7 @@ pub struct TerminalView {
     ssh_connect_hide_task: Option<Task<()>>,
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
+    pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
     /// Per-row render cache, indexed by viewport row (0 = top).
@@ -396,6 +398,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                pending_remote_cwd_restore: None,
                 hovered_link: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
@@ -421,6 +424,13 @@ impl TerminalView {
     /// 创建新的本地终端
     pub fn new(cx: &mut App) -> Entity<Self> {
         let working_directory = dirs::home_dir();
+        Self::new_with_working_directory(cx, working_directory)
+    }
+
+    pub fn new_with_working_directory(
+        cx: &mut App,
+        working_directory: Option<PathBuf>,
+    ) -> Entity<Self> {
         let terminal = Terminal::new(cx, working_directory.clone());
         Self::create_terminal_view(cx, terminal, working_directory, None, "Terminal".into())
     }
@@ -455,6 +465,14 @@ impl TerminalView {
     /// * `cx` - GPUI 上下文
     /// * `ssh_config` - SSH 连接配置
     pub fn new_ssh(cx: &mut App, ssh_config: &SshConnectionConfig) -> Entity<Self> {
+        Self::new_ssh_with_initial_remote_cwd(cx, ssh_config, None)
+    }
+
+    fn new_ssh_with_initial_remote_cwd(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        initial_remote_cwd: Option<String>,
+    ) -> Entity<Self> {
         log::info!("=== 创建 SSH 远程终端（优先 russh，失败回退到 ssh 命令）===");
         log::info!(
             "目标: {}@{}:{}",
@@ -465,10 +483,15 @@ impl TerminalView {
 
         let focus_handle = cx.focus_handle();
         let ssh_config_clone = ssh_config.clone();
+        let initial_remote_cwd = initial_remote_cwd.filter(|cwd| !cwd.trim().is_empty());
 
         cx.new(|cx| {
             // 首先尝试 russh 方式创建终端
-            let terminal = Terminal::new_ssh(cx, &ssh_config_clone);
+            let terminal = Terminal::new_ssh_with_remote_cwd(
+                cx,
+                &ssh_config_clone,
+                initial_remote_cwd.clone(),
+            );
             let terminal_clone = terminal.clone();
 
             // 创建 SSH 连接进度视图（在连接成功前覆盖在终端上方）
@@ -530,6 +553,7 @@ impl TerminalView {
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
                 remote_os: None,
+                pending_remote_cwd_restore: None,
                 hovered_link: None,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
@@ -555,6 +579,20 @@ impl TerminalView {
             this.update_title(cx);
             this
         })
+    }
+
+    pub fn new_ssh_with_remote_cwd(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+    ) -> Entity<Self> {
+        let remote_cwd = remote_cwd.filter(|cwd| !cwd.trim().is_empty());
+        let terminal_view =
+            Self::new_ssh_with_initial_remote_cwd(cx, ssh_config, remote_cwd.clone());
+        terminal_view.update(cx, |this, _cx| {
+            this.pending_remote_cwd_restore = remote_cwd;
+        });
+        terminal_view
     }
 
     /// 更新终端标题
@@ -655,6 +693,40 @@ impl TerminalView {
 
     pub fn ssh_config(&self) -> Option<&SshConnectionConfig> {
         self.ssh_config.as_ref()
+    }
+
+    pub fn session_state(&self, cx: &App) -> TerminalSessionState {
+        if let Some(config) = self.ssh_config.clone() {
+            return TerminalSessionState::Ssh {
+                config,
+                remote_cwd: self.pending_remote_cwd_restore.clone().or_else(|| {
+                    self.terminal
+                        .read(cx)
+                        .reported_working_directory()
+                        .map(String::from)
+                }),
+            };
+        }
+
+        let cwd = self.current_local_working_directory(cx);
+        TerminalSessionState::Local {
+            cwd: cwd.map(|path| path.to_string_lossy().to_string()),
+            command: None,
+            args: Vec::new(),
+        }
+    }
+
+    fn current_local_working_directory(&self, cx: &App) -> Option<PathBuf> {
+        let terminal = self.terminal.read(cx);
+        terminal
+            .reported_working_directory()
+            .map(PathBuf::from)
+            .or_else(|| {
+                terminal.child_process_id.and_then(
+                    crate::builtin_commands::PathResolver::query_process_working_directory,
+                )
+            })
+            .or_else(|| self.working_directory.clone())
     }
 
     pub fn title(&self) -> SharedString {
@@ -843,8 +915,7 @@ impl TerminalView {
         let term = self.terminal.read(cx);
         let content = term.last_content();
         let bounds = term.terminal_bounds;
-        let cursor_row_in_viewport =
-            content.cursor.line.0.max(0) as f32 + visual_extra_rows as f32;
+        let cursor_row_in_viewport = content.cursor.line.0.max(0) as f32 + visual_extra_rows as f32;
         // 当文本未换行时延用原有的 cursor_col + anchor_cells 偏移；换行后视觉光标列
         // 从 0 重新开始，anchor 也基于视觉列。
         let cursor_col = if visual_extra_rows == 0 {
@@ -1167,14 +1238,22 @@ impl TerminalView {
             let remote_cwd = self
                 .terminal
                 .read(cx)
-                .remote_working_directory()
+                .reported_working_directory()
                 .map(String::from);
             (None, remote_cwd)
         } else {
-            // 本地终端：通过操作系统查询 shell 进程实际 CWD
-            let pid = self.terminal.read(cx).child_process_id;
-            let process_cwd = pid
-                .and_then(PathResolver::query_process_working_directory)
+            // 本地终端：优先使用 OSC 7 上报的 cwd。OSC 7 来自 shell prompt hook，
+            // 能实时反映 shell 内建 `cd` 后的目录；进程 cwd 查询只作为兼容兜底，
+            // 因为某些平台/场景下拿到的可能是启动 shell 或前台程序的旧目录。
+            let terminal = self.terminal.read(cx);
+            let process_cwd = terminal
+                .reported_working_directory()
+                .map(PathBuf::from)
+                .or_else(|| {
+                    terminal
+                        .child_process_id
+                        .and_then(PathResolver::query_process_working_directory)
+                })
                 .or_else(|| self.working_directory.clone());
             (process_cwd, None)
         };
@@ -1298,7 +1377,7 @@ impl TerminalView {
         let terminal_remote_cwd = if self.ssh_config.is_some() {
             self.terminal
                 .read(cx)
-                .remote_working_directory()
+                .reported_working_directory()
                 .map(String::from)
         } else {
             None
@@ -1550,7 +1629,10 @@ impl TerminalView {
                 if modifiers.platform {
                     match key {
                         "left" => {
-                            self.mutate_builtin_command(cx, BuiltinCommandManager::move_cursor_home);
+                            self.mutate_builtin_command(
+                                cx,
+                                BuiltinCommandManager::move_cursor_home,
+                            );
                             return true;
                         }
                         "right" => {
@@ -1665,7 +1747,11 @@ impl TerminalView {
 
                 if has_highlight {
                     // 选中历史项 ⇒ 回填整行后收起浮层，等待用户再次回车提交（不 auto-advance）。
-                    if self.builtin_command_manager.history_selected_index().is_some() {
+                    if self
+                        .builtin_command_manager
+                        .history_selected_index()
+                        .is_some()
+                    {
                         self.mutate_builtin_command(cx, BuiltinCommandManager::complete_history);
                     } else {
                         let is_arg = mgr.is_argument_input();
@@ -1681,7 +1767,8 @@ impl TerminalView {
                 } else if overlay_visible_with_results {
                     // B：用户没选任何项，只是想关掉浮层
                     // 但如果缓冲区第一个 token 精确匹配了某个注册命令，应该提交执行
-                    let first_token = self.builtin_command_manager
+                    let first_token = self
+                        .builtin_command_manager
                         .query()
                         .and_then(|q| q.split_whitespace().next());
                     let is_exact_command = first_token
@@ -2247,14 +2334,14 @@ impl Render for TerminalView {
                         if col >= content.cols || row >= content.rows {
                             return None;
                         }
-                        terminal
-                            .url_range_at_viewport_position(row, col)
-                            .map(|(url, start_col, end_col)| HoveredLink {
+                        terminal.url_range_at_viewport_position(row, col).map(
+                            |(url, start_col, end_col)| HoveredLink {
                                 url: url.into(),
                                 row,
                                 start_col,
                                 end_col,
-                            })
+                            },
+                        )
                     })
                 } else {
                     None

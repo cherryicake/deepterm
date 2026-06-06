@@ -78,6 +78,7 @@ impl RusshTerminal {
         initial_rows: u32,
         listener: ZedListener,
         driver_listener: DriverListener,
+        initial_cwd: Option<String>,
     ) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState {
             terminal: None,
@@ -90,6 +91,7 @@ impl RusshTerminal {
         let state_for_task = state.clone();
         let config_clone = config.clone();
         let driver_listener_for_task = driver_listener.clone();
+        let initial_cwd_for_task = initial_cwd.clone();
 
         // 在独立线程中启动 tokio 运行时进行连接
         std::thread::Builder::new()
@@ -106,7 +108,14 @@ impl RusshTerminal {
                 };
 
                 rt.block_on(async move {
-                    match Self::connect_and_setup(&config_clone, initial_cols, initial_rows).await {
+                    match Self::connect_and_setup(
+                        &config_clone,
+                        initial_cols,
+                        initial_rows,
+                        initial_cwd_for_task.as_deref(),
+                    )
+                    .await
+                    {
                         Ok((handle, channel)) => {
                             log::info!("russh: 连接成功，启动 I/O 循环");
 
@@ -229,6 +238,7 @@ impl RusshTerminal {
         config: &SshConnectionConfig,
         cols: u32,
         rows: u32,
+        initial_cwd: Option<&str>,
     ) -> anyhow::Result<(
         client::Handle<SshClientHandler>,
         russh::Channel<client::Msg>,
@@ -277,7 +287,7 @@ impl RusshTerminal {
             .await
             .map_err(|e| anyhow::anyhow!("请求 PTY 失败: {}", e))?;
 
-        let shell_command = remote_shell_tracking_command();
+        let shell_command = remote_shell_tracking_command(initial_cwd);
         channel
             .exec(true, shell_command.as_str())
             .await

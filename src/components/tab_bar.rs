@@ -727,7 +727,8 @@ impl Render for TabBar {
                                 cx.defer(move |cx| {
                                     entity.update(cx, |this, cx| {
                                         // 只在宽度变化超过 1px 时更新
-                                        if (this.measured_container_width - container_width).abs() > 1.0
+                                        if (this.measured_container_width - container_width).abs()
+                                            > 1.0
                                         {
                                             let was_first = this.measured_container_width <= 0.0;
                                             this.measured_container_width = container_width;

@@ -1,13 +1,13 @@
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use crate::file_transfer::utils::{
-    check_cancelled, is_remote_noop_move, prevent_remote_recursive_copy,
-    remove_remote_source, remote_file_name, resolve_remote_conflict, TransferSummary,
+    TransferSummary, check_cancelled, is_remote_noop_move, prevent_remote_recursive_copy,
+    remote_file_name, remove_remote_source, resolve_remote_conflict,
 };
 use crate::file_transfer::{ConflictPolicy, ConflictResolver};
-use crate::ssh::sftp_fs::{self, RemoteFileKind};
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
 pub fn copy_remote_to_same_remote(
     ssh_config: &SshConnectionConfig,
@@ -32,11 +32,16 @@ pub fn copy_remote_to_same_remote(
 
         if metadata.kind == RemoteFileKind::File {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
-            let destination_path =
-                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_path = match resolve_remote_conflict(
+                session,
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             if remote_path == destination_path {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
             }
@@ -51,11 +56,16 @@ pub fn copy_remote_to_same_remote(
 
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
-            let destination_root =
-                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_root = match resolve_remote_conflict(
+                session,
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             if remote_path == destination_root {
                 return Ok(TransferSummary::from_remote_metadata(&metadata));
             }
@@ -73,7 +83,11 @@ pub fn copy_remote_to_same_remote(
         }
 
         // 符号链接 / 特殊文件：计为跳过。
-        log::warn!("跳过不支持的远程文件类型 ({:?}): {}", metadata.kind, remote_path);
+        log::warn!(
+            "跳过不支持的远程文件类型 ({:?}): {}",
+            metadata.kind,
+            remote_path
+        );
         Ok(TransferSummary::one_skipped())
     })
 }
@@ -103,12 +117,17 @@ pub fn move_remote_to_same_remote(
             file_name.as_str()
         };
         let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
-        let destination_path =
-            match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
-                Some(path) => path,
-                // 顶层冲突选择跳过：不移动、不删源。
-                None => return Ok(TransferSummary::one_skipped()),
-            };
+        let destination_path = match resolve_remote_conflict(
+            session,
+            &desired_path,
+            conflict_policy,
+            resolver,
+            cancelled,
+        )? {
+            Some(path) => path,
+            // 顶层冲突选择跳过：不移动、不删源。
+            None => return Ok(TransferSummary::one_skipped()),
+        };
 
         if remote_path == destination_path {
             return Ok(TransferSummary::from_remote_metadata(&metadata));
@@ -169,14 +188,30 @@ pub fn copy_remote_dir_to_remote_path(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+            match resolve_remote_conflict(
+                session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
                 Some(path) => summary.merge(copy_remote_file_to_remote_path(
-                    session, &entry.path, &path, cancelled, progress,
+                    session,
+                    &entry.path,
+                    &path,
+                    cancelled,
+                    progress,
                 )?),
                 None => summary.merge(TransferSummary::one_skipped()),
             }
         } else if entry.kind == RemoteFileKind::Directory {
-            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+            match resolve_remote_conflict(
+                session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
                 Some(path) => {
                     session.create_dir_all(&path)?;
                     summary.merge(copy_remote_dir_to_remote_path(

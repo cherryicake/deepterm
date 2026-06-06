@@ -1,17 +1,17 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 
 use crate::file_transfer::utils::{
-    check_cancelled, remote_file_name, remove_remote_source, resolve_remote_conflict,
-    shell_single_quote, temporary_remote_path, TransferSummary, TRANSFER_CANCELLED_MSG,
+    TRANSFER_CANCELLED_MSG, TransferSummary, check_cancelled, remote_file_name,
+    remove_remote_source, resolve_remote_conflict, shell_single_quote, temporary_remote_path,
 };
 use crate::file_transfer::{ConflictPolicy, ConflictResolver};
-use crate::ssh::sftp_fs::{self, BlockingSftpSession, RemoteFileKind};
-use crate::ssh::keychain::{resolve_auth_method, ResolvedAuthMethod};
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
+use crate::ssh::sftp_fs::{self, BlockingSftpSession, RemoteFileKind};
 
 /// 状态报告器：用于将 scp 执行过程中的状态信息实时回传到 UI
 pub trait TransferStatusReporter: Send + Sync {
@@ -163,9 +163,9 @@ fn unique_remote_backup_path(
 }
 
 pub fn is_safe_for_direct_scp(path: &str) -> bool {
-    !path.bytes().any(|byte| {
-        matches!(byte, b'\n' | b'\r' | b'\0' | b'\t' | b'\x08' | b'\x1b')
-    })
+    !path
+        .bytes()
+        .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0' | b'\t' | b'\x08' | b'\x1b'))
 }
 
 pub fn remote_scp_timeout_secs() -> u64 {
@@ -321,10 +321,7 @@ pub fn copy_remote_to_different_remote(
 
             match result {
                 Ok(summary) => {
-                    cleanup_remote_overwrite_backup(
-                        destination_config,
-                        overwrite_backup.as_ref(),
-                    );
+                    cleanup_remote_overwrite_backup(destination_config, overwrite_backup.as_ref());
                     return Ok(summary);
                 }
                 Err(e) => {
@@ -373,12 +370,11 @@ fn detect_transfer_strategies(
                 return vec![
                     RemoteToRemoteStrategy::AgentForwardScp,
                     RemoteToRemoteStrategy::StreamViaLocal,
-                ]
+                ];
             }
             "3b" | "tempkey" => {
                 let mut forced_strategies = Vec::new();
-                if let Some(cached) =
-                    crate::ssh::auth::lookup_authenticated_key(destination_config)
+                if let Some(cached) = crate::ssh::auth::lookup_authenticated_key(destination_config)
                 {
                     forced_strategies.push(RemoteToRemoteStrategy::TempKeyScp { key_path: cached });
                 }
@@ -662,7 +658,13 @@ fn copy_via_agent_forward_scp(
             secs,
             (total as f64) / secs / (1024.0 * 1024.0)
         );
-        report_status(reporter, format!("完成 {:.2} MiB/s", (total as f64) / secs / (1024.0 * 1024.0)));
+        report_status(
+            reporter,
+            format!(
+                "完成 {:.2} MiB/s",
+                (total as f64) / secs / (1024.0 * 1024.0)
+            ),
+        );
         if let Some(p) = progress {
             // 修正最终进度（避免轮询偏差）
             let current = p.load(Ordering::Relaxed);
@@ -686,8 +688,17 @@ fn copy_via_agent_forward_scp(
             cmd_result.exit_status,
             stderr
         );
-        report_status(reporter, format!("失败: {}",
-            if stderr.is_empty() { "无错误输出".to_string() } else { stderr.to_string() }));
+        report_status(
+            reporter,
+            format!(
+                "失败: {}",
+                if stderr.is_empty() {
+                    "无错误输出".to_string()
+                } else {
+                    stderr.to_string()
+                }
+            ),
+        );
         bail!(
             "scp failed: {}",
             if stderr.is_empty() {
@@ -751,7 +762,10 @@ fn monitor_dest_progress(
                 _ => None,
             }
         } else {
-            session.metadata(destination_path).ok().map(|meta| meta.size)
+            session
+                .metadata(destination_path)
+                .ok()
+                .map(|meta| meta.size)
         };
         if let Some(size) = size {
             if size > last_size {
@@ -893,8 +907,11 @@ fn copy_via_remote_scp(
                 );
             });
         }
-        let r =
-            source_session.execute_command_with_cancel(&scp_cmd, remote_scp_timeout_secs(), cancelled);
+        let r = source_session.execute_command_with_cancel(
+            &scp_cmd,
+            remote_scp_timeout_secs(),
+            cancelled,
+        );
         stop_monitor.store(true, Ordering::Relaxed);
         r
     });
@@ -915,7 +932,13 @@ fn copy_via_remote_scp(
                     secs,
                     (total as f64) / secs / (1024.0 * 1024.0)
                 );
-                report_status(reporter, format!("完成 {:.2} MiB/s", (total as f64) / secs / (1024.0 * 1024.0)));
+                report_status(
+                    reporter,
+                    format!(
+                        "完成 {:.2} MiB/s",
+                        (total as f64) / secs / (1024.0 * 1024.0)
+                    ),
+                );
                 if let Some(p) = progress {
                     // 修正最终进度（避免轮询偏差）
                     let current = p.load(Ordering::Relaxed);

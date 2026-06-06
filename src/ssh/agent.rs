@@ -30,8 +30,7 @@ async fn create_agent_client() -> Result<AgentClient<UnixStream>, anyhow::Error>
 
 #[cfg(windows)]
 async fn create_agent_client() -> Result<AgentClient<NamedPipeClient>, anyhow::Error> {
-    let path = std::env::var("SSH_AUTH_SOCK")
-        .map_err(|_| anyhow!("SSH_AUTH_SOCK 未设置"))?;
+    let path = std::env::var("SSH_AUTH_SOCK").map_err(|_| anyhow!("SSH_AUTH_SOCK 未设置"))?;
     AgentClient::connect_named_pipe(&path)
         .await
         .map_err(|e| anyhow!("连接 ssh-agent 失败: {}", e))

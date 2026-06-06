@@ -129,8 +129,7 @@ fn scan_windows_terminals() -> Vec<LocalTerminalOption> {
     {
         wsl_cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    if let Ok(output) = wsl_cmd.output()
-    {
+    if let Ok(output) = wsl_cmd.output() {
         if output.status.success() {
             let output_str = decode_wsl_output(&output.stdout);
             for line in output_str.lines() {
@@ -474,7 +473,11 @@ impl SshPicker {
                     div()
                         .text_color(theme.text_subtle)
                         .text_size(px(12.0))
-                        .child(if cfg!(target_os = "windows") { "Ctrl+K" } else { "⌘+K" }),
+                        .child(if cfg!(target_os = "windows") {
+                            "Ctrl+K"
+                        } else {
+                            "⌘+K"
+                        }),
                 ),
         )
     }

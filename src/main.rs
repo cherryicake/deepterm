@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub mod assets;
 pub mod builtin_commands;
@@ -19,11 +20,13 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render, Window,
-    actions, div, px,
+    AnimationExt, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
+    Subscription, Window, actions, div, px,
 };
 
-use crate::components::macos_sidebar::{DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabItem};
+use crate::components::macos_sidebar::{
+    DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabGroupState, SidebarTabItem,
+};
 use crate::components::title_bar::TitleBar;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
@@ -31,8 +34,12 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::ToggleSidebar;
+use crate::workspace::persistence::PersistenceManager;
+use crate::workspace::session_state::{
+    AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
+};
 use crate::workspace::window_manager::WindowManager;
-use crate::workspace::workspace::Workspace;
+use crate::workspace::workspace::{Workspace, WorkspaceEvent};
 
 // Define application-level actions
 actions!(app, [Quit, NewWindow]);
@@ -40,21 +47,42 @@ actions!(app, [Quit, NewWindow]);
 const CONTEXT: &str = "AppWindow";
 
 /// Root component that contains title bar, sidebar and workspace
+struct TabGroupWorkspace {
+    id: String,
+    workspace: Option<Entity<Workspace>>,
+    pending_session: Option<WorkspaceSessionState>,
+}
+
 pub struct AppWindow {
     title_bar: Entity<TitleBar>,
     default_workspace: Entity<Workspace>,
     workspace: Entity<Workspace>,
-    tab_group_workspaces: HashMap<String, Entity<Workspace>>,
+    tab_group_workspaces: Vec<TabGroupWorkspace>,
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
+    _session_save_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
+    persistence: PersistenceManager,
+    workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
 }
 
 impl AppWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let workspace = Workspace::new(window, cx);
+        let persistence = PersistenceManager::new();
+        let session = persistence.load_session().ok().flatten();
+        let workspace = session
+            .as_ref()
+            .and_then(|session| {
+                session.groups.iter().find_map(|group| {
+                    (group.id == DEFAULT_TAB_GROUP_ID)
+                        .then_some(group.workspace.as_ref())
+                        .flatten()
+                        .and_then(|workspace| Workspace::from_session_state(workspace, window, cx))
+                })
+            })
+            .unwrap_or_else(|| Workspace::new(window, cx));
 
         let tab_bar = workspace.read(cx).tab_bar.clone();
         let workspace_weak = workspace.downgrade();
@@ -134,16 +162,177 @@ impl AppWindow {
             });
         });
 
-        Self {
+        let mut this = Self {
             title_bar,
             default_workspace: workspace.clone(),
-            workspace,
-            tab_group_workspaces: HashMap::new(),
+            workspace: workspace.clone(),
+            tab_group_workspaces: Vec::new(),
             ssh_picker,
             sidebar,
             _sidebar_hide_task: None,
+            _session_save_task: None,
             host_view,
             keychain_view,
+            persistence,
+            workspace_subscriptions: HashMap::new(),
+        };
+
+        this.subscribe_workspace_events(workspace.clone(), cx);
+        if let Some(session) = session {
+            this.restore_tab_group_workspaces(session, cx);
+        }
+        this.start_periodic_session_save(cx);
+
+        this
+    }
+
+    fn start_periodic_session_save(&mut self, cx: &mut Context<Self>) {
+        self._session_save_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.save_session(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn subscribe_workspace_events(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
+        let entity_id = workspace.entity_id();
+        if self.workspace_subscriptions.contains_key(&entity_id) {
+            return;
+        }
+
+        let subscription =
+            cx.subscribe(
+                &workspace,
+                |this, _, event: &WorkspaceEvent, cx| match event {
+                    WorkspaceEvent::SessionChanged => this.save_session(cx),
+                },
+            );
+        self.workspace_subscriptions.insert(entity_id, subscription);
+    }
+
+    fn tab_group_workspace(&self, group_id: &str) -> Option<Entity<Workspace>> {
+        self.tab_group_workspaces
+            .iter()
+            .find(|group| group.id == group_id)
+            .and_then(|group| group.workspace.clone())
+    }
+
+    fn active_tab_group_id(&self) -> String {
+        self.tab_group_workspaces
+            .iter()
+            .find_map(|group| {
+                let workspace = group.workspace.as_ref()?;
+                (workspace.entity_id() == self.workspace.entity_id()).then(|| group.id.clone())
+            })
+            .unwrap_or_else(|| DEFAULT_TAB_GROUP_ID.to_string())
+    }
+
+    fn restore_tab_group_workspaces(&mut self, session: AppSessionState, cx: &mut Context<Self>) {
+        let mut seen_group_ids = std::collections::HashSet::new();
+        let sidebar_groups = session
+            .groups
+            .iter()
+            .filter(|group| {
+                group.id != DEFAULT_TAB_GROUP_ID && seen_group_ids.insert(group.id.clone())
+            })
+            .map(|group| SidebarTabGroupState {
+                id: group.id.clone(),
+                label: group.label.clone().unwrap_or_else(|| group.id.clone()),
+                collapsed: group.collapsed,
+            })
+            .collect();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.restore_tab_groups(sidebar_groups, cx);
+        });
+
+        // 用户创建的标签页组只恢复侧边栏元数据，具体 workspace 延迟到用户
+        // 手动选中该组时再创建。这样启动后不会自动连接非默认组里的 SSH，
+        // 也不会默认打开用户未选中的标签页组内容。
+        let mut seen_group_ids = std::collections::HashSet::new();
+        self.tab_group_workspaces = session
+            .groups
+            .iter()
+            .filter(|group| {
+                group.id != DEFAULT_TAB_GROUP_ID && seen_group_ids.insert(group.id.clone())
+            })
+            .map(|group| TabGroupWorkspace {
+                id: group.id.clone(),
+                workspace: None,
+                pending_session: group.workspace.clone(),
+            })
+            .collect();
+
+        let active_group_id = if session.active_group_id != DEFAULT_TAB_GROUP_ID {
+            DEFAULT_TAB_GROUP_ID
+        } else {
+            DEFAULT_TAB_GROUP_ID
+        };
+
+        // 恢复 session 时 workspace/title bar 已切到 active group，但侧边栏本身
+        // 不会自动收到用户点击事件。这里显式同步 selected_id，避免重启后出现
+        // 内容区是某个标签页组、侧边栏却高亮“默认标签页组”的错位状态。
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.handle_item_select(active_group_id);
+            cx.notify();
+        });
+
+        self.sync_sidebar_tab_groups(cx);
+    }
+
+    fn session_state(&self, cx: &mut Context<Self>) -> AppSessionState {
+        let mut groups = Vec::with_capacity(self.tab_group_workspaces.len() + 1);
+        groups.push(WorkspaceGroupSessionState {
+            id: DEFAULT_TAB_GROUP_ID.to_string(),
+            label: Some("标签页".to_string()),
+            collapsed: false,
+            workspace: Some(self.default_workspace.read(cx).session_state(cx)),
+        });
+
+        let sidebar_groups = self.sidebar.read(cx).tab_group_states();
+        let mut seen_group_ids = std::collections::HashSet::new();
+        groups.extend(sidebar_groups.into_iter().filter_map(|sidebar_group| {
+            if !seen_group_ids.insert(sidebar_group.id.clone()) {
+                return None;
+            }
+            let workspace_entry = self
+                .tab_group_workspaces
+                .iter()
+                .find(|group| group.id == sidebar_group.id);
+            Some(WorkspaceGroupSessionState {
+                id: sidebar_group.id,
+                label: Some(sidebar_group.label),
+                collapsed: sidebar_group.collapsed,
+                workspace: workspace_entry.and_then(|group| {
+                    group
+                        .workspace
+                        .as_ref()
+                        .map(|workspace| workspace.read(cx).session_state(cx))
+                        .or_else(|| group.pending_session.clone())
+                }),
+            })
+        }));
+
+        let active_group_id = self.active_tab_group_id();
+
+        AppSessionState {
+            version: crate::workspace::session_state::SESSION_STATE_VERSION,
+            active_group_id,
+            groups,
+        }
+    }
+
+    fn save_session(&self, cx: &mut Context<Self>) {
+        let session = self.session_state(cx);
+        if let Err(error) = self.persistence.save_session(&session) {
+            log::warn!("Failed to save session state: {error}");
         }
     }
 
@@ -165,7 +354,20 @@ impl AppWindow {
         workspace.update(cx, |workspace, cx| {
             workspace.set_ssh_picker(self.ssh_picker.clone(), cx);
         });
+        self.subscribe_workspace_events(workspace, cx);
         cx.notify();
+    }
+
+    fn defer_save_session(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(0))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.save_session(cx);
+            });
+        })
+        .detach();
     }
 
     fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {
@@ -174,11 +376,13 @@ impl AppWindow {
             sidebar.set_tab_group_tabs(DEFAULT_TAB_GROUP_ID, default_tabs, cx);
         });
 
-        for (group_id, workspace) in &self.tab_group_workspaces {
-            let tabs = Self::sidebar_tabs_for_workspace(workspace, cx);
-            self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.set_tab_group_tabs(group_id.clone(), tabs, cx);
-            });
+        for group in &self.tab_group_workspaces {
+            if let Some(workspace) = &group.workspace {
+                let tabs = Self::sidebar_tabs_for_workspace(workspace, cx);
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_tab_group_tabs(group.id.clone(), tabs, cx);
+                });
+            }
         }
     }
 
@@ -210,9 +414,14 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         let workspace = Workspace::new(window, cx);
-        self.tab_group_workspaces
-            .insert(group_id.clone(), workspace.clone());
+        self.subscribe_workspace_events(workspace.clone(), cx);
+        self.tab_group_workspaces.push(TabGroupWorkspace {
+            id: group_id.clone(),
+            workspace: Some(workspace.clone()),
+            pending_session: None,
+        });
         self.bind_active_workspace(workspace, cx);
+        self.save_session(cx);
     }
 
     fn switch_tab_group_workspace(
@@ -226,16 +435,37 @@ impl AppWindow {
             return;
         }
 
-        let workspace = if let Some(workspace) = self.tab_group_workspaces.get(group_id) {
-            workspace.clone()
+        let workspace = if let Some(workspace) = self.tab_group_workspace(group_id) {
+            workspace
         } else {
-            let workspace = Workspace::new(window, cx);
-            self.tab_group_workspaces
-                .insert(group_id.to_string(), workspace.clone());
+            let pending_session = self
+                .tab_group_workspaces
+                .iter_mut()
+                .find(|group| group.id == group_id)
+                .and_then(|group| group.pending_session.take());
+            let workspace = pending_session
+                .as_ref()
+                .and_then(|state| Workspace::from_session_state(state, window, cx))
+                .unwrap_or_else(|| Workspace::new(window, cx));
+            self.subscribe_workspace_events(workspace.clone(), cx);
+            if let Some(group) = self
+                .tab_group_workspaces
+                .iter_mut()
+                .find(|group| group.id == group_id)
+            {
+                group.workspace = Some(workspace.clone());
+            } else {
+                self.tab_group_workspaces.push(TabGroupWorkspace {
+                    id: group_id.to_string(),
+                    workspace: Some(workspace.clone()),
+                    pending_session: None,
+                });
+            }
             workspace
         };
 
         self.bind_active_workspace(workspace, cx);
+        self.defer_save_session(cx);
     }
 
     /// 切换侧边栏显示/隐藏

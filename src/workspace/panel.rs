@@ -3,6 +3,7 @@ use gpui::{
     App, BoxShadow, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, Render, SharedString, Styled, Subscription, Window, div, point, px, svg,
 };
+use std::path::PathBuf;
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
@@ -14,6 +15,9 @@ use crate::file_transfer::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;
+use crate::workspace::session_state::{
+    PanelContentSessionState, PanelSessionState, TerminalSessionState,
+};
 
 // Re-export for convenience
 pub use crate::ssh::SshConnectionConfig;
@@ -289,6 +293,27 @@ impl Panel {
         )
     }
 
+    pub fn with_terminal_working_directory(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        working_directory: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let panel_id = panel_id.into();
+        let terminal_view = TerminalView::new_with_working_directory(cx, working_directory);
+        Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
+        Self::new_common(
+            panel_id,
+            workspace_id,
+            active_tab_id,
+            active_tab_label,
+            PanelContent::Terminal(terminal_view),
+            cx,
+        )
+    }
+
     /// Creates a new panel with a terminal view using a specific command.
     pub fn with_terminal_command(
         panel_id: impl Into<String>,
@@ -543,6 +568,59 @@ impl Panel {
         &self.content
     }
 
+    pub fn session_state(&self, cx: &App) -> Option<PanelSessionState> {
+        match &self.content {
+            PanelContent::Terminal(terminal_view) => Some(PanelSessionState {
+                id: self.panel_id.clone(),
+                content: PanelContentSessionState::Terminal(
+                    terminal_view.read(cx).session_state(cx),
+                ),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn from_session_state(
+        state: &PanelSessionState,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        match &state.content {
+            PanelContentSessionState::Terminal(TerminalSessionState::Local { cwd, .. }) => {
+                let working_directory = cwd.as_ref().map(PathBuf::from);
+                Self::with_terminal_working_directory(
+                    state.id.clone(),
+                    workspace_id,
+                    active_tab_id,
+                    active_tab_label,
+                    working_directory,
+                    cx,
+                )
+            }
+            PanelContentSessionState::Terminal(TerminalSessionState::Ssh {
+                config,
+                remote_cwd,
+            }) => {
+                let panel_id = state.id.clone();
+                let terminal_view =
+                    TerminalView::new_ssh_with_remote_cwd(cx, config, remote_cwd.clone());
+                Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
+                let mut panel = Self::new_common(
+                    panel_id,
+                    workspace_id,
+                    active_tab_id,
+                    active_tab_label,
+                    PanelContent::Terminal(terminal_view),
+                    cx,
+                );
+                panel.ssh_config_id = Some(config.id());
+                panel
+            }
+        }
+    }
+
     /// 设置Tab标签名
     pub fn set_tab_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.active_tab_label = Some(label.into());
@@ -683,6 +761,37 @@ impl Panel {
 impl EventEmitter<PanelEvent> for Panel {}
 
 impl Panel {
+    /// 生成 Panel 拖回 TabBar 后应该使用的标签。
+    ///
+    /// Panel 在 Workspace 容器里时，`active_tab_label` 会被同步成 Workspace 的名称，
+    /// 这是为了标题栏表达“当前属于哪个 Workspace”。但拖回 TabBar 时，新标签必须
+    /// 恢复成终端自身的名字，否则远程终端会丢失 Host 名称并显示成 WorkSpace[n]。
+    fn drag_tab_label(&self, cx: &App) -> SharedString {
+        if let PanelContent::Terminal(terminal_view) = &self.content {
+            let terminal_view = terminal_view.read(cx);
+            if let Some(config) = terminal_view.ssh_config() {
+                return config
+                    .nickname
+                    .clone()
+                    .unwrap_or_else(|| config.host_label())
+                    .into();
+            }
+
+            let title = terminal_view.title().to_string();
+            if !title.trim().is_empty() && title != "Terminal" {
+                return title.into();
+            }
+
+            // 本地终端内部默认标题可能只是 Terminal，而应用层标签使用 Local Terminal。
+            // 拖出 Workspace 时按应用层语义恢复，避免新标签出现过于泛化的标题。
+            return "Local Terminal".into();
+        }
+
+        self.active_tab_label
+            .clone()
+            .unwrap_or_else(|| "Panel".into())
+    }
+
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -702,7 +811,7 @@ impl Panel {
             .clone()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let drag_title = title.clone();
+        let drag_title = self.drag_tab_label(cx).to_string();
         let broadcast_enabled = self.broadcast_enabled;
 
         div()

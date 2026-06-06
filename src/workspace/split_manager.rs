@@ -1,9 +1,10 @@
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Styled, Window,
-    div,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Styled, Window, div,
 };
 
 use crate::workspace::panel::{Panel, PanelPlacement};
+use crate::workspace::session_state::{SplitSessionDirection, SplitSessionState};
 
 /// 分割方向
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,72 @@ impl SplitContainer {
             direction,
             children,
             sizes,
+        }
+    }
+
+    pub fn session_state(&self, cx: &App) -> Option<SplitSessionState> {
+        match self {
+            SplitContainer::Panel(panel) => panel
+                .read(cx)
+                .session_state(cx)
+                .map(SplitSessionState::Panel),
+            SplitContainer::Split {
+                direction,
+                children,
+                sizes,
+            } => {
+                let children = children
+                    .iter()
+                    .filter_map(|child| child.session_state(cx))
+                    .collect::<Vec<_>>();
+
+                if children.is_empty() {
+                    return None;
+                }
+
+                Some(SplitSessionState::Split {
+                    direction: (*direction).into(),
+                    children,
+                    sizes: sizes.clone(),
+                })
+            }
+        }
+    }
+
+    pub fn from_session_state(
+        state: &SplitSessionState,
+        workspace_id: &str,
+        tab_id: &str,
+        tab_label: &str,
+        cx: &mut App,
+    ) -> Self {
+        match state {
+            SplitSessionState::Panel(panel_state) => {
+                let panel = cx.new(|cx| {
+                    Panel::from_session_state(
+                        panel_state,
+                        workspace_id.to_string(),
+                        Some(SharedString::from(tab_id.to_string())),
+                        Some(SharedString::from(tab_label.to_string())),
+                        cx,
+                    )
+                });
+                SplitContainer::Panel(panel)
+            }
+            SplitSessionState::Split {
+                direction,
+                children,
+                sizes,
+            } => SplitContainer::Split {
+                direction: (*direction).into(),
+                children: children
+                    .iter()
+                    .map(|child| {
+                        Self::from_session_state(child, workspace_id, tab_id, tab_label, cx)
+                    })
+                    .collect(),
+                sizes: sizes.clone(),
+            },
         }
     }
 
@@ -342,6 +409,24 @@ impl SplitContainer {
                 }
                 children[idx].resize_at_path(&path[1..], child_index, delta, min_size)
             }
+        }
+    }
+}
+
+impl From<SplitDirection> for SplitSessionDirection {
+    fn from(direction: SplitDirection) -> Self {
+        match direction {
+            SplitDirection::Horizontal => SplitSessionDirection::Horizontal,
+            SplitDirection::Vertical => SplitSessionDirection::Vertical,
+        }
+    }
+}
+
+impl From<SplitSessionDirection> for SplitDirection {
+    fn from(direction: SplitSessionDirection) -> Self {
+        match direction {
+            SplitSessionDirection::Horizontal => SplitDirection::Horizontal,
+            SplitSessionDirection::Vertical => SplitDirection::Vertical,
         }
     }
 }

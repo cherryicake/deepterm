@@ -84,11 +84,7 @@ impl CommandHistory {
         if line.is_empty() {
             return;
         }
-        let command_name = line
-            .split_whitespace()
-            .next()
-            .unwrap_or(line)
-            .to_string();
+        let command_name = line.split_whitespace().next().unwrap_or(line).to_string();
 
         if let Some(existing) = self.entries.iter_mut().find(|e| e.command_line == line) {
             existing.count = existing.count.saturating_add(1);
@@ -105,16 +101,11 @@ impl CommandHistory {
 
         if self.entries.len() > MAX_ENTRIES {
             // 淘汰 score 最低的一条
-            if let Some((idx, _)) = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    a.score(now)
-                        .partial_cmp(&b.score(now))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
+            if let Some((idx, _)) = self.entries.iter().enumerate().min_by(|(_, a), (_, b)| {
+                a.score(now)
+                    .partial_cmp(&b.score(now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
                 self.entries.remove(idx);
             }
         }

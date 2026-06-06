@@ -511,7 +511,9 @@ impl Render for TitleBar {
             .when(is_macos && !is_fullscreen, |this| {
                 this.pl(TITLE_BAR_LEFT_PADDING)
             })
-            .when(is_macos && is_fullscreen, |this| this.pl(TITLE_BAR_LEFT_PADDING))
+            .when(is_macos && is_fullscreen, |this| {
+                this.pl(TITLE_BAR_LEFT_PADDING)
+            })
             .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
             .bg(theme.app_background)
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽

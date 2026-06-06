@@ -4,7 +4,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{Animation, AnimationExt as _, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Transformation};
+use gpui::{
+    Animation, AnimationExt as _, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    Transformation,
+};
 use gpui::{MouseButton, Pixels, ScrollHandle, div, ease_in_out, percentage, px, svg};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -274,10 +277,8 @@ impl BuiltinCommandManager {
                     None => true,
                 };
                 if changed {
-                    self.remote_dir_cache.insert(
-                        key.clone(),
-                        RemoteDirCacheEntry { items: new_items },
-                    );
+                    self.remote_dir_cache
+                        .insert(key.clone(), RemoteDirCacheEntry { items: new_items });
                     // LRU 淘汰
                     self.remote_dir_cache_lru.retain(|k| k != &key);
                     self.remote_dir_cache_lru.push(key.clone());
@@ -1057,10 +1058,7 @@ impl BuiltinCommandManager {
                 // 远程终端：host 候选 + 当前终端的远程文件；
                 // 本地终端：host 候选 + 本机文件。
                 if let Some(terminal_cfg) = self.terminal_ssh.clone() {
-                    let mut items = build_host_only_completions(
-                        prefix,
-                        &self.ssh_saved_configs,
-                    );
+                    let mut items = build_host_only_completions(prefix, &self.ssh_saved_configs);
                     items.extend(self.compute_bare_remote_completion_items(
                         prefix,
                         terminal_cfg,
@@ -1094,9 +1092,7 @@ impl BuiltinCommandManager {
                     };
                     h.display.eq_ignore_ascii_case(host_token)
                         || cfg.host_label().eq_ignore_ascii_case(host_token)
-                        || cfg
-                            .connection_string()
-                            .eq_ignore_ascii_case(host_token)
+                        || cfg.connection_string().eq_ignore_ascii_case(host_token)
                         || cfg
                             .nickname
                             .as_deref()
@@ -2036,7 +2032,13 @@ where
     }
 
     // 分隔线
-    rows.push(div().h(px(1.0)).my(px(2.0)).bg(theme.border).into_any_element());
+    rows.push(
+        div()
+            .h(px(1.0))
+            .my(px(2.0))
+            .bg(theme.border)
+            .into_any_element(),
+    );
     rows
 }
 
@@ -2063,13 +2065,15 @@ where
     let on_pick = Rc::new(on_pick);
     let anchored_at_bottom = matches!(anchor, OverlayAnchor::Bottom(_));
 
-    let history_rows =
-        render_history_rows(history, history_selected, theme, is_dark, Rc::new(on_pick_history));
+    let history_rows = render_history_rows(
+        history,
+        history_selected,
+        theme,
+        is_dark,
+        Rc::new(on_pick_history),
+    );
 
-    let items_list = div()
-        .max_h(px(420.0))
-        .children(history_rows)
-        .children(
+    let items_list = div().max_h(px(420.0)).children(history_rows).children(
         suggestions
             .iter()
             .cloned()
@@ -2189,8 +2193,13 @@ where
     let on_pick = Rc::new(on_pick);
     let overlay_width = estimate_overlay_width(completions);
 
-    let history_rows =
-        render_history_rows(history, history_selected, theme, is_dark, Rc::new(on_pick_history));
+    let history_rows = render_history_rows(
+        history,
+        history_selected,
+        theme,
+        is_dark,
+        Rc::new(on_pick_history),
+    );
 
     // 紧贴命令行光标的圆角弹层。当 `anchor` 为 `Bottom` 时浮窗底端贴近光标，
     // 列表从下往上贴着光标增长。宽度按最长建议项估算（夹紧到 320–900px）。
@@ -2223,13 +2232,16 @@ where
                         .map(move |(index, item)| {
                             let on_pick = on_pick.clone();
                             let is_selected = Some(index) == selected_index;
-                            let icon_path = item.icon
-                                .map(|i| i.path())
-                                .unwrap_or_else(|| match item.kind {
-                                    CompletionKind::Directory => crate::assets::Icon::Folder.path(),
-                                    CompletionKind::Host => crate::assets::Icon::Host.path(),
-                                    CompletionKind::File => crate::assets::Icon::File.path(),
-                                });
+                            let icon_path =
+                                item.icon
+                                    .map(|i| i.path())
+                                    .unwrap_or_else(|| match item.kind {
+                                        CompletionKind::Directory => {
+                                            crate::assets::Icon::Folder.path()
+                                        }
+                                        CompletionKind::Host => crate::assets::Icon::Host.path(),
+                                        CompletionKind::File => crate::assets::Icon::File.path(),
+                                    });
                             div()
                                 .w_full()
                                 .h(px(28.0))
@@ -2268,19 +2280,23 @@ where
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .child(svg_element.with_animation(
-                                                "progress-rotate",
-                                                Animation::new(std::time::Duration::from_millis(
-                                                    1000,
-                                                ))
-                                                .repeat()
-                                                .with_easing(ease_in_out),
-                                                |this, delta| {
-                                                    this.with_transformation(
-                                                        Transformation::rotate(percentage(delta)),
+                                            .child(
+                                                svg_element.with_animation(
+                                                    "progress-rotate",
+                                                    Animation::new(
+                                                        std::time::Duration::from_millis(1000),
                                                     )
-                                                },
-                                            ))
+                                                    .repeat()
+                                                    .with_easing(ease_in_out),
+                                                    |this, delta| {
+                                                        this.with_transformation(
+                                                            Transformation::rotate(percentage(
+                                                                delta,
+                                                            )),
+                                                        )
+                                                    },
+                                                ),
+                                            )
                                     } else {
                                         div()
                                             .w(px(16.0))
@@ -2299,22 +2315,19 @@ where
                                 )
                                 // 仅 Host 条目附带 nickname / 描述（"This machine"、保存的别名等）；
                                 // 文件 / 目录条目只显示文件名
-                                .when_some(
-                                    host_description(&item),
-                                    |this, desc| {
-                                        this.child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .truncate()
-                                                .text_size(px(12.5))
-                                                .text_color(theme.text_muted)
-                                                .child(desc),
-                                        )
-                                    },
-                                )
+                                .when_some(host_description(&item), |this, desc| {
+                                    this.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.text_muted)
+                                            .child(desc),
+                                    )
+                                })
                         }),
                 ),
         )
@@ -2322,7 +2335,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BuiltinCommandManager, CommandHistory, find_builtin_command, resolve_command_line};
+    use super::{
+        BuiltinCommandManager, CommandHistory, find_builtin_command, resolve_command_line,
+    };
 
     #[test]
     fn parses_builtin_open_command() {
@@ -2475,9 +2490,9 @@ mod tests {
         }];
         let items = super::build_remote_completions(
             &entries,
-            "",                  // file_prefix
-            Some("my host"),     // host_token（含空格）
-            "/home/me/",         // current_path_prefix（光标处字面量）
+            "",              // file_prefix
+            Some("my host"), // host_token（含空格）
+            "/home/me/",     // current_path_prefix（光标处字面量）
         );
         assert_eq!(items.len(), 1);
         let replacement = items[0].replacement.clone().unwrap();
@@ -2771,10 +2786,7 @@ mod tests {
         // 不应加空格
         assert_eq!(manager.query(), Some("/scp Local:/tmp/"));
         // 浮层保持 Visible —— 让用户继续选择子目录
-        assert_eq!(
-            manager.overlay_state(),
-            super::OverlayState::Visible
-        );
+        assert_eq!(manager.overlay_state(), super::OverlayState::Visible);
     }
 
     #[test]
@@ -2944,7 +2956,10 @@ mod tests {
         // 整行回填，光标落末尾，浮层收起
         assert_eq!(manager.query(), Some("/scp alice:/etc/hosts ./"));
         assert_eq!(manager.cursor(), Some("/scp alice:/etc/hosts ./".len()));
-        assert_eq!(manager.overlay_state(), super::OverlayState::HiddenAfterPick);
+        assert_eq!(
+            manager.overlay_state(),
+            super::OverlayState::HiddenAfterPick
+        );
     }
 
     #[test]

@@ -452,7 +452,11 @@ fn resolve_host_token(
         return Some(resolve_local_endpoint(path_part, ctx));
     }
     if let HostMatch::One(config) = match_host(host_part, saved_configs) {
-        return Some(resolve_remote_path_with_cwd(path_part, config.clone(), None));
+        return Some(resolve_remote_path_with_cwd(
+            path_part,
+            config.clone(),
+            None,
+        ));
     }
     None
 }
@@ -513,14 +517,22 @@ fn split_destination(
                     if name == "." {
                         return (FileEndpoint::Local { path }, None);
                     }
-                    let parent = path.parent().filter(|p| {
-                        // 相对路径如 "a.txt" 的 parent 是 ""（空路径），
-                        // 此时应视为当前目录，不能返回空 parent 否则后续拼接丢失目录语义
-                        !p.as_os_str().is_empty()
-                    }).map(PathBuf::from);
+                    let parent = path
+                        .parent()
+                        .filter(|p| {
+                            // 相对路径如 "a.txt" 的 parent 是 ""（空路径），
+                            // 此时应视为当前目录，不能返回空 parent 否则后续拼接丢失目录语义
+                            !p.as_os_str().is_empty()
+                        })
+                        .map(PathBuf::from);
                     match parent {
                         Some(parent) => (FileEndpoint::Local { path: parent }, Some(name)),
-                        None => (FileEndpoint::Local { path: PathBuf::from(".") }, Some(name)),
+                        None => (
+                            FileEndpoint::Local {
+                                path: PathBuf::from("."),
+                            },
+                            Some(name),
+                        ),
                     }
                 }
                 None => (FileEndpoint::Local { path }, None),

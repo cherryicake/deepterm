@@ -220,9 +220,7 @@ impl SshConnectionManager {
                 let mut info = info;
                 info.set_state(ConnectionState::Connected);
 
-                let active_conn = ActiveConnection {
-                    info: info.clone(),
-                };
+                let active_conn = ActiveConnection { info: info.clone() };
 
                 // 存储连接
                 self.connections
@@ -242,9 +240,7 @@ impl SshConnectionManager {
                 let mut info = info;
                 info.set_error(&e.to_string());
 
-                let active_conn = ActiveConnection {
-                    info: info.clone(),
-                };
+                let active_conn = ActiveConnection { info: info.clone() };
 
                 self.connections
                     .lock()

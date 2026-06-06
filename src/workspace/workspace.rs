@@ -8,7 +8,7 @@ use gpui::{
     GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, Style, Styled, Subscription, Window, div, px,
 };
-use gpui::{KeyBinding, actions, prelude::*};
+use gpui::{EventEmitter, KeyBinding, actions, prelude::*};
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
 /// (workspace_id, panel_id, input_data)
@@ -20,22 +20,30 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
+use crate::file_transfer::TransferStatusReporter;
 use crate::file_transfer::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
     TransferTaskState, TransferTaskStatus, quick_total_size, transfer_item_name, transfer_label,
 };
-use crate::file_transfer::TransferStatusReporter;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
+use crate::workspace::session_state::{TabSessionState, TabSessionType, WorkspaceSessionState};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
 const FILE_BROWSER_TAB_ID: &str = "__file_browser__";
+
+#[derive(Clone, Debug)]
+pub enum WorkspaceEvent {
+    SessionChanged,
+}
+
+impl EventEmitter<WorkspaceEvent> for Workspace {}
 pub(crate) fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     // 使用 None 作为 context，让这些快捷键全局有效
@@ -153,6 +161,43 @@ struct ResizeDragState {
 }
 
 impl Workspace {
+    pub fn session_state(&self, cx: &App) -> WorkspaceSessionState {
+        let tab_items = self.tab_bar.read(cx).tabs.clone();
+        let tabs = tab_items
+            .into_iter()
+            .filter_map(|item| {
+                let tab = self.tabs.get(item.id.as_ref())?;
+                let container = tab.container.session_state(cx)?;
+                let icon_os = tab
+                    .container
+                    .get_first_panel()
+                    .and_then(|panel| panel.read(cx).remote_os)
+                    .map(|os| os.to_id().to_string());
+                Some(TabSessionState {
+                    id: tab.id.clone(),
+                    label: tab.label.clone(),
+                    tab_type: match tab.tab_type {
+                        TabType::Normal => TabSessionType::Normal,
+                        TabType::Workspace => TabSessionType::Workspace,
+                    },
+                    broadcast_enabled: tab.broadcast_enabled,
+                    icon_os,
+                    container,
+                })
+            })
+            .collect();
+
+        WorkspaceSessionState {
+            workspace_id: self.workspace_id.clone(),
+            active_tab_id: self.active_tab_id.clone(),
+            next_tab_id: self.next_tab_id,
+            next_panel_id: self.next_panel_id,
+            local_terminal_count: self.local_terminal_count,
+            workspace_index: self.workspace_index,
+            tabs,
+        }
+    }
+
     /// 计算指定 tab 的有效广播状态。
     /// 只有 WorkSpace 类型的 tab 才允许真正开启广播。
     fn get_tab_broadcast_state(&self, tab_id: &str) -> bool {
@@ -220,8 +265,7 @@ impl Workspace {
         // 创建初始tab - Local Terminal
         let initial_label = "Local Terminal";
         let local_os_icon = Some(crate::ssh::platform::detect_local_os().icon());
-        let initial_tab_items =
-            vec![TabItem::new("tab-0", initial_label).with_icon(local_os_icon)];
+        let initial_tab_items = vec![TabItem::new("tab-0", initial_label).with_icon(local_os_icon)];
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, initial_tab_items);
 
         // 生成唯一的workspace ID（先创建，确保与Panel一致）
@@ -280,6 +324,101 @@ impl Workspace {
         });
 
         workspace
+    }
+
+    pub fn from_session_state(
+        state: &WorkspaceSessionState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<Self>> {
+        if state.tabs.is_empty() {
+            return None;
+        }
+
+        let focus_handle = cx.focus_handle();
+        let workspace_id = if state.workspace_id.is_empty() {
+            format!("workspace-{}", uuid::Uuid::new_v4())
+        } else {
+            state.workspace_id.clone()
+        };
+
+        let tab_items = state
+            .tabs
+            .iter()
+            .map(|tab| {
+                let icon = match tab.tab_type {
+                    // Workspace tab 是一个布局容器，不代表某一台终端；恢复会话时必须保留
+                    // Workspace 自己的图标，不能用第一个 Panel 的系统图标覆盖它。
+                    TabSessionType::Workspace => Some(crate::assets::Icon::Workspace),
+                    TabSessionType::Normal => tab
+                        .icon_os
+                        .as_deref()
+                        .map(RemoteOS::from_id)
+                        .filter(|os| *os != RemoteOS::Unknown)
+                        .map(|os| os.icon()),
+                };
+                TabItem::new(&tab.id, &tab.label).with_icon(icon)
+            })
+            .collect();
+        let tab_bar = TabBar::new_with_tabs("tab-bar", cx, tab_items);
+
+        let active_tab_id = state
+            .tabs
+            .iter()
+            .any(|tab| tab.id == state.active_tab_id)
+            .then(|| state.active_tab_id.clone())
+            .unwrap_or_else(|| state.tabs[0].id.clone());
+
+        let tabs = state
+            .tabs
+            .iter()
+            .map(|tab| {
+                let container = SplitContainer::from_session_state(
+                    &tab.container,
+                    &workspace_id,
+                    &tab.id,
+                    &tab.label,
+                    cx,
+                );
+                let tab_info = TabInfo {
+                    id: tab.id.clone(),
+                    label: tab.label.clone(),
+                    tab_type: match tab.tab_type {
+                        TabSessionType::Normal => TabType::Normal,
+                        TabSessionType::Workspace => TabType::Workspace,
+                    },
+                    container,
+                    broadcast_enabled: tab.broadcast_enabled,
+                };
+                (tab.id.clone(), tab_info)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let workspace = cx.new(|cx| {
+            let mut workspace = Self {
+                tab_bar,
+                tabs,
+                active_tab_id: active_tab_id.clone(),
+                next_tab_id: state.next_tab_id.max(state.tabs.len()),
+                next_panel_id: state.next_panel_id.max(1),
+                local_terminal_count: state.local_terminal_count.max(1),
+                workspace_index: state.workspace_index,
+                focus_handle,
+                panel_subscriptions: HashMap::new(),
+                workspace_id,
+                resize_drag: None,
+                ssh_picker: None,
+                next_transfer_id: 1,
+                transfer_tasks: Vec::new(),
+            };
+
+            workspace.setup_tab_bar_handlers(cx);
+            workspace.subscribe_to_panels(window, cx);
+            workspace.switch_to_tab(&active_tab_id, cx);
+            workspace
+        });
+
+        Some(workspace)
     }
 
     /// 设置初始焦点到当前活动 tab 的第一个 panel 的 terminal
@@ -436,7 +575,6 @@ impl Workspace {
                     });
                 }
             });
-
         });
     }
 
@@ -809,7 +947,8 @@ impl Workspace {
                 if let Some(entity) = weak.upgrade() {
                     let tb = total_bytes_for_reporter.load(Ordering::Relaxed);
                     let _ = entity.update(cx, |this, cx| {
-                        if let Some(task) = this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
+                        if let Some(task) =
+                            this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
                         {
                             if tb > 0 && task.total_bytes == 0 {
                                 task.total_bytes = tb;
@@ -926,6 +1065,7 @@ impl Workspace {
             }
         }
 
+        cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
 
@@ -1100,6 +1240,7 @@ impl Workspace {
             if self.active_tab_id == target_tab_id {
                 self.activate_next_tab(cx);
             }
+            cx.emit(WorkspaceEvent::SessionChanged);
             cx.notify();
             return;
         }
@@ -1157,6 +1298,7 @@ impl Workspace {
             self.disable_tab_broadcast(&target_tab_id, cx);
         }
 
+        cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
 
@@ -1355,6 +1497,7 @@ impl Workspace {
             });
         });
 
+        cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
 
@@ -1381,12 +1524,17 @@ impl Workspace {
             return;
         };
 
-        // 获取panel的标签名用于新tab
-        let panel_label = dragged_panel_entity
-            .read(cx)
-            .tab_label()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "Panel".to_string());
+        // 拖回 TabBar 时使用拖拽开始时捕获的“内容标签”。Workspace 内的 Panel
+        // 可见标题会被同步成 Workspace 名称，如果这里重新读取 Panel::tab_label，
+        // 终端脱离 Workspace 后就会错误地变成 WorkSpace[n]。
+        let panel_label = {
+            let label = dragged_panel.tab_label.to_string();
+            if label.trim().is_empty() {
+                "Panel".to_string()
+            } else {
+                label
+            }
+        };
 
         // 从当前container中移除被拖拽的panel
         let new_container = tab_info.container.remove_panel(&dragged_panel.panel_id, cx);
@@ -1483,6 +1631,7 @@ impl Workspace {
         self.active_tab_id = new_tab_id.clone();
         self.switch_to_tab(&new_tab_id, cx);
 
+        cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
 
@@ -1493,15 +1642,20 @@ impl Workspace {
         to_index: usize,
         cx: &mut Context<Self>,
     ) {
+        let mut changed = false;
         self.tab_bar.update(cx, |tab_bar, cx| {
             if let Some(from_index) = tab_bar.tabs.iter().position(|t| t.id == dragged_tab_id) {
                 if from_index != to_index {
                     let tab = tab_bar.tabs.remove(from_index);
                     tab_bar.tabs.insert(to_index, tab);
+                    changed = true;
                     cx.notify();
                 }
             }
         });
+        if changed {
+            cx.emit(WorkspaceEvent::SessionChanged);
+        }
     }
 
     /// 处理 TabBar 溢出事件
@@ -1758,6 +1912,7 @@ impl Workspace {
                 tab_bar.set_active_tab(tab_id.clone(), cx);
             });
             self.sync_tab_broadcast_to_panels(&tab_id, cx);
+            cx.emit(WorkspaceEvent::SessionChanged);
             cx.notify();
         }
     }
@@ -1885,6 +2040,8 @@ impl Workspace {
                 window.focus(&handle, cx);
             }
         });
+
+        cx.emit(WorkspaceEvent::SessionChanged);
     }
 
     /// 生成终端类型的Tab名称
@@ -1911,6 +2068,7 @@ impl Workspace {
             }
         }
 
+        cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
 

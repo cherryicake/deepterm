@@ -20,14 +20,14 @@ use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
+use crate::components::input::highlighter::DiagnosticSet;
+#[cfg(not(target_family = "wasm"))]
+use crate::components::input::highlighter::LanguageRegistry;
 use crate::components::input::history::History;
 use crate::components::input::movement::MoveDirection;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
-use crate::components::input::highlighter::DiagnosticSet;
-#[cfg(not(target_family = "wasm"))]
-use crate::components::input::highlighter::LanguageRegistry;
 use lsp_types::Position;
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]

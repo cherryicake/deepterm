@@ -130,10 +130,7 @@ pub async fn try_default_keys<H: russh::client::Handler>(
             if idx != 0 {
                 let hit = default_keys.remove(idx);
                 default_keys.insert(0, hit);
-                log::info!(
-                    "复用上次认证过的密钥 {:?}，优先尝试",
-                    default_keys[0]
-                );
+                log::info!("复用上次认证过的密钥 {:?}，优先尝试", default_keys[0]);
             }
         }
     }

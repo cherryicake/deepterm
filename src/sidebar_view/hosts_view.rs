@@ -1,5 +1,5 @@
-use gpui::{App, SharedString};
 use gpui::actions;
+use gpui::{App, SharedString};
 
 actions!(
     host_actions,
@@ -113,7 +113,6 @@ impl HostIconColor {
         }
     }
 }
-
 
 /// Load hosts from SSH config file, returning hosts and configs
 pub fn load_hosts_from_config() -> (Vec<Host>, Vec<SshConnectionConfig>) {

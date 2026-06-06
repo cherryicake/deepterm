@@ -370,7 +370,11 @@ pub mod easing {
         #[test]
         fn enter_front_loads_progress() {
             let f = macos_enter();
-            assert!(f(0.3) > 0.5, "enter curve should pass 0.5 by t=0.3, got {}", f(0.3));
+            assert!(
+                f(0.3) > 0.5,
+                "enter curve should pass 0.5 by t=0.3, got {}",
+                f(0.3)
+            );
         }
 
         /// x 反解精度：对线性对角线 cubic-bezier(t)=t 的近似应足够准。
@@ -379,9 +383,12 @@ pub mod easing {
             let f = cubic_bezier(0.33, 0.33, 0.66, 0.66);
             for i in 0..=10 {
                 let t = i as f32 / 10.0;
-                assert!((f(t) - t).abs() < 5e-3, "diagonal mismatch at {t}: {}", f(t));
+                assert!(
+                    (f(t) - t).abs() < 5e-3,
+                    "diagonal mismatch at {t}: {}",
+                    f(t)
+                );
             }
         }
     }
 }
-

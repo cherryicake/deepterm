@@ -1,17 +1,17 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 
 use crate::file_transfer::utils::{
-    check_cancelled, remote_file_name, resolve_local_conflict, resolve_remote_conflict,
-    temporary_local_path, temporary_remote_path, TransferSummary,
+    TransferSummary, check_cancelled, remote_file_name, resolve_local_conflict,
+    resolve_remote_conflict, temporary_local_path, temporary_remote_path,
 };
 use crate::file_transfer::{ConflictPolicy, ConflictResolver};
-use crate::ssh::sftp_fs::{self, RemoteFileKind};
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
 pub fn upload_local_to_remote(
     source_path: &Path,
@@ -34,11 +34,16 @@ pub fn upload_local_to_remote(
 
         if metadata.is_file() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, effective_name);
-            let destination_path =
-                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_path = match resolve_remote_conflict(
+                session,
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             return upload_local_file_to_remote_path(
                 session,
                 source_path,
@@ -50,11 +55,16 @@ pub fn upload_local_to_remote(
 
         if metadata.is_dir() {
             let desired_path = sftp_fs::join_remote_path(destination_dir, &file_name);
-            let destination_root =
-                match resolve_remote_conflict(session, &desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_root = match resolve_remote_conflict(
+                session,
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             session.create_dir_all(&destination_root)?;
             return upload_local_dir_to_remote_path(
                 session,
@@ -104,14 +114,30 @@ pub fn upload_local_dir_to_remote_path(
         let destination_path = sftp_fs::join_remote_path(destination_dir, &file_name);
 
         if metadata.is_file() {
-            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+            match resolve_remote_conflict(
+                session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
                 Some(path) => summary.merge(upload_local_file_to_remote_path(
-                    session, &source_path, &path, cancelled, progress,
+                    session,
+                    &source_path,
+                    &path,
+                    cancelled,
+                    progress,
                 )?),
                 None => summary.merge(TransferSummary::one_skipped()),
             }
         } else if metadata.is_dir() {
-            match resolve_remote_conflict(session, &destination_path, conflict_policy, resolver, cancelled)? {
+            match resolve_remote_conflict(
+                session,
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
                 Some(path) => {
                     session.create_dir_all(&path)?;
                     summary.merge(upload_local_dir_to_remote_path(
@@ -195,11 +221,15 @@ pub fn download_remote_to_local(
 
         if metadata.kind == RemoteFileKind::File {
             let desired_path = destination_dir.join(effective_name);
-            let destination_path =
-                match resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_path = match resolve_local_conflict(
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             return download_remote_file_to_local_path(
                 session,
                 remote_path,
@@ -211,11 +241,15 @@ pub fn download_remote_to_local(
 
         if metadata.kind == RemoteFileKind::Directory {
             let desired_path = destination_dir.join(&file_name);
-            let destination_root =
-                match resolve_local_conflict(&desired_path, conflict_policy, resolver, cancelled)? {
-                    Some(path) => path,
-                    None => return Ok(TransferSummary::one_skipped()),
-                };
+            let destination_root = match resolve_local_conflict(
+                &desired_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => path,
+                None => return Ok(TransferSummary::one_skipped()),
+            };
             fs::create_dir_all(&destination_root)?;
             return download_remote_dir_to_local_path(
                 session,
@@ -229,7 +263,11 @@ pub fn download_remote_to_local(
         }
 
         // 符号链接 / 设备文件等不支持的类型：计为跳过而非静默丢弃，避免 Move 误删源。
-        log::warn!("跳过不支持的远程文件类型 ({:?}): {}", metadata.kind, remote_path);
+        log::warn!(
+            "跳过不支持的远程文件类型 ({:?}): {}",
+            metadata.kind,
+            remote_path
+        );
         Ok(TransferSummary::one_skipped())
     })
 }
@@ -262,7 +300,11 @@ pub fn download_remote_dir_to_local_path(
         if entry.kind == RemoteFileKind::File {
             match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
                 Some(path) => summary.merge(download_remote_file_to_local_path(
-                    session, &entry.path, &path, cancelled, progress,
+                    session,
+                    &entry.path,
+                    &path,
+                    cancelled,
+                    progress,
                 )?),
                 None => summary.merge(TransferSummary::one_skipped()),
             }

@@ -248,7 +248,10 @@ pub fn acquire_lease(
 }
 
 fn remote_key_alive(session: &mut BlockingSftpSession, remote_key_path: &str) -> bool {
-    let cmd = format!("test -f '{}' && echo ok", shell_single_quote(remote_key_path));
+    let cmd = format!(
+        "test -f '{}' && echo ok",
+        shell_single_quote(remote_key_path)
+    );
     matches!(
         session.execute_command(&cmd, 5),
         Ok(r) if r.success() && r.stdout.trim() == "ok"
@@ -371,4 +374,3 @@ fn create_lease(
         source_config: source_config.clone(),
     })
 }
-
