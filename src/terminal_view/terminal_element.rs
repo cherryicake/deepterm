@@ -640,11 +640,26 @@ impl TerminalElement {
         cells: &[IndexedCell],
         terminal_theme: &TerminalTheme,
     ) -> Vec<BackgroundSpan> {
+        Self::background_spans_for_range(row_idx, cells, (0, usize::MAX), terminal_theme)
+    }
+
+    fn background_spans_for_range(
+        row_idx: usize,
+        cells: &[IndexedCell],
+        range: (usize, usize),
+        terminal_theme: &TerminalTheme,
+    ) -> Vec<BackgroundSpan> {
+        let (left, right) = range;
         let mut backgrounds = Vec::new();
         let mut current_span: Option<BackgroundSpan> = None;
+
         for cell in cells {
-            let (_, bg) = rendered_cell_colors(&cell.cell);
             let col = cell.point.column.0;
+            if col < left || col > right {
+                continue;
+            }
+
+            let (_, bg) = rendered_cell_colors(&cell.cell);
             let color = if bg
                 == &alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -684,18 +699,92 @@ impl TerminalElement {
                 (None, None) => {}
             }
         }
+
         if let Some(span) = current_span {
             backgrounds.push(span);
         }
         backgrounds
     }
 
-    fn update_background_spans_in_row(
+    fn merge_background_spans(spans: &mut Vec<BackgroundSpan>) {
+        spans.sort_by_key(|span| span.start_col);
+
+        let mut merged: Vec<BackgroundSpan> = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            if span.width == 0 {
+                continue;
+            }
+
+            if let Some(last) = merged.last_mut() {
+                if last.row == span.row
+                    && last.color == span.color
+                    && last.start_col + last.width == span.start_col
+                {
+                    last.width += span.width;
+                    continue;
+                }
+            }
+
+            merged.push(span);
+        }
+
+        *spans = merged;
+    }
+
+    fn split_cached_background_spans(
+        cached_spans: &[BackgroundSpan],
+        range: (usize, usize),
+    ) -> Vec<BackgroundSpan> {
+        let (left, right) = range;
+        let mut backgrounds = Vec::new();
+
+        for span in cached_spans {
+            let span_left = span.start_col;
+            let span_right = span.start_col + span.width.saturating_sub(1);
+
+            if span_right < left || span_left > right {
+                backgrounds.push(span.clone());
+                continue;
+            }
+
+            if span_left < left {
+                backgrounds.push(BackgroundSpan {
+                    start_col: span_left,
+                    row: span.row,
+                    width: left - span_left,
+                    color: span.color,
+                });
+            }
+
+            if span_right > right {
+                backgrounds.push(BackgroundSpan {
+                    start_col: right + 1,
+                    row: span.row,
+                    width: span_right - right,
+                    color: span.color,
+                });
+            }
+        }
+
+        backgrounds
+    }
+
+    fn update_background_spans_in_range(
         row_idx: usize,
+        cached_spans: &[BackgroundSpan],
         cells: &[IndexedCell],
+        range: (usize, usize),
         terminal_theme: &TerminalTheme,
     ) -> Vec<BackgroundSpan> {
-        Self::background_spans_for_row(row_idx, cells, terminal_theme)
+        let mut backgrounds = Self::split_cached_background_spans(cached_spans, range);
+        backgrounds.extend(Self::background_spans_for_range(
+            row_idx,
+            cells,
+            range,
+            terminal_theme,
+        ));
+        Self::merge_background_spans(&mut backgrounds);
+        backgrounds
     }
 
     fn box_cells_for_row(
@@ -1236,12 +1325,27 @@ impl Element for TerminalElement {
                     }
                     row_cache.background_spans = Some(backgrounds);
                 } else if is_dirty {
-                    let backgrounds =
-                        Self::update_background_spans_in_row(row_idx, row_cells, &terminal_theme);
-                    if rebuild_flattened_cache {
-                        background_spans.extend_from_slice(&backgrounds);
+                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
+                        let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
+                        let backgrounds = Self::update_background_spans_in_range(
+                            row_idx,
+                            cached_backgrounds,
+                            row_cells,
+                            range,
+                            &terminal_theme,
+                        );
+                        if rebuild_flattened_cache {
+                            background_spans.extend_from_slice(&backgrounds);
+                        }
+                        row_cache.background_spans = Some(backgrounds);
+                    } else {
+                        let backgrounds =
+                            Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                        if rebuild_flattened_cache {
+                            background_spans.extend_from_slice(&backgrounds);
+                        }
+                        row_cache.background_spans = Some(backgrounds);
                     }
-                    row_cache.background_spans = Some(backgrounds);
                 } else if rebuild_flattened_cache {
                     let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
                     background_spans.extend_from_slice(cached_backgrounds);
@@ -1729,5 +1833,87 @@ mod tests {
     fn cursor_thickness_matches_alacritty_scaling() {
         assert_eq!(cursor_thickness(px(9.0)), px(1.0));
         assert_eq!(cursor_thickness(px(20.0)), px(3.0));
+    }
+
+    fn test_color(l: f32) -> Hsla {
+        Hsla {
+            h: 0.0,
+            s: 0.0,
+            l,
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn merge_background_spans_combines_adjacent_same_color() {
+        let color = test_color(0.4);
+        let mut spans = vec![
+            BackgroundSpan {
+                start_col: 4,
+                row: 0,
+                width: 2,
+                color,
+            },
+            BackgroundSpan {
+                start_col: 0,
+                row: 0,
+                width: 4,
+                color,
+            },
+        ];
+
+        TerminalElement::merge_background_spans(&mut spans);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start_col, 0);
+        assert_eq!(spans[0].width, 6);
+        assert_eq!(spans[0].color, color);
+    }
+
+    #[test]
+    fn merge_background_spans_keeps_gaps_between_same_color_spans() {
+        let color = test_color(0.4);
+        let mut spans = vec![
+            BackgroundSpan {
+                start_col: 0,
+                row: 0,
+                width: 2,
+                color,
+            },
+            BackgroundSpan {
+                start_col: 4,
+                row: 0,
+                width: 2,
+                color,
+            },
+        ];
+
+        TerminalElement::merge_background_spans(&mut spans);
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].start_col, 0);
+        assert_eq!(spans[0].width, 2);
+        assert_eq!(spans[1].start_col, 4);
+        assert_eq!(spans[1].width, 2);
+    }
+
+    #[test]
+    fn split_cached_background_spans_removes_dirty_middle() {
+        let color = test_color(0.4);
+        let cached = vec![BackgroundSpan {
+            start_col: 0,
+            row: 0,
+            width: 6,
+            color,
+        }];
+
+        let updated = TerminalElement::split_cached_background_spans(&cached, (2, 3));
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[0].start_col, 0);
+        assert_eq!(updated[0].width, 2);
+        assert_eq!(updated[1].start_col, 4);
+        assert_eq!(updated[1].width, 2);
+        assert!(updated.iter().all(|span| span.color == color));
     }
 }
