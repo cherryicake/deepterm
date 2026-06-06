@@ -1112,6 +1112,9 @@ impl Element for TerminalElement {
         let content_cells = &content.cells;
         let row_ranges = &content.row_ranges;
 
+        #[cfg(debug_assertions)]
+        let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
+
         for row_idx in 0..viewport_lines {
             let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
             let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx) {
@@ -1119,16 +1122,13 @@ impl Element for TerminalElement {
             } else {
                 &[]
             };
-            let hovered_url_cols = {
-                let view = self.view.read(cx);
-                view.hovered_link.as_ref().and_then(|link| {
-                    if link.row == row_idx {
-                        Some((link.start_col, link.end_col))
-                    } else {
-                        None
-                    }
-                })
-            };
+            let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
+                if link.row == row_idx {
+                    Some((link.start_col, link.end_col))
+                } else {
+                    None
+                }
+            });
 
             let row_cache = &mut row_caches[row_idx];
 
@@ -1273,7 +1273,7 @@ impl Element for TerminalElement {
             }
 
             #[cfg(debug_assertions)]
-            {
+            if validate_row_cache {
                 let row_runs = &row_cache.layout.as_ref().unwrap().runs;
                 let row_boxes = row_cache.box_cells.as_ref().unwrap();
                 let row_backgrounds = row_cache.background_spans.as_ref().unwrap();
