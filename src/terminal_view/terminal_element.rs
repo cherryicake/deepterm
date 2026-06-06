@@ -1106,192 +1106,198 @@ impl Element for TerminalElement {
             || has_dirty_rows
             || metrics_changed;
 
-        // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
-        let terminal = self.terminal.read(cx);
-        let content = terminal.last_content();
-        let content_cells = &content.cells;
-        let row_ranges = &content.row_ranges;
+        if rebuild_flattened_cache {
+            // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
+            let terminal = self.terminal.read(cx);
+            let content = terminal.last_content();
+            let content_cells = &content.cells;
+            let row_ranges = &content.row_ranges;
 
-        #[cfg(debug_assertions)]
-        let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
+            #[cfg(debug_assertions)]
+            let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
 
-        for row_idx in 0..viewport_lines {
-            let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
-            let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx) {
-                &content_cells[*start..*end]
-            } else {
-                &[]
-            };
-            let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
-                if link.row == row_idx {
-                    Some((link.start_col, link.end_col))
-                } else {
-                    None
-                }
-            });
-
-            let row_cache = &mut row_caches[row_idx];
-
-            // Invalidate cached layout when the hovered URL range on this row changes,
-            // so that underline styles are recomputed even if terminal content is clean.
-            if row_cache.hovered_url_cols != hovered_url_cols {
-                row_cache.layout = None;
-                row_cache.hovered_url_cols = hovered_url_cols;
-            }
-
-            if is_dirty || row_cache.layout.is_none() {
-                dirty_count += 1;
-                let cached_entry = row_cache.layout.clone();
-                let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
-                let entry = if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
-                    if let Some(updated_runs) = Self::try_update_runs_in_range(
-                        row_idx,
-                        &cached_entry.runs,
-                        row_cells,
-                        range,
-                        hovered_url_cols,
-                        window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                    ) {
-                        partial_run_update_count += 1;
-                        let mut entry = cached_entry;
-                        entry.runs = updated_runs;
-                        entry
+            for row_idx in 0..viewport_lines {
+                let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
+                let row_cells: &[IndexedCell] =
+                    if let Some((start, end)) = row_ranges.get(row_idx) {
+                        &content_cells[*start..*end]
                     } else {
-                        Self::layout_row(
-                            row_idx,
-                            row_cells.iter(),
-                            hovered_url_cols,
-                            window,
-                            &text_style,
-                            font_size,
-                            cell_width,
-                            &terminal_theme,
-                        )
+                        &[]
+                    };
+                let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
+                    if link.row == row_idx {
+                        Some((link.start_col, link.end_col))
+                    } else {
+                        None
                     }
-                } else {
-                    Self::layout_row(
-                        row_idx,
-                        row_cells.iter(),
-                        hovered_url_cols,
-                        window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                    )
-                };
-                if rebuild_flattened_cache {
-                    batched_runs.extend_from_slice(&entry.runs);
-                }
-                row_cache.layout = Some(entry);
-            } else {
-                cache_hit_count += 1;
-                if rebuild_flattened_cache {
-                    let cached_entry = row_cache.layout.as_ref().unwrap();
-                    batched_runs.extend_from_slice(&cached_entry.runs);
-                }
-            }
+                });
 
-            if row_cache.box_cells.is_none() {
-                let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
-                if rebuild_flattened_cache {
-                    box_cells.extend_from_slice(&row_boxes);
+                let row_cache = &mut row_caches[row_idx];
+
+                // Invalidate cached layout when the hovered URL range on this row changes,
+                // so that underline styles are recomputed even if terminal content is clean.
+                if row_cache.hovered_url_cols != hovered_url_cols {
+                    row_cache.layout = None;
+                    row_cache.hovered_url_cols = hovered_url_cols;
                 }
-                row_cache.box_cells = Some(row_boxes);
-            } else if is_dirty {
-                if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                    let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
-                    let row_boxes = Self::update_box_cells_in_range(
-                        row_idx,
-                        cached_row_boxes,
-                        row_cells,
-                        range,
-                        &terminal_theme,
-                    );
+
+                if is_dirty || row_cache.layout.is_none() {
+                    dirty_count += 1;
+                    let cached_entry = row_cache.layout.clone();
+                    let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
+                    let entry =
+                        if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
+                            if let Some(updated_runs) = Self::try_update_runs_in_range(
+                                row_idx,
+                                &cached_entry.runs,
+                                row_cells,
+                                range,
+                                hovered_url_cols,
+                                window,
+                                &text_style,
+                                font_size,
+                                cell_width,
+                                &terminal_theme,
+                            ) {
+                                partial_run_update_count += 1;
+                                let mut entry = cached_entry;
+                                entry.runs = updated_runs;
+                                entry
+                            } else {
+                                Self::layout_row(
+                                    row_idx,
+                                    row_cells.iter(),
+                                    hovered_url_cols,
+                                    window,
+                                    &text_style,
+                                    font_size,
+                                    cell_width,
+                                    &terminal_theme,
+                                )
+                            }
+                        } else {
+                            Self::layout_row(
+                                row_idx,
+                                row_cells.iter(),
+                                hovered_url_cols,
+                                window,
+                                &text_style,
+                                font_size,
+                                cell_width,
+                                &terminal_theme,
+                            )
+                        };
+                    if rebuild_flattened_cache {
+                        batched_runs.extend_from_slice(&entry.runs);
+                    }
+                    row_cache.layout = Some(entry);
+                } else {
+                    cache_hit_count += 1;
+                    if rebuild_flattened_cache {
+                        let cached_entry = row_cache.layout.as_ref().unwrap();
+                        batched_runs.extend_from_slice(&cached_entry.runs);
+                    }
+                }
+
+                if row_cache.box_cells.is_none() {
+                    let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
                     if rebuild_flattened_cache {
                         box_cells.extend_from_slice(&row_boxes);
                     }
                     row_cache.box_cells = Some(row_boxes);
+                } else if is_dirty {
+                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
+                        let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
+                        let row_boxes = Self::update_box_cells_in_range(
+                            row_idx,
+                            cached_row_boxes,
+                            row_cells,
+                            range,
+                            &terminal_theme,
+                        );
+                        if rebuild_flattened_cache {
+                            box_cells.extend_from_slice(&row_boxes);
+                        }
+                        row_cache.box_cells = Some(row_boxes);
+                    } else if rebuild_flattened_cache {
+                        let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
+                        box_cells.extend_from_slice(cached_row_boxes);
+                    }
                 } else if rebuild_flattened_cache {
                     let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
                     box_cells.extend_from_slice(cached_row_boxes);
                 }
-            } else if rebuild_flattened_cache {
-                let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
-                box_cells.extend_from_slice(cached_row_boxes);
-            }
 
-            if row_cache.background_spans.is_none() {
-                let backgrounds =
-                    Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
-                if rebuild_flattened_cache {
-                    background_spans.extend_from_slice(&backgrounds);
+                if row_cache.background_spans.is_none() {
+                    let backgrounds =
+                        Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                    if rebuild_flattened_cache {
+                        background_spans.extend_from_slice(&backgrounds);
+                    }
+                    row_cache.background_spans = Some(backgrounds);
+                } else if is_dirty {
+                    let backgrounds =
+                        Self::update_background_spans_in_row(row_idx, row_cells, &terminal_theme);
+                    if rebuild_flattened_cache {
+                        background_spans.extend_from_slice(&backgrounds);
+                    }
+                    row_cache.background_spans = Some(backgrounds);
+                } else if rebuild_flattened_cache {
+                    let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
+                    background_spans.extend_from_slice(cached_backgrounds);
                 }
-                row_cache.background_spans = Some(backgrounds);
-            } else if is_dirty {
-                let backgrounds =
-                    Self::update_background_spans_in_row(row_idx, row_cells, &terminal_theme);
-                if rebuild_flattened_cache {
-                    background_spans.extend_from_slice(&backgrounds);
-                }
-                row_cache.background_spans = Some(backgrounds);
-            } else if rebuild_flattened_cache {
-                let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
-                background_spans.extend_from_slice(cached_backgrounds);
-            }
 
-            if selection_changed || row_cache.selection_cols.is_none() {
-                let selected_cols = Self::selected_cols_for_row(row_cells, &selection_range);
-                if rebuild_flattened_cache {
-                    selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
-                }
-                row_cache.selection_cols = Some(selected_cols);
-            } else if is_dirty {
-                if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                    let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                    let selected_cols = Self::update_selected_cols_in_range(
-                        cached_selected_cols,
-                        row_cells,
-                        range,
-                        &selection_range,
-                    );
+                if selection_changed || row_cache.selection_cols.is_none() {
+                    let selected_cols = Self::selected_cols_for_row(row_cells, &selection_range);
                     if rebuild_flattened_cache {
                         selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
                     }
                     row_cache.selection_cols = Some(selected_cols);
+                } else if is_dirty {
+                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
+                        let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
+                        let selected_cols = Self::update_selected_cols_in_range(
+                            cached_selected_cols,
+                            row_cells,
+                            range,
+                            &selection_range,
+                        );
+                        if rebuild_flattened_cache {
+                            selection_cells
+                                .extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                        }
+                        row_cache.selection_cols = Some(selected_cols);
+                    } else if rebuild_flattened_cache {
+                        let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
+                        selection_cells
+                            .extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
+                    }
                 } else if rebuild_flattened_cache {
                     let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
                     selection_cells.extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
                 }
-            } else if rebuild_flattened_cache {
-                let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                selection_cells.extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
-            }
 
-            #[cfg(debug_assertions)]
-            if validate_row_cache {
-                let row_runs = &row_cache.layout.as_ref().unwrap().runs;
-                let row_boxes = row_cache.box_cells.as_ref().unwrap();
-                let row_backgrounds = row_cache.background_spans.as_ref().unwrap();
-                let row_selection_cols = row_cache.selection_cols.as_ref().unwrap();
-                Self::assert_row_consistency(
-                    row_idx,
-                    row_cells,
-                    row_runs,
-                    row_boxes,
-                    row_backgrounds,
-                    row_selection_cols,
-                    window,
-                    &text_style,
-                    font_size,
-                    cell_width,
-                    &terminal_theme,
-                    &selection_range,
-                );
+                #[cfg(debug_assertions)]
+                if validate_row_cache {
+                    let row_runs = &row_cache.layout.as_ref().unwrap().runs;
+                    let row_boxes = row_cache.box_cells.as_ref().unwrap();
+                    let row_backgrounds = row_cache.background_spans.as_ref().unwrap();
+                    let row_selection_cols = row_cache.selection_cols.as_ref().unwrap();
+                    Self::assert_row_consistency(
+                        row_idx,
+                        row_cells,
+                        row_runs,
+                        row_boxes,
+                        row_backgrounds,
+                        row_selection_cols,
+                        window,
+                        &text_style,
+                        font_size,
+                        cell_width,
+                        &terminal_theme,
+                        &selection_range,
+                    );
+                }
             }
         }
 
