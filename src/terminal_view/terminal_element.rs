@@ -1308,9 +1308,13 @@ impl Element for TerminalElement {
                             box_cells.extend_from_slice(&row_boxes);
                         }
                         row_cache.box_cells = Some(row_boxes);
-                    } else if rebuild_flattened_cache {
-                        let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
-                        box_cells.extend_from_slice(cached_row_boxes);
+                    } else {
+                        let row_boxes =
+                            Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
+                        if rebuild_flattened_cache {
+                            box_cells.extend_from_slice(&row_boxes);
+                        }
+                        row_cache.box_cells = Some(row_boxes);
                     }
                 } else if rebuild_flattened_cache {
                     let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
@@ -1371,10 +1375,14 @@ impl Element for TerminalElement {
                                 .extend(selected_cols.iter().map(|col| (row_idx, *col)));
                         }
                         row_cache.selection_cols = Some(selected_cols);
-                    } else if rebuild_flattened_cache {
-                        let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                        selection_cells
-                            .extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
+                    } else {
+                        let selected_cols =
+                            Self::selected_cols_for_row(row_cells, &selection_range);
+                        if rebuild_flattened_cache {
+                            selection_cells
+                                .extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                        }
+                        row_cache.selection_cols = Some(selected_cols);
                     }
                 } else if rebuild_flattened_cache {
                     let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
