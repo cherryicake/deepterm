@@ -1344,33 +1344,61 @@ impl Terminal {
         }
     }
 
-    fn update_last_content(&mut self) {
+    fn mark_viewport_fully_dirty(
+        dirty_rows: &mut Vec<bool>,
+        dirty_row_bounds: &mut Vec<Option<(usize, usize)>>,
+        num_rows: usize,
+        num_cols: usize,
+    ) {
+        dirty_rows.clear();
+        dirty_rows.resize(num_rows, true);
+        dirty_row_bounds.clear();
+        if num_cols == 0 {
+            dirty_row_bounds.resize(num_rows, None);
+        } else {
+            dirty_row_bounds.resize(num_rows, Some((0, num_cols.saturating_sub(1))));
+        }
+    }
+
+    fn update_last_content(&mut self, force_full_damage: bool) {
         let mut term = self.term.lock();
 
         // Collect damage info while we hold the lock, before resetting.
         let num_rows = self.terminal_bounds.num_lines();
         let num_cols = self.terminal_bounds.num_columns();
-        let damage = term.damage();
-        self.dirty_rows.clear();
-        self.dirty_row_bounds.clear();
-        match damage {
-            TermDamage::Full => {
-                self.dirty_rows.resize(num_rows, true);
-                if num_cols == 0 {
-                    self.dirty_row_bounds.resize(num_rows, None);
-                } else {
-                    self.dirty_row_bounds
-                        .resize(num_rows, Some((0, num_cols.saturating_sub(1))));
+        if force_full_damage {
+            // 在重置前先消费掉待处理的 damage，这样即使我们将强制进行
+            // 全量失效，内部的 damage 追踪器状态也能保持一致。
+            let _ = term.damage();
+            Self::mark_viewport_fully_dirty(
+                &mut self.dirty_rows,
+                &mut self.dirty_row_bounds,
+                num_rows,
+                num_cols,
+            );
+        } else {
+            let damage = term.damage();
+            self.dirty_rows.clear();
+            self.dirty_row_bounds.clear();
+            match damage {
+                TermDamage::Full => {
+                    Self::mark_viewport_fully_dirty(
+                        &mut self.dirty_rows,
+                        &mut self.dirty_row_bounds,
+                        num_rows,
+                        num_cols,
+                    );
                 }
-            }
-            TermDamage::Partial(iter) => {
-                self.dirty_rows.resize(num_rows, false);
-                self.dirty_row_bounds.resize(num_rows, None);
-                for line_damage in iter {
-                    let row = line_damage.line;
-                    if row < num_rows {
-                        self.dirty_rows[row] = true;
-                        self.dirty_row_bounds[row] = Some((line_damage.left, line_damage.right));
+                TermDamage::Partial(iter) => {
+                    self.dirty_rows.resize(num_rows, false);
+                    self.dirty_row_bounds.resize(num_rows, None);
+                    for line_damage in iter {
+                        let row = line_damage.line;
+                        if row < num_rows {
+                            self.dirty_rows[row] = true;
+                            self.dirty_row_bounds[row] =
+                                Some((line_damage.left, line_damage.right));
+                        }
                     }
                 }
             }
@@ -1430,7 +1458,7 @@ impl Terminal {
 
     pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         if self.content_dirty {
-            self.update_last_content();
+            self.update_last_content(false);
             self.content_dirty = false;
         } else {
             // Nothing changed this frame – tell the element all rows are clean.
@@ -1462,7 +1490,7 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
+    pub fn resize(&mut self, bounds: TerminalBounds, _cx: &mut Context<Self>) {
         let previous_cols = self.terminal_bounds.num_columns();
         let previous_rows = self.terminal_bounds.num_lines();
         let cols = bounds.num_columns();
@@ -1498,8 +1526,10 @@ impl Terminal {
         term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
 
         drop(term);
-        self.update_last_content();
-        cx.emit(Event::Wakeup);
+        // Alacritty does not mark resize as full damage. Treat the new grid as
+        // a full renderer invalidation so stale row caches never survive a wrap
+        // or viewport-size change.
+        self.update_last_content(true);
     }
 
     pub fn last_content(&self) -> &TerminalContent {

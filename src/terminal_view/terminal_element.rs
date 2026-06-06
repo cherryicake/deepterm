@@ -1071,8 +1071,21 @@ impl Element for TerminalElement {
                 }
             });
 
-        // Grow or shrink caches to match the current viewport height.
+        let metrics_signature = RenderMetricsSignature {
+            font_size,
+            line_height,
+            cell_width,
+            viewport_lines,
+            viewport_cols: terminal_bounds.num_columns(),
+        };
+        let metrics_changed = cached_flattened.metrics != Some(metrics_signature);
+
+        // Match Ghostty's grid-size-diff behavior: when the grid or text metrics
+        // change, row-local shaped text and span caches are no longer valid.
         let cache_resized = row_caches.len() != viewport_lines;
+        if metrics_changed {
+            row_caches.clear();
+        }
         row_caches.resize_with(viewport_lines, RowRenderCache::default);
 
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
@@ -1083,13 +1096,6 @@ impl Element for TerminalElement {
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
         let has_dirty_rows = dirty_rows.iter().any(|dirty| *dirty);
-        let metrics_signature = RenderMetricsSignature {
-            font_size,
-            line_height,
-            cell_width,
-            viewport_lines,
-            viewport_cols: terminal_bounds.num_columns(),
-        };
         let hovered_link = self.view.read(cx).hovered_link.clone();
         let hovered_link_changed = cached_flattened.hovered_link != hovered_link;
 
@@ -1098,8 +1104,7 @@ impl Element for TerminalElement {
             || selection_changed
             || hovered_link_changed
             || has_dirty_rows
-            || cached_flattened.metrics != Some(metrics_signature)
-            || cached_flattened.runs.is_empty();
+            || metrics_changed;
 
         // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
         let terminal = self.terminal.read(cx);
