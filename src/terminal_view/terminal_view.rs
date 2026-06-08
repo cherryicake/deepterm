@@ -801,11 +801,17 @@ impl TerminalView {
                     }
                 })
                 .unwrap_or_default();
-            return match (process, cwd.is_empty()) {
-                (Some(proc), false) => format!("{} - {}: {}", host, proc, cwd),
-                (Some(proc), true) => format!("{} - {}", host, proc),
-                (None, false) => format!("{} - {}", host, cwd),
-                (None, true) => host,
+            let mut parts = Vec::with_capacity(2);
+            if let Some(proc) = process {
+                parts.push(proc.to_string());
+            }
+            if !cwd.is_empty() {
+                parts.push(cwd);
+            }
+            return if parts.is_empty() {
+                host
+            } else {
+                format!("{} - {}", host, parts.join(": "))
             };
         }
 

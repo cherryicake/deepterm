@@ -385,8 +385,6 @@ pub struct Terminal {
     reported_working_directory: Option<String>,
     /// 检测到的远程操作系统
     pub remote_os: Option<RemoteOS>,
-    /// 远程 shell 名称（如 "bash"、"zsh"）
-    remote_shell_name: Option<String>,
     /// 远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 上报）
     remote_process_name: Option<String>,
     window_title: Option<String>,
@@ -506,7 +504,6 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os,
-                remote_shell_name: None,
                 remote_process_name: None,
                 window_title: None,
                 sender: Some(notifier),
@@ -631,7 +628,6 @@ impl Terminal {
             remote_shell_ready: false,
             reported_working_directory: None,
             remote_os: None,
-            remote_shell_name: None,
             remote_process_name: None,
             window_title: None,
             sender: None,
@@ -708,7 +704,6 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
-                remote_shell_name: None,
                 remote_process_name: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
@@ -920,7 +915,6 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
-                remote_shell_name: None,
                 remote_process_name: None,
                 window_title: None,
                 sender: None,

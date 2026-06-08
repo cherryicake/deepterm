@@ -830,12 +830,8 @@ impl Panel {
             .content
             .terminal_view()
             .map(|tv| tv.read(cx).tab_label(cx))
-            .or_else(|| {
-                self.active_tab_label
-                    .as_ref()
-                    .map(|s| s.to_string())
-                    .or_else(|| self.active_tab_id.as_ref().map(|s| s.to_string()))
-            })
+            .or_else(|| self.active_tab_label.as_ref().map(|s| s.to_string()))
+            .or_else(|| self.active_tab_id.as_ref().map(|s| s.to_string()))
             .unwrap_or_else(|| self.panel_id.clone());
 
         let panel_id = self.panel_id.clone();
