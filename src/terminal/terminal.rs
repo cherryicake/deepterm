@@ -385,6 +385,10 @@ pub struct Terminal {
     reported_working_directory: Option<String>,
     /// 检测到的远程操作系统
     pub remote_os: Option<RemoteOS>,
+    /// 远程 shell 名称（如 "bash"、"zsh"）
+    remote_shell_name: Option<String>,
+    /// 远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 上报）
+    remote_process_name: Option<String>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器
     sender: Option<EventLoopSender>,
@@ -502,6 +506,8 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os,
+                remote_shell_name: None,
+                remote_process_name: None,
                 window_title: None,
                 sender: Some(notifier),
                 last_content: TerminalContent::default(),
@@ -625,6 +631,8 @@ impl Terminal {
             remote_shell_ready: false,
             reported_working_directory: None,
             remote_os: None,
+            remote_shell_name: None,
+            remote_process_name: None,
             window_title: None,
             sender: None,
             last_content: TerminalContent::default(),
@@ -700,6 +708,8 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
+                remote_shell_name: None,
+                remote_process_name: None,
                 window_title: None,
                 sender: None, // 远程终端不使用本地 sender
                 last_content: TerminalContent::default(),
@@ -910,6 +920,8 @@ impl Terminal {
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
+                remote_shell_name: None,
+                remote_process_name: None,
                 window_title: None,
                 sender: None,
                 last_content: TerminalContent::default(),
@@ -992,6 +1004,11 @@ impl Terminal {
             .as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .and_then(|n| n.to_str())
+    }
+
+    /// 获取远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 1337;Proc= 上报）。
+    pub fn remote_process_name(&self) -> Option<&str> {
+        self.remote_process_name.as_deref()
     }
 
     /// 获取当前 TTY 前台进程的名称（本地终端）。
@@ -1191,6 +1208,13 @@ impl Terminal {
             return true;
         }
 
+        if let Some(proc) = Self::parse_remote_process_osc(osc_content) {
+            if self.remote_process_name.as_deref() != Some(proc.as_str()) {
+                self.remote_process_name = Some(proc);
+            }
+            return true;
+        }
+
         if let Some(os) = Self::parse_remote_os_osc(osc_content) {
             self.remote_os = Some(os);
             return true;
@@ -1224,6 +1248,16 @@ impl Terminal {
         }
 
         None
+    }
+
+    fn parse_remote_process_osc(osc_content: &[u8]) -> Option<String> {
+        let content = std::str::from_utf8(osc_content).ok()?.trim();
+        let proc = content.strip_prefix("1337;Proc=")?;
+        let proc = proc.trim();
+        if proc.is_empty() {
+            return None;
+        }
+        Some(proc.to_string())
     }
 
     fn parse_remote_os_osc(osc_content: &[u8]) -> Option<RemoteOS> {

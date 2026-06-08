@@ -177,6 +177,10 @@ function __deepterm_precmd() {
     builtin printf "\e]133;D;%s;aid=%s\a" "$ret" "$BASHPID"
   fi
 
+  # Report shell name as process name when returning to prompt
+  builtin local __deepterm_shell_name="${SHELL:-/bin/bash}"
+  builtin printf "\e]1337;Proc=%s\a" "${__deepterm_shell_name##*/}"
+
   # Fresh line and start of prompt. When ble.sh is active, emit 133;P instead
   # of 133;A because ble.sh maintains its own cursor position tracking. 133;A's
   # cursor movement (CR+LF when not at column 0) is invisible to ble.sh and
@@ -204,6 +208,12 @@ function __deepterm_preexec() {
 
   PS1="$_DEEPTERM_SAVE_PS1"
   PS2="$_DEEPTERM_SAVE_PS2"
+
+  # Report foreground process name to terminal (first token of command)
+  builtin local proc="${cmd%% *}"
+  if [[ -n "$proc" ]]; then
+    builtin printf "\e]1337;Proc=%s\a" "$proc"
+  fi
 
   # Title (current command)
   if [[ -n $cmd && "$DEEPTERM_SHELL_FEATURES" == *"title"* ]]; then

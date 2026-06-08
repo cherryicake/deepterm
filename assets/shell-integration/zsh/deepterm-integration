@@ -121,6 +121,10 @@ _deepterm_deferred_init() {
             fi
         fi
 
+        # Report shell name as process name when returning to prompt
+        builtin local -r __deepterm_shell_name="${SHELL:-/bin/zsh}"
+        builtin print -rnu $_deepterm_fd $'\e]1337;Proc='"${__deepterm_shell_name##*/}"$'\a'
+
         builtin local mark1=$'%{\e]133;A;cl=line\a%}'
         if [[ -o prompt_percent ]]; then
             builtin typeset -g precmd_functions
@@ -219,6 +223,12 @@ _deepterm_deferred_init() {
         if [[ -n ${_deepterm_saved_ps1+x} && $PS1 == $_deepterm_marked_ps1 ]]; then
             PS1=$_deepterm_saved_ps1
             PS2=$_deepterm_saved_ps2
+        fi
+
+        # Report foreground process name to terminal (first token of command)
+        builtin local -r proc="${1%% *}"
+        if [[ -n "$proc" ]]; then
+            builtin print -rnu $_deepterm_fd $'\e]1337;Proc='"$proc"$'\a'
         fi
 
         # This will work incorrectly in the presence of a preexec hook that

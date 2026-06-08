@@ -783,13 +783,14 @@ impl TerminalView {
     pub fn tab_label(&self, cx: &App) -> String {
         let term = self.terminal.read(cx);
 
-        // 远程终端：HostName - ~/cwd
+        // 远程终端：HostName - process: ~/cwd
         if term.is_remote() {
             let host = self
                 .ssh_config
                 .as_ref()
                 .map(|c| c.nickname.clone().unwrap_or_else(|| c.host.clone()))
                 .unwrap_or_else(|| self.title().to_string());
+            let process = term.remote_process_name();
             let cwd = self
                 .current_remote_working_directory(cx)
                 .map(|p| {
@@ -800,10 +801,11 @@ impl TerminalView {
                     }
                 })
                 .unwrap_or_default();
-            return if cwd.is_empty() {
-                host
-            } else {
-                format!("{} - {}", host, cwd)
+            return match (process, cwd.is_empty()) {
+                (Some(proc), false) => format!("{} - {}: {}", host, proc, cwd),
+                (Some(proc), true) => format!("{} - {}", host, proc),
+                (None, false) => format!("{} - {}", host, cwd),
+                (None, true) => host,
             };
         }
 
