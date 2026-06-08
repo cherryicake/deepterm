@@ -1091,8 +1091,13 @@ impl Terminal {
         osc_content: &[u8],
         require_local_osc7_host: bool,
     ) -> bool {
-        if Self::is_shell_prompt_osc(osc_content) {
+        if Self::matches_osc_prefix(osc_content, "133;A") {
             self.remote_shell_ready = true;
+            return true;
+        }
+
+        if Self::matches_osc_prefix(osc_content, "133;C") {
+            self.remote_shell_ready = false;
             return true;
         }
 
@@ -1118,11 +1123,10 @@ impl Terminal {
         false
     }
 
-    fn is_shell_prompt_osc(osc_content: &[u8]) -> bool {
+    fn matches_osc_prefix(osc_content: &[u8], prefix: &str) -> bool {
         std::str::from_utf8(osc_content)
             .ok()
-            .map(|s| s.trim())
-            .is_some_and(|s| s.starts_with("133;A"))
+            .is_some_and(|s| s.trim().starts_with(prefix))
     }
 
     fn parse_working_directory_osc(
