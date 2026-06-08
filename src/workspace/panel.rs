@@ -97,6 +97,11 @@ pub enum PanelEvent {
     /// 广播状态切换事件
     BroadcastToggle { panel_id: String },
     SessionChanged,
+    /// Tab 标签变更事件（由终端工作目录/前台进程变化触发）
+    TabLabelChanged {
+        panel_id: String,
+        label: String,
+    },
 }
 
 /// Panel content type
@@ -112,6 +117,15 @@ pub enum PanelContent {
     RemoteFileBrowser(Entity<RemoteFileBrowserView>),
     /// Editor panel
     Editor(Entity<InputState>),
+}
+
+impl PanelContent {
+    pub fn terminal_view(&self) -> Option<&Entity<TerminalView>> {
+        match self {
+            PanelContent::Terminal(tv) => Some(tv),
+            _ => None,
+        }
+    }
 }
 
 /// A panel within the workspace that displays terminal or other content.
@@ -274,8 +288,16 @@ impl Panel {
                         ssh_config_id: this.ssh_config_id.clone(),
                     });
                 }
-                TerminalViewEvent::WorkingDirectoryChanged => {
-                    cx.emit(PanelEvent::SessionChanged);
+                TerminalViewEvent::WorkingDirectoryChanged | TerminalViewEvent::TitleChanged => {
+                    let label = view.read(cx).tab_label(cx);
+                    cx.emit(PanelEvent::TabLabelChanged {
+                        panel_id: close_panel_id.clone(),
+                        label,
+                    });
+                    cx.notify(); // 触发 Panel 标题栏重绘
+                    if matches!(event, TerminalViewEvent::WorkingDirectoryChanged) {
+                        cx.emit(PanelEvent::SessionChanged);
+                    }
                 }
             },
         )
@@ -786,13 +808,12 @@ impl Panel {
                     .into();
             }
 
-            let title = terminal_view.title().to_string();
-            if !title.trim().is_empty() && title != "Terminal" {
-                return title.into();
+            let label = terminal_view.tab_label(cx);
+            if !label.is_empty() && label != "Terminal" {
+                return label.into();
             }
 
-            // 本地终端内部默认标题可能只是 Terminal，而应用层标签使用 Local Terminal。
-            // 拖出 Workspace 时按应用层语义恢复，避免新标签出现过于泛化的标题。
+            // 本地终端内部默认标题可能只是 Terminal，按应用层语义恢复。
             return "Local Terminal".into();
         }
 
@@ -804,12 +825,17 @@ impl Panel {
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        // 使用Tab标签名作为标题，如果没有则使用Tab ID，最后使用Panel ID
+        // 如果包含 TerminalView，使用其动态标签（实时反映 shell/cwd/进程）
         let title = self
-            .active_tab_label
-            .as_ref()
-            .map(|s| s.to_string())
-            .or_else(|| self.active_tab_id.as_ref().map(|s| s.to_string()))
+            .content
+            .terminal_view()
+            .map(|tv| tv.read(cx).tab_label(cx))
+            .or_else(|| {
+                self.active_tab_label
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .or_else(|| self.active_tab_id.as_ref().map(|s| s.to_string()))
+            })
             .unwrap_or_else(|| self.panel_id.clone());
 
         let panel_id = self.panel_id.clone();

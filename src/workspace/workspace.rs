@@ -721,6 +721,41 @@ impl Workspace {
             PanelEvent::BroadcastToggle { .. } => {
                 self.handle_broadcast_toggle(cx);
             }
+            PanelEvent::TabLabelChanged { panel_id, label } => {
+                if let Some((tab_id, tab_type)) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
+                    tab_info
+                        .container
+                        .contains_panel(panel_id, cx)
+                        .then_some((tab_id.clone(), tab_info.tab_type.clone()))
+                }) {
+                    // Workspace 类型的 tab 保持 "WorkSpace" 标签不变；
+                    // Panel 标题栏的更新已在 Panel 内部通过 cx.notify() 完成。
+                    if matches!(tab_type, TabType::Normal) {
+                        if let Some(tab_info) = self.tabs.get_mut(&tab_id) {
+                            tab_info.label = label.clone();
+                        }
+                        self.tab_bar.update(cx, |tab_bar, cx| {
+                            let tabs: Vec<TabItem> = tab_bar
+                                .tabs
+                                .iter()
+                                .map(|t| {
+                                    if t.id == tab_id {
+                                        let mut new_tab = TabItem::new(&tab_id, label);
+                                        if let Some(icon) = t.icon {
+                                            new_tab = new_tab.with_icon(Some(icon));
+                                        }
+                                        new_tab
+                                    } else {
+                                        t.clone()
+                                    }
+                                })
+                                .collect();
+                            tab_bar.set_tabs(tabs, cx);
+                        });
+                        cx.emit(WorkspaceEvent::SessionChanged);
+                    }
+                }
+            }
             PanelEvent::SessionChanged => {
                 cx.emit(WorkspaceEvent::SessionChanged);
             }
@@ -1959,20 +1994,29 @@ impl Workspace {
         }
     }
 
+    /// 从 Panel 的 TerminalView 读取初始标签
+    fn terminal_label_from_panel(panel: &Entity<Panel>, cx: &App) -> String {
+        panel
+            .read(cx)
+            .content()
+            .terminal_view()
+            .map(|tv| tv.read(cx).tab_label(cx))
+            .unwrap_or_else(|| "Local Terminal".to_string())
+    }
+
     /// 创建本地终端Tab
     pub fn create_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let label = self.generate_terminal_tab_name();
         let icon = Some(crate::ssh::platform::detect_local_os().icon());
         let panel = cx.new(|cx| {
             Panel::with_terminal(
                 format!("panel-{}", self.next_panel_id),
                 "group-0",
                 Some(format!("tab-{}", self.next_tab_id).into()),
-                Some(label.clone().into()),
+                None,
                 cx,
             )
         });
-
+        let label = Self::terminal_label_from_panel(&panel, cx);
         self.add_terminal_tab(label, panel, icon, window, cx);
     }
 
@@ -1984,7 +2028,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let label = self.generate_terminal_tab_name();
         let icon = if command.to_lowercase().contains("wsl") {
             Some(crate::ssh::platform::detect_wsl_os(command, args).icon())
         } else {
@@ -1995,13 +2038,13 @@ impl Workspace {
                 format!("panel-{}", self.next_panel_id),
                 "group-0",
                 Some(format!("tab-{}", self.next_tab_id).into()),
-                Some(label.clone().into()),
+                None,
                 command,
                 args,
                 cx,
             )
         });
-
+        let label = Self::terminal_label_from_panel(&panel, cx);
         self.add_terminal_tab(label, panel, icon, window, cx);
     }
 
@@ -2084,11 +2127,6 @@ impl Workspace {
         });
 
         cx.emit(WorkspaceEvent::SessionChanged);
-    }
-
-    /// 生成终端类型的Tab名称
-    fn generate_terminal_tab_name(&mut self) -> String {
-        Self::generate_indexed_name("Local Terminal", &mut self.local_terminal_count)
     }
 
     /// 处理关闭tab事件

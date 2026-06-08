@@ -33,6 +33,8 @@ pub enum Event {
     /// 远程操作系统已检测到
     RemoteOsDetected { os: RemoteOS },
     WorkingDirectoryChanged,
+    /// 终端标题变化（可能由前台进程设置）
+    TitleChanged,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -190,6 +192,9 @@ pub struct TerminalView {
     toast_message: Option<String>,
     /// Toast 自动隐藏任务
     toast_hide_task: Option<Task<()>>,
+    // ── Tab label tracking ─────────────────────────────────────────────────
+    /// 上一次计算出的 tab 标签，用于检测是否需要更新
+    last_tab_label: Option<String>,
 }
 
 /// SSH 连接状态检查结果
@@ -365,6 +370,7 @@ impl TerminalView {
                     }
                     TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
                         this.check_remote_os(terminal.clone(), cx);
+                        this.check_tab_label_changed(cx);
                         cx.notify();
                     }
                     TerminalEvent::WorkingDirectoryChanged(cwd) => {
@@ -426,8 +432,10 @@ impl TerminalView {
                 last_scroll_direction: 0,
                 toast_message: None,
                 toast_hide_task: None,
+                last_tab_label: None,
             };
             this.update_title(cx);
+            this.last_tab_label = Some(this.tab_label(cx));
             this
         })
     }
@@ -523,6 +531,7 @@ impl TerminalView {
                             );
                         }
                         this.check_remote_os(terminal.clone(), cx);
+                        this.check_tab_label_changed(cx);
                         cx.notify();
                     }
                     TerminalEvent::WorkingDirectoryChanged(cwd) => {
@@ -585,6 +594,7 @@ impl TerminalView {
                 last_scroll_direction: 0,
                 toast_message: None,
                 toast_hide_task: None,
+                last_tab_label: None,
             };
 
             // 订阅 SshConnectView 的重新连接事件并存储订阅
@@ -592,6 +602,7 @@ impl TerminalView {
                 Some(this.subscribe_ssh_connect_view(&connect_view, cx));
 
             this.update_title(cx);
+            this.last_tab_label = Some(this.tab_label(cx));
             this
         })
     }
@@ -623,6 +634,7 @@ impl TerminalView {
                 .into()
             },
         );
+        cx.emit(Event::TitleChanged);
     }
 
     /// 订阅终端事件（用于重新连接时）
@@ -645,6 +657,7 @@ impl TerminalView {
                             cx,
                         );
                     }
+                    this.check_tab_label_changed(cx);
                     cx.notify();
                 }
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
@@ -761,6 +774,63 @@ impl TerminalView {
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    /// 生成用于 TabBar 的标签文本。
+    /// 格式：
+    /// - shell 在前台时：`shell_name: ~/shortened/cwd`
+    /// - 有前台应用时：`process_name: ~/shortened/cwd`（若 cwd 获取不到则只显示进程名）
+    pub fn tab_label(&self, cx: &App) -> String {
+        let term = self.terminal.read(cx);
+
+        // 远程终端保持现有标题逻辑
+        if term.is_remote() {
+            return self.title().to_string();
+        }
+
+        let process_name = term
+            .foreground_process_name()
+            .or_else(|| term.shell_name().map(|s| s.to_string()));
+
+        // 优先使用缓存的 cwd（OSC 7 / 远程上报），fallback 到进程实时查询
+        let cwd = self
+            .cached_working_directory
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| term.reported_working_directory().map(PathBuf::from))
+            .or_else(|| {
+                term.child_process_id.and_then(
+                    crate::builtin_commands::PathResolver::query_process_working_directory,
+                )
+            })
+            .or_else(|| self.working_directory.clone());
+
+        let cwd_display = cwd.as_ref().and_then(|p| {
+            let path = p.to_string_lossy();
+            let home = dirs::home_dir()?;
+            let home_str = home.to_string_lossy();
+            if path.starts_with(home_str.as_ref()) {
+                Some(format!("~{}", &path[home_str.len()..]))
+            } else {
+                Some(path.to_string())
+            }
+        });
+
+        match (process_name, cwd_display) {
+            (Some(proc), Some(cwd)) => format!("{}: {}", proc, cwd),
+            (Some(proc), None) => proc,
+            (None, Some(cwd)) => cwd,
+            (None, None) => "Local Terminal".to_string(),
+        }
+    }
+
+    /// 检查 tab 标签是否发生变化，只在变化时触发更新。
+    fn check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
+        let current = self.tab_label(cx);
+        if self.last_tab_label.as_deref() != Some(&current) {
+            self.last_tab_label = Some(current);
+            cx.emit(Event::TitleChanged);
+        }
     }
 
     /// 设置广播输入回调

@@ -371,6 +371,8 @@ pub struct Terminal {
     shell_process_group_id: Option<i32>,
     /// 本地 PTY master fd，用来读取当前 TTY 的前台进程组。
     pty_master_fd: Option<i32>,
+    /// 启动时使用的 shell 程序路径（如 "/bin/zsh"），用于生成 tab 标签。
+    shell_program: Option<String>,
     /// 远程 shell 提示符是否已准备好。
     remote_shell_ready: bool,
     /// 终端通过 OSC 7 / CurrentDir 等序列主动上报的工作目录。
@@ -439,6 +441,7 @@ impl Terminal {
         pty_options: tty::Options,
         pty_error_message: String,
         remote_os: Option<RemoteOS>,
+        shell_program: Option<String>,
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
@@ -495,6 +498,7 @@ impl Terminal {
                 child_process_id,
                 shell_process_group_id,
                 pty_master_fd,
+                shell_program,
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os,
@@ -549,6 +553,7 @@ impl Terminal {
 
         let remote_os = Some(detect_local_os());
 
+        let shell_program = default_shell.clone();
         let mut env = crate::terminal::mappings::default_terminal_env();
         let shell = configure_local_shell_integration(default_shell, Vec::new(), &mut env);
 
@@ -562,6 +567,7 @@ impl Terminal {
             },
             "Failed to create PTY".to_string(),
             remote_os,
+            Some(shell_program),
         )
     }
 
@@ -599,6 +605,7 @@ impl Terminal {
             },
             format!("Failed to create PTY for command '{command}'"),
             remote_os,
+            Some(command.to_string()),
         )
     }
 
@@ -614,6 +621,7 @@ impl Terminal {
             child_process_id: None,
             shell_process_group_id: None,
             pty_master_fd: None,
+            shell_program: None,
             remote_shell_ready: false,
             reported_working_directory: None,
             remote_os: None,
@@ -688,6 +696,7 @@ impl Terminal {
                 child_process_id: None,
                 shell_process_group_id: None,
                 pty_master_fd: None,
+                shell_program: None,
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
@@ -897,6 +906,7 @@ impl Terminal {
                 child_process_id: None,
                 shell_process_group_id: None,
                 pty_master_fd: None,
+                shell_program: None,
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
@@ -975,6 +985,72 @@ impl Terminal {
 
     pub fn window_title(&self) -> Option<&str> {
         self.window_title.as_deref()
+    }
+
+    pub fn shell_name(&self) -> Option<&str> {
+        self.shell_program
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+    }
+
+    /// 获取当前 TTY 前台进程的名称（本地终端）。
+    /// 如果前台仍然是 shell 或无法获取，返回 None。
+    pub fn foreground_process_name(&self) -> Option<String> {
+        if self.is_remote() {
+            return None;
+        }
+
+        #[cfg(unix)]
+        {
+            let fd = self.pty_master_fd?;
+            let pgid = unsafe { libc::tcgetpgrp(fd) };
+            if pgid < 0 {
+                return None;
+            }
+            // 前台进程组就是 shell 自己，说明没有前台应用
+            if self.shell_process_group_id == Some(pgid) {
+                return None;
+            }
+            // 获取前台进程组的 leader 进程名
+            Self::process_name_by_pid(pgid as u32)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_name_by_pid(pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        String::from_utf8(out.stdout)
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    } else {
+                        None
+                    }
+                })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None
+        }
     }
 
     pub fn reported_working_directory(&self) -> Option<&str> {
