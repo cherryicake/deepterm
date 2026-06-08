@@ -375,10 +375,15 @@ impl Panel {
         active_tab_id: Option<SharedString>,
         active_tab_label: Option<SharedString>,
         ssh_config: &crate::ssh::SshConnectionConfig,
+        remote_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = TerminalView::new_ssh(cx, ssh_config);
+        let terminal_view = if let Some(cwd) = remote_cwd {
+            TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
+        } else {
+            TerminalView::new_ssh(cx, ssh_config)
+        };
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
@@ -592,6 +597,10 @@ impl Panel {
     /// Returns true if this panel contains a terminal view.
     pub fn has_terminal_content(&self) -> bool {
         matches!(self.content, PanelContent::Terminal(_))
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.ssh_config_id.is_some()
     }
 
     /// Returns a reference to the panel's content.

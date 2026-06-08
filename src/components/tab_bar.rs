@@ -5,13 +5,16 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
     Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun, TextStyle,
-    Window, canvas, div, ease_out_quint, px,
+    Window, actions, canvas, div, ease_out_quint, px, svg, MouseButton,
 };
 
 use crate::assets::Icon;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
-use gpui::svg;
+use crate::components::button::Icon as MenuIcon;
+use crate::components::menu::{ContextMenuExt, PopupMenu};
+
+actions!(tab_context_menu, [CopyTabAddress, DuplicateTab]);
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +148,7 @@ pub struct TabItem {
     pub icon: Option<Icon>,
     pub is_active: bool,
     pub is_modified: bool,
+    pub is_remote: bool,
 }
 
 impl TabItem {
@@ -155,6 +159,7 @@ impl TabItem {
             icon: None,
             is_active: false,
             is_modified: false,
+            is_remote: false,
         }
     }
 
@@ -165,6 +170,11 @@ impl TabItem {
 
     pub fn with_icon(mut self, icon: Option<Icon>) -> Self {
         self.icon = icon;
+        self
+    }
+
+    pub fn with_is_remote(mut self, is_remote: bool) -> Self {
+        self.is_remote = is_remote;
         self
     }
 }
@@ -216,6 +226,14 @@ pub struct TabBar {
     panel_drop_preview: Option<PanelDropPreview>,
     /// 当前悬停的标签 ID
     hovered_tab_id: Option<SharedString>,
+    /// 右键菜单的目标标签 ID
+    context_menu_tab_id: Option<SharedString>,
+    /// 拷贝地址回调
+    on_tab_copy_address:
+        Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    /// 复制标签页回调
+    on_tab_duplicate:
+        Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
 }
 
 impl TabBar {
@@ -244,6 +262,9 @@ impl TabBar {
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
             panel_drop_preview: None,
+            context_menu_tab_id: None,
+            on_tab_copy_address: None,
+            on_tab_duplicate: None,
         })
     }
 
@@ -281,11 +302,14 @@ impl TabBar {
             reorder_animation_epoch: 0,
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
-            panel_drop_preview: None,
-        })
-    }
-
-    pub fn on_tab_click<F>(&mut self, callback: F)
+          panel_drop_preview: None,
+              context_menu_tab_id: None,
+              on_tab_copy_address: None,
+              on_tab_duplicate: None,
+          })
+      }
+  
+      pub fn on_tab_click<F>(&mut self, callback: F)
     where
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
@@ -343,6 +367,22 @@ impl TabBar {
         F: Fn(bool, &mut App) + Send + Sync + 'static,
     {
         self.on_overflow_changed = Some(Rc::new(callback));
+    }
+
+    /// 拷贝地址回调
+    pub fn on_tab_copy_address<F>(&mut self, callback: F)
+    where
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_tab_copy_address = Some(Rc::new(callback));
+    }
+
+    /// 复制标签页回调
+    pub fn on_tab_duplicate<F>(&mut self, callback: F)
+    where
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_tab_duplicate = Some(Rc::new(callback));
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
@@ -711,6 +751,26 @@ impl Render for TabBar {
                     }
                 }
             }))
+            .on_action(cx.listener({
+                let on_tab_copy_address = self.on_tab_copy_address.clone();
+                move |this, _: &CopyTabAddress, window, cx| {
+                    if let Some(ref cb) = on_tab_copy_address {
+                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
+                            cb(tab_id, window, cx);
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener({
+                let on_tab_duplicate = self.on_tab_duplicate.clone();
+                move |this, _: &DuplicateTab, window, cx| {
+                    if let Some(ref cb) = on_tab_duplicate {
+                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
+                            cb(tab_id, window, cx);
+                        }
+                    }
+                }
+            }))
             .child(
                 // 外层容器，用于测量实际可用宽度
                 div()
@@ -900,6 +960,7 @@ impl Render for TabBar {
                                     let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                                     let label = tab.label.clone();
                                     let icon = tab.icon;
+                                    let is_remote = tab.is_remote;
                                     let on_panel_drop_for_tab = on_panel_drop.clone();
                                     let entity = cx.entity();
                                     let start_offset = self.tab_offset_for_preview(
@@ -1128,6 +1189,38 @@ impl Render for TabBar {
                                         }))
                                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener({
+                                                let tab_id = tab_id.clone();
+                                                move |this, _, _, cx| {
+                                                    this.context_menu_tab_id = Some(tab_id.clone());
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )
+                                        .context_menu({
+                                            move |menu: PopupMenu, _window, _cx| {
+                                                let m = if is_remote {
+                                                    menu.menu_with_icon(
+                                                        "拷贝地址",
+                                                        MenuIcon::new(
+                                                            "icons/document.on.document.svg",
+                                                        ),
+                                                        Box::new(CopyTabAddress),
+                                                    )
+                                                } else {
+                                                    menu
+                                                };
+                                                m.menu_with_icon(
+                                                    "复制标签页",
+                                                    MenuIcon::new(
+                                                        "icons/plus.square.on.square.svg",
+                                                    ),
+                                                    Box::new(DuplicateTab),
+                                                )
+                                            }
                                         });
 
                                     let needs_animation =

@@ -19,6 +19,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::terminal_view::TerminalView;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::TransferStatusReporter;
 use crate::file_transfer::{
@@ -31,7 +32,7 @@ use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
-use crate::workspace::session_state::{TabSessionState, TabSessionType, WorkspaceSessionState};
+use crate::workspace::session_state::{TabSessionState, TabSessionType, TerminalSessionState, WorkspaceSessionState};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 // Define workspace actions
@@ -415,6 +416,30 @@ impl Workspace {
             workspace.setup_tab_bar_handlers(cx);
             workspace.subscribe_to_panels(window, cx);
             workspace.switch_to_tab(&active_tab_id, cx);
+
+            // 同步 TabItem 的 is_remote 标记
+            let remote_status: Vec<(String, bool)> = workspace
+                .tabs
+                .iter()
+                .map(|(tab_id, info)| {
+                    let is_remote = info
+                        .container
+                        .get_first_panel()
+                        .map(|p| p.read(cx).is_remote())
+                        .unwrap_or(false);
+                    (tab_id.clone(), is_remote)
+                })
+                .collect();
+            workspace.tab_bar.update(cx, |tab_bar, _cx| {
+                for tab in tab_bar.tabs.iter_mut() {
+                    if let Some((_, is_remote)) =
+                        remote_status.iter().find(|(id, _)| id == tab.id.as_ref())
+                    {
+                        tab.is_remote = *is_remote;
+                    }
+                }
+            });
+
             workspace
         });
 
@@ -575,6 +600,32 @@ impl Workspace {
                     });
                 }
             });
+
+            // 拷贝地址 - 将终端连接地址写入剪贴板
+            tab_bar.on_tab_copy_address({
+                let workspace = workspace.clone();
+                move |tab_id, window, cx| {
+                    let id = tab_id.to_string();
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_copy_address(&id, window, cx);
+                        });
+                    });
+                }
+            });
+
+            // 复制标签页 - 创建新的终端标签页并初始化到相同的工作目录
+            tab_bar.on_tab_duplicate({
+                let workspace = workspace.clone();
+                move |tab_id, window, cx| {
+                    let id = tab_id.to_string();
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_duplicate(&id, window, cx);
+                        });
+                    });
+                }
+            });
         });
     }
 
@@ -669,7 +720,7 @@ impl Workspace {
                                 .iter()
                                 .map(|t| {
                                     if t.id == tab_id {
-                                        TabItem::new(&tab_id, &t.label).with_icon(Some(icon))
+                                        TabItem::new(&tab_id, &t.label).with_icon(Some(icon)).with_is_remote(t.is_remote)
                                     } else {
                                         t.clone()
                                     }
@@ -740,7 +791,7 @@ impl Workspace {
                                 .iter()
                                 .map(|t| {
                                     if t.id == tab_id {
-                                        let mut new_tab = TabItem::new(&tab_id, label);
+                                        let mut new_tab = TabItem::new(&tab_id, label).with_is_remote(t.is_remote);
                                         if let Some(icon) = t.icon {
                                             new_tab = new_tab.with_icon(Some(icon));
                                         }
@@ -1647,7 +1698,7 @@ impl Workspace {
                     .iter()
                     .map(|t| {
                         if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(remaining_icon)
+                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(remaining_icon).with_is_remote(t.is_remote)
                         } else {
                             t.clone()
                         }
@@ -1667,7 +1718,10 @@ impl Workspace {
         self.tabs.insert(new_tab_id.clone(), new_tab_info);
 
         // 添加到TabBar的指定位置，使用拖拽panel自身的icon
-        let new_tab_item = TabItem::new(&new_tab_id, &panel_label).with_icon(dragged_panel.icon);
+        let is_remote = dragged_panel_entity.read(cx).is_remote();
+        let new_tab_item = TabItem::new(&new_tab_id, &panel_label)
+            .with_icon(dragged_panel.icon)
+            .with_is_remote(is_remote);
         self.tab_bar.update(cx, |tab_bar, cx| {
             match insert_index {
                 Some(index) => {
@@ -2074,10 +2128,10 @@ impl Workspace {
                 Some(format!("tab-{}", self.next_tab_id).into()),
                 Some(label.clone().into()),
                 config,
+                None,
                 cx,
             )
         });
-
         self.add_terminal_tab(label, panel, initial_icon, window, cx);
     }
 
@@ -2106,8 +2160,14 @@ impl Workspace {
             TabInfo::new_normal(&tab_id, &label, panel.clone()),
         );
 
+        let is_remote = panel.read(cx).is_remote();
         self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.add_tab(TabItem::new(&tab_id, &label).with_icon(icon), cx)
+            tab_bar.add_tab(
+                TabItem::new(&tab_id, &label)
+                    .with_icon(icon)
+                    .with_is_remote(is_remote),
+                cx,
+            )
         });
 
         let subscription =
@@ -2150,6 +2210,94 @@ impl Workspace {
 
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
+    }
+
+    fn terminal_view_for_tab(
+        &self,
+        tab_id: &str,
+        cx: &App,
+    ) -> Option<Entity<TerminalView>> {
+        let tab_info = self.tabs.get(tab_id)?;
+        let panel = tab_info.container.get_first_panel()?;
+        panel.read(cx).content().terminal_view().cloned()
+    }
+
+    /// 拷贝地址 - 将终端连接地址写入剪贴板
+    fn handle_tab_copy_address(
+        &mut self,
+        tab_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::ClipboardItem;
+
+        let Some(terminal_view) = self.terminal_view_for_tab(tab_id, cx) else {
+            return;
+        };
+
+        let state = terminal_view.read(cx).session_state(cx);
+        match state {
+            TerminalSessionState::Ssh { config, .. } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(config.host.clone()));
+            }
+            TerminalSessionState::Local { cwd, .. } => {
+                if let Some(path) = cwd {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path));
+                }
+            }
+        }
+    }
+
+    /// 复制标签页 - 创建新的终端标签页并初始化到相同的工作目录
+    fn handle_tab_duplicate(
+        &mut self,
+        tab_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_view) = self.terminal_view_for_tab(tab_id, cx) else {
+            return;
+        };
+
+        let state = terminal_view.read(cx).session_state(cx);
+        match state {
+            TerminalSessionState::Ssh {
+                config,
+                remote_cwd,
+            } => {
+                let panel = cx.new(|cx| {
+                    Panel::with_ssh_terminal(
+                        format!("panel-{}", self.next_panel_id),
+                        "group-0",
+                        Some(format!("tab-{}", self.next_tab_id).into()),
+                        Some(config.display_name().into()),
+                        &config,
+                        remote_cwd,
+                        cx,
+                    )
+                });
+                let label = Self::terminal_label_from_panel(&panel, cx);
+                self.add_terminal_tab(label, panel, None, window, cx);
+            }
+            TerminalSessionState::Local { cwd, command, args } => {
+                if let Some(_cmd) = command {
+                    self.create_local_terminal_with_command(&_cmd, &args, window, cx);
+                } else {
+                    let panel = cx.new(|cx| {
+                        Panel::with_terminal_working_directory(
+                            format!("panel-{}", self.next_panel_id),
+                            "group-0",
+                            Some(format!("tab-{}", self.next_tab_id).into()),
+                            None,
+                            cwd.map(std::path::PathBuf::from),
+                            cx,
+                        )
+                    });
+                    let label = Self::terminal_label_from_panel(&panel, cx);
+                    self.add_terminal_tab(label, panel, None, window, cx);
+                }
+            }
+        }
     }
 
     fn start_resize(
