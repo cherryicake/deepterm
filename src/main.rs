@@ -277,16 +277,11 @@ impl AppWindow {
             })
             .collect();
 
-        let active_group_id = session.active_group_id;
-
-        // 恢复 session 时 workspace/title bar 已切到 active group，但侧边栏本身
-        // 不会自动收到用户点击事件。这里显式同步 selected_id，避免重启后出现
-        // 内容区是某个标签页组、侧边栏却高亮“默认标签页组”的错位状态。
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.handle_item_select(&active_group_id);
-            cx.notify();
-        });
-
+        // 侧边栏默认已选中 DEFAULT_TAB_GROUP_ID（MacosSidebar::new 中设置），
+        // 而 workspace 启动时始终是默认标签页组（见 AppWindow::new 中 workspace 的创建逻辑）。
+        // 两者天然对齐，无需用 session.active_group_id 覆盖侧边栏选中项。
+        // 此外自定义标签页组的 workspace 会在用户手动点击时才创建（延迟创建），
+        // 此时用 session.active_group_id 同步侧边栏会导致高亮与实际内容不一致。
         self.sync_sidebar_tab_groups(cx);
     }
 
