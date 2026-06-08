@@ -78,6 +78,7 @@ pub enum Icon {
     PersonBadgeKey,
     Clock,
     FolderOutline,
+    XmarkCircleFill,
 }
 
 impl Icon {
@@ -133,6 +134,7 @@ impl Icon {
             Icon::PersonBadgeKey => SharedString::new_static("icons/person.badge.key.fill.svg"),
             Icon::Clock => SharedString::new_static("icons/clock.svg"),
             Icon::FolderOutline => SharedString::new_static("icons/folder.svg"),
+            Icon::XmarkCircleFill => SharedString::new_static("icons/xmark.circle.fill.svg"),
         }
     }
 }

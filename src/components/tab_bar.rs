@@ -214,6 +214,8 @@ pub struct TabBar {
     tab_list_bounds: Option<Bounds<Pixels>>,
     /// 当前 Panel 拖入 TabBar 的插入预览
     panel_drop_preview: Option<PanelDropPreview>,
+    /// 当前悬停的标签 ID
+    hovered_tab_id: Option<SharedString>,
 }
 
 impl TabBar {
@@ -231,6 +233,7 @@ impl TabBar {
             on_tab_merge: None,
             on_panel_drop: None,
             on_overflow_changed: None,
+            hovered_tab_id: None,
             focus_handle,
             scroll_handle: ScrollHandle::new(),
             last_overflow: Some(false),
@@ -268,6 +271,7 @@ impl TabBar {
             on_tab_merge: None,
             on_panel_drop: None,
             on_overflow_changed: None,
+            hovered_tab_id: None,
             focus_handle,
             scroll_handle: ScrollHandle::new(),
             last_overflow: Some(false),
@@ -896,7 +900,6 @@ impl Render for TabBar {
                                     let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                                     let label = tab.label.clone();
                                     let icon = tab.icon;
-                                    let is_modified = tab.is_modified;
                                     let on_panel_drop_for_tab = on_panel_drop.clone();
                                     let entity = cx.entity();
                                     let start_offset = self.tab_offset_for_preview(
@@ -943,6 +946,17 @@ impl Render for TabBar {
                                                 style
                                             }
                                         })
+                                        .on_hover(cx.listener({
+                                            let tab_id = tab_id.clone();
+                                            move |this, hovered: &bool, _window, cx| {
+                                                if *hovered {
+                                                    this.hovered_tab_id = Some(tab_id.clone());
+                                                } else {
+                                                    this.hovered_tab_id = None;
+                                                }
+                                                cx.notify();
+                                            }
+                                        }))
                                         .on_drag(
                                             DraggedTab {
                                                 tab_id: tab_id.clone(),
@@ -1048,8 +1062,33 @@ impl Render for TabBar {
                                                 }
                                             }
                                         }))
-                                        .when_some(icon, |this, icon| {
-                                            this.child(
+                                        .child({
+                                            let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
+
+                                            if is_hovered && icon.is_some() {
+                                                let on_tab_close = on_tab_close.clone();
+                                                let tab_id_close = tab_id.clone();
+                                                svg()
+                                                    .size(px(16.0))
+                                                    .cursor_pointer()
+                                                    .text_color(if is_active {
+                                                        theme.text
+                                                    } else {
+                                                        theme.text_muted
+                                                    })
+                                                    .path(Icon::XmarkCircleFill.path())
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        cx.listener(
+                                                            move |_this, _event, window, cx| {
+                                                                if let Some(ref callback) = on_tab_close {
+                                                                    callback(tab_id_close.clone(), window, cx);
+                                                                }
+                                                            },
+                                                        ),
+                                                    )
+                                                    .into_any_element()
+                                            } else if let Some(icon) = icon {
                                                 svg()
                                                     .size(px(16.0))
                                                     .text_color(if is_active {
@@ -1057,8 +1096,11 @@ impl Render for TabBar {
                                                     } else {
                                                         theme.text_muted
                                                     })
-                                                    .path(icon.path()),
-                                            )
+                                                    .path(icon.path())
+                                                    .into_any_element()
+                                            } else {
+                                                div().into_any_element()
+                                            }
                                         })
                                         .child(
                                             div()
@@ -1074,38 +1116,6 @@ impl Render for TabBar {
                                                     theme.text_muted
                                                 })
                                                 .child(label),
-                                        )
-                                        .child(
-                                            div()
-                                                .w(px(18.0))
-                                                .h(px(18.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .hover(move |style| {
-                                                    style.bg(theme.error.opacity(0.15))
-                                                })
-                                                .cursor_pointer()
-                                                .text_color(theme.icon_muted)
-                                                .child(if is_modified { "●" } else { "×" })
-                                                .on_mouse_down(
-                                                    gpui::MouseButton::Left,
-                                                    cx.listener({
-                                                        let on_tab_close = on_tab_close.clone();
-                                                        let tab_id = tab_id.clone();
-                                                        move |_this, _, window, cx| {
-                                                            if let Some(ref callback) = on_tab_close
-                                                            {
-                                                                callback(
-                                                                    tab_id.clone(),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            }
-                                                        }
-                                                    }),
-                                                ),
                                         )
                                         .on_click(cx.listener({
                                             let on_tab_click = on_tab_click.clone();
