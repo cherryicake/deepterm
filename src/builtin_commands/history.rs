@@ -111,7 +111,7 @@ impl CommandHistory {
         }
     }
 
-    /// 按整行大小写不敏感子串匹配，按 score 从高到低返回 Top-N。
+    /// 按整行大小写不敏感子串匹配，按最近使用时间从新到旧返回 Top-N。
     ///
     /// `query` 为当前输入的整行（如 `/sc`、`/scp ali`）。空 query 返回最近使用的若干条。
     pub fn matches(&self, query: &str, now: i64) -> Vec<HistoryEntry> {
@@ -130,9 +130,8 @@ impl CommandHistory {
             .collect();
 
         hits.sort_by(|a, b| {
-            b.score(now)
-                .partial_cmp(&a.score(now))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.last_used
+                .cmp(&a.last_used)
         });
         hits.into_iter().take(MAX_MATCHES).cloned().collect()
     }
