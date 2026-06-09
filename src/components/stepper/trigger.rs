@@ -145,7 +145,10 @@ impl RenderOnce for StepperTrigger {
                                 .items_center()
                                 .justify_center()
                                 .child(
-                                    Spinner::new().size(size.spinner_size()).color(theme.accent),
+                                    Spinner::new()
+                                        .size(size.spinner_size())
+                                        .color(theme.accent)
+                                        .path("icons/loader_fade.svg"),
                                 ),
                         )
                     })

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::assets::Icon;
 use gpui::{
-    Animation, AnimationExt as _, App, Hsla, IntoElement, ParentElement, RenderOnce, Styled as _,
-    Transformation, Window, div, ease_in_out, percentage, prelude::FluentBuilder as _,
+    Animation, AnimationExt as _, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString,
+    Styled as _, Transformation, Window, div, ease_in_out, percentage, prelude::FluentBuilder as _,
 };
 
 /// A cycling loading spinner.
@@ -12,6 +12,7 @@ pub struct Spinner {
     size: SpinnerSize,
     speed: Duration,
     color: Option<Hsla>,
+    path: SharedString,
 }
 
 /// Spinner size variants
@@ -42,7 +43,14 @@ impl Spinner {
             size: SpinnerSize::Medium,
             speed: Duration::from_millis(800),
             color: None,
+            path: Icon::Loader.path(),
         }
+    }
+
+    /// Set a custom SVG path for the spinner.
+    pub fn path(mut self, path: impl Into<SharedString>) -> Self {
+        self.path = path.into();
+        self
     }
 
     /// Set the spinner size.
@@ -74,19 +82,20 @@ impl RenderOnce for Spinner {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let size = self.size.px_size();
 
-        // Create an SVG element for the loader icon
-        let icon_path = Icon::Loader.path();
-        let svg_element = gpui::svg()
-            .path(icon_path)
-            .size(size)
-            .when_some(self.color, |this, color| this.text_color(color));
-
         div()
-            .child(svg_element.with_animation(
-                "spinner-rotate",
-                Animation::new(self.speed).repeat().with_easing(ease_in_out),
-                |this, delta| this.with_transformation(Transformation::rotate(percentage(delta))),
-            ))
+            .child(
+                gpui::svg()
+                    .path(self.path)
+                    .size(size)
+                    .when_some(self.color, |this, color| this.text_color(color))
+                    .with_animation(
+                        "spinner-rotate",
+                        Animation::new(self.speed).repeat().with_easing(ease_in_out),
+                        |this, delta| {
+                            this.with_transformation(Transformation::rotate(percentage(delta)))
+                        },
+                    ),
+            )
             .into_element()
     }
 }
