@@ -796,9 +796,13 @@ impl TerminalView {
                 .current_remote_working_directory(cx)
                 .map(|p| {
                     if let Some(user) = username {
-                        let home_prefix = format!("/home/{}/", user);
+                        let home_path = format!("/home/{}", user);
+                        if p == home_path {
+                            return "~".to_string();
+                        }
+                        let home_prefix = format!("{}/", home_path);
                         if let Some(rest) = p.strip_prefix(&home_prefix) {
-                            return format!("~/{}" ,rest);
+                            return format!("~/{}", rest);
                         }
                     }
                     if p == "/home" {
