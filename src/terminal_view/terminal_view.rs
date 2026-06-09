@@ -791,11 +791,18 @@ impl TerminalView {
                 .map(|c| c.nickname.clone().unwrap_or_else(|| c.host.clone()))
                 .unwrap_or_else(|| self.title().to_string());
             let process = term.remote_process_name();
+            let username = self.ssh_config.as_ref().map(|c| c.username.as_str());
             let cwd = self
                 .current_remote_working_directory(cx)
                 .map(|p| {
-                    if p.starts_with("/home/") {
-                        p.replacen("/home/", "~/", 1)
+                    if let Some(user) = username {
+                        let home_prefix = format!("/home/{}/", user);
+                        if let Some(rest) = p.strip_prefix(&home_prefix) {
+                            return format!("~/{}" ,rest);
+                        }
+                    }
+                    if p == "/home" {
+                        "/home".to_string()
                     } else {
                         p
                     }
