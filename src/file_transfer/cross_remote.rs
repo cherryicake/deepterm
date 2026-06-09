@@ -231,7 +231,20 @@ pub fn copy_remote_to_different_remote(
         let direct_paths_are_safe =
             is_safe_for_direct_scp(remote_path) && is_safe_for_direct_scp(&destination_path);
 
-        let strategies = detect_transfer_strategies(source_session, destination_config);
+        const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+        let force_stream = metadata.kind == RemoteFileKind::File && metadata.size < SMALL_FILE_THRESHOLD;
+        if force_stream {
+            log::info!(
+                "文件大小 {:.2} MiB 小于 10MB，跳过直连尝试，直接使用本地中转传输",
+                metadata.size as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        let strategies = if force_stream {
+            vec![RemoteToRemoteStrategy::StreamViaLocal]
+        } else {
+            detect_transfer_strategies(source_session, destination_config)
+        };
 
         let mut tried_labels: Vec<&str> = Vec::new();
         let mut failure_reasons: Vec<String> = Vec::new();
