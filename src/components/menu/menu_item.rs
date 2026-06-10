@@ -92,8 +92,8 @@ impl RenderOnce for MenuItemElement {
             .id(self.id)
             .group(&self.group_name)
             .h(px(22.)) // Fixed height like macOS menu items
-            .pl(px(12.))
-            .pr(px(6.))
+            .pl(px(8.))
+            .pr(px(8.))
             .text_sm()
             .text_color(theme.text)
             .relative()
@@ -101,7 +101,7 @@ impl RenderOnce for MenuItemElement {
             .flex_row()
             .items_center()
             .justify_between()
-            .rounded(px(6.)) // Rounded corners for hover effect
+            .rounded(px(6.)) // Subtle rounded corners for hover effect
             .when_some(self.on_hover, |this, on_hover| {
                 this.on_hover(move |hovered, window, cx| (on_hover)(hovered, window, cx))
             })

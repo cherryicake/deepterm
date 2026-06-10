@@ -1,6 +1,7 @@
 use crate::components::button::button_icon::Sizable;
 use crate::components::button::{Icon, Size};
 use crate::components::menu::menu_item::MenuItemElement;
+
 use crate::theme::ActiveTheme;
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, Entity,
@@ -1005,10 +1006,7 @@ impl PopupMenu {
                     })
                     .disabled(*disabled);
 
-                let mut content = div()
-                    .flex()
-                    .flex_row()
-                    .items_center();
+                let mut content = div().flex().flex_row().items_center();
 
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
@@ -1047,10 +1045,7 @@ impl PopupMenu {
             } => {
                 let this = this.disabled(*disabled);
 
-                let mut content = div()
-                    .flex()
-                    .flex_row()
-                    .items_center();
+                let mut content = div().flex().flex_row().items_center();
 
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
@@ -1113,8 +1108,25 @@ impl Render for PopupMenu {
 
         let max_width = self.max_width();
         let theme = cx.theme().ui;
+        let is_dark = cx.theme().appearance.is_dark();
 
-        // Liquid glass effect: outer shadow + inner highlight border
+        // Theme-aware macOS popup menu colors
+        let menu_bg = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0x2C2C2E))
+        } else {
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF))
+        };
+        let menu_border = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0x48484A))
+        } else {
+            gpui::Hsla::from(gpui::rgb(0xD1D1D6))
+        };
+        let separator_color = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0x48484A))
+        } else {
+            gpui::Hsla::from(gpui::rgb(0xE5E5EA))
+        };
+
         div()
             .id("popup-menu")
             .key_context(CONTEXT)
@@ -1128,18 +1140,16 @@ impl Render for PopupMenu {
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .rounded(px(12.))
             .occlude()
-            // Inner menu container with highlight border
+            // Menu container
             .child(
                 div()
                     .id("menu-container")
-                    .bg(theme.elevated_background)
+                    .bg(menu_bg)
                     .text_color(theme.text)
-                    .border_1()
-                    .border_color(theme.border)
+                    .border(px(0.5))
+                    .border_color(menu_border)
                     .rounded(px(12.))
-                    .py(px(6.))
-                    .pl(px(8.))
-                    .pr(px(4.))
+                    .p(px(6.))
                     .relative()
                     .occlude()
                     .child(
@@ -1147,7 +1157,7 @@ impl Render for PopupMenu {
                             .id("items")
                             .flex()
                             .flex_col()
-                            .gap_y(px(2.))
+                            .gap_y(px(0.))
                             .min_w(rems(10.))
                             .when_some(self.min_width, |this, min_width| this.min_w(min_width))
                             .max_w(max_width)
@@ -1164,18 +1174,16 @@ impl Render for PopupMenu {
                                         !(*ix + 1 == items_count && item.is_separator())
                                     })
                                     .map(|(ix, item)| {
-                                        // Render separator as standalone div, not wrapped in MenuItemElement
                                         if item.is_separator() {
                                             div()
-                                                .h(px(8.))
-                                                .py(px(4.))
+                                                .h(px(9.))
                                                 .flex()
                                                 .items_center()
                                                 .child(
                                                     div()
                                                         .h(px(1.))
-                                                        .mx(px(12.))
-                                                        .bg(theme.border)
+                                                        .mx(px(8.))
+                                                        .bg(separator_color.opacity(0.6))
                                                         .w_full(),
                                                 )
                                                 .into_any_element()
