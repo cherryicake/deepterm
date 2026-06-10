@@ -28,8 +28,8 @@ const BUTTON_TOP: f32 = 12.0;
 const TAB_GROUP_SECTION_TITLE: &str = "标签页组";
 const SIDEBAR_ROW_HEIGHT: f32 = 28.0;
 const SIDEBAR_ROW_GAP: f32 = 2.0;
-const SIDEBAR_ROW_ICON_BOX: f32 = 18.0;
-const SIDEBAR_ROW_ICON: f32 = 14.0;
+const SIDEBAR_ROW_ICON_BOX: f32 = 16.0;
+const SIDEBAR_ROW_ICON: f32 = 16.0;
 const SIDEBAR_ACTION_BOX: f32 = 20.0;
 const CHEVRON_RIGHT_SIZE: f32 = 8.0;
 const CHEVRON_DOWN_SIZE: f32 = 12.0;
@@ -533,12 +533,7 @@ impl MacosSidebar {
         self.notify_app_window(cx);
     }
 
-    fn open_tab_group_menu(
-        &mut self,
-        group_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_tab_group_menu(&mut self, group_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.close_tab_group_menu(cx);
 
         let rename_group_id = group_id.to_string();
@@ -570,12 +565,9 @@ impl MacosSidebar {
             )
         });
 
-        let subscription = cx.subscribe(
-            &menu,
-            move |this, _, _: &gpui::DismissEvent, cx| {
-                this.close_tab_group_menu(cx);
-            },
-        );
+        let subscription = cx.subscribe(&menu, move |this, _, _: &gpui::DismissEvent, cx| {
+            this.close_tab_group_menu(cx);
+        });
 
         self.tab_group_menu_open = true;
         self.tab_group_menu_group_id = Some(group_id.to_string());
@@ -778,7 +770,7 @@ impl MacosSidebar {
             40.0,
             "new-tab-group-btn",
             Icon::PlusSquareOnSquare,
-            16.0,
+            SIDEBAR_ROW_ICON,
             on_create,
         )
     }
@@ -831,7 +823,7 @@ impl MacosSidebar {
                 self.default_tab_group_collapsed,
                 None,
                 false,
-                Icon::Screen,
+                Icon::Macbook,
             ))
             .child(Self::render_collapsible_content(
                 self.render_tab_group_tabs(DEFAULT_TAB_GROUP_ID, &default_tabs, theme),
@@ -962,18 +954,20 @@ impl MacosSidebar {
                     })
                     .child(
                         div()
-                            .w(px(18.0))
-                            .h(px(18.0))
+                            .size(px(SIDEBAR_ROW_ICON_BOX))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(gpui::svg().size(px(14.0)).path(icon.path()).text_color(
-                                if is_selected {
-                                    theme.accent_foreground
-                                } else {
-                                    theme.text_muted
-                                },
-                            )),
+                            .child(
+                                gpui::svg()
+                                    .size(px(SIDEBAR_ROW_ICON))
+                                    .path(icon.path())
+                                    .text_color(if is_selected {
+                                        theme.accent_foreground
+                                    } else {
+                                        theme.text
+                                    }),
+                            ),
                     )
                     .child(
                         div().flex_1().child(
@@ -1163,7 +1157,7 @@ impl MacosSidebar {
         let icon_color = if is_selected {
             theme.accent_foreground
         } else {
-            theme.text_muted
+            theme.text
         };
         let text_color = if is_selected {
             theme.accent_foreground
@@ -1397,7 +1391,7 @@ impl MacosSidebar {
                                 gpui::svg()
                                     .size(px(SIDEBAR_ROW_ICON))
                                     .path(icon.path())
-                                    .text_color(theme.text_muted),
+                                    .text_color(text_color),
                             ),
                     )
                     .child(

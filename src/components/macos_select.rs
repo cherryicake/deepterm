@@ -236,6 +236,19 @@ impl Render for MacosSelect {
         let theme_accent = theme.accent;
         let theme_text = theme.text;
         let theme_text_muted = theme.text_muted;
+        let is_dark = cx.theme().appearance.is_dark();
+
+        // 和 popup_menu 一致的颜色
+        let menu_bg = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0x2C2C2E))
+        } else {
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF))
+        };
+        let menu_border = if is_dark {
+            gpui::Hsla::from(gpui::rgb(0x48484A))
+        } else {
+            gpui::Hsla::from(gpui::rgb(0xD1D1D6))
+        };
 
         let highlighted = self.highlighted_index;
         let focus_handle = self.focus_handle.clone();
@@ -413,11 +426,11 @@ impl Render for MacosSelect {
                                     .child(
                                         div()
                                             .occlude()
-                                            .bg(theme.panel_background)
-                                            .border_1()
-                                            .border_color(theme.border)
+                                            .bg(menu_bg)
+                                            .border(px(0.5))
+                                            .border_color(menu_border)
                                             .rounded(px(10.0))
-                                            .shadow_md()
+                                            .shadow_lg()
                                             .p(px(6.0))
                                             .flex()
                                             .flex_col()

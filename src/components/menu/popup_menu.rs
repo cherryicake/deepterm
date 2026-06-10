@@ -1008,6 +1008,8 @@ impl PopupMenu {
 
                 let mut content = div().flex().flex_row().items_center();
 
+                let icon_color = if *disabled { theme.text_muted } else { theme.text };
+
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
                         div()
@@ -1019,6 +1021,7 @@ impl PopupMenu {
                             .child(
                                 Icon::new(icon.path())
                                     .with_size(Size::XSmall)
+                                    .color(icon_color)
                                     .into_any_element(),
                             ),
                     );
@@ -1046,6 +1049,7 @@ impl PopupMenu {
                 let this = this.disabled(*disabled);
 
                 let mut content = div().flex().flex_row().items_center();
+                let icon_color = if *disabled { theme.text_muted } else { theme.text };
 
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
@@ -1058,6 +1062,7 @@ impl PopupMenu {
                             .child(
                                 Icon::new(icon.path())
                                     .with_size(Size::XSmall)
+                                    .color(icon_color)
                                     .into_any_element(),
                             ),
                     );
