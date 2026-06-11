@@ -222,6 +222,8 @@ pub struct TabBar {
     tab_bounds: Vec<Bounds<Pixels>>,
     /// Tab 列表容器边界，用于判断拖拽是否仍在列表区域内
     tab_list_bounds: Option<Bounds<Pixels>>,
+    /// 是否已完成溢出检查（防止 on_children_prepainted 循环触发）
+    overflow_check_done: bool,
     /// 当前 Panel 拖入 TabBar 的插入预览
     panel_drop_preview: Option<PanelDropPreview>,
     /// 当前悬停的标签 ID
@@ -261,6 +263,7 @@ impl TabBar {
             reorder_animation_epoch: 0,
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
+            overflow_check_done: false,
             panel_drop_preview: None,
             context_menu_tab_id: None,
             on_tab_copy_address: None,
@@ -302,11 +305,12 @@ impl TabBar {
             reorder_animation_epoch: 0,
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
-          panel_drop_preview: None,
-              context_menu_tab_id: None,
-              on_tab_copy_address: None,
-              on_tab_duplicate: None,
-          })
+            overflow_check_done: false,
+            panel_drop_preview: None,
+            context_menu_tab_id: None,
+            on_tab_copy_address: None,
+            on_tab_duplicate: None,
+        })
       }
   
       pub fn on_tab_click<F>(&mut self, callback: F)
@@ -387,6 +391,7 @@ impl TabBar {
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         self.tabs.push(tab);
+        self.overflow_check_done = false;
         // 提前检查溢出状态，避免 UI 上出现溢出后再切换
         self.update_overflow_state(cx);
         cx.notify();
@@ -398,6 +403,7 @@ impl TabBar {
     pub fn remove_tab(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|t| t.id.as_ref() == id) {
             self.tabs.remove(index);
+            self.overflow_check_done = false;
 
             // 更新活动标签
             if self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(id) {
@@ -427,6 +433,7 @@ impl TabBar {
 
     pub fn set_tabs(&mut self, tabs: Vec<TabItem>, cx: &mut Context<Self>) {
         self.tabs = tabs;
+        self.overflow_check_done = false;
         if self.active_tab_id.is_none() && !self.tabs.is_empty() {
             self.active_tab_id = Some(self.tabs[0].id.clone());
         }
@@ -460,13 +467,26 @@ impl TabBar {
             return false;
         }
 
-        // 预估内容宽度：每个 tab 约 180px（包含 gap），加上 "+" 按钮 40px
-        const ESTIMATED_TAB_WIDTH: f32 = 180.0;
-        const NEW_TAB_BUTTON_WIDTH: f32 = 40.0;
+        const NEW_TAB_BUTTON_SPACE: f32 = 48.0;
+        let available_width = self.measured_container_width - NEW_TAB_BUTTON_SPACE;
 
-        let estimated_content_width =
-            self.tabs.len() as f32 * ESTIMATED_TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
-        let would_overflow = estimated_content_width > self.measured_container_width;
+        // 根据当前模式选择检测策略：
+        // - 滚动模式：tab bounds 是真实尺寸，可直接判断是否还需要滚动
+        // - 非滚动模式：tab bounds 被 overflow_x_hidden 截断不可信，用估算值
+        let would_overflow = if self.last_overflow == Some(true)
+            && self.tab_bounds.len() >= self.tabs.len()
+            && self.tab_list_bounds.is_some()
+        {
+            // 滚动模式：用真实数据判断是否可以切回非滚动
+            let tab_list_left = self.tab_list_bounds.unwrap().origin.x.as_f32();
+            let last_tab = &self.tab_bounds[self.tabs.len() - 1];
+            let last_tab_right = tab_list_left + last_tab.origin.x.as_f32() + last_tab.size.width.as_f32();
+            last_tab_right >= available_width
+        } else {
+            // 非滚动模式或无 layout 数据：用估算值
+            const ESTIMATED_TAB_WIDTH: f32 = 180.0;
+            self.tabs.len() as f32 * ESTIMATED_TAB_WIDTH > available_width
+        };
 
         if self.last_overflow != Some(would_overflow) {
             self.last_overflow = Some(would_overflow);
@@ -853,6 +873,28 @@ impl Render for TabBar {
                                         }
 
                                         this.tab_bounds = tab_bounds;
+
+                                        // 非滚动模式下：paint 后若真实内容溢出，切换到滚动模式。
+                                        // 滚动模式由 update_overflow_state (真实数据) 或 canvas 回调处理回切。
+                                        // overflow_check_done 防止切滚动后因 bounds 变化再次触发检测。
+                                        if this.last_overflow == Some(false)
+                                            && !this.overflow_check_done
+                                            && this.tab_bounds.len() >= this.tabs.len()
+                                            && this.tab_list_bounds.is_some()
+                                        {
+                                            let tab_list_left = this.tab_list_bounds.unwrap().origin.x.as_f32();
+                                            let last_tab = &this.tab_bounds[this.tabs.len() - 1];
+                                            let last_tab_right = tab_list_left
+                                                + last_tab.origin.x.as_f32()
+                                                + last_tab.size.width.as_f32();
+                                            let available = this.measured_container_width - 48.0;
+
+                                            if last_tab_right >= available {
+                                                this.last_overflow = Some(true);
+                                                this.overflow_check_done = true;
+                                                _cx.notify();
+                                            }
+                                        }
                                     });
                                 }
                             })
