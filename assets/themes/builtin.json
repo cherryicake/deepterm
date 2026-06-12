@@ -212,7 +212,7 @@
         "ime_background": "#20263a",
         "ime_underline": "#7dcfff",
         "normal": [
-          "#15161e",
+          "#414868",
           "#f7768e",
           "#9ece6a",
           "#e0af68",
@@ -229,7 +229,7 @@
           "#8db8ff",
           "#cfb8ff",
           "#a4daff",
-          "#e5e9ff"
+          "#c0caf5"
         ],
         "dim": [
           "#11131a",
@@ -472,7 +472,7 @@
           "#89b4fa",
           "#f5c2e7",
           "#94e2d5",
-          "#a6adc8"
+          "#bac2de"
         ],
         "dim": [
           "#45475a",
@@ -546,14 +546,14 @@
           "#acb0be"
         ],
         "bright": [
-          "#6c6f85",
+          "#acb0be",
           "#d20f39",
           "#40a02b",
           "#df8e1d",
           "#1e66f5",
           "#ea76cb",
           "#179299",
-          "#bcc0cc"
+          "#5c5f77"
         ],
         "dim": [
           "#5c5f77",
@@ -698,7 +698,7 @@
         "ime_background": "#3b4252",
         "ime_underline": "#88c0d0",
         "normal": [
-          "#3b4252",
+          "#2e3440",
           "#bf616a",
           "#a3be8c",
           "#ebcb8b",
@@ -852,7 +852,7 @@
       },
       "terminal": {
         "background": "#fdf6e3",
-        "foreground": "#586e75",
+        "foreground": "#657b83",
         "bright_foreground": "#fdf6e3",
         "dim_foreground": "#839496",
         "cursor": "#268bd2",
@@ -1176,7 +1176,7 @@
       },
       "terminal": {
         "background": "#272822",
-        "foreground": "#f1ebeb",
+        "foreground": "#f8f8f2",
         "bright_foreground": "#cfd0c2",
         "dim_foreground": "#76715e",
         "cursor": "#f1ebeb",
@@ -1427,7 +1427,7 @@
         "ime_background": "#f2e9e1",
         "ime_underline": "#907aa9",
         "normal": [
-          "#f4ede8",
+          "#faf4ed",
           "#b4637a",
           "#286983",
           "#ea9d34",
@@ -1447,7 +1447,7 @@
           "#575279"
         ],
         "dim": [
-          "#f4ede8",
+          "#faf4ed",
           "#b4637a",
           "#286983",
           "#ea9d34",
