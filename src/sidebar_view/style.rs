@@ -10,9 +10,9 @@ pub fn glass_bg(is_dark: bool) -> Hsla {
 
 pub fn border_color(is_dark: bool) -> Hsla {
     if is_dark {
-        Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.14)
+        Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.1)
     } else {
-        Hsla::from(gpui::rgb(0x000000)).opacity(0.08)
+        Hsla::from(gpui::rgb(0xFFFFFF)).opacity(0.6)
     }
 }
 

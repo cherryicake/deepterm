@@ -1033,7 +1033,7 @@ impl Render for TabBar {
                                         .rounded(px(8.0))
                                         .border_1()
                                         .border_color(if is_active {
-                                            theme.border
+                                            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if cx.theme().appearance.is_dark() { 0.1 } else { 0.6 })
                                         } else {
                                             theme.transparent()
                                         })

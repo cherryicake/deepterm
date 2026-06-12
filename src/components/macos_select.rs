@@ -244,11 +244,7 @@ impl Render for MacosSelect {
         } else {
             gpui::Hsla::from(gpui::rgb(0xFFFFFF))
         };
-        let menu_border = if is_dark {
-            gpui::Hsla::from(gpui::rgb(0x48484A))
-        } else {
-            gpui::Hsla::from(gpui::rgb(0xD1D1D6))
-        };
+        let menu_border = gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
 
         let highlighted = self.highlighted_index;
         let focus_handle = self.focus_handle.clone();

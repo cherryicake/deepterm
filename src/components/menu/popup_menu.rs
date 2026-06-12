@@ -1121,11 +1121,7 @@ impl Render for PopupMenu {
         } else {
             gpui::Hsla::from(gpui::rgb(0xFFFFFF))
         };
-        let menu_border = if is_dark {
-            gpui::Hsla::from(gpui::rgb(0x48484A))
-        } else {
-            gpui::Hsla::from(gpui::rgb(0xD1D1D6))
-        };
+        let menu_border = gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
         let separator_color = if is_dark {
             gpui::Hsla::from(gpui::rgb(0x48484A))
         } else {
