@@ -41,6 +41,8 @@ const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
 const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
 const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
+const TAB_MAX_WIDTH_PX: f32 = 180.0;
+const TAB_FADE_WIDTH_PX: f32 = 24.0;
 
 /// Tab 放置事件
 pub struct TabDropEvent {
@@ -1206,18 +1208,49 @@ impl Render for TabBar {
                                         })
                                         .child(
                                             div()
-                                                .text_sm()
-                                                .font_weight(if is_active {
-                                                    gpui::FontWeight::SEMIBOLD
-                                                } else {
-                                                    gpui::FontWeight::NORMAL
+                                                .relative()
+                                                .overflow_hidden()
+                                                .flex_none()
+                                                .when(!is_active, |this| {
+                                                    this.max_w(px(TAB_MAX_WIDTH_PX))
                                                 })
-                                                .text_color(if is_active {
-                                                    theme.text
-                                                } else {
-                                                    theme.text_muted
-                                                })
-                                                .child(label),
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .whitespace_nowrap()
+                                                        .font_weight(if is_active {
+                                                            gpui::FontWeight::SEMIBOLD
+                                                        } else {
+                                                            gpui::FontWeight::NORMAL
+                                                        })
+                                                        .text_color(if is_active {
+                                                            theme.text
+                                                        } else {
+                                                            theme.text_muted
+                                                        })
+                                                        .child(label),
+                                                )
+                                                .when(!is_active, |this| {
+                                                    let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
+                                                    let tab_bg = if is_hovered {
+                                                        theme.tab_hover_background
+                                                    } else {
+                                                        theme.tab_inactive_background
+                                                    };
+                                                    this.child(
+                                                        div()
+                                                            .absolute()
+                                                            .right_0()
+                                                            .top_0()
+                                                            .bottom_0()
+                                                            .w(px(TAB_FADE_WIDTH_PX))
+                                                            .bg(gpui::linear_gradient(
+                                                                90.0,
+                                                                gpui::linear_color_stop(tab_bg.opacity(0.0), 0.0),
+                                                                gpui::linear_color_stop(tab_bg, 1.0),
+                                                            )),
+                                                    )
+                                                }),
                                         )
                                         .on_click(cx.listener({
                                             let on_tab_click = on_tab_click.clone();
