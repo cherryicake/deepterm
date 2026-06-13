@@ -498,7 +498,7 @@ impl LanguageRegistry {
         self.languages
             .lock()
             .unwrap()
-            .insert(lang.to_string().into(), config.clone());
+            .insert(lang.into(), config.clone());
     }
 
     /// Returns a list of all registered language names.

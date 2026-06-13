@@ -1082,10 +1082,9 @@ impl MacosSidebar {
 
         let mut groups = div().w_full().flex().flex_col().gap(px(2.0));
         for (index, group) in self.tab_groups.iter().enumerate() {
-            let group_id = group.id.clone();
             let tabs = self
                 .tab_group_tabs
-                .get(&group_id)
+                .get(&group.id)
                 .cloned()
                 .unwrap_or_default();
             groups = groups
@@ -1093,7 +1092,7 @@ impl MacosSidebar {
                     cx,
                     is_dark,
                     theme,
-                    group_id.clone(),
+                    group.id.clone(),
                     group.label.clone(),
                     group.collapsed,
                     group.editing_input.clone(),
@@ -1101,7 +1100,7 @@ impl MacosSidebar {
                     Icon::SquareOnSquare,
                 ))
                 .child(Self::render_collapsible_content(
-                    self.render_tab_group_tabs(&group_id, &tabs, theme),
+                    self.render_tab_group_tabs(&group.id, &tabs, theme),
                     group.collapsed,
                     group.collapse_epoch,
                     (tabs.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP) - SIDEBAR_ROW_GAP)

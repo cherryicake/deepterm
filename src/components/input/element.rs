@@ -752,7 +752,7 @@ impl TextElement {
                 .split("\n")
                 .map(|line| {
                     let shaped_line = window.text_system().shape_line(
-                        line.to_string().into(),
+                        line.into(),
                         font_size,
                         &runs,
                         None,
@@ -798,7 +798,7 @@ impl TextElement {
                     continue;
                 }
 
-                let sub_line: SharedString = line_text[range.clone()].to_string().into();
+                let sub_line: SharedString = line_text[range.clone()].into();
                 let runs_len: usize = line_runs.iter().map(|r| r.len).sum();
                 if runs_len != sub_line.len() {
                     log::error!(
@@ -1384,11 +1384,12 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.state.read(cx).focus_handle.clone();
-        let show_cursor = self.state.read(cx).show_cursor(window, cx);
+        let state = self.state.read(cx);
+        let focus_handle = state.focus_handle.clone();
+        let show_cursor = state.show_cursor(window, cx);
         let focused = focus_handle.is_focused(window);
         let bounds = prepaint.bounds;
-        let selected_range = self.state.read(cx).selected_range;
+        let selected_range = state.selected_range;
         let text_align = prepaint.last_layout.text_align;
 
         window.handle_input(

@@ -104,8 +104,7 @@ impl From<io::Error> for SshError {
 impl From<russh::Error> for SshError {
     fn from(err: russh::Error) -> Self {
         // 简化处理：将所有 russh 错误映射为内部错误或连接错误
-        let err_str = format!("{:?}", err);
-        SshError::Internal(format!("SSH 错误: {}", err_str))
+        SshError::Internal(format!("SSH 错误: {:?}", err))
     }
 }
 

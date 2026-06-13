@@ -573,8 +573,8 @@ fn render_keychain_item_row(
             cx.listener({
                 let item_id = item_id.clone();
                 move |this, _event, _window, cx| {
-                    this.context_menu_item_id = Some(item_id.clone().into());
                     let item_shared: SharedString = item_id.clone().into();
+                    this.context_menu_item_id = Some(item_shared.clone());
                     if !this.selected_ids.contains(&item_shared) {
                         this.selected_ids.clear();
                         this.selected_ids.insert(item_shared);

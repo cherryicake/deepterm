@@ -724,7 +724,6 @@ impl Render for TabBar {
         let on_tab_close = self.on_tab_close.clone();
         let on_new_tab = self.on_new_tab.clone();
         let on_tab_reorder = self.on_tab_reorder.clone();
-        let _on_tab_merge = self.on_tab_merge.clone();
         let on_panel_drop = self.on_panel_drop.clone();
         let animation_epoch = self.reorder_animation_epoch;
         let panel_drop_preview = self.panel_drop_preview.clone();

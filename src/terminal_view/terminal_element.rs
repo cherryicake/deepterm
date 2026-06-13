@@ -1177,10 +1177,6 @@ impl Element for TerminalElement {
         }
         row_caches.resize_with(viewport_lines, RowRenderCache::default);
 
-        let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
-        let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
-        let mut background_spans: Vec<BackgroundSpan> = Vec::new();
-        let mut selection_cells: Vec<(usize, usize)> = Vec::new();
         let mut dirty_count = 0usize;
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
@@ -1195,7 +1191,11 @@ impl Element for TerminalElement {
             || has_dirty_rows
             || metrics_changed;
 
-        if rebuild_flattened_cache {
+        let flattened_cache = if rebuild_flattened_cache {
+            let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
+            let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
+            let mut background_spans: Vec<BackgroundSpan> = Vec::new();
+            let mut selection_cells: Vec<(usize, usize)> = Vec::new();
             // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
             let terminal = self.terminal.read(cx);
             let content = terminal.last_content();
@@ -1411,12 +1411,7 @@ impl Element for TerminalElement {
                     );
                 }
             }
-        }
 
-        log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
-        log::trace!("row run partial updates: {partial_run_update_count}");
-
-        let flattened_cache = if rebuild_flattened_cache {
             let flattened = FlattenedRenderCache {
                 runs: Arc::from(batched_runs),
                 box_cells: Arc::from(box_cells),
@@ -1436,6 +1431,9 @@ impl Element for TerminalElement {
             });
             cached_flattened
         };
+
+        log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
+        log::trace!("row run partial updates: {partial_run_update_count}");
 
         // Calculate cursor position relative to viewport
         let cursor_line_in_viewport = cursor_point.line.0 + display_offset as i32;

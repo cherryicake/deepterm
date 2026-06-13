@@ -300,8 +300,8 @@ fn unique_styles(
         significant_intervals.insert(range.end);
     }
 
-    let mut result: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    let mut active_styles: Vec<usize> = Vec::new();
+    let mut result: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(styles.len());
+    let mut active_styles: Vec<usize> = Vec::with_capacity(8);
     let mut last_pos = total_range.start;
 
     for (pos, is_start, style_idx) in intervals {

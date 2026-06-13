@@ -327,7 +327,7 @@ impl KeyType {
 ///
 /// 在 `~/.ssh` 目录下查找常见的密钥文件
 pub fn find_default_ssh_keys() -> Vec<std::path::PathBuf> {
-    let mut keys = Vec::new();
+    let mut keys = Vec::with_capacity(4);
 
     if let Some(home_dir) = dirs::home_dir() {
         let ssh_dir = home_dir.join(".ssh");

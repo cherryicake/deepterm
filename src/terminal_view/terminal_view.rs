@@ -1605,7 +1605,7 @@ impl TerminalView {
                         .collect();
                     Ok(list)
                 }
-                Err(err) => Err(format!("{}", err)),
+                Err(err) => Err(err.to_string()),
             };
             this.update(cx, |this, cx| {
                 // canonical 与 original 都写一次，避免 prefix 用 "~" 查不到

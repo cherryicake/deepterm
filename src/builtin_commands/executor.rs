@@ -413,7 +413,7 @@ fn parse_scp_token(
 ///
 /// 返回所有合理切分（含 keyword `Local`），调用方按命中第一个 host 来定。
 fn candidate_host_path_splits(token: &str) -> Vec<(&str, &str)> {
-    let mut splits: Vec<(&str, &str)> = Vec::new();
+    let mut splits: Vec<(&str, &str)> = Vec::with_capacity(2);
     for (i, c) in token.char_indices() {
         if c != ':' {
             continue;

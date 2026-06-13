@@ -75,7 +75,7 @@ impl FontSettingsView {
             let font_select = MacosSelect::new(window, cx, default_fonts, selected_label);
             font_select.update(cx, |select, _cx| {
                 select.on_select(move |family, _index, cx| {
-                    let family = clean_font_choice(&family.to_string()).to_string();
+                    let family = clean_font_choice(&family).to_string();
                     FontState::update(cx, |settings| {
                         settings.terminal_font_family = family;
                     });

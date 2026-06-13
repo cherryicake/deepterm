@@ -39,9 +39,10 @@ struct FileEntry {
 
 impl FileEntry {
     fn from_sftp_entry(entry: SftpFileEntry) -> Self {
+        let name_lower = entry.name.to_lowercase();
         Self {
-            name: entry.name.clone(),
-            name_lower: entry.name.to_lowercase(),
+            name: entry.name,
+            name_lower,
             path: entry.path,
             kind: entry.kind,
             size: entry.size,
@@ -225,17 +226,18 @@ impl RemoteFileBrowserView {
 
     fn set_hovered_path(&mut self, path: String, hovered: bool, cx: &mut Context<Self>) {
         let next = if hovered {
-            Some(path.clone())
+            if self.hovered_path.as_deref() == Some(&path) {
+                return;
+            }
+            Some(path)
         } else if self.hovered_path.as_ref() == Some(&path) {
             None
         } else {
             return;
         };
 
-        if self.hovered_path != next {
-            self.hovered_path = next;
-            cx.notify();
-        }
+        self.hovered_path = next;
+        cx.notify();
     }
 
     fn column_width_at(&self, index: usize) -> gpui::Pixels {

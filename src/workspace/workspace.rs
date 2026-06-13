@@ -1813,7 +1813,7 @@ impl Workspace {
                 self.focus_panel_content(panel, window, cx);
             }
 
-            self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
+            self.active_tab_id = FILE_BROWSER_TAB_ID.into();
             self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
             return;
         }
@@ -1831,7 +1831,7 @@ impl Workspace {
         self.next_panel_id += 1;
 
         self.tabs.insert(
-            FILE_BROWSER_TAB_ID.to_string(),
+            FILE_BROWSER_TAB_ID.into(),
             TabInfo::new_normal(FILE_BROWSER_TAB_ID, "Files", file_browser_panel.clone()),
         );
 
@@ -1851,7 +1851,7 @@ impl Workspace {
             subscription,
         );
 
-        self.active_tab_id = FILE_BROWSER_TAB_ID.to_string();
+        self.active_tab_id = FILE_BROWSER_TAB_ID.into();
         self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
         self.focus_panel_content(file_browser_panel, window, cx);
         cx.notify();
@@ -2055,7 +2055,7 @@ impl Workspace {
             .content()
             .terminal_view()
             .map(|tv| tv.read(cx).tab_label(cx))
-            .unwrap_or_else(|| "Local Terminal".to_string())
+            .unwrap_or_else(|| "Local Terminal".into())
     }
 
     /// 创建本地终端Tab

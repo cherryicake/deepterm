@@ -98,7 +98,7 @@ impl TextWrapper {
     /// Get the line item by row index.
     #[inline]
     pub(crate) fn line(&self, row: usize) -> Option<&LineItem> {
-        self.lines.iter().skip(row).next()
+        self.lines.get(row)
     }
 
     pub(crate) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {

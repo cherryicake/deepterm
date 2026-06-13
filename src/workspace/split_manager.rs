@@ -331,11 +331,7 @@ impl SplitContainer {
                 let new_children: Vec<SplitContainer> = children
                     .iter()
                     .map(|child| {
-                        if child.contains_panel(target_panel_id, cx) {
-                            child.split_at(target_panel_id, placement, new_container.clone(), cx)
-                        } else {
-                            child.clone()
-                        }
+                        child.split_at(target_panel_id, placement, new_container.clone(), cx)
                     })
                     .collect();
 

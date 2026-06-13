@@ -1893,11 +1893,12 @@ fn render_key_hint(key: &str, label: Option<&str>, theme: UiTheme) -> impl IntoE
                 .child(key),
         )
         .when_some(label, |this, label| {
+            let label = label.to_string();
             this.child(
                 div()
                     .text_size(px(11.5))
                     .text_color(theme.text_muted)
-                    .child(label.to_string()),
+                    .child(label),
             )
         })
 }

@@ -442,8 +442,8 @@ impl Render for HostView {
                     cx.listener({
                         let host_id = host_id.clone();
                         move |this, _, _, cx| {
-                            this.context_menu_host_id = Some(host_id.clone().into());
                             let id_shared: SharedString = host_id.clone().into();
+                            this.context_menu_host_id = Some(id_shared.clone());
                             if !this.selected_ids.contains(&id_shared) {
                                 this.selected_ids.clear();
                                 this.selected_ids.insert(id_shared);

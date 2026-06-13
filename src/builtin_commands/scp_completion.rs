@@ -44,7 +44,7 @@ pub fn shell_split_tokens(area: &str, base_offset: usize) -> Vec<ShellToken> {
     let chars: Vec<(usize, char)> = area.char_indices().collect();
     let total = chars.len();
     let area_len = area.len();
-    let mut tokens: Vec<ShellToken> = Vec::new();
+    let mut tokens: Vec<ShellToken> = Vec::with_capacity(8);
     let mut idx = 0;
     while idx < total {
         // 跳过空白
