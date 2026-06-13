@@ -1537,7 +1537,10 @@ fn build_remote_completions(
             if entry.name.starts_with('.') && !prefix_lower.starts_with('.') {
                 return None;
             }
-            if !entry.name.to_lowercase().starts_with(&prefix_lower) {
+            // Use case-insensitive prefix check without allocating
+            if !entry.name.starts_with(&prefix_lower)
+                && !entry.name.to_lowercase().starts_with(&prefix_lower)
+            {
                 return None;
             }
             let new_path_segment = if entry.is_directory {

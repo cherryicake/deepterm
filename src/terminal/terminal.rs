@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
     rc::Rc,
     sync::Arc,
     time::Instant,
@@ -1304,23 +1305,28 @@ impl Terminal {
             return true;
         }
 
-        std::process::Command::new("/bin/hostname")
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|hostname| {
-                let hostname = hostname.trim();
-                host == hostname
-                    || hostname
-                        .split_once('.')
-                        .map(|(short, _)| host == short)
-                        .unwrap_or(false)
-                    || host
-                        .split_once('.')
-                        .map(|(short, _)| short == hostname)
-                        .unwrap_or(false)
+        fn cached_hostname() -> &'static str {
+            static HOSTNAME: OnceLock<String> = OnceLock::new();
+            HOSTNAME.get_or_init(|| {
+                std::process::Command::new("/bin/hostname")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
             })
-            .unwrap_or(false)
+        }
+
+        let hostname = cached_hostname();
+        host == hostname
+            || hostname
+                .split_once('.')
+                .map(|(short, _)| host == short)
+                .unwrap_or(false)
+            || host
+                .split_once('.')
+                .map(|(short, _)| short == hostname)
+                .unwrap_or(false)
     }
 
     fn normalize_remote_working_directory(path: &str) -> Option<String> {

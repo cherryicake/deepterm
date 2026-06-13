@@ -666,11 +666,44 @@ fn session_cache() -> &'static Mutex<HashMap<String, SharedBlockingSftpSession>>
 
 fn cache_key(config: &SshConnectionConfig) -> String {
     // v2: inactivity_timeout disabled for long file transfers
-    format!(
-        "v2:{}",
-        serde_json::to_string(config)
-            .unwrap_or_else(|_| format!("{}@{}:{}", config.username, config.host, config.port))
-    )
+    // Build a compact key from identifying fields instead of full JSON serialization
+    let port_str = config.port.to_string();
+    let capacity = 3 + config.username.len() + 1 + config.host.len() + 1 + port_str.len() + 16;
+    let mut key = String::with_capacity(capacity);
+    key.push_str("v2:");
+    key.push_str(&config.username);
+    key.push('@');
+    key.push_str(&config.host);
+    key.push(':');
+    key.push_str(&port_str);
+
+    // Include auth_method discriminant for cache correctness
+    use crate::ssh::config::AuthMethod;
+    match &config.auth_method {
+        AuthMethod::Password { password } => {
+            use std::fmt::Write;
+            let _ = write!(key, ":pw:{}", password.len());
+        }
+        AuthMethod::PasswordRef { keychain_id } => {
+            use std::fmt::Write;
+            let _ = write!(key, ":pwr:{}", keychain_id);
+        }
+        AuthMethod::PrivateKey { path, .. } => {
+            use std::fmt::Write;
+            let _ = write!(key, ":pk:{}", path.display());
+        }
+        AuthMethod::PrivateKeyRef { keychain_id } => {
+            use std::fmt::Write;
+            let _ = write!(key, ":pkr:{}", keychain_id);
+        }
+        AuthMethod::Agent => {
+            key.push_str(":agent");
+        }
+        AuthMethod::Auto => {
+            key.push_str(":auto");
+        }
+    }
+    key
 }
 
 fn get_or_connect_session(
@@ -896,15 +929,21 @@ fn convert_metadata(
 
 pub fn join_remote_path(base: &str, child: &str) -> String {
     if base == "/" {
-        format!("/{}", child.trim_start_matches('/'))
+        let child_trimmed = child.trim_start_matches('/');
+        let mut result = String::with_capacity(1 + child_trimmed.len());
+        result.push('/');
+        result.push_str(child_trimmed);
+        result
     } else if base.is_empty() {
         child.to_string()
     } else {
-        format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            child.trim_start_matches('/')
-        )
+        let base_trimmed = base.trim_end_matches('/');
+        let child_trimmed = child.trim_start_matches('/');
+        let mut result = String::with_capacity(base_trimmed.len() + 1 + child_trimmed.len());
+        result.push_str(base_trimmed);
+        result.push('/');
+        result.push_str(child_trimmed);
+        result
     }
 }
 

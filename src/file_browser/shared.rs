@@ -290,16 +290,49 @@ pub fn truncate_middle(name: &str, max_chars: usize) -> String {
         return name.to_string();
     }
 
-    let ellipsis = "...";
-    let keep = max_chars.saturating_sub(ellipsis.len());
+    const ELLIPSIS: &str = "...";
+    let keep = max_chars.saturating_sub(ELLIPSIS.len());
+
+    // Edge case: max_chars too small for any content
+    if keep == 0 {
+        return if max_chars <= ELLIPSIS.len() {
+            ELLIPSIS[..max_chars].to_string()
+        } else {
+            ELLIPSIS.to_string()
+        };
+    }
+
     let prefix_len = keep / 2;
     let suffix_len = keep - prefix_len;
 
-    let chars: Vec<char> = name.chars().collect();
-    let prefix: String = chars.iter().take(prefix_len).collect();
-    let suffix: String = chars.iter().skip(char_count - suffix_len).collect();
+    // Find byte offset for prefix_len-th char (prefix includes chars 0..prefix_len)
+    let mut prefix_end_byte = 0;
+    let mut count = 0;
+    for (i, ch) in name.char_indices() {
+        count += 1;
+        if count == prefix_len {
+            prefix_end_byte = i + ch.len_utf8();
+            break;
+        }
+    }
 
-    format!("{}{}{}", prefix, ellipsis, suffix)
+    // Find byte offset for suffix start (skip char_count - suffix_len chars)
+    let suffix_start_char = char_count - suffix_len;
+    let mut suffix_start_byte = name.len();
+    count = 0;
+    for (i, ch) in name.char_indices() {
+        count += 1;
+        if count == suffix_start_char {
+            suffix_start_byte = i;
+            break;
+        }
+    }
+
+    let mut result = String::with_capacity(max_chars * 3);
+    result.push_str(&name[..prefix_end_byte]);
+    result.push_str(ELLIPSIS);
+    result.push_str(&name[suffix_start_byte..]);
+    result
 }
 
 pub fn format_size(size: u64) -> String {

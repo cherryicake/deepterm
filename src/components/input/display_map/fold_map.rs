@@ -115,8 +115,8 @@ impl FoldMap {
         // Remove any folded ranges that are no longer in candidates
         self.folded.retain(|fold| {
             self.candidates
-                .iter()
-                .any(|c| c.start_line == fold.start_line)
+                .binary_search_by_key(&fold.start_line, |c| c.start_line)
+                .is_ok()
         });
     }
 
@@ -145,18 +145,31 @@ impl FoldMap {
     pub fn set_folded(&mut self, start_line: usize, folded: bool) {
         if folded {
             // Find the candidate range for this start_line
-            if let Some(candidate) = self.candidates.iter().find(|c| c.start_line == start_line) {
-                // Add to folded if not already present
-                if !self.folded.iter().any(|f| f.start_line == start_line) {
-                    self.folded.push(*candidate);
-                    self.folded.sort_by_key(|r| r.start_line);
-                    self.needs_rebuild = true;
+            if let Ok(idx) = self
+                .candidates
+                .binary_search_by_key(&start_line, |c| c.start_line)
+            {
+                // Add to folded if not already present, maintaining sorted order
+                match self
+                    .folded
+                    .binary_search_by_key(&start_line, |f| f.start_line)
+                {
+                    Err(insert_pos) => {
+                        self.folded.insert(insert_pos, self.candidates[idx]);
+                        self.needs_rebuild = true;
+                    }
+                    Ok(_) => {} // Already folded
                 }
             }
         } else {
             // Remove from folded
-            self.folded.retain(|f| f.start_line != start_line);
-            self.needs_rebuild = true;
+            if let Ok(idx) = self
+                .folded
+                .binary_search_by_key(&start_line, |f| f.start_line)
+            {
+                self.folded.remove(idx);
+                self.needs_rebuild = true;
+            }
         }
     }
 
@@ -168,12 +181,16 @@ impl FoldMap {
 
     /// Check if a line is currently folded
     pub fn is_folded_at(&self, start_line: usize) -> bool {
-        self.folded.iter().any(|f| f.start_line == start_line)
+        self.folded
+            .binary_search_by_key(&start_line, |f| f.start_line)
+            .is_ok()
     }
 
     /// Check if a line is a fold candidate
     pub fn is_fold_candidate(&self, start_line: usize) -> bool {
-        self.candidates.iter().any(|c| c.start_line == start_line)
+        self.candidates
+            .binary_search_by_key(&start_line, |c| c.start_line)
+            .is_ok()
     }
 
     /// Get all fold candidates
@@ -254,11 +271,12 @@ impl FoldMap {
         self.cached_wrap_row_count = wrap_row_count;
 
         self.visible_wrap_rows.clear();
-        self.wrap_row_to_display_row = vec![None; wrap_row_count];
+        self.wrap_row_to_display_row.clear();
+        self.wrap_row_to_display_row.resize(wrap_row_count, None);
 
         if self.folded.is_empty() {
             // Fast path: no folds, all wrap rows are visible
-            self.visible_wrap_rows = (0..wrap_row_count).collect();
+            self.visible_wrap_rows.extend(0..wrap_row_count);
             for (display_row, &wrap_row) in self.visible_wrap_rows.iter().enumerate() {
                 self.wrap_row_to_display_row[wrap_row] = Some(display_row);
             }

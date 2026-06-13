@@ -66,14 +66,14 @@ impl FileEntry {
         }
     }
 
-    fn sort_key(&self) -> (u8, String) {
+    fn sort_key(&self) -> (u8, &str) {
         let rank = match self.kind {
             RemoteFileKind::Directory => 0,
             RemoteFileKind::Symlink => 1,
             RemoteFileKind::File => 2,
             RemoteFileKind::Other => 3,
         };
-        (rank, self.name_lower.clone())
+        (rank, &self.name_lower)
     }
 
     fn size_label(&self) -> String {
@@ -289,7 +289,7 @@ impl RemoteFileBrowserView {
                                 .into_iter()
                                 .map(FileEntry::from_sftp_entry)
                                 .collect();
-                            entries.sort_by_key(FileEntry::sort_key);
+                            entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
                             this.directory_cache.insert(path, entries);
                         }
                         Err(error) => {
@@ -1651,7 +1651,7 @@ fn build_loaded_state(
                     .into_iter()
                     .map(FileEntry::from_sftp_entry)
                     .collect();
-                entries.sort_by_key(FileEntry::sort_key);
+                entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
                 directory_cache.insert(directory, entries);
             }
             Err(error) => {

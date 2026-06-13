@@ -31,16 +31,14 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, _vi_mode: bool) -> Opt
     if let Some(f_num) = key.strip_prefix('f') {
         if let Ok(n) = f_num.parse::<u8>() {
             if n >= 1 && n <= 12 {
-                let seq = match n {
-                    1 => "OP",
-                    2 => "OQ",
-                    3 => "OR",
-                    4 => "OS",
-                    5..=8 => &format!("{}~", n + 10),
-                    9..=12 => &format!("{}~", n + 11),
-                    _ => return None,
-                };
-                return Some(encode_csi(seq, keystroke, mode));
+                // Pre-computed lookup to avoid format! allocation per keystroke
+                // Values match original: F5-F8 = n+10~, F9-F12 = n+11~
+                const F_SUFFIXES: [&str; 12] = [
+                    "OP", "OQ", "OR", "OS", // F1-F4 (SS3 sequences)
+                    "15~", "16~", "17~", "18~", // F5-F8
+                    "20~", "21~", "22~", "23~", // F9-F12
+                ];
+                return Some(encode_csi(F_SUFFIXES[(n - 1) as usize], keystroke, mode));
             }
         }
     }
@@ -94,8 +92,14 @@ fn encode_csi(suffix: &str, keystroke: &Keystroke, mode: &TermMode) -> Vec<u8> {
     let application_mode = mode.contains(TermMode::APP_CURSOR);
 
     if suffix.contains('~') {
-        let num: String = suffix.chars().take_while(|c| c.is_ascii_digit()).collect();
-        result.extend_from_slice(num.as_bytes());
+        // Parse digits directly from suffix bytes without String allocation
+        for b in suffix.bytes() {
+            if b.is_ascii_digit() {
+                result.push(b);
+            } else {
+                break;
+            }
+        }
         if modifier > 1 {
             result.push(b';');
             result.push(b'0' + modifier);

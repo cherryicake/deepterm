@@ -89,14 +89,14 @@ impl FileEntry {
         }
     }
 
-    fn sort_key(&self) -> (u8, String) {
+    fn sort_key(&self) -> (u8, &str) {
         let rank = match self.kind {
             FileEntryKind::Directory => 0,
             FileEntryKind::Symlink => 1,
             FileEntryKind::File => 2,
             FileEntryKind::Other => 3,
         };
-        (rank, self.name_lower.clone())
+        (rank, &self.name_lower)
     }
 
     fn size_label(&self) -> String {
@@ -422,7 +422,7 @@ impl FileBrowserView {
             }
         }
 
-        entries.sort_by_key(FileEntry::sort_key);
+        entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         self.directory_cache
             .insert(directory.to_path_buf(), entries);
         self.invalidate_list_cache();
@@ -1040,28 +1040,38 @@ impl FileBrowserView {
                     let name_max_chars = name_max_chars;
                     let theme = theme.clone();
                     move |this, range: std::ops::Range<usize>, _window, cx| {
-                        let entries: Vec<FileEntry> = this
+                        // Build index map of filtered entries WITHOUT cloning all entries
+                        let filtered_indices: Vec<usize> = this
                             .directory_cache
                             .get(&directory_buf)
                             .map(|entries| {
                                 entries
                                     .iter()
-                                    .filter(|e| this.matches_search(e))
-                                    .cloned()
+                                    .enumerate()
+                                    .filter(|(_, e)| this.matches_search(e))
+                                    .map(|(i, _)| i)
                                     .collect()
                             })
                             .unwrap_or_default();
 
+                        let total = filtered_indices.len();
                         let selected_child = this.selected_child_for_directory(&directory_buf);
 
                         range
                             .filter_map(|ix| {
-                                if ix >= entries.len() {
+                                if ix >= total {
                                     return None;
                                 }
-                                let entry = &entries[ix];
+                                let original_idx = filtered_indices[ix];
+                                // Clone only the single entry we need, not all entries
+                                let entry = this
+                                    .directory_cache
+                                    .get(&directory_buf)
+                                    .and_then(|entries| entries.get(original_idx))?
+                                    .clone();
+
                                 Some(this.render_column_row(
-                                    entry,
+                                    &entry,
                                     selected_child.as_ref(),
                                     name_max_chars,
                                     theme.clone(),
