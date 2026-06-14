@@ -304,6 +304,8 @@ fn create_lease(
     let mut key_bytes = std::fs::read(key_path)
         .with_context(|| format!("读取本地私钥失败: {}", key_path.display()))?;
 
+    super::utils::check_cancelled(cancelled)?;
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -321,6 +323,8 @@ fn create_lease(
         )
         .map_err(|e| anyhow!("源端创建临时目录失败: {}", e))?;
 
+    super::utils::check_cancelled(cancelled)?;
+
     let remote_key_path = format!("{}/id_key", remote_temp_dir);
     let local_temp_path = std::env::temp_dir().join(&dir_name);
 
@@ -332,6 +336,8 @@ fn create_lease(
         key_bytes.fill(0);
         return Err(anyhow!("写入本地临时密钥文件失败: {}", e));
     }
+
+    super::utils::check_cancelled(cancelled)?;
 
     if let Err(e) = source_session.upload_file_from_local_with_cancel(
         &local_temp_path,
@@ -347,6 +353,8 @@ fn create_lease(
         key_bytes.fill(0);
         return Err(anyhow!("上传临时密钥到源服务器失败: {}", e));
     }
+
+    super::utils::check_cancelled(cancelled)?;
 
     if let Err(e) = source_session.execute_command(
         &format!("chmod 600 '{}'", shell_single_quote(&remote_key_path)),

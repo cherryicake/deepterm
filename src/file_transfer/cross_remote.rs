@@ -168,6 +168,41 @@ pub fn is_safe_for_direct_scp(path: &str) -> bool {
         .any(|byte| matches!(byte, b'\n' | b'\r' | b'\0' | b'\t' | b'\x08' | b'\x1b'))
 }
 
+/// SCP 直连传输失败后，尝试清理目标端可能残留的不完整文件。
+///
+/// SCP 协议直接写入目标路径（不经过临时文件），失败后目标端可能留下
+/// 部分写入的文件。此函数连接目标端并尝试删除该文件，仅在文件存在时
+/// 执行清理，失败时仅记录警告不传播错误（清理失败不影响主流程）。
+fn cleanup_partial_scp_destination(
+    destination_config: &SshConnectionConfig,
+    destination_path: &str,
+) {
+    let _ = sftp_fs::with_cached_session(destination_config, |session| {
+        if session.exists(destination_path)? {
+            match crate::file_transfer::utils::remove_remote_source(session, destination_path) {
+                Ok(()) => {
+                    log::info!(
+                        "已清理 SCP 目标端残留文件: {}@{}:{}",
+                        destination_config.username,
+                        destination_config.host,
+                        destination_path,
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "清理 SCP 目标端残留文件失败: {}@{}:{} ({})",
+                        destination_config.username,
+                        destination_config.host,
+                        destination_path,
+                        e,
+                    );
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
 pub fn remote_scp_timeout_secs() -> u64 {
     std::env::var("DEEPTERM_REMOTE_SCP_TIMEOUT_SECS")
         .ok()
@@ -712,6 +747,10 @@ fn copy_via_agent_forward_scp(
                 }
             ),
         );
+        // SCP 直连失败：目标端可能残留不完整文件，尝试清理新建的文件
+        if !is_directory {
+            cleanup_partial_scp_destination(destination_config, destination_path);
+        }
         bail!(
             "scp failed: {}",
             if stderr.is_empty() {
@@ -977,6 +1016,10 @@ fn copy_via_remote_scp(
                     stderr
                 );
                 report_status(reporter, format!("失败: {}", stderr));
+                // SCP 直连失败：目标端可能残留不完整文件，尝试清理新建的文件
+                if !is_directory {
+                    cleanup_partial_scp_destination(destination_config, destination_path);
+                }
                 bail!("远程 scp 失败: {}", stderr)
             }
         }

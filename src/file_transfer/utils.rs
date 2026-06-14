@@ -177,7 +177,9 @@ pub fn check_cancelled(cancelled: &Arc<AtomicBool>) -> anyhow::Result<()> {
 }
 
 pub fn remove_local_source(path: &Path) -> anyhow::Result<()> {
-    let metadata = fs::metadata(path)?;
+    // 用 symlink_metadata 不跟随符号链接：若 path 是指向目录的符号链接，
+    // 应当只删链接本身（remove_file），绝不能递归删除链接目标的内容。
+    let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
         fs::remove_dir_all(path)?;
     } else {
