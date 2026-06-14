@@ -85,6 +85,7 @@ tree-sitter-go = "0.23"
 tree-sitter-toml-ng = "0.7"
 regex = "1.12.3"
 open = "5"
+mimalloc = "0.1.52"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

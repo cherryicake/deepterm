@@ -41,6 +41,11 @@ use crate::workspace::session_state::{
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::{Workspace, WorkspaceEvent};
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 // Define application-level actions
 actions!(app, [Quit, NewWindow]);
 
