@@ -4,7 +4,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render, ScrollHandle,
-    SharedString, Window, actions, div, px,
+    SharedString, Subscription, Window, actions, div, px,
 };
 
 use crate::assets::Icon;
@@ -28,6 +28,7 @@ pub struct KeychainSidebarView {
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     context_menu_item_id: Option<SharedString>,
     search_input: Entity<InputState>,
+    _search_subscription: Subscription,
     search_query: SharedString,
 }
 
@@ -54,7 +55,6 @@ impl KeychainSidebarView {
                     }
                 },
             );
-            std::mem::forget(subscription);
 
             Self {
                 focus_handle,
@@ -65,6 +65,7 @@ impl KeychainSidebarView {
                 on_select: None,
                 context_menu_item_id: None,
                 search_input,
+                _search_subscription: subscription,
                 search_query: SharedString::new_static(""),
             }
         })
@@ -78,10 +79,10 @@ impl KeychainSidebarView {
     }
 
     fn open_new_key_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.is_none() {
-            self.editor = Some(KeychainEditor::new(window, cx));
-        }
-        let editor = self.editor.as_ref().unwrap().clone();
+        let editor = self
+            .editor
+            .get_or_insert_with(|| KeychainEditor::new(window, cx))
+            .clone();
         let entity = cx.entity().clone();
         editor.update(cx, |ed, cx| {
             ed.start_new_key(cx);
@@ -108,10 +109,10 @@ impl KeychainSidebarView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editor.is_none() {
-            self.editor = Some(KeychainEditor::new(window, cx));
-        }
-        let editor = self.editor.as_ref().unwrap().clone();
+        let editor = self
+            .editor
+            .get_or_insert_with(|| KeychainEditor::new(window, cx))
+            .clone();
         let entity = cx.entity().clone();
         editor.update(cx, |ed, cx| {
             ed.load_item(item, cx);

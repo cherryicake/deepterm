@@ -5,8 +5,9 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
     collections::HashMap,
     ops::Deref,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
+use parking_lot::Mutex;
 
 use crate::{components::input::highlighter::languages, theme::ThemeAppearance};
 
@@ -497,20 +498,19 @@ impl LanguageRegistry {
     pub fn register(&self, lang: &str, config: &LanguageConfig) {
         self.languages
             .lock()
-            .unwrap()
             .insert(lang.into(), config.clone());
     }
 
     /// Returns a list of all registered language names.
     pub fn languages(&self) -> Vec<SharedString> {
-        self.languages.lock().unwrap().keys().cloned().collect()
+        self.languages.lock().keys().cloned().collect()
     }
 
     /// Returns the language configuration for the given language name.
     pub fn language(&self, name: &str) -> Option<LanguageConfig> {
         // Try to get by name first, there may have a custom language registered
         // Then try to get built-in language to support short language names, e.g. "js" for "javascript"
-        let languages = self.languages.lock().unwrap();
+        let languages = self.languages.lock();
         languages
             .get(name)
             .or_else(|| languages.get(languages::Language::from_str(name).name()))

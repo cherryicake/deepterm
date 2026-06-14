@@ -5,7 +5,7 @@
 //! serde + 同步小 JSON 读写。记录只发生在回车提交时（低频），开销可忽略。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -156,20 +156,20 @@ fn now_secs() -> i64 {
 
 /// 记录一条已提交命令行并立即持久化（线程安全）。
 pub fn record_command(command_line: &str) {
-    let mut history = global_history().lock().unwrap();
+    let mut history = global_history().lock();
     history.record(command_line, now_secs());
     history.save();
 }
 
 /// 取当前输入对应的历史候选（线程安全）。
 pub fn match_history(query: &str) -> Vec<HistoryEntry> {
-    let history = global_history().lock().unwrap();
+    let history = global_history().lock();
     history.matches(query, now_secs())
 }
 
 /// 克隆全局历史的内存快照（线程安全）。供补全管理器注入使用，避免每次按键读盘。
 pub fn snapshot() -> CommandHistory {
-    global_history().lock().unwrap().clone()
+    global_history().lock().clone()
 }
 
 /// 当前 unix 秒（供管理器计算 recency 排序）。

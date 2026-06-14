@@ -1324,7 +1324,8 @@ mod tests {
 
 // ── Global Executor ──────────────────────────────────────────────────────────
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use parking_lot::Mutex;
 
 static GLOBAL_EXECUTOR: OnceLock<Mutex<CommandExecutor>> = OnceLock::new();
 

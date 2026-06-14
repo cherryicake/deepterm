@@ -4,7 +4,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
-    ScrollHandle, SharedString, Window, div, px,
+    ScrollHandle, SharedString, Subscription, Window, div, px,
 };
 
 use crate::assets::Icon;
@@ -31,6 +31,7 @@ pub struct HostView {
     on_edit_host: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
     context_menu_host_id: Option<SharedString>,
     search_input: Entity<InputState>,
+    _search_subscription: Subscription,
     search_query: SharedString,
 }
 
@@ -57,7 +58,6 @@ impl HostView {
                     }
                 },
             );
-            std::mem::forget(subscription);
 
             Self {
                 focus_handle,
@@ -70,6 +70,7 @@ impl HostView {
                 on_edit_host: None,
                 context_menu_host_id: None,
                 search_input,
+                _search_subscription: subscription,
                 search_query: SharedString::new_static(""),
             }
         })
@@ -100,10 +101,10 @@ impl HostView {
     }
 
     fn open_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.host_form.is_none() {
-            self.host_form = Some(NewHostForm::new(window, cx));
-        }
-        let form = self.host_form.as_ref().unwrap().clone();
+        let form = self
+            .host_form
+            .get_or_insert_with(|| NewHostForm::new(window, cx))
+            .clone();
         let entity = cx.entity().clone();
         form.update(cx, |form, _cx| {
             form.reset(_cx);
@@ -130,10 +131,10 @@ impl HostView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.host_form.is_none() {
-            self.host_form = Some(NewHostForm::new(window, cx));
-        }
-        let form = self.host_form.as_ref().unwrap().clone();
+        let form = self
+            .host_form
+            .get_or_insert_with(|| NewHostForm::new(window, cx))
+            .clone();
         let entity = cx.entity().clone();
         form.update(cx, |form, cx| {
             form.edit_config(config, cx);

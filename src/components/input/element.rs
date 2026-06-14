@@ -364,12 +364,14 @@ impl TextElement {
             );
 
             if line_cursor_start.is_some() || line_cursor_end.is_some() {
-                let start = line_cursor_start
-                    .unwrap_or_else(|| line.position_for_index(0, last_layout, false).unwrap());
+                let start = line_cursor_start.unwrap_or_else(|| {
+                    line.position_for_index(0, last_layout, false)
+                        .unwrap_or(point(px(0.), px(0.)))
+                });
 
                 let end = line_cursor_end.unwrap_or_else(|| {
                     line.position_for_index(line.len(), last_layout, false)
-                        .unwrap()
+                        .unwrap_or(point(px(0.), px(0.)))
                 });
 
                 // Split the selection into multiple items
@@ -447,7 +449,9 @@ impl TextElement {
         // print_points_as_svg_path(&line_corners, &points);
 
         let path_origin = bounds.origin + point(line_number_width, px(0.));
-        let first_p = *points.get(0).unwrap();
+        let Some(&first_p) = points.first() else {
+            return None;
+        };
         let mut builder = gpui::PathBuilder::fill();
         builder.move_to(path_origin + first_p);
         for p in points.iter().skip(1) {

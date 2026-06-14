@@ -19,7 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::utils::shell_single_quote;
@@ -82,7 +83,7 @@ impl Drop for LeaseGuard {
     fn drop(&mut self) {
         let registry = registry();
         let lease_arc = {
-            let leases = registry.leases.lock().unwrap();
+            let leases = registry.leases.lock();
             leases.get(&self.key).cloned()
         };
         let Some(lease_arc) = lease_arc else {
@@ -92,7 +93,7 @@ impl Drop for LeaseGuard {
 
         // 决定是否要清理：refcount > 1 仅自减；归零时摘出 lease 并交后台线程清理。
         let to_cleanup = {
-            let mut lease = lease_arc.lock().unwrap();
+            let mut lease = lease_arc.lock();
             if lease.ref_count > 1 {
                 lease.ref_count -= 1;
                 log::info!(
@@ -102,7 +103,7 @@ impl Drop for LeaseGuard {
                 );
                 None
             } else {
-                let mut leases = registry.leases.lock().unwrap();
+                let mut leases = registry.leases.lock();
                 leases.remove(&self.key);
                 Some(ScpKeyLease {
                     local_temp_path: lease.local_temp_path.clone(),
@@ -195,11 +196,11 @@ pub fn acquire_lease(
     };
 
     // 1) 命中：存活检查 + ref_count + 1
-    let cached = registry().leases.lock().unwrap().get(&lease_key).cloned();
+    let cached = registry().leases.lock().get(&lease_key).cloned();
     if let Some(lease_arc) = cached {
-        let remote_key_path = lease_arc.lock().unwrap().remote_key_path.clone();
+        let remote_key_path = lease_arc.lock().remote_key_path.clone();
         if remote_key_alive(source_session, &remote_key_path) {
-            let mut lease = lease_arc.lock().unwrap();
+            let mut lease = lease_arc.lock();
             lease.ref_count += 1;
             log::info!(
                 "SCP 密钥租约复用: refs={} src={}@{} dst={}@{} key={}",
@@ -220,7 +221,7 @@ pub fn acquire_lease(
             "SCP 密钥租约失效（远端密钥已不存在），重新建立: {}",
             remote_key_path
         );
-        registry().leases.lock().unwrap().remove(&lease_key);
+        registry().leases.lock().remove(&lease_key);
     }
 
     // 2) 未命中：建租约
@@ -238,7 +239,6 @@ pub fn acquire_lease(
     registry()
         .leases
         .lock()
-        .unwrap()
         .insert(lease_key.clone(), Arc::new(Mutex::new(new_lease)));
 
     Ok(LeaseGuard {
@@ -264,7 +264,7 @@ fn sweep_stale_temp_dirs_once(
 ) {
     let key = config_key(source_config);
     {
-        let cleaned = registry().cleaned_sources.lock().unwrap();
+        let cleaned = registry().cleaned_sources.lock();
         if cleaned.contains(&key) {
             return;
         }
@@ -292,7 +292,7 @@ fn sweep_stale_temp_dirs_once(
         }
     }
 
-    registry().cleaned_sources.lock().unwrap().insert(key);
+    registry().cleaned_sources.lock().insert(key);
 }
 
 fn create_lease(

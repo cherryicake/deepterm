@@ -4,8 +4,10 @@
 //! 如果连接或认证失败，调用方应回退到 SshPtyTerminal（ssh_pty.rs）。
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener};
 use russh::client::AuthResult;
@@ -29,18 +31,62 @@ enum InputMsg {
 }
 
 /// russh 客户端事件处理器
-struct SshClientHandler;
+struct SshClientHandler {
+    host: String,
+    port: u16,
+}
 
 impl client::Handler for SshClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO: 根据 known_hosts 文件验证主机密钥
-        // 目前接受所有主机密钥（等同于 StrictHostKeyChecking=accept-new）
-        Ok(true)
+        match russh::keys::known_hosts::check_known_hosts(
+            &self.host,
+            self.port,
+            server_public_key,
+        ) {
+            Ok(true) => {
+                log::debug!(
+                    "russh: 主机密钥已知且匹配: {}:{}",
+                    self.host,
+                    self.port
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                // 主机未知，自动添加到 known_hosts（accept-new 行为）
+                log::info!(
+                    "russh: 新主机 {}:{}，自动添加密钥到 known_hosts",
+                    self.host,
+                    self.port
+                );
+                if let Err(e) = russh::keys::known_hosts::learn_known_hosts(
+                    &self.host,
+                    self.port,
+                    server_public_key,
+                ) {
+                    log::warn!("russh: 写入 known_hosts 失败: {}", e);
+                }
+                Ok(true)
+            }
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                log::error!(
+                    "russh: 主机密钥已变更！{}:{} known_hosts 第 {} 行不匹配",
+                    self.host,
+                    self.port,
+                    line
+                );
+                Err(russh::Error::Inconsistent)
+            }
+            Err(e) => {
+                log::warn!("russh: known_hosts 检查出错: {}", e);
+                // 检查出错时接受密钥（兼容性）
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -100,7 +146,7 @@ impl RusshTerminal {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let mut state = state_for_task.lock().unwrap();
+                        let mut state = state_for_task.lock();
                         state.failed = true;
                         state.error_message = Some(format!("创建 tokio 运行时失败: {}", e));
                         return;
@@ -121,7 +167,7 @@ impl RusshTerminal {
 
                             // 获取待处理的输入和大小调整
                             let (pending_input, pending_resize) = {
-                                let mut state = state_for_task.lock().unwrap();
+                                let mut state = state_for_task.lock();
                                 let input = std::mem::take(&mut state.pending_input);
                                 let resize = state.pending_resize.take();
                                 (input, resize)
@@ -140,7 +186,7 @@ impl RusshTerminal {
 
                             // 存储到状态
                             {
-                                let mut state = state_for_task.lock().unwrap();
+                                let mut state = state_for_task.lock();
                                 state.terminal = Some(RusshTerminalInner { input_tx });
                             }
 
@@ -157,7 +203,7 @@ impl RusshTerminal {
                         Err(e) => {
                             log::warn!("russh: 连接失败: {}", e);
                             {
-                                let mut state = state_for_task.lock().unwrap();
+                                let mut state = state_for_task.lock();
                                 state.failed = true;
                                 state.error_message = Some(e.to_string());
                             }
@@ -174,24 +220,24 @@ impl RusshTerminal {
 
     /// 检查连接是否已失败
     pub fn is_failed(&self) -> bool {
-        self.state.lock().unwrap().failed
+        self.state.lock().failed
     }
 
     /// 获取失败原因（如果连接失败）
     pub fn error_message(&self) -> Option<String> {
-        self.state.lock().unwrap().error_message.clone()
+        self.state.lock().error_message.clone()
     }
 
     /// 检查连接是否已就绪
     pub fn is_ready(&self) -> bool {
-        self.state.lock().unwrap().terminal.is_some()
+        self.state.lock().terminal.is_some()
     }
 
     /// 向 SSH 通道发送数据（键盘输入等）
     ///
     /// 如果连接尚未就绪，数据会被缓存，连接成功后自动发送。
     pub fn write(&self, data: &[u8]) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
 
         if let Some(ref terminal) = state.terminal {
             // 连接已就绪，直接发送
@@ -210,7 +256,7 @@ impl RusshTerminal {
     ///
     /// 如果连接尚未就绪，大小调整会被缓存，连接成功后自动发送。
     pub fn resize(&self, cols: u16, rows: u16) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
 
         if let Some(ref terminal) = state.terminal {
             // 连接已就绪，直接发送
@@ -226,7 +272,7 @@ impl RusshTerminal {
 
     /// 关闭 SSH 连接
     pub fn close(&self) {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
 
         if let Some(ref terminal) = state.terminal {
             terminal.input_tx.send(InputMsg::Close).ok();
@@ -254,7 +300,10 @@ impl RusshTerminal {
         let mut handle = client::connect(
             russh_config,
             (config.host.as_str(), config.port),
-            SshClientHandler,
+            SshClientHandler {
+                host: config.host.clone(),
+                port: config.port,
+            },
         )
         .await
         .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {}", e))?;

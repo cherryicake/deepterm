@@ -3,7 +3,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -710,12 +711,12 @@ fn get_or_connect_session(
     config: &SshConnectionConfig,
     key: &str,
 ) -> anyhow::Result<SharedBlockingSftpSession> {
-    if let Some(session) = session_cache().lock().unwrap().get(key).cloned() {
+    if let Some(session) = session_cache().lock().get(key).cloned() {
         return Ok(session);
     }
 
     let session = Arc::new(Mutex::new(BlockingSftpSession::connect(config)?));
-    let mut cache = session_cache().lock().unwrap();
+    let mut cache = session_cache().lock();
     Ok(cache
         .entry(key.to_string())
         .or_insert_with(|| session.clone())
@@ -723,7 +724,7 @@ fn get_or_connect_session(
 }
 
 fn evict_session(key: &str, session: &SharedBlockingSftpSession) {
-    let mut cache = session_cache().lock().unwrap();
+    let mut cache = session_cache().lock();
     if cache
         .get(key)
         .is_some_and(|cached| Arc::ptr_eq(cached, session))
@@ -739,12 +740,12 @@ pub fn with_cached_session<T>(
     let key = cache_key(config);
     let session = get_or_connect_session(config, &key)?;
 
-    match f(&mut session.lock().unwrap()) {
+    match f(&mut session.lock()) {
         Ok(result) => Ok(result),
         Err(_) => {
             evict_session(&key, &session);
             let session = get_or_connect_session(config, &key)?;
-            f(&mut session.lock().unwrap())
+            f(&mut session.lock())
         }
     }
 }
@@ -755,7 +756,7 @@ pub fn with_cached_session_once<T>(
 ) -> anyhow::Result<T> {
     let key = cache_key(config);
     let session = get_or_connect_session(config, &key)?;
-    f(&mut session.lock().unwrap())
+    f(&mut session.lock())
 }
 
 impl Drop for BlockingSftpSession {

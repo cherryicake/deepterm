@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, Render, Stateful, Window, div, px, svg,
+    MouseButton, Render, Stateful, Subscription, Window, div, px, svg,
 };
 
 use crate::assets::Icon;
@@ -128,6 +128,7 @@ pub struct RemoteFileBrowserView {
     focus_handle: FocusHandle,
     ssh_config: SshConnectionConfig,
     search_input: Entity<InputState>,
+    _search_subscription: Subscription,
     search_query: String,
     home_path: Option<String>,
     root_path: String,
@@ -169,12 +170,12 @@ impl RemoteFileBrowserView {
                     }
                 },
             );
-            std::mem::forget(subscription);
 
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
                 ssh_config,
                 search_input,
+                _search_subscription: subscription,
                 search_query: String::new(),
                 home_path: None,
                 root_path: "/".to_string(),

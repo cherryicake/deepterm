@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use gpui::prelude::*;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, Render, Stateful, Window, div, px, svg, uniform_list,
+    MouseButton, Render, Stateful, Subscription, Window, div, px, svg, uniform_list,
 };
 
 use crate::assets::Icon;
@@ -131,6 +131,7 @@ struct FilePreview {
 pub struct FileBrowserView {
     focus_handle: FocusHandle,
     search_input: Entity<InputState>,
+    _search_subscription: Subscription,
     search_query: String,
     root_path: PathBuf,
     selected_path: Option<PathBuf>,
@@ -167,12 +168,11 @@ impl FileBrowserView {
                     }
                 },
             );
-            // Keep subscription alive for the lifetime of the view
-            std::mem::forget(subscription);
 
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
                 search_input,
+                _search_subscription: subscription,
                 search_query: String::new(),
                 root_path: Self::default_root_path(),
                 selected_path: None,

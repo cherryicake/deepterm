@@ -1393,7 +1393,7 @@ impl TerminalView {
 
         // 执行命令
         let result = {
-            let executor = global_executor().lock().unwrap();
+            let executor = global_executor().lock();
             executor.execute(&command, argument, ctx)
         };
 

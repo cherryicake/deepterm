@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use parking_lot::Mutex;
 
 use russh::client::{AuthResult, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
@@ -26,16 +27,14 @@ fn auth_cache_key(config: &SshConnectionConfig) -> String {
 
 /// 记录一次成功的"磁盘密钥 → 目标"认证关系。
 pub fn record_authenticated_key(config: &SshConnectionConfig, path: &Path) {
-    if let Ok(mut map) = auth_key_cache().lock() {
-        map.insert(auth_cache_key(config), path.to_path_buf());
-    }
+    let mut map = auth_key_cache().lock();
+    map.insert(auth_cache_key(config), path.to_path_buf());
 }
 
 /// 查询某个目标最近一次认证成功用的磁盘密钥。
 pub fn lookup_authenticated_key(config: &SshConnectionConfig) -> Option<PathBuf> {
     auth_key_cache()
         .lock()
-        .ok()?
         .get(&auth_cache_key(config))
         .cloned()
 }

@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 use gpui::prelude::*;
@@ -216,7 +217,7 @@ fn render_transfer_list_item(
         action.hint_text().to_string()
     } else if is_running && !is_transferring {
         // 连接尝试阶段：显示策略提示（如 "直连(agent forwarding)..."）
-        let msg = task.status_message.lock().unwrap();
+        let msg = task.status_message.lock();
         if msg.is_empty() {
             "准备中...".to_string()
         } else {

@@ -220,16 +220,7 @@ impl SshGlobalState {
         }
     }
 
-    /// 获取连接管理器的引用
-    pub fn manager(
-        &self,
-    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, SshConnectionManager>> {
-        // Note: parking_lot::Mutex doesn't return a Result, it returns the guard directly
-        // We keep this signature for compatibility with standard Mutex API
-        panic!("Use manager_lock() for parking_lot Mutex")
-    }
-
-    /// 获取连接管理器的锁（parking_lot 版本）
+    /// 获取连接管理器的锁
     pub fn manager_lock(&self) -> parking_lot::MutexGuard<'_, SshConnectionManager> {
         self.manager.lock()
     }

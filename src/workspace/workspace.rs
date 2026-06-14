@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use parking_lot::Mutex;
 
 use gpui::{
     AnyWindowHandle, App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable,
@@ -1214,7 +1215,7 @@ impl Workspace {
 
         // 从队列中取出所有待处理的输入（只处理属于当前Workspace的输入）
         let inputs: Vec<(String, Vec<u8>)> = {
-            let mut queue = get_broadcast_queue().lock().unwrap();
+            let mut queue = get_broadcast_queue().lock();
             if queue.is_empty() {
                 return;
             }
@@ -1235,7 +1236,7 @@ impl Workspace {
 
     /// 添加输入到广播队列（由TerminalView调用）
     pub fn queue_broadcast_input(workspace_id: &str, panel_id: &str, data: &[u8]) {
-        let mut queue = get_broadcast_queue().lock().unwrap();
+        let mut queue = get_broadcast_queue().lock();
         queue.push((
             workspace_id.to_string(),
             panel_id.to_string(),
@@ -1336,7 +1337,9 @@ impl Workspace {
 
         // 从container中移除指定的panel
         let new_container = {
-            let tab_info = self.tabs.get_mut(&target_tab_id).unwrap();
+            let Some(tab_info) = self.tabs.get_mut(&target_tab_id) else {
+                return;
+            };
             tab_info.container.remove_panel(panel_id, cx)
         };
 
@@ -1355,7 +1358,9 @@ impl Workspace {
 
         let panel_count = new_container.panel_count();
         // 更新container
-        let tab_info = self.tabs.get_mut(&target_tab_id).unwrap();
+        let Some(tab_info) = self.tabs.get_mut(&target_tab_id) else {
+            return;
+        };
         tab_info.container = new_container;
 
         // 如果移除后只剩一个panel，更新tab类型为Normal
@@ -2421,7 +2426,7 @@ struct TaskStatusReporter {
 
 impl TransferStatusReporter for TaskStatusReporter {
     fn report(&self, message: String) {
-        let mut guard = self.status_message.lock().unwrap();
+        let mut guard = self.status_message.lock();
         *guard = message;
     }
     fn set_total_bytes(&self, bytes: u64) {
