@@ -85,6 +85,7 @@ pub struct SshConnectView {
     /// 动画帧计数（用于 "..." 点动画）
     frame: u32,
     /// 动画任务（持有此字段使任务保持运行，drop 时自动停止）
+    #[allow(dead_code)]
     animation_task: Option<Task<()>>,
 }
 

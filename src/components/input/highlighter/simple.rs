@@ -125,7 +125,7 @@ impl SimpleHighlighter {
             }
         }
 
-        self.tree = self.parser.parse_with(
+        self.tree = self.parser.parse_with_options(
             &mut |offset, _| {
                 if offset >= self.text.len() {
                     return &[] as &[u8];
@@ -135,6 +135,7 @@ impl SimpleHighlighter {
                 chunk.as_bytes().get(start_in_chunk..).unwrap_or(&[])
             },
             old_tree.as_ref(),
+            None,
         );
         true
     }

@@ -320,7 +320,7 @@ pub fn truncate_middle(name: &str, max_chars: usize) -> String {
     let suffix_start_char = char_count - suffix_len;
     let mut suffix_start_byte = name.len();
     count = 0;
-    for (i, ch) in name.char_indices() {
+    for (i, _) in name.char_indices() {
         count += 1;
         if count == suffix_start_char {
             suffix_start_byte = i;

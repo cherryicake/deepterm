@@ -5,7 +5,7 @@ use gpui::{App, MouseButton, ScrollHandle, Window, div, px};
 
 use crate::assets::Icon;
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
-use crate::theme::{ActiveTheme, ThemeState};
+use crate::theme::ThemeState;
 
 /// 渲染主题侧边栏视图
 pub fn render_theme_sidebar<F>(

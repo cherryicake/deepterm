@@ -114,7 +114,7 @@ impl CommandHistory {
     /// 按整行大小写不敏感子串匹配，按最近使用时间从新到旧返回 Top-N。
     ///
     /// `query` 为当前输入的整行（如 `/sc`、`/scp ali`）。空 query 返回最近使用的若干条。
-    pub fn matches(&self, query: &str, now: i64) -> Vec<HistoryEntry> {
+    pub fn matches(&self, query: &str) -> Vec<HistoryEntry> {
         let q = query.trim().to_lowercase();
         let mut hits: Vec<&HistoryEntry> = self
             .entries
@@ -164,7 +164,7 @@ pub fn record_command(command_line: &str) {
 /// 取当前输入对应的历史候选（线程安全）。
 pub fn match_history(query: &str) -> Vec<HistoryEntry> {
     let history = global_history().lock();
-    history.matches(query, now_secs())
+    history.matches(query)
 }
 
 /// 克隆全局历史的内存快照（线程安全）。供补全管理器注入使用，避免每次按键读盘。
@@ -204,7 +204,7 @@ mod tests {
         let mut h = CommandHistory::default();
         h.record("/scp alice:/etc/hosts ./", 100);
         h.record("/open /var/log", 100);
-        let hits = h.matches("ALI", 200);
+        let hits = h.matches("ALI");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].command_line, "/scp alice:/etc/hosts ./");
     }
@@ -214,9 +214,9 @@ mod tests {
         let mut h = CommandHistory::default();
         h.record("/scp a b", 100);
         // 输入与历史完全一致时不应把自己作为候选
-        assert!(h.matches("/scp a b", 200).is_empty());
+        assert!(h.matches("/scp a b").is_empty());
         // 但作为子串前缀仍可召回
-        assert_eq!(h.matches("/scp a", 200).len(), 1);
+        assert_eq!(h.matches("/scp a").len(), 1);
     }
 
     #[test]
@@ -225,7 +225,7 @@ mod tests {
         h.record("/scp rare:/x ./", 100);
         h.record("/scp common:/y ./", 100);
         h.record("/scp common:/y ./", 150);
-        let hits = h.matches("/scp", 200);
+        let hits = h.matches("/scp");
         assert_eq!(hits[0].command_line, "/scp common:/y ./");
     }
 

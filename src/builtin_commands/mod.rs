@@ -225,9 +225,8 @@ impl BuiltinCommandManager {
 
     /// 按当前缓冲重算历史候选；缓冲为空时清空。
     fn refresh_history_matches(&mut self) {
-        let now = history::current_unix_secs();
         self.history_matches = match self.query() {
-            Some(q) if !q.trim().is_empty() => self.history.matches(q, now),
+            Some(q) if !q.trim().is_empty() => self.history.matches(q),
             _ => Vec::new(),
         };
         // 列表变化后 clamp 选中项
