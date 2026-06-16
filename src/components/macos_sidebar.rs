@@ -5,8 +5,9 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollHandle, Subscription, WeakEntity, Window, anchored, deferred, div, ease_in_out, px,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, ScrollHandle, Subscription, WeakEntity, Window, WindowControlArea, anchored, deferred,
+    div, ease_in_out, px,
 };
 
 use crate::assets::Icon;
@@ -146,6 +147,7 @@ pub struct MacosSidebar {
     keychain_view: Option<Entity<KeychainSidebarView>>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
+    dragging: bool,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
     tab_group_menu_open: bool,
@@ -197,6 +199,7 @@ impl MacosSidebar {
             keychain_view: None,
             width: 280.0,
             resize_drag_x: None,
+            dragging: false,
             app_window: None,
             on_tab_group_select: None,
             tab_group_menu_open: false,
@@ -1590,7 +1593,45 @@ impl Render for MacosSidebar {
                 )
             };
 
+        let is_macos = cfg!(target_os = "macos");
+        let is_web = cfg!(target_arch = "wasm32");
+
+        // 顶部空白区域：允许在此处拖拽整个窗口；按钮稍后渲染在上方，不会阻挡点击。
+        let drag_region = div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(48.0))
+            .when(!is_macos && !is_web, |this| {
+                this.window_control_area(WindowControlArea::Drag)
+            })
+            .when(is_macos, |this| {
+                this.on_mouse_down_out(cx.listener(|this, _, _, _| {
+                    this.dragging = false;
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.dragging = false;
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.dragging = true;
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, _, window, _| {
+                    if this.dragging {
+                        this.dragging = false;
+                        window.start_window_move();
+                    }
+                }))
+            });
+
         let inner = div()
+            .relative()
             .h_full()
             .rounded(px(12.0))
             .bg(glass_bg(is_dark))
@@ -1602,6 +1643,7 @@ impl Render for MacosSidebar {
             .pb(px(16.0))
             .pl(px(12.0))
             .pr(px(12.0))
+            .child(drag_region)
             .child(match self.current_view {
                 SidebarView::Menu => self
                     .render_menu_content(cx, is_dark, theme)

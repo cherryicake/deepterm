@@ -81,6 +81,7 @@ pub enum TerminalBlink {
     TerminalControlled,
 }
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
+const TAB_LABEL_DEBOUNCE_DELAY: Duration = Duration::from_millis(100);
 
 // Scroll velocity tracking constants
 const SCROLL_VELOCITY_WINDOW_SIZE: usize = 3;
@@ -195,6 +196,10 @@ pub struct TerminalView {
     // ── Tab label tracking ─────────────────────────────────────────────────
     /// 上一次计算出的 tab 标签，用于检测是否需要更新
     last_tab_label: Option<String>,
+    /// Tab 标签防抖：延迟计算任务
+    tab_label_debounce_task: Option<Task<()>>,
+    /// Tab 标签是否需要在防抖触发后重新计算
+    tab_label_pending: bool,
 }
 
 /// SSH 连接状态检查结果
@@ -433,6 +438,8 @@ impl TerminalView {
                 toast_message: None,
                 toast_hide_task: None,
                 last_tab_label: None,
+                tab_label_debounce_task: None,
+                tab_label_pending: false,
             };
             this.update_title(cx);
             this.last_tab_label = Some(this.tab_label(cx));
@@ -595,6 +602,8 @@ impl TerminalView {
                 toast_message: None,
                 toast_hide_task: None,
                 last_tab_label: None,
+                tab_label_debounce_task: None,
+                tab_label_pending: false,
             };
 
             // 订阅 SshConnectView 的重新连接事件并存储订阅
@@ -862,8 +871,26 @@ impl TerminalView {
         }
     }
 
-    /// 检查 tab 标签是否发生变化，只在变化时触发更新。
+    /// 检查 tab 标签是否发生变化，带防抖：首次立即计算，后续快速调用在间隔内只触发一次。
     fn check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
+        if self.tab_label_debounce_task.is_none() {
+            self.do_check_tab_label_changed(cx);
+            self.tab_label_debounce_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(TAB_LABEL_DEBOUNCE_DELAY).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.tab_label_debounce_task = None;
+                    if this.tab_label_pending {
+                        this.tab_label_pending = false;
+                        this.do_check_tab_label_changed(cx);
+                    }
+                });
+            }));
+            return;
+        }
+        self.tab_label_pending = true;
+    }
+
+    fn do_check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
         let current = self.tab_label(cx);
         if self.last_tab_label.as_deref() != Some(&current) {
             self.last_tab_label = Some(current);

@@ -1054,6 +1054,12 @@ impl Terminal {
                             .ok()
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
+                            .map(|s| {
+                                std::path::Path::new(&s)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or(s)
+                            })
                     } else {
                         None
                     }
