@@ -66,7 +66,6 @@ pub struct AppWindow {
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
-    _session_save_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
     persistence: PersistenceManager,
@@ -175,7 +174,6 @@ impl AppWindow {
             ssh_picker,
             sidebar,
             _sidebar_hide_task: None,
-            _session_save_task: None,
             host_view,
             keychain_view,
             persistence,
@@ -186,25 +184,8 @@ impl AppWindow {
         if let Some(session) = session {
             this.restore_tab_group_workspaces(session, cx);
         }
-        this.start_periodic_session_save(cx);
 
         this
-    }
-
-    fn start_periodic_session_save(&mut self, cx: &mut Context<Self>) {
-        self._session_save_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(5)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.save_session(cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
     }
 
     fn subscribe_workspace_events(

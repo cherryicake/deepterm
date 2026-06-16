@@ -139,20 +139,11 @@ impl RusshTerminal {
         let driver_listener_for_task = driver_listener.clone();
         let initial_cwd_for_task = initial_cwd.clone();
 
-        // 在独立线程中启动 tokio 运行时进行连接
+        // 在独立线程中使用共享 tokio runtime 进行连接
         std::thread::Builder::new()
             .name(format!("russh-{}", config.host))
             .spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let mut state = state_for_task.lock();
-                        state.failed = true;
-                        state.error_message = Some(format!("创建 tokio 运行时失败: {}", e));
-                        return;
-                    }
-                };
-
+                let rt = crate::ssh::shared_runtime::shared_ssh_runtime();
                 rt.block_on(async move {
                     match Self::connect_and_setup(
                         &config_clone,

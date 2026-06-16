@@ -60,7 +60,6 @@ impl client::Handler for SftpClientHandler {
 }
 
 pub struct BlockingSftpSession {
-    runtime: tokio::runtime::Runtime,
     handle: client::Handle<SftpClientHandler>,
     sftp: SftpSession,
     /// 懒启的 bulk 通道：为管道化批量 read/write 使用独立 SFTP subsystem，
@@ -72,10 +71,9 @@ impl BlockingSftpSession {
     const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
     pub fn connect(config: &SshConnectionConfig) -> anyhow::Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let (handle, sftp) = runtime.block_on(connect_sftp(config))?;
+        let rt = crate::ssh::shared_runtime::shared_ssh_runtime();
+        let (handle, sftp) = rt.block_on(connect_sftp(config))?;
         Ok(Self {
-            runtime,
             handle,
             sftp,
             bulk: None,
@@ -90,14 +88,14 @@ impl BlockingSftpSession {
         if let Some(existing) = &self.bulk {
             return Ok(existing.clone());
         }
-        let session = self.runtime.block_on(open_raw_sftp_session(&self.handle))?;
+        let session = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(open_raw_sftp_session(&self.handle))?;
         let arc = Arc::new(session);
         self.bulk = Some(arc.clone());
         Ok(arc)
     }
 
     pub fn canonicalize(&mut self, path: &str) -> anyhow::Result<String> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             self.sftp
                 .canonicalize(path)
                 .await
@@ -106,7 +104,7 @@ impl BlockingSftpSession {
     }
 
     pub fn metadata(&mut self, path: &str) -> anyhow::Result<RemoteFileMetadata> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let metadata = self.sftp.metadata(path).await?;
             Ok(convert_metadata(
                 metadata.file_type(),
@@ -120,7 +118,7 @@ impl BlockingSftpSession {
     /// 与 [`metadata`](Self::metadata) 相同，但**不跟随符号链接**：返回链接自身的属性。
     /// 用于删源等需要区分"链接本身"与"链接目标"的场景，避免误删/误递归到目标。
     pub fn symlink_metadata(&mut self, path: &str) -> anyhow::Result<RemoteFileMetadata> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let metadata = self.sftp.symlink_metadata(path).await?;
             Ok(convert_metadata(
                 metadata.file_type(),
@@ -132,14 +130,14 @@ impl BlockingSftpSession {
     }
 
     pub fn permissions(&mut self, path: &str) -> anyhow::Result<Option<u32>> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let metadata = self.sftp.metadata(path).await?;
             Ok(metadata.permissions)
         })
     }
 
     pub fn set_permissions(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let mut attrs = FileAttributes::empty();
             attrs.permissions = Some(mode);
             self.sftp.set_metadata(path, attrs).await?;
@@ -148,7 +146,7 @@ impl BlockingSftpSession {
     }
 
     pub fn exists(&mut self, path: &str) -> anyhow::Result<bool> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             self.sftp
                 .try_exists(path)
                 .await
@@ -173,7 +171,7 @@ impl BlockingSftpSession {
                 continue;
             }
 
-            self.runtime
+            crate::ssh::shared_runtime::shared_ssh_runtime()
                 .block_on(async { self.sftp.create_dir(current.clone()).await })?;
         }
 
@@ -181,7 +179,7 @@ impl BlockingSftpSession {
     }
 
     pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             self.sftp
                 .rename(from, to)
                 .await
@@ -190,7 +188,7 @@ impl BlockingSftpSession {
     }
 
     pub fn remove_file(&mut self, path: &str) -> anyhow::Result<()> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             self.sftp
                 .remove_file(path)
                 .await
@@ -199,7 +197,7 @@ impl BlockingSftpSession {
     }
 
     pub fn remove_dir(&mut self, path: &str) -> anyhow::Result<()> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             self.sftp
                 .remove_dir(path)
                 .await
@@ -237,7 +235,7 @@ impl BlockingSftpSession {
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
         let mut local_file = File::open(local_path)?;
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let mut remote_file = self.sftp.create(remote_path).await?;
             let mut transferred = 0;
             let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
@@ -301,7 +299,7 @@ impl BlockingSftpSession {
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
         let mut local_file = File::create(local_path)?;
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let mut remote_file = self.sftp.open(remote_path).await?;
             let mut transferred = 0;
             let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
@@ -355,7 +353,7 @@ impl BlockingSftpSession {
         let bulk = self.bulk_session()?;
         let config = ParallelTransferConfig::from_env();
 
-        let transferred = self.runtime.block_on(pipelined_copy_between(
+        let transferred = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
             bulk.clone(),
             source_path,
             bulk,
@@ -403,7 +401,7 @@ impl BlockingSftpSession {
         let dest_raw = destination_session.bulk_session()?;
         let config = ParallelTransferConfig::from_env();
 
-        self.runtime.block_on(pipelined_copy_between(
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
             source_raw,
             source_path,
             dest_raw,
@@ -416,7 +414,7 @@ impl BlockingSftpSession {
     }
 
     pub fn read_dir(&mut self, path: &str) -> anyhow::Result<Vec<RemoteFileEntry>> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let entries = self
                 .sftp
                 .read_dir(path)
@@ -442,7 +440,7 @@ impl BlockingSftpSession {
         use crate::file_browser::shared::is_binary_content;
         const PREVIEW_BYTES: usize = 64 * 1024;
 
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.take(PREVIEW_BYTES as u64)
@@ -545,7 +543,7 @@ impl BlockingSftpSession {
         mut progress_cb: Option<&mut dyn FnMut(&[u8])>,
         agent_forward: bool,
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.runtime.block_on(async {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let mut channel = self
                 .handle
                 .channel_open_session()
@@ -761,7 +759,8 @@ pub fn with_cached_session_once<T>(
 
 impl Drop for BlockingSftpSession {
     fn drop(&mut self) {
-        self.runtime.block_on(async {
+        let rt = crate::ssh::shared_runtime::shared_ssh_runtime();
+        rt.block_on(async {
             let _ = self.sftp.close().await;
             let _ = self
                 .handle
