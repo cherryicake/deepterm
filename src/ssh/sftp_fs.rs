@@ -658,9 +658,33 @@ impl RemoteCommandResult {
 
 type SharedBlockingSftpSession = Arc<Mutex<BlockingSftpSession>>;
 
-fn session_cache() -> &'static Mutex<HashMap<String, SharedBlockingSftpSession>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, SharedBlockingSftpSession>>> = OnceLock::new();
+/// SFTP 会话缓存条目：会话 + 最后访问时间
+struct CacheEntry {
+    session: SharedBlockingSftpSession,
+    last_access: std::time::Instant,
+}
+
+/// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理
+const SFTP_SESSION_IDLE_TIMEOUT: u64 = 300; // 5 分钟
+
+fn session_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 清理空闲超时的 SFTP 会话
+fn evict_stale_sessions() {
+    let mut cache = session_cache().lock();
+    let now = std::time::Instant::now();
+    let stale_keys: Vec<String> = cache
+        .iter()
+        .filter(|(_, entry)| now.duration_since(entry.last_access).as_secs() > SFTP_SESSION_IDLE_TIMEOUT)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in stale_keys {
+        log::debug!("Evicting stale SFTP session: {}", key);
+        cache.remove(&key);
+    }
 }
 
 fn cache_key(config: &SshConnectionConfig) -> String {
@@ -709,15 +733,27 @@ fn get_or_connect_session(
     config: &SshConnectionConfig,
     key: &str,
 ) -> anyhow::Result<SharedBlockingSftpSession> {
-    if let Some(session) = session_cache().lock().get(key).cloned() {
-        return Ok(session);
+    // 每次获取会话时清理空闲超时的会话
+    evict_stale_sessions();
+
+    if session_cache().lock().contains_key(key) {
+        // 更新最后访问时间
+        let mut cache = session_cache().lock();
+        if let Some(entry) = cache.get_mut(key) {
+            entry.last_access = std::time::Instant::now();
+        }
+        return Ok(cache.get(key).unwrap().session.clone());
     }
 
     let session = Arc::new(Mutex::new(BlockingSftpSession::connect(config)?));
     let mut cache = session_cache().lock();
     Ok(cache
         .entry(key.to_string())
-        .or_insert_with(|| session.clone())
+        .or_insert_with(|| CacheEntry {
+            session: session.clone(),
+            last_access: std::time::Instant::now(),
+        })
+        .session
         .clone())
 }
 
@@ -725,7 +761,7 @@ fn evict_session(key: &str, session: &SharedBlockingSftpSession) {
     let mut cache = session_cache().lock();
     if cache
         .get(key)
-        .is_some_and(|cached| Arc::ptr_eq(cached, session))
+        .is_some_and(|entry| Arc::ptr_eq(&entry.session, session))
     {
         cache.remove(key);
     }

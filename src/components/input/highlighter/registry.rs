@@ -475,21 +475,25 @@ impl HighlightTheme {
 }
 
 /// Registry for code highlighter languages.
+///
+/// Languages are loaded lazily on first access to reduce startup memory usage.
 pub struct LanguageRegistry {
+    /// All known language names (populated at startup)
+    language_names: Mutex<Vec<SharedString>>,
+    /// Loaded language configs (populated on demand)
     languages: Mutex<HashMap<SharedString, LanguageConfig>>,
 }
 
 impl LanguageRegistry {
-    /// Returns the singleton instance of the `LanguageRegistry` with default languages and themes.
+    /// Returns the singleton instance of the `LanguageRegistry`.
     pub fn singleton() -> &'static LazyLock<LanguageRegistry> {
         static INSTANCE: LazyLock<LanguageRegistry> = LazyLock::new(|| LanguageRegistry {
-            languages: Mutex::new(
+            language_names: Mutex::new(
                 languages::Language::all()
-                    .map(|language: languages::Language| {
-                        (language.name().into(), language.config())
-                    })
-                    .collect::<HashMap<SharedString, LanguageConfig>>(),
+                    .map(|l| SharedString::from(l.name()))
+                    .collect(),
             ),
+            languages: Mutex::new(HashMap::new()),
         });
         &INSTANCE
     }
@@ -503,18 +507,30 @@ impl LanguageRegistry {
 
     /// Returns a list of all registered language names.
     pub fn languages(&self) -> Vec<SharedString> {
-        self.languages.lock().keys().cloned().collect()
+        self.language_names.lock().clone()
     }
 
     /// Returns the language configuration for the given language name.
+    /// Configs are loaded lazily on first access.
     pub fn language(&self, name: &str) -> Option<LanguageConfig> {
         // Try to get by name first, there may have a custom language registered
-        // Then try to get built-in language to support short language names, e.g. "js" for "javascript"
-        let languages = self.languages.lock();
-        languages
-            .get(name)
-            .or_else(|| languages.get(languages::Language::from_str(name).name()))
-            .cloned()
+        if let Some(config) = self.languages.lock().get(name) {
+            return Some(config.clone());
+        }
+
+        // Try to get built-in language to support short language names, e.g. "js" for "javascript"
+        let enum_name = languages::Language::from_str(name).name();
+
+        // Check if already loaded by enum name
+        if let Some(config) = self.languages.lock().get(enum_name) {
+            return Some(config.clone());
+        }
+
+        // Lazy-load: find the language enum and create its config
+        let lang_enum = languages::Language::all().find(|l| l.name() == enum_name)?;
+        let config = lang_enum.config();
+        self.languages.lock().insert(enum_name.into(), config.clone());
+        Some(config)
     }
 }
 
