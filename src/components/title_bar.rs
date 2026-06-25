@@ -520,7 +520,7 @@ impl Render for TitleBar {
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
                 this.child(
                     div()
-                        .flex_shrink(1.0)
+                        .flex_shrink()
                         .min_w_0() // 允许收缩到 0 宽度
                         // 让 TabBar 可以收缩，但不会挤压窗口控制按钮
                         .when(!is_macos && !is_web, |div| {
