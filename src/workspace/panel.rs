@@ -1199,7 +1199,6 @@ impl Render for Panel {
                         offset: point(px(2.), px(4.)),
                         blur_radius: px(20.),
                         spread_radius: px(-4.),
-                        inset: false,
                     }])
             })
             .rounded(px(12.0))
