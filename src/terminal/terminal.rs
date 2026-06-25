@@ -1678,7 +1678,7 @@ impl Terminal {
         }
         for range in &content.url_ranges[viewport_row] {
             if col >= range.start_col && col < range.end_col {
-                return Some((range.url.as_str().into(), range.start_col, range.end_col));
+                return Some((range.url.clone().into(), range.start_col, range.end_col));
             }
         }
         None
