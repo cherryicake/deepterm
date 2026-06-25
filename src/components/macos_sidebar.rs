@@ -1329,7 +1329,7 @@ impl MacosSidebar {
                         deferred(
                             anchored()
                                 .position(position)
-                                .anchor(gpui::Anchor::TopLeft)
+                                .anchor(gpui::Corner::TopLeft)
                                 .snap_to_window_with_margin(px(8.))
                                 .child(menu),
                         )
