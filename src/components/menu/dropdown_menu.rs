@@ -1,4 +1,6 @@
-use gpui::{Anchor, Context, ElementId, InteractiveElement, IntoElement, RenderOnce, Window};
+use gpui::{Context, ElementId, InteractiveElement, IntoElement, RenderOnce, Window};
+
+use crate::components::menu::Anchor;
 
 use crate::components::button::Selectable;
 use crate::components::menu::PopupMenu;

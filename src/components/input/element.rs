@@ -751,12 +751,12 @@ impl TextElement {
 
         // Empty to use placeholder, the placeholder is not in the wrapper map.
         if state.text.len() == 0 {
-            return display_text
-                .to_string()
+            let text = display_text.to_string();
+            return text
                 .split("\n")
                 .map(|line| {
                     let shaped_line = window.text_system().shape_line(
-                        line.into(),
+                        SharedString::from(line.to_string()),
                         font_size,
                         &runs,
                         None,
@@ -802,7 +802,7 @@ impl TextElement {
                     continue;
                 }
 
-                let sub_line: SharedString = line_text[range.clone()].into();
+                let sub_line: SharedString = line_text[range.clone()].to_string().into();
                 let runs_len: usize = line_runs.iter().map(|r| r.len).sum();
                 if runs_len != sub_line.len() {
                     log::error!(

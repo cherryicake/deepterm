@@ -182,7 +182,7 @@ impl RenderOnce for EditorInput {
                 .id("editor-input")
                 .flex_1()
                 .h_full()
-                .flex_grow(1.0)
+                .flex_grow()
                 .overflow_x_hidden()
                 .child(TextElement::new(self.state.clone()).placeholder(state.placeholder.clone()))
                 .into_any_element()
