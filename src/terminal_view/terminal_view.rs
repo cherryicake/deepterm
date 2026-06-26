@@ -170,6 +170,12 @@ pub struct TerminalView {
     pub cached_selection_range: Option<SelectionRange>,
     /// Last mouse mode state used to build row cache.
     pub cached_selection_mouse_mode: bool,
+    // ── Render scratch buffers ──────────────────────────────────────────────
+    // Reused across frames in `prepaint` to avoid per-frame allocations when
+    // copying out the terminal's dirty-row / dirty-row-bound snapshots. These
+    // are only read (never mutated) after being filled each frame.
+    pub scratch_dirty_rows: Vec<bool>,
+    pub scratch_dirty_row_bounds: Vec<Option<(usize, usize)>>,
     // ── Scrollbar thumb animation ───────────────────────────────────────────
     /// Current animated thumb Y offset (relative to track top).
     pub scrollbar_thumb_y: Pixels,
@@ -427,6 +433,8 @@ impl TerminalView {
                 cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
+                scratch_dirty_rows: Vec::new(),
+                scratch_dirty_row_bounds: Vec::new(),
                 scrollbar_thumb_y: px(0.0),
                 scrollbar_target_y: px(0.0),
                 scrollbar_anim_from_y: px(0.0),
@@ -591,6 +599,8 @@ impl TerminalView {
                 cached_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
+                scratch_dirty_rows: Vec::new(),
+                scratch_dirty_row_bounds: Vec::new(),
                 scrollbar_thumb_y: px(0.0),
                 scrollbar_target_y: px(0.0),
                 scrollbar_anim_from_y: px(0.0),
@@ -2511,7 +2521,15 @@ impl Render for TerminalView {
                         terminal.mouse_drag(event, cx);
                     }
                 });
-                cx.notify();
+                // Only request a repaint when something visible changes.
+                // - Link hover changes are already notified above (`link_changed`).
+                // - Mouse-mode moves forward bytes to the PTY; the application's own
+                //   redraw output drives the subsequent repaint, so no notify is needed.
+                // - Active drag selection needs an immediate repaint to update the
+                //   selection highlight as the cursor moves.
+                if this.selecting {
+                    cx.notify();
+                }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 let now = Instant::now();

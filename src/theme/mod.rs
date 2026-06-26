@@ -80,6 +80,12 @@ pub struct TerminalTheme {
     normal: [Hsla; 8],
     bright: [Hsla; 8],
     dim: [Hsla; 8],
+    /// Pre-resolved 256-entry ANSI palette. Entries 0..=15 mirror the named
+    /// colors (normal/bright); 16..=255 follow the standard xterm 6×6×6 cube
+    /// and grayscale ramp. Built once at theme construction so that per-cell
+    /// color conversion in the render path is an O(1) array lookup instead of
+    /// recomputing the `Rgb -> Hsla` conversion for every indexed cell.
+    indexed_palette: [Hsla; 256],
 }
 
 impl TerminalTheme {
@@ -115,6 +121,41 @@ impl TerminalTheme {
             NamedColor::BrightForeground => self.bright_foreground,
             NamedColor::DimForeground => self.dim_foreground,
         }
+    }
+
+    /// Look up a pre-resolved entry of the 256-color ANSI palette.
+    /// Used by the render path for `Indexed` colors, avoiding per-cell
+    /// `Rgb -> Hsla` recomputation.
+    pub fn indexed_color(&self, idx: u8) -> Hsla {
+        self.indexed_palette[idx as usize]
+    }
+
+    /// Build the 256-entry palette from the theme's named colors and the
+    /// standard xterm 6×6×6 color cube + grayscale ramp formulas.
+    fn build_indexed_palette(normal: [Hsla; 8], bright: [Hsla; 8]) -> [Hsla; 256] {
+        let mut palette = [gpui::transparent_black(); 256];
+        // 0..=15: standard ANSI colors mirror the named normal/bright colors.
+        palette[0..8].copy_from_slice(&normal);
+        palette[8..16].copy_from_slice(&bright);
+        // 16..=231: 6×6×6 color cube.
+        for idx in 16..=231u16 {
+            let i = idx - 16;
+            let r = (i / 36) as u8;
+            let g = ((i % 36) / 6) as u8;
+            let b = (i % 6) as u8;
+            let r = if r == 0 { 0 } else { r * 40 + 55 };
+            let g = if g == 0 { 0 } else { g * 40 + 55 };
+            let b = if b == 0 { 0 } else { b * 40 + 55 };
+            let packed = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+            palette[idx as usize] = rgb(packed).into();
+        }
+        // 232..=255: grayscale ramp.
+        for idx in 232..=255u16 {
+            let gray = 8 + (idx - 232) as u8 * 10;
+            let packed = (gray as u32) << 16 | (gray as u32) << 8 | gray as u32;
+            palette[idx as usize] = rgb(packed).into();
+        }
+        palette
     }
 
     pub fn preview_colors(&self) -> [Hsla; 16] {
@@ -505,6 +546,10 @@ impl TryFrom<TerminalThemeFile> for TerminalTheme {
             ])
         };
 
+        let normal = parse_array(value.normal)?;
+        let bright = parse_array(value.bright)?;
+        let dim = parse_array(value.dim)?;
+        let indexed_palette = Self::build_indexed_palette(normal, bright);
         Ok(Self {
             background: parse_color(&value.background)?,
             foreground: parse_color(&value.foreground)?,
@@ -514,9 +559,10 @@ impl TryFrom<TerminalThemeFile> for TerminalTheme {
             selection_background: parse_color(&value.selection_background)?,
             ime_background: parse_color(&value.ime_background)?,
             ime_underline: parse_color(&value.ime_underline)?,
-            normal: parse_array(value.normal)?,
-            bright: parse_array(value.bright)?,
-            dim: parse_array(value.dim)?,
+            normal,
+            bright,
+            dim,
+            indexed_palette,
         })
     }
 }

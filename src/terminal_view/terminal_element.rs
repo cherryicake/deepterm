@@ -52,7 +52,7 @@ fn cursor_thickness(cell_width: Pixels) -> Pixels {
 
 #[inline]
 fn rendered_cell_colors(
-    cell: &alacritty_terminal::term::cell::Cell,
+    cell: &crate::terminal::terminal::PackedCell,
 ) -> (
     &alacritty_terminal::vte::ansi::Color,
     &alacritty_terminal::vte::ansi::Color,
@@ -113,6 +113,25 @@ pub struct BackgroundSpan {
     pub color: Hsla,
 }
 
+impl BackgroundSpan {
+    /// Construct a selection-highlight span over a contiguous run of cells.
+    ///
+    /// `BackgroundSpan.color` carries the cell foreground for *background* spans
+    /// painted later, but the selection quad is painted with
+    /// `terminal_theme.selection_background`, so the `color` here is a dummy
+    /// that is never read. Centralizing it keeps the dummy out of every
+    /// call site and makes "why black" self-documenting.
+    #[inline]
+    pub fn for_selection(start_col: usize, row: usize, width: usize) -> Self {
+        Self {
+            start_col,
+            row,
+            width,
+            color: gpui::black(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderMetricsSignature {
     pub font_size: Pixels,
@@ -127,7 +146,10 @@ pub struct FlattenedRenderCache {
     pub runs: Arc<[BatchedTextRun]>,
     pub box_cells: Arc<[BoxDrawingCell]>,
     pub background_spans: Arc<[BackgroundSpan]>,
-    pub selection_cells: Arc<[(usize, usize)]>,
+    /// Selection highlight stored as coalesced spans (one quad per contiguous
+    /// run of selected cells in a row) rather than one entry per selected cell.
+    /// See `BackgroundSpan::for_selection` for how these are constructed.
+    pub selection_spans: Arc<[BackgroundSpan]>,
     pub metrics: Option<RenderMetricsSignature>,
     /// Tracks the hovered link state that produced this cache so we can
     /// detect changes and rebuild when the user moves between URLs.
@@ -507,19 +529,7 @@ impl TerminalElement {
                 .map(|(start, end)| col >= start && col < end)
                 .unwrap_or(false);
 
-            if ch == '\0' {
-                Self::flush_text_batch(
-                    row_idx,
-                    &mut batched_runs,
-                    &mut current_batch,
-                    window,
-                    font_size,
-                    cell_width,
-                );
-                continue;
-            }
-
-            if box_drawing::is_box_drawing_char(ch) {
+            if ch == '\0' || ch == ' ' || box_drawing::is_box_drawing_char(ch) {
                 Self::flush_text_batch(
                     row_idx,
                     &mut batched_runs,
@@ -533,7 +543,6 @@ impl TerminalElement {
 
             let cell_style =
                 Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
-            let is_space = ch == ' ';
 
             match current_batch.as_mut() {
                 Some((start_col, text, style, cell_count))
@@ -557,9 +566,6 @@ impl TerminalElement {
                         font_size,
                         cell_width,
                     );
-                    if is_space {
-                        continue;
-                    }
                     current_batch = Some((cell.point.column.0, ch.to_string(), cell_style, 1));
                 }
             }
@@ -606,6 +612,28 @@ impl TerminalElement {
             }
         }
         cols
+    }
+
+    /// Coalesce a row's sorted selected column indices into contiguous spans
+    /// (`start_col`, `width`). Emits one `BackgroundSpan` per contiguous run,
+    /// collapsing what would otherwise be one quad per selected cell into one
+    /// quad per run. See `BackgroundSpan::for_selection`.
+    fn selection_spans_for_cols(row: usize, cols: &[usize]) -> Vec<BackgroundSpan> {
+        let mut spans = Vec::new();
+        let mut iter = cols.iter().peekable();
+        while let Some(&start) = iter.next() {
+            let mut width = 1;
+            while let Some(&&next) = iter.peek() {
+                if next == start + width {
+                    width += 1;
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            spans.push(BackgroundSpan::for_selection(start, row, width));
+        }
+        spans
     }
 
     fn update_selected_cols_in_range(
@@ -1003,7 +1031,7 @@ impl Element for TerminalElement {
         Arc<[BatchedTextRun]>,
         Arc<[BoxDrawingCell]>,
         Arc<[BackgroundSpan]>,
-        Arc<[(usize, usize)]>,
+        Arc<[BackgroundSpan]>,
         Pixels,
         Pixels,
         usize,
@@ -1105,18 +1133,38 @@ impl Element for TerminalElement {
 
         // --- Row dirty tracking + per-row layout cache ---
         // dirty_rows is populated by Terminal::sync() via alacritty's damage API.
-        let (dirty_rows, dirty_row_bounds, mouse_mode, selection_range, cursor_cell) = {
+        //
+        // The dirty-row snapshots are filled into reusable scratch buffers that
+        // live on the view (instead of allocating fresh `Vec`s every frame via
+        // `to_vec()`). We take them out of the view so we can hold owned locals
+        // across the many interleaved `cx` calls below (a borrowed slice from
+        // the view/terminal cannot survive those), then put them back at the end
+        // so the capacity is reused on the next frame.
+        let (mut dirty_rows, mut dirty_row_bounds, mouse_mode, selection_range, cursor_cell) = {
+            let (mut dirty_rows, mut dirty_row_bounds) = self
+                .view
+                .update(cx, |view, _cx| {
+                    (
+                        std::mem::take(&mut view.scratch_dirty_rows),
+                        std::mem::take(&mut view.scratch_dirty_row_bounds),
+                    )
+                });
             let terminal_snapshot = self.terminal.read(cx);
-            let dirty_rows = terminal_snapshot.dirty_rows().to_vec();
-            let dirty_row_bounds = terminal_snapshot.dirty_row_bounds().to_vec();
-            let mouse_mode = terminal_snapshot
-                .last_content()
+            dirty_rows.clear();
+            dirty_rows.extend_from_slice(terminal_snapshot.dirty_rows());
+            dirty_row_bounds.clear();
+            dirty_row_bounds.extend_from_slice(terminal_snapshot.dirty_row_bounds());
+            let content = terminal_snapshot.last_content();
+            let mouse_mode = content
                 .mode
                 .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
             // Always render local selection, even in mouse mode, so that
             // double/triple-click selections are visible inside tmux/vim.
-            let selection_range = terminal_snapshot.selection_range();
-            let cursor_cell = terminal_snapshot.last_content().cursor_cell.clone();
+            // Read the cached selection range from `last_content` (resolved while
+            // the term lock was held in `update_last_content`) instead of calling
+            // `selection_range()`, which would acquire the lock a second time.
+            let selection_range = content.selection_range;
+            let cursor_cell = content.cursor_cell;
             (
                 dirty_rows,
                 dirty_row_bounds,
@@ -1195,7 +1243,7 @@ impl Element for TerminalElement {
             let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
             let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
             let mut background_spans: Vec<BackgroundSpan> = Vec::new();
-            let mut selection_cells: Vec<(usize, usize)> = Vec::new();
+            let mut selection_spans: Vec<BackgroundSpan> = Vec::new();
             // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
             let terminal = self.terminal.read(cx);
             let content = terminal.last_content();
@@ -1358,7 +1406,8 @@ impl Element for TerminalElement {
                 if selection_changed || row_cache.selection_cols.is_none() {
                     let selected_cols = Self::selected_cols_for_row(row_cells, &selection_range);
                     if rebuild_flattened_cache {
-                        selection_cells.extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                        selection_spans
+                            .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
                     }
                     row_cache.selection_cols = Some(selected_cols);
                 } else if is_dirty {
@@ -1371,22 +1420,23 @@ impl Element for TerminalElement {
                             &selection_range,
                         );
                         if rebuild_flattened_cache {
-                            selection_cells
-                                .extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                            selection_spans
+                                .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
                         }
                         row_cache.selection_cols = Some(selected_cols);
                     } else {
                         let selected_cols =
                             Self::selected_cols_for_row(row_cells, &selection_range);
                         if rebuild_flattened_cache {
-                            selection_cells
-                                .extend(selected_cols.iter().map(|col| (row_idx, *col)));
+                            selection_spans
+                                .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
                         }
                         row_cache.selection_cols = Some(selected_cols);
                     }
                 } else if rebuild_flattened_cache {
                     let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                    selection_cells.extend(cached_selected_cols.iter().map(|col| (row_idx, *col)));
+                    selection_spans
+                        .extend(Self::selection_spans_for_cols(row_idx, cached_selected_cols));
                 }
 
                 #[cfg(debug_assertions)]
@@ -1416,7 +1466,7 @@ impl Element for TerminalElement {
                 runs: Arc::from(batched_runs),
                 box_cells: Arc::from(box_cells),
                 background_spans: Arc::from(background_spans),
-                selection_cells: Arc::from(selection_cells),
+                selection_spans: Arc::from(selection_spans),
                 metrics: Some(metrics_signature),
                 hovered_link,
             };
@@ -1431,6 +1481,13 @@ impl Element for TerminalElement {
             });
             cached_flattened
         };
+
+        // Return the dirty-row scratch buffers to the view so their capacity is
+        // reused on the next frame instead of being reallocated.
+        self.view.update(cx, |view, _cx| {
+            view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
+            view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
+        });
 
         log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
         log::trace!("row run partial updates: {partial_run_update_count}");
@@ -1587,7 +1644,7 @@ impl Element for TerminalElement {
             flattened_cache.runs,
             flattened_cache.box_cells,
             flattened_cache.background_spans,
-            flattened_cache.selection_cells,
+            flattened_cache.selection_spans,
             cell_width,
             line_height,
             cursor_point.column.0,
@@ -1614,7 +1671,7 @@ impl Element for TerminalElement {
             batched_runs,
             box_cells,
             background_spans,
-            selection_cells,
+            selection_spans,
             cell_width,
             line_height,
             cursor_col,
@@ -1628,11 +1685,16 @@ impl Element for TerminalElement {
         let origin = terminal_bounds.bounds.origin;
         window.paint_quad(fill(bounds, terminal_theme.background));
 
-        for (row, col) in selection_cells.iter() {
-            let cell_x = origin.x + *cell_width * *col as f32;
-            let cell_y = origin.y + *line_height * *row as f32;
+        for span in selection_spans.iter() {
+            let span_origin = point(
+                origin.x + *cell_width * span.start_col as f32,
+                origin.y + *line_height * span.row as f32,
+            );
             window.paint_quad(fill(
-                Bounds::new(point(cell_x, cell_y), size(*cell_width, *line_height)),
+                Bounds::new(
+                    span_origin,
+                    size(*cell_width * span.width as f32, *line_height),
+                ),
                 terminal_theme.selection_background,
             ));
         }

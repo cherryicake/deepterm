@@ -317,7 +317,7 @@ pub struct TerminalContent {
     /// Each tuple is `(start, end)` where `cells[start..end]` belongs to one visible row.
     pub row_ranges: Vec<(usize, usize)>,
     pub cursor: AlacPoint,
-    pub cursor_cell: alacritty_terminal::term::cell::Cell,
+    pub cursor_cell: PackedCell,
     /// 光标形状 - 用于光标委托机制
     /// 当光标形状为Hidden时，终端不渲染光标，由应用程序（如Claude Code）自己处理
     pub cursor_shape: AlacCursorShape,
@@ -331,6 +331,11 @@ pub struct TerminalContent {
     pub viewport_lines: usize,
     /// Per-row URL ranges detected in the current content.
     pub url_ranges: Vec<Vec<UrlRange>>,
+    /// Current selection range, resolved while the term lock is already held
+    /// in `update_last_content`. Read by the render hot path so it does not
+    /// need to acquire the `FairMutex<Term>` a second time per frame.
+    pub selection_range:
+        Option<alacritty_terminal::selection::SelectionRange>,
 }
 
 impl Default for TerminalContent {
@@ -339,7 +344,7 @@ impl Default for TerminalContent {
             cells: Vec::new(),
             row_ranges: Vec::new(),
             cursor: AlacPoint::new(Line(0), Column(0)),
-            cursor_cell: alacritty_terminal::term::cell::Cell::default(),
+            cursor_cell: PackedCell::from(&alacritty_terminal::term::cell::Cell::default()),
             cursor_shape: AlacCursorShape::Block,
             display_offset: 0,
             mode: alacritty_terminal::term::TermMode::default(),
@@ -348,6 +353,36 @@ impl Default for TerminalContent {
             total_lines: 24,
             viewport_lines: 24,
             url_ranges: Vec::new(),
+            selection_range: None,
+        }
+    }
+}
+
+/// Compact snapshot of the fields from alacritty's `Cell` that the render
+/// pipeline actually reads.
+///
+/// `IndexedCell.cell` stores this instead of a full `alacritty_terminal::Cell`
+/// so that the per-frame clone of every visible cell (see `update_last_content`)
+/// copies only `c`/`fg`/`bg`/`flags` and skips the `Option<Arc<CellExtra>>` field
+/// (`zerowidth` / `underline_color` / `hyperlink`), which is unused on the render
+/// path. All four fields are cheap `Copy` types, making the clone effectively
+/// a small stack copy with no heap traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedCell {
+    pub c: char,
+    pub fg: alacritty_terminal::vte::ansi::Color,
+    pub bg: alacritty_terminal::vte::ansi::Color,
+    pub flags: alacritty_terminal::term::cell::Flags,
+}
+
+impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
+    #[inline]
+    fn from(cell: &alacritty_terminal::term::cell::Cell) -> Self {
+        Self {
+            c: cell.c,
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
         }
     }
 }
@@ -355,7 +390,7 @@ impl Default for TerminalContent {
 #[derive(Clone, Debug)]
 pub struct IndexedCell {
     pub point: AlacPoint,
-    pub cell: alacritty_terminal::term::cell::Cell,
+    pub cell: PackedCell,
 }
 
 /// 远程终端输入回调类型
@@ -1536,7 +1571,7 @@ impl Terminal {
 
         cells.extend(content.display_iter.map(|ic| IndexedCell {
             point: ic.point,
-            cell: ic.cell.clone(),
+            cell: PackedCell::from(ic.cell),
         }));
 
         let row_ranges = &mut self.last_content.row_ranges;
@@ -1554,7 +1589,9 @@ impl Terminal {
         }
 
         self.last_content.cursor = content.cursor.point;
-        self.last_content.cursor_cell = term.grid()[content.cursor.point].clone();
+        let cursor_grid_cell: &alacritty_terminal::term::cell::Cell =
+            &term.grid()[content.cursor.point];
+        self.last_content.cursor_cell = PackedCell::from(cursor_grid_cell);
         // 获取光标形状 - 用于光标委托机制
         // 当光标形状为Hidden时，终端不渲染光标，由应用程序自己处理
         self.last_content.cursor_shape = content.cursor.shape;
@@ -1565,6 +1602,11 @@ impl Terminal {
         // Cache line counts while we already hold the lock (avoids extra mutex grabs per frame)
         self.last_content.total_lines = term.total_lines();
         self.last_content.viewport_lines = term.screen_lines();
+        // Resolve the current selection range now that the lock is held, so the
+        // render path can read it from `last_content` instead of acquiring the
+        // term lock a second time per frame.
+        self.last_content.selection_range =
+            term.selection.as_ref().and_then(|s| s.to_range(&term));
 
         let rebuild_all_urls =
             force_full_damage || self.last_content.url_ranges.len() != row_ranges.len();
@@ -1598,6 +1640,16 @@ impl Terminal {
             // Nothing changed this frame – tell the element all rows are clean.
             self.dirty_rows.fill(false);
             self.dirty_row_bounds.fill(None);
+            // Content is unchanged, but the selection may still have moved
+            // (e.g. a drag via `update_selection` does not set `content_dirty`).
+            // Refresh the cached selection range so the render path's read from
+            // `last_content.selection_range` stays accurate without an extra
+            // lock grab there.
+            if self.selection_phase != SelectionPhase::Ended {
+                let term = self.term.lock();
+                self.last_content.selection_range =
+                    term.selection.as_ref().and_then(|s| s.to_range(&term));
+            }
         }
     }
 
@@ -1949,23 +2001,16 @@ impl Terminal {
         term.selection_to_string()
     }
 
-    pub fn selection_range(&self) -> Option<alacritty_terminal::selection::SelectionRange> {
-        let term = self.term.lock();
-        term.selection.as_ref().and_then(|s| s.to_range(&term))
-    }
-
-    pub fn is_cell_selected(&self, point: &AlacPoint) -> bool {
-        let Some(range) = self.selection_range() else {
-            return false;
-        };
-
-        range.contains(*point)
-    }
-
     pub fn clear_selection(&mut self) {
         let mut term = self.term.lock();
         term.selection = None;
         self.selection_phase = SelectionPhase::Ended;
+        // `is_cell_selected` / the render path read `last_content.selection_range`
+        // instead of re-locking the term. Keep the cached value in sync here:
+        // because `selection_phase` is now `Ended`, `sync()`'s else-branch will
+        // NOT refresh it, so without this it would linger stale until the next
+        // `content_dirty` frame.
+        self.last_content.selection_range = None;
     }
 
     pub fn select_all(&mut self) {
@@ -1973,6 +2018,11 @@ impl Terminal {
         let start = AlacPoint::new(Line(0), Column(0));
         let selection = Selection::new(SelectionType::Lines, start, Side::Left);
         term.selection = Some(selection);
+        // Resolve the new selection immediately so the first frame after a
+        // "select all" action shows the highlight without waiting for a
+        // content-dirty cycle.
+        self.last_content.selection_range =
+            term.selection.as_ref().and_then(|s| s.to_range(&term));
     }
 
     // Scrolling
