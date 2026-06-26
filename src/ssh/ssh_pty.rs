@@ -101,7 +101,7 @@ impl SshPtyTerminal {
                 ssh_args,
             )),
             working_directory: None,
-            hold: true,
+            drain_on_exit: true,
             env,
         };
 

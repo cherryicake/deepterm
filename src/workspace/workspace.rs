@@ -2350,7 +2350,7 @@ impl Workspace {
 
                     let child_element = div()
                         .flex_basis(gpui::DefiniteLength::Fraction(size.into()))
-                        .flex_shrink()
+                        .flex_shrink(1.0)
                         .overflow_hidden()
                         .min_w(px(0.0))
                         .child(self.render_split_container(child, &child_path, cx))

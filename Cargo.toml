@@ -13,12 +13,12 @@ serde_repr = "0.1"
 schemars = "1.0"
 tracing = "0.1"
 enum-iterator = "2.1"
-rust-embed = { version = "8.0", features = ["include-flate"] }
+rust-embed = { version = "8.0", features = ["include-flate", "include-exclude"] }
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Terminal dependencies
-alacritty_terminal = "0.24"
+alacritty_terminal = "0.26"
 parking_lot = "0.12"
 async-channel = "2.0"
 itertools = "0.13"

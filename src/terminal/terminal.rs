@@ -1147,9 +1147,7 @@ impl Terminal {
             self.extract_and_handle_osc_sequences(data, require_local_osc7_host, cx);
 
         let mut term = self.term.lock();
-        for byte in filtered_data.as_ref() {
-            self.vte_processor.advance(&mut *term, *byte);
-        }
+        self.vte_processor.advance(&mut *term, filtered_data.as_ref());
 
         // 标记内容已更新
         self.content_dirty = true;

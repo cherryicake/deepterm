@@ -294,7 +294,7 @@ pub struct PopupMenu {
     external_link_icon: bool,
     scroll_handle: ScrollHandle,
     // This will update on render
-    submenu_anchor: (gpui::Corner, Pixels),
+    submenu_anchor: (gpui::Anchor, Pixels),
 
     _subscriptions: Vec<Subscription>,
 }
@@ -315,7 +315,7 @@ impl PopupMenu {
             scrollable: false,
             scroll_handle: ScrollHandle::default(),
             external_link_icon: true,
-            submenu_anchor: (gpui::Corner::TopLeft, Pixels::ZERO),
+            submenu_anchor: (gpui::Anchor::TopLeft, Pixels::ZERO),
             _subscriptions: vec![],
         }
     }
@@ -787,7 +787,7 @@ impl PopupMenu {
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, gpui::Corner::TopLeft | gpui::Corner::BottomLeft) {
+        let handled = if matches!(self.submenu_anchor.0, gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft) {
             self._unselect_submenu(window, cx)
         } else {
             self._select_submenu(window, cx)
@@ -808,7 +808,7 @@ impl PopupMenu {
     }
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, gpui::Corner::TopLeft | gpui::Corner::BottomLeft) {
+        let handled = if matches!(self.submenu_anchor.0, gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft) {
             self._select_submenu(window, cx)
         } else {
             self._unselect_submenu(window, cx)
@@ -879,8 +879,8 @@ impl PopupMenu {
         };
 
         match parent.read(cx).submenu_anchor.0 {
-            gpui::Corner::TopLeft | gpui::Corner::BottomLeft => Side::Left,
-            gpui::Corner::TopRight | gpui::Corner::BottomRight => Side::Right,
+            gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft | gpui::Anchor::LeftCenter => Side::Left,
+            gpui::Anchor::TopRight | gpui::Anchor::BottomRight | gpui::Anchor::RightCenter | gpui::Anchor::TopCenter | gpui::Anchor::BottomCenter => Side::Right,
         }
     }
 
@@ -944,14 +944,14 @@ impl PopupMenu {
         let bounds = self.bounds;
         let max_width = self.max_width();
         let (anchor, left) = if max_width + bounds.origin.x > window.bounds().size.width {
-            (gpui::Corner::TopRight, -px(16.))
+            (gpui::Anchor::TopRight, -px(16.))
         } else {
-            (gpui::Corner::TopLeft, bounds.size.width - px(8.))
+            (gpui::Anchor::TopLeft, bounds.size.width - px(8.))
         };
 
         let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
         self.submenu_anchor = if is_bottom_pos {
-            (anchor.other_side_corner_along(gpui::Axis::Vertical), left)
+            (anchor.other_side_along(gpui::Axis::Vertical), left)
         } else {
             (anchor, left)
         };
