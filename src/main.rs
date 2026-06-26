@@ -459,11 +459,22 @@ impl AppWindow {
     }
 
     /// 切换侧边栏显示/隐藏
-    fn toggle_sidebar(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
+    fn toggle_sidebar(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 通知 TabBar 侧边栏动画开始，锁定溢出状态
+        let tab_bar = self.workspace.read(cx).tab_bar.clone();
+        tab_bar.update(cx, |tab_bar, _cx| {
+            tab_bar.on_sidebar_animation_start();
+        });
+
         let needs_hide_task = self.sidebar.update(cx, |s, _cx| s.toggle());
         if needs_hide_task {
             let sidebar = self.sidebar.clone();
             let app_window = cx.entity();
+            let workspace = self.workspace.clone();
             self._sidebar_hide_task = Some(cx.spawn(async move |_, cx| {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(250 + 40))
@@ -473,9 +484,28 @@ impl AppWindow {
                     cx.notify();
                 });
                 let _ = app_window.update(cx, |_, cx| cx.notify());
+                // 动画结束后通知 TabBar 解锁溢出状态
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.tab_bar.update(cx, |tab_bar, cx| {
+                        tab_bar.on_sidebar_animation_end(cx);
+                    });
+                });
             }));
         } else {
             self._sidebar_hide_task = None;
+            // 展开侧边栏动画结束后通知 TabBar 解锁（展开动画300ms）
+            let workspace = self.workspace.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300 + 40))
+                    .await;
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.tab_bar.update(cx, |tab_bar, cx| {
+                        tab_bar.on_sidebar_animation_end(cx);
+                    });
+                });
+            })
+            .detach();
         }
         cx.notify();
     }
