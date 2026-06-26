@@ -1,3 +1,4 @@
+pub mod client_decorations;
 pub mod panel;
 pub mod persistence;
 pub mod session_state;

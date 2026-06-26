@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::vte::ansi::NamedColor;
-use gpui::{App, Global, Hsla, SharedString, WindowAppearance, rgb};
+use gpui::{App, Global, Hsla, Pixels, SharedString, WindowAppearance, px, rgb};
+
+pub const CLIENT_SIDE_DECORATION_ROUNDING: Pixels = px(10.0);
+pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

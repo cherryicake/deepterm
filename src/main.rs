@@ -33,6 +33,7 @@ use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
+use crate::workspace::client_decorations::client_side_decorations;
 use crate::workspace::ToggleSidebar;
 use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
@@ -631,7 +632,7 @@ impl Render for AppWindow {
             root = root.child(modal);
         }
 
-        root
+        client_side_decorations(root, window, cx)
     }
 }
 
