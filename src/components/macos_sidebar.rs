@@ -268,7 +268,7 @@ impl MacosSidebar {
         // 因此文件树使用相同的 session_state() 方法在 TitleChanged 时重新同步打开目录。
         if let Some(tv) = &terminal_view {
             let file_tree = view.clone();
-            let sub = cx.subscribe(tv, move |this, _, event: &crate::terminal_view::terminal_view::Event, cx| {
+            let sub = cx.subscribe(tv, move |this, subscribed_tv, event: &crate::terminal_view::terminal_view::Event, cx| {
                 let should_sync = matches!(
                     event,
                     crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
@@ -277,16 +277,22 @@ impl MacosSidebar {
                 if !should_sync {
                     return;
                 }
-                if let Some(tv) = &this.file_tree_terminal_view {
-                    let state = tv.read(cx).session_state(cx);
-                    let (cwd, target_label) = state.file_tree_target();
-                    this.file_tree_target_label = Some(target_label);
-                    let _ = file_tree.update(cx, |tree, cx| {
-                        tree.open_path(cwd, cx);
-                    });
-                    cx.notify();
-                    this.notify_app_window(cx);
+                // 如果当前文件树已经切换到其他终端，忽略旧终端的事件，避免"幽灵更新"。
+                if this.file_tree_terminal_view.as_ref() != Some(&subscribed_tv) {
+                    return;
                 }
+                let state = subscribed_tv.read(cx).session_state(cx);
+                let (cwd, target_label) = state.file_tree_target();
+                // 路径未实际变化时避免无意义的刷新
+                if cwd.as_deref() == Some(file_tree.read(cx).root_path()) {
+                    return;
+                }
+                this.file_tree_target_label = Some(target_label);
+                let _ = file_tree.update(cx, |tree, cx| {
+                    tree.open_path(cwd, cx);
+                });
+                cx.notify();
+                this.notify_app_window(cx);
             });
             self.file_tree_subscription = Some(sub);
         }

@@ -2193,6 +2193,12 @@ impl Workspace {
             return;
         };
 
+        // 如果文件树已经绑定到同一个终端，则无需重新创建。
+        let already_bound = sidebar.read(cx).file_tree_terminal_view() == Some(terminal_view.clone());
+        if already_bound {
+            return;
+        }
+
         let state = terminal_view.read(cx).session_state(cx);
 
         let (path, display_name) = state.file_tree_target();
