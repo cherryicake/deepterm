@@ -1990,15 +1990,13 @@ impl Workspace {
 
     /// 切换到指定tab
     pub fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        if self.tabs.get(tab_id).is_some() {
-            // 同步 workspace 当前活动 tab（tab_bar 与内部状态保持一致）
-            let tab_id = tab_id.to_string();
-            self.active_tab_id = tab_id.clone();
-            // 更新TabBar的活动tab
+        if self.tabs.contains_key(tab_id) {
+            self.active_tab_id = tab_id.to_string();
+            let active_tab_id = self.active_tab_id.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.set_active_tab(tab_id.clone(), cx);
+                tab_bar.set_active_tab(active_tab_id, cx);
             });
-            self.sync_tab_broadcast_to_panels(&tab_id, cx);
+            self.sync_tab_broadcast_to_panels(tab_id, cx);
             cx.emit(WorkspaceEvent::SessionChanged);
             cx.notify();
         }
@@ -2197,28 +2195,16 @@ impl Workspace {
 
         let state = terminal_view.read(cx).session_state(cx);
 
-        let (target, display_name) = match state {
-            TerminalSessionState::Ssh { config, remote_cwd } => {
-                let name = remote_cwd.as_ref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("远程文件树")
-                    .to_string();
-                (FileBrowserTarget::Remote {
-                    ssh_config: config,
-                    requested_path: remote_cwd,
-                }, name)
-            }
-            TerminalSessionState::Local { cwd, .. } => {
-                let name = cwd.as_ref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("本地文件树")
-                    .to_string();
-                (FileBrowserTarget::Local {
-                    requested_path: cwd.map(std::path::PathBuf::from),
-                }, name)
-            }
+        let (path, display_name) = state.file_tree_target();
+
+        let target = match &state {
+            TerminalSessionState::Ssh { config, .. } => FileBrowserTarget::Remote {
+                ssh_config: config.clone(),
+                requested_path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            },
+            TerminalSessionState::Local { .. } => FileBrowserTarget::Local {
+                requested_path: path.clone(),
+            },
         };
 
         // 4. 根据终端类型选择后端

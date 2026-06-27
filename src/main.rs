@@ -21,7 +21,7 @@ pub mod workspace;
 use gpui::prelude::*;
 use gpui::{
     AnimationExt, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
-    Subscription, Window, actions, div, px,
+    Subscription, WeakEntity, Window, actions, div, px,
 };
 
 use crate::components::macos_sidebar::{
@@ -133,41 +133,23 @@ impl AppWindow {
             });
         });
 
-        // 设置侧边栏标签页双击回调：立即打开文件树页（loading），后台加载内容
+        // 设置侧边栏标签页双击回调：立即打开文件树页，后台加载内容
         let app_window_for_dblclick = app_window.downgrade();
         let sidebar_for_dblclick = sidebar.clone();
         sidebar.update(cx, |sidebar, _cx| {
             sidebar.on_tab_double_click(move |group_id, tab_id, _tab_label, this, window, cx| {
-                let app_window = app_window_for_dblclick.clone();
                 let sidebar = sidebar_for_dblclick.clone();
                 let group_id = group_id.to_string();
                 let tab_id = tab_id.to_string();
-                if let Some(aw) = app_window.upgrade() {
-                    // 读取 workspace（不同实体，安全）
-                    let app = aw.read(cx);
-                    let workspace = if group_id == DEFAULT_TAB_GROUP_ID {
-                        app.default_workspace.clone()
-                    } else if let Some(ws) = app.tab_group_workspace(&group_id) {
-                        ws
-                    } else {
-                        log::warn!("未找到标签页组 workspace: {}", group_id);
-                        return;
-                    };
-                    // 立即：切换 workspace、tab、聚焦
-                    aw.update(cx, |app_window, cx| {
-                        app_window.switch_tab_group_workspace(&group_id, window, cx);
-                    });
-                    workspace.update(cx, |ws, cx| {
-                        ws.switch_to_tab(&tab_id, cx);
-                        ws.focus_active_tab_panel(window, cx);
-                    });
-                    // 立即：切换到文件树页（loading 占位）
-                    this.show_file_tree_page("加载中...".to_string());
-                    this.handle_item_select(&group_id);
-                    // 触发重绘，立刻显示文件树页
-                    aw.update(cx, |_, cx| cx.notify());
-                    // 延时：创建真实文件树实体、加载内容、设订阅
-                    let workspace = workspace.clone();
+                if let Some(workspace) = Self::activate_sidebar_tab(
+                    app_window_for_dblclick.clone(),
+                    &group_id,
+                    &tab_id,
+                    this,
+                    window,
+                    cx,
+                ) {
+                    this.show_file_tree_page();
                     window.defer(cx, move |_window, cx| {
                         let _ = workspace.update(cx, |ws, cx| {
                             ws.handle_sidebar_tab_double_click(&tab_id, sidebar, cx);
@@ -181,29 +163,14 @@ impl AppWindow {
         let app_window_for_single = app_window.downgrade();
         sidebar.update(cx, |sidebar, _cx| {
             sidebar.on_tab_single_click(move |group_id, tab_id, _tab_label, this, window, cx| {
-                let app_window = app_window_for_single.clone();
-                let group_id = group_id.to_string();
-                let tab_id = tab_id.to_string();
-                if let Some(aw) = app_window.upgrade() {
-                    let app = aw.read(cx);
-                    let workspace = if group_id == DEFAULT_TAB_GROUP_ID {
-                        app.default_workspace.clone()
-                    } else if let Some(ws) = app.tab_group_workspace(&group_id) {
-                        ws
-                    } else {
-                        log::warn!("未找到标签页组 workspace: {}", group_id);
-                        return;
-                    };
-                    aw.update(cx, |app_window, cx| {
-                        app_window.switch_tab_group_workspace(&group_id, window, cx);
-                    });
-                    workspace.update(cx, |ws, cx| {
-                        ws.switch_to_tab(&tab_id, cx);
-                        ws.focus_active_tab_panel(window, cx);
-                    });
-                    this.handle_item_select(&group_id);
-                    aw.update(cx, |_, cx| cx.notify());
-                }
+                Self::activate_sidebar_tab(
+                    app_window_for_single.clone(),
+                    &group_id,
+                    &tab_id,
+                    this,
+                    window,
+                    cx,
+                );
             });
         });
         let sidebar_for_host = sidebar.clone();
@@ -259,6 +226,40 @@ impl AppWindow {
         }
 
         this
+    }
+
+    /// 提取侧边栏标签页单击/双击的公共切换逻辑：切换 workspace、top tab、聚焦终端、高亮侧边栏。
+    /// 返回当前 workspace entity，供双击回调后续用于创建文件树。
+    fn activate_sidebar_tab(
+        app_window: WeakEntity<Self>,
+        group_id: &str,
+        tab_id: &str,
+        sidebar: &mut MacosSidebar,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<Workspace>> {
+        let aw = app_window.upgrade()?;
+        let workspace = {
+            let app = aw.read(cx);
+            if group_id == DEFAULT_TAB_GROUP_ID {
+                app.default_workspace.clone()
+            } else if let Some(ws) = app.tab_group_workspace(group_id) {
+                ws
+            } else {
+                log::warn!("未找到标签页组 workspace: {}", group_id);
+                return None;
+            }
+        };
+        aw.update(cx, |app_window, cx| {
+            app_window.switch_tab_group_workspace(group_id, window, cx);
+        });
+        workspace.update(cx, |ws, cx| {
+            ws.switch_to_tab(tab_id, cx);
+            ws.focus_active_tab_panel(window, cx);
+        });
+        sidebar.handle_item_select(group_id);
+        aw.update(cx, |_, cx| cx.notify());
+        Some(workspace)
     }
 
     fn subscribe_workspace_events(

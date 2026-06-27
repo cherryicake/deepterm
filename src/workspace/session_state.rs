@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ssh::SshConnectionConfig;
@@ -96,4 +98,25 @@ pub enum TerminalSessionState {
         config: SshConnectionConfig,
         remote_cwd: Option<String>,
     },
+}
+
+impl TerminalSessionState {
+    /// 提取终端 CWD 路径和文件树显示名
+    pub fn file_tree_target(&self) -> (Option<PathBuf>, String) {
+        let default_label = match self {
+            Self::Local { .. } => "本地文件树",
+            Self::Ssh { .. } => "远程文件树",
+        };
+        let path = match self {
+            Self::Local { cwd, .. } => cwd.as_ref().map(PathBuf::from),
+            Self::Ssh { remote_cwd, .. } => remote_cwd.as_ref().map(PathBuf::from),
+        };
+        let label = path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(default_label)
+            .to_string();
+        (path, label)
+    }
 }

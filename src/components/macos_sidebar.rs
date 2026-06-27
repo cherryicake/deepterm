@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -280,36 +279,13 @@ impl MacosSidebar {
                 }
                 if let Some(tv) = &this.file_tree_terminal_view {
                     let state = tv.read(cx).session_state(cx);
-                    let (cwd, target_label) = match state {
-                        crate::workspace::session_state::TerminalSessionState::Local { cwd, .. } => {
-                            let path = cwd.map(PathBuf::from);
-                            let label = path.as_ref()
-                                .and_then(|p| std::path::Path::new(p).file_name())
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("本地文件树")
-                                .to_string();
-                            (path, label)
-                        }
-                        crate::workspace::session_state::TerminalSessionState::Ssh { remote_cwd, .. } => {
-                            let path = remote_cwd.map(PathBuf::from);
-                            let label = path.as_ref()
-                                .and_then(|p| std::path::Path::new(p).file_name())
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("远程文件树")
-                                .to_string();
-                            (path, label)
-                        }
-                    };
-                    // 如果目录没有实际变化，避免刷新文件树 UI
-                    let should_update = cwd.as_deref() != Some(file_tree.read(cx).root_path());
-                    if should_update {
-                        this.file_tree_target_label = Some(target_label);
-                        let _ = file_tree.update(cx, |tree, cx| {
-                            tree.open_path(cwd, cx);
-                        });
-                        cx.notify();
-                        this.notify_app_window(cx);
-                    }
+                    let (cwd, target_label) = state.file_tree_target();
+                    this.file_tree_target_label = Some(target_label);
+                    let _ = file_tree.update(cx, |tree, cx| {
+                        tree.open_path(cwd, cx);
+                    });
+                    cx.notify();
+                    this.notify_app_window(cx);
                 }
             });
             self.file_tree_subscription = Some(sub);
@@ -329,12 +305,10 @@ impl MacosSidebar {
 
     /// 轻量版：仅切换侧边栏到文件树页面，不设订阅、不创建实体。
     /// 从 listener 回调中直接调用（无需 Context<Self>），然后通过 AppWindow 触发重绘。
-    pub fn show_file_tree_page(&mut self, target_label: String) {
+    pub fn show_file_tree_page(&mut self) {
         self.current_view = SidebarView::FileTree;
-        self.file_tree_target_label = Some(target_label);
+        self.file_tree_target_label = None;
     }
-
-
 
     pub fn set_tab_group_tabs(
         &mut self,
