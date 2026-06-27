@@ -454,6 +454,8 @@ impl MacosSidebar {
     pub fn go_back(&mut self) {
         self.file_tree_subscription.take();
         self.file_tree_terminal_view = None;
+        self.file_tree_view.take();
+        self.file_tree_target_label = None;
         self.current_view = SidebarView::Menu;
         self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
     }

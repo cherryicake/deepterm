@@ -131,7 +131,7 @@ impl SidebarFileTree {
 
         cx.spawn(async move |_, cx| {
             let result = task.await;
-            weak.update(cx, |this, cx| {
+            let _ = weak.update(cx, |this, cx| {
                 this.loading_paths.remove(&path_for_loading);
                 match result {
                     Ok(entries) => {
@@ -144,7 +144,7 @@ impl SidebarFileTree {
                         cx.notify();
                     }
                 }
-            }).ok();
+            });
         }).detach();
     }
 
@@ -323,13 +323,16 @@ impl Render for SidebarFileTree {
         }
 
         // Build flat cache if needed
-        if self.flat_cache.is_none() {
+        let flat_count = if let Some(ref flat) = self.flat_cache {
+            flat.len()
+        } else {
             let mut flat = Vec::new();
             self.build_flat_list(&directory, 0, &mut flat);
+            let count = flat.len();
             self.flat_cache = Some(flat);
-        }
+            count
+        };
 
-        let flat_count = self.flat_cache.as_ref().map(|v| v.len()).unwrap_or(0);
         let is_directory_loaded = self.directory_cache.contains_key(&directory);
 
         let rows_element: gpui::AnyElement = if is_directory_loaded && flat_count == 0 {
@@ -349,7 +352,7 @@ impl Render for SidebarFileTree {
                 )
                 .into_any_element()
         } else {
-            let flat_rows = self.flat_cache.clone().unwrap_or_default();
+            let flat_rows = self.flat_cache.take().unwrap_or_default();
             let mut list = div()
                 .id("sidebar-file-tree")
                 .w_full()
