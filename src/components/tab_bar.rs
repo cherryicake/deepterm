@@ -148,7 +148,6 @@ pub struct TabItem {
     pub id: SharedString,
     pub label: SharedString,
     pub icon: Option<Icon>,
-    pub is_active: bool,
     pub is_modified: bool,
     pub is_remote: bool,
 }
@@ -159,7 +158,6 @@ impl TabItem {
             id: id.into(),
             label: label.into(),
             icon: None,
-            is_active: false,
             is_modified: false,
             is_remote: false,
         }
@@ -224,8 +222,6 @@ pub struct TabBar {
     tab_bounds: Vec<Bounds<Pixels>>,
     /// Tab 列表容器边界，用于判断拖拽是否仍在列表区域内
     tab_list_bounds: Option<Bounds<Pixels>>,
-    /// 侧边栏动画期间保持的溢出状态
-    sidebar_animation_overflow: Option<bool>,
     /// 当前 Panel 拖入 TabBar 的插入预览
     panel_drop_preview: Option<PanelDropPreview>,
     /// 当前悬停的标签 ID
@@ -265,7 +261,6 @@ impl TabBar {
             reorder_animation_epoch: 0,
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
-            sidebar_animation_overflow: None,
             panel_drop_preview: None,
             context_menu_tab_id: None,
             on_tab_copy_address: None,
@@ -307,7 +302,6 @@ impl TabBar {
             reorder_animation_epoch: 0,
             tab_bounds: Vec::new(),
             tab_list_bounds: None,
-            sidebar_animation_overflow: None,
             panel_drop_preview: None,
             context_menu_tab_id: None,
             on_tab_copy_address: None,
@@ -393,7 +387,6 @@ impl TabBar {
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         self.tabs.push(tab);
-        self.sidebar_animation_overflow = None;
         // 提前检查溢出状态，避免 UI 上出现溢出后再切换
         self.update_overflow_state(cx);
         cx.notify();
@@ -405,7 +398,6 @@ impl TabBar {
     pub fn remove_tab(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|t| t.id.as_ref() == id) {
             self.tabs.remove(index);
-            self.sidebar_animation_overflow = None;
 
             // 更新活动标签
             if self.active_tab_id.as_ref().map(|s| s.as_ref()) == Some(id) {
@@ -435,7 +427,6 @@ impl TabBar {
 
     pub fn set_tabs(&mut self, tabs: Vec<TabItem>, cx: &mut Context<Self>) {
         self.tabs = tabs;
-        self.sidebar_animation_overflow = None;
         if self.active_tab_id.is_none() && !self.tabs.is_empty() {
             self.active_tab_id = Some(self.tabs[0].id.clone());
         }
@@ -461,32 +452,8 @@ impl TabBar {
         self.scroll_handle.scroll_to_item(index);
     }
 
-    /// 检查并更新溢出状态
-    /// 当溢出状态变化时触发回调
-    /// 返回 `true` 表示溢出状态发生了改变
-    /// 当侧边栏开始动画时调用，锁定当前溢出状态
-    pub fn on_sidebar_animation_start(&mut self) {
-        // 只有在当前已经确定溢出状态时才锁定
-        if let Some(overflow) = self.last_overflow {
-            self.sidebar_animation_overflow = Some(overflow);
-        }
-    }
-
-    /// 当侧边栏动画结束时调用，解锁溢出状态
-    pub fn on_sidebar_animation_end(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_animation_overflow = None;
-        // 动画结束后不立即调用 update_overflow_state，
-        // 而是等待下一个 canvas 宽度回调自然触发，避免在动画尾端宽度未稳定时计算
-        cx.notify();
-    }
-
     pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) -> bool {
         if self.measured_container_width <= 0.0 {
-            return false;
-        }
-
-        // 如果处于侧边栏动画期间，不更新溢出状态，保持锁定
-        if self.sidebar_animation_overflow.is_some() {
             return false;
         }
 
@@ -746,17 +713,6 @@ impl Render for TabBar {
         let animation_epoch = self.reorder_animation_epoch;
         let panel_drop_preview = self.panel_drop_preview.clone();
 
-        // 根据溢出状态决定布局模式
-        // 如果还没测量过，根据预估宽度预判；否则使用测量结果
-        let is_overflowing = match self.last_overflow {
-            Some(overflow) => overflow,
-            None => {
-                // 未测量时，如果有多个标签，默认启用滚动以避免溢出
-                // 一旦测量完成，会根据实际宽度调整
-                self.tabs.len() > 1
-            }
-        };
-
         div()
             .id(self.id.clone())
             .h_full()
@@ -831,14 +787,8 @@ impl Render for TabBar {
                                         if (this.measured_container_width - container_width).abs()
                                             > 1.0
                                         {
-                                            let was_first = this.measured_container_width <= 0.0;
                                             this.measured_container_width = container_width;
-                                            let overflow_changed = this.update_overflow_state(cx);
-                                            // 首次测量时不通知，避免初始布局稳定前的闪烁；
-                                            // 后续只在溢出状态变化时通知
-                                            if !was_first && overflow_changed {
-                                                cx.notify();
-                                            }
+                                            this.update_overflow_state(cx);
                                         }
                                     });
                                 });
@@ -847,7 +797,7 @@ impl Render for TabBar {
                         .absolute()
                         .size_full()
                     })
-                    // 标签列表容器（包含所有标签和新建按钮）
+                    // 标签列表容器（始终使用 overflow_x_scroll，无论是否溢出）
                     .child(
                         div()
                             .child({
@@ -949,16 +899,9 @@ impl Render for TabBar {
                                     }
                                 }
                             }))
-                            .when(is_overflowing, |this| {
-                                // 溢出模式：水平滚动
-                                this.w_full()
-                                    .overflow_x_scroll()
-                                    .track_scroll(&self.scroll_handle)
-                            })
-                            .when(!is_overflowing, |this| {
-                                // 普通模式：flex 布局，不换行
-                                this.flex_1().overflow_x_hidden()
-                            })
+                            .flex_1()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.scroll_handle)
                             .children({
                                 let mut children: Vec<AnyElement> = Vec::with_capacity(
                                     self.tabs.len() + usize::from(panel_drop_preview.is_some()),
