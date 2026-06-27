@@ -1,11 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Window, div, px, svg};
+use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Window, div, px, svg};
 
 use crate::assets::Icon;
 use crate::theme::ActiveTheme;
+use crate::sidebar_view::file_system::FileSystem;
 
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const INDENT_SIZE: f32 = 14.0;
@@ -43,14 +45,14 @@ impl FileEntry {
         Some(Self { name, path, kind })
     }
 
-    fn icon(&self) -> Icon {
+    pub fn icon(&self) -> Icon {
         match self.kind {
             FileEntryKind::Directory => Icon::Folder,
             FileEntryKind::File | FileEntryKind::Symlink | FileEntryKind::Other => Icon::File,
         }
     }
 
-    fn sort_key(&self) -> (u8, String) {
+    pub fn sort_key(&self) -> (u8, String) {
         let rank = match self.kind {
             FileEntryKind::Directory => 0,
             FileEntryKind::Symlink => 1,
@@ -66,58 +68,84 @@ pub struct SidebarFileTree {
     focus_handle: FocusHandle,
     root_path: PathBuf,
     selected_path: Option<PathBuf>,
-    directory_cache: std::collections::HashMap<PathBuf, Vec<FileEntry>>,
+    directory_cache: HashMap<PathBuf, Vec<FileEntry>>,
     expanded_folders: HashSet<PathBuf>,
     hovered_path: Option<PathBuf>,
     flat_cache: Option<Vec<(FileEntry, usize)>>,
+    backend: Arc<dyn FileSystem>,
+    loading_paths: HashSet<PathBuf>,
 }
 
 impl SidebarFileTree {
-    pub fn new(cx: &mut App, root_path: Option<PathBuf>) -> Self {
+    pub fn new(cx: &mut App, backend: Arc<dyn FileSystem>, root_path: Option<PathBuf>) -> Self {
         let root_path = root_path.unwrap_or_else(|| {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+            backend.home_dir().unwrap_or_else(|| PathBuf::from("/"))
         });
         Self {
             focus_handle: cx.focus_handle(),
             root_path: root_path.clone(),
             selected_path: None,
-            directory_cache: std::collections::HashMap::new(),
+            directory_cache: HashMap::new(),
             expanded_folders: HashSet::new(),
             hovered_path: None,
             flat_cache: None,
+            backend,
+            loading_paths: HashSet::new(),
         }
     }
 
     pub fn open_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         if let Some(path) = path {
+            // 路径未发生变化时避免清空缓存、触发无意义的 UI 刷新
+            if path == self.root_path {
+                return;
+            }
             self.root_path = path;
         }
         self.directory_cache.clear();
         self.expanded_folders.clear();
         self.flat_cache = None;
         let root = self.root_path.clone();
-        self.load_directory(&root, cx);
+        self.load_directory(root, cx);
         cx.notify();
     }
 
-    fn load_directory(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if self.directory_cache.contains_key(path) {
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.directory_cache.contains_key(&path) || self.loading_paths.contains(&path) {
             return;
         }
-        match std::fs::read_dir(path) {
-            Ok(entries) => {
-                let mut file_entries: Vec<FileEntry> = entries
-                    .filter_map(|e| e.ok().and_then(FileEntry::from_dir_entry))
-                    .collect();
-                file_entries.sort_by_key(|a| a.sort_key());
-                self.directory_cache.insert(path.to_path_buf(), file_entries);
-                self.invalidate_flat_cache();
-                cx.notify();
-            }
-            Err(e) => {
-                log::warn!("Failed to read directory {}: {}", path.display(), e);
-            }
-        }
+        let path_for_loading = path.clone();
+        self.loading_paths.insert(path_for_loading.clone());
+
+        let backend = self.backend.clone();
+        let weak = cx.weak_entity();
+        let path_for_task = path_for_loading.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            backend.read_dir(&path_for_task)
+        });
+
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            weak.update(cx, |this, cx| {
+                this.loading_paths.remove(&path_for_loading);
+                match result {
+                    Ok(entries) => {
+                        this.directory_cache.insert(path_for_loading, entries);
+                        this.invalidate_flat_cache();
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read directory {}: {}", path_for_loading.display(), e);
+                        cx.notify();
+                    }
+                }
+            }).ok();
+        }).detach();
     }
 
     fn invalidate_flat_cache(&mut self) {
@@ -145,7 +173,7 @@ impl SidebarFileTree {
             self.expanded_folders.remove(&path);
         } else {
             self.expanded_folders.insert(path.clone());
-            self.load_directory(&path, cx);
+            self.load_directory(path, cx);
         }
         self.invalidate_flat_cache();
         cx.notify();
@@ -290,8 +318,8 @@ impl Render for SidebarFileTree {
         let directory = self.root_path.clone();
 
         // Ensure root directory is loaded
-        if !self.directory_cache.contains_key(&directory) {
-            self.load_directory(&directory, cx);
+        if !self.directory_cache.contains_key(&directory) && !self.loading_paths.contains(&directory) {
+            self.load_directory(directory.clone(), cx);
         }
 
         // Build flat cache if needed

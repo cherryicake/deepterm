@@ -133,19 +133,77 @@ impl AppWindow {
             });
         });
 
-        // 设置侧边栏标签页双击回调
-        let workspace_for_dblclick = workspace.clone();
+        // 设置侧边栏标签页双击回调：立即打开文件树页（loading），后台加载内容
+        let app_window_for_dblclick = app_window.downgrade();
         let sidebar_for_dblclick = sidebar.clone();
         sidebar.update(cx, |sidebar, _cx| {
-            sidebar.on_tab_double_click(move |tab_label, _window, cx| {
-                let workspace = workspace_for_dblclick.clone();
+            sidebar.on_tab_double_click(move |group_id, tab_id, _tab_label, this, window, cx| {
+                let app_window = app_window_for_dblclick.clone();
                 let sidebar = sidebar_for_dblclick.clone();
-                let tab_label = tab_label.to_string();
-                cx.defer(move |cx| {
-                    let _ = workspace.update(cx, |ws, cx| {
-                        ws.handle_sidebar_tab_double_click(&tab_label, sidebar, cx);
+                let group_id = group_id.to_string();
+                let tab_id = tab_id.to_string();
+                if let Some(aw) = app_window.upgrade() {
+                    // 读取 workspace（不同实体，安全）
+                    let app = aw.read(cx);
+                    let workspace = if group_id == DEFAULT_TAB_GROUP_ID {
+                        app.default_workspace.clone()
+                    } else if let Some(ws) = app.tab_group_workspace(&group_id) {
+                        ws
+                    } else {
+                        log::warn!("未找到标签页组 workspace: {}", group_id);
+                        return;
+                    };
+                    // 立即：切换 workspace、tab、聚焦
+                    aw.update(cx, |app_window, cx| {
+                        app_window.switch_tab_group_workspace(&group_id, window, cx);
                     });
-                });
+                    workspace.update(cx, |ws, cx| {
+                        ws.switch_to_tab(&tab_id, cx);
+                        ws.focus_active_tab_panel(window, cx);
+                    });
+                    // 立即：切换到文件树页（loading 占位）
+                    this.show_file_tree_page("加载中...".to_string());
+                    this.handle_item_select(&group_id);
+                    // 触发重绘，立刻显示文件树页
+                    aw.update(cx, |_, cx| cx.notify());
+                    // 延时：创建真实文件树实体、加载内容、设订阅
+                    let workspace = workspace.clone();
+                    window.defer(cx, move |_window, cx| {
+                        let _ = workspace.update(cx, |ws, cx| {
+                            ws.handle_sidebar_tab_double_click(&tab_id, sidebar, cx);
+                        });
+                    });
+                }
+            });
+        });
+
+        // 设置侧边栏标签页单击回调：切换 workspace + 顶部标签页 + 聚焦终端 + 高亮侧边栏（立即执行）
+        let app_window_for_single = app_window.downgrade();
+        sidebar.update(cx, |sidebar, _cx| {
+            sidebar.on_tab_single_click(move |group_id, tab_id, _tab_label, this, window, cx| {
+                let app_window = app_window_for_single.clone();
+                let group_id = group_id.to_string();
+                let tab_id = tab_id.to_string();
+                if let Some(aw) = app_window.upgrade() {
+                    let app = aw.read(cx);
+                    let workspace = if group_id == DEFAULT_TAB_GROUP_ID {
+                        app.default_workspace.clone()
+                    } else if let Some(ws) = app.tab_group_workspace(&group_id) {
+                        ws
+                    } else {
+                        log::warn!("未找到标签页组 workspace: {}", group_id);
+                        return;
+                    };
+                    aw.update(cx, |app_window, cx| {
+                        app_window.switch_tab_group_workspace(&group_id, window, cx);
+                    });
+                    workspace.update(cx, |ws, cx| {
+                        ws.switch_to_tab(&tab_id, cx);
+                        ws.focus_active_tab_panel(window, cx);
+                    });
+                    this.handle_item_select(&group_id);
+                    aw.update(cx, |_, cx| cx.notify());
+                }
             });
         });
         let sidebar_for_host = sidebar.clone();
@@ -220,6 +278,26 @@ impl AppWindow {
             |this, _, event: &WorkspaceEvent, _window, cx| match event {
                 WorkspaceEvent::SessionChanged => {
                     this.defer_save_session(cx);
+                    // 如果侧边栏正在显示文件树，且顶部 TabBar 切换到了别的终端，
+                    // 延迟同步文件树到当前活动终端。
+                    let sidebar = this.sidebar.clone();
+                    let workspace = this.workspace.clone();
+                    cx.defer(move |cx| {
+                        if sidebar.read(cx).current_view() != &crate::components::macos_sidebar::SidebarView::FileTree {
+                            return;
+                        }
+                        let active_tab_id = workspace.read(cx).active_tab_id().to_string();
+                        let active_terminal = workspace.read(cx).terminal_view_for_tab(&active_tab_id, cx);
+                        let current_terminal = sidebar.read(cx).file_tree_terminal_view();
+                        if active_terminal == current_terminal {
+                            return;
+                        }
+                        if active_terminal.is_some() {
+                            let _ = workspace.update(cx, |ws, cx| {
+                                ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+                            });
+                        }
+                    });
                 }
             },
         );
@@ -407,6 +485,7 @@ impl AppWindow {
                     .active_tab_id()
                     .map(|active_id| active_id == &tab.id)
                     .unwrap_or(false),
+                tab_id: Some(tab.id.to_string()),
             })
             .collect()
     }

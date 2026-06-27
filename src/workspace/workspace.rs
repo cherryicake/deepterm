@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -23,6 +24,7 @@ use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::TransferStatusReporter;
+use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::file_transfer::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
@@ -164,6 +166,10 @@ struct ResizeDragState {
 }
 
 impl Workspace {
+    pub fn active_tab_id(&self) -> &str {
+        &self.active_tab_id
+    }
+
     pub fn session_state(&self, cx: &App) -> WorkspaceSessionState {
         let tab_items = self.tab_bar.read(cx).tabs.clone();
         let tabs = tab_items
@@ -480,7 +486,7 @@ impl Workspace {
     }
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
-    fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             if let Some(panel) = tab_info.container.get_first_panel() {
                 if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
@@ -1983,10 +1989,12 @@ impl Workspace {
     }
 
     /// 切换到指定tab
-    fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+    pub fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.tabs.get(tab_id).is_some() {
-            // 更新TabBar的活动tab
+            // 同步 workspace 当前活动 tab（tab_bar 与内部状态保持一致）
             let tab_id = tab_id.to_string();
+            self.active_tab_id = tab_id.clone();
+            // 更新TabBar的活动tab
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.set_active_tab(tab_id.clone(), cx);
             });
@@ -2160,7 +2168,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn terminal_view_for_tab(
+    pub fn terminal_view_for_tab(
         &self,
         tab_id: &str,
         cx: &App,
@@ -2173,20 +2181,16 @@ impl Workspace {
     /// 处理侧边栏终端标签页双击事件：在侧边栏打开文件树
     pub fn handle_sidebar_tab_double_click(
         &mut self,
-        tab_label: &str,
+        tab_id: &str,
         sidebar: Entity<crate::components::macos_sidebar::MacosSidebar>,
         cx: &mut Context<Self>,
     ) {
-        let tab_id = self.tabs.iter().find_map(|(id, info)| {
-            if info.label == tab_label { Some(id.clone()) } else { None }
-        });
-
-        let Some(tab_id) = tab_id else {
-            log::warn!("未找到标签页: {}", tab_label);
+        if !self.tabs.contains_key(tab_id) {
+            log::warn!("未找到标签页: {}", tab_id);
             return;
-        };
+        }
 
-        let Some(terminal_view) = self.terminal_view_for_tab(&tab_id, cx) else {
+        let Some(terminal_view) = self.terminal_view_for_tab(tab_id, cx) else {
             log::warn!("标签页 {} 没有终端视图", tab_id);
             return;
         };
@@ -2217,23 +2221,28 @@ impl Workspace {
             }
         };
 
-        // 4. 创建 SidebarFileTree
-        let file_tree = cx.new(|cx| {
-            let mut tree = SidebarFileTree::new(cx, None);
-            match &target {
-                FileBrowserTarget::Local { requested_path } => {
-                    tree.open_path(requested_path.clone(), cx);
-                }
-                FileBrowserTarget::Remote { .. } => {
-                    tree.open_path(None, cx);
-                }
+        // 4. 根据终端类型选择后端
+        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = match &target {
+            FileBrowserTarget::Local { requested_path } => {
+                (Arc::new(LocalFileSystem), requested_path.clone())
             }
+            FileBrowserTarget::Remote { ssh_config, requested_path } => {
+                let path = requested_path.as_ref().map(PathBuf::from);
+                (Arc::new(RemoteFileSystem::new(ssh_config.clone())), path)
+            }
+        };
+
+        // 使用已知的 requested_path 作为初始 root_path，避免 SidebarFileTree::new
+        // 同步调用 backend.home_dir()（远程 backend 会建立 SFTP 连接，导致 UI 卡顿）。
+        let file_tree = cx.new(|cx| {
+            let mut tree = SidebarFileTree::new(cx, backend, requested_path.clone());
+            tree.open_path(requested_path, cx);
             tree
         });
 
-        // 5. 设置到 Sidebar
+        // 5. 设置到 Sidebar（同时传递终端视图引用用于 CWD 实时同步）
         let _ = sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_file_tree_view(file_tree, display_name, cx);
+            sidebar.set_file_tree_view(file_tree, display_name, Some(terminal_view), cx);
         });
     }
 

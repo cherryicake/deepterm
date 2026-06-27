@@ -1,3 +1,4 @@
+pub mod file_system;
 pub mod file_tree;
 pub mod font_settings;
 pub mod font_view;

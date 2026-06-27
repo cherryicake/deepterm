@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 use crate::sidebar_view::file_tree::SidebarFileTree;
+use crate::terminal_view::TerminalView;
 
 pub const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
@@ -60,6 +62,7 @@ pub struct SidebarTabItem {
     pub label: String,
     pub icon: Option<Icon>,
     pub active: bool,
+    pub tab_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,12 +152,15 @@ pub struct MacosSidebar {
     keychain_view: Option<Entity<KeychainSidebarView>>,
     file_tree_view: Option<Entity<SidebarFileTree>>,
     file_tree_target_label: Option<String>,
+    file_tree_terminal_view: Option<Entity<TerminalView>>,
+    file_tree_subscription: Option<Subscription>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
-    on_tab_double_click: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
+    on_tab_double_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
+    on_tab_single_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
@@ -204,12 +210,15 @@ impl MacosSidebar {
             keychain_view: None,
             file_tree_view: None,
             file_tree_target_label: None,
+            file_tree_terminal_view: None,
+            file_tree_subscription: None,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
             app_window: None,
             on_tab_group_select: None,
             on_tab_double_click: None,
+            on_tab_single_click: None,
             tab_group_menu_open: false,
             tab_group_menu_group_id: None,
             tab_group_popup_menu: None,
@@ -232,17 +241,80 @@ impl MacosSidebar {
 
     pub fn on_tab_double_click<F>(&mut self, callback: F)
     where
-        F: Fn(&str, &mut Window, &mut App) + 'static,
+        F: Fn(&str, &str, &str, &mut Self, &mut Window, &mut App) + 'static,
     {
         self.on_tab_double_click = Some(Rc::new(callback));
+    }
+
+    pub fn on_tab_single_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, &str, &str, &mut Self, &mut Window, &mut App) + 'static,
+    {
+        self.on_tab_single_click = Some(Rc::new(callback));
     }
 
     pub fn set_file_tree_view(
         &mut self,
         view: Entity<SidebarFileTree>,
         target_label: String,
+        terminal_view: Option<Entity<TerminalView>>,
         cx: &mut Context<Self>,
     ) {
+        // 取消之前的订阅
+        self.file_tree_subscription.take();
+        self.file_tree_terminal_view = terminal_view.clone();
+
+        // 订阅终端 CWD 变化，实时同步文件树
+        // 同时监听 TitleChanged：终端标签页通过 process cwd 查询等方式更新目录时也会触发该事件，
+        // 因此文件树使用相同的 session_state() 方法在 TitleChanged 时重新同步打开目录。
+        if let Some(tv) = &terminal_view {
+            let file_tree = view.clone();
+            let sub = cx.subscribe(tv, move |this, _, event: &crate::terminal_view::terminal_view::Event, cx| {
+                let should_sync = matches!(
+                    event,
+                    crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
+                        | crate::terminal_view::terminal_view::Event::TitleChanged
+                );
+                if !should_sync {
+                    return;
+                }
+                if let Some(tv) = &this.file_tree_terminal_view {
+                    let state = tv.read(cx).session_state(cx);
+                    let (cwd, target_label) = match state {
+                        crate::workspace::session_state::TerminalSessionState::Local { cwd, .. } => {
+                            let path = cwd.map(PathBuf::from);
+                            let label = path.as_ref()
+                                .and_then(|p| std::path::Path::new(p).file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("本地文件树")
+                                .to_string();
+                            (path, label)
+                        }
+                        crate::workspace::session_state::TerminalSessionState::Ssh { remote_cwd, .. } => {
+                            let path = remote_cwd.map(PathBuf::from);
+                            let label = path.as_ref()
+                                .and_then(|p| std::path::Path::new(p).file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("远程文件树")
+                                .to_string();
+                            (path, label)
+                        }
+                    };
+                    // 如果目录没有实际变化，避免刷新文件树 UI
+                    let should_update = cwd.as_deref() != Some(file_tree.read(cx).root_path());
+                    if should_update {
+                        this.file_tree_target_label = Some(target_label);
+                        let _ = file_tree.update(cx, |tree, cx| {
+                            tree.open_path(cwd, cx);
+                        });
+                        cx.notify();
+                        this.notify_app_window(cx);
+                    }
+                }
+            });
+            self.file_tree_subscription = Some(sub);
+        }
+
         self.file_tree_view = Some(view);
         self.file_tree_target_label = Some(target_label);
         self.current_view = SidebarView::FileTree;
@@ -254,6 +326,15 @@ impl MacosSidebar {
             }
         });
     }
+
+    /// 轻量版：仅切换侧边栏到文件树页面，不设订阅、不创建实体。
+    /// 从 listener 回调中直接调用（无需 Context<Self>），然后通过 AppWindow 触发重绘。
+    pub fn show_file_tree_page(&mut self, target_label: String) {
+        self.current_view = SidebarView::FileTree;
+        self.file_tree_target_label = Some(target_label);
+    }
+
+
 
     pub fn set_tab_group_tabs(
         &mut self,
@@ -389,14 +470,21 @@ impl MacosSidebar {
         self.current_view = view;
     }
 
-    /// 返回上一级视图
+    /// 返回上一级视图（清除文件树订阅）
     pub fn go_back(&mut self) {
+        self.file_tree_subscription.take();
+        self.file_tree_terminal_view = None;
         self.current_view = SidebarView::Menu;
+        self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
     }
 
     /// 获取当前视图
     pub fn current_view(&self) -> &SidebarView {
         &self.current_view
+    }
+
+    pub fn file_tree_terminal_view(&self) -> Option<Entity<TerminalView>> {
+        self.file_tree_terminal_view.clone()
     }
 
     /// 设置字体设置视图
@@ -1401,6 +1489,7 @@ impl MacosSidebar {
     ) -> gpui::Div {
         let mut list = div().w_full().flex().flex_col().gap(px(2.0));
 
+        let group_id_for_cb = group_id.to_string();
         for (index, tab) in tabs.iter().enumerate() {
             let icon = tab.icon.unwrap_or(Icon::Terminal);
             let text_color = if tab.active {
@@ -1409,7 +1498,10 @@ impl MacosSidebar {
                 theme.text_muted
             };
             let on_tab_double_click = self.on_tab_double_click.clone();
+            let on_tab_single_click = self.on_tab_single_click.clone();
             let tab_label = tab.label.clone();
+            let tab_id = tab.tab_id.clone().unwrap_or_default();
+            let click_group_id = group_id_for_cb.clone();
             list = list.child(
                 div()
                     .id(format!("sidebar-tab-group-tab-{}-{}", group_id, index))
@@ -1423,10 +1515,14 @@ impl MacosSidebar {
                     .rounded(px(8.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(hover_bg(cx.theme().appearance.is_dark())))
-                    .on_click(cx.listener(move |_this, event: &gpui::ClickEvent, window, cx| {
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                         if event.click_count() == 2 {
                             if let Some(ref callback) = on_tab_double_click {
-                                callback(&tab_label, window, cx);
+                                callback(&click_group_id, &tab_id, &tab_label, this, window, cx);
+                            }
+                        } else if event.click_count() == 1 {
+                            if let Some(ref callback) = on_tab_single_click {
+                                callback(&click_group_id, &tab_id, &tab_label, this, window, cx);
                             }
                         }
                     }))
