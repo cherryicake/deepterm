@@ -434,6 +434,20 @@ impl TabBar {
         cx.notify();
     }
 
+    /// 原地修改单个标签，避免重建整个 tabs Vec
+    pub fn modify_tab(
+        &mut self,
+        tab_id: &str,
+        f: impl FnOnce(&mut TabItem),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            f(tab);
+            self.update_overflow_state(cx);
+            cx.notify();
+        }
+    }
+
     pub fn active_tab_id(&self) -> Option<&SharedString> {
         self.active_tab_id.as_ref()
     }

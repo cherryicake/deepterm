@@ -717,18 +717,9 @@ impl Workspace {
                     if let Some(os) = os {
                         let icon = os.icon();
                         self.tab_bar.update(cx, |tab_bar, cx| {
-                            let tabs: Vec<TabItem> = tab_bar
-                                .tabs
-                                .iter()
-                                .map(|t| {
-                                    if t.id == tab_id {
-                                        TabItem::new(&tab_id, &t.label).with_icon(Some(icon)).with_is_remote(t.is_remote)
-                                    } else {
-                                        t.clone()
-                                    }
-                                })
-                                .collect();
-                            tab_bar.set_tabs(tabs, cx);
+                            tab_bar.modify_tab(&tab_id, |tab| {
+                                tab.icon = Some(icon);
+                            }, cx);
                         });
                     }
                 }
@@ -788,22 +779,9 @@ impl Workspace {
                             tab_info.label = label.clone();
                         }
                         self.tab_bar.update(cx, |tab_bar, cx| {
-                            let tabs: Vec<TabItem> = tab_bar
-                                .tabs
-                                .iter()
-                                .map(|t| {
-                                    if t.id == tab_id {
-                                        let mut new_tab = TabItem::new(&tab_id, label).with_is_remote(t.is_remote);
-                                        if let Some(icon) = t.icon {
-                                            new_tab = new_tab.with_icon(Some(icon));
-                                        }
-                                        new_tab
-                                    } else {
-                                        t.clone()
-                                    }
-                                })
-                                .collect();
-                            tab_bar.set_tabs(tabs, cx);
+                            tab_bar.modify_tab(&tab_id, |tab| {
+                                tab.label = label.clone().into();
+                            }, cx);
                         });
                         cx.emit(WorkspaceEvent::SessionChanged);
                     }
@@ -1384,18 +1362,10 @@ impl Workspace {
                 .unwrap_or_else(|| tab_info.label.clone());
             tab_info.label = label.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                let tabs: Vec<TabItem> = tab_bar
-                    .tabs
-                    .iter()
-                    .map(|t| {
-                        if t.id == target_tab_id {
-                            TabItem::new(&target_tab_id, &label).with_icon(remaining_icon)
-                        } else {
-                            t.clone()
-                        }
-                    })
-                    .collect();
-                tab_bar.set_tabs(tabs, cx);
+                tab_bar.modify_tab(&target_tab_id, |tab| {
+                    tab.label = label.clone().into();
+                    tab.icon = remaining_icon;
+                }, cx);
             });
         }
 
@@ -1462,20 +1432,10 @@ impl Workspace {
         // 更新TabBar显示（Workspace使用统一图标）
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
-            // 更新目标tab的标签
-            let tabs: Vec<TabItem> = tab_bar
-                .tabs
-                .iter()
-                .map(|t| {
-                    if t.id == target_tab_id {
-                        TabItem::new(&target_tab_id, &workspace_label)
-                            .with_icon(Some(crate::assets::Icon::Workspace))
-                    } else {
-                        t.clone()
-                    }
-                })
-                .collect();
-            tab_bar.set_tabs(tabs, cx);
+            tab_bar.modify_tab(&target_tab_id, |tab| {
+                tab.label = workspace_label.clone().into();
+                tab.icon = Some(crate::assets::Icon::Workspace);
+            }, cx);
         });
 
         // 重新订阅所有panel
@@ -1576,19 +1536,10 @@ impl Workspace {
             // 更新TabBar显示（Workspace使用统一图标）
             let workspace_label = self.generate_workspace_label();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                let tabs: Vec<TabItem> = tab_bar
-                    .tabs
-                    .iter()
-                    .map(|t| {
-                        if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &workspace_label)
-                                .with_icon(Some(crate::assets::Icon::Workspace))
-                        } else {
-                            t.clone()
-                        }
-                    })
-                    .collect();
-                tab_bar.set_tabs(tabs, cx);
+                tab_bar.modify_tab(&active_tab_id, |tab| {
+                    tab.label = workspace_label.clone().into();
+                    tab.icon = Some(crate::assets::Icon::Workspace);
+                }, cx);
             });
         }
 
@@ -1699,18 +1650,9 @@ impl Workspace {
                 .and_then(|p| p.read(cx).remote_os)
                 .map(|os| os.icon());
             self.tab_bar.update(cx, |tab_bar, cx| {
-                let tabs: Vec<TabItem> = tab_bar
-                    .tabs
-                    .iter()
-                    .map(|t| {
-                        if t.id == active_tab_id {
-                            TabItem::new(&active_tab_id, &tab_info.label).with_icon(remaining_icon).with_is_remote(t.is_remote)
-                        } else {
-                            t.clone()
-                        }
-                    })
-                    .collect();
-                tab_bar.set_tabs(tabs, cx);
+                tab_bar.modify_tab(&active_tab_id, |tab| {
+                    tab.icon = remaining_icon;
+                }, cx);
             });
         }
 

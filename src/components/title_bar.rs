@@ -133,7 +133,6 @@ impl TitleBar {
                         this.close_bell_panel(cx);
                     }
                     this.last_seen_task_id = max_id;
-                    cx.notify();
                 }));
         }
         self.workspace = Some(workspace);
