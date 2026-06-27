@@ -133,7 +133,21 @@ impl AppWindow {
             });
         });
 
-        // 设置 HostView 回调
+        // 设置侧边栏标签页双击回调
+        let workspace_for_dblclick = workspace.clone();
+        let sidebar_for_dblclick = sidebar.clone();
+        sidebar.update(cx, |sidebar, _cx| {
+            sidebar.on_tab_double_click(move |tab_label, _window, cx| {
+                let workspace = workspace_for_dblclick.clone();
+                let sidebar = sidebar_for_dblclick.clone();
+                let tab_label = tab_label.to_string();
+                cx.defer(move |cx| {
+                    let _ = workspace.update(cx, |ws, cx| {
+                        ws.handle_sidebar_tab_double_click(&tab_label, sidebar, cx);
+                    });
+                });
+            });
+        });
         let sidebar_for_host = sidebar.clone();
         host_view.update(cx, |hv, _cx| {
             hv.on_select(move |id, _window, cx| {

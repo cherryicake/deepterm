@@ -23,6 +23,7 @@ use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
 use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::TransferStatusReporter;
+use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::file_transfer::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
@@ -2225,6 +2226,73 @@ impl Workspace {
         let tab_info = self.tabs.get(tab_id)?;
         let panel = tab_info.container.get_first_panel()?;
         panel.read(cx).content().terminal_view().cloned()
+    }
+
+    /// 处理侧边栏终端标签页双击事件：在侧边栏打开文件树
+    pub fn handle_sidebar_tab_double_click(
+        &mut self,
+        tab_label: &str,
+        sidebar: Entity<crate::components::macos_sidebar::MacosSidebar>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.tabs.iter().find_map(|(id, info)| {
+            if info.label == tab_label { Some(id.clone()) } else { None }
+        });
+
+        let Some(tab_id) = tab_id else {
+            log::warn!("未找到标签页: {}", tab_label);
+            return;
+        };
+
+        let Some(terminal_view) = self.terminal_view_for_tab(&tab_id, cx) else {
+            log::warn!("标签页 {} 没有终端视图", tab_id);
+            return;
+        };
+
+        let state = terminal_view.read(cx).session_state(cx);
+
+        let (target, display_name) = match state {
+            TerminalSessionState::Ssh { config, remote_cwd } => {
+                let name = remote_cwd.as_ref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("远程文件树")
+                    .to_string();
+                (FileBrowserTarget::Remote {
+                    ssh_config: config,
+                    requested_path: remote_cwd,
+                }, name)
+            }
+            TerminalSessionState::Local { cwd, .. } => {
+                let name = cwd.as_ref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("本地文件树")
+                    .to_string();
+                (FileBrowserTarget::Local {
+                    requested_path: cwd.map(std::path::PathBuf::from),
+                }, name)
+            }
+        };
+
+        // 4. 创建 SidebarFileTree
+        let file_tree = cx.new(|cx| {
+            let mut tree = SidebarFileTree::new(cx, None);
+            match &target {
+                FileBrowserTarget::Local { requested_path } => {
+                    tree.open_path(requested_path.clone(), cx);
+                }
+                FileBrowserTarget::Remote { .. } => {
+                    tree.open_path(None, cx);
+                }
+            }
+            tree
+        });
+
+        // 5. 设置到 Sidebar
+        let _ = sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_file_tree_view(file_tree, display_name, cx);
+        });
     }
 
     /// 拷贝地址 - 将终端连接地址写入剪贴板

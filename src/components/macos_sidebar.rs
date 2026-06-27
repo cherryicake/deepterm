@@ -19,6 +19,7 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
+use crate::sidebar_view::file_tree::SidebarFileTree;
 
 pub const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
@@ -116,6 +117,7 @@ pub enum SidebarView {
     Font,
     Host,
     Keychain,
+    FileTree,
 }
 
 /// macOS 风格侧边栏组件
@@ -145,11 +147,14 @@ pub struct MacosSidebar {
     font_view: Option<Entity<FontSettingsView>>,
     host_view: Option<Entity<HostView>>,
     keychain_view: Option<Entity<KeychainSidebarView>>,
+    file_tree_view: Option<Entity<SidebarFileTree>>,
+    file_tree_target_label: Option<String>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
+    on_tab_double_click: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
@@ -197,11 +202,14 @@ impl MacosSidebar {
             font_view: None,
             host_view: None,
             keychain_view: None,
+            file_tree_view: None,
+            file_tree_target_label: None,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
             app_window: None,
             on_tab_group_select: None,
+            on_tab_double_click: None,
             tab_group_menu_open: false,
             tab_group_menu_group_id: None,
             tab_group_popup_menu: None,
@@ -220,6 +228,31 @@ impl MacosSidebar {
         F: Fn(&str, &mut Window, &mut App) + 'static,
     {
         self.on_tab_group_select = Some(Rc::new(callback));
+    }
+
+    pub fn on_tab_double_click<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, &mut Window, &mut App) + 'static,
+    {
+        self.on_tab_double_click = Some(Rc::new(callback));
+    }
+
+    pub fn set_file_tree_view(
+        &mut self,
+        view: Entity<SidebarFileTree>,
+        target_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_view = Some(view);
+        self.file_tree_target_label = Some(target_label);
+        self.current_view = SidebarView::FileTree;
+        cx.notify();
+        let app_window = self.app_window.clone();
+        cx.defer(move |cx| {
+            if let Some(aw) = &app_window {
+                aw.update(cx, |_, cx| cx.notify()).ok();
+            }
+        });
     }
 
     pub fn set_tab_group_tabs(
@@ -799,7 +832,7 @@ impl MacosSidebar {
     }
 
     fn render_menu_content(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
         is_dark: bool,
         theme: crate::theme::UiTheme,
@@ -825,7 +858,7 @@ impl MacosSidebar {
                 Icon::Macbook,
             ))
             .child(Self::render_collapsible_content(
-                self.render_tab_group_tabs(DEFAULT_TAB_GROUP_ID, &default_tabs, theme),
+                self.render_tab_group_tabs(DEFAULT_TAB_GROUP_ID, &default_tabs, theme, cx),
                 self.default_tab_group_collapsed,
                 self.default_tab_group_epoch,
                 (default_tabs.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP)
@@ -1009,7 +1042,7 @@ impl MacosSidebar {
     }
 
     fn render_tab_groups_section(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
         is_dark: bool,
         theme: crate::theme::UiTheme,
@@ -1080,10 +1113,16 @@ impl MacosSidebar {
             );
 
         let mut groups = div().w_full().flex().flex_col().gap(px(2.0));
-        for (index, group) in self.tab_groups.iter().enumerate() {
+        let tab_group_count = self.tab_groups.len();
+        for index in 0..tab_group_count {
+            let group_id = self.tab_groups[index].id.clone();
+            let group_label = self.tab_groups[index].label.clone();
+            let group_collapsed = self.tab_groups[index].collapsed;
+            let group_epoch = self.tab_groups[index].collapse_epoch;
+            let group_editing_input = self.tab_groups[index].editing_input.clone();
             let tabs = self
                 .tab_group_tabs
-                .get(&group.id)
+                .get(&group_id)
                 .cloned()
                 .unwrap_or_default();
             groups = groups
@@ -1091,17 +1130,17 @@ impl MacosSidebar {
                     cx,
                     is_dark,
                     theme,
-                    group.id.clone(),
-                    group.label.clone(),
-                    group.collapsed,
-                    group.editing_input.clone(),
+                    group_id.clone(),
+                    group_label,
+                    group_collapsed,
+                    group_editing_input,
                     true,
                     Icon::SquareOnSquare,
                 ))
                 .child(Self::render_collapsible_content(
-                    self.render_tab_group_tabs(&group.id, &tabs, theme),
-                    group.collapsed,
-                    group.collapse_epoch,
+                    self.render_tab_group_tabs(&group_id, &tabs, theme, cx),
+                    group_collapsed,
+                    group_epoch,
                     (tabs.len() as f32 * (SIDEBAR_ROW_HEIGHT + SIDEBAR_ROW_GAP) - SIDEBAR_ROW_GAP)
                         .max(0.0),
                     ("tab-group-tabs", index),
@@ -1354,10 +1393,11 @@ impl MacosSidebar {
     }
 
     fn render_tab_group_tabs(
-        &self,
+        &mut self,
         group_id: &str,
         tabs: &[SidebarTabItem],
         theme: crate::theme::UiTheme,
+        cx: &mut Context<Self>,
     ) -> gpui::Div {
         let mut list = div().w_full().flex().flex_col().gap(px(2.0));
 
@@ -1368,6 +1408,8 @@ impl MacosSidebar {
             } else {
                 theme.text_muted
             };
+            let on_tab_double_click = self.on_tab_double_click.clone();
+            let tab_label = tab.label.clone();
             list = list.child(
                 div()
                     .id(format!("sidebar-tab-group-tab-{}-{}", group_id, index))
@@ -1379,6 +1421,15 @@ impl MacosSidebar {
                     .pr(px(10.0))
                     .gap(px(6.0))
                     .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hover_bg(cx.theme().appearance.is_dark())))
+                    .on_click(cx.listener(move |_this, event: &gpui::ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            if let Some(ref callback) = on_tab_double_click {
+                                callback(&tab_label, window, cx);
+                            }
+                        }
+                    }))
                     .child(
                         div()
                             .size(px(SIDEBAR_ROW_ICON_BOX))
@@ -1545,6 +1596,77 @@ impl MacosSidebar {
         theme_view::render_theme_sidebar(cx, on_select, is_dark, theme, &self.theme_scroll_handle)
     }
 
+    fn render_file_tree_content(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = cx.theme().ui;
+        let is_dark = cx.theme().appearance.is_dark();
+        let target_label = self.file_tree_target_label.clone().unwrap_or_else(|| "文件树".to_string());
+
+        let header = div()
+            .w_full()
+            .h(px(36.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(4.0))
+            .mb(px(8.0))
+            .child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(999.0))
+                    .bg(button_bg(is_dark))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .child(
+                        gpui::svg()
+                            .size(px(8.0))
+                            .path(Icon::ChevronLeft.path())
+                            .text_color(theme.text),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _window, cx| {
+                            this.handle_item_select("__back");
+                            this.notify_app_window(cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(target_label),
+            )
+            .child(div().w(px(28.0)));
+
+        let file_tree_content = self
+            .file_tree_view
+            .clone()
+            .map(|view| div().w_full().h_full().child(view))
+            .unwrap_or_else(|| div().w_full().h_full());
+
+        div()
+            .w_full()
+            .h_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(file_tree_content),
+            )
+    }
+
     fn render_host_content(&self) -> gpui::Div {
         self.host_view
             .clone()
@@ -1656,6 +1778,7 @@ impl Render for MacosSidebar {
                     .into_any_element(),
                 SidebarView::Host => self.render_host_content().into_any_element(),
                 SidebarView::Keychain => self.render_keychain_content().into_any_element(),
+                SidebarView::FileTree => self.render_file_tree_content(cx).into_any_element(),
             });
 
         // Resize handle：贴 sidebar 右边缘，默认透明，hover 显淡色背景
