@@ -736,7 +736,6 @@ impl Render for AppWindow {
         if editor_is_empty {
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(0.0, 0.0, cx);
-                editor.set_tab_bar_pad_animation(0, 0.0, 0.0, 0, cx);
             });
         } else if sidebar_epoch == 0 {
             let pad = if sidebar_visible { 6.0 } else { closed_tab_bar_pad() };
