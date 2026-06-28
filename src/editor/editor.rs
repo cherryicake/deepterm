@@ -31,6 +31,9 @@ pub struct Editor {
     width: f32,
     resize_drag_x: Option<Pixels>,
     app_window: Option<WeakEntity<crate::AppWindow>>,
+    tab_bar_left_padding: f32,
+    content_left_padding: f32,
+    content_bottom_padding: f32,
 }
 
 impl Editor {
@@ -44,6 +47,9 @@ impl Editor {
             width: EDITOR_DEFAULT_WIDTH,
             resize_drag_x: None,
             app_window: None,
+            tab_bar_left_padding: 0.0,
+            content_left_padding: 0.0,
+            content_bottom_padding: 0.0,
         };
 
         this.setup_tab_bar_handlers(cx);
@@ -76,6 +82,24 @@ impl Editor {
 
     pub fn end_resize(&mut self) {
         self.resize_drag_x = None;
+    }
+
+    pub fn set_paddings(
+        &mut self,
+        tab_bar_left: f32,
+        content_left: f32,
+        content_bottom: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if (self.tab_bar_left_padding - tab_bar_left).abs() > 0.5
+            || (self.content_left_padding - content_left).abs() > 0.5
+            || (self.content_bottom_padding - content_bottom).abs() > 0.5
+        {
+            self.tab_bar_left_padding = tab_bar_left;
+            self.content_left_padding = content_left;
+            self.content_bottom_padding = content_bottom;
+            cx.notify();
+        }
     }
 
     pub fn notify_app_window(&self, cx: &mut App) {
@@ -230,6 +254,9 @@ impl Render for Editor {
         let tab_bar = div()
             .h(px(44.0))
             .w_full()
+            .when(self.tab_bar_left_padding > 0.0, |this| {
+                this.pl(px(self.tab_bar_left_padding))
+            })
             .child(self.tab_bar.clone());
 
         let content = if let Some(active_id) = &self.active_file_id {
@@ -239,6 +266,12 @@ impl Render for Editor {
                     .min_h_0()
                     .overflow_hidden()
                     .bg(theme.app_background)
+                    .when(self.content_left_padding > 0.0, |this| {
+                        this.pl(px(self.content_left_padding))
+                    })
+                    .when(self.content_bottom_padding > 0.0, |this| {
+                        this.pb(px(self.content_bottom_padding))
+                    })
                     .child(EditorInput::new(&file.editor_state))
                     .into_any_element()
             } else {

@@ -717,6 +717,25 @@ impl Render for AppWindow {
         self.sync_sidebar_tab_groups(cx);
         let theme = cx.theme().ui;
 
+        let sidebar_visible = self.sidebar.read(cx).is_visible();
+        let editor_is_empty = self.editor.read(cx).is_empty();
+        if !sidebar_visible && !editor_is_empty {
+            let tab_bar_left = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+                124.0
+            } else if cfg!(target_os = "macos") {
+                48.0
+            } else {
+                50.0
+            };
+            self.editor.update(cx, |editor, cx| {
+                editor.set_paddings(tab_bar_left, 12.0, 16.0, cx);
+            });
+        } else {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_paddings(0.0, 0.0, 0.0, cx);
+            });
+        }
+
         let mut root = div()
             .size_full()
             .bg(theme.app_background)
