@@ -52,8 +52,8 @@ impl Editor {
             resize_drag_x: None,
             app_window: None,
             tab_bar_pad_epoch: 0,
-            tab_bar_pad_start: 0.0,
-            tab_bar_pad_end: 0.0,
+            tab_bar_pad_start: 6.0,
+            tab_bar_pad_end: 6.0,
             tab_bar_pad_duration_ms: 0,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
@@ -307,6 +307,7 @@ impl Render for Editor {
                 div()
                     .h(px(44.0))
                     .w_full()
+                    .pl(px(6.0))
                     .child(inner)
                     .into_any_element()
             }
