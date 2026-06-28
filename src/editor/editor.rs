@@ -270,13 +270,10 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.open_files.is_empty() {
-            return div().into_any_element();
-        }
-
+        let is_empty = self.open_files.is_empty();
         let theme = cx.theme().ui;
 
-        let tab_bar: gpui::AnyElement = {
+        let tab_bar: gpui::AnyElement = if !is_empty {
             let epoch = self.tab_bar_pad_epoch;
             let start = self.tab_bar_pad_start;
             let end = self.tab_bar_pad_end;
@@ -311,23 +308,29 @@ impl Render for Editor {
                     .child(inner)
                     .into_any_element()
             }
+        } else {
+            div().into_any_element()
         };
 
-        let content = if let Some(active_id) = &self.active_file_id {
-            if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .bg(theme.app_background)
-                    .when(self.content_left_padding > 0.0, |this| {
-                        this.pl(px(self.content_left_padding))
-                    })
-                    .when(self.content_bottom_padding > 0.0, |this| {
-                        this.pb(px(self.content_bottom_padding))
-                    })
-                    .child(EditorInput::new(&file.editor_state))
-                    .into_any_element()
+        let content: gpui::AnyElement = if !is_empty {
+            if let Some(active_id) = &self.active_file_id {
+                if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .bg(theme.app_background)
+                        .when(self.content_left_padding > 0.0, |this| {
+                            this.pl(px(self.content_left_padding))
+                        })
+                        .when(self.content_bottom_padding > 0.0, |this| {
+                            this.pb(px(self.content_bottom_padding))
+                        })
+                        .child(EditorInput::new(&file.editor_state))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
             } else {
                 div().into_any_element()
             }
@@ -335,25 +338,30 @@ impl Render for Editor {
             div().into_any_element()
         };
 
-        let resize_handle = div()
-            .absolute()
-            .right(px(0.0))
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .w(px(2.0))
-            .cursor_col_resize()
-            .bg(theme.border.opacity(0.5))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.start_resize(event.position.x);
-                    cx.notify();
-                    this.notify_app_window(cx);
-                }),
-            );
+        let resize_handle: gpui::AnyElement = if !is_empty {
+            div()
+                .absolute()
+                .right(px(0.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(px(2.0))
+                .cursor_col_resize()
+                .bg(theme.border.opacity(0.5))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.start_resize(event.position.x);
+                        cx.notify();
+                        this.notify_app_window(cx);
+                    }),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
 
         div()
-            .w(px(self.width))
+            .w(px(if is_empty { 0.0 } else { self.width }))
             .h_full()
             .relative()
             .flex()
@@ -361,8 +369,10 @@ impl Render for Editor {
             .child(tab_bar)
             .child(content)
             .child(resize_handle)
-            .child(EditorResizeElement {
-                editor: cx.entity().downgrade(),
+            .when(!is_empty, |this| {
+                this.child(EditorResizeElement {
+                    editor: cx.entity().downgrade(),
+                })
             })
             .into_any_element()
     }
