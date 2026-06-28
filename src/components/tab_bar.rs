@@ -386,13 +386,17 @@ impl TabBar {
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
+        let is_first = self.tabs.is_empty();
         self.tabs.push(tab);
         // 提前检查溢出状态，避免 UI 上出现溢出后再切换
         self.update_overflow_state(cx);
         cx.notify();
         // 滚动到最新添加的标签（最右边）
-        let last_index = self.tabs.len().saturating_sub(1);
-        self.scroll_handle.scroll_to_item(last_index);
+        // 首个标签不要调用 scroll_to_item(0)，避免 ScrollHandle 未初始化时触发默认偏移
+        if !is_first {
+            let last_index = self.tabs.len().saturating_sub(1);
+            self.scroll_handle.scroll_to_item(last_index);
+        }
     }
 
     pub fn remove_tab(&mut self, id: &str, cx: &mut Context<Self>) {
