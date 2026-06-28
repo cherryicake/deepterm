@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -160,6 +161,7 @@ pub struct MacosSidebar {
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
     on_tab_double_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
     on_tab_single_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
+    on_file_open: Option<Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>>,
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
@@ -218,6 +220,7 @@ impl MacosSidebar {
             on_tab_group_select: None,
             on_tab_double_click: None,
             on_tab_single_click: None,
+            on_file_open: None,
             tab_group_menu_open: false,
             tab_group_menu_group_id: None,
             tab_group_popup_menu: None,
@@ -251,6 +254,15 @@ impl MacosSidebar {
     {
         self.on_tab_single_click = Some(Rc::new(callback));
     }
+
+    pub fn set_on_file_open<F>(&mut self, callback: F)
+    where
+        F: Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_file_open = Some(Rc::new(callback));
+    }
+
+
 
     pub fn set_file_tree_view(
         &mut self,
@@ -295,6 +307,11 @@ impl MacosSidebar {
                 this.notify_app_window(cx);
             });
             self.file_tree_subscription = Some(sub);
+        }
+
+        // 转发文件打开回调到文件树
+        if let Some(ref callback) = self.on_file_open.clone() {
+            view.update(cx, |tree, _cx| tree.set_on_file_open(callback.clone()));
         }
 
         self.file_tree_view = Some(view);

@@ -1,5 +1,6 @@
 use std::collections::{HashSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
@@ -74,6 +75,7 @@ pub struct SidebarFileTree {
     flat_cache: Option<Vec<(FileEntry, usize)>>,
     backend: Arc<dyn FileSystem>,
     loading_paths: HashSet<PathBuf>,
+    on_file_open: Option<Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>>,
 }
 
 impl SidebarFileTree {
@@ -91,6 +93,7 @@ impl SidebarFileTree {
             flat_cache: None,
             backend,
             loading_paths: HashSet::new(),
+            on_file_open: None,
         }
     }
 
@@ -112,6 +115,10 @@ impl SidebarFileTree {
 
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    pub fn set_on_file_open(&mut self, callback: Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>) {
+        self.on_file_open = Some(callback);
     }
 
     fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -238,11 +245,15 @@ impl SidebarFileTree {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
+                cx.listener(move |this, _, window, cx| {
                     if is_directory {
                         this.toggle_folder_expanded(click_path.clone(), cx);
                     } else {
                         this.select_path(click_path.clone(), cx);
+                        let cb = this.on_file_open.clone();
+                        if let Some(callback) = cb {
+                            callback(click_path.clone(), window, cx);
+                        }
                     }
                 }),
             );

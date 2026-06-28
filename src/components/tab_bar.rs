@@ -467,7 +467,7 @@ impl TabBar {
     }
 
     pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.measured_container_width <= 0.0 {
+        if self.measured_container_width <= 0.0 || self.tabs.is_empty() {
             return false;
         }
 
@@ -1288,36 +1288,36 @@ impl Render for TabBar {
                     )
                     // 新建标签按钮 - 放在滚动区域外面，始终可见
                     // 使用 ml_1 保持与 Tab 标签页之间的间距一致（gap_1 = 4px）
-                    .child(
-                        div()
-                            .id("new-tab-btn")
-                            .w(px(32.0))
-                            .h(px(32.0))
-                            .flex()
-                            .flex_shrink_0()
-                            .ml_1()
-                            .mr_3()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(999.0))
-                            .cursor_pointer()
-                            // .bg(theme.tab_inactive_background)
-                            .hover(move |style| style.bg(theme.tab_hover_background))
-                            .child(
-                                svg()
-                                    .size(px(16.0))
-                                    .text_color(theme.icon_muted)
-                                    .path(Icon::Plus.path()),
-                            )
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(move |_, _, window, cx| {
-                                    if let Some(ref callback) = on_new_tab {
-                                        callback(window, cx);
-                                    }
-                                }),
-                            ),
-                    ),
+                    .when_some(on_new_tab, |this, on_new_tab| {
+                        this.child(
+                            div()
+                                .id("new-tab-btn")
+                                .w(px(32.0))
+                                .h(px(32.0))
+                                .flex()
+                                .flex_shrink_0()
+                                .ml_1()
+                                .mr_3()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(999.0))
+                                .cursor_pointer()
+                                // .bg(theme.tab_inactive_background)
+                                .hover(move |style| style.bg(theme.tab_hover_background))
+                                .child(
+                                    svg()
+                                        .size(px(16.0))
+                                        .text_color(theme.icon_muted)
+                                        .path(Icon::Plus.path()),
+                                )
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |_, _, window, cx| {
+                                        on_new_tab(window, cx);
+                                    }),
+                                ),
+                        )
+                    }),
             )
     }
 }

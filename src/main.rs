@@ -8,6 +8,7 @@ use std::time::Duration;
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
+pub mod editor;
 pub mod file_browser;
 pub mod file_transfer;
 mod sidebar_view;
@@ -28,6 +29,7 @@ use crate::components::macos_sidebar::{
     DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabGroupState, SidebarTabItem,
 };
 use crate::components::title_bar::TitleBar;
+use crate::editor::Editor;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
@@ -66,6 +68,7 @@ pub struct AppWindow {
     tab_group_workspaces: Vec<TabGroupWorkspace>,
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
+    editor: Entity<Editor>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
@@ -206,6 +209,22 @@ impl AppWindow {
             });
         });
 
+        // 创建 Editor（侧边栏和 Workspace 之间的文件编辑器）
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(window, cx));
+        editor.update(cx, |editor, _cx| {
+            editor.bind_app_window(app_window.downgrade());
+        });
+
+        // 设置文件打开回调：侧边栏文件树点击文件 → Editor 打开文件
+        let editor_for_open = editor.downgrade();
+        sidebar.update(cx, |sidebar, _cx| {
+            sidebar.set_on_file_open(move |path, window, cx| {
+                if let Some(editor) = editor_for_open.upgrade() {
+                    editor.update(cx, |e, cx| e.open_file(path, window, cx));
+                }
+            });
+        });
+
         let mut this = Self {
             title_bar,
             default_workspace: workspace.clone(),
@@ -213,6 +232,7 @@ impl AppWindow {
             tab_group_workspaces: Vec::new(),
             ssh_picker,
             sidebar,
+            editor,
             _sidebar_hide_task: None,
             host_view,
             keychain_view,
@@ -715,6 +735,7 @@ impl Render for AppWindow {
                 this.toggle_sidebar(window, cx);
             }))
             .child(self.sidebar.clone())
+            .child(self.editor.clone())
             .child(self.render_main_area(window, cx))
             .child(self.render_new_tab_group_button(window, cx))
             .child(self.render_sidebar_toggle(window, cx))
