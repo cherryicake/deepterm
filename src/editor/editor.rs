@@ -284,7 +284,7 @@ impl Render for Editor {
                 let id = ("editor-tab-pad", epoch);
                 div()
                     .h(px(44.0))
-                    .w_full()
+                    .w(px((self.width - 3.0).max(0.0)))
                     .child(inner)
                     .with_animation(
                         id,
@@ -296,14 +296,14 @@ impl Render for Editor {
             } else if end > 0.0 {
                 div()
                     .h(px(44.0))
-                    .w_full()
+                    .w(px((self.width - 3.0).max(0.0)))
                     .pl(px(end))
                     .child(inner)
                     .into_any_element()
             } else {
                 div()
                     .h(px(44.0))
-                    .w_full()
+                    .w(px((self.width - 3.0).max(0.0)))
                     .pl(px(6.0))
                     .child(inner)
                     .into_any_element()
@@ -316,6 +316,7 @@ impl Render for Editor {
             if let Some(active_id) = &self.active_file_id {
                 if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
                     div()
+                        .w_full()
                         .flex_1()
                         .min_h_0()
                         .overflow_hidden()
@@ -366,6 +367,7 @@ impl Render for Editor {
             .relative()
             .flex()
             .flex_col()
+            .items_start()
             .child(tab_bar)
             .child(content)
             .child(resize_handle)
