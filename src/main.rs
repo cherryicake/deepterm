@@ -730,6 +730,10 @@ impl Render for AppWindow {
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(tab_bar_left, 12.0, 16.0, cx);
             });
+        } else if !editor_is_empty {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_paddings(6.0, 0.0, 0.0, cx);
+            });
         } else {
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(0.0, 0.0, 0.0, cx);
