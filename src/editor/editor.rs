@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, CursorStyle, Element, ElementId, Entity, GlobalElementId,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, WeakEntity,
-    Window, div, px,
+    Animation, AnimationExt, App, Context, CursorStyle, Element, ElementId, Entity,
+    GlobalElementId, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
+    WeakEntity, Window, div, px,
 };
 
 use crate::components::input::{EditorInput, InputState};
@@ -31,7 +32,10 @@ pub struct Editor {
     width: f32,
     resize_drag_x: Option<Pixels>,
     app_window: Option<WeakEntity<crate::AppWindow>>,
-    tab_bar_left_padding: f32,
+    tab_bar_pad_epoch: u32,
+    tab_bar_pad_start: f32,
+    tab_bar_pad_end: f32,
+    tab_bar_pad_duration_ms: u64,
     content_left_padding: f32,
     content_bottom_padding: f32,
 }
@@ -47,7 +51,10 @@ impl Editor {
             width: EDITOR_DEFAULT_WIDTH,
             resize_drag_x: None,
             app_window: None,
-            tab_bar_left_padding: 0.0,
+            tab_bar_pad_epoch: 0,
+            tab_bar_pad_start: 0.0,
+            tab_bar_pad_end: 0.0,
+            tab_bar_pad_duration_ms: 0,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
         };
@@ -86,18 +93,36 @@ impl Editor {
 
     pub fn set_paddings(
         &mut self,
-        tab_bar_left: f32,
         content_left: f32,
         content_bottom: f32,
         cx: &mut Context<Self>,
     ) {
-        if (self.tab_bar_left_padding - tab_bar_left).abs() > 0.5
-            || (self.content_left_padding - content_left).abs() > 0.5
+        if (self.content_left_padding - content_left).abs() > 0.5
             || (self.content_bottom_padding - content_bottom).abs() > 0.5
         {
-            self.tab_bar_left_padding = tab_bar_left;
             self.content_left_padding = content_left;
             self.content_bottom_padding = content_bottom;
+            cx.notify();
+        }
+    }
+
+    pub fn set_tab_bar_pad_animation(
+        &mut self,
+        epoch: u32,
+        start: f32,
+        end: f32,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_bar_pad_epoch != epoch
+            || (self.tab_bar_pad_start - start).abs() > 0.5
+            || (self.tab_bar_pad_end - end).abs() > 0.5
+            || self.tab_bar_pad_duration_ms != duration_ms
+        {
+            self.tab_bar_pad_epoch = epoch;
+            self.tab_bar_pad_start = start;
+            self.tab_bar_pad_end = end;
+            self.tab_bar_pad_duration_ms = duration_ms;
             cx.notify();
         }
     }
@@ -251,13 +276,41 @@ impl Render for Editor {
 
         let theme = cx.theme().ui;
 
-        let tab_bar = div()
-            .h(px(44.0))
-            .w_full()
-            .when(self.tab_bar_left_padding > 0.0, |this| {
-                this.pl(px(self.tab_bar_left_padding))
-            })
-            .child(self.tab_bar.clone());
+        let tab_bar: gpui::AnyElement = {
+            let epoch = self.tab_bar_pad_epoch;
+            let start = self.tab_bar_pad_start;
+            let end = self.tab_bar_pad_end;
+            let dur = self.tab_bar_pad_duration_ms;
+            let inner = self.tab_bar.clone();
+
+            if epoch > 0 {
+                let id = ("editor-tab-pad", epoch);
+                div()
+                    .h(px(44.0))
+                    .w_full()
+                    .child(inner)
+                    .with_animation(
+                        id,
+                        Animation::new(Duration::from_millis(dur))
+                            .with_easing(gpui::ease_in_out),
+                        move |this, delta| this.pl(px(start + (end - start) * delta)),
+                    )
+                    .into_any_element()
+            } else if end > 0.0 {
+                div()
+                    .h(px(44.0))
+                    .w_full()
+                    .pl(px(end))
+                    .child(inner)
+                    .into_any_element()
+            } else {
+                div()
+                    .h(px(44.0))
+                    .w_full()
+                    .child(inner)
+                    .into_any_element()
+            }
+        };
 
         let content = if let Some(active_id) = &self.active_file_id {
             if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {

@@ -718,25 +718,45 @@ impl Render for AppWindow {
         let theme = cx.theme().ui;
 
         let sidebar_visible = self.sidebar.read(cx).is_visible();
+        let sidebar_epoch = self.sidebar.read(cx).animation_epoch();
         let editor_is_empty = self.editor.read(cx).is_empty();
-        if !sidebar_visible && !editor_is_empty {
-            let tab_bar_left = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+        const SIDEBAR_ENTER_MS: u64 = 300;
+        const SIDEBAR_EXIT_MS: u64 = 250;
+
+        let closed_tab_bar_pad = || -> f32 {
+            if cfg!(target_os = "macos") && !window.is_fullscreen() {
                 124.0
             } else if cfg!(target_os = "macos") {
                 48.0
             } else {
                 50.0
-            };
+            }
+        };
+
+        if editor_is_empty {
             self.editor.update(cx, |editor, cx| {
-                editor.set_paddings(tab_bar_left, 12.0, 16.0, cx);
+                editor.set_paddings(0.0, 0.0, cx);
+                editor.set_tab_bar_pad_animation(0, 0.0, 0.0, 0, cx);
             });
-        } else if !editor_is_empty {
+        } else if sidebar_epoch == 0 {
+            let pad = if sidebar_visible { 6.0 } else { closed_tab_bar_pad() };
+            let content_left = if sidebar_visible { 0.0 } else { 12.0 };
+            let content_bottom = if sidebar_visible { 0.0 } else { 16.0 };
             self.editor.update(cx, |editor, cx| {
-                editor.set_paddings(6.0, 0.0, 0.0, cx);
+                editor.set_paddings(content_left, content_bottom, cx);
+                editor.set_tab_bar_pad_animation(0, pad, pad, 0, cx);
+            });
+        } else if sidebar_visible {
+            let closed = closed_tab_bar_pad();
+            self.editor.update(cx, |editor, cx| {
+                editor.set_paddings(0.0, 0.0, cx);
+                editor.set_tab_bar_pad_animation(sidebar_epoch, closed, 6.0, SIDEBAR_ENTER_MS, cx);
             });
         } else {
+            let closed = closed_tab_bar_pad();
             self.editor.update(cx, |editor, cx| {
-                editor.set_paddings(0.0, 0.0, 0.0, cx);
+                editor.set_paddings(12.0, 16.0, cx);
+                editor.set_tab_bar_pad_animation(sidebar_epoch, 6.0, closed, SIDEBAR_EXIT_MS, cx);
             });
         }
 
