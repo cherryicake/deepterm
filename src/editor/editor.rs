@@ -13,7 +13,7 @@ use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
-const EDITOR_DEFAULT_WIDTH: f32 = 400.0;
+const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 const EDITOR_MAX_WIDTH: f32 = 800.0;
 
