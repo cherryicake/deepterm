@@ -7,6 +7,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Window, div, px, svg};
 
 use crate::assets::Icon;
+use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 use crate::sidebar_view::file_system::FileSystem;
 
@@ -75,7 +76,7 @@ pub struct SidebarFileTree {
     flat_cache: Option<Vec<(FileEntry, usize)>>,
     backend: Arc<dyn FileSystem>,
     loading_paths: HashSet<PathBuf>,
-    on_file_open: Option<Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>>,
+    on_file_open: Option<Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>>,
 }
 
 impl SidebarFileTree {
@@ -117,7 +118,10 @@ impl SidebarFileTree {
         &self.root_path
     }
 
-    pub fn set_on_file_open(&mut self, callback: Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>) {
+    pub fn set_on_file_open(
+        &mut self,
+        callback: Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>,
+    ) {
         self.on_file_open = Some(callback);
     }
 
@@ -251,8 +255,9 @@ impl SidebarFileTree {
                     } else {
                         this.select_path(click_path.clone(), cx);
                         let cb = this.on_file_open.clone();
+                        let ssh_config = this.backend.ssh_config();
                         if let Some(callback) = cb {
-                            callback(click_path.clone(), window, cx);
+                            callback(click_path.clone(), ssh_config, window, cx);
                         }
                     }
                 }),

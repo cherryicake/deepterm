@@ -218,9 +218,15 @@ impl AppWindow {
         // 设置文件打开回调：侧边栏文件树点击文件 → Editor 打开文件
         let editor_for_open = editor.downgrade();
         sidebar.update(cx, |sidebar, _cx| {
-            sidebar.set_on_file_open(move |path, window, cx| {
+            sidebar.set_on_file_open(move |path, ssh_config, window, cx| {
                 if let Some(editor) = editor_for_open.upgrade() {
-                    editor.update(cx, |e, cx| e.open_file(path, window, cx));
+                    editor.update(cx, |e, cx| {
+                        if let Some(config) = ssh_config {
+                            e.open_remote_file(path.to_string_lossy().to_string(), config, window, cx);
+                        } else {
+                            e.open_file(path, window, cx);
+                        }
+                    });
                 }
             });
         });
@@ -795,12 +801,13 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
-            theme::init(cx);
-            sidebar_view::font_settings::FontState::init(cx);
-            components::init(cx);
-            terminal_view::init(cx);
-            workspace::init(cx);
-            WindowManager::init(cx);
+        theme::init(cx);
+        sidebar_view::font_settings::FontState::init(cx);
+        components::init(cx);
+        terminal_view::init(cx);
+        workspace::init(cx);
+        editor::init(cx);
+        WindowManager::init(cx);
             crate::builtin_commands::executor::init_global_executor();
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),

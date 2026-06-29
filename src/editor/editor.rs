@@ -4,17 +4,27 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, ElementId, Entity,
-    GlobalElementId, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
-    WeakEntity, Window, div, px,
+    GlobalElementId, IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled,
+    WeakEntity, Window, actions, div, px,
 };
 
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
 const EDITOR_DEFAULT_WIDTH: f32 = 400.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 const EDITOR_MAX_WIDTH: f32 = 800.0;
+
+actions!(editor_panel, [CloseActiveEditorTab]);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+    ]);
+}
 
 struct EditorFile {
     id: SharedString,
@@ -143,6 +153,65 @@ impl Editor {
         }
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
+        self.open_file_with_content(
+            tab_id,
+            path_str,
+            content,
+            path,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_remote_file(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = format!("editor-remote-{}", path);
+
+        if self.open_files.iter().any(|f| f.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            return;
+        }
+
+        let content = match crate::ssh::sftp_fs::read_text_preview(&ssh_config, &path) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                log::warn!("远程文件为二进制或空，无法打开编辑: {}", path);
+                String::new()
+            }
+            Err(e) => {
+                log::warn!("读取远程文件失败 {}: {}", path, e);
+                String::new()
+            }
+        };
+
+        self.open_file_with_content(
+            tab_id,
+            path.clone(),
+            content,
+            PathBuf::from(&path),
+            Some(ssh_config),
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_file_with_content(
+        &mut self,
+        tab_id: String,
+        path_str: String,
+        content: String,
+        path: PathBuf,
+        _ssh_config: Option<SshConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let label = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -368,6 +437,12 @@ impl Render for Editor {
         };
 
         div()
+            .key_context("EditorPanel")
+            .on_action(cx.listener(|this, _: &CloseActiveEditorTab, _window, cx| {
+                if let Some(active_id) = this.active_file_id.clone() {
+                    this.close_file(active_id.as_ref(), cx);
+                }
+            }))
             .w(px(if is_empty { 0.0 } else { self.width }))
             .h_full()
             .relative()

@@ -21,6 +21,7 @@ use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
 use crate::sidebar_view::file_tree::SidebarFileTree;
+use crate::ssh::SshConnectionConfig;
 use crate::terminal_view::TerminalView;
 
 pub const SIDEBAR_MIN_WIDTH: f32 = 220.0;
@@ -161,7 +162,7 @@ pub struct MacosSidebar {
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
     on_tab_double_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
     on_tab_single_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
-    on_file_open: Option<Rc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>>,
+    on_file_open: Option<Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>>,
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
@@ -257,7 +258,7 @@ impl MacosSidebar {
 
     pub fn set_on_file_open<F>(&mut self, callback: F)
     where
-        F: Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static,
+        F: Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_file_open = Some(Rc::new(callback));
     }

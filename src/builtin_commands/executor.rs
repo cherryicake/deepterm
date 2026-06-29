@@ -39,7 +39,7 @@ pub enum CommandResult {
     /// 打开文件浏览器
     OpenFileBrowser { target: FileBrowserTarget },
     /// 打开文件
-    OpenFile { path: String },
+    OpenFile { path: String, ssh_config: Option<SshConnectionConfig> },
     /// 启动一次文件传输（由 workspace 层挂接进度/冲突弹窗/任务列表）
     StartTransfer { request: TransferRequest },
     /// 仅记录日志
@@ -206,7 +206,9 @@ impl CommandHandler for OpenFileHandler {
                 .into_owned()
         };
 
-        CommandResult::OpenFile { path }
+        let ssh_config = ctx.ssh_config.clone();
+
+        CommandResult::OpenFile { path, ssh_config }
     }
 }
 
@@ -750,8 +752,9 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenFile { path } => {
+            CommandResult::OpenFile { path, ssh_config } => {
                 assert_eq!(path, "/home/user/project/src/main.rs");
+                assert!(ssh_config.is_none());
             }
             _ => panic!("Expected OpenFile result"),
         }
@@ -778,8 +781,9 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenFile { path } => {
+            CommandResult::OpenFile { path, ssh_config } => {
                 assert_eq!(path, "/srv/app/logs/app.log");
+                assert!(ssh_config.is_some());
             }
             _ => panic!("Expected OpenFile result"),
         }

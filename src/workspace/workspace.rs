@@ -759,8 +759,12 @@ impl Workspace {
                 let window_handle = window.window_handle();
                 self.start_transfer_request(panel_id.clone(), request.clone(), window_handle, cx);
             }
-            PanelEvent::OpenFile { panel_id, path } => {
-                self.show_editor_panel(panel_id.clone(), path.clone(), window, cx);
+            PanelEvent::OpenFile {
+                panel_id,
+                path,
+                ssh_config,
+            } => {
+                self.show_editor_panel(panel_id.clone(), path.clone(), ssh_config.clone(), window, cx);
             }
             PanelEvent::Close { panel_id } => {
                 self.handle_panel_close(panel_id, window, cx);
@@ -1854,11 +1858,26 @@ impl Workspace {
         &mut self,
         _panel_id: String,
         path: String,
+        ssh_config: Option<SshConnectionConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Read file content
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        // Read file content (local or remote)
+        let content = if let Some(config) = &ssh_config {
+            match crate::ssh::sftp_fs::read_text_preview(config, &path) {
+                Ok(Some(text)) => text,
+                Ok(None) => {
+                    log::warn!("远程文件为二进制或空，无法打开编辑: {}", path);
+                    String::new()
+                }
+                Err(e) => {
+                    log::warn!("读取远程文件失败 {}: {}", path, e);
+                    String::new()
+                }
+            }
+        } else {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
         // Guess language from extension
         let language = std::path::Path::new(&path)
             .extension()

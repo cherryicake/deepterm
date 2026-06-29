@@ -25,7 +25,7 @@ pub enum Event {
     /// Open the file browser view
     OpenFileBrowser { target: FileBrowserTarget },
     /// Open a file in the editor
-    OpenFile { path: String },
+    OpenFile { path: String, ssh_config: Option<SshConnectionConfig> },
     /// 发起一次文件传输（由 /scp 等内建命令触发）
     StartTransfer { request: TransferRequest },
     /// SSH 重新连接请求
@@ -1439,8 +1439,11 @@ impl TerminalView {
                 cx.emit(Event::OpenFileBrowser { target });
                 true
             }
-            Some(CommandResult::OpenFile { path }) => {
-                cx.emit(Event::OpenFile { path });
+            Some(CommandResult::OpenFile { path, ssh_config }) => {
+                cx.emit(Event::OpenFile {
+                    path,
+                    ssh_config,
+                });
                 true
             }
             Some(CommandResult::StartTransfer { request }) => {

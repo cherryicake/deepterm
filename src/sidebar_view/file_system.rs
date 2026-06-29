@@ -8,6 +8,7 @@ use crate::sidebar_view::file_tree::{FileEntry, FileEntryKind};
 pub trait FileSystem: Send + Sync + 'static {
     fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>, String>;
     fn home_dir(&self) -> Option<PathBuf>;
+    fn ssh_config(&self) -> Option<SshConnectionConfig>;
 }
 
 pub struct LocalFileSystem;
@@ -24,6 +25,10 @@ impl FileSystem for LocalFileSystem {
 
     fn home_dir(&self) -> Option<PathBuf> {
         dirs::home_dir()
+    }
+
+    fn ssh_config(&self) -> Option<SshConnectionConfig> {
+        None
     }
 }
 
@@ -80,5 +85,9 @@ impl FileSystem for RemoteFileSystem {
                 .map(PathBuf::from)
             })
             .clone()
+    }
+
+    fn ssh_config(&self) -> Option<SshConnectionConfig> {
+        Some(self.config.clone())
     }
 }

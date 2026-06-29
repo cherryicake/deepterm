@@ -89,7 +89,11 @@ pub enum PanelEvent {
         request: TransferRequest,
     },
     /// 在编辑器中打开文件
-    OpenFile { panel_id: String, path: String },
+    OpenFile {
+        panel_id: String,
+        path: String,
+        ssh_config: Option<SshConnectionConfig>,
+    },
     /// 关闭panel事件
     Close { panel_id: String },
     /// 选中状态变更事件
@@ -254,10 +258,11 @@ impl Panel {
                         target: target.clone(),
                     });
                 }
-                TerminalViewEvent::OpenFile { path } => {
+                TerminalViewEvent::OpenFile { path, ssh_config } => {
                     cx.emit(PanelEvent::OpenFile {
                         panel_id: close_panel_id.clone(),
                         path: path.clone(),
+                        ssh_config: ssh_config.clone(),
                     });
                 }
                 TerminalViewEvent::StartTransfer { request } => {
