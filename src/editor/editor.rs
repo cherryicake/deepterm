@@ -273,12 +273,20 @@ impl Render for Editor {
         let is_empty = self.open_files.is_empty();
         let theme = cx.theme().ui;
 
-        let tab_bar: gpui::AnyElement = if !is_empty {
+        let inner = self.tab_bar.clone();
+
+        let tab_bar: gpui::AnyElement = if is_empty {
+            div()
+                .w(px(0.0))
+                .h(px(44.0))
+                .overflow_hidden()
+                .child(inner)
+                .into_any_element()
+        } else {
             let epoch = self.tab_bar_pad_epoch;
             let start = self.tab_bar_pad_start;
             let end = self.tab_bar_pad_end;
             let dur = self.tab_bar_pad_duration_ms;
-            let inner = self.tab_bar.clone();
 
             if epoch > 0 {
                 let id = ("editor-tab-pad", epoch);
@@ -308,8 +316,6 @@ impl Render for Editor {
                     .child(inner)
                     .into_any_element()
             }
-        } else {
-            div().into_any_element()
         };
 
         let content: gpui::AnyElement = if !is_empty {
