@@ -660,8 +660,8 @@ impl AppWindow {
 
         let editor_is_empty = self.editor.read(cx).is_empty();
 
-        // 当编辑器打开时，终端 TabBar 只需与编辑器分割线保持 3px 间距；
-        // 无需为侧边栏 Toggle 按钮预留大段 padding，因为编辑器自身已提供左侧视觉隔离。
+        // 编辑器打开时，由 TitleBar 内部 left_padding 控制 3px 间距，
+        // 外层无需额外偏移；编辑器关闭时才需要外层 padding 为交通灯+toggle预留空间。
         let needs_traffic_pad = cfg!(target_os = "macos") && !is_fullscreen;
         let compact_pad = if cfg!(target_os = "macos") {
             TITLE_BAR_EXTRA_PAD_MACOS_FS
@@ -669,7 +669,7 @@ impl AppWindow {
             TITLE_BAR_EXTRA_PAD_WIN
         };
         let closed_pad = if !editor_is_empty {
-            3.0
+            0.0
         } else if needs_traffic_pad {
             TITLE_BAR_EXTRA_PAD_MACOS
         } else {
@@ -680,6 +680,17 @@ impl AppWindow {
         } else {
             (0.0, closed_pad, SIDEBAR_EXIT_MS)
         };
+
+        // 编辑器打开时，TitleBar 内部 left_padding 设为 3px，
+        // 使终端 TabBar 与编辑器分割线统一保持 3px 间距；
+        // 编辑器关闭时恢复平台默认内边距。
+        self.title_bar.update(cx, |tb, _| {
+            if editor_is_empty {
+                tb.reset_left_padding();
+            } else {
+                tb.set_left_padding(px(3.0));
+            }
+        });
 
         // 初始状态（epoch == 0）直接应用最终 padding，避免打开时出现一次不必要的展开动画
         let animated_title_bar: gpui::AnyElement = if epoch == 0 {

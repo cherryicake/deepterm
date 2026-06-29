@@ -67,6 +67,9 @@ pub struct TitleBar {
     _progress_refresh_task: Option<gpui::Task<()>>,
     /// 关闭动画结束后清除 `bell_panel_animating_out` 的延迟任务。
     _bell_hide_task: Option<gpui::Task<()>>,
+    /// 覆盖 TitleBar 默认左侧内边距。
+    /// 当编辑器打开时设为 `3px`，使终端 TabBar 与编辑器分割线保持 3px 间距。
+    left_padding: Pixels,
 }
 
 impl TitleBar {
@@ -87,7 +90,19 @@ impl TitleBar {
             _subscriptions: Vec::new(),
             _progress_refresh_task: None,
             _bell_hide_task: None,
+            left_padding: TITLE_BAR_LEFT_PADDING,
         }
+    }
+
+    /// 设置 TitleBar 左侧内边距覆盖值。用于在编辑器打开时精确控制
+    /// 终端 TabBar 与编辑器分割线的间距。
+    pub fn set_left_padding(&mut self, padding: Pixels) {
+        self.left_padding = padding;
+    }
+
+    /// 重置 TitleBar 左侧内边距为平台默认值。
+    pub fn reset_left_padding(&mut self) {
+        self.left_padding = TITLE_BAR_LEFT_PADDING;
     }
 
     /// Create a new TitleBar as an Entity.
@@ -506,14 +521,7 @@ impl Render for TitleBar {
             .flex_row()
             .items_center()
             .h(TITLE_BAR_HEIGHT)
-            // macOS 非全屏时为交通灯留出基础边距；其余情况统一使用 8px
-            .when(is_macos && !is_fullscreen, |this| {
-                this.pl(TITLE_BAR_LEFT_PADDING)
-            })
-            .when(is_macos && is_fullscreen, |this| {
-                this.pl(TITLE_BAR_LEFT_PADDING)
-            })
-            .when(!is_macos, |this| this.pl(TITLE_BAR_LEFT_PADDING))
+            .pl(self.left_padding)
             .bg(theme.app_background)
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
