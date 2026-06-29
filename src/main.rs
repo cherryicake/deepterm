@@ -751,7 +751,7 @@ impl Render for AppWindow {
         } else {
             let pad = if sidebar_visible { 6.0 } else { closed_tab_bar_pad() };
             let content_left = if sidebar_visible { 0.0 } else { 12.0 };
-            let content_bottom = if sidebar_visible { 0.0 } else { 16.0 };
+            let content_bottom = 8.0;
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(content_left, content_bottom, cx);
                 editor.set_tab_bar_pad_animation(0, pad, pad, 0, cx);
