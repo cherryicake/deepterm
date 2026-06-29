@@ -643,7 +643,7 @@ impl AppWindow {
 
     /// 渲染右侧主内容区域（TitleBar + Workspace）。
     /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
-    fn render_main_area(&self, window: &gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main_area(&self, window: &gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         const TITLE_BAR_EXTRA_PAD_MACOS: f32 = 116.0;
         const TITLE_BAR_EXTRA_PAD_MACOS_FS: f32 = 40.0;
         const TITLE_BAR_EXTRA_PAD_WIN: f32 = 44.0;
@@ -654,34 +654,31 @@ impl AppWindow {
 
         // 从 Sidebar Entity 读取状态
         let (is_visible, epoch) = {
-            let sidebar = self.sidebar.read(_cx);
+            let sidebar = self.sidebar.read(cx);
             (sidebar.is_visible(), sidebar.animation_epoch())
         };
 
-        // macOS 非全屏: 关闭时需为交通灯+toggle 按钮留出空间(116px)；
-        //   打开后按钮移入 sidebar，padding 恢复。
-        // macOS 全屏: toggle 在 8px，用 40px 外层 padding 保持与
-        //   非全屏一致的 4px 间距；打开后按钮移入 sidebar，padding 恢复。
-        // Windows / Linux: 关闭时 toggle 按钮在左边缘(8px)，
-        //   需为按钮留出 44px 空间；打开后按钮移入 sidebar，padding 恢复。
+        let editor_is_empty = self.editor.read(cx).is_empty();
+
+        // 当编辑器打开时，终端 TabBar 只需与编辑器分割线保持 3px 间距；
+        // 无需为侧边栏 Toggle 按钮预留大段 padding，因为编辑器自身已提供左侧视觉隔离。
         let needs_traffic_pad = cfg!(target_os = "macos") && !is_fullscreen;
         let compact_pad = if cfg!(target_os = "macos") {
             TITLE_BAR_EXTRA_PAD_MACOS_FS
         } else {
             TITLE_BAR_EXTRA_PAD_WIN
         };
-        let (start_pl, end_pl, dur_ms) = if is_visible {
-            if needs_traffic_pad {
-                (TITLE_BAR_EXTRA_PAD_MACOS, 0.0, SIDEBAR_ENTER_MS)
-            } else {
-                (compact_pad, 0.0, SIDEBAR_ENTER_MS)
-            }
+        let closed_pad = if !editor_is_empty {
+            3.0
+        } else if needs_traffic_pad {
+            TITLE_BAR_EXTRA_PAD_MACOS
         } else {
-            if needs_traffic_pad {
-                (0.0, TITLE_BAR_EXTRA_PAD_MACOS, SIDEBAR_EXIT_MS)
-            } else {
-                (0.0, compact_pad, SIDEBAR_EXIT_MS)
-            }
+            compact_pad
+        };
+        let (start_pl, end_pl, dur_ms) = if is_visible {
+            (closed_pad, 0.0, SIDEBAR_ENTER_MS)
+        } else {
+            (0.0, closed_pad, SIDEBAR_EXIT_MS)
         };
 
         // 初始状态（epoch == 0）直接应用最终 padding，避免打开时出现一次不必要的展开动画
