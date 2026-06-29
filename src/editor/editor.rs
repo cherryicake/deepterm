@@ -361,7 +361,7 @@ impl Render for Editor {
                 let id = ("editor-tab-pad", epoch);
                 div()
                     .h(px(44.0))
-                    .w(px((self.width - 5.0).max(0.0)))
+                    .w(px((self.width - 8.0).max(0.0)))
                     .child(inner)
                     .with_animation(
                         id,
@@ -373,14 +373,14 @@ impl Render for Editor {
             } else if end > 0.0 {
                 div()
                     .h(px(44.0))
-                    .w(px((self.width - 5.0).max(0.0)))
+                    .w(px((self.width - 8.0).max(0.0)))
                     .pl(px(end))
                     .child(inner)
                     .into_any_element()
             } else {
                 div()
                     .h(px(44.0))
-                    .w(px((self.width - 5.0).max(0.0)))
+                    .w(px((self.width - 8.0).max(0.0)))
                     .pl(px(6.0))
                     .child(inner)
                     .into_any_element()

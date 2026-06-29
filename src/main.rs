@@ -688,7 +688,7 @@ impl AppWindow {
             if editor_is_empty {
                 tb.reset_left_padding();
             } else {
-                tb.set_left_padding(px(3.0));
+                tb.set_left_padding(px(6.0));
             }
         });
 
