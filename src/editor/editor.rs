@@ -15,7 +15,7 @@ use crate::theme::ActiveTheme;
 
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
-const EDITOR_MAX_WIDTH: f32 = 800.0;
+
 
 actions!(editor_panel, [CloseActiveEditorTab]);
 
@@ -92,7 +92,7 @@ impl Editor {
     pub fn update_resize(&mut self, pos: Pixels) {
         if let Some(start) = self.resize_drag_x {
             let delta: f32 = (pos - start).into();
-            self.width = (self.width + delta).clamp(EDITOR_MIN_WIDTH, EDITOR_MAX_WIDTH);
+            self.width = (self.width + delta).max(EDITOR_MIN_WIDTH);
             self.resize_drag_x = Some(pos);
         }
     }
