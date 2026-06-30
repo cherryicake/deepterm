@@ -437,7 +437,6 @@ impl BlockingSftpSession {
     }
 
     pub fn read_text_preview(&mut self, path: &str) -> anyhow::Result<Option<String>> {
-        use crate::file_browser::shared::is_binary_content;
         const PREVIEW_BYTES: usize = 64 * 1024;
 
         crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
@@ -1301,4 +1300,63 @@ async fn pipelined_writer(
     }
 
     Ok(bytes_written)
+}
+
+const PREVIEW_ANALYSIS_BYTES: usize = 1024;
+
+/// Detect whether a byte sequence is likely binary content.
+/// Based on zed's heuristic in worktree/src/worktree.rs.
+fn is_binary_content(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    if bytes.starts_with(b"%PDF-")
+        || bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xFF\xD8\xFF")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || bytes.starts_with(b"RIFF")
+        || bytes.starts_with(b"OggS")
+        || bytes.starts_with(b"fLaC")
+        || bytes.starts_with(b"ID3")
+        || bytes.starts_with(b"\xFF\xFB")
+        || bytes.starts_with(b"\xFF\xFA")
+        || bytes.starts_with(b"\xFF\xF3")
+        || bytes.starts_with(b"\xFF\xF2")
+    {
+        return true;
+    }
+
+    let limit = bytes.len().min(PREVIEW_ANALYSIS_BYTES);
+    let mut null_count = 0usize;
+    let mut non_text_like_count = 0usize;
+
+    for &byte in &bytes[..limit] {
+        if byte == 0 {
+            null_count += 1;
+            non_text_like_count += 1;
+            continue;
+        }
+
+        let is_text_like = matches!(
+            byte,
+            b'\t' | b'\n' | b'\r' | 0x0C
+            | 0x20..=0x7E
+            | 0x80..=0xBF | 0xC2..=0xF4
+        );
+
+        if !is_text_like {
+            non_text_like_count += 1;
+        }
+    }
+
+    if null_count > 0 && null_count * 16 >= limit {
+        return true;
+    }
+
+    non_text_like_count * 100 >= limit * 8
 }

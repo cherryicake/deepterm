@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use crate::file_browser::FileBrowserTarget;
 use crate::ssh::SshConnectionConfig;
 
 /// 本地路径解析上下文
@@ -58,37 +57,6 @@ impl PathResolver {
         } else {
             cwd.map(|cwd| crate::ssh::sftp_fs::join_remote_path(cwd, trimmed))
                 .or_else(|| Some(trimmed.to_string()))
-        }
-    }
-
-    /// 构建文件浏览器目标
-    pub fn build_file_browser_target(
-        argument: Option<&str>,
-        is_remote: bool,
-        local_ctx: Option<LocalPathContext>,
-        remote_ctx: Option<RemotePathContext>,
-    ) -> FileBrowserTarget {
-        if is_remote {
-            let ctx = remote_ctx.expect("remote context required for remote terminal");
-            let requested_path = argument.and_then(|raw| {
-                Self::resolve_remote(raw, ctx.current_remote_working_directory.as_deref())
-            });
-
-            FileBrowserTarget::Remote {
-                ssh_config: ctx.ssh_config,
-                requested_path: requested_path.or(ctx.current_remote_working_directory),
-            }
-        } else {
-            let ctx = local_ctx.expect("local context required for local terminal");
-            let requested_path = argument.map(|raw| Self::resolve_local(raw, &ctx));
-
-            FileBrowserTarget::Local {
-                requested_path: requested_path
-                    .or_else(|| ctx.process_cwd.clone())
-                    .or_else(|| ctx.working_directory.clone())
-                    .or_else(dirs::home_dir)
-                    .or(Some(PathBuf::from("/"))),
-            }
         }
     }
 

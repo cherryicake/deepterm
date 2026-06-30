@@ -13,7 +13,6 @@ use gpui::{
 use gpui::{KeyBinding, prelude::*};
 use unicode_width::UnicodeWidthStr;
 
-use crate::file_browser::FileBrowserTarget;
 use crate::file_transfer::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::ssh_view::connect::Event::Reconnect;
@@ -22,10 +21,8 @@ use crate::ssh_view::connect::Event::Reconnect;
 pub enum Event {
     /// Terminal process exited - container should close this view
     CloseTerminal,
-    /// Open the file browser view
-    OpenFileBrowser { target: FileBrowserTarget },
-    /// Open a file in the editor
-    OpenFile { path: String, ssh_config: Option<SshConnectionConfig> },
+    /// Open a file or directory in the editor or file tree
+    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
     /// 发起一次文件传输（由 /scp 等内建命令触发）
     StartTransfer { request: TransferRequest },
     /// SSH 重新连接请求
@@ -1435,15 +1432,8 @@ impl TerminalView {
         };
 
         match result {
-            Some(CommandResult::OpenFileBrowser { target }) => {
-                cx.emit(Event::OpenFileBrowser { target });
-                true
-            }
-            Some(CommandResult::OpenFile { path, ssh_config }) => {
-                cx.emit(Event::OpenFile {
-                    path,
-                    ssh_config,
-                });
+            Some(CommandResult::OpenPath { path, ssh_config }) => {
+                cx.emit(Event::OpenPath { path, ssh_config });
                 true
             }
             Some(CommandResult::StartTransfer { request }) => {

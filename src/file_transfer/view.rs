@@ -7,7 +7,20 @@ use gpui::prelude::*;
 use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
 
 use crate::assets::Icon;
-use crate::file_browser::shared::format_size;
+fn format_size(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", size, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
 use crate::file_transfer::{FileEndpoint, TransferRequest};
 use crate::theme::UiTheme;
 

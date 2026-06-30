@@ -161,6 +161,7 @@ impl Editor {
             None,
             window,
             cx,
+            true,
         );
     }
 
@@ -170,6 +171,27 @@ impl Editor {
         ssh_config: SshConnectionConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
+    ) {
+        self.open_remote_file_inner(path, ssh_config, window, cx, true);
+    }
+
+    pub fn open_remote_file_no_notify(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote_file_inner(path, ssh_config, window, cx, false);
+    }
+
+    fn open_remote_file_inner(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
     ) {
         let tab_id = format!("editor-remote-{}", path);
 
@@ -198,6 +220,7 @@ impl Editor {
             Some(ssh_config),
             window,
             cx,
+            notify_app,
         );
     }
 
@@ -211,6 +234,7 @@ impl Editor {
         _ssh_config: Option<SshConnectionConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        notify_app: bool,
     ) {
         let label = path
             .file_name()
@@ -244,7 +268,36 @@ impl Editor {
 
         self.switch_to_file(&tab_id, cx);
         cx.notify();
-        self.notify_app_window(cx);
+        if notify_app {
+            self.notify_app_window(cx);
+        }
+    }
+
+    pub fn open_file_no_notify(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_str = path.to_string_lossy().to_string();
+        let tab_id = format!("editor-{}", path_str);
+
+        if self.open_files.iter().any(|f| f.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            return;
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        self.open_file_with_content(
+            tab_id,
+            path_str,
+            content,
+            path,
+            None,
+            window,
+            cx,
+            false,
+        );
     }
 
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {

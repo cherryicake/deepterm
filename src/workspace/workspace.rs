@@ -19,10 +19,8 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::components::input::InputState;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
-use crate::file_browser::{FileBrowserTarget, FileBrowserView, RemoteFileBrowserView};
 use crate::file_transfer::TransferStatusReporter;
 use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
@@ -41,11 +39,11 @@ use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
-const FILE_BROWSER_TAB_ID: &str = "__file_browser__";
 
 #[derive(Clone, Debug)]
 pub enum WorkspaceEvent {
     SessionChanged,
+    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -747,10 +745,13 @@ impl Workspace {
                     }
                 }
             }
-            PanelEvent::OpenFileBrowser { panel_id, target } => {
-                self.show_file_browser_overlay(panel_id, target.clone(), window, cx);
-            }
-            PanelEvent::FileBrowserOverlayClosed { panel_id } => {
+            PanelEvent::OpenPath { panel_id, path, ssh_config } => {
+                // 判断路径是文件还是目录
+                cx.emit(WorkspaceEvent::OpenPath {
+                    path: path.clone(),
+                    ssh_config: ssh_config.clone(),
+                });
+                // 聚焦原 panel
                 if let Some(panel) = self.find_panel(panel_id, cx) {
                     self.focus_panel_content(panel, window, cx);
                 }
@@ -758,13 +759,6 @@ impl Workspace {
             PanelEvent::TransferRequested { panel_id, request } => {
                 let window_handle = window.window_handle();
                 self.start_transfer_request(panel_id.clone(), request.clone(), window_handle, cx);
-            }
-            PanelEvent::OpenFile {
-                panel_id,
-                path,
-                ssh_config,
-            } => {
-                self.show_editor_panel(panel_id.clone(), path.clone(), ssh_config.clone(), window, cx);
             }
             PanelEvent::Close { panel_id } => {
                 self.handle_panel_close(panel_id, window, cx);
@@ -1096,20 +1090,8 @@ impl Workspace {
         }
         cx.notify();
 
-        self.refresh_file_browsers(cx);
-
         // 已完成/失败/取消的任务保留在列表中，仅通过用户点击"清除"或"×"手动移除。
         let _ = transfer_id;
-    }
-
-    fn refresh_file_browsers(&mut self, cx: &mut Context<Self>) {
-        for tab in self.tabs.values() {
-            for panel in tab.container.collect_panels_vec() {
-                panel.update(cx, |panel, cx| {
-                    panel.refresh_file_browser_content(cx);
-                });
-            }
-        }
     }
 
     /// 处理广播状态切换
@@ -1759,82 +1741,6 @@ impl Workspace {
         }
     }
 
-    fn show_file_browser_panel(
-        &mut self,
-        target: FileBrowserTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab_info) = self.tabs.get(FILE_BROWSER_TAB_ID) {
-            if let Some(panel) = tab_info.container.get_first_panel() {
-                self.replace_or_update_file_browser_panel(&panel, target, window, cx);
-                self.focus_panel_content(panel, window, cx);
-            }
-
-            self.active_tab_id = FILE_BROWSER_TAB_ID.into();
-            self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
-            return;
-        }
-
-        let file_browser_panel = cx.new(|cx| {
-            Panel::with_file_browser_view(
-                format!("file-browser-panel-{}", self.next_panel_id),
-                self.workspace_id.clone(),
-                Some(FILE_BROWSER_TAB_ID.into()),
-                FileBrowserView::new_with_path(window, cx, None),
-                cx,
-            )
-        });
-        self.replace_or_update_file_browser_panel(&file_browser_panel, target, window, cx);
-        self.next_panel_id += 1;
-
-        self.tabs.insert(
-            FILE_BROWSER_TAB_ID.into(),
-            TabInfo::new_normal(FILE_BROWSER_TAB_ID, "Files", file_browser_panel.clone()),
-        );
-
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.add_tab(TabItem::new(FILE_BROWSER_TAB_ID, "Files"), cx);
-        });
-
-        let subscription = cx.subscribe_in(
-            &file_browser_panel,
-            window,
-            |this, _, event: &PanelEvent, window, cx| {
-                this.handle_panel_event(event, window, cx);
-            },
-        );
-        self.panel_subscriptions.insert(
-            file_browser_panel.read(cx).panel_id.to_string(),
-            subscription,
-        );
-
-        self.active_tab_id = FILE_BROWSER_TAB_ID.into();
-        self.switch_to_tab(FILE_BROWSER_TAB_ID, cx);
-        self.focus_panel_content(file_browser_panel, window, cx);
-        cx.notify();
-    }
-
-    fn show_file_browser_overlay(
-        &mut self,
-        panel_id: &str,
-        target: FileBrowserTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = self.find_panel(panel_id, cx);
-
-        let Some(panel) = panel else {
-            self.show_file_browser_panel(target, window, cx);
-            return;
-        };
-
-        panel.update(cx, |panel, cx| {
-            panel.show_file_browser_overlay(target, window, cx);
-        });
-        self.focus_panel_content(panel, window, cx);
-    }
-
     fn find_panel(&self, panel_id: &str, cx: &App) -> Option<Entity<Panel>> {
         self.tabs
             .values()
@@ -1850,159 +1756,6 @@ impl Workspace {
         cx.defer_in(window, move |_, window, cx| {
             if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
                 window.focus(&handle, cx);
-            }
-        });
-    }
-
-    fn show_editor_panel(
-        &mut self,
-        _panel_id: String,
-        path: String,
-        ssh_config: Option<SshConnectionConfig>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Read file content (local or remote)
-        let content = if let Some(config) = &ssh_config {
-            match crate::ssh::sftp_fs::read_text_preview(config, &path) {
-                Ok(Some(text)) => text,
-                Ok(None) => {
-                    log::warn!("远程文件为二进制或空，无法打开编辑: {}", path);
-                    String::new()
-                }
-                Err(e) => {
-                    log::warn!("读取远程文件失败 {}: {}", path, e);
-                    String::new()
-                }
-            }
-        } else {
-            std::fs::read_to_string(&path).unwrap_or_default()
-        };
-        // Guess language from extension
-        let language = std::path::Path::new(&path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| match ext {
-                "rs" => "rust",
-                "js" => "javascript",
-                "ts" => "typescript",
-                "json" => "json",
-                "py" => "python",
-                "go" => "go",
-                "cpp" | "cc" | "cxx" => "cpp",
-                "c" => "c",
-                "html" => "html",
-                "css" => "css",
-                "md" => "markdown",
-                "sh" | "bash" => "bash",
-                "toml" => "toml",
-                "yaml" | "yml" => "yaml",
-                _ => "text",
-            })
-            .unwrap_or("text")
-            .to_string();
-
-        let tab_id = format!("editor-{}", path);
-        let tab_label = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&path)
-            .to_string();
-
-        let editor_panel = cx.new(|cx| {
-            let editor_state = cx.new(|cx| {
-                let mut state = InputState::new(window, cx)
-                    .code_editor(language)
-                    .multi_line(true);
-                state.set_value(&content, window, cx);
-                state
-            });
-            Panel::with_editor(
-                format!("editor-panel-{}", self.next_panel_id),
-                self.workspace_id.clone(),
-                Some(tab_id.clone().into()),
-                editor_state,
-                cx,
-            )
-        });
-        self.next_panel_id += 1;
-
-        self.tabs.insert(
-            tab_id.clone(),
-            TabInfo::new_normal(&tab_id, &tab_label, editor_panel.clone()),
-        );
-
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.add_tab(TabItem::new(&tab_id, &tab_label), cx);
-        });
-
-        let subscription = cx.subscribe_in(
-            &editor_panel,
-            window,
-            |this, _, event: &PanelEvent, window, cx| {
-                this.handle_panel_event(event, window, cx);
-            },
-        );
-        self.panel_subscriptions
-            .insert(editor_panel.read(cx).panel_id.to_string(), subscription);
-
-        self.active_tab_id = tab_id.clone();
-        self.switch_to_tab(&tab_id, cx);
-        cx.notify();
-    }
-
-    fn replace_or_update_file_browser_panel(
-        &self,
-        panel: &Entity<Panel>,
-        target: FileBrowserTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        panel.update(cx, move |panel, cx| match target {
-            FileBrowserTarget::Local { requested_path } => {
-                let existing_view = match panel.content() {
-                    PanelContent::FileBrowser(file_browser_view) => Some(file_browser_view.clone()),
-                    _ => None,
-                };
-
-                if let Some(file_browser_view) = existing_view {
-                    file_browser_view.update(cx, |file_browser, cx| {
-                        file_browser.open_requested_path(requested_path.clone(), window, cx);
-                    });
-                } else {
-                    let file_browser_view =
-                        FileBrowserView::new_with_path(window, cx, requested_path);
-                    panel.set_content(PanelContent::FileBrowser(file_browser_view), cx);
-                }
-            }
-            FileBrowserTarget::Remote {
-                ssh_config,
-                requested_path,
-            } => {
-                let existing_view = match panel.content() {
-                    PanelContent::RemoteFileBrowser(file_browser_view) => {
-                        Some(file_browser_view.clone())
-                    }
-                    _ => None,
-                };
-
-                if let Some(file_browser_view) = existing_view {
-                    let should_replace = file_browser_view.read(cx).ssh_config() != &ssh_config;
-
-                    if should_replace {
-                        let file_browser_view =
-                            RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
-                        panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
-                    } else {
-                        file_browser_view.update(cx, |file_browser, cx| {
-                            file_browser.open_requested_path(requested_path.clone(), window, cx);
-                        });
-                    }
-                } else {
-                    let file_browser_view =
-                        RemoteFileBrowserView::new(window, cx, ssh_config, requested_path);
-                    panel.set_content(PanelContent::RemoteFileBrowser(file_browser_view), cx);
-                }
             }
         });
     }
@@ -2222,24 +1975,13 @@ impl Workspace {
 
         let (path, display_name) = state.file_tree_target();
 
-        let target = match &state {
-            TerminalSessionState::Ssh { config, .. } => FileBrowserTarget::Remote {
-                ssh_config: config.clone(),
-                requested_path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
-            },
-            TerminalSessionState::Local { .. } => FileBrowserTarget::Local {
-                requested_path: path.clone(),
-            },
-        };
-
-        // 4. 根据终端类型选择后端
-        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = match &target {
-            FileBrowserTarget::Local { requested_path } => {
-                (Arc::new(LocalFileSystem), requested_path.clone())
+        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = match &state {
+            TerminalSessionState::Ssh { config, .. } => {
+                let path = path.as_ref().map(|p| p.to_string_lossy().to_string()).map(PathBuf::from);
+                (Arc::new(RemoteFileSystem::new(config.clone())), path)
             }
-            FileBrowserTarget::Remote { ssh_config, requested_path } => {
-                let path = requested_path.as_ref().map(PathBuf::from);
-                (Arc::new(RemoteFileSystem::new(ssh_config.clone())), path)
+            TerminalSessionState::Local { .. } => {
+                (Arc::new(LocalFileSystem), path.clone())
             }
         };
 

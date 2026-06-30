@@ -135,24 +135,6 @@ pub fn init_global_registry() -> CommandRegistry {
     let mut registry = CommandRegistry::new();
 
     registry.register(BuiltinCommand {
-        name: "/open",
-        description: "Open DeepTerm's File Browser.",
-        icon: Icon::FolderOutline,
-        availability: Availability::Always,
-        argument: ArgumentType::Optional {
-            hint: Some("file_path"),
-        },
-        handler_id: CommandHandlerId("open_file_browser"),
-    });
-    registry.register(BuiltinCommand {
-        name: "/open-file",
-        description: "Open a file in DeepTerm's editor.",
-        icon: Icon::Screen,
-        availability: Availability::Always,
-        argument: ArgumentType::Required { hint: "file_path" },
-        handler_id: CommandHandlerId("open_file"),
-    });
-    registry.register(BuiltinCommand {
         name: "/scp",
         description: "Copy files between configured hosts or local (e.g. /scp alice:/etc/hosts bob:/tmp/).",
         icon: Icon::Server,
@@ -161,6 +143,16 @@ pub fn init_global_registry() -> CommandRegistry {
             hint: "src dst",
         },
         handler_id: CommandHandlerId("scp_transfer"),
+    });
+    registry.register(BuiltinCommand {
+        name: "/open",
+        description: "Open a file or directory in the editor or file tree.",
+        icon: Icon::FolderOutline,
+        availability: Availability::Always,
+        argument: ArgumentType::Required {
+            hint: "path",
+        },
+        handler_id: CommandHandlerId("open_path"),
     });
 
     registry
@@ -252,7 +244,6 @@ mod tests {
     #[test]
     fn test_global_registry_initialized() {
         let registry = global_registry();
-        assert!(registry.find("/open").is_some());
-        assert!(registry.find("/open-file").is_some());
+        assert!(registry.find("/scp").is_some());
     }
 }

@@ -3,13 +3,13 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
 pub mod editor;
-pub mod file_browser;
 pub mod file_transfer;
 mod sidebar_view;
 pub mod ssh;
@@ -30,9 +30,12 @@ use crate::components::macos_sidebar::{
 };
 use crate::components::title_bar::TitleBar;
 use crate::editor::Editor;
+use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem};
+use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
+use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
 use crate::workspace::client_decorations::client_side_decorations;
@@ -74,6 +77,7 @@ pub struct AppWindow {
     keychain_view: Entity<KeychainSidebarView>,
     persistence: PersistenceManager,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    pending_open_paths: Vec<(String, Option<SshConnectionConfig>)>,
 }
 
 impl AppWindow {
@@ -244,6 +248,7 @@ impl AppWindow {
             keychain_view,
             persistence,
             workspace_subscriptions: HashMap::new(),
+            pending_open_paths: Vec::new(),
         };
 
         this.subscribe_workspace_events(workspace.clone(), window, cx);
@@ -325,6 +330,10 @@ impl AppWindow {
                             });
                         }
                     });
+                }
+                WorkspaceEvent::OpenPath { path, ssh_config } => {
+                    this.pending_open_paths.push((path.clone(), ssh_config.clone()));
+                    cx.notify();
                 }
             },
         );
@@ -729,6 +738,46 @@ impl AppWindow {
 impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sidebar_tab_groups(cx);
+
+        let paths: Vec<_> = self.pending_open_paths.drain(..).collect();
+        if !paths.is_empty() {
+            let editor = self.editor.clone();
+            let sidebar = self.sidebar.clone();
+            cx.defer(move |cx| {
+                let window_handle = cx.active_window();
+                for (path, ssh_config) in paths {
+                    if let Some(ssh_config) = ssh_config {
+                        if let Some(handle) = window_handle {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                editor.update(cx, |e, cx| {
+                                    e.open_remote_file_no_notify(path, ssh_config, window, cx);
+                                });
+                            });
+                        }
+                    } else {
+                        let local_path = std::path::PathBuf::from(&path);
+                        if local_path.is_dir() {
+                            let backend = Arc::new(LocalFileSystem) as Arc<dyn FileSystem>;
+                            let file_tree = cx.new(|cx| {
+                                let mut tree = SidebarFileTree::new(cx, backend, Some(local_path.clone()));
+                                tree.open_path(Some(local_path), cx);
+                                tree
+                            });
+                            sidebar.update(cx, |s, cx| {
+                                s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
+                            });
+                        } else if let Some(handle) = window_handle {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                editor.update(cx, |e, cx| {
+                                    e.open_file_no_notify(local_path, window, cx);
+                                });
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
         let theme = cx.theme().ui;
 
         let sidebar_visible = self.sidebar.read(cx).is_visible();

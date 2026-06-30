@@ -4,8 +4,7 @@ use gpui::Entity;
 
 use crate::builtin_commands::registry::{BuiltinCommand, CommandHandlerId};
 use crate::builtin_commands::scp_completion::is_local_keyword_str;
-use crate::builtin_commands::{ArgumentParser, LocalPathContext, PathResolver};
-use crate::file_browser::FileBrowserTarget;
+use crate::builtin_commands::{LocalPathContext, PathResolver};
 use crate::file_transfer::{ConflictPolicy, FileEndpoint, TransferOperation, TransferRequest};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::config::SshGlobalConfig;
@@ -30,16 +29,14 @@ pub struct CommandContext {
 /// Handler 返回此结果，由调用方（TerminalView）负责发射事件。
 ///
 /// 瀑布语义（参考 Warp 的 `execute_slash_command -> bool`，app/src/terminal/input/slash_commands/mod.rs:328）：
-/// - `OpenFileBrowser` / `OpenFile` / `StartTransfer` / `Log` / `None` / `Error`
+/// - `StartTransfer` / `Log` / `None` / `Error`
 ///   表示 handler **吃掉**了这条命令，TerminalView 不再把原文交给 shell。
 /// - `FallThrough { shell_command }` 表示 handler 只做了"副作用 / 预处理"，
 ///   仍需要 shell 处理一段文本；若 `None` 则发原始命令行，若 `Some(s)` 则发
 ///   `s`（handler 可能已改写）。用于将来像 `/plan` 这样"做完内建动作后把 prompt 交回下一层"的命令。
 pub enum CommandResult {
-    /// 打开文件浏览器
-    OpenFileBrowser { target: FileBrowserTarget },
-    /// 打开文件
-    OpenFile { path: String, ssh_config: Option<SshConnectionConfig> },
+    /// 打开路径：文件→编辑器，目录→文件树
+    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
     /// 启动一次文件传输（由 workspace 层挂接进度/冲突弹窗/任务列表）
     StartTransfer { request: TransferRequest },
     /// 仅记录日志
@@ -126,89 +123,37 @@ pub fn show_error_toast(message: impl Into<String>) {
     log::warn!("Command error: {}", message.into());
 }
 
-/// 打开文件浏览器处理器
-pub struct OpenFileBrowserHandler;
+/// `/open` 处理器：解析路径，打开文件或目录
+pub struct OpenPathHandler;
 
-impl CommandHandler for OpenFileBrowserHandler {
+impl CommandHandler for OpenPathHandler {
     fn execute(&self, argument: Option<&str>, ctx: CommandContext) -> CommandResult {
-        let target = if ctx.is_remote {
-            let ssh_config = ctx
-                .ssh_config
-                .expect("remote terminal should carry ssh config");
-
-            // 使用远程终端动态追踪的 CWD（来自 OSC 序列），作为无参时的默认路径
-            let requested_path = argument
-                .and_then(|raw| PathResolver::resolve_remote(raw, ctx.remote_cwd.as_deref()));
-
-            FileBrowserTarget::Remote {
-                ssh_config,
-                // 无参数时默认打开远程终端当前工作目录
-                requested_path: requested_path.or_else(|| ctx.remote_cwd.clone()),
-            }
-        } else {
-            let local_ctx = LocalPathContext {
-                working_directory: ctx.working_directory.clone(),
-                process_cwd: None,
-            };
-
-            let requested_path = argument.map(|raw| PathResolver::resolve_local(raw, &local_ctx));
-
-            FileBrowserTarget::Local {
-                // 优先使用进程实时 CWD，其次用初始工作目录，最后回退到家目录和根目录
-                requested_path: requested_path
-                    .or_else(|| ctx.process_cwd.clone())
-                    .or_else(|| local_ctx.working_directory)
-                    .or_else(dirs::home_dir)
-                    .or(Some(PathBuf::from("/"))),
-            }
-        };
-
-        CommandResult::OpenFileBrowser { target }
-    }
-}
-
-/// 打开文件处理器
-pub struct OpenFileHandler;
-
-impl CommandHandler for OpenFileHandler {
-    fn execute(&self, argument: Option<&str>, ctx: CommandContext) -> CommandResult {
-        let parsed = match ArgumentParser::parse(argument, false) {
-            Ok(p) => p,
-            Err(e) => {
+        let raw_path = match argument {
+            Some(arg) => arg.trim(),
+            None => {
                 return CommandResult::Error {
-                    message: e.to_string(),
+                    message: "Please provide a file or directory path".to_string(),
                 };
             }
         };
 
-        let Some(raw_path) = parsed.first_token() else {
-            return CommandResult::Error {
-                message: "Please provide a file path".to_string(),
-            };
-        };
-
-        // 解析行号和列号（如 "file.txt:4:2"）
-        let (path_part, _line, _col) =
-            crate::builtin_commands::PathCompletionEngine::parse_line_column(raw_path);
-
         let path = if ctx.is_remote {
-            // 远程终端：相对路径以 OSC 7 报上来的 cwd 为基准，与补全侧一致
-            PathResolver::resolve_remote(&path_part, ctx.remote_cwd.as_deref())
-                .unwrap_or_else(|| path_part.to_string())
+            PathResolver::resolve_remote(raw_path, ctx.remote_cwd.as_deref())
+                .unwrap_or_else(|| raw_path.to_string())
         } else {
             let local_ctx = LocalPathContext {
                 working_directory: ctx.working_directory.clone(),
                 process_cwd: ctx.process_cwd.clone(),
             };
-
-            PathResolver::resolve_local(&path_part, &local_ctx)
+            PathResolver::resolve_local(raw_path, &local_ctx)
                 .to_string_lossy()
                 .into_owned()
         };
 
-        let ssh_config = ctx.ssh_config.clone();
-
-        CommandResult::OpenFile { path, ssh_config }
+        CommandResult::OpenPath {
+            path,
+            ssh_config: ctx.ssh_config.clone(),
+        }
     }
 }
 
@@ -711,34 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn test_open_file_browser_local() {
-        let handler = OpenFileBrowserHandler;
-        let result = handler.execute(
-            Some("/tmp"),
-            CommandContext {
-                terminal_view: None,
-                working_directory: Some(PathBuf::from("/home/user")),
-                process_cwd: None,
-                remote_cwd: None,
-                is_remote: false,
-                ssh_config: None,
-            },
-        );
-
-        match result {
-            CommandResult::OpenFileBrowser { target } => match target {
-                FileBrowserTarget::Local { requested_path } => {
-                    assert_eq!(requested_path, Some(PathBuf::from("/tmp")));
-                }
-                _ => panic!("Expected local target"),
-            },
-            _ => panic!("Expected OpenFileBrowser result"),
-        }
-    }
-
-    #[test]
-    fn test_open_file_handler() {
-        let handler = OpenFileHandler;
+    fn test_open_path_handler_local() {
+        let handler = OpenPathHandler;
         let result = handler.execute(
             Some("src/main.rs"),
             CommandContext {
@@ -752,20 +671,18 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenFile { path, ssh_config } => {
+            CommandResult::OpenPath { path, ssh_config } => {
                 assert_eq!(path, "/home/user/project/src/main.rs");
                 assert!(ssh_config.is_none());
             }
-            _ => panic!("Expected OpenFile result"),
+            _ => panic!("Expected OpenPath result"),
         }
     }
 
     #[test]
-    fn test_open_file_handler_remote_uses_terminal_cwd() {
-        // 远程终端：相对路径应当以 OSC 7 报上来的 cwd 为基准，
-        // 与补全侧"裸路径跟随当前终端"对齐。
+    fn test_open_path_handler_remote_uses_terminal_cwd() {
         use crate::ssh::config::AuthMethod;
-        let handler = OpenFileHandler;
+        let handler = OpenPathHandler;
         let cfg =
             SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
         let result = handler.execute(
@@ -781,11 +698,11 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenFile { path, ssh_config } => {
+            CommandResult::OpenPath { path, ssh_config } => {
                 assert_eq!(path, "/srv/app/logs/app.log");
                 assert!(ssh_config.is_some());
             }
-            _ => panic!("Expected OpenFile result"),
+            _ => panic!("Expected OpenPath result"),
         }
     }
 
@@ -820,8 +737,7 @@ mod tests {
                 match other {
                     CommandResult::Error { message } => format!("Error({})", message),
                     CommandResult::Log { .. } => "Log".into(),
-                    CommandResult::OpenFile { .. } => "OpenFile".into(),
-                    CommandResult::OpenFileBrowser { .. } => "OpenFileBrowser".into(),
+                    CommandResult::OpenPath { .. } => "OpenPath".into(),
                     CommandResult::None => "None".into(),
                     CommandResult::FallThrough { .. } => "FallThrough".into(),
                     CommandResult::StartTransfer { .. } => unreachable!(),
@@ -1335,11 +1251,7 @@ static GLOBAL_EXECUTOR: OnceLock<Mutex<CommandExecutor>> = OnceLock::new();
 
 fn create_default_executor() -> CommandExecutor {
     let mut executor = CommandExecutor::new();
-    executor.register(
-        CommandHandlerId("open_file_browser"),
-        Box::new(OpenFileBrowserHandler),
-    );
-    executor.register(CommandHandlerId("open_file"), Box::new(OpenFileHandler));
+    executor.register(CommandHandlerId("open_path"), Box::new(OpenPathHandler));
     executor.register(CommandHandlerId("scp_transfer"), Box::new(ScpHandler));
     executor.register(CommandHandlerId("log_only"), Box::new(LogOnlyHandler));
     executor
