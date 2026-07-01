@@ -58,7 +58,7 @@ impl SimpleHighlighter {
                 tree_sitter_html::LANGUAGE.into(),
                 include_str!("languages/html/highlights.scm"),
             ),
-            "css" => Self::setup_language(
+            "css" | "scss" => Self::setup_language(
                 &mut parser,
                 tree_sitter_css::LANGUAGE.into(),
                 tree_sitter_css::HIGHLIGHTS_QUERY,
@@ -87,6 +87,26 @@ impl SimpleHighlighter {
                 &mut parser,
                 tree_sitter_toml_ng::LANGUAGE.into(),
                 tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            ),
+            "tsx" => Self::setup_language(
+                &mut parser,
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            ),
+            "lua" => Self::setup_language(
+                &mut parser,
+                tree_sitter_lua::LANGUAGE.into(),
+                tree_sitter_lua::HIGHLIGHTS_QUERY,
+            ),
+            "kotlin" | "kt" => Self::setup_language(
+                &mut parser,
+                tree_sitter_kotlin_ng::LANGUAGE.into(),
+                include_str!("languages/kotlin/highlights.scm"),
+            ),
+            "zig" => Self::setup_language(
+                &mut parser,
+                tree_sitter_zig::LANGUAGE.into(),
+                tree_sitter_zig::HIGHLIGHTS_QUERY,
             ),
             _ => None,
         };

@@ -20,6 +20,8 @@ pub enum Language {
     Go,
     Html,
     JavaScript,
+    Kotlin,
+    Lua,
     Markdown,
     MarkdownInline,
     Python,
@@ -27,6 +29,7 @@ pub enum Language {
     Toml,
     Tsx,
     TypeScript,
+    Zig,
 }
 
 impl From<Language> for SharedString {
@@ -55,6 +58,8 @@ impl Language {
             Self::Html => "html",
             Self::JavaScript => "javascript",
             Self::Json => "json",
+            Self::Kotlin => "kotlin",
+            Self::Lua => "lua",
             Self::Markdown => "markdown",
             Self::MarkdownInline => "markdown_inline",
             Self::Python => "python",
@@ -62,6 +67,7 @@ impl Language {
             Self::Toml => "toml",
             Self::Tsx => "tsx",
             Self::TypeScript => "typescript",
+            Self::Zig => "zig",
         }
     }
 
@@ -80,6 +86,8 @@ impl Language {
             "html" => Self::Html,
             "javascript" | "js" => Self::JavaScript,
             "json" | "jsonc" => Self::Json,
+            "kotlin" | "kt" | "kts" => Self::Kotlin,
+            "lua" => Self::Lua,
             "markdown" | "md" | "mdx" => Self::Markdown,
             "markdown_inline" | "markdown-inline" => Self::MarkdownInline,
             "python" | "py" => Self::Python,
@@ -87,6 +95,7 @@ impl Language {
             "toml" => Self::Toml,
             "tsx" => Self::Tsx,
             "typescript" | "ts" => Self::TypeScript,
+            "zig" => Self::Zig,
             _ => Self::Plain,
         }
     }
@@ -207,6 +216,18 @@ impl Language {
                 "",
                 "",
             ),
+            Self::Kotlin => (
+                tree_sitter_kotlin_ng::LANGUAGE,
+                include_str!("languages/kotlin/highlights.scm"),
+                "",
+                "",
+            ),
+            Self::Lua => (
+                tree_sitter_lua::LANGUAGE,
+                tree_sitter_lua::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
             Self::TypeScript => (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
                 include_str!("languages/typescript/highlights.scm"),
@@ -218,6 +239,12 @@ impl Language {
                 tree_sitter_typescript::HIGHLIGHTS_QUERY,
                 "",
                 tree_sitter_typescript::LOCALS_QUERY,
+            ),
+            Self::Zig => (
+                tree_sitter_zig::LANGUAGE,
+                tree_sitter_zig::HIGHLIGHTS_QUERY,
+                include_str!("languages/zig/injections.scm"),
+                "",
             ),
         };
 

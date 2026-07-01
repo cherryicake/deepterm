@@ -594,7 +594,8 @@ fn guess_language_from_extension(path: &Path) -> String {
         .map(|ext| match ext {
             "rs" => "rust",
             "js" | "jsx" => "javascript",
-            "ts" | "tsx" => "typescript",
+            "ts" => "typescript",
+            "tsx" => "tsx",
             "json" => "json",
             "py" => "python",
             "go" => "go",
