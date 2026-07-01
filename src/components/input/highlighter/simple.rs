@@ -83,6 +83,11 @@ impl SimpleHighlighter {
                 tree_sitter_md::LANGUAGE.into(),
                 include_str!("languages/markdown/highlights.scm"),
             ),
+            "toml" => Self::setup_language(
+                &mut parser,
+                tree_sitter_toml_ng::LANGUAGE.into(),
+                tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            ),
             _ => None,
         };
         Self {

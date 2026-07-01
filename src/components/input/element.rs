@@ -914,7 +914,11 @@ impl TextElement {
 
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
-        Some(styles)
+        if styles.is_empty() {
+            None
+        } else {
+            Some(styles)
+        }
     }
 }
 
