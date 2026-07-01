@@ -765,6 +765,9 @@ impl Render for AppWindow {
                             });
                             sidebar.update(cx, |s, cx| {
                                 s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
+                                if !s.is_visible() {
+                                    s.toggle();
+                                }
                             });
                         } else if let Some(handle) = window_handle {
                             let _ = handle.update(cx, |_, window, cx| {

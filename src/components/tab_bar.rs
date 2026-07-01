@@ -11,7 +11,6 @@ use gpui::{
 use crate::assets::Icon;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
-use crate::components::button::Icon as MenuIcon;
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 
 actions!(tab_context_menu, [CopyTabAddress, DuplicateTab]);
@@ -234,6 +233,11 @@ pub struct TabBar {
     /// 复制标签页回调
     on_tab_duplicate:
         Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
+    on_context_menu:
+        Option<
+            Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
+        >,
 }
 
 impl TabBar {
@@ -265,6 +269,7 @@ impl TabBar {
             context_menu_tab_id: None,
             on_tab_copy_address: None,
             on_tab_duplicate: None,
+            on_context_menu: None,
         })
     }
 
@@ -306,10 +311,11 @@ impl TabBar {
             context_menu_tab_id: None,
             on_tab_copy_address: None,
             on_tab_duplicate: None,
+            on_context_menu: None,
         })
-      }
-  
-      pub fn on_tab_click<F>(&mut self, callback: F)
+    }
+
+    pub fn on_tab_click<F>(&mut self, callback: F)
     where
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
@@ -383,6 +389,20 @@ impl TabBar {
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_duplicate = Some(Rc::new(callback));
+    }
+
+    /// 右键菜单构建回调（由调用方设置）
+    pub fn on_context_menu<F>(&mut self, callback: F)
+    where
+        F: Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu
+            + 'static,
+    {
+        self.on_context_menu = Some(Rc::new(callback));
+    }
+
+    /// 获取右键菜单的目标标签 ID
+    pub fn context_menu_tab_id(&self) -> Option<SharedString> {
+        self.context_menu_tab_id.clone()
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
@@ -961,7 +981,6 @@ impl Render for TabBar {
                                     let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
                                     let label = tab.label.clone();
                                     let icon = tab.icon;
-                                    let is_remote = tab.is_remote;
                                     let on_panel_drop_for_tab = on_panel_drop.clone();
                                     let entity = cx.entity();
                                     let start_offset = self.tab_offset_for_preview(
@@ -1233,25 +1252,14 @@ impl Render for TabBar {
                                             }),
                                         )
                                         .context_menu({
-                                            move |menu: PopupMenu, _window, _cx| {
-                                                let m = if is_remote {
-                                                    menu.menu_with_icon(
-                                                        "拷贝地址",
-                                                        MenuIcon::new(
-                                                            "icons/document.on.document.svg",
-                                                        ),
-                                                        Box::new(CopyTabAddress),
-                                                    )
+                                            let tab_id = tab_id.clone();
+                                            let on_context_menu = self.on_context_menu.clone();
+                                            move |menu: PopupMenu, window, cx| {
+                                                if let Some(ref cb) = on_context_menu {
+                                                    cb(tab_id.clone(), menu, window, cx)
                                                 } else {
                                                     menu
-                                                };
-                                                m.menu_with_icon(
-                                                    "复制标签页",
-                                                    MenuIcon::new(
-                                                        "icons/plus.square.on.square.svg",
-                                                    ),
-                                                    Box::new(DuplicateTab),
-                                                )
+                                                }
                                             }
                                         });
 

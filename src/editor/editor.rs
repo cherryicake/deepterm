@@ -16,8 +16,17 @@ use crate::theme::ActiveTheme;
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 
-
 actions!(editor_panel, [CloseActiveEditorTab]);
+actions!(
+    editor_tab_context_menu,
+    [
+        CloseTab,
+        CloseOtherTabs,
+        CloseRightTabs,
+        CloseLeftTabs,
+        CloseAllTabs,
+    ]
+);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -101,12 +110,7 @@ impl Editor {
         self.resize_drag_x = None;
     }
 
-    pub fn set_paddings(
-        &mut self,
-        content_left: f32,
-        content_bottom: f32,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_paddings(&mut self, content_left: f32, content_bottom: f32, cx: &mut Context<Self>) {
         if (self.content_left_padding - content_left).abs() > 0.5
             || (self.content_bottom_padding - content_bottom).abs() > 0.5
         {
@@ -153,16 +157,7 @@ impl Editor {
         }
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        self.open_file_with_content(
-            tab_id,
-            path_str,
-            content,
-            path,
-            None,
-            window,
-            cx,
-            true,
-        );
+        self.open_file_with_content(tab_id, path_str, content, path, None, window, cx, true);
     }
 
     pub fn open_remote_file(
@@ -260,8 +255,7 @@ impl Editor {
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&tab_id, &label)
-                    .with_icon(Some(crate::assets::Icon::File)),
+                TabItem::new(&tab_id, &label).with_icon(Some(crate::assets::Icon::File)),
                 cx,
             );
         });
@@ -288,16 +282,7 @@ impl Editor {
         }
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        self.open_file_with_content(
-            tab_id,
-            path_str,
-            content,
-            path,
-            None,
-            window,
-            cx,
-            false,
-        );
+        self.open_file_with_content(tab_id, path_str, content, path, None, window, cx, false);
     }
 
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -336,13 +321,70 @@ impl Editor {
         self.notify_app_window(cx);
     }
 
-    fn handle_tab_reorder(&mut self, dragged_tab: DraggedTab, to_index: usize, cx: &mut Context<Self>) {
+    fn close_other_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .open_files
+            .iter()
+            .filter(|f| f.id.as_ref() != id)
+            .map(|f| f.id.to_string())
+            .collect();
+        for file_id in ids {
+            self.close_file(&file_id, cx);
+        }
+    }
+
+    fn close_right_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+        let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
+        if let Some(index) = pos {
+            let ids: Vec<String> = self.open_files[index + 1..]
+                .iter()
+                .map(|f| f.id.to_string())
+                .collect();
+            for file_id in ids {
+                self.close_file(&file_id, cx);
+            }
+        }
+    }
+
+    fn close_left_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+        let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
+        if let Some(index) = pos {
+            let ids: Vec<String> = self.open_files[..index]
+                .iter()
+                .map(|f| f.id.to_string())
+                .collect();
+            for file_id in ids {
+                self.close_file(&file_id, cx);
+            }
+        }
+    }
+
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.open_files.iter().map(|f| f.id.to_string()).collect();
+        for file_id in ids {
+            self.close_file(&file_id, cx);
+        }
+    }
+
+    fn handle_tab_reorder(
+        &mut self,
+        dragged_tab: DraggedTab,
+        to_index: usize,
+        cx: &mut Context<Self>,
+    ) {
         let dragged_id = dragged_tab.tab_id.as_ref();
-        let from_index = self.open_files.iter().position(|f| f.id.as_ref() == dragged_id);
+        let from_index = self
+            .open_files
+            .iter()
+            .position(|f| f.id.as_ref() == dragged_id);
         if let Some(from) = from_index {
             if from != to_index {
                 let file = self.open_files.remove(from);
-                let insert_idx = if to_index > from { to_index.saturating_sub(1) } else { to_index };
+                let insert_idx = if to_index > from {
+                    to_index.saturating_sub(1)
+                } else {
+                    to_index
+                };
                 let capped = insert_idx.min(self.open_files.len());
                 self.open_files.insert(capped, file);
                 cx.notify();
@@ -386,6 +428,16 @@ impl Editor {
                     });
                 }
             });
+
+            tab_bar.on_context_menu({
+                move |_tab_id, menu, _window, _cx| {
+                    menu.menu("关闭", Box::new(CloseTab))
+                        .menu("关闭其他标签页", Box::new(CloseOtherTabs))
+                        .menu("关闭左侧标签页", Box::new(CloseLeftTabs))
+                        .menu("关闭右侧标签页", Box::new(CloseRightTabs))
+                        .menu("关闭所有标签页", Box::new(CloseAllTabs))
+                }
+            });
         });
     }
 }
@@ -418,8 +470,7 @@ impl Render for Editor {
                     .child(inner)
                     .with_animation(
                         id,
-                        Animation::new(Duration::from_millis(dur))
-                            .with_easing(gpui::ease_in_out),
+                        Animation::new(Duration::from_millis(dur)).with_easing(gpui::ease_in_out),
                         move |this, delta| this.pl(px(start + (end - start) * delta)),
                     )
                     .into_any_element()
@@ -494,6 +545,29 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &CloseActiveEditorTab, _window, cx| {
                 if let Some(active_id) = this.active_file_id.clone() {
                     this.close_file(active_id.as_ref(), cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
+                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                    this.close_file(&tab_id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseOtherTabs, _window, cx| {
+                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                    this.close_other_tabs(&tab_id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseRightTabs, _window, cx| {
+                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                    this.close_right_tabs(&tab_id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseAllTabs, _window, cx| {
+                this.close_all_tabs(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseLeftTabs, _window, cx| {
+                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                    this.close_left_tabs(&tab_id, cx);
                 }
             }))
             .w(px(if is_empty { 0.0 } else { self.width }))

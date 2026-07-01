@@ -129,23 +129,30 @@ pub struct OpenPathHandler;
 impl CommandHandler for OpenPathHandler {
     fn execute(&self, argument: Option<&str>, ctx: CommandContext) -> CommandResult {
         let raw_path = match argument {
-            Some(arg) => arg.trim(),
+            Some(arg) => arg.trim().to_string(),
             None => {
-                return CommandResult::Error {
-                    message: "Please provide a file or directory path".to_string(),
-                };
+                // 默认打开当前工作目录
+                if ctx.is_remote {
+                    ctx.remote_cwd.clone().unwrap_or_default()
+                } else {
+                    ctx.process_cwd
+                        .clone()
+                        .or(ctx.working_directory.clone())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                }
             }
         };
 
         let path = if ctx.is_remote {
-            PathResolver::resolve_remote(raw_path, ctx.remote_cwd.as_deref())
+            PathResolver::resolve_remote(&raw_path, ctx.remote_cwd.as_deref())
                 .unwrap_or_else(|| raw_path.to_string())
         } else {
             let local_ctx = LocalPathContext {
                 working_directory: ctx.working_directory.clone(),
                 process_cwd: ctx.process_cwd.clone(),
             };
-            PathResolver::resolve_local(raw_path, &local_ctx)
+            PathResolver::resolve_local(&raw_path, &local_ctx)
                 .to_string_lossy()
                 .into_owned()
         };

@@ -19,7 +19,8 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::components::button::Icon as MenuIcon;
+use crate::components::tab_bar::{CopyTabAddress, DraggedTab, DuplicateTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
 use crate::file_transfer::TransferStatusReporter;
 use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem, RemoteFileSystem};
@@ -630,6 +631,34 @@ impl Workspace {
                             this.handle_tab_duplicate(&id, window, cx);
                         });
                     });
+                }
+            });
+
+            // 右键菜单
+            tab_bar.on_context_menu({
+                let workspace = workspace.clone();
+                move |tab_id, menu, _window, cx| {
+                    let tabs = workspace.read(cx).tab_bar.read(cx).tabs.clone();
+                    let is_remote = tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .map(|t| t.is_remote)
+                        .unwrap_or(false);
+
+                    let m = if is_remote {
+                        menu.menu_with_icon(
+                            "拷贝地址",
+                            MenuIcon::new("icons/document.on.document.svg"),
+                            Box::new(CopyTabAddress),
+                        )
+                    } else {
+                        menu
+                    };
+                    m.menu_with_icon(
+                        "复制标签页",
+                        MenuIcon::new("icons/plus.square.on.square.svg"),
+                        Box::new(DuplicateTab),
+                    )
                 }
             });
         });
