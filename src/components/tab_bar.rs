@@ -315,6 +315,12 @@ impl TabBar {
         })
     }
 
+    pub fn clear_tabs(&mut self, cx: &mut Context<Self>) {
+        self.tabs.clear();
+        self.active_tab_id = None;
+        cx.notify();
+    }
+
     pub fn on_tab_click<F>(&mut self, callback: F)
     where
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,

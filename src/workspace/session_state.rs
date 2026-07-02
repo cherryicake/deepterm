@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ssh::SshConnectionConfig;
 
-pub const SESSION_STATE_VERSION: u32 = 1;
+pub const SESSION_STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppSessionState {
@@ -31,6 +31,8 @@ pub struct WorkspaceGroupSessionState {
     #[serde(default)]
     pub collapsed: bool,
     pub workspace: Option<WorkspaceSessionState>,
+    #[serde(default)]
+    pub editor: Option<EditorSessionState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +44,21 @@ pub struct WorkspaceSessionState {
     pub local_terminal_count: usize,
     pub workspace_index: usize,
     pub tabs: Vec<TabSessionState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorFileSessionState {
+    pub id: String,
+    pub path: String,
+    pub label: String,
+    #[serde(default)]
+    pub ssh_config: Option<SshConnectionConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorSessionState {
+    pub open_files: Vec<EditorFileSessionState>,
+    pub active_file_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

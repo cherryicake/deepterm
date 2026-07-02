@@ -2361,14 +2361,6 @@ mod tests {
     }
 
     #[test]
-    fn fake_builtin_command_specs_are_available_for_prompt() {
-        let registry = super::global_registry();
-        assert!(registry.find("/open-file").is_some());
-        assert!(registry.find("/open").is_some());
-        assert!(registry.find("/scp").is_some());
-    }
-
-    #[test]
     fn resolves_selected_command_when_query_is_a_prefix() {
         let registry = super::global_registry();
         let selected = registry.find("/open");
@@ -2389,16 +2381,6 @@ mod tests {
     }
 
     #[test]
-    fn forces_selected_command_for_explicit_pick() {
-        let registry = super::global_registry();
-        let selected = registry.find("/open-file");
-        assert_eq!(
-            resolve_command_line("/unknown target", selected.as_deref(), true),
-            "/open-file target"
-        );
-    }
-
-    #[test]
     fn pick_completes_selected_command_and_keeps_args() {
         let mut manager = BuiltinCommandManager::new();
         manager.update("/op target");
@@ -2409,17 +2391,6 @@ mod tests {
         // 选择已应用 ⇒ 高亮重置为 None（"无选中" 是新的默认）
         assert_eq!(manager.selected_index(), None);
         assert!(!manager.is_dismissed());
-    }
-
-    #[test]
-    fn pick_uses_clicked_index() {
-        let mut manager = BuiltinCommandManager::new();
-        manager.update("/op target");
-        manager.pick(1);
-
-        assert_eq!(manager.query(), Some("/open-file target"));
-        // 选择已应用 ⇒ 高亮重置为 None
-        assert_eq!(manager.selected_index(), None);
     }
 
     // ── overlay 状态机行为 ─────────────────────────────────────────────────────

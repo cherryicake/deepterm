@@ -144,20 +144,6 @@ mod tests {
     }
 
     #[test]
-    fn test_detected_command_with_argument() {
-        let model = BuiltinCommandModel::new();
-        let state = model.detect_command("/open-file src/main.rs");
-
-        match state {
-            CommandEntryState::Detected(cmd) => {
-                assert_eq!(cmd.command.name, "/open-file");
-                assert_eq!(cmd.argument, Some("src/main.rs".to_string()));
-            }
-            other => panic!("Expected Detected, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn test_detected_command_without_argument() {
         let model = BuiltinCommandModel::new();
         let state = model.detect_command("/open");

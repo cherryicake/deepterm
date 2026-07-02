@@ -29,7 +29,7 @@ use crate::components::macos_sidebar::{
     DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabGroupState, SidebarTabItem,
 };
 use crate::components::title_bar::TitleBar;
-use crate::editor::Editor;
+use crate::editor::{Editor, EditorRuntimeState};
 use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::sidebar_view::font_view::FontSettingsView;
@@ -42,7 +42,7 @@ use crate::workspace::client_decorations::client_side_decorations;
 use crate::workspace::ToggleSidebar;
 use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
-    AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
+    AppSessionState, EditorSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
 };
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::{Workspace, WorkspaceEvent};
@@ -62,6 +62,8 @@ struct TabGroupWorkspace {
     id: String,
     workspace: Option<Entity<Workspace>>,
     pending_session: Option<WorkspaceSessionState>,
+    editor_runtime_state: Option<EditorRuntimeState>,
+    editor_session_state: Option<EditorSessionState>,
 }
 
 pub struct AppWindow {
@@ -72,6 +74,8 @@ pub struct AppWindow {
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     editor: Entity<Editor>,
+    default_editor_runtime_state: Option<EditorRuntimeState>,
+    default_editor_session_state: Option<EditorSessionState>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
@@ -219,6 +223,19 @@ impl AppWindow {
             editor.bind_app_window(app_window.downgrade());
         });
 
+        let default_editor_session_state = session.as_ref().and_then(|session| {
+            session
+                .groups
+                .iter()
+                .find(|group| group.id == DEFAULT_TAB_GROUP_ID)
+                .and_then(|group| group.editor.clone())
+        });
+        if let Some(ref state) = default_editor_session_state {
+            editor.update(cx, |editor, cx| {
+                editor.restore_from_session_state(state.clone(), window, cx);
+            });
+        }
+
         // 设置文件打开回调：侧边栏文件树点击文件 → Editor 打开文件
         let editor_for_open = editor.downgrade();
         sidebar.update(cx, |sidebar, _cx| {
@@ -243,6 +260,8 @@ impl AppWindow {
             ssh_picker,
             sidebar,
             editor,
+            default_editor_runtime_state: None,
+            default_editor_session_state,
             _sidebar_hide_task: None,
             host_view,
             keychain_view,
@@ -389,6 +408,8 @@ impl AppWindow {
                 id: group.id.clone(),
                 workspace: None,
                 pending_session: group.workspace.clone(),
+                editor_runtime_state: None,
+                editor_session_state: group.editor.clone(),
             })
             .collect();
 
@@ -401,12 +422,23 @@ impl AppWindow {
     }
 
     fn session_state(&self, cx: &mut Context<Self>) -> AppSessionState {
+        let active_group_id = self.active_tab_group_id();
         let mut groups = Vec::with_capacity(self.tab_group_workspaces.len() + 1);
+
+        let default_editor = if active_group_id == DEFAULT_TAB_GROUP_ID {
+            Some(self.editor.read(cx).session_state())
+        } else {
+            self.default_editor_runtime_state
+                .as_ref()
+                .map(|state| state.to_session_state())
+                .or_else(|| self.default_editor_session_state.clone())
+        };
         groups.push(WorkspaceGroupSessionState {
             id: DEFAULT_TAB_GROUP_ID.to_string(),
             label: Some("标签页".to_string()),
             collapsed: false,
             workspace: Some(self.default_workspace.read(cx).session_state(cx)),
+            editor: default_editor,
         });
 
         let sidebar_groups = self.sidebar.read(cx).tab_group_states();
@@ -419,6 +451,17 @@ impl AppWindow {
                 .tab_group_workspaces
                 .iter()
                 .find(|group| group.id == sidebar_group.id);
+            let editor = workspace_entry.and_then(|group| {
+                if group.id == active_group_id {
+                    Some(self.editor.read(cx).session_state())
+                } else {
+                    group
+                        .editor_runtime_state
+                        .as_ref()
+                        .map(|state| state.to_session_state())
+                        .or_else(|| group.editor_session_state.clone())
+                }
+            });
             Some(WorkspaceGroupSessionState {
                 id: sidebar_group.id,
                 label: Some(sidebar_group.label),
@@ -430,10 +473,9 @@ impl AppWindow {
                         .map(|workspace| workspace.read(cx).session_state(cx))
                         .or_else(|| group.pending_session.clone())
                 }),
+                editor,
             })
         }));
-
-        let active_group_id = self.active_tab_group_id();
 
         AppSessionState {
             version: crate::workspace::session_state::SESSION_STATE_VERSION,
@@ -538,9 +580,10 @@ impl AppWindow {
             id: group_id.clone(),
             workspace: Some(workspace.clone()),
             pending_session: None,
+            editor_runtime_state: None,
+            editor_session_state: None,
         });
-        self.bind_active_workspace(workspace, window, cx);
-        self.save_session(cx);
+        self.switch_tab_group_workspace(&group_id, window, cx);
     }
 
     fn switch_tab_group_workspace(
@@ -549,8 +592,39 @@ impl AppWindow {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
+        let from_group_id = self.active_tab_group_id();
+        if from_group_id == group_id {
+            return;
+        }
+
+        // 保存当前组的运行时状态（不重新读取文件）。
+        let current_runtime_state =
+            self.editor
+                .update(cx, |editor, cx| editor.take_runtime_state(cx));
+        if from_group_id == DEFAULT_TAB_GROUP_ID {
+            self.default_editor_runtime_state = Some(current_runtime_state);
+        } else if let Some(group) = self
+            .tab_group_workspaces
+            .iter_mut()
+            .find(|group| group.id == from_group_id)
+        {
+            group.editor_runtime_state = Some(current_runtime_state);
+        }
+
         if group_id == DEFAULT_TAB_GROUP_ID {
             self.bind_active_workspace(self.default_workspace.clone(), window, cx);
+            let target_state = self.default_editor_runtime_state.take();
+            if let Some(state) = target_state {
+                self.editor.update(cx, |editor, cx| {
+                    editor.restore_runtime_state(state, cx);
+                });
+            } else if let Some(ref state) = self.default_editor_session_state {
+                self.editor.update(cx, |editor, cx| {
+                    editor.restore_from_session_state(state.clone(), window, cx);
+                });
+                self.default_editor_session_state = None;
+            }
+            self.defer_save_session(cx);
             return;
         }
 
@@ -578,12 +652,31 @@ impl AppWindow {
                     id: group_id.to_string(),
                     workspace: Some(workspace.clone()),
                     pending_session: None,
+                    editor_runtime_state: None,
+                    editor_session_state: None,
                 });
             }
             workspace
         };
 
         self.bind_active_workspace(workspace, window, cx);
+
+        let group = self
+            .tab_group_workspaces
+            .iter_mut()
+            .find(|group| group.id == group_id);
+        if let Some(group) = group {
+            if let Some(state) = group.editor_runtime_state.take() {
+                self.editor.update(cx, |editor, cx| {
+                    editor.restore_runtime_state(state, cx);
+                });
+            } else if let Some(state) = group.editor_session_state.take() {
+                self.editor.update(cx, |editor, cx| {
+                    editor.restore_from_session_state(state, window, cx);
+                });
+            }
+        }
+
         self.defer_save_session(cx);
     }
 

@@ -41,7 +41,33 @@ struct EditorFile {
     path: String,
     #[allow(dead_code)]
     label: String,
+    ssh_config: Option<SshConnectionConfig>,
     editor_state: Entity<InputState>,
+}
+
+/// 运行时状态，包含已打开的 [`InputState`] entity，切换标签页组时直接交换，不重新读取文件。
+pub struct EditorRuntimeState {
+    open_files: Vec<EditorFile>,
+    active_file_id: Option<SharedString>,
+}
+
+impl EditorRuntimeState {
+    pub fn to_session_state(&self) -> crate::workspace::session_state::EditorSessionState {
+        use crate::workspace::session_state::{EditorFileSessionState, EditorSessionState};
+        EditorSessionState {
+            open_files: self
+                .open_files
+                .iter()
+                .map(|f| EditorFileSessionState {
+                    id: f.id.to_string(),
+                    path: f.path.clone(),
+                    label: f.label.clone(),
+                    ssh_config: f.ssh_config.clone(),
+                })
+                .collect(),
+            active_file_id: self.active_file_id.as_ref().map(|id| id.to_string()),
+        }
+    }
 }
 
 pub struct Editor {
@@ -88,6 +114,91 @@ impl Editor {
 
     pub fn is_empty(&self) -> bool {
         self.open_files.is_empty()
+    }
+
+    pub fn session_state(&self) -> crate::workspace::session_state::EditorSessionState {
+        use crate::workspace::session_state::{EditorFileSessionState, EditorSessionState};
+        let open_files = self
+            .open_files
+            .iter()
+            .map(|f| EditorFileSessionState {
+                id: f.id.to_string(),
+                path: f.path.clone(),
+                label: f.label.clone(),
+                ssh_config: f.ssh_config.clone(),
+            })
+            .collect();
+        EditorSessionState {
+            open_files,
+            active_file_id: self.active_file_id.as_ref().map(|id| id.to_string()),
+        }
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.open_files.clear();
+        self.active_file_id = None;
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.clear_tabs(cx);
+        });
+        cx.notify();
+    }
+
+    pub fn restore_from_session_state(
+        &mut self,
+        state: crate::workspace::session_state::EditorSessionState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear(cx);
+        for file_state in state.open_files {
+            if let Some(ref ssh_config) = file_state.ssh_config {
+                self.open_remote_file_no_notify(
+                    file_state.path,
+                    ssh_config.clone(),
+                    window,
+                    cx,
+                );
+            } else {
+                self.open_file_no_notify(PathBuf::from(&file_state.path), window, cx);
+            }
+        }
+        if let Some(active_id) = state.active_file_id {
+            self.switch_to_file(&active_id, cx);
+        }
+    }
+
+    /// 取出当前运行状态（用于切换到其他标签页组前暂存）。
+    pub fn take_runtime_state(&mut self, cx: &mut Context<Self>) -> EditorRuntimeState {
+        let mut open_files = Vec::new();
+        std::mem::swap(&mut open_files, &mut self.open_files);
+        let active_file_id = self.active_file_id.take();
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.clear_tabs(cx);
+        });
+        cx.notify();
+        EditorRuntimeState {
+            open_files,
+            active_file_id,
+        }
+    }
+
+    /// 恢复运行状态（直接复用已有的 InputState entity，不重新读取文件）。
+    pub fn restore_runtime_state(&mut self, state: EditorRuntimeState, cx: &mut Context<Self>) {
+        self.open_files = state.open_files;
+        self.active_file_id = state.active_file_id;
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.clear_tabs(cx);
+            for file in &self.open_files {
+                tab_bar.add_tab(
+                    TabItem::new(&file.id, &file.label).with_icon(Some(crate::assets::Icon::File)),
+                    cx,
+                );
+            }
+            if let Some(ref active_id) = self.active_file_id {
+                tab_bar.set_active_tab(active_id, cx);
+            }
+        });
+        cx.notify();
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -144,6 +255,15 @@ impl Editor {
     pub fn notify_app_window(&self, cx: &mut App) {
         if let Some(aw) = &self.app_window {
             aw.update(cx, |_, cx| cx.notify()).ok();
+        }
+    }
+
+    pub fn notify_app_window_to_save(&self, cx: &mut App) {
+        if let Some(aw) = &self.app_window {
+            aw.update(cx, |this, cx| {
+                this.defer_save_session(cx);
+                cx.notify();
+            }).ok();
         }
     }
 
@@ -226,7 +346,7 @@ impl Editor {
         path_str: String,
         content: String,
         path: PathBuf,
-        _ssh_config: Option<SshConnectionConfig>,
+        ssh_config: Option<SshConnectionConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
         notify_app: bool,
@@ -250,6 +370,7 @@ impl Editor {
             id: tab_id.clone().into(),
             path: path_str,
             label: label.clone(),
+            ssh_config,
             editor_state,
         });
 
@@ -263,7 +384,7 @@ impl Editor {
         self.switch_to_file(&tab_id, cx);
         cx.notify();
         if notify_app {
-            self.notify_app_window(cx);
+            self.notify_app_window_to_save(cx);
         }
     }
 
@@ -318,7 +439,7 @@ impl Editor {
             }
         }
         cx.notify();
-        self.notify_app_window(cx);
+        self.notify_app_window_to_save(cx);
     }
 
     fn close_other_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -388,7 +509,7 @@ impl Editor {
                 let capped = insert_idx.min(self.open_files.len());
                 self.open_files.insert(capped, file);
                 cx.notify();
-                self.notify_app_window(cx);
+                self.notify_app_window_to_save(cx);
             }
         }
     }
