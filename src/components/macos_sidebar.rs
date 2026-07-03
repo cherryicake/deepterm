@@ -7,7 +7,7 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
     InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollHandle, Subscription, WeakEntity, Window, WindowControlArea, anchored, deferred,
+    Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, WindowControlArea, anchored, deferred,
     div, ease_in_out, px,
 };
 
@@ -358,6 +358,19 @@ impl MacosSidebar {
                 collapsed: group.collapsed,
             })
             .collect()
+    }
+
+    pub fn tab_group_select_items(
+        &self,
+        default_label: impl Into<SharedString>,
+    ) -> Vec<(String, SharedString)> {
+        let mut items = vec![(DEFAULT_TAB_GROUP_ID.to_string(), default_label.into())];
+        items.extend(
+            self.tab_groups
+                .iter()
+                .map(|group| (group.id.clone(), group.label.clone().into())),
+        );
+        items
     }
 
     pub fn restore_tab_groups(
@@ -807,20 +820,16 @@ impl MacosSidebar {
         self.epoch
     }
 
-    fn render_top_icon_button<F>(
+    fn render_top_element<E>(
         &self,
-        cx: &gpui::App,
         is_fullscreen: bool,
         offset_from_toggle: f32,
         id: &'static str,
-        icon: Icon,
-        icon_size: f32,
-        on_mouse_down: F,
+        element: E,
     ) -> gpui::AnyElement
     where
-        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+        E: IntoElement,
     {
-        let theme = cx.theme().ui;
         let toggle_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
             BUTTON_LEFT_CLOSED
         } else {
@@ -835,10 +844,45 @@ impl MacosSidebar {
             (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
         };
 
-        let button = div()
+        let container = div()
             .id((id, self.epoch))
             .absolute()
             .top(px(if self.visible { BUTTON_TOP } else { 8.0 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(element);
+
+        if self.epoch == 0 {
+            container.left(px(end_left)).into_any_element()
+        } else {
+            container
+                .left(px(start_left))
+                .with_animation(
+                    (id, self.epoch),
+                    gpui::Animation::new(Duration::from_millis(duration_ms))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
+                )
+                .into_any_element()
+        }
+    }
+
+    fn render_top_icon_button<F>(
+        &self,
+        cx: &gpui::App,
+        is_fullscreen: bool,
+        offset_from_toggle: f32,
+        id: &'static str,
+        icon: Icon,
+        icon_size: f32,
+        on_mouse_down: F,
+    ) -> gpui::AnyElement
+    where
+        F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    {
+        let theme = cx.theme().ui;
+        let button = div()
             .flex()
             .items_center()
             .justify_center()
@@ -855,20 +899,7 @@ impl MacosSidebar {
                     .text_color(theme.text)
                     .path(icon.path()),
             );
-
-        if self.epoch == 0 {
-            button.left(px(end_left)).into_any_element()
-        } else {
-            button
-                .left(px(start_left))
-                .with_animation(
-                    (id, self.epoch),
-                    gpui::Animation::new(Duration::from_millis(duration_ms))
-                        .with_easing(gpui::ease_in_out),
-                    move |this, delta| this.left(px(start_left + (end_left - start_left) * delta)),
-                )
-                .into_any_element()
-        }
+        self.render_top_element(is_fullscreen, offset_from_toggle, id, button)
     }
 
     pub fn render_new_tab_group_button<F>(
@@ -892,6 +923,33 @@ impl MacosSidebar {
             Icon::PlusSquareOnSquare,
             SIDEBAR_ROW_ICON,
             on_create,
+        )
+    }
+
+    pub fn render_tab_group_select<E>(
+        &self,
+        _cx: &gpui::App,
+        is_fullscreen: bool,
+        select_element: E,
+    ) -> gpui::AnyElement
+    where
+        E: IntoElement,
+    {
+        if !self.visible {
+            return div().into_any_element();
+        }
+
+        const SELECT_WIDTH: f32 = 100.0;
+        let offset_from_toggle = SELECT_WIDTH + 4.0;
+        let wrapper = div()
+            .w(px(SELECT_WIDTH))
+            .h(px(24.))
+            .child(select_element);
+        self.render_top_element(
+            is_fullscreen,
+            offset_from_toggle,
+            "tab-group-select",
+            wrapper,
         )
     }
 

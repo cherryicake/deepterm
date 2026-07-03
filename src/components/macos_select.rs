@@ -64,7 +64,7 @@ fn select_exit_progress(t: f32) -> (f32, f32) {
 /// let items = vec!["始终显示".into(), "启用时显示".into(), "从不显示".into()];
 /// let select = MacosSelect::new(window, cx, items, "启用时显示");
 /// select.update(cx, |select, _cx| {
-///     select.on_select(|label, index, cx| {
+///     select.on_select(|label, index, _window, cx| {
 ///         println!("Selected: {}", label);
 ///     });
 /// });
@@ -77,7 +77,7 @@ pub struct MacosSelect {
     selected_item: SharedString,
     highlighted_index: usize,
     scroll_handle: ScrollHandle,
-    on_select: Option<Arc<dyn Fn(SharedString, usize, &mut App) + Send + Sync>>,
+    on_select: Option<Arc<dyn Fn(SharedString, usize, &mut Window, &mut App) + Send + Sync>>,
     trigger_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     /// 动画代次，确保每次开/关从 delta=0 重新播放。
     anim_epoch: u32,
@@ -115,7 +115,7 @@ impl MacosSelect {
 
     pub fn on_select<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, usize, &mut App) + Send + Sync + 'static,
+        F: Fn(SharedString, usize, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_select = Some(Arc::new(callback));
     }
@@ -181,11 +181,17 @@ impl MacosSelect {
         }));
     }
 
-    fn confirm(&mut self, item: SharedString, item_idx: usize, cx: &mut Context<Self>) {
+    fn confirm(&mut self, item: SharedString, item_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_item = item.clone();
         self.close(cx);
         if let Some(ref on_select) = self.on_select {
-            on_select(item, item_idx, cx);
+            on_select(item, item_idx, window, cx);
+        }
+    }
+
+    fn confirm_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.all_items.get(self.highlighted_index).cloned() {
+            self.confirm(item, self.highlighted_index, window, cx);
         }
     }
 
@@ -208,12 +214,6 @@ impl MacosSelect {
         self.highlighted_index = new_index;
         self.scroll_handle.scroll_to_item(self.highlighted_index);
         cx.notify();
-    }
-
-    fn confirm_highlighted(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = self.all_items.get(self.highlighted_index).cloned() {
-            self.confirm(item, self.highlighted_index, cx);
-        }
     }
 }
 
@@ -283,8 +283,8 @@ impl Render for MacosSelect {
                     })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.confirm(item_clone.clone(), item_idx, cx);
+                        cx.listener(move |this, _, window, cx| {
+                            this.confirm(item_clone.clone(), item_idx, window, cx);
                         }),
                     )
                     .child(
@@ -433,12 +433,12 @@ impl Render for MacosSelect {
                                             .gap(px(2.0))
                                             .key_context("MacosSelect")
                                             .on_key_down(cx.listener(
-                                                |this, event: &KeyDownEvent, _, cx| {
+                                                |this, event: &KeyDownEvent, window, cx| {
                                                     match event.keystroke.key.as_str() {
                                                         "down" => this.move_highlight(1, cx),
                                                         "up" => this.move_highlight(-1, cx),
                                                         "enter" | "return" => {
-                                                            this.confirm_highlighted(cx)
+                                                            this.confirm_highlighted(window, cx)
                                                         }
                                                         "escape" => this.close(cx),
                                                         _ => {}

@@ -25,6 +25,7 @@ use gpui::{
     Subscription, WeakEntity, Window, actions, div, px,
 };
 
+use crate::components::macos_select::MacosSelect;
 use crate::components::macos_sidebar::{
     DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabGroupState, SidebarTabItem,
 };
@@ -74,6 +75,7 @@ pub struct AppWindow {
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     editor: Entity<Editor>,
+    tab_group_select: Entity<MacosSelect>,
     default_editor_runtime_state: Option<EditorRuntimeState>,
     default_editor_session_state: Option<EditorSessionState>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
@@ -139,6 +141,25 @@ impl AppWindow {
                     let group_id = group_id.to_string();
                     app_window.update(cx, |this, cx| {
                         this.switch_tab_group_workspace(&group_id, window, cx);
+                    });
+                }
+            });
+        });
+
+        let app_window_for_select = app_window.downgrade();
+        let tab_group_select = MacosSelect::new(window, cx, vec!["0个标签页".into()], "0个标签页");
+        tab_group_select.update(cx, |select, _cx| {
+            select.on_select(move |_label, index, window, cx| {
+                if let Some(app_window) = app_window_for_select.upgrade() {
+                    app_window.update(cx, |this, cx| {
+                        let default_label = {
+                            let count = this.default_workspace.read(cx).tab_bar.read(cx).tabs.len();
+                            format!("{}个标签页", count)
+                        };
+                        let items = this.sidebar.read(cx).tab_group_select_items(default_label);
+                        if let Some((group_id, _)) = items.get(index) {
+                            this.switch_tab_group_workspace(group_id, window, cx);
+                        }
                     });
                 }
             });
@@ -260,6 +281,7 @@ impl AppWindow {
             ssh_picker,
             sidebar,
             editor,
+            tab_group_select,
             default_editor_runtime_state: None,
             default_editor_session_state,
             _sidebar_hide_task: None,
@@ -544,6 +566,23 @@ impl AppWindow {
                 });
             }
         }
+
+        let default_tab_count = self.default_workspace.read(cx).tab_bar.read(cx).tabs.len();
+        let default_label = format!("{}个标签页", default_tab_count);
+        let (items, selected_label) = self.sidebar.update(cx, |sidebar, _cx| {
+            let items = sidebar.tab_group_select_items(default_label.clone());
+            let selected_label = items
+                .iter()
+                .find(|(id, _)| id == &self.active_tab_group_id())
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| default_label.into());
+            (items, selected_label)
+        });
+        let item_labels: Vec<_> = items.into_iter().map(|(_, label)| label).collect();
+        self.tab_group_select.update(cx, |select, cx| {
+            select.set_items(item_labels, cx);
+            select.set_selected(selected_label, cx);
+        });
     }
 
     fn sidebar_tabs_for_workspace(
@@ -727,7 +766,7 @@ impl AppWindow {
         &self,
         window: &gpui::Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         self.sidebar.read(cx).render_new_tab_group_button(
             cx,
             window.is_fullscreen(),
@@ -740,6 +779,19 @@ impl AppWindow {
                 });
                 this.create_tab_group_workspace(group_id, window, cx);
             }),
+        )
+    }
+
+    /// 渲染标签页组选择下拉列表（在侧边栏二级页面时显示）。
+    fn render_tab_group_select(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.sidebar.read(cx).render_tab_group_select(
+            cx,
+            window.is_fullscreen(),
+            self.tab_group_select.clone(),
         )
     }
 
@@ -903,6 +955,13 @@ impl Render for AppWindow {
             });
         }
 
+        let is_menu_view = *self.sidebar.read(cx).current_view() == crate::components::macos_sidebar::SidebarView::Menu;
+        let top_control: gpui::AnyElement = if is_menu_view {
+            self.render_new_tab_group_button(window, cx).into_any_element()
+        } else {
+            self.render_tab_group_select(window, cx).into_any_element()
+        };
+
         let mut root = div()
             .size_full()
             .bg(theme.app_background)
@@ -923,7 +982,7 @@ impl Render for AppWindow {
             .child(self.sidebar.clone())
             .child(self.editor.clone())
             .child(self.render_main_area(window, cx))
-            .child(self.render_new_tab_group_button(window, cx))
+            .child(top_control)
             .child(self.render_sidebar_toggle(window, cx))
             .child(self.ssh_picker.clone());
 

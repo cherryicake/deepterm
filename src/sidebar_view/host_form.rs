@@ -124,7 +124,7 @@ impl NewHostForm {
             let entity = cx.entity();
             auth_type_select.update(cx, |select, _cx| {
                 let entity = entity.clone();
-                select.on_select(move |label, _index, cx| {
+                select.on_select(move |label, _index, _window, cx| {
                     let auth_type = match label.as_ref() {
                         "SSH Agent" => AuthType::Agent,
                         "私钥" => AuthType::PrivateKey,
@@ -141,7 +141,7 @@ impl NewHostForm {
 
             let entity2 = entity.clone();
             keychain_select.update(cx, |select, _cx| {
-                select.on_select(move |_label, index, cx| {
+                select.on_select(move |_label, index, _window, cx| {
                     cx.update_entity(&entity2, |this: &mut NewHostForm, cx| {
                         // index 0 是"新密码"/"新密钥"，不引用已有钥匙串项
                         this.selected_keychain_id = index

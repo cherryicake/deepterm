@@ -74,7 +74,7 @@ impl FontSettingsView {
 
             let font_select = MacosSelect::new(window, cx, default_fonts, selected_label);
             font_select.update(cx, |select, _cx| {
-                select.on_select(move |family, _index, cx| {
+                select.on_select(move |family, _index, _window, cx| {
                     let family = clean_font_choice(&family).to_string();
                     FontState::update(cx, |settings| {
                         settings.terminal_font_family = family;
@@ -95,7 +95,7 @@ impl FontSettingsView {
 
             let weight_select = MacosSelect::new(window, cx, weight_labels, selected_weight_label);
             weight_select.update(cx, |select, _cx| {
-                select.on_select(move |label, _index, cx| {
+                select.on_select(move |label, _index, _window, cx| {
                     if let Some((weight, _)) =
                         WEIGHT_OPTIONS.iter().find(|(_, l)| *l == label.as_ref())
                     {
