@@ -835,9 +835,10 @@ impl MacosSidebar {
         offset_from_toggle: f32,
         id: &'static str,
         element: E,
+        animate: bool,
     ) -> gpui::AnyElement
     where
-        E: IntoElement,
+        E: gpui::IntoElement,
     {
         let toggle_left_closed = if cfg!(target_os = "macos") && !is_fullscreen {
             BUTTON_LEFT_CLOSED
@@ -847,11 +848,7 @@ impl MacosSidebar {
         let toggle_left_open = self.width - 40.0;
         let button_left_closed = toggle_left_closed - offset_from_toggle;
         let button_left_open = toggle_left_open - offset_from_toggle;
-        let (start_left, end_left, duration_ms) = if self.visible {
-            (button_left_closed, button_left_open, ANIMATION_ENTER_MS)
-        } else {
-            (button_left_open, button_left_closed, ANIMATION_EXIT_MS)
-        };
+        let end_left = if self.visible { button_left_open } else { button_left_closed };
 
         let container = div()
             .id((id, self.epoch))
@@ -862,9 +859,14 @@ impl MacosSidebar {
             .justify_center()
             .child(element);
 
-        if self.epoch == 0 {
+        if !animate || self.epoch == 0 {
             container.left(px(end_left)).into_any_element()
         } else {
+            let (start_left, duration_ms) = if self.visible {
+                (button_left_closed, ANIMATION_ENTER_MS)
+            } else {
+                (button_left_open, ANIMATION_EXIT_MS)
+            };
             container
                 .left(px(start_left))
                 .with_animation(
@@ -886,6 +888,7 @@ impl MacosSidebar {
         icon: Icon,
         icon_size: f32,
         on_mouse_down: F,
+        animate: bool,
     ) -> gpui::AnyElement
     where
         F: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
@@ -908,7 +911,7 @@ impl MacosSidebar {
                     .text_color(theme.text)
                     .path(icon.path()),
             );
-        self.render_top_element(is_fullscreen, offset_from_toggle, id, button)
+        self.render_top_element(is_fullscreen, offset_from_toggle, id, button, animate)
     }
 
     pub fn render_new_tab_group_button<F>(
@@ -932,6 +935,7 @@ impl MacosSidebar {
             Icon::PlusSquareOnSquare,
             SIDEBAR_ROW_ICON,
             on_create,
+            false,
         )
     }
 
@@ -969,6 +973,7 @@ impl MacosSidebar {
             offset_from_toggle,
             "tab-group-select",
             wrapper,
+            false,
         )
     }
 
@@ -993,6 +998,7 @@ impl MacosSidebar {
             Icon::Sidebar,
             20.0,
             on_toggle,
+            true,
         )
     }
 
