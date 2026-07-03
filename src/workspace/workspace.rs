@@ -44,6 +44,7 @@ actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
 #[derive(Clone, Debug)]
 pub enum WorkspaceEvent {
     SessionChanged,
+    TabBarChanged,
     OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
 }
 
@@ -754,6 +755,7 @@ impl Workspace {
                                 tab.icon = Some(icon);
                             }, cx);
                         });
+                        cx.emit(WorkspaceEvent::TabBarChanged);
                     }
                 }
                 // 保存检测到的OS到SSH配置
@@ -817,6 +819,7 @@ impl Workspace {
                             }, cx);
                         });
                         cx.emit(WorkspaceEvent::SessionChanged);
+                        cx.emit(WorkspaceEvent::TabBarChanged);
                     }
                 }
             }
@@ -1331,6 +1334,7 @@ impl Workspace {
                 self.activate_next_tab(cx);
             }
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
             cx.notify();
             return;
         }
@@ -1352,6 +1356,7 @@ impl Workspace {
                 self.activate_next_tab(cx);
             }
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
             cx.notify();
             return;
         };
@@ -1398,6 +1403,7 @@ impl Workspace {
         }
 
         cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
         cx.notify();
     }
 
@@ -1536,6 +1542,7 @@ impl Workspace {
                 self.activate_next_tab(cx);
             }
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
             cx.notify();
             return;
         };
@@ -1591,6 +1598,7 @@ impl Workspace {
         });
 
         cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
         cx.notify();
     }
 
@@ -1641,6 +1649,7 @@ impl Workspace {
                 self.activate_next_tab(cx);
             }
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
             cx.notify();
             return;
         };
@@ -1755,6 +1764,7 @@ impl Workspace {
         });
         if changed {
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
         }
     }
 
@@ -1799,6 +1809,7 @@ impl Workspace {
             });
             self.sync_tab_broadcast_to_panels(tab_id, cx);
             cx.emit(WorkspaceEvent::SessionChanged);
+            cx.emit(WorkspaceEvent::TabBarChanged);
             cx.notify();
         }
     }
@@ -1942,6 +1953,7 @@ impl Workspace {
         });
 
         cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
     }
 
     /// 处理关闭tab事件
@@ -1964,6 +1976,7 @@ impl Workspace {
         }
 
         cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
         cx.notify();
     }
 

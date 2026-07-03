@@ -27,7 +27,7 @@ use gpui::{
 
 use crate::components::macos_select::MacosSelect;
 use crate::components::macos_sidebar::{
-    DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarTabGroupState, SidebarTabItem,
+    DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarEvent, SidebarTabGroupState, SidebarTabItem,
 };
 use crate::components::title_bar::TitleBar;
 use crate::editor::{Editor, EditorRuntimeState};
@@ -83,6 +83,7 @@ pub struct AppWindow {
     keychain_view: Entity<KeychainSidebarView>,
     persistence: PersistenceManager,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    _sidebar_subscription: Option<Subscription>,
     pending_open_paths: Vec<(String, Option<SshConnectionConfig>)>,
 }
 
@@ -238,7 +239,22 @@ impl AppWindow {
             });
         });
 
-        // 创建 Editor（侧边栏和 Workspace 之间的文件编辑器）
+        let sidebar_subscription = cx.subscribe_in(
+            &sidebar,
+            window,
+            move |_this, _, event: &SidebarEvent, window, cx| match event {
+                SidebarEvent::TabGroupsChanged => {
+                    let app_window = cx.entity().clone();
+                    window.defer(cx, move |_window, cx| {
+                        let _ = app_window.update(cx, |this, cx| {
+                            this.sync_sidebar_tab_groups(cx);
+                        });
+                    });
+                }
+            },
+        );
+
+        // 创建 Editor（侧栏和 Workspace 之间的文件编辑器）
         let editor: Entity<Editor> = cx.new(|cx| Editor::new(window, cx));
         editor.update(cx, |editor, _cx| {
             editor.bind_app_window(app_window.downgrade());
@@ -289,6 +305,7 @@ impl AppWindow {
             keychain_view,
             persistence,
             workspace_subscriptions: HashMap::new(),
+            _sidebar_subscription: Some(sidebar_subscription),
             pending_open_paths: Vec::new(),
         };
 
@@ -296,6 +313,7 @@ impl AppWindow {
         if let Some(session) = session {
             this.restore_tab_group_workspaces(session, cx);
         }
+        this.sync_sidebar_tab_groups(cx);
 
         this
     }
@@ -348,14 +366,14 @@ impl AppWindow {
         let subscription = cx.subscribe_in(
             &workspace,
             window,
-            |this, _, event: &WorkspaceEvent, _window, cx| match event {
+            |this, _, event: &WorkspaceEvent, window, cx| match event {
                 WorkspaceEvent::SessionChanged => {
                     this.defer_save_session(cx);
                     // 如果侧边栏正在显示文件树，且顶部 TabBar 切换到了别的终端，
                     // 延迟同步文件树到当前活动终端。
                     let sidebar = this.sidebar.clone();
                     let workspace = this.workspace.clone();
-                    cx.defer(move |cx| {
+                    window.defer(cx, move |_window, cx| {
                         if sidebar.read(cx).current_view() != &crate::components::macos_sidebar::SidebarView::FileTree {
                             return;
                         }
@@ -370,6 +388,14 @@ impl AppWindow {
                                 ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
                             });
                         }
+                    });
+                }
+                WorkspaceEvent::TabBarChanged => {
+                    let app_window = cx.entity();
+                    window.defer(cx, move |_window, cx| {
+                        let _ = app_window.update(cx, |this, cx| {
+                            this.sync_sidebar_tab_groups(cx);
+                        });
                     });
                 }
                 WorkspaceEvent::OpenPath { path, ssh_config } => {
@@ -536,7 +562,10 @@ impl AppWindow {
         workspace.update(cx, |workspace, cx| {
             workspace.set_ssh_picker(self.ssh_picker.clone(), cx);
         });
-        self.subscribe_workspace_events(workspace, window, cx);
+        self.subscribe_workspace_events(workspace.clone(), window, cx);
+        workspace.update(cx, |_, cx| {
+            cx.emit(WorkspaceEvent::TabBarChanged);
+        });
         cx.notify();
     }
 
@@ -663,7 +692,7 @@ impl AppWindow {
                 });
                 self.default_editor_session_state = None;
             }
-            self.sync_file_tree_with_active_tab(cx);
+            self.sync_file_tree_with_active_tab(window, cx);
             self.defer_save_session(cx);
             return;
         }
@@ -717,21 +746,28 @@ impl AppWindow {
             }
         }
 
-        self.sync_file_tree_with_active_tab(cx);
+        self.sync_file_tree_with_active_tab(window, cx);
         self.defer_save_session(cx);
     }
 
     /// 如果当前侧边栏处于文件树页面，将文件树同步到当前活动工作区的活动终端目录。
-    fn sync_file_tree_with_active_tab(&self, cx: &mut Context<Self>) {
-        if *self.sidebar.read(cx).current_view()
-            != crate::components::macos_sidebar::SidebarView::FileTree
-        {
-            return;
-        }
-        let active_tab_id = self.workspace.read(cx).active_tab_id().to_string();
+    fn sync_file_tree_with_active_tab(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let sidebar = self.sidebar.clone();
-        self.workspace.update(cx, |ws, cx| {
-            ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |_window, cx| {
+            if *sidebar.read(cx).current_view()
+                != crate::components::macos_sidebar::SidebarView::FileTree
+            {
+                return;
+            }
+            let active_tab_id = workspace.read(cx).active_tab_id().to_string();
+            let _ = workspace.update(cx, |ws, cx| {
+                ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+            });
         });
     }
 
@@ -898,8 +934,6 @@ impl AppWindow {
 
 impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_sidebar_tab_groups(cx);
-
         let paths: Vec<_> = self.pending_open_paths.drain(..).collect();
         if !paths.is_empty() {
             let editor = self.editor.clone();

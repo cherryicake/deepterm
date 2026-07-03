@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, GlobalElementId,
+    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, EventEmitter, GlobalElementId,
     InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
     Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, WindowControlArea, anchored, deferred,
     div, ease_in_out, px,
@@ -128,6 +128,11 @@ pub enum SidebarView {
 ///
 /// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
 /// 内部包含多组菜单结构，支持选中高亮和点击回调。
+#[derive(Clone, Debug)]
+pub enum SidebarEvent {
+    TabGroupsChanged,
+}
+
 pub struct MacosSidebar {
     visible: bool,
     animating_out: bool,
@@ -403,6 +408,7 @@ impl MacosSidebar {
             .max()
             .map(|max_id| max_id + 1)
             .unwrap_or(0);
+        cx.emit(SidebarEvent::TabGroupsChanged);
         cx.notify();
     }
 
@@ -574,6 +580,7 @@ impl MacosSidebar {
             editing_input: Some(input.clone()),
             editing_subscription: Some(subscription),
         });
+        cx.emit(SidebarEvent::TabGroupsChanged);
         input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
@@ -595,6 +602,7 @@ impl MacosSidebar {
         if !value.is_empty() {
             group.label = value.to_string();
         }
+        cx.emit(SidebarEvent::TabGroupsChanged);
         cx.notify();
     }
 
@@ -662,6 +670,7 @@ impl MacosSidebar {
             self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
         }
 
+        cx.emit(SidebarEvent::TabGroupsChanged);
         cx.notify();
         self.notify_app_window(cx);
     }
@@ -1851,6 +1860,8 @@ impl Default for MacosSidebar {
         Self::new()
     }
 }
+
+impl EventEmitter<SidebarEvent> for MacosSidebar {}
 
 impl Render for MacosSidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
