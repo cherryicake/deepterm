@@ -20,6 +20,8 @@ const SELECT_ENTER_MS: u64 = 200;
 const SELECT_EXIT_MS: u64 = 130;
 /// 进入 / 退出动画的垂直位移，像素。
 const SELECT_SLIDE_PX: f32 = 10.0;
+/// 在触发器正下方弹出时，触发器底边到弹窗边框的间距（像素）需要 > 6px 后才是视觉上真实的间距。
+const POPUP_GAP_BELOW_TRIGGER: f32 = 6.0;
 
 /// 进入动画：返回 (位置进度, 不透明度)。位置全程平滑减速，不透明度提前收尾。
 fn select_enter_progress(t: f32) -> (f32, f32) {
@@ -35,6 +37,16 @@ fn select_exit_progress(t: f32) -> (f32, f32) {
     let pos = easing::macos_exit()(t);
     let opacity = 1.0 - (t / 0.7).clamp(0.0, 1.0);
     (pos, opacity)
+}
+
+/// 下拉弹窗相对于触发器的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectPopupPosition {
+    /// 将高亮项与触发器对齐（默认行为）。
+    #[default]
+    AlignSelected,
+    /// 在触发器正下方弹出。
+    BelowTrigger,
 }
 
 /// A macOS-style dropdown select component.
@@ -63,10 +75,11 @@ fn select_exit_progress(t: f32) -> (f32, f32) {
 /// ```rust
 /// let items = vec!["始终显示".into(), "启用时显示".into(), "从不显示".into()];
 /// let select = MacosSelect::new(window, cx, items, "启用时显示");
-/// select.update(cx, |select, _cx| {
+/// select.update(cx, |select, cx| {
 ///     select.on_select(|label, index, _window, cx| {
 ///         println!("Selected: {}", label);
 ///     });
+///     select.set_popup_position(SelectPopupPosition::BelowTrigger, cx);
 /// });
 /// ```
 pub struct MacosSelect {
@@ -83,6 +96,8 @@ pub struct MacosSelect {
     anim_epoch: u32,
     /// 退出动画结束后清除 `is_closing` 的延迟任务。
     _close_task: Option<Task<()>>,
+    /// 下拉弹窗的显示位置。
+    popup_position: SelectPopupPosition,
 }
 
 impl MacosSelect {
@@ -109,6 +124,7 @@ impl MacosSelect {
                 trigger_bounds: Rc::new(Cell::new(gpui::Bounds::default())),
                 anim_epoch: 0,
                 _close_task: None,
+                popup_position: SelectPopupPosition::default(),
             }
         })
     }
@@ -137,6 +153,11 @@ impl MacosSelect {
             .iter()
             .position(|item| item == &self.selected_item)
             .unwrap_or(0);
+        cx.notify();
+    }
+
+    pub fn set_popup_position(&mut self, position: SelectPopupPosition, cx: &mut Context<Self>) {
+        self.popup_position = position;
         cx.notify();
     }
 
@@ -181,7 +202,13 @@ impl MacosSelect {
         }));
     }
 
-    fn confirm(&mut self, item: SharedString, item_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm(
+        &mut self,
+        item: SharedString,
+        item_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.selected_item = item.clone();
         self.close(cx);
         if let Some(ref on_select) = self.on_select {
@@ -244,11 +271,23 @@ impl Render for MacosSelect {
         } else {
             gpui::Hsla::from(gpui::rgb(0xFFFFFF))
         };
-        let menu_border = gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
+        let menu_border =
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
 
         let highlighted = self.highlighted_index;
+        let popup_position = self.popup_position;
         let focus_handle = self.focus_handle.clone();
         let scroll_handle = self.scroll_handle.clone();
+
+        let trigger_bounds_value = trigger_bounds.get();
+        let dropdown_offset_y = match popup_position {
+            SelectPopupPosition::BelowTrigger => px(POPUP_GAP_BELOW_TRIGGER),
+            SelectPopupPosition::AlignSelected => -(px(30.0) + px(highlighted as f32 * 26.0)),
+        };
+        let dropdown_width = match popup_position {
+            SelectPopupPosition::AlignSelected => None,
+            SelectPopupPosition::BelowTrigger => Some(trigger_bounds_value.size.width),
+        };
 
         let item_elements: Vec<gpui::AnyElement> = self
             .all_items
@@ -340,6 +379,7 @@ impl Render for MacosSelect {
             .child(
                 div()
                     .id("macos-select-trigger")
+                    .relative()
                     .h(px(24.0))
                     .max_w_full()
                     .px(px(6.0))
@@ -413,81 +453,76 @@ impl Render for MacosSelect {
                     deferred(
                         anchored()
                             .anchor(gpui::Anchor::TopLeft)
-                            .offset(point(px(0.0), -(px(30.0) + px(highlighted as f32 * 26.0))))
+                            .offset(point(px(0.0), dropdown_offset_y))
                             .snap_to_window_with_margin(px(8.))
                             .child(
                                 div()
                                     .id("macos-select-dropdown")
                                     .occlude()
+                                    .bg(menu_bg)
+                                    .border(px(0.5))
+                                    .border_color(menu_border)
+                                    .rounded(px(10.0))
+                                    .shadow_lg()
+                                    .when(dropdown_width.is_some(), |d| {
+                                        d.w(dropdown_width.unwrap())
+                                            .px(px(6.0))
+                                            .pb(px(6.0))
+                                            .pt(px(1.0))
+                                    })
+                                    .when(dropdown_width.is_none(), |d| d.p(px(6.0)))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .key_context("MacosSelect")
+                                    .on_key_down(cx.listener(
+                                        |this, event: &KeyDownEvent, window, cx| {
+                                            match event.keystroke.key.as_str() {
+                                                "down" => this.move_highlight(1, cx),
+                                                "up" => this.move_highlight(-1, cx),
+                                                "enter" | "return" => {
+                                                    this.confirm_highlighted(window, cx)
+                                                }
+                                                "escape" => this.close(cx),
+                                                _ => {}
+                                            }
+                                        },
+                                    ))
+                                    .track_focus(&focus_handle)
                                     .child(
                                         div()
-                                            .occlude()
-                                            .bg(menu_bg)
-                                            .border(px(0.5))
-                                            .border_color(menu_border)
-                                            .rounded(px(10.0))
-                                            .shadow_lg()
-                                            .p(px(6.0))
+                                            .id("macos-select-list")
+                                            .flex_1()
+                                            .min_h_0()
+                                            .max_h(
+                                                window.window_bounds().get_bounds().size.height
+                                                    - px(32.0),
+                                            )
+                                            .overflow_y_scroll()
+                                            .track_scroll(&scroll_handle)
                                             .flex()
                                             .flex_col()
                                             .gap(px(2.0))
-                                            .key_context("MacosSelect")
-                                            .on_key_down(cx.listener(
-                                                |this, event: &KeyDownEvent, window, cx| {
-                                                    match event.keystroke.key.as_str() {
-                                                        "down" => this.move_highlight(1, cx),
-                                                        "up" => this.move_highlight(-1, cx),
-                                                        "enter" | "return" => {
-                                                            this.confirm_highlighted(window, cx)
-                                                        }
-                                                        "escape" => this.close(cx),
-                                                        _ => {}
-                                                    }
-                                                },
-                                            ))
-                                            .track_focus(&focus_handle)
-                                            .child(
-                                                div()
-                                                    .id("macos-select-list")
-                                                    .flex_1()
-                                                    .min_h_0()
-                                                    .max_h(
-                                                        window
-                                                            .window_bounds()
-                                                            .get_bounds()
-                                                            .size
-                                                            .height
-                                                            - px(32.0),
-                                                    )
-                                                    .overflow_y_scroll()
-                                                    .track_scroll(&scroll_handle)
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(2.0))
-                                                    .children(item_elements),
-                                            )
-                                            .with_animation(
-                                                anim_id,
-                                                Animation::new(Duration::from_millis(duration_ms))
-                                                    .with_easing(linear),
-                                                move |this, t| {
-                                                    let (pos, opacity) = if is_exit {
-                                                        select_exit_progress(t)
-                                                    } else {
-                                                        select_enter_progress(t)
-                                                    };
-                                                    let offset_y = if is_exit {
-                                                        -SELECT_SLIDE_PX * pos
-                                                    } else {
-                                                        -SELECT_SLIDE_PX * (1.0 - pos)
-                                                    };
-                                                    this.top(px(offset_y))
-                                                        .opacity(opacity.clamp(0.0, 1.0))
-                                                },
-                                            ),
+                                            .children(item_elements),
                                     )
-                                    .on_mouse_down_out(
-                                        cx.listener(|this, _, _, cx| this.close(cx)),
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+                                    .with_animation(
+                                        anim_id,
+                                        Animation::new(Duration::from_millis(duration_ms))
+                                            .with_easing(linear),
+                                        move |this, t| {
+                                            let (pos, opacity) = if is_exit {
+                                                select_exit_progress(t)
+                                            } else {
+                                                select_enter_progress(t)
+                                            };
+                                            let offset_y = if is_exit {
+                                                -SELECT_SLIDE_PX * pos
+                                            } else {
+                                                -SELECT_SLIDE_PX * (1.0 - pos)
+                                            };
+                                            this.top(px(offset_y)).opacity(opacity.clamp(0.0, 1.0))
+                                        },
                                     ),
                             ),
                     )

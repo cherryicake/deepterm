@@ -25,7 +25,7 @@ use gpui::{
     Subscription, WeakEntity, Window, actions, div, px,
 };
 
-use crate::components::macos_select::MacosSelect;
+use crate::components::macos_select::{MacosSelect, SelectPopupPosition};
 use crate::components::macos_sidebar::{
     DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarEvent, SidebarTabGroupState, SidebarTabItem,
 };
@@ -149,7 +149,8 @@ impl AppWindow {
 
         let app_window_for_select = app_window.downgrade();
         let tab_group_select = MacosSelect::new(window, cx, vec!["0个标签页".into()], "0个标签页");
-        tab_group_select.update(cx, |select, _cx| {
+        tab_group_select.update(cx, |select, cx| {
+            select.set_popup_position(SelectPopupPosition::BelowTrigger, cx);
             select.on_select(move |_label, index, window, cx| {
                 if let Some(app_window) = app_window_for_select.upgrade() {
                     app_window.update(cx, |this, cx| {
