@@ -663,6 +663,7 @@ impl AppWindow {
                 });
                 self.default_editor_session_state = None;
             }
+            self.sync_file_tree_with_active_tab(cx);
             self.defer_save_session(cx);
             return;
         }
@@ -716,7 +717,22 @@ impl AppWindow {
             }
         }
 
+        self.sync_file_tree_with_active_tab(cx);
         self.defer_save_session(cx);
+    }
+
+    /// 如果当前侧边栏处于文件树页面，将文件树同步到当前活动工作区的活动终端目录。
+    fn sync_file_tree_with_active_tab(&self, cx: &mut Context<Self>) {
+        if *self.sidebar.read(cx).current_view()
+            != crate::components::macos_sidebar::SidebarView::FileTree
+        {
+            return;
+        }
+        let active_tab_id = self.workspace.read(cx).active_tab_id().to_string();
+        let sidebar = self.sidebar.clone();
+        self.workspace.update(cx, |ws, cx| {
+            ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+        });
     }
 
     /// 切换侧边栏显示/隐藏
