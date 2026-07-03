@@ -939,10 +939,20 @@ impl MacosSidebar {
             return div().into_any_element();
         }
 
-        const SELECT_WIDTH: f32 = 100.0;
-        let offset_from_toggle = SELECT_WIDTH + 4.0;
+        const LEFT_GAP: f32 = 4.0;
+        const RIGHT_GAP: f32 = 4.0;
+        let left_edge = if cfg!(target_os = "macos") && !is_fullscreen {
+            BUTTON_LEFT_CLOSED + LEFT_GAP
+        } else {
+            8.0 + LEFT_GAP
+        };
+        let toggle_left_open = self.width - 40.0;
+        let right_edge = toggle_left_open - RIGHT_GAP;
+        let select_width = (right_edge - left_edge).max(36.0);
+        let offset_from_toggle = toggle_left_open - left_edge;
+
         let wrapper = div()
-            .w(px(SELECT_WIDTH))
+            .w(px(select_width))
             .h(px(24.))
             .child(select_element);
         self.render_top_element(
