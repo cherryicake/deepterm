@@ -10,7 +10,7 @@ use std::{
 
 use crate::{components::input::highlighter::languages, theme::ThemeAppearance};
 
-pub(super) const HIGHLIGHT_NAMES: [&str; 40] = [
+pub(super) const HIGHLIGHT_NAMES: [&str; 41] = [
     "attribute",
     "boolean",
     "comment",
@@ -45,6 +45,7 @@ pub(super) const HIGHLIGHT_NAMES: [&str; 40] = [
     "string.special.symbol",
     "tag",
     "tag.doctype",
+    "text.code.span",
     "text.literal",
     "title",
     "type",
@@ -136,6 +137,8 @@ pub struct SyntaxColors {
     pub tag: Option<ThemeStyle>,
     #[serde(rename = "tag.doctype")]
     pub tag_doctype: Option<ThemeStyle>,
+    #[serde(rename = "text.code.span")]
+    pub text_code_span: Option<ThemeStyle>,
     #[serde(rename = "text.literal")]
     pub text_literal: Option<ThemeStyle>,
     pub title: Option<ThemeStyle>,
@@ -224,7 +227,48 @@ impl From<ThemeStyle> for HighlightStyle {
 }
 
 impl SyntaxColors {
+    /// Map bare capture aliases that appear in language queries but are not
+    /// part of the canonical 41-token palette to a supported token name.
+    fn normalize_name(name: &str) -> &str {
+        match name {
+            "escape" | "string.documentation" | "string.doc" | "comment.documentation" => "string.escape",
+            "character" | "char" => "string",
+            "import" | "cImport" => "keyword",
+            "function.macro" | "function.method" | "function.call"
+            | "function.builtin" | "function.special" => "function",
+            "constant.builtin" | "constant.macro" => "constant",
+            "float" | "number.float" => "number",
+            "variable.builtin" | "variable.parameter" | "variable.member"
+            | "variable.special" => "variable.special",
+            "namespace" | "module" => "type",
+            "type.builtin" | "type.definition" | "type.interface"
+            | "type.super" | "type.class.definition" => "type",
+            "keyword.control" | "keyword.modifier" | "keyword.type"
+            | "keyword.coroutine" | "keyword.function" | "keyword.import"
+            | "keyword.repeat" | "keyword.return" | "keyword.debug"
+            | "keyword.exception" | "keyword.conditional"
+            | "keyword.conditional.ternary" | "keyword.directive"
+            | "keyword.directive.define" | "keyword.export"
+            | "keyword.operator" => "keyword",
+            "tag.error" | "tag.attribute" | "tag.delimiter" => "tag",
+            "text.reference" | "text.uri" => "link_text",
+            "selector" | "selector.pseudo" => "type",
+            "punctuation.markup" => "punctuation",
+            "diff.plus" | "diff.minus" => "string.special",
+            "_class" | "_function" | "_jsdoc_comment" | "_name" | "spell"
+            | "injection.content" | "injection.language" => "",
+            "boolean" => "boolean",
+            "none" => "",
+            _ => name,
+        }
+    }
+
     pub fn style(&self, name: &str) -> Option<HighlightStyle> {
+        if name.is_empty() {
+            return None;
+        }
+
+        let name = Self::normalize_name(name);
         if name.is_empty() {
             return None;
         }
@@ -264,6 +308,7 @@ impl SyntaxColors {
             "string.special.symbol" => self.string_special_symbol,
             "tag" => self.tag,
             "tag.doctype" => self.tag_doctype,
+            "text.code.span" => self.text_code_span,
             "text.literal" => self.text_literal,
             "title" => self.title,
             "type" => self.type_,
@@ -276,17 +321,11 @@ impl SyntaxColors {
 
         if style.is_some() {
             style
-        } else {
+        } else if name.contains('.') {
             // Fallback `keyword.modifier` to `keyword`
-            if name.contains(".") {
-                if let Some(prefix) = name.split(".").next() {
-                    return self.style(prefix);
-                }
-
-                None
-            } else {
-                None
-            }
+            name.split('.').next().and_then(|prefix| self.style(prefix))
+        } else {
+            None
         }
     }
 

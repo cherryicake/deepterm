@@ -188,57 +188,126 @@ impl TerminalTheme {
         name: &str,
         appearance: ThemeAppearance,
     ) -> Arc<HighlightTheme> {
-        Arc::new(HighlightTheme {
-            name: name.to_string(),
-            appearance,
-            style: HighlightThemeStyle {
-                editor_background: Some(self.background),
-                editor_foreground: Some(self.foreground),
-                editor_active_line: Some(gpui::Hsla::from(
+        let (editor_bg, editor_fg, active_line, line_number, active_line_number, invisible) =
+            (
+                Some(self.background),
+                Some(self.foreground),
+                Some(gpui::Hsla::from(
                     gpui::Rgba::from(self.background).blend(if appearance.is_dark() {
                         gpui::rgba(0xFFFFFF10)
                     } else {
                         gpui::rgba(0x0000000C)
                     }),
                 )),
-                editor_line_number: Some(self.dim_foreground),
-                editor_active_line_number: Some(self.foreground),
-                editor_invisible: Some(self.dim_foreground),
+                Some(self.dim_foreground),
+                Some(self.foreground),
+                Some(self.dim_foreground),
+            );
+
+        let syntax: SyntaxColors = if appearance.is_dark() {
+            // Default Dark: approximate One Dark / gpui-component Default Dark
+            SyntaxColors {
+                attribute: Some(ThemeStyle::color(rgb(0x74ade8).into())),
+                boolean: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                comment: Some(ThemeStyle::color(rgb(0x5d636f).into())),
+                comment_doc: Some(ThemeStyle::color(rgb(0x878e98).into())),
+                constant: Some(ThemeStyle::color(rgb(0xdfc184).into())),
+                constructor: Some(ThemeStyle::color(rgb(0x73ade9).into())),
+                embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
+                emphasis: Some(ThemeStyle::color(rgb(0x74ade8).into())),
+                emphasis_strong: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                enum_: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
+                function: Some(ThemeStyle::color(rgb(0x73ade9).into())),
+                hint: Some(ThemeStyle::color(rgb(0x788ca6).into())),
+                keyword: Some(ThemeStyle::color(rgb(0xb477cf).into())),
+                label: Some(ThemeStyle::color(rgb(0x74ade8).into())),
+                link_text: Some(ThemeStyle::color(rgb(0x73ade9).into())),
+                link_uri: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
+                number: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                operator: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
+                predictive: Some(ThemeStyle::color(rgb(0x5a6a87).into())),
+                preproc: Some(ThemeStyle::color(rgb(0xb477cf).into())),
+                primary: Some(ThemeStyle::color(editor_fg.unwrap())),
+                property: Some(ThemeStyle::color(rgb(0xd07277).into())),
+                punctuation: Some(ThemeStyle::color(editor_fg.unwrap())),
+                punctuation_bracket: Some(ThemeStyle::color(rgb(0xb2b9c6).into())),
+                punctuation_delimiter: Some(ThemeStyle::color(rgb(0xb2b9c6).into())),
+                punctuation_list_marker: Some(ThemeStyle::color(rgb(0xd07277).into())),
+                punctuation_special: Some(ThemeStyle::color(rgb(0xb1574b).into())),
+                string: Some(ThemeStyle::color(rgb(0xa1c181).into())),
+                string_escape: Some(ThemeStyle::color(rgb(0x878e98).into())),
+                string_regex: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                string_special: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                string_special_symbol: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                tag: Some(ThemeStyle::color(rgb(0x74ade8).into())),
+                tag_doctype: Some(ThemeStyle::color(rgb(0xb477cf).into())),
+                text_code_span: Some(ThemeStyle::color(rgb(0xe1d797).into())),
+                text_literal: Some(ThemeStyle::color(rgb(0xa1c181).into())),
+                title: Some(ThemeStyle::color(rgb(0xd07277).into())),
+                type_: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
+                variable: Some(ThemeStyle::color(editor_fg.unwrap())),
+                variable_special: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                variant: Some(ThemeStyle::color(rgb(0x73ade9).into())),
+            }
+        } else {
+            // Default Light: approximate One Light / gpui-component Default Light
+            SyntaxColors {
+                attribute: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
+                boolean: Some(ThemeStyle::color(rgb(0xad6e25).into())),
+                comment: Some(ThemeStyle::color(rgb(0xa2a3a7).into())),
+                comment_doc: Some(ThemeStyle::color(rgb(0x7c7e86).into())),
+                constant: Some(ThemeStyle::color(rgb(0xc18401).into())),
+                constructor: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
+                embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
+                emphasis: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
+                emphasis_strong: Some(ThemeStyle::color(rgb(0xad6e25).into())),
+                enum_: Some(ThemeStyle::color(rgb(0x3882b7).into())),
+                function: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
+                hint: Some(ThemeStyle::color(rgb(0x7274a7).into())),
+                keyword: Some(ThemeStyle::color(rgb(0xa449ab).into())),
+                label: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
+                link_text: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
+                link_uri: Some(ThemeStyle::color(rgb(0x3882b7).into())),
+                number: Some(ThemeStyle::color(rgb(0xad6e25).into())),
+                operator: Some(ThemeStyle::color(rgb(0x3882b7).into())),
+                predictive: Some(ThemeStyle::color(rgb(0x9b9ec6).into())),
+                preproc: Some(ThemeStyle::color(rgb(0xa449ab).into())),
+                primary: Some(ThemeStyle::color(editor_fg.unwrap())),
+                property: Some(ThemeStyle::color(rgb(0xd3604f).into())),
+                punctuation: Some(ThemeStyle::color(editor_fg.unwrap())),
+                punctuation_bracket: Some(ThemeStyle::color(rgb(0x4d4f52).into())),
+                punctuation_delimiter: Some(ThemeStyle::color(rgb(0x4d4f52).into())),
+                punctuation_list_marker: Some(ThemeStyle::color(rgb(0xd3604f).into())),
+                punctuation_special: Some(ThemeStyle::color(rgb(0xb92b46).into())),
+                string: Some(ThemeStyle::color(rgb(0x649f57).into())),
+                string_escape: Some(ThemeStyle::color(rgb(0x7c7e86).into())),
+                string_regex: Some(ThemeStyle::color(rgb(0xad6e26).into())),
+                string_special: Some(ThemeStyle::color(rgb(0xad6e26).into())),
+                string_special_symbol: Some(ThemeStyle::color(rgb(0xad6e26).into())),
+                tag: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
+                tag_doctype: Some(ThemeStyle::color(rgb(0xa449ab).into())),
+                text_code_span: Some(ThemeStyle::color(rgb(0x6f42c1).into())),
+                text_literal: Some(ThemeStyle::color(rgb(0x649f57).into())),
+                title: Some(ThemeStyle::color(rgb(0xd3604f).into())),
+                type_: Some(ThemeStyle::color(rgb(0x3882b7).into())),
+                variable: Some(ThemeStyle::color(editor_fg.unwrap())),
+                variable_special: Some(ThemeStyle::color(rgb(0xad6e25).into())),
+                variant: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
+            }
+        };
+
+        Arc::new(HighlightTheme {
+            name: name.to_string(),
+            appearance,
+            style: HighlightThemeStyle {
+                editor_background: editor_bg,
+                editor_foreground: editor_fg,
+                editor_active_line: active_line,
+                editor_line_number: line_number,
+                editor_active_line_number: active_line_number,
+                editor_invisible: invisible,
                 status: StatusColors::default(),
-                syntax: SyntaxColors {
-                    attribute: Some(ThemeStyle::color(self.normal[6])),
-                    boolean: Some(ThemeStyle::color(self.normal[4])),
-                    comment: Some(ThemeStyle::color(self.dim_foreground)),
-                    comment_doc: Some(ThemeStyle::color(self.dim_foreground)),
-                    constant: Some(ThemeStyle::color(self.normal[5])),
-                    constructor: Some(ThemeStyle::color(self.normal[3])),
-                    embedded: Some(ThemeStyle::color(self.foreground)),
-                    enum_: Some(ThemeStyle::color(self.normal[6])),
-                    function: Some(ThemeStyle::color(self.normal[3])),
-                    keyword: Some(ThemeStyle::color(self.normal[5])),
-                    label: Some(ThemeStyle::color(self.normal[3])),
-                    link_text: Some(ThemeStyle::color(self.normal[4])),
-                    link_uri: Some(ThemeStyle::color(self.normal[4])),
-                    number: Some(ThemeStyle::color(self.normal[2])),
-                    operator: Some(ThemeStyle::color(self.foreground)),
-                    preproc: Some(ThemeStyle::color(self.normal[5])),
-                    property: Some(ThemeStyle::color(self.normal[5])),
-                    punctuation: Some(ThemeStyle::color(self.dim_foreground)),
-                    punctuation_bracket: Some(ThemeStyle::color(self.dim_foreground)),
-                    punctuation_delimiter: Some(ThemeStyle::color(self.dim_foreground)),
-                    punctuation_special: Some(ThemeStyle::color(self.normal[5])),
-                    string: Some(ThemeStyle::color(self.normal[1])),
-                    string_escape: Some(ThemeStyle::color(self.normal[6])),
-                    string_regex: Some(ThemeStyle::color(self.normal[1])),
-                    string_special: Some(ThemeStyle::color(self.normal[3])),
-                    tag: Some(ThemeStyle::color(self.normal[1])),
-                    text_literal: Some(ThemeStyle::color(self.normal[6])),
-                    title: Some(ThemeStyle::color(self.normal[5])),
-                    type_: Some(ThemeStyle::color(self.normal[6])),
-                    variable: Some(ThemeStyle::color(self.foreground)),
-                    variable_special: Some(ThemeStyle::color(self.normal[5])),
-                    ..Default::default()
-                },
+                syntax,
             },
         })
     }
@@ -486,7 +555,17 @@ fn parse_color(value: &str) -> anyhow::Result<Hsla> {
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value);
     let parsed = u32::from_str_radix(hex, 16)?;
-    Ok(rgb(parsed).into())
+
+    // Support both #RRGGBB and #RRGGBBAA.
+    if hex.len() == 8 {
+        let rgb_value = parsed >> 8;
+        let alpha = (parsed & 0xFF) as f32 / 255.0;
+        let mut color: Hsla = rgb(rgb_value).into();
+        color.a = alpha;
+        Ok(color)
+    } else {
+        Ok(rgb(parsed).into())
+    }
 }
 
 impl TryFrom<UiThemeFile> for UiTheme {
