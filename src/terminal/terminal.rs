@@ -84,6 +84,8 @@ pub enum DriverEvent {
 pub enum Event {
     TitleChanged,
     CloseTerminal,
+    /// 子进程退出（带退出状态）
+    ProcessExited(i32),
     /// SSH 连接异常断开（网络问题）
     SshAbnormalDisconnect,
     Bell,
@@ -509,7 +511,7 @@ impl Terminal {
         #[cfg(not(unix))]
         let (child_process_id, shell_process_group_id, pty_master_fd) =
             (pty.child_watcher().pid().map(|p| p.get()), None, None);
-        let event_loop = match EventLoop::new(term.clone(), listener, pty, false, false) {
+        let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
                 eprintln!("Failed to create EventLoop: {}", e);
@@ -1440,8 +1442,16 @@ impl Terminal {
             AlacTermEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            AlacTermEvent::Exit | AlacTermEvent::ChildExit(_) => {
+            AlacTermEvent::Exit => {
                 cx.emit(Event::CloseTerminal);
+            }
+            AlacTermEvent::ChildExit(status) => {
+                let exit_code = status.code().unwrap_or(-1);
+                if exit_code == 0 {
+                    cx.emit(Event::CloseTerminal);
+                } else {
+                    cx.emit(Event::ProcessExited(exit_code));
+                }
             }
             AlacTermEvent::ClipboardStore(_, data) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(data));

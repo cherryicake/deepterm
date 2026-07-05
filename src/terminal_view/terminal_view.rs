@@ -21,6 +21,8 @@ use crate::ssh_view::connect::Event::Reconnect;
 pub enum Event {
     /// Terminal process exited - container should close this view
     CloseTerminal,
+    /// 子进程退出（带退出状态）
+    ProcessExited(i32),
     /// Open a file or directory in the editor or file tree
     OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
     /// 发起一次文件传输（由 /scp 等内建命令触发）
@@ -388,6 +390,9 @@ impl TerminalView {
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
                     }
+                    TerminalEvent::ProcessExited(status) => {
+                        cx.emit(Event::ProcessExited(*status));
+                    }
                     // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
                     TerminalEvent::SshAbnormalDisconnect => {}
                     TerminalEvent::BlinkChanged(blinking) => {
@@ -553,6 +558,9 @@ impl TerminalView {
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
                     }
+                    TerminalEvent::ProcessExited(status) => {
+                        cx.emit(Event::ProcessExited(*status));
+                    }
                     TerminalEvent::SshAbnormalDisconnect => {
                         this.handle_ssh_abnormal_disconnect(cx);
                     }
@@ -683,6 +691,9 @@ impl TerminalView {
                 TerminalEvent::CloseTerminal => {
                     // 正常退出（用户执行 exit 命令），关闭 panel
                     cx.emit(Event::CloseTerminal);
+                }
+                TerminalEvent::ProcessExited(status) => {
+                    cx.emit(Event::ProcessExited(*status));
                 }
                 TerminalEvent::SshAbnormalDisconnect => {
                     this.handle_ssh_abnormal_disconnect(cx);

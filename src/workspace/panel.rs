@@ -228,6 +228,11 @@ impl Panel {
                         panel_id: close_panel_id.clone(),
                     });
                 }
+                TerminalViewEvent::ProcessExited(status) => {
+                    // 子进程退出，但不关闭面板（除非用户执行 exit）
+                    // 这里可以添加逻辑来显示退出状态或保持面板打开
+                    log::info!("Panel {}: 子进程退出，状态码: {}", close_panel_id, status);
+                }
                 TerminalViewEvent::OpenPath { path, ssh_config } => {
                     cx.emit(PanelEvent::OpenPath {
                         panel_id: close_panel_id.clone(),
