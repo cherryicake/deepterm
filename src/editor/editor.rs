@@ -1,15 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, Context, CursorStyle, Element, ElementId, Entity,
     GlobalElementId, IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled,
-    WeakEntity, Window, actions, div, px,
+    Subscription, WeakEntity, Window, actions, div, px,
 };
 
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::fs_watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
+use crate::sidebar_view::file_system::RemoteFileSystem;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
@@ -37,12 +40,12 @@ pub fn init(cx: &mut App) {
 
 struct EditorFile {
     id: SharedString,
-    #[allow(dead_code)]
     path: String,
-    #[allow(dead_code)]
     label: String,
     ssh_config: Option<SshConnectionConfig>,
     editor_state: Entity<InputState>,
+    original_content: String,
+    pending_reload: bool,
 }
 
 /// 运行时状态，包含已打开的 [`InputState`] entity，切换标签页组时直接交换，不重新读取文件。
@@ -83,6 +86,8 @@ pub struct Editor {
     tab_bar_pad_duration_ms: u64,
     content_left_padding: f32,
     content_bottom_padding: f32,
+    watcher_subscription: Option<Subscription>,
+    remote_watcher_subscription: Option<Subscription>,
 }
 
 impl Editor {
@@ -102,9 +107,12 @@ impl Editor {
             tab_bar_pad_duration_ms: 0,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
+            watcher_subscription: None,
+            remote_watcher_subscription: None,
         };
 
         this.setup_tab_bar_handlers(cx);
+        this.setup_watcher(cx);
         this
     }
 
@@ -134,7 +142,155 @@ impl Editor {
         }
     }
 
+    fn setup_watcher(&mut self, cx: &mut Context<Self>) {
+        let watcher = cx.fs_watcher();
+        let remote_watcher = cx.remote_fs_watcher();
+        self.watcher_subscription = Some(cx.subscribe(
+            &watcher,
+            move |this, _, event: &FsChangeEvent, cx| {
+                this.handle_fs_event(event, cx);
+            },
+        ));
+        self.remote_watcher_subscription = Some(cx.subscribe(
+            &remote_watcher,
+            move |this, _, event: &FsChangeEvent, cx| {
+                this.handle_fs_event(event, cx);
+            },
+        ));
+    }
+
+    fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
+        if !matches!(event.kind, FsChangeKind::Modify | FsChangeKind::Create) {
+            return;
+        }
+
+        for file in &mut self.open_files {
+            if Path::new(&file.path) != event.path.as_path() {
+                continue;
+            }
+            if file.pending_reload {
+                return;
+            }
+
+            file.pending_reload = true;
+            let path = file.path.clone();
+            let ssh_config = file.ssh_config.clone();
+            let weak = cx.entity().downgrade();
+
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+
+                let content = if let Some(config) = ssh_config {
+                    let path_for_task = path.clone();
+                    match cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::ssh::sftp_fs::read_text_preview(
+                                &config, &path_for_task,
+                            )
+                        })
+                        .await
+                    {
+                        Ok(Some(text)) => Some(text),
+                        Ok(None) => {
+                            log::warn!(
+                                "远程文件为二进制或空，无法重载: {}",
+                                path
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "重载远程文件失败 {}: {}",
+                                path, e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => Some(text),
+                        Err(e) => {
+                            log::warn!(
+                                "重载本地文件失败 {}: {}",
+                                path, e
+                            );
+                            None
+                        }
+                    }
+                };
+
+                if let Some(content) = content {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(file) =
+                            this.open_files.iter_mut().find(|f| f.path == path)
+                        {
+                            let current =
+                                file.editor_state.read(cx).value().to_string();
+                            if current == file.original_content {
+                                file.original_content = content.clone();
+                                file.editor_state.update(cx, |state, cx| {
+                                    state.set_text(content, cx);
+                                });
+                            } else {
+                                log::info!(
+                                    "File changed externally but has unsaved changes: {}",
+                                    path
+                                );
+                            }
+                            file.pending_reload = false;
+                        }
+                    });
+                } else {
+                    let _ = weak.update(cx, |this, _cx| {
+                        if let Some(file) =
+                            this.open_files.iter_mut().find(|f| f.path == path)
+                        {
+                            file.pending_reload = false;
+                        }
+                    });
+                }
+            }).detach();
+
+            return;
+        }
+    }
+
+    fn watch_file(path: &Path, cx: &mut Context<Self>) {
+        cx.watch_path(path);
+    }
+
+    fn watch_remote_file(path: &Path, fs: Arc<dyn crate::sidebar_view::file_system::FileSystem>, cx: &mut Context<Self>) {
+        cx.watch_remote_path(path, fs);
+    }
+
+    fn unwatch_file(path: &Path, cx: &mut Context<Self>) {
+        cx.unwatch_path(path);
+    }
+
+    fn unwatch_remote_file(path: &Path, cx: &mut Context<Self>) {
+        cx.unwatch_remote_path(path);
+    }
+
+    fn unwatch_all_files(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<(PathBuf, bool)> = self
+            .open_files
+            .iter()
+            .map(|f| (PathBuf::from(&f.path), f.ssh_config.is_some()))
+            .collect();
+        for (path, is_remote) in paths {
+            if is_remote {
+                Self::unwatch_remote_file(&path, cx);
+            } else {
+                Self::unwatch_file(&path, cx);
+            }
+        }
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.unwatch_all_files(cx);
         self.open_files.clear();
         self.active_file_id = None;
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -169,6 +325,7 @@ impl Editor {
 
     /// 取出当前运行状态（用于切换到其他标签页组前暂存）。
     pub fn take_runtime_state(&mut self, cx: &mut Context<Self>) -> EditorRuntimeState {
+        self.unwatch_all_files(cx);
         let mut open_files = Vec::new();
         std::mem::swap(&mut open_files, &mut self.open_files);
         let active_file_id = self.active_file_id.take();
@@ -186,6 +343,14 @@ impl Editor {
     pub fn restore_runtime_state(&mut self, state: EditorRuntimeState, cx: &mut Context<Self>) {
         self.open_files = state.open_files;
         self.active_file_id = state.active_file_id;
+        for file in &self.open_files {
+            if file.ssh_config.is_none() {
+                Self::watch_file(Path::new(&file.path), cx);
+            } else {
+                let fs = Arc::new(RemoteFileSystem::new(file.ssh_config.clone().unwrap()));
+                Self::watch_remote_file(Path::new(&file.path), fs, cx);
+            }
+        }
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
             for file in &self.open_files {
@@ -372,7 +537,19 @@ impl Editor {
             label: label.clone(),
             ssh_config,
             editor_state,
+            original_content: content.clone(),
+            pending_reload: false,
         });
+
+        let is_local = self.open_files.last().map(|f| f.ssh_config.is_none()).unwrap_or(true);
+        if is_local {
+            Self::watch_file(&path, cx);
+        } else {
+            let fs = Arc::new(RemoteFileSystem::new(
+                self.open_files.last().unwrap().ssh_config.clone().unwrap(),
+            ));
+            Self::watch_remote_file(&path, fs, cx);
+        }
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
@@ -417,6 +594,12 @@ impl Editor {
     fn close_file(&mut self, id: &str, cx: &mut Context<Self>) {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
+            let file = &self.open_files[index];
+            if file.ssh_config.is_none() {
+                Self::unwatch_file(Path::new(&file.path), cx);
+            } else {
+                Self::unwatch_remote_file(Path::new(&file.path), cx);
+            }
             self.open_files.remove(index);
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.remove_tab(id, cx);

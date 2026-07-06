@@ -4,9 +4,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Window, div, px, svg};
+use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Subscription, Task, Window, div, px, svg};
 
 use crate::assets::Icon;
+use crate::fs_watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 use crate::sidebar_view::file_system::FileSystem;
@@ -23,7 +24,7 @@ pub enum FileEntryKind {
     Other,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
@@ -76,15 +77,34 @@ pub struct SidebarFileTree {
     flat_cache: Option<Vec<(FileEntry, usize)>>,
     backend: Arc<dyn FileSystem>,
     loading_paths: HashSet<PathBuf>,
+    /// Directories that need a refresh after the current in-flight load/refresh completes.
+    pending_refresh: HashSet<PathBuf>,
     on_file_open: Option<Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>>,
+    watcher_subscription: Option<Subscription>,
+    watched_paths: HashSet<PathBuf>,
+    is_local: bool,
 }
 
 impl SidebarFileTree {
-    pub fn new(cx: &mut App, backend: Arc<dyn FileSystem>, root_path: Option<PathBuf>) -> Self {
+    pub fn new(cx: &mut Context<Self>, backend: Arc<dyn FileSystem>, root_path: Option<PathBuf>) -> Self {
         let root_path = root_path.unwrap_or_else(|| {
             backend.home_dir().unwrap_or_else(|| PathBuf::from("/"))
         });
-        Self {
+        let is_local = backend.is_local();
+
+        let watcher_subscription = if is_local {
+            let watcher = cx.fs_watcher();
+            Some(cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
+                this.handle_fs_event(event, cx);
+            }))
+        } else {
+            let watcher = cx.remote_fs_watcher();
+            Some(cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
+                this.handle_fs_event(event, cx);
+            }))
+        };
+
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             root_path: root_path.clone(),
             selected_path: None,
@@ -94,23 +114,56 @@ impl SidebarFileTree {
             flat_cache: None,
             backend,
             loading_paths: HashSet::new(),
+            pending_refresh: HashSet::new(),
             on_file_open: None,
+            watcher_subscription,
+            watched_paths: HashSet::new(),
+            is_local,
+        };
+
+        if !is_local {
+            cx.watch_remote_path(&root_path, this.backend.clone());
+            this.watched_paths.insert(root_path.clone());
+        } else {
+            cx.watch_recursive_path(&root_path);
         }
+
+        this
     }
 
     pub fn open_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let old_root = self.root_path.clone();
+
         if let Some(path) = path {
-            // 路径未发生变化时避免清空缓存、触发无意义的 UI 刷新
             if path == self.root_path {
                 return;
             }
             self.root_path = path;
         }
+
+        if self.is_local {
+            cx.unwatch_recursive_path(&old_root);
+        } else {
+            for watched in &self.watched_paths {
+                cx.unwatch_remote_path(watched);
+            }
+            self.watched_paths.clear();
+        }
+
         self.directory_cache.clear();
         self.expanded_folders.clear();
         self.flat_cache = None;
+        self.pending_refresh.clear();
         let root = self.root_path.clone();
         self.load_directory(root, cx);
+
+        if self.is_local {
+            cx.watch_recursive_path(&self.root_path);
+        } else {
+            cx.watch_remote_path(&self.root_path, self.backend.clone());
+            self.watched_paths.insert(self.root_path.clone());
+        }
+
         cx.notify();
     }
 
@@ -125,38 +178,192 @@ impl SidebarFileTree {
         self.on_file_open = Some(callback);
     }
 
-    fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.directory_cache.contains_key(&path) || self.loading_paths.contains(&path) {
+    fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
+        if !event.path.starts_with(&self.root_path) {
             return;
         }
-        let path_for_loading = path.clone();
-        self.loading_paths.insert(path_for_loading.clone());
 
-        let backend = self.backend.clone();
+        // Remote directory polling can provide the new entries directly. In that case we can
+        // update the cached directory without an extra async load and without a temporary empty
+        // state, which prevents flicker.
+        if let Some(ref entries) = event.entries {
+            if self.directory_cache.contains_key(&event.path)
+                || self.loading_paths.contains(&event.path)
+            {
+                if self.directory_cache.get(&event.path) != Some(entries) {
+                    self.loading_paths.remove(&event.path);
+                    self.directory_cache.insert(event.path.clone(), entries.clone());
+                    self.invalidate_flat_cache();
+                    cx.notify();
+                }
+                return;
+            }
+        }
+
+        // For Remove events, the path itself is gone. Drop it and its descendants from cache so
+        // they disappear from the tree, then refresh the parent directory so it disappears from
+        // the parent's listing too.
+        if event.kind == FsChangeKind::Remove {
+            let removed_path = &event.path;
+            let is_root = removed_path == &self.root_path;
+            let cache_before = self.directory_cache.len();
+            let expanded_before = self.expanded_folders.len();
+            if is_root {
+                // Keep the root entry itself to avoid a render-driven reload loop; just clear
+                // any expanded descendants.
+                self.directory_cache.retain(|p, _| p == removed_path);
+            } else {
+                self.directory_cache.retain(|p, _| !p.starts_with(removed_path));
+            }
+            self.expanded_folders.retain(|p| !p.starts_with(removed_path));
+            let changed = self.directory_cache.len() != cache_before
+                || self.expanded_folders.len() != expanded_before
+                || self.loading_paths.remove(removed_path);
+            if changed {
+                self.invalidate_flat_cache();
+                cx.notify();
+            }
+            let mut ancestor = removed_path.parent();
+            while let Some(p) = ancestor {
+                if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
+                    self.refresh_directory(p.to_path_buf(), cx);
+                    return;
+                }
+                ancestor = p.parent();
+            }
+            return;
+        }
+
+        // For local Create/Modify events or remote events without entries, find the closest cached
+        // ancestor and refresh it incrementally without clearing the cache first.
+        let mut ancestor = Some(event.path.as_path());
+        while let Some(p) = ancestor {
+            if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
+                self.refresh_directory(p.to_path_buf(), cx);
+                return;
+            }
+            ancestor = p.parent();
+        }
+    }
+
+    pub fn cleanup(&mut self, cx: &mut Context<Self>) {
+        if self.is_local {
+            cx.unwatch_recursive_path(&self.root_path);
+        } else {
+            for watched in &self.watched_paths {
+                cx.unwatch_remote_path(watched);
+            }
+            self.watched_paths.clear();
+        }
+        self.watcher_subscription.take();
+        self.pending_refresh.clear();
+    }
+
+    fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.directory_cache.contains_key(&path) {
+            return;
+        }
+        let Some(task) = self.spawn_read_dir(&path, cx) else {
+            return;
+        };
         let weak = cx.weak_entity();
-        let path_for_task = path_for_loading.clone();
-
-        let task = cx.background_executor().spawn(async move {
-            backend.read_dir(&path_for_task)
-        });
+        let path_for_loading = path.clone();
 
         cx.spawn(async move |_, cx| {
             let result = task.await;
             let _ = weak.update(cx, |this, cx| {
-                this.loading_paths.remove(&path_for_loading);
-                match result {
-                    Ok(entries) => {
-                        this.directory_cache.insert(path_for_loading, entries);
-                        this.invalidate_flat_cache();
-                        cx.notify();
+                // If the path was removed from loading_paths by a watcher event (which already
+                // inserted fresher entries), skip writing potentially stale results.
+                let was_loading = this.loading_paths.remove(&path_for_loading);
+                if was_loading {
+                    match result {
+                        Ok(entries) => {
+                            this.directory_cache.insert(path_for_loading.clone(), entries);
+                            this.invalidate_flat_cache();
+                            cx.notify();
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to read directory {}: {}", path_for_loading.display(), e);
+                            cx.notify();
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("Failed to read directory {}: {}", path_for_loading.display(), e);
-                        cx.notify();
-                    }
+                }
+                // If a refresh was requested while this directory was loading, run it now so we
+                // don't drop events that arrived during the load.
+                if this.pending_refresh.remove(&path_for_loading) {
+                    this.refresh_directory(path_for_loading, cx);
                 }
             });
         }).detach();
+    }
+
+    fn refresh_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.loading_paths.contains(&path) {
+            self.pending_refresh.insert(path);
+            return;
+        }
+        let Some(task) = self.spawn_read_dir(&path, cx) else {
+            return;
+        };
+        let weak = cx.weak_entity();
+        let path_for_loading = path.clone();
+
+        cx.spawn(async move |_, cx| {
+            let result = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                // If a watcher event already removed this path from loading_paths and inserted
+                // fresher entries, skip writing potentially stale results.
+                let was_loading = this.loading_paths.remove(&path_for_loading);
+                if was_loading {
+                    match result {
+                        Ok(entries) => {
+                            if this.directory_cache.get(&path_for_loading) != Some(&entries) {
+                                this.directory_cache.insert(path_for_loading.clone(), entries);
+                                this.invalidate_flat_cache();
+                                cx.notify();
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to refresh directory {}: {}", path_for_loading.display(), e);
+                            if this.directory_cache.remove(&path_for_loading).is_some() {
+                                this.invalidate_flat_cache();
+                                cx.notify();
+                                // The path is gone; refresh the parent so it disappears from the
+                                // parent's listing too.
+                                if let Some(parent) = path_for_loading.parent() {
+                                    if this.directory_cache.contains_key(parent)
+                                        || this.loading_paths.contains(parent)
+                                    {
+                                        this.refresh_directory(parent.to_path_buf(), cx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // If a refresh was requested while this directory was loading, run it now so we
+                // don't drop events that arrived during the load.
+                if this.pending_refresh.remove(&path_for_loading) {
+                    this.refresh_directory(path_for_loading, cx);
+                }
+            });
+        }).detach();
+    }
+
+    fn spawn_read_dir(
+        &mut self,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<Vec<FileEntry>, String>>> {
+        if self.loading_paths.contains(path) {
+            return None;
+        }
+        let path = path.to_path_buf();
+        self.loading_paths.insert(path.clone());
+        let backend = self.backend.clone();
+        Some(cx.background_executor().spawn(async move {
+            backend.read_dir(&path)
+        }))
     }
 
     fn invalidate_flat_cache(&mut self) {
@@ -182,9 +389,30 @@ impl SidebarFileTree {
     fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
+            self.pending_refresh.remove(&path);
+            if !self.is_local {
+                // Unwatch this folder and any nested folders that are still being watched.
+                let to_unwatch: Vec<PathBuf> = self
+                    .watched_paths
+                    .iter()
+                    .filter(|p| p.starts_with(&path))
+                    .cloned()
+                    .collect();
+                for p in to_unwatch {
+                    cx.unwatch_remote_path(&p);
+                    self.watched_paths.remove(&p);
+                }
+            }
         } else {
             self.expanded_folders.insert(path.clone());
-            self.load_directory(path, cx);
+            // 重新展开时强制刷新缓存，确保能看到外部变化
+            self.directory_cache.remove(&path);
+            self.loading_paths.remove(&path);
+            self.load_directory(path.clone(), cx);
+            if !self.is_local {
+                cx.watch_remote_path(&path, self.backend.clone());
+                self.watched_paths.insert(path);
+            }
         }
         self.invalidate_flat_cache();
         cx.notify();

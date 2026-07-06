@@ -11,6 +11,7 @@ pub mod builtin_commands;
 pub mod components;
 pub mod editor;
 pub mod file_transfer;
+pub mod fs_watcher;
 mod sidebar_view;
 pub mod ssh;
 pub mod ssh_view;
@@ -211,7 +212,7 @@ impl AppWindow {
         host_view.update(cx, |hv, _cx| {
             hv.on_select(move |id, _window, cx| {
                 sidebar_for_host.update(cx, |this, cx| {
-                    this.handle_item_select(id);
+                    this.handle_item_select(id, cx);
                     this.notify_app_window(cx);
                 });
             });
@@ -234,7 +235,7 @@ impl AppWindow {
         keychain_view.update(cx, |kv, _cx| {
             kv.on_select(move |id, _window, cx| {
                 sidebar_for_keychain.update(cx, |this, cx| {
-                    this.handle_item_select(id);
+                    this.handle_item_select(id, cx);
                     this.notify_app_window(cx);
                 });
             });
@@ -348,7 +349,7 @@ impl AppWindow {
             ws.switch_to_tab(tab_id, cx);
             ws.focus_active_tab_panel(window, cx);
         });
-        sidebar.handle_item_select(group_id);
+        sidebar.select_item(group_id);
         aw.update(cx, |_, cx| cx.notify());
         Some(workspace)
     }
@@ -1066,6 +1067,7 @@ fn main() {
         .run(|cx: &mut App| {
         theme::init(cx);
         sidebar_view::font_settings::FontState::init(cx);
+        fs_watcher::init(cx);
         components::init(cx);
         terminal_view::init(cx);
         workspace::init(cx);

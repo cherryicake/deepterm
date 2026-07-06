@@ -1,14 +1,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 use crate::ssh::SshConnectionConfig;
 use crate::sidebar_view::file_tree::{FileEntry, FileEntryKind};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified_at: Option<SystemTime>,
+}
+
 pub trait FileSystem: Send + Sync + 'static {
     fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>, String>;
+    fn metadata(&self, path: &Path) -> Result<FileMetadata, String>;
     fn home_dir(&self) -> Option<PathBuf>;
     fn ssh_config(&self) -> Option<SshConnectionConfig>;
+    fn is_local(&self) -> bool;
 }
 
 pub struct LocalFileSystem;
@@ -23,12 +33,25 @@ impl FileSystem for LocalFileSystem {
         Ok(result)
     }
 
+    fn metadata(&self, path: &Path) -> Result<FileMetadata, String> {
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        Ok(FileMetadata {
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            modified_at: meta.modified().ok(),
+        })
+    }
+
     fn home_dir(&self) -> Option<PathBuf> {
         dirs::home_dir()
     }
 
     fn ssh_config(&self) -> Option<SshConnectionConfig> {
         None
+    }
+
+    fn is_local(&self) -> bool {
+        true
     }
 }
 
@@ -71,6 +94,19 @@ impl FileSystem for RemoteFileSystem {
         Ok(result)
     }
 
+    fn metadata(&self, path: &Path) -> Result<FileMetadata, String> {
+        let path_str = path.to_string_lossy();
+        let meta = sftp_fs::with_cached_session(&self.config, |session| {
+            session.metadata(&path_str)
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(FileMetadata {
+            is_dir: matches!(meta.kind, RemoteFileKind::Directory),
+            size: meta.size,
+            modified_at: meta.modified_at,
+        })
+    }
+
     fn home_dir(&self) -> Option<PathBuf> {
         self.home
             .get_or_init(|| {
@@ -89,5 +125,9 @@ impl FileSystem for RemoteFileSystem {
 
     fn ssh_config(&self) -> Option<SshConnectionConfig> {
         Some(self.config.clone())
+    }
+
+    fn is_local(&self) -> bool {
+        false
     }
 }

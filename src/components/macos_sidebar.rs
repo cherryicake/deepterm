@@ -277,8 +277,11 @@ impl MacosSidebar {
         terminal_view: Option<Entity<TerminalView>>,
         cx: &mut Context<Self>,
     ) {
-        // 取消之前的订阅
+        // 取消之前的订阅并释放旧文件树的 watcher
         self.file_tree_subscription.take();
+        if let Some(old_tree) = self.file_tree_view.take() {
+            let _ = old_tree.update(cx, |tree, cx| tree.cleanup(cx));
+        }
         self.file_tree_terminal_view = terminal_view.clone();
 
         // 订阅终端 CWD 变化，实时同步文件树
@@ -487,11 +490,13 @@ impl MacosSidebar {
         self.current_view = view;
     }
 
-    /// 返回上一级视图（清除文件树订阅）
-    pub fn go_back(&mut self) {
+    /// 返回上一级视图（清除文件树订阅与 watcher）
+    pub fn go_back(&mut self, cx: &mut Context<Self>) {
         self.file_tree_subscription.take();
+        if let Some(tree) = self.file_tree_view.take() {
+            let _ = tree.update(cx, |tree, cx| tree.cleanup(cx));
+        }
         self.file_tree_terminal_view = None;
-        self.file_tree_view.take();
         self.file_tree_target_label = None;
         self.current_view = SidebarView::Menu;
         self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
@@ -522,7 +527,7 @@ impl MacosSidebar {
     }
 
     /// 处理侧边栏菜单项点击，统一封装导航逻辑。
-    pub fn handle_item_select(&mut self, id: &str) {
+    pub fn handle_item_select(&mut self, id: &str, cx: &mut Context<Self>) {
         match id {
             "themes" => {
                 self.select_item(id);
@@ -540,7 +545,7 @@ impl MacosSidebar {
                 self.select_item(id);
                 self.navigate_to(SidebarView::Keychain);
             }
-            "__back" => self.go_back(),
+            "__back" => self.go_back(cx),
             _ => self.select_item(id),
         }
     }
@@ -1185,7 +1190,7 @@ impl MacosSidebar {
                         ),
                     )
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.handle_item_select(&item_id);
+                        this.handle_item_select(&item_id, cx);
                         this.notify_app_window(cx);
                     }));
 
@@ -1523,7 +1528,7 @@ impl MacosSidebar {
         let click_group_id = group_id.clone();
         let mut row = row
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.handle_item_select(&click_group_id);
+                this.handle_item_select(&click_group_id, cx);
                 if let Some(callback) = this.on_tab_group_select.clone() {
                     callback(&click_group_id, window, cx);
                 }
@@ -1716,7 +1721,7 @@ impl MacosSidebar {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, _window, cx| {
-                            this.handle_item_select("__back");
+                            this.handle_item_select("__back", cx);
                             this.notify_app_window(cx);
                         }),
                     ),
@@ -1766,7 +1771,7 @@ impl MacosSidebar {
             move |id: &str, _window: &mut Window, cx: &mut App| {
                 if let Some(s) = sidebar.upgrade() {
                     s.update(cx, |this, cx| {
-                        this.handle_item_select(id);
+                        this.handle_item_select(id, cx);
                         this.notify_app_window(cx);
                     });
                 }
@@ -1811,7 +1816,7 @@ impl MacosSidebar {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, _window, cx| {
-                            this.handle_item_select("__back");
+                            this.handle_item_select("__back", cx);
                             this.notify_app_window(cx);
                         }),
                     ),
