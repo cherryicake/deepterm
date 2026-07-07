@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px};
+use gpui::{App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative};
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
 use crate::theme::ActiveTheme;
@@ -94,7 +94,7 @@ impl RenderOnce for EditorInput {
         let state = self.state.read(cx);
         let is_multi_line = state.mode.is_multi_line();
         let theme = cx.theme().ui;
-        const LINE_HEIGHT: gpui::Rems = gpui::Rems(1.25);
+        const LINE_HEIGHT: gpui::DefiniteLength = relative(1.618);
 
         let input_py = match self.size {
             Size::Large => px(10.0),

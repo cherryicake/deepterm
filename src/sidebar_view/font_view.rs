@@ -117,7 +117,7 @@ impl FontSettingsView {
 
             let line_height_input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("1.25")
+                    .placeholder("1.3")
                     .placeholder_font_size(px(14.0))
             });
             line_height_input.update(cx, |input, cx| {

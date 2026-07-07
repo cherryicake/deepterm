@@ -63,7 +63,7 @@ fn default_terminal_font_size() -> f32 {
 }
 
 fn default_terminal_line_height() -> f32 {
-    1.25
+    1.3
 }
 
 fn default_terminal_font_weight() -> f32 {
