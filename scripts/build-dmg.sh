@@ -45,6 +45,17 @@ fi
 echo "Preparing app bundle..."
 cp -R "${BUNDLE_DIR}/${APP_BUNDLE}" "${PROJECT_DIR}/${APP_BUNDLE}"
 
+# Compile terminfo into app bundle (matching Alacritty's build process)
+echo "Compiling terminfo..."
+if ! command -v tic &> /dev/null; then
+    echo -e "${YELLOW}Warning: tic not found. Install ncurses to enable terminfo support.${NC}"
+else
+    tic -xe deepterm \
+        -o "${PROJECT_DIR}/${APP_BUNDLE}/Contents/Resources" \
+        "${PROJECT_DIR}/assets/terminfo/deepterm.info"
+    echo -e "${GREEN}Terminfo compiled into bundle.${NC}"
+fi
+
 # Create DMG using create-dmg if available, otherwise use hdiutil
 if command -v create-dmg &> /dev/null; then
     echo -e "${GREEN}Creating DMG with create-dmg...${NC}"

@@ -307,6 +307,9 @@ impl TerminalView {
             return;
         }
         self.was_focused = focused;
+        self.terminal.update(cx, |terminal, _| {
+            terminal.set_focused(focused);
+        });
         self.sync_blink_manager(focused, cx);
     }
 

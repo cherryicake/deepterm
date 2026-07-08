@@ -93,7 +93,9 @@ impl SshPtyTerminal {
         log::info!("SSH 命令: {} {:?}", ssh_program, ssh_args);
 
         // 创建 PTY 选项 - 使用共享的环境变量设置
-        let env = crate::terminal::mappings::default_terminal_env();
+        let mut env = crate::terminal::mappings::default_terminal_env();
+        // SSH 远程主机可能没有 deepterm terminfo，回退 xterm-256color
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let pty_options = Options {
             shell: Some(alacritty_terminal::tty::Shell::new(

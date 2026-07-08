@@ -83,6 +83,45 @@ fn get_macos_system_path() -> &'static str {
     })
 }
 
+/// 检查系统中是否存在指定 terminfo 条目。
+/// 移植自 alacritty_terminal::tty::terminfo_exists。
+fn terminfo_exists(name: &str) -> bool {
+    let first = name.get(..1).unwrap_or_default();
+    let first_hex = format!("{:x}", first.as_bytes()[0]);
+
+    macro_rules! check_path {
+        ($path:expr) => {{
+            let p = $path;
+            if p.join(first).join(name).exists()
+                || p.join(&first_hex).join(name).exists()
+            {
+                return true;
+            }
+        }};
+    }
+
+    if let Some(dir) = std::env::var_os("TERMINFO") {
+        check_path!(std::path::PathBuf::from(dir));
+    }
+
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    if let Some(ref home) = home {
+        check_path!(home.join(".terminfo"));
+    }
+
+    if let Ok(dirs) = std::env::var("TERMINFO_DIRS") {
+        for dir in std::env::split_paths(&dirs) {
+            check_path!(dir);
+        }
+    }
+
+    check_path!(std::path::PathBuf::from("/usr/share/terminfo"));
+    check_path!(std::path::PathBuf::from("/etc/terminfo"));
+    check_path!(std::path::PathBuf::from("/lib/terminfo"));
+
+    false
+}
+
 /// Creates the standard terminal environment variables.
 /// Used by both local terminals and SSH PTY sessions.
 pub fn default_terminal_env() -> HashMap<String, String> {
@@ -93,7 +132,13 @@ pub fn default_terminal_env() -> HashMap<String, String> {
         "TERM_PROGRAM_VERSION".to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
-    env.insert("TERM".to_string(), "xterm-256color".to_string());
+    // 如 deepterm terminfo 已安装则使用，否则回退 xterm-256color
+    let term = if terminfo_exists("deepterm") {
+        "deepterm"
+    } else {
+        "xterm-256color"
+    };
+    env.insert("TERM".to_string(), term.to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
 
     // Set a comprehensive PATH that includes system and Homebrew paths

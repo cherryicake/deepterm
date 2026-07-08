@@ -463,6 +463,8 @@ pub struct Terminal {
     remote_resize_callback: Option<RemoteResizeCallback>,
     /// russh 句柄（用于查询 SSH 连接状态）
     russh_handle: Option<RusshTerminal>,
+    /// 终端视图是否获得焦点（用于剪辑板操作守卫）
+    focused: bool,
 }
 
 impl Terminal {
@@ -473,6 +475,7 @@ impl Terminal {
             shape: AlacCursorShape::Block,
             blinking: false,
         };
+        config.osc52 = alacritty_terminal::term::Osc52::CopyPaste;
         config
     }
 
@@ -563,6 +566,7 @@ impl Terminal {
                 remote_input_callback: None,
                 remote_resize_callback: None,
                 russh_handle: None,
+                focused: true,
             }
         })
     }
@@ -687,6 +691,7 @@ impl Terminal {
             remote_input_callback: None,
             remote_resize_callback: None,
             russh_handle: None,
+            focused: true,
         }
     }
 
@@ -767,6 +772,7 @@ impl Terminal {
                 remote_input_callback: Some(Box::new(on_data)),
                 remote_resize_callback: Some(Box::new(on_resize)),
                 russh_handle: None,
+                focused: true,
             }
         })
     }
@@ -978,6 +984,7 @@ impl Terminal {
                 remote_input_callback: Some(Box::new(input_handler)),
                 remote_resize_callback: Some(Box::new(resize_handler)),
                 russh_handle,
+                focused: true,
             }
         })
     }
@@ -1134,6 +1141,11 @@ impl Terminal {
         self.russh_handle.as_ref()?.error_message()
     }
 
+    /// 更新终端焦点状态
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
     /// 处理 PTY/SSH 原始输出。
     ///
     /// 所有原始 bytes 都先经过这里旁路识别 OSC 7，再继续喂给 alacritty 的 VTE
@@ -1144,7 +1156,7 @@ impl Terminal {
         require_local_osc7_host: bool,
         cx: &mut Context<Self>,
     ) {
-        // 先拦截需要由应用层消费的 OSC 序列，比如 OSC 52 与 cwd 更新。
+        // 先拦截需要由应用层消费的 OSC 序列（如 cwd 更新），OSC 52 则透传至 VTE 解析器处理。
         let filtered_data =
             self.extract_and_handle_osc_sequences(data, require_local_osc7_host, cx);
 
@@ -1454,9 +1466,14 @@ impl Terminal {
                 }
             }
             AlacTermEvent::ClipboardStore(_, data) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(data));
+                if self.focused {
+                    cx.write_to_clipboard(ClipboardItem::new_string(data));
+                }
             }
             AlacTermEvent::ClipboardLoad(_clipboard_type, format) => {
+                if !self.focused {
+                    return;
+                }
                 let clipboard_content = cx
                     .read_from_clipboard()
                     .and_then(|item| item.text().map(|t| t.to_string()))
