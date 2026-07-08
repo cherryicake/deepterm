@@ -484,7 +484,6 @@ impl RusshTerminal {
                                     reason: "连接意外关闭 (EOF)".to_string(),
                                 })
                                 .ok();
-                            listener.send_event(AlacTermEvent::Exit);
                             break;
                         }
                         _ => {}
@@ -503,7 +502,6 @@ impl RusshTerminal {
                                         reason: format!("发送数据失败: {}", e),
                                     })
                                     .ok();
-                                listener.send_event(AlacTermEvent::Exit);
                                 break;
                             }
                         }
