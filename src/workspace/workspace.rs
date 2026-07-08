@@ -1257,14 +1257,22 @@ impl Workspace {
         // 获取该tab下的所有panel
         let panels = tab_info.container.collect_panels_vec();
 
+        let mut changed = false;
+
         // 取消其他panel的选中状态，设置当前panel为选中
         for panel in panels {
             panel.update(cx, |p, cx| {
                 let should_be_selected = p.panel_id == selected_panel_id;
                 if p.is_selected != should_be_selected {
                     p.set_selected(should_be_selected, cx);
+                    changed = true;
                 }
             });
+        }
+
+        if changed {
+            // 通知文件树跟随切换到当前选中 panel 的终端目录
+            cx.emit(WorkspaceEvent::SessionChanged);
         }
 
         cx.notify();
@@ -1986,7 +1994,10 @@ impl Workspace {
         cx: &App,
     ) -> Option<Entity<TerminalView>> {
         let tab_info = self.tabs.get(tab_id)?;
-        let panel = tab_info.container.get_first_panel()?;
+        let panel = tab_info
+            .container
+            .get_selected_panel(cx)
+            .or_else(|| tab_info.container.get_first_panel())?;
         panel.read(cx).content().terminal_view().cloned()
     }
 

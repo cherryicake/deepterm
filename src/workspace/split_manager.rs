@@ -203,6 +203,27 @@ impl SplitContainer {
         }
     }
 
+    /// 获取选中状态的panel
+    pub fn get_selected_panel(&self, cx: &App) -> Option<Entity<Panel>> {
+        match self {
+            SplitContainer::Panel(panel) => {
+                if panel.read(cx).is_selected {
+                    Some(panel.clone())
+                } else {
+                    None
+                }
+            }
+            SplitContainer::Split { children, .. } => {
+                for child in children {
+                    if let Some(panel) = child.get_selected_panel(cx) {
+                        return Some(panel);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// 分割面板
     pub fn split_panel(
         &mut self,
