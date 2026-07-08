@@ -1,11 +1,13 @@
 mod conflict;
 mod cross_remote;
 mod endpoint;
+pub mod filesystem;
 mod local_ops;
 mod manager;
 mod remote_ops;
 mod request;
 mod scp_key_lease;
+pub mod types;
 mod upload_download;
 mod utils;
 mod view;
@@ -17,6 +19,7 @@ pub use conflict::{
 };
 pub use cross_remote::{NoopReporter, TransferStatusReporter};
 pub use endpoint::FileEndpoint;
+pub use filesystem::{FileMetadata, FileSystem, LocalFileSystem, RemoteFileSystem};
 pub use manager::TransferManager;
 pub use request::{ConflictPolicy, TransferOperation, TransferRequest};
 pub use utils::{TRANSFER_CANCELLED_MSG, TransferSummary};

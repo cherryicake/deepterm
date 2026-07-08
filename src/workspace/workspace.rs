@@ -23,7 +23,7 @@ use crate::components::button::Icon as MenuIcon;
 use crate::components::tab_bar::{CopyTabAddress, DraggedTab, DuplicateTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
 use crate::file_manager::TransferStatusReporter;
-use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem, RemoteFileSystem};
+use crate::file_manager::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::file_manager::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,

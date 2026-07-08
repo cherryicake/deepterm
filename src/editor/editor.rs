@@ -12,7 +12,7 @@ use gpui::{
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
-use crate::sidebar_view::file_system::RemoteFileSystem;
+use crate::file_manager::filesystem::RemoteFileSystem;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
@@ -262,7 +262,7 @@ impl Editor {
         cx.watch_path(path);
     }
 
-    fn watch_remote_file(path: &Path, fs: Arc<dyn crate::sidebar_view::file_system::FileSystem>, cx: &mut Context<Self>) {
+    fn watch_remote_file(path: &Path, fs: Arc<dyn crate::file_manager::FileSystem>, cx: &mut Context<Self>) {
         cx.watch_remote_path(path, fs);
     }
 

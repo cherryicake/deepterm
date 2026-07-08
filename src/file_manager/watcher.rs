@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::sidebar_view::file_system::{FileMetadata, FileSystem};
-use crate::sidebar_view::file_tree::FileEntry;
+use crate::file_manager::filesystem::{FileMetadata, FileSystem};
+use crate::file_manager::types::FileEntry;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FsChangeKind {

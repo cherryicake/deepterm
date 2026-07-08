@@ -5,7 +5,7 @@ use gpui::{App, AppContext, Entity, Window};
 
 use crate::components::macos_sidebar::MacosSidebar;
 use crate::editor::Editor;
-use crate::sidebar_view::file_system::{FileSystem, LocalFileSystem, RemoteFileSystem};
+use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::ssh::SshConnectionConfig;
 

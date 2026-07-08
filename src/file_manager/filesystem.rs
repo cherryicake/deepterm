@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 use crate::ssh::SshConnectionConfig;
-use crate::sidebar_view::file_tree::{FileEntry, FileEntryKind};
+use crate::file_manager::types::{FileEntry, FileEntryKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileMetadata {
