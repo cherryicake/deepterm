@@ -5,12 +5,12 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Context as _;
 
-use crate::file_transfer::utils::{
+use crate::file_manager::utils::{
     TransferSummary, check_cancelled, copy_local_file_interruptible, is_local_noop_move,
     prevent_local_recursive_copy, remove_local_source, resolve_local_conflict,
     temporary_local_path,
 };
-use crate::file_transfer::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver};
 
 pub fn copy_local_to_local(
     source_path: &Path,
@@ -231,7 +231,7 @@ pub fn copy_local_file_to_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_transfer::{ConflictPrompt, ConflictResolution};
+    use crate::file_manager::{ConflictPrompt, ConflictResolution};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 测试用冲突解决器：对每个冲突回复固定决策，并记录被询问的次数。

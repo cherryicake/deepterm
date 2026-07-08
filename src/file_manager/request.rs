@@ -1,4 +1,4 @@
-use crate::file_transfer::FileEndpoint;
+use crate::file_manager::FileEndpoint;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferOperation {

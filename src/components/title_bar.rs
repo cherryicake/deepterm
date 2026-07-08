@@ -13,7 +13,7 @@ use gpui::{
 };
 
 use crate::components::tab_bar::TabBar;
-use crate::file_transfer::{
+use crate::file_manager::{
     TransferHoverAction, TransferTaskHandler, TransferTaskStatus, render_transfer_panel,
 };
 use crate::theme::ActiveTheme;

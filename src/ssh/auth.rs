@@ -12,7 +12,7 @@ use crate::ssh::config::SshConnectionConfig;
 
 /// 进程内缓存：记录"DeepTerm 连接 `<user>@<host>:<port>` 时，最终是哪一把磁盘密钥认过的"。
 ///
-/// 用于 [`crate::file_transfer`] 的远程到远程 scp 直连：当目标使用 `Agent`/`Auto`
+/// 用于 [`crate::file_manager`] 的远程到远程 scp 直连：当目标使用 `Agent`/`Auto`
 /// 且 ssh-agent 没有可用身份时，DeepTerm 自己会回退到 `~/.ssh` 默认密钥认证；
 /// 此时同一把磁盘密钥就是源端 scp 唯一需要的。把它直接复用即可，避免再把所有默认
 /// 密钥都丢给 scp 试一遍（每次失败都要一次完整握手）。

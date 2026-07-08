@@ -21,7 +21,7 @@ fn format_size(size: u64) -> String {
         format!("{:.1} {}", value, UNITS[unit])
     }
 }
-use crate::file_transfer::{FileEndpoint, TransferRequest};
+use crate::file_manager::{FileEndpoint, TransferRequest};
 use crate::theme::UiTheme;
 
 const PANEL_WIDTH: f32 = 520.0;
@@ -601,7 +601,7 @@ fn remote_total_size(ssh_config: &crate::ssh::SshConnectionConfig, path: &str) -
     };
     let cmd = format!(
         "du -sb '{}' 2>/dev/null || echo 0",
-        crate::file_transfer::utils::shell_single_quote(path)
+        crate::file_manager::utils::shell_single_quote(path)
     );
     match session.execute_command(&cmd, 30) {
         Ok(result) if result.success() => result

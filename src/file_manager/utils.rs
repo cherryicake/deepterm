@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail};
 
-use crate::file_transfer::{
+use crate::file_manager::{
     ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, wait_for_resolution,
 };
 use crate::ssh::sftp_fs::{self, RemoteFileKind};

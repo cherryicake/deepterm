@@ -11,7 +11,7 @@ use gpui::{
 
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::fs_watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
+use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::sidebar_view::file_system::RemoteFileSystem;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;

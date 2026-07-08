@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context as _, anyhow, bail};
 
-use crate::file_transfer::utils::{
+use crate::file_manager::utils::{
     TRANSFER_CANCELLED_MSG, TransferSummary, check_cancelled, remote_file_name,
     remove_remote_source, resolve_remote_conflict, shell_single_quote, temporary_remote_path,
 };
-use crate::file_transfer::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
 use crate::ssh::sftp_fs::{self, BlockingSftpSession, RemoteFileKind};
@@ -179,7 +179,7 @@ fn cleanup_partial_scp_destination(
 ) {
     let _ = sftp_fs::with_cached_session(destination_config, |session| {
         if session.exists(destination_path)? {
-            match crate::file_transfer::utils::remove_remote_source(session, destination_path) {
+            match crate::file_manager::utils::remove_remote_source(session, destination_path) {
                 Ok(()) => {
                     log::info!(
                         "已清理 SCP 目标端残留文件: {}@{}:{}",
@@ -890,7 +890,7 @@ fn copy_via_remote_scp(
 
     log::debug!("远程 scp 使用本地密钥: {}", key_path.display());
 
-    let lease = crate::file_transfer::scp_key_lease::acquire_lease(
+    let lease = crate::file_manager::scp_key_lease::acquire_lease(
         source_session,
         source_config,
         destination_config,

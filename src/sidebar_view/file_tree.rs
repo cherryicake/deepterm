@@ -7,7 +7,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Subscription, Task, Window, div, px, svg};
 
 use crate::assets::Icon;
-use crate::fs_watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
+use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 use crate::sidebar_view::file_system::FileSystem;

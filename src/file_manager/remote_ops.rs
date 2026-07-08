@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use crate::file_transfer::utils::{
+use crate::file_manager::utils::{
     TransferSummary, check_cancelled, is_remote_noop_move, prevent_remote_recursive_copy,
     remote_file_name, remove_remote_source, resolve_remote_conflict,
 };
-use crate::file_transfer::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 

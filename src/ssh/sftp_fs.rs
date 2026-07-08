@@ -14,7 +14,7 @@ use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::file_transfer::TRANSFER_CANCELLED_MSG;
+use crate::file_manager::TRANSFER_CANCELLED_MSG;
 use crate::ssh::auth::{try_agent_auth, try_default_keys};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{

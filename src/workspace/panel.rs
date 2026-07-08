@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::assets::Icon;
 use crate::components::tab_bar::{DragPreview, DraggedTab};
-use crate::file_transfer::TransferRequest;
+use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
 use crate::theme::ActiveTheme;

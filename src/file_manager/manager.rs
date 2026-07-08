@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use crate::file_transfer::cross_remote::{self, TransferStatusReporter};
-use crate::file_transfer::utils::TransferSummary;
-use crate::file_transfer::{
+use crate::file_manager::cross_remote::{self, TransferStatusReporter};
+use crate::file_manager::utils::TransferSummary;
+use crate::file_manager::{
     ConflictPolicy, ConflictResolver, FileEndpoint, TransferOperation, TransferRequest,
 };
 
@@ -56,7 +56,7 @@ impl TransferManager {
             None
         };
         for source in request.sources {
-            crate::file_transfer::utils::check_cancelled(&cancelled)?;
+            crate::file_manager::utils::check_cancelled(&cancelled)?;
             summary.merge(Self::transfer_one(
                 source,
                 &request.destination,
@@ -109,7 +109,7 @@ impl TransferManager {
                     path: destination_dir,
                 },
             ) if operation == TransferOperation::Move => {
-                crate::file_transfer::local_ops::move_local_to_local(
+                crate::file_manager::local_ops::move_local_to_local(
                     &path,
                     destination_dir,
                     conflict_policy,
@@ -123,7 +123,7 @@ impl TransferManager {
                 FileEndpoint::Local {
                     path: destination_dir,
                 },
-            ) => crate::file_transfer::local_ops::copy_local_to_local(
+            ) => crate::file_manager::local_ops::copy_local_to_local(
                 &path,
                 destination_dir,
                 conflict_policy,
@@ -138,7 +138,7 @@ impl TransferManager {
                     path: destination_dir,
                 },
             ) => {
-                let summary = crate::file_transfer::upload_download::upload_local_to_remote(
+                let summary = crate::file_manager::upload_download::upload_local_to_remote(
                     &path,
                     ssh_config,
                     destination_dir,
@@ -150,7 +150,7 @@ impl TransferManager {
                 )?;
                 if operation == TransferOperation::Move {
                     Self::remove_source_if_complete(&summary, || {
-                        crate::file_transfer::utils::remove_local_source(&path)
+                        crate::file_manager::utils::remove_local_source(&path)
                     })?;
                 }
                 Ok(summary)
@@ -164,7 +164,7 @@ impl TransferManager {
                     path: destination_dir,
                 },
             ) => {
-                let summary = crate::file_transfer::upload_download::download_remote_to_local(
+                let summary = crate::file_manager::upload_download::download_remote_to_local(
                     &ssh_config,
                     &remote_path,
                     destination_dir,
@@ -177,7 +177,7 @@ impl TransferManager {
                 if operation == TransferOperation::Move {
                     Self::remove_source_if_complete(&summary, || {
                         crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
-                            crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                            crate::file_manager::utils::remove_remote_source(session, &remote_path)
                         })
                     })?;
                 }
@@ -193,7 +193,7 @@ impl TransferManager {
                     path: destination_dir,
                 },
             ) if ssh_config == *destination_config && operation == TransferOperation::Move => {
-                crate::file_transfer::remote_ops::move_remote_to_same_remote(
+                crate::file_manager::remote_ops::move_remote_to_same_remote(
                     &ssh_config,
                     &remote_path,
                     destination_dir,
@@ -214,7 +214,7 @@ impl TransferManager {
                     path: destination_dir,
                 },
             ) if ssh_config == *destination_config => {
-                crate::file_transfer::remote_ops::copy_remote_to_same_remote(
+                crate::file_manager::remote_ops::copy_remote_to_same_remote(
                     &ssh_config,
                     &remote_path,
                     destination_dir,
@@ -250,7 +250,7 @@ impl TransferManager {
                 if operation == TransferOperation::Move {
                     Self::remove_source_if_complete(&summary, || {
                         crate::ssh::sftp_fs::with_cached_session(&ssh_config, |session| {
-                            crate::file_transfer::utils::remove_remote_source(session, &remote_path)
+                            crate::file_manager::utils::remove_remote_source(session, &remote_path)
                         })
                     })?;
                 }

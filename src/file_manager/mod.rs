@@ -9,6 +9,7 @@ mod scp_key_lease;
 mod upload_download;
 mod utils;
 mod view;
+pub mod watcher;
 
 pub use conflict::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver, is_apply_to_all,
@@ -23,3 +24,4 @@ pub use view::{
     TransferHoverAction, TransferTaskHandler, TransferTaskState, TransferTaskStatus,
     endpoint_label, quick_total_size, render_transfer_panel, transfer_item_name, transfer_label,
 };
+pub use watcher::{FsChangeEvent, FsChangeKind, FsWatcher, RemoteFsWatcher, WatcherContext};

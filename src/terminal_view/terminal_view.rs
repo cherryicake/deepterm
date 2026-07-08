@@ -13,7 +13,7 @@ use gpui::{
 use gpui::{KeyBinding, prelude::*};
 use unicode_width::UnicodeWidthStr;
 
-use crate::file_transfer::TransferRequest;
+use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::ssh_view::connect::Event::Reconnect;
 /// Events emitted by TerminalView

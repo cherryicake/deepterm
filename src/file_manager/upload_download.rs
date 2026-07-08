@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::{Context as _, anyhow};
 
-use crate::file_transfer::utils::{
+use crate::file_manager::utils::{
     TransferSummary, check_cancelled, remote_file_name, resolve_local_conflict,
     resolve_remote_conflict, temporary_local_path, temporary_remote_path,
 };
-use crate::file_transfer::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 

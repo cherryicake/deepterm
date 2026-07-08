@@ -5,7 +5,7 @@ use gpui::Entity;
 use crate::builtin_commands::registry::{BuiltinCommand, CommandHandlerId};
 use crate::builtin_commands::scp_completion::is_local_keyword_str;
 use crate::builtin_commands::{LocalPathContext, PathResolver};
-use crate::file_transfer::{ConflictPolicy, FileEndpoint, TransferOperation, TransferRequest};
+use crate::file_manager::{ConflictPolicy, FileEndpoint, TransferOperation, TransferRequest};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::config::SshGlobalConfig;
 use crate::terminal_view::TerminalView;
