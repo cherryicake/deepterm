@@ -118,6 +118,17 @@ pub enum TerminalSessionState {
 }
 
 impl TerminalSessionState {
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+
+    pub fn ssh_config(&self) -> Option<&SshConnectionConfig> {
+        match self {
+            Self::Ssh { config, .. } => Some(config),
+            _ => None,
+        }
+    }
+
     /// 提取终端 CWD 路径和文件树显示名
     pub fn file_tree_target(&self) -> (Option<PathBuf>, String) {
         let default_label = match self {

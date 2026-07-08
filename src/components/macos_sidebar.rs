@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -20,6 +21,7 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::theme_view;
 use crate::theme::ActiveTheme;
+use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::ssh::SshConnectionConfig;
 use crate::terminal_view::TerminalView;
@@ -270,55 +272,56 @@ impl MacosSidebar {
 
 
 
-    pub fn set_file_tree_view(
+    fn subscribe_file_tree_to_terminal(
+        &mut self,
+        terminal_view: &Entity<TerminalView>,
+        file_tree: Entity<SidebarFileTree>,
+        cx: &mut Context<Self>,
+    ) {
+        let sub = cx.subscribe(terminal_view, move |this, subscribed_tv, event: &crate::terminal_view::terminal_view::Event, cx| {
+            let should_sync = matches!(
+                event,
+                crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
+                    | crate::terminal_view::terminal_view::Event::TitleChanged
+            );
+            if !should_sync {
+                return;
+            }
+            if this.file_tree_terminal_view.as_ref() != Some(&subscribed_tv) {
+                return;
+            }
+            let state = subscribed_tv.read(cx).session_state(cx);
+            let (cwd, target_label) = state.file_tree_target();
+            if cwd.as_deref() == Some(file_tree.read(cx).root_path()) {
+                return;
+            }
+            this.file_tree_target_label = Some(target_label);
+            let _ = file_tree.update(cx, |tree, cx| {
+                tree.open_path(cwd, cx);
+            });
+            cx.notify();
+            this.notify_app_window(cx);
+        });
+        self.file_tree_subscription = Some(sub);
+    }
+
+    pub(crate) fn set_file_tree_view(
         &mut self,
         view: Entity<SidebarFileTree>,
         target_label: String,
         terminal_view: Option<Entity<TerminalView>>,
         cx: &mut Context<Self>,
     ) {
-        // 取消之前的订阅并释放旧文件树的 watcher
         self.file_tree_subscription.take();
         if let Some(old_tree) = self.file_tree_view.take() {
             let _ = old_tree.update(cx, |tree, cx| tree.cleanup(cx));
         }
         self.file_tree_terminal_view = terminal_view.clone();
 
-        // 订阅终端 CWD 变化，实时同步文件树
-        // 同时监听 TitleChanged：终端标签页通过 process cwd 查询等方式更新目录时也会触发该事件，
-        // 因此文件树使用相同的 session_state() 方法在 TitleChanged 时重新同步打开目录。
         if let Some(tv) = &terminal_view {
-            let file_tree = view.clone();
-            let sub = cx.subscribe(tv, move |this, subscribed_tv, event: &crate::terminal_view::terminal_view::Event, cx| {
-                let should_sync = matches!(
-                    event,
-                    crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
-                        | crate::terminal_view::terminal_view::Event::TitleChanged
-                );
-                if !should_sync {
-                    return;
-                }
-                // 如果当前文件树已经切换到其他终端，忽略旧终端的事件，避免"幽灵更新"。
-                if this.file_tree_terminal_view.as_ref() != Some(&subscribed_tv) {
-                    return;
-                }
-                let state = subscribed_tv.read(cx).session_state(cx);
-                let (cwd, target_label) = state.file_tree_target();
-                // 路径未实际变化时避免无意义的刷新
-                if cwd.as_deref() == Some(file_tree.read(cx).root_path()) {
-                    return;
-                }
-                this.file_tree_target_label = Some(target_label);
-                let _ = file_tree.update(cx, |tree, cx| {
-                    tree.open_path(cwd, cx);
-                });
-                cx.notify();
-                this.notify_app_window(cx);
-            });
-            self.file_tree_subscription = Some(sub);
+            self.subscribe_file_tree_to_terminal(tv, view.clone(), cx);
         }
 
-        // 转发文件打开回调到文件树
         if let Some(ref callback) = self.on_file_open.clone() {
             view.update(cx, |tree, _cx| tree.set_on_file_open(callback.clone()));
         }
@@ -333,6 +336,66 @@ impl MacosSidebar {
                 aw.update(cx, |_, cx| cx.notify()).ok();
             }
         });
+    }
+
+    /// 将文件树切换到指定终端。路径+后端相同时复用现有树（仅切换订阅），否则重建。
+    pub fn set_terminal_file_tree(
+        &mut self,
+        terminal_view: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let (path, display_name, is_local, ssh_config) = {
+            let state = terminal_view.read(cx).session_state(cx);
+            let (p, d) = state.file_tree_target();
+            (p, d, state.is_local(), state.ssh_config().cloned())
+        };
+
+        // 同一终端实例 → 跳过
+        if self.file_tree_terminal_view.as_ref() == Some(&terminal_view) {
+            return;
+        }
+
+        // 路径+后端一致 → 复用（仅切换订阅）
+        if let Some(ref path) = path {
+            if let Some(tree) = &self.file_tree_view {
+                if tree.read(cx).matches_location(path, is_local, ssh_config.as_ref()) {
+                    self.file_tree_subscription.take();
+                    self.file_tree_terminal_view = Some(terminal_view.clone());
+                    self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
+                    self.file_tree_target_label = Some(display_name);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        // 不同 → 重建
+        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = if !is_local {
+            let config = ssh_config.unwrap();
+            let p = path.as_ref().map(|p| PathBuf::from(p.to_string_lossy().to_string()));
+            (Arc::new(RemoteFileSystem::new(config)), p)
+        } else {
+            (Arc::new(LocalFileSystem), path.clone())
+        };
+        let file_tree = cx.new(|cx| {
+            let mut tree = SidebarFileTree::new(cx, backend, requested_path);
+            tree.open_path(path, cx);
+            tree
+        });
+
+        self.file_tree_subscription.take();
+        if let Some(old) = self.file_tree_view.take() {
+            let _ = old.update(cx, |t, cx| t.cleanup(cx));
+        }
+        self.file_tree_terminal_view = Some(terminal_view.clone());
+        self.subscribe_file_tree_to_terminal(&terminal_view, file_tree.clone(), cx);
+        if let Some(ref cb) = self.on_file_open.clone() {
+            file_tree.update(cx, |t, _| t.set_on_file_open(cb.clone()));
+        }
+        self.file_tree_view = Some(file_tree);
+        self.file_tree_target_label = Some(display_name);
+        self.current_view = SidebarView::FileTree;
+        cx.notify();
     }
 
     /// 轻量版：仅切换侧边栏到文件树页面，不设订阅、不创建实体。

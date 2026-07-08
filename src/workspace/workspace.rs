@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -23,8 +22,6 @@ use crate::components::button::Icon as MenuIcon;
 use crate::components::tab_bar::{CopyTabAddress, DraggedTab, DuplicateTab, TabBar, TabItem};
 use crate::terminal_view::TerminalView;
 use crate::file_manager::TransferStatusReporter;
-use crate::file_manager::{FileSystem, LocalFileSystem, RemoteFileSystem};
-use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::file_manager::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
     TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary, TransferTaskHandler,
@@ -2018,38 +2015,7 @@ impl Workspace {
             return;
         };
 
-        // 如果文件树已经绑定到同一个终端，则无需重新创建。
-        let already_bound = sidebar.read(cx).file_tree_terminal_view() == Some(terminal_view.clone());
-        if already_bound {
-            return;
-        }
-
-        let state = terminal_view.read(cx).session_state(cx);
-
-        let (path, display_name) = state.file_tree_target();
-
-        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = match &state {
-            TerminalSessionState::Ssh { config, .. } => {
-                let path = path.as_ref().map(|p| p.to_string_lossy().to_string()).map(PathBuf::from);
-                (Arc::new(RemoteFileSystem::new(config.clone())), path)
-            }
-            TerminalSessionState::Local { .. } => {
-                (Arc::new(LocalFileSystem), path.clone())
-            }
-        };
-
-        // 使用已知的 requested_path 作为初始 root_path，避免 SidebarFileTree::new
-        // 同步调用 backend.home_dir()（远程 backend 会建立 SFTP 连接，导致 UI 卡顿）。
-        let file_tree = cx.new(|cx| {
-            let mut tree = SidebarFileTree::new(cx, backend, requested_path.clone());
-            tree.open_path(requested_path, cx);
-            tree
-        });
-
-        // 5. 设置到 Sidebar（同时传递终端视图引用用于 CWD 实时同步）
-        let _ = sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_file_tree_view(file_tree, display_name, Some(terminal_view), cx);
-        });
+        let _ = sidebar.update(cx, |s, cx| s.set_terminal_file_tree(terminal_view, cx));
     }
 
     /// 拷贝地址 - 将终端连接地址写入剪贴板

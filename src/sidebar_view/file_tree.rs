@@ -129,6 +129,10 @@ impl SidebarFileTree {
         &self.root_path
     }
 
+    pub fn matches_location(&self, path: &Path, is_local: bool, ssh_config: Option<&SshConnectionConfig>) -> bool {
+        self.root_path == path && self.backend.matches(is_local, ssh_config)
+    }
+
     pub fn set_on_file_open(
         &mut self,
         callback: Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>,

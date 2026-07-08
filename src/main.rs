@@ -365,8 +365,6 @@ impl AppWindow {
             |this, _, event: &WorkspaceEvent, window, cx| match event {
                 WorkspaceEvent::SessionChanged => {
                     this.defer_save_session(cx);
-                    // 如果侧边栏正在显示文件树，且顶部 TabBar 切换到了别的终端，
-                    // 延迟同步文件树到当前活动终端。
                     let sidebar = this.sidebar.clone();
                     let workspace = this.workspace.clone();
                     window.defer(cx, move |_window, cx| {
@@ -374,16 +372,9 @@ impl AppWindow {
                             return;
                         }
                         let active_tab_id = workspace.read(cx).active_tab_id().to_string();
-                        let active_terminal = workspace.read(cx).terminal_view_for_tab(&active_tab_id, cx);
-                        let current_terminal = sidebar.read(cx).file_tree_terminal_view();
-                        if active_terminal == current_terminal {
-                            return;
-                        }
-                        if active_terminal.is_some() {
-                            let _ = workspace.update(cx, |ws, cx| {
-                                ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
-                            });
-                        }
+                        let _ = workspace.update(cx, |ws, cx| {
+                            ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+                        });
                     });
                 }
                 WorkspaceEvent::TabBarChanged => {

@@ -19,6 +19,10 @@ pub trait FileSystem: Send + Sync + 'static {
     fn home_dir(&self) -> Option<PathBuf>;
     fn ssh_config(&self) -> Option<SshConnectionConfig>;
     fn is_local(&self) -> bool;
+
+    fn matches(&self, is_local: bool, ssh_config: Option<&SshConnectionConfig>) -> bool {
+        self.is_local() == is_local && self.ssh_config().as_ref() == ssh_config
+    }
 }
 
 pub struct LocalFileSystem;
