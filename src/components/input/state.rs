@@ -673,7 +673,9 @@ impl InputState {
 
     /// Set the text of the input field without requiring a window.
     ///
-    /// This is a lightweight alternative to [`Self::set_value`] for simple single-line inputs.
+    /// Unlike [`Self::set_value`], this does not need a `Window` and is safe to call from
+    /// async completion paths (e.g. background file loads). It updates the rope, display map,
+    /// and schedules a highlight refresh for code editors.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.history.ignore = true;
         let text: SharedString = text.into();
@@ -685,6 +687,11 @@ impl InputState {
         }
         self.ime_marked_range = None;
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        self.display_map.set_text(&self.text, cx);
+        if self.mode.is_code_editor() {
+            self.reset_highlighter(cx);
+            self._pending_update = true;
+        }
         self.history.ignore = false;
         cx.emit(InputEvent::Change);
         cx.notify();

@@ -20,14 +20,16 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, Entity, IntoElement, KeyBinding, ParentElement, Render,
-    Subscription, WeakEntity, Window, actions, div, px,
+    AnimationExt, App, Context, Entity, IntoElement, InteractiveElement, KeyBinding, ParentElement,
+    Render, SharedString, Styled, Subscription, WeakEntity, Window, actions, div, px, svg,
 };
 
+use crate::assets::Icon;
 use crate::components::macos_select::{MacosSelect, SelectPopupPosition};
 use crate::components::macos_sidebar::{
     DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarEvent, SidebarTabGroupState, SidebarTabItem,
 };
+use crate::components::notification::{NotificationKind, NotificationManager};
 use crate::components::title_bar::TitleBar;
 use crate::editor::{Editor, EditorRuntimeState};
 use crate::sidebar_view::font_view::FontSettingsView;
@@ -72,6 +74,7 @@ pub struct AppWindow {
     ssh_picker: Entity<SshPicker>,
     sidebar: Entity<MacosSidebar>,
     editor: Entity<Editor>,
+    notification_manager: Entity<NotificationManager>,
     tab_group_select: Entity<MacosSelect>,
     default_editor_runtime_state: Option<EditorRuntimeState>,
     default_editor_session_state: Option<EditorSessionState>,
@@ -236,22 +239,7 @@ impl AppWindow {
             });
         });
 
-        let sidebar_subscription = cx.subscribe_in(
-            &sidebar,
-            window,
-            move |_this, _, event: &SidebarEvent, window, cx| match event {
-                SidebarEvent::TabGroupsChanged => {
-                    let app_window = cx.entity().clone();
-                    window.defer(cx, move |_window, cx| {
-                        let _ = app_window.update(cx, |this, cx| {
-                            this.sync_sidebar_tab_groups(cx);
-                        });
-                    });
-                }
-            },
-        );
-
-        // 创建 Editor（侧栏和 Workspace 之间的文件编辑器）
+        // 创建 Editor
         let editor: Entity<Editor> = cx.new(|cx| Editor::new(window, cx));
         editor.update(cx, |editor, _cx| {
             editor.bind_app_window(app_window.downgrade());
@@ -270,21 +258,38 @@ impl AppWindow {
             });
         }
 
-        // 设置文件打开回调：侧边栏文件树点击文件 → Editor 打开文件
+        // 文件树点击 → Editor 打开文件
         let editor_for_open = editor.downgrade();
-        sidebar.update(cx, |sidebar, _cx| {
-            sidebar.set_on_file_open(move |path, ssh_config, window, cx| {
-                if let Some(editor) = editor_for_open.upgrade() {
-                    editor.update(cx, |e, cx| {
-                        if let Some(config) = ssh_config {
-                            e.open_remote_file(path.to_string_lossy().to_string(), config, window, cx);
-                        } else {
-                            e.open_file(path, window, cx);
+        let sidebar_subscription = cx.subscribe_in(
+            &sidebar,
+            window,
+            move |_this, _, event: &SidebarEvent, window, cx| match event {
+                SidebarEvent::TabGroupsChanged => {
+                    let app_window = cx.entity().clone();
+                    window.defer(cx, move |_window, cx| {
+                        let _ = app_window.update(cx, |this, cx| {
+                            this.sync_sidebar_tab_groups(cx);
+                        });
+                    });
+                }
+                SidebarEvent::OpenFile { path, ssh_config } => {
+                    let editor = editor_for_open.clone();
+                    let path = path.clone();
+                    let config = ssh_config.clone();
+                    window.defer(cx, move |window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                if let Some(config) = config {
+                                    e.open_remote_file(path.to_string_lossy().to_string(), config, window, cx);
+                                } else {
+                                    e.open_file(path, window, cx);
+                                }
+                            });
                         }
                     });
                 }
-            });
-        });
+            },
+        );
 
         let mut this = Self {
             title_bar,
@@ -294,6 +299,7 @@ impl AppWindow {
             ssh_picker,
             sidebar,
             editor,
+            notification_manager: cx.new(|_cx| NotificationManager::new()),
             tab_group_select,
             default_editor_runtime_state: None,
             default_editor_session_state,
@@ -677,7 +683,7 @@ impl AppWindow {
             let target_state = self.default_editor_runtime_state.take();
             if let Some(state) = target_state {
                 self.editor.update(cx, |editor, cx| {
-                    editor.restore_runtime_state(state, cx);
+                    editor.restore_runtime_state(state, window, cx);
                 });
             } else if let Some(ref state) = self.default_editor_session_state {
                 self.editor.update(cx, |editor, cx| {
@@ -730,7 +736,7 @@ impl AppWindow {
         if let Some(group) = group {
             if let Some(state) = group.editor_runtime_state.take() {
                 self.editor.update(cx, |editor, cx| {
-                    editor.restore_runtime_state(state, cx);
+                    editor.restore_runtime_state(state, window, cx);
                 });
             } else if let Some(state) = group.editor_session_state.take() {
                 self.editor.update(cx, |editor, cx| {
@@ -923,6 +929,37 @@ impl AppWindow {
                     .child(self.workspace.clone()),
             )
     }
+
+    pub fn show_notification(
+        &mut self,
+        message: impl Into<SharedString>,
+        kind: NotificationKind,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self
+            .notification_manager
+            .update(cx, |manager, _cx| manager.add(message, kind));
+        let entity = self.notification_manager.downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(4))
+                    .await;
+                let should_dismiss = entity
+                    .update(cx, |manager, _cx| manager.should_auto_dismiss(id))
+                    .unwrap_or(true);
+                if should_dismiss {
+                    let _ = entity.update(cx, |manager, cx| {
+                        manager.dismiss(id);
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
 }
 
 impl Render for AppWindow {
@@ -995,6 +1032,87 @@ impl Render for AppWindow {
         // Keychain Modal 同样在窗口根节点渲染
         if let Some(modal) = self.keychain_view.update(cx, |kv, cx| kv.build_modal(cx)) {
             root = root.child(modal);
+        }
+
+        // 全局通知 Toast（单条：最新一条覆盖旧的）
+        if let Some(notification) = self.notification_manager.read(cx).current() {
+            let theme = cx.theme().ui;
+            let id = notification.id;
+            let entity = self.notification_manager.clone();
+            let (bg_color, icon_color, icon) = match notification.kind {
+                NotificationKind::Error => {
+                    (theme.error_background, theme.error, Icon::XmarkCircleFill)
+                }
+                NotificationKind::Warning => {
+                    (theme.warning_background, theme.warning, Icon::EllipsisCircleFill)
+                }
+                NotificationKind::Success => {
+                    (theme.success_background, theme.success, Icon::PlusCircleFull)
+                }
+                NotificationKind::Info => {
+                    (theme.notification_background, theme.text, Icon::Bell)
+                }
+            };
+
+            let entity_hover = self.notification_manager.clone();
+            let toast = div()
+                .id("global-notification")
+                .absolute()
+                .top(px(12.0))
+                .left(px(12.0))
+                .right(px(12.0))
+                .flex()
+                .justify_center()
+                .on_hover(move |hovered, _window, cx| {
+                    cx.update_entity(&entity_hover, |manager, _cx| {
+                        manager.set_hovered(id, *hovered);
+                    });
+                })
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(10.0))
+                        .bg(bg_color)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            svg()
+                                .size(px(18.0))
+                                .text_color(icon_color)
+                                .path(icon.path())
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(theme.text)
+                                .child(notification.message.clone())
+                        )
+                        .child(
+                            div()
+                                .id("notification-dismiss")
+                                .cursor_pointer()
+                                .on_click(move |_event, _window, cx| {
+                                    cx.update_entity(&entity, |manager, cx| {
+                                        manager.dismiss(id);
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    svg()
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted)
+                                        .path(Icon::WindowClose.path())
+                                )
+                        )
+                )
+                .into_any_element();
+            root = root.child(toast);
         }
 
         client_side_decorations(root, window, cx)

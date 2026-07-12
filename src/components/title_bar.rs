@@ -508,7 +508,6 @@ impl Render for TitleBar {
         let is_web = cfg!(target_family = "wasm");
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
-        let is_fullscreen = window.is_fullscreen();
         let theme = cx.theme().ui;
 
         // 注意：TabBar 现在使用 ScrollHandle.max_offset() 自动检测溢出

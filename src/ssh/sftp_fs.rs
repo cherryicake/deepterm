@@ -436,6 +436,15 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 发送轻量级 SFTP ping（stat "."）以保持 SSH 连接活跃。
+    /// 适合用于心跳保活场景。
+    pub fn ping(&mut self) -> anyhow::Result<()> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            self.sftp.metadata(".").await?;
+            Ok(())
+        })
+    }
+
     pub fn read_text_preview(&mut self, path: &str) -> anyhow::Result<Option<String>> {
         const PREVIEW_BYTES: usize = 64 * 1024;
 
@@ -664,7 +673,10 @@ struct CacheEntry {
 }
 
 /// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理
-const SFTP_SESSION_IDLE_TIMEOUT: u64 = 300; // 5 分钟
+const SFTP_SESSION_IDLE_TIMEOUT: u64 = 1800; // 30 分钟（原 5 分钟，通过心跳减少断连）
+
+/// 空闲超过此时间后，在清理前先尝试 ping 保活
+const SFTP_SESSION_PING_THRESHOLD: u64 = 600; // 10 分钟
 
 fn session_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
@@ -683,6 +695,26 @@ fn evict_stale_sessions() {
     for key in stale_keys {
         log::debug!("Evicting stale SFTP session: {}", key);
         cache.remove(&key);
+    }
+}
+
+/// 判断会话空闲状态：是否需要 ping、是否已过期。
+enum IdleCheck {
+    Fresh,
+    NeedsPing,
+    Expired,
+}
+
+fn idle_check(entry: &CacheEntry) -> IdleCheck {
+    let idle = std::time::Instant::now()
+        .duration_since(entry.last_access)
+        .as_secs();
+    if idle < SFTP_SESSION_PING_THRESHOLD {
+        IdleCheck::Fresh
+    } else if idle >= SFTP_SESSION_IDLE_TIMEOUT {
+        IdleCheck::Expired
+    } else {
+        IdleCheck::NeedsPing
     }
 }
 
@@ -735,13 +767,44 @@ fn get_or_connect_session(
     // 每次获取会话时清理空闲超时的会话
     evict_stale_sessions();
 
-    if session_cache().lock().contains_key(key) {
-        // 更新最后访问时间
+    // 在持锁期间只做轻量判断；网络 ping 放到锁外，避免阻塞其他 SFTP 访问。
+    let session_to_ping: Option<SharedBlockingSftpSession> = {
+        let mut cache = session_cache().lock();
+        match cache.get_mut(key) {
+            Some(entry) => match idle_check(entry) {
+                IdleCheck::Fresh => {
+                    entry.last_access = std::time::Instant::now();
+                    return Ok(entry.session.clone());
+                }
+                IdleCheck::NeedsPing => Some(entry.session.clone()),
+                IdleCheck::Expired => {
+                    cache.remove(key);
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+
+    if let Some(session) = session_to_ping {
+        let ping_ok = session.lock().ping().is_ok();
         let mut cache = session_cache().lock();
         if let Some(entry) = cache.get_mut(key) {
-            entry.last_access = std::time::Instant::now();
+            // 仅在缓存仍指向同一 session 时更新/移除，避免覆盖并发重连结果。
+            if Arc::ptr_eq(&entry.session, &session) {
+                if ping_ok {
+                    entry.last_access = std::time::Instant::now();
+                    log::debug!("Ping kept session alive: {}", key);
+                    return Ok(entry.session.clone());
+                }
+                log::debug!("Ping failed, session stale: {}", key);
+                cache.remove(key);
+            } else if ping_ok {
+                // 已被替换为新 session，直接复用缓存中的新条目。
+                entry.last_access = std::time::Instant::now();
+                return Ok(entry.session.clone());
+            }
         }
-        return Ok(cache.get(key).unwrap().session.clone());
     }
 
     let session = Arc::new(Mutex::new(BlockingSftpSession::connect(config)?));

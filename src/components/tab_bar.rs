@@ -5,7 +5,8 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
     Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun, TextStyle,
-    Window, actions, canvas, div, ease_out_quint, px, svg, MouseButton,
+    Transformation, Window, actions, canvas, div, ease_in_out, ease_out_quint, percentage, px, svg,
+    MouseButton,
 };
 
 use crate::assets::Icon;
@@ -149,6 +150,7 @@ pub struct TabItem {
     pub icon: Option<Icon>,
     pub is_modified: bool,
     pub is_remote: bool,
+    pub is_loading: bool,
 }
 
 impl TabItem {
@@ -159,7 +161,13 @@ impl TabItem {
             icon: None,
             is_modified: false,
             is_remote: false,
+            is_loading: false,
         }
+    }
+
+    pub fn with_loading(mut self, loading: bool) -> Self {
+        self.is_loading = loading;
+        self
     }
 
     pub fn with_modified(mut self, modified: bool) -> Self {
@@ -1152,6 +1160,8 @@ impl Render for TabBar {
                                         .child({
                                             let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
 
+                                            // Hover close takes priority over loading spinner so
+                                            // slow remote opens can still be dismissed from the tab.
                                             if is_hovered && icon.is_some() {
                                                 let on_tab_close = on_tab_close.clone();
                                                 let tab_id_close = tab_id.clone();
@@ -1173,6 +1183,27 @@ impl Render for TabBar {
                                                                 }
                                                             },
                                                         ),
+                                                    )
+                                                    .into_any_element()
+                                            } else if tab.is_loading {
+                                                svg()
+                                                    .size(px(16.0))
+                                                    .text_color(if is_active {
+                                                        theme.text
+                                                    } else {
+                                                        theme.text_muted
+                                                    })
+                                                    .path(Icon::Loader.path())
+                                                    .with_animation(
+                                                        format!("tab-loading-{}", tab_id),
+                                                        Animation::new(Duration::from_millis(800))
+                                                            .repeat()
+                                                            .with_easing(ease_in_out),
+                                                        |this, delta| {
+                                                            this.with_transformation(
+                                                                Transformation::rotate(percentage(delta)),
+                                                            )
+                                                        },
                                                     )
                                                     .into_any_element()
                                             } else if let Some(icon) = icon {

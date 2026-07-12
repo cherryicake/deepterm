@@ -91,6 +91,21 @@ impl SshConnectionConfig {
         }
     }
 
+    /// 本地文件系统占位配置，用于共享缓存 key
+    pub fn local() -> Self {
+        Self {
+            host: "localhost".into(),
+            port: 0,
+            username: "localhost".into(),
+            auth_method: AuthMethod::Agent,
+            nickname: None,
+            extra_args: None,
+            timeout: default_timeout(),
+            save_config: false,
+            os: None,
+        }
+    }
+
     /// 从连接字符串创建配置
     ///
     /// 支持格式：

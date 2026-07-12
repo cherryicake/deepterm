@@ -1,6 +1,9 @@
 mod conflict;
 mod cross_remote;
 mod endpoint;
+pub mod file_tree_cache;
+pub mod file_tree_event;
+pub mod file_tree_loader;
 pub mod filesystem;
 mod local_ops;
 mod manager;

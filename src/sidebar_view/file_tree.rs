@@ -1,17 +1,23 @@
-use std::collections::{HashSet, HashMap};
+use gpui::prelude::*;
+use gpui::{
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, Stateful, Styled, Subscription, Task, Window, div, px, svg,
+};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::prelude::*;
-use gpui::{App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Stateful, Styled, Subscription, Task, Window, div, px, svg};
-
 use crate::assets::Icon;
+use crate::file_manager::FileSystem;
+use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
+use crate::file_manager::file_tree_event::FileTreeEvent;
+use crate::file_manager::file_tree_loader::FileTreeLoader;
 use crate::file_manager::types::{FileEntry, FileEntryKind};
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
-use crate::file_manager::FileSystem;
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
+
+impl gpui::EventEmitter<crate::file_manager::file_tree_event::FileTreeEvent> for SidebarFileTree {}
 
 fn entry_icon(kind: &FileEntryKind) -> Icon {
     match kind {
@@ -25,65 +31,87 @@ const INDENT_SIZE: f32 = 14.0;
 const MAX_TREE_DEPTH: usize = 20;
 
 /// 侧边栏文件树组件 - 单列模式，类似 VSCode 文件树
+///
+/// View 层：只负责渲染和用户交互，所有文件操作委托给 `FileTreeLoader`。
 pub struct SidebarFileTree {
     focus_handle: FocusHandle,
     root_path: PathBuf,
     selected_path: Option<PathBuf>,
-    directory_cache: HashMap<PathBuf, Vec<FileEntry>>,
+    /// 所有文件操作都委托给 loader
+    loader: FileTreeLoader,
     expanded_folders: HashSet<PathBuf>,
     hovered_path: Option<PathBuf>,
     flat_cache: Option<Vec<(FileEntry, usize)>>,
-    backend: Arc<dyn FileSystem>,
-    loading_paths: HashSet<PathBuf>,
-    /// Directories that need a refresh after the current in-flight load/refresh completes.
-    pending_refresh: HashSet<PathBuf>,
-    on_file_open: Option<Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>>,
     watcher_subscription: Option<Subscription>,
     watched_paths: HashSet<PathBuf>,
-    is_local: bool,
 }
 
 impl SidebarFileTree {
-    pub fn new(cx: &mut Context<Self>, backend: Arc<dyn FileSystem>, root_path: Option<PathBuf>) -> Self {
-        let root_path = root_path.unwrap_or_else(|| {
-            backend.home_dir().unwrap_or_else(|| PathBuf::from("/"))
-        });
+    pub fn new(
+        cx: &mut Context<Self>,
+        backend: Arc<dyn FileSystem>,
+        root_path: Option<PathBuf>,
+    ) -> Self {
+        let root_path =
+            root_path.unwrap_or_else(|| backend.home_dir().unwrap_or_else(|| PathBuf::from("/")));
         let is_local = backend.is_local();
 
         let watcher_subscription = if is_local {
             let watcher = cx.fs_watcher();
-            Some(cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
-                this.handle_fs_event(event, cx);
-            }))
+            Some(
+                cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
+                    this.handle_fs_event(event, cx);
+                }),
+            )
         } else {
             let watcher = cx.remote_fs_watcher();
-            Some(cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
-                this.handle_fs_event(event, cx);
-            }))
+            Some(
+                cx.subscribe(&watcher, move |this, _, event: &FsChangeEvent, cx| {
+                    this.handle_fs_event(event, cx);
+                }),
+            )
         };
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             root_path: root_path.clone(),
             selected_path: None,
-            directory_cache: HashMap::new(),
+            loader: FileTreeLoader::new(backend),
             expanded_folders: HashSet::new(),
             hovered_path: None,
             flat_cache: None,
-            backend,
-            loading_paths: HashSet::new(),
-            pending_refresh: HashSet::new(),
-            on_file_open: None,
             watcher_subscription,
             watched_paths: HashSet::new(),
-            is_local,
         };
 
-        if !is_local {
-            cx.watch_remote_path(&root_path, this.backend.clone());
-            this.watched_paths.insert(root_path.clone());
-        } else {
+        // 从共享缓存恢复之前的展开状态
+        if let Some(config) = this.loader.ssh_config() {
+            let cached = RemoteFileTreeCache::global()
+                .lock()
+                .unwrap()
+                .load_expanded(config);
+            if !cached.is_empty() {
+                this.expanded_folders = cached;
+            }
+        }
+
+        if is_local {
             cx.watch_recursive_path(&root_path);
+        } else {
+            cx.watch_remote_path(&root_path, this.loader.backend().clone());
+            this.watched_paths.insert(root_path.clone());
+        }
+
+        // 为已恢复的展开文件夹触发加载并设置监听
+        if !this.expanded_folders.is_empty() {
+            let expanded: Vec<PathBuf> = this.expanded_folders.iter().cloned().collect();
+            for path in expanded {
+                this.load_directory(path.clone(), cx);
+                if !this.watched_paths.contains(&path) && !is_local {
+                    cx.watch_remote_path(&path, this.loader.backend().clone());
+                    this.watched_paths.insert(path);
+                }
+            }
         }
 
         this
@@ -99,7 +127,7 @@ impl SidebarFileTree {
             self.root_path = path;
         }
 
-        if self.is_local {
+        if self.loader.is_local() {
             cx.unwatch_recursive_path(&old_root);
         } else {
             for watched in &self.watched_paths {
@@ -108,17 +136,17 @@ impl SidebarFileTree {
             self.watched_paths.clear();
         }
 
-        self.directory_cache.clear();
+        // 不再清空 directory_cache，保留共享缓存中的目录数据以加速切换
         self.expanded_folders.clear();
         self.flat_cache = None;
-        self.pending_refresh.clear();
+        self.loader.clear_pending_refresh();
         let root = self.root_path.clone();
         self.load_directory(root, cx);
 
-        if self.is_local {
+        if self.loader.is_local() {
             cx.watch_recursive_path(&self.root_path);
         } else {
-            cx.watch_remote_path(&self.root_path, self.backend.clone());
+            cx.watch_remote_path(&self.root_path, self.loader.backend().clone());
             self.watched_paths.insert(self.root_path.clone());
         }
 
@@ -129,87 +157,49 @@ impl SidebarFileTree {
         &self.root_path
     }
 
-    pub fn matches_location(&self, path: &Path, is_local: bool, ssh_config: Option<&SshConnectionConfig>) -> bool {
-        self.root_path == path && self.backend.matches(is_local, ssh_config)
-    }
-
-    pub fn set_on_file_open(
-        &mut self,
-        callback: Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>,
-    ) {
-        self.on_file_open = Some(callback);
-    }
-
     fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
         if !event.path.starts_with(&self.root_path) {
             return;
         }
 
-        // Remote directory polling can provide the new entries directly. In that case we can
-        // update the cached directory without an extra async load and without a temporary empty
-        // state, which prevents flicker.
-        if let Some(ref entries) = event.entries {
-            if self.directory_cache.contains_key(&event.path)
-                || self.loading_paths.contains(&event.path)
-            {
-                if self.directory_cache.get(&event.path) != Some(entries) {
-                    self.loading_paths.remove(&event.path);
-                    self.directory_cache.insert(event.path.clone(), entries.clone());
-                    self.invalidate_flat_cache();
-                    cx.notify();
-                }
+        // 委托给 loader 处理缓存更新
+        let affected = self.loader.handle_fs_event(&self.root_path, event);
+
+        // Remote watcher 直接提供了新 entries → loader 已直接更新本地缓存
+        // 检查是否有带 entries 的事件已被 loader 直接处理
+        if let Some(ref _entries) = event.entries {
+            if self.loader.has_cached(&event.path) || self.loader.is_loading(&event.path) {
+                // loader 已处理，只需通知 UI
+                self.invalidate_flat_cache();
+                cx.notify();
                 return;
             }
         }
 
-        // For Remove events, the path itself is gone. Drop it and its descendants from cache so
-        // they disappear from the tree, then refresh the parent directory so it disappears from
-        // the parent's listing too.
+        // Remove 事件
         if event.kind == FsChangeKind::Remove {
             let removed_path = &event.path;
-            let is_root = removed_path == &self.root_path;
-            let cache_before = self.directory_cache.len();
-            let expanded_before = self.expanded_folders.len();
-            if is_root {
-                // Keep the root entry itself to avoid a render-driven reload loop; just clear
-                // any expanded descendants.
-                self.directory_cache.retain(|p, _| p == removed_path);
-            } else {
-                self.directory_cache.retain(|p, _| !p.starts_with(removed_path));
-            }
-            self.expanded_folders.retain(|p| !p.starts_with(removed_path));
-            let changed = self.directory_cache.len() != cache_before
-                || self.expanded_folders.len() != expanded_before
-                || self.loading_paths.remove(removed_path);
-            if changed {
+            self.expanded_folders
+                .retain(|p| !p.starts_with(removed_path));
+            if affected.is_some() || self.loader.has_cached(&self.root_path) {
                 self.invalidate_flat_cache();
                 cx.notify();
             }
-            let mut ancestor = removed_path.parent();
-            while let Some(p) = ancestor {
-                if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
-                    self.refresh_directory(p.to_path_buf(), cx);
-                    return;
-                }
-                ancestor = p.parent();
+            if let Some(ancestor) = affected {
+                self.refresh_directory(ancestor, cx);
             }
             return;
         }
 
-        // For local Create/Modify events or remote events without entries, find the closest cached
-        // ancestor and refresh it incrementally without clearing the cache first.
-        let mut ancestor = Some(event.path.as_path());
-        while let Some(p) = ancestor {
-            if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
-                self.refresh_directory(p.to_path_buf(), cx);
-                return;
-            }
-            ancestor = p.parent();
+        // Create/Modify 事件
+        if let Some(ancestor) = affected {
+            self.refresh_directory(ancestor, cx);
         }
     }
 
     pub fn cleanup(&mut self, cx: &mut Context<Self>) {
-        if self.is_local {
+        self.loader.release_shared_cache();
+        if self.loader.is_local() {
             cx.unwatch_recursive_path(&self.root_path);
         } else {
             for watched in &self.watched_paths {
@@ -218,13 +208,62 @@ impl SidebarFileTree {
             self.watched_paths.clear();
         }
         self.watcher_subscription.take();
-        self.pending_refresh.clear();
+        self.loader.clear_pending_refresh();
+    }
+
+    /// 分离：做 cleanup 可选是否释放共享缓存引用。
+    /// 用于同一服务器上切换终端时保留缓存，或远程切远程时归还引用。
+    pub fn detach(&mut self, cx: &mut Context<Self>, release_cache: bool) {
+        // 保存展开状态到共享缓存，以便切换回来时恢复
+        if let Some(config) = self.loader.ssh_config() {
+            RemoteFileTreeCache::global()
+                .lock()
+                .unwrap()
+                .save_expanded(config, self.expanded_folders.clone());
+        }
+        if release_cache {
+            self.loader.release_shared_cache();
+        }
+        if self.loader.is_local() {
+            cx.unwatch_recursive_path(&self.root_path);
+        } else {
+            for watched in &self.watched_paths {
+                cx.unwatch_remote_path(watched);
+            }
+            self.watched_paths.clear();
+        }
+        self.watcher_subscription.take();
+        self.loader.clear_pending_refresh();
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.loader.is_local()
+    }
+
+    pub fn matches_location(
+        &self,
+        path: &Path,
+        is_local: bool,
+        ssh_config: Option<&SshConnectionConfig>,
+    ) -> bool {
+        self.root_path == path && self.loader.backend().matches(is_local, ssh_config)
     }
 
     fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.directory_cache.contains_key(&path) {
+        // 委托给 loader；若已在加载中则跳过，避免重复任务
+        if !self.loader.begin_load(&path) {
             return;
         }
+
+        // 先查共享缓存，命中则立即显示 + 后台刷新
+        if let Some(entries) = self.loader.get_shared_cache(&path) {
+            self.loader.finish_load(&path, entries);
+            self.invalidate_flat_cache();
+            cx.notify();
+            self.spawn_background_refresh(path, cx);
+            return;
+        }
+
         let Some(task) = self.spawn_read_dir(&path, cx) else {
             return;
         };
@@ -236,32 +275,39 @@ impl SidebarFileTree {
             let _ = weak.update(cx, |this, cx| {
                 // If the path was removed from loading_paths by a watcher event (which already
                 // inserted fresher entries), skip writing potentially stale results.
-                let was_loading = this.loading_paths.remove(&path_for_loading);
-                if was_loading {
+                if this.loader.is_loading(&path_for_loading) {
                     match result {
                         Ok(entries) => {
-                            this.directory_cache.insert(path_for_loading.clone(), entries);
+                            // 写入共享缓存
+                            this.loader
+                                .set_shared_cache(&path_for_loading, entries.clone());
+                            this.loader.finish_load(&path_for_loading, entries);
                             this.invalidate_flat_cache();
                             cx.notify();
                         }
                         Err(e) => {
-                            log::warn!("Failed to read directory {}: {}", path_for_loading.display(), e);
+                            log::warn!(
+                                "Failed to read directory {}: {}",
+                                path_for_loading.display(),
+                                e
+                            );
+                            this.loader.fail_load(&path_for_loading);
                             cx.notify();
                         }
                     }
                 }
                 // If a refresh was requested while this directory was loading, run it now so we
                 // don't drop events that arrived during the load.
-                if this.pending_refresh.remove(&path_for_loading) {
+                if this.loader.take_pending_refresh(&path_for_loading) {
                     this.refresh_directory(path_for_loading, cx);
                 }
             });
-        }).detach();
+        })
+        .detach();
     }
 
     fn refresh_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.loading_paths.contains(&path) {
-            self.pending_refresh.insert(path);
+        if !self.loader.request_refresh(&path) {
             return;
         }
         let Some(task) = self.spawn_read_dir(&path, cx) else {
@@ -275,26 +321,36 @@ impl SidebarFileTree {
             let _ = weak.update(cx, |this, cx| {
                 // If a watcher event already removed this path from loading_paths and inserted
                 // fresher entries, skip writing potentially stale results.
-                let was_loading = this.loading_paths.remove(&path_for_loading);
-                if was_loading {
+                if this.loader.is_loading(&path_for_loading) {
                     match result {
                         Ok(entries) => {
-                            if this.directory_cache.get(&path_for_loading) != Some(&entries) {
-                                this.directory_cache.insert(path_for_loading.clone(), entries);
+                            if this.loader.get_cached(&path_for_loading) != Some(&entries) {
+                                // 更新共享缓存
+                                this.loader
+                                    .set_shared_cache(&path_for_loading, entries.clone());
+                                this.loader.finish_load(&path_for_loading, entries);
                                 this.invalidate_flat_cache();
                                 cx.notify();
+                            } else {
+                                this.loader.fail_load(&path_for_loading);
                             }
                         }
                         Err(e) => {
-                            log::warn!("Failed to refresh directory {}: {}", path_for_loading.display(), e);
-                            if this.directory_cache.remove(&path_for_loading).is_some() {
+                            log::warn!(
+                                "Failed to refresh directory {}: {}",
+                                path_for_loading.display(),
+                                e
+                            );
+                            if this.loader.fail_refresh(&path_for_loading) {
+                                // 从共享缓存中也移除
+                                this.loader.remove_shared_cache(&path_for_loading);
                                 this.invalidate_flat_cache();
                                 cx.notify();
                                 // The path is gone; refresh the parent so it disappears from the
                                 // parent's listing too.
                                 if let Some(parent) = path_for_loading.parent() {
-                                    if this.directory_cache.contains_key(parent)
-                                        || this.loading_paths.contains(parent)
+                                    if this.loader.has_cached(parent)
+                                        || this.loader.is_loading(parent)
                                     {
                                         this.refresh_directory(parent.to_path_buf(), cx);
                                     }
@@ -305,11 +361,38 @@ impl SidebarFileTree {
                 }
                 // If a refresh was requested while this directory was loading, run it now so we
                 // don't drop events that arrived during the load.
-                if this.pending_refresh.remove(&path_for_loading) {
+                if this.loader.take_pending_refresh(&path_for_loading) {
                     this.refresh_directory(path_for_loading, cx);
                 }
             });
-        }).detach();
+        })
+        .detach();
+    }
+
+    /// 缓存命中后发起的后台刷新：不显示加载状态，静默更新
+    fn spawn_background_refresh(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let backend = self.loader.backend().clone();
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let result: Result<Vec<FileEntry>, String> = cx
+                .background_executor()
+                .spawn({
+                    let backend = backend.clone();
+                    let path = path.clone();
+                    async move { backend.read_dir(&path) }
+                })
+                .await;
+            if let Ok(entries) = result {
+                let _ = weak.update(cx, |this, cx| {
+                    this.loader.set_shared_cache(&path, entries.clone());
+                    if this.loader.update_cached(&path, entries) {
+                        this.invalidate_flat_cache();
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn spawn_read_dir(
@@ -317,26 +400,28 @@ impl SidebarFileTree {
         path: &Path,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Vec<FileEntry>, String>>> {
-        if self.loading_paths.contains(path) {
-            return None;
-        }
         let path = path.to_path_buf();
-        self.loading_paths.insert(path.clone());
-        let backend = self.backend.clone();
-        Some(cx.background_executor().spawn(async move {
-            backend.read_dir(&path)
-        }))
+        let backend = self.loader.backend().clone();
+        Some(
+            cx.background_executor()
+                .spawn(async move { backend.read_dir(&path) }),
+        )
     }
 
     fn invalidate_flat_cache(&mut self) {
         self.flat_cache = None;
     }
 
-    fn build_flat_list(&self, directory: &Path, depth: usize, result: &mut Vec<(FileEntry, usize)>) {
+    fn build_flat_list(
+        &self,
+        directory: &Path,
+        depth: usize,
+        result: &mut Vec<(FileEntry, usize)>,
+    ) {
         if depth > MAX_TREE_DEPTH {
             return;
         }
-        if let Some(entries) = self.directory_cache.get(directory) {
+        if let Some(entries) = self.loader.get_cached(directory) {
             for entry in entries {
                 let is_directory = entry.kind == FileEntryKind::Directory;
                 let is_expanded = is_directory && self.expanded_folders.contains(&entry.path);
@@ -351,8 +436,9 @@ impl SidebarFileTree {
     fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
-            self.pending_refresh.remove(&path);
-            if !self.is_local {
+            // 清除 pending refresh
+            self.loader.clear_pending_refresh_for(&path);
+            if !self.loader.is_local() {
                 // Unwatch this folder and any nested folders that are still being watched.
                 let to_unwatch: Vec<PathBuf> = self
                     .watched_paths
@@ -368,11 +454,10 @@ impl SidebarFileTree {
         } else {
             self.expanded_folders.insert(path.clone());
             // 重新展开时强制刷新缓存，确保能看到外部变化
-            self.directory_cache.remove(&path);
-            self.loading_paths.remove(&path);
+            self.loader.invalidate_path(&path);
             self.load_directory(path.clone(), cx);
-            if !self.is_local {
-                cx.watch_remote_path(&path, self.backend.clone());
+            if !self.loader.is_local() {
+                cx.watch_remote_path(&path, self.loader.backend().clone());
                 self.watched_paths.insert(path);
             }
         }
@@ -439,16 +524,19 @@ impl SidebarFileTree {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |this, _, _window, cx| {
                     if is_directory {
                         this.toggle_folder_expanded(click_path.clone(), cx);
                     } else {
                         this.select_path(click_path.clone(), cx);
-                        let cb = this.on_file_open.clone();
-                        let ssh_config = this.backend.ssh_config();
-                        if let Some(callback) = cb {
-                            callback(click_path.clone(), ssh_config, window, cx);
-                        }
+                        cx.emit(FileTreeEvent::OpenFile {
+                            path: click_path.clone(),
+                            ssh_config: if this.loader.is_local() {
+                                None
+                            } else {
+                                this.loader.ssh_config().cloned()
+                            },
+                        });
                     }
                 }),
             );
@@ -473,7 +561,11 @@ impl SidebarFileTree {
                             div()
                                 .w(px(12.0))
                                 .flex_none()
-                                .text_color(if is_selected { theme.accent_foreground } else { theme.text_subtle })
+                                .text_color(if is_selected {
+                                    theme.accent_foreground
+                                } else {
+                                    theme.text_subtle
+                                })
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -524,7 +616,7 @@ impl Render for SidebarFileTree {
         let directory = self.root_path.clone();
 
         // Ensure root directory is loaded
-        if !self.directory_cache.contains_key(&directory) && !self.loading_paths.contains(&directory) {
+        if !self.loader.has_cached(&directory) && !self.loader.is_loading(&directory) {
             self.load_directory(directory.clone(), cx);
         }
 
@@ -539,7 +631,7 @@ impl Render for SidebarFileTree {
             count
         };
 
-        let is_directory_loaded = self.directory_cache.contains_key(&directory);
+        let is_directory_loaded = self.loader.has_cached(&directory);
 
         let rows_element: gpui::AnyElement = if is_directory_loaded && flat_count == 0 {
             div()

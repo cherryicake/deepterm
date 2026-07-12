@@ -255,7 +255,7 @@ impl TextWrapper {
     /// Update the text wrapper and recalculate the wrapped lines.
     ///
     /// If the `text` is the same as the current text, do nothing.
-    fn update_all(&mut self, text: &Rope, cx: &mut App) {
+    pub(crate) fn update_all(&mut self, text: &Rope, cx: &mut App) {
         self.update(text, &(0..text.len()), &text, cx);
     }
 

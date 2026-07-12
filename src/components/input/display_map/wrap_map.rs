@@ -166,7 +166,7 @@ impl WrapMap {
     /// Initialize with text
     pub fn set_text(&mut self, text: &Rope, cx: &mut App) {
         self.wrapper.set_default_text(text);
-        self.wrapper.prepare_if_need(text, cx);
+        self.wrapper.update_all(text, cx);
         self.rebuild_cache();
     }
 

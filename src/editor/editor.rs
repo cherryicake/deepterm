@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,10 +10,11 @@ use gpui::{
     Subscription, WeakEntity, Window, actions, div, px,
 };
 
+use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
-use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::file_manager::filesystem::RemoteFileSystem;
+use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
@@ -46,6 +48,7 @@ struct EditorFile {
     editor_state: Entity<InputState>,
     original_content: String,
     pending_reload: bool,
+    is_loading: bool,
 }
 
 /// 运行时状态，包含已打开的 [`InputState`] entity，切换标签页组时直接交换，不重新读取文件。
@@ -88,6 +91,9 @@ pub struct Editor {
     content_bottom_padding: f32,
     watcher_subscription: Option<Subscription>,
     remote_watcher_subscription: Option<Subscription>,
+    /// tab_id -> in-flight load generation (supersedes stale tasks after tab-group swap).
+    loading_gens: HashMap<String, u64>,
+    next_load_generation: u64,
 }
 
 impl Editor {
@@ -109,6 +115,8 @@ impl Editor {
             content_bottom_padding: 0.0,
             watcher_subscription: None,
             remote_watcher_subscription: None,
+            loading_gens: HashMap::new(),
+            next_load_generation: 0,
         };
 
         this.setup_tab_bar_handlers(cx);
@@ -187,25 +195,17 @@ impl Editor {
                     match cx
                         .background_executor()
                         .spawn(async move {
-                            crate::ssh::sftp_fs::read_text_preview(
-                                &config, &path_for_task,
-                            )
+                            crate::ssh::sftp_fs::read_text_preview(&config, &path_for_task)
                         })
                         .await
                     {
                         Ok(Some(text)) => Some(text),
                         Ok(None) => {
-                            log::warn!(
-                                "远程文件为二进制或空，无法重载: {}",
-                                path
-                            );
+                            log::warn!("远程文件为二进制或空，无法重载: {}", path);
                             None
                         }
                         Err(e) => {
-                            log::warn!(
-                                "重载远程文件失败 {}: {}",
-                                path, e
-                            );
+                            log::warn!("重载远程文件失败 {}: {}", path, e);
                             None
                         }
                     }
@@ -213,10 +213,7 @@ impl Editor {
                     match std::fs::read_to_string(&path) {
                         Ok(text) => Some(text),
                         Err(e) => {
-                            log::warn!(
-                                "重载本地文件失败 {}: {}",
-                                path, e
-                            );
+                            log::warn!("重载本地文件失败 {}: {}", path, e);
                             None
                         }
                     }
@@ -224,11 +221,8 @@ impl Editor {
 
                 if let Some(content) = content {
                     let _ = weak.update(cx, |this, cx| {
-                        if let Some(file) =
-                            this.open_files.iter_mut().find(|f| f.path == path)
-                        {
-                            let current =
-                                file.editor_state.read(cx).value().to_string();
+                        if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path) {
+                            let current = file.editor_state.read(cx).value().to_string();
                             if current == file.original_content {
                                 file.original_content = content.clone();
                                 file.editor_state.update(cx, |state, cx| {
@@ -245,14 +239,13 @@ impl Editor {
                     });
                 } else {
                     let _ = weak.update(cx, |this, _cx| {
-                        if let Some(file) =
-                            this.open_files.iter_mut().find(|f| f.path == path)
-                        {
+                        if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path) {
                             file.pending_reload = false;
                         }
                     });
                 }
-            }).detach();
+            })
+            .detach();
 
             return;
         }
@@ -262,7 +255,11 @@ impl Editor {
         cx.watch_path(path);
     }
 
-    fn watch_remote_file(path: &Path, fs: Arc<dyn crate::file_manager::FileSystem>, cx: &mut Context<Self>) {
+    fn watch_remote_file(
+        path: &Path,
+        fs: Arc<dyn crate::file_manager::FileSystem>,
+        cx: &mut Context<Self>,
+    ) {
         cx.watch_remote_path(path, fs);
     }
 
@@ -293,6 +290,7 @@ impl Editor {
         self.unwatch_all_files(cx);
         self.open_files.clear();
         self.active_file_id = None;
+        self.loading_gens.clear();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
         });
@@ -308,12 +306,7 @@ impl Editor {
         self.clear(cx);
         for file_state in state.open_files {
             if let Some(ref ssh_config) = file_state.ssh_config {
-                self.open_remote_file_no_notify(
-                    file_state.path,
-                    ssh_config.clone(),
-                    window,
-                    cx,
-                );
+                self.open_remote_file_no_notify(file_state.path, ssh_config.clone(), window, cx);
             } else {
                 self.open_file_no_notify(PathBuf::from(&file_state.path), window, cx);
             }
@@ -329,6 +322,9 @@ impl Editor {
         let mut open_files = Vec::new();
         std::mem::swap(&mut open_files, &mut self.open_files);
         let active_file_id = self.active_file_id.take();
+        // Invalidate in-flight loads for this editor instance; parked files keep
+        // `is_loading` so restore can re-kick with a new generation.
+        self.loading_gens.clear();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
         });
@@ -339,10 +335,17 @@ impl Editor {
         }
     }
 
-    /// 恢复运行状态（直接复用已有的 InputState entity，不重新读取文件）。
-    pub fn restore_runtime_state(&mut self, state: EditorRuntimeState, cx: &mut Context<Self>) {
+    /// 恢复运行状态（直接复用已有的 InputState entity；加载中的文件会重新发起读取）。
+    pub fn restore_runtime_state(
+        &mut self,
+        state: EditorRuntimeState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_files = state.open_files;
         self.active_file_id = state.active_file_id;
+        self.loading_gens.clear();
+
         for file in &self.open_files {
             if file.ssh_config.is_none() {
                 Self::watch_file(Path::new(&file.path), cx);
@@ -351,11 +354,19 @@ impl Editor {
                 Self::watch_remote_file(Path::new(&file.path), fs, cx);
             }
         }
+
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
             for file in &self.open_files {
+                let tab_icon = if file.is_loading {
+                    Some(Icon::Loader)
+                } else {
+                    Some(Icon::File)
+                };
                 tab_bar.add_tab(
-                    TabItem::new(&file.id, &file.label).with_icon(Some(crate::assets::Icon::File)),
+                    TabItem::new(&file.id, &file.label)
+                        .with_icon(tab_icon)
+                        .with_loading(file.is_loading),
                     cx,
                 );
             }
@@ -363,7 +374,76 @@ impl Editor {
                 tab_bar.set_active_tab(active_id, cx);
             }
         });
+
+        // Re-kick loads for files that were mid-load when the tab group was swapped away.
+        let pending: Vec<(String, String, Option<SshConnectionConfig>)> = self
+            .open_files
+            .iter()
+            .filter(|f| f.is_loading)
+            .map(|f| (f.id.to_string(), f.path.clone(), f.ssh_config.clone()))
+            .collect();
+
+        for (tab_id, path, ssh_config) in pending {
+            // 重新加载前先禁用输入，避免用户编辑被覆盖
+            if let Some(file) = self.open_files.iter_mut().find(|f| f.id == tab_id) {
+                file.editor_state.update(cx, |state, _cx| {
+                    state.disabled = true;
+                });
+            }
+
+            let load_gen = self.begin_load(&tab_id);
+            if let Some(config) = ssh_config {
+                let path_for_task = path.clone();
+                let path_for_log = path.clone();
+                self.spawn_file_load(
+                    tab_id,
+                    load_gen,
+                    Arc::new(move || {
+                        match crate::ssh::sftp_fs::read_text_preview(&config, &path_for_task) {
+                            Ok(Some(text)) => Ok(text),
+                            Ok(None) => {
+                                log::warn!("远程文件为二进制或空，无法打开编辑: {}", path_for_log);
+                                Ok(String::new())
+                            }
+                            Err(e) => {
+                                log::warn!("读取远程文件失败 {}: {}", path_for_log, e);
+                                Err(e.to_string())
+                            }
+                        }
+                    }),
+                    "读取文件失败",
+                    "无法读取远程文件",
+                    window,
+                    cx,
+                );
+            } else {
+                let path_for_task = PathBuf::from(&path);
+                self.spawn_file_load(
+                    tab_id,
+                    load_gen,
+                    Arc::new(move || {
+                        std::fs::read_to_string(&path_for_task).map_err(|e| e.to_string())
+                    }),
+                    "读取文件失败",
+                    "无法读取本地文件",
+                    window,
+                    cx,
+                );
+            }
+        }
+
         cx.notify();
+    }
+
+    fn begin_load(&mut self, tab_id: &str) -> u64 {
+        self.next_load_generation = self.next_load_generation.wrapping_add(1);
+        let load_gen = self.next_load_generation;
+        self.loading_gens.insert(tab_id.to_string(), load_gen);
+        load_gen
+    }
+
+    fn is_load_current(&self, tab_id: &str, load_gen: u64) -> bool {
+        self.loading_gens.get(tab_id).copied() == Some(load_gen)
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -428,11 +508,45 @@ impl Editor {
             aw.update(cx, |this, cx| {
                 this.defer_save_session(cx);
                 cx.notify();
-            }).ok();
+            })
+            .ok();
+        }
+    }
+
+    pub fn show_notification(
+        &self,
+        message: impl Into<gpui::SharedString>,
+        kind: crate::components::notification::NotificationKind,
+        cx: &mut App,
+    ) {
+        if let Some(aw) = &self.app_window {
+            aw.update(cx, |this, cx| {
+                this.show_notification(message, kind, cx);
+            })
+            .ok();
         }
     }
 
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_file(path, window, cx, true);
+    }
+
+    pub fn open_file_no_notify(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_local_file(path, window, cx, false);
+    }
+
+    fn open_local_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
+    ) {
         let path_str = path.to_string_lossy().to_string();
         let tab_id = format!("editor-{}", path_str);
 
@@ -441,8 +555,140 @@ impl Editor {
             return;
         }
 
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        self.open_file_with_content(tab_id, path_str, content, path, None, window, cx, true);
+        if self.loading_gens.contains_key(&tab_id) {
+            return;
+        }
+
+        let load_gen = self.begin_load(&tab_id);
+        let path_for_task = path.clone();
+
+        self.open_file_with_content(
+            tab_id.clone(),
+            path_str,
+            String::new(),
+            path,
+            None,
+            window,
+            cx,
+            notify_app,
+            true,
+        );
+
+        self.spawn_file_load(
+            tab_id,
+            load_gen,
+            Arc::new(move || std::fs::read_to_string(&path_for_task).map_err(|e| e.to_string())),
+            "读取文件失败",
+            "无法读取本地文件",
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_file_load(
+        &mut self,
+        tab_id: String,
+        load_generation: u64,
+        load_content: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+        error_title: &'static str,
+        error_prefix: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let window_handle = window.window_handle();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                let still_current = weak
+                    .update(cx, |this, _cx| {
+                        this.is_load_current(&tab_id, load_generation)
+                            && this.open_files.iter().any(|f| f.id == tab_id)
+                    })
+                    .unwrap_or(false);
+                if !still_current {
+                    let _ = weak.update(cx, |this, _cx| {
+                        if this.is_load_current(&tab_id, load_generation) {
+                            this.loading_gens.remove(&tab_id);
+                        }
+                    });
+                    break;
+                }
+
+                let load_content = load_content.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { load_content() })
+                    .await;
+
+                match result {
+                    Ok(content) => {
+                        let _ = weak.update(cx, |this, cx| {
+                            if !this.is_load_current(&tab_id, load_generation) {
+                                return;
+                            }
+                            this.loading_gens.remove(&tab_id);
+                            if let Some(file) = this.open_files.iter_mut().find(|f| f.id == tab_id)
+                            {
+                                file.original_content = content.clone();
+                                file.is_loading = false;
+                                file.editor_state.update(cx, |state, cx| {
+                                    state.disabled = false;
+                                    state.set_text(content, cx);
+                                });
+                            }
+                            this.tab_bar.update(cx, |tab_bar, cx| {
+                                tab_bar.modify_tab(
+                                    &tab_id,
+                                    |tab| {
+                                        tab.icon = Some(Icon::File);
+                                        tab.is_loading = false;
+                                    },
+                                    cx,
+                                );
+                            });
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    Err(msg) => {
+                        let still_current = weak
+                            .update(cx, |this, _cx| {
+                                this.is_load_current(&tab_id, load_generation)
+                                    && this.open_files.iter().any(|f| f.id == tab_id)
+                            })
+                            .unwrap_or(false);
+                        if !still_current {
+                            break;
+                        }
+
+                        let close = match cx.update_window(window_handle, |_view, window, cx| {
+                            window.prompt(
+                                gpui::PromptLevel::Warning,
+                                error_title,
+                                Some(&format!("{}:\n{}\n\n重试或关闭标签页?", error_prefix, msg)),
+                                &["重新加载", "关闭标签页"],
+                                cx,
+                            )
+                        }) {
+                            Ok(promise) => promise.await.unwrap_or(1) != 0,
+                            Err(_) => true,
+                        };
+                        if close {
+                            let _ = weak.update(cx, |this, cx| {
+                                if this.is_load_current(&tab_id, load_generation) {
+                                    this.loading_gens.remove(&tab_id);
+                                    this.close_file(&tab_id, cx);
+                                }
+                                cx.notify();
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn open_remote_file(
@@ -480,27 +726,47 @@ impl Editor {
             return;
         }
 
-        let content = match crate::ssh::sftp_fs::read_text_preview(&ssh_config, &path) {
-            Ok(Some(text)) => text,
-            Ok(None) => {
-                log::warn!("远程文件为二进制或空，无法打开编辑: {}", path);
-                String::new()
-            }
-            Err(e) => {
-                log::warn!("读取远程文件失败 {}: {}", path, e);
-                String::new()
-            }
-        };
+        if self.loading_gens.contains_key(&tab_id) {
+            return;
+        }
+
+        let load_gen = self.begin_load(&tab_id);
+        let ssh_config_for_task = ssh_config.clone();
+        let path_for_task = path.clone();
+        let path_for_log = path.clone();
 
         self.open_file_with_content(
-            tab_id,
+            tab_id.clone(),
             path.clone(),
-            content,
+            String::new(),
             PathBuf::from(&path),
             Some(ssh_config),
             window,
             cx,
             notify_app,
+            true,
+        );
+
+        self.spawn_file_load(
+            tab_id,
+            load_gen,
+            Arc::new(move || {
+                match crate::ssh::sftp_fs::read_text_preview(&ssh_config_for_task, &path_for_task) {
+                    Ok(Some(text)) => Ok(text),
+                    Ok(None) => {
+                        log::warn!("远程文件为二进制或空，无法打开编辑: {}", path_for_log);
+                        Ok(String::new())
+                    }
+                    Err(e) => {
+                        log::warn!("读取远程文件失败 {}: {}", path_for_log, e);
+                        Err(e.to_string())
+                    }
+                }
+            }),
+            "读取文件失败",
+            "无法读取远程文件",
+            window,
+            cx,
         );
     }
 
@@ -515,6 +781,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
         notify_app: bool,
+        is_loading: bool,
     ) {
         let label = path
             .file_name()
@@ -528,6 +795,7 @@ impl Editor {
                 .code_editor(language)
                 .multi_line(true);
             state.set_value(&content, window, cx);
+            state.disabled = is_loading;
             state
         });
 
@@ -539,9 +807,14 @@ impl Editor {
             editor_state,
             original_content: content.clone(),
             pending_reload: false,
+            is_loading,
         });
 
-        let is_local = self.open_files.last().map(|f| f.ssh_config.is_none()).unwrap_or(true);
+        let is_local = self
+            .open_files
+            .last()
+            .map(|f| f.ssh_config.is_none())
+            .unwrap_or(true);
         if is_local {
             Self::watch_file(&path, cx);
         } else {
@@ -551,9 +824,16 @@ impl Editor {
             Self::watch_remote_file(&path, fs, cx);
         }
 
+        let tab_icon = if is_loading {
+            Some(Icon::Loader)
+        } else {
+            Some(Icon::File)
+        };
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&tab_id, &label).with_icon(Some(crate::assets::Icon::File)),
+                TabItem::new(&tab_id, &label)
+                    .with_icon(tab_icon)
+                    .with_loading(is_loading),
                 cx,
             );
         });
@@ -565,24 +845,6 @@ impl Editor {
         }
     }
 
-    pub fn open_file_no_notify(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let path_str = path.to_string_lossy().to_string();
-        let tab_id = format!("editor-{}", path_str);
-
-        if self.open_files.iter().any(|f| f.id == tab_id) {
-            self.switch_to_file(&tab_id, cx);
-            return;
-        }
-
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        self.open_file_with_content(tab_id, path_str, content, path, None, window, cx, false);
-    }
-
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {
         self.active_file_id = Some(id.into());
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -592,6 +854,7 @@ impl Editor {
     }
 
     fn close_file(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.loading_gens.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let file = &self.open_files[index];

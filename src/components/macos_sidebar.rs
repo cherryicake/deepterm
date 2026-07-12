@@ -6,25 +6,27 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, EventEmitter, GlobalElementId,
-    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels,
-    Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, WindowControlArea, anchored, deferred,
-    div, ease_in_out, px,
+    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, EventEmitter,
+    GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
+    WindowControlArea, anchored, deferred, div, ease_in_out, px,
 };
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
+use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
+use crate::file_manager::file_tree_event::FileTreeEvent;
+use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
+use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
 use crate::sidebar_view::theme_view;
-use crate::theme::ActiveTheme;
-use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
-use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::ssh::SshConnectionConfig;
 use crate::terminal_view::TerminalView;
+use crate::theme::ActiveTheme;
 
 pub const SIDEBAR_MIN_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 500.0;
@@ -133,6 +135,10 @@ pub enum SidebarView {
 #[derive(Clone, Debug)]
 pub enum SidebarEvent {
     TabGroupsChanged,
+    OpenFile {
+        path: PathBuf,
+        ssh_config: Option<SshConnectionConfig>,
+    },
 }
 
 pub struct MacosSidebar {
@@ -162,6 +168,7 @@ pub struct MacosSidebar {
     file_tree_target_label: Option<String>,
     file_tree_terminal_view: Option<Entity<TerminalView>>,
     file_tree_subscription: Option<Subscription>,
+    file_tree_event_subscription: Option<Subscription>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
@@ -169,7 +176,7 @@ pub struct MacosSidebar {
     on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
     on_tab_double_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
     on_tab_single_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
-    on_file_open: Option<Rc<dyn Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync>>,
+
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
@@ -221,6 +228,7 @@ impl MacosSidebar {
             file_tree_target_label: None,
             file_tree_terminal_view: None,
             file_tree_subscription: None,
+            file_tree_event_subscription: None,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
@@ -228,7 +236,6 @@ impl MacosSidebar {
             on_tab_group_select: None,
             on_tab_double_click: None,
             on_tab_single_click: None,
-            on_file_open: None,
             tab_group_menu_open: false,
             tab_group_menu_group_id: None,
             tab_group_popup_menu: None,
@@ -263,46 +270,60 @@ impl MacosSidebar {
         self.on_tab_single_click = Some(Rc::new(callback));
     }
 
-    pub fn set_on_file_open<F>(&mut self, callback: F)
-    where
-        F: Fn(PathBuf, Option<SshConnectionConfig>, &mut Window, &mut App) + Send + Sync + 'static,
-    {
-        self.on_file_open = Some(Rc::new(callback));
-    }
-
-
-
     fn subscribe_file_tree_to_terminal(
         &mut self,
         terminal_view: &Entity<TerminalView>,
         file_tree: Entity<SidebarFileTree>,
         cx: &mut Context<Self>,
     ) {
-        let sub = cx.subscribe(terminal_view, move |this, subscribed_tv, event: &crate::terminal_view::terminal_view::Event, cx| {
-            let should_sync = matches!(
-                event,
-                crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
-                    | crate::terminal_view::terminal_view::Event::TitleChanged
-            );
-            if !should_sync {
-                return;
-            }
-            if this.file_tree_terminal_view.as_ref() != Some(&subscribed_tv) {
-                return;
-            }
-            let state = subscribed_tv.read(cx).session_state(cx);
-            let (cwd, target_label) = state.file_tree_target();
-            if cwd.as_deref() == Some(file_tree.read(cx).root_path()) {
-                return;
-            }
-            this.file_tree_target_label = Some(target_label);
-            let _ = file_tree.update(cx, |tree, cx| {
-                tree.open_path(cwd, cx);
-            });
-            cx.notify();
-            this.notify_app_window(cx);
-        });
+        let sub = cx.subscribe(
+            terminal_view,
+            move |this, subscribed_tv, event: &crate::terminal_view::terminal_view::Event, cx| {
+                let should_sync = matches!(
+                    event,
+                    crate::terminal_view::terminal_view::Event::WorkingDirectoryChanged
+                        | crate::terminal_view::terminal_view::Event::TitleChanged
+                );
+                if !should_sync {
+                    return;
+                }
+                if this.file_tree_terminal_view.as_ref() != Some(&subscribed_tv) {
+                    return;
+                }
+                let state = subscribed_tv.read(cx).session_state(cx);
+                let (cwd, target_label) = state.file_tree_target();
+                if cwd.as_deref() == Some(file_tree.read(cx).root_path()) {
+                    return;
+                }
+                this.file_tree_target_label = Some(target_label);
+                let _ = file_tree.update(cx, |tree, cx| {
+                    tree.open_path(cwd, cx);
+                });
+                cx.notify();
+                this.notify_app_window(cx);
+            },
+        );
         self.file_tree_subscription = Some(sub);
+    }
+
+    fn subscribe_file_tree_events(
+        &mut self,
+        file_tree: Entity<SidebarFileTree>,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_event_subscription.take();
+        let sub = cx.subscribe(
+            &file_tree,
+            move |_this, _emitter, event: &FileTreeEvent, cx| match event {
+                FileTreeEvent::OpenFile { path, ssh_config } => {
+                    cx.emit(SidebarEvent::OpenFile {
+                        path: path.clone(),
+                        ssh_config: ssh_config.clone(),
+                    });
+                }
+            },
+        );
+        self.file_tree_event_subscription = Some(sub);
     }
 
     pub(crate) fn set_file_tree_view(
@@ -322,9 +343,7 @@ impl MacosSidebar {
             self.subscribe_file_tree_to_terminal(tv, view.clone(), cx);
         }
 
-        if let Some(ref callback) = self.on_file_open.clone() {
-            view.update(cx, |tree, _cx| tree.set_on_file_open(callback.clone()));
-        }
+        self.subscribe_file_tree_events(view.clone(), cx);
 
         self.file_tree_view = Some(view);
         self.file_tree_target_label = Some(target_label);
@@ -358,7 +377,10 @@ impl MacosSidebar {
         // 路径+后端一致 → 复用（仅切换订阅）
         if let Some(ref path) = path {
             if let Some(tree) = &self.file_tree_view {
-                if tree.read(cx).matches_location(path, is_local, ssh_config.as_ref()) {
+                if tree
+                    .read(cx)
+                    .matches_location(path, is_local, ssh_config.as_ref())
+                {
                     self.file_tree_subscription.take();
                     self.file_tree_terminal_view = Some(terminal_view.clone());
                     self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
@@ -370,12 +392,18 @@ impl MacosSidebar {
         }
 
         // 不同 → 重建
-        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = if !is_local {
-            let config = ssh_config.unwrap();
-            let p = path.as_ref().map(|p| PathBuf::from(p.to_string_lossy().to_string()));
-            (Arc::new(RemoteFileSystem::new(config)), p)
+        let (backend, requested_path, config_for_cache): (
+            Arc<dyn FileSystem>,
+            Option<PathBuf>,
+            Option<SshConnectionConfig>,
+        ) = if !is_local {
+            let config = ssh_config.clone().unwrap();
+            let p = path
+                .as_ref()
+                .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
+            (Arc::new(RemoteFileSystem::new(config)), p, ssh_config)
         } else {
-            (Arc::new(LocalFileSystem), path.clone())
+            (Arc::new(LocalFileSystem), path.clone(), None)
         };
         let file_tree = cx.new(|cx| {
             let mut tree = SidebarFileTree::new(cx, backend, requested_path);
@@ -383,15 +411,29 @@ impl MacosSidebar {
             tree
         });
 
+        // 为新树注册共享缓存引用
+        if let Some(config) = &config_for_cache {
+            RemoteFileTreeCache::global()
+                .lock()
+                .unwrap()
+                .acquire(config);
+        }
+
         self.file_tree_subscription.take();
         if let Some(old) = self.file_tree_view.take() {
-            let _ = old.update(cx, |t, cx| t.cleanup(cx));
+            // 旧树是远程且新终端也是远程：释放旧树引用再让新树 acquire，ref_count 保持正确；
+            // 远程 -> 本地：只 detach，保留缓存引用以便切回时复用。
+            let old_is_remote = !old.read(cx).is_local();
+            let new_is_remote = config_for_cache.is_some();
+            old.update(cx, |t, cx| {
+                // 新终端仍是远程时，释放旧树对共享缓存的引用；
+                // 远程 -> 本地时保留引用，以便切回远程时复用缓存。
+                t.detach(cx, old_is_remote && new_is_remote);
+            });
         }
         self.file_tree_terminal_view = Some(terminal_view.clone());
         self.subscribe_file_tree_to_terminal(&terminal_view, file_tree.clone(), cx);
-        if let Some(ref cb) = self.on_file_open.clone() {
-            file_tree.update(cx, |t, _| t.set_on_file_open(cb.clone()));
-        }
+        self.subscribe_file_tree_events(file_tree.clone(), cx);
         self.file_tree_view = Some(file_tree);
         self.file_tree_target_label = Some(display_name);
         self.current_view = SidebarView::FileTree;
@@ -916,7 +958,11 @@ impl MacosSidebar {
         let toggle_left_open = self.width - 40.0;
         let button_left_closed = toggle_left_closed - offset_from_toggle;
         let button_left_open = toggle_left_open - offset_from_toggle;
-        let end_left = if self.visible { button_left_open } else { button_left_closed };
+        let end_left = if self.visible {
+            button_left_open
+        } else {
+            button_left_closed
+        };
 
         let container = div()
             .id((id, self.epoch))
@@ -1032,10 +1078,7 @@ impl MacosSidebar {
         let select_width = (right_edge - left_edge).max(36.0);
         let offset_from_toggle = toggle_left_open - left_edge;
 
-        let wrapper = div()
-            .w(px(select_width))
-            .h(px(24.))
-            .child(select_element);
+        let wrapper = div().w(px(select_width)).h(px(24.)).child(select_element);
         self.render_top_element(
             is_fullscreen,
             offset_from_toggle,
@@ -1666,17 +1709,33 @@ impl MacosSidebar {
                     .rounded(px(8.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(hover_bg(cx.theme().appearance.is_dark())))
-                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                        if event.click_count() == 2 {
-                            if let Some(ref callback) = on_tab_double_click {
-                                callback(&click_group_id, &tab_id, &tab_label, this, window, cx);
+                    .on_click(
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            if event.click_count() == 2 {
+                                if let Some(ref callback) = on_tab_double_click {
+                                    callback(
+                                        &click_group_id,
+                                        &tab_id,
+                                        &tab_label,
+                                        this,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            } else if event.click_count() == 1 {
+                                if let Some(ref callback) = on_tab_single_click {
+                                    callback(
+                                        &click_group_id,
+                                        &tab_id,
+                                        &tab_label,
+                                        this,
+                                        window,
+                                        cx,
+                                    );
+                                }
                             }
-                        } else if event.click_count() == 1 {
-                            if let Some(ref callback) = on_tab_single_click {
-                                callback(&click_group_id, &tab_id, &tab_label, this, window, cx);
-                            }
-                        }
-                    }))
+                        }),
+                    )
                     .child(
                         div()
                             .size(px(SIDEBAR_ROW_ICON_BOX))
@@ -1843,13 +1902,13 @@ impl MacosSidebar {
         theme_view::render_theme_sidebar(cx, on_select, is_dark, theme, &self.theme_scroll_handle)
     }
 
-    fn render_file_tree_content(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_file_tree_content(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
-        let target_label = self.file_tree_target_label.clone().unwrap_or_else(|| "文件树".to_string());
+        let target_label = self
+            .file_tree_target_label
+            .clone()
+            .unwrap_or_else(|| "文件树".to_string());
 
         let header = div()
             .w_full()
