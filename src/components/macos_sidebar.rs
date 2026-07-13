@@ -128,6 +128,14 @@ pub enum SidebarView {
     FileTree,
 }
 
+/// 文件树侧边栏内的子面板
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileTreePanel {
+    Files,
+    Search,
+    Git,
+}
+
 /// macOS 风格侧边栏组件
 ///
 /// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
@@ -169,6 +177,9 @@ pub struct MacosSidebar {
     file_tree_terminal_view: Option<Entity<TerminalView>>,
     file_tree_subscription: Option<Subscription>,
     file_tree_event_subscription: Option<Subscription>,
+    file_tree_panel: FileTreePanel,
+    file_tree_panel_prev: FileTreePanel,
+    file_tree_panel_anim: u32,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
@@ -229,6 +240,9 @@ impl MacosSidebar {
             file_tree_terminal_view: None,
             file_tree_subscription: None,
             file_tree_event_subscription: None,
+            file_tree_panel: FileTreePanel::Files,
+            file_tree_panel_prev: FileTreePanel::Files,
+            file_tree_panel_anim: 0,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
@@ -603,6 +617,8 @@ impl MacosSidebar {
         }
         self.file_tree_terminal_view = None;
         self.file_tree_target_label = None;
+        self.file_tree_panel = FileTreePanel::Files;
+        self.file_tree_panel_prev = FileTreePanel::Files;
         self.current_view = SidebarView::Menu;
         self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
     }
@@ -1905,17 +1921,13 @@ impl MacosSidebar {
     fn render_file_tree_content(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
-        let target_label = self
-            .file_tree_target_label
-            .clone()
-            .unwrap_or_else(|| "文件树".to_string());
 
         let header = div()
             .w_full()
             .h(px(36.0))
             .flex()
             .items_center()
-            .justify_between()
+            .gap(px(4.0))
             .px(px(4.0))
             .mb(px(8.0))
             .child(
@@ -1943,20 +1955,44 @@ impl MacosSidebar {
                         }),
                     ),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text)
-                    .child(target_label),
-            )
-            .child(div().w(px(28.0)));
+            .child(self.render_file_tree_panel_tabs(is_dark, cx));
 
-        let file_tree_content = self
-            .file_tree_view
-            .clone()
-            .map(|view| div().w_full().h_full().child(view))
-            .unwrap_or_else(|| div().w_full().h_full());
+        let content_element: gpui::AnyElement = match self.file_tree_panel {
+            FileTreePanel::Files => {
+                let file_tree_content = self
+                    .file_tree_view
+                    .clone()
+                    .map(|view| div().w_full().h_full().child(view))
+                    .unwrap_or_else(|| div().w_full().h_full());
+                file_tree_content.into_any_element()
+            }
+            FileTreePanel::Search => div()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.text_subtle)
+                        .child("搜索"),
+                )
+                .into_any_element(),
+            FileTreePanel::Git => div()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.text_subtle)
+                        .child("Git"),
+                )
+                .into_any_element(),
+        };
 
         div()
             .w_full()
@@ -1969,8 +2005,113 @@ impl MacosSidebar {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(file_tree_content),
+                    .child(content_element),
             )
+    }
+
+    fn render_file_tree_panel_tabs(
+        &self,
+        is_dark: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = cx.theme().ui;
+        let current = self.file_tree_panel.clone();
+        let prev = self.file_tree_panel_prev.clone();
+        let anim_epoch = self.file_tree_panel_anim;
+
+        let items: Vec<(&'static str, Icon, FileTreePanel, f32)> = vec![
+            ("文件", Icon::Folder, FileTreePanel::Files, 60.0),
+            ("搜索", Icon::MagnifyingGlass, FileTreePanel::Search, 60.0),
+            ("Git", Icon::Git, FileTreePanel::Git, 60.0),
+        ];
+
+        let mut container = div()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0));
+
+        for (label, icon, panel, active_w) in items {
+            let is_active = current == panel;
+            let was_active = prev == panel;
+            let panel_clone = panel.clone();
+            let icon_path = icon.path();
+            let text_color = if is_active {
+                theme.accent_foreground
+            } else {
+                theme.text
+            };
+
+            let factor_target: f32 = if is_active { 1.0 } else { 0.0 };
+            let factor_source: f32 = if was_active { 1.0 } else { 0.0 };
+
+            let base = div()
+                .id(format!("panel-tab-{}", label))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(14.0))
+                .bg(button_bg(is_dark))
+                .when(is_active, |this| this.bg(theme.accent))
+                .cursor_pointer()
+                .hover(move |style| {
+                    if is_active {
+                        style
+                    } else {
+                        style.bg(button_bg_hover(is_dark))
+                    }
+                })
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _window, cx| {
+                        let old = this.file_tree_panel.clone();
+                        if old != panel_clone {
+                            this.file_tree_panel_prev = old;
+                            this.file_tree_panel = panel_clone.clone();
+                            this.file_tree_panel_anim += 1;
+                            cx.notify();
+                            this.notify_app_window(cx);
+                        }
+                    }),
+                )
+                .child(
+                    gpui::svg()
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(text_color)
+                        .path(icon_path.clone()),
+                );
+
+            let btn = base.with_animation(
+                format!("panel-tab-{}-{}", label, anim_epoch),
+                gpui::Animation::new(Duration::from_millis(200))
+                    .with_easing(gpui::ease_in_out),
+                move |this, delta| {
+                    let width_factor =
+                        factor_source + (factor_target - factor_source) * delta;
+                    let w = 28.0 + (active_w - 28.0) * width_factor;
+                    let this = this
+                        .w(px(w))
+                        .gap(px(4.0) * width_factor);
+                    if width_factor > 0.9 {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.accent_foreground)
+                                .child(label),
+                        )
+                    } else {
+                        this
+                    }
+                },
+            );
+
+            container = container.child(btn);
+        }
+
+        container
     }
 
     fn render_host_content(&self) -> gpui::Div {

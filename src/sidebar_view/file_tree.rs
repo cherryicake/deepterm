@@ -40,6 +40,7 @@ pub struct SidebarFileTree {
     /// 所有文件操作都委托给 loader
     loader: FileTreeLoader,
     expanded_folders: HashSet<PathBuf>,
+    root_expanded: bool,
     hovered_path: Option<PathBuf>,
     flat_cache: Option<Vec<(FileEntry, usize)>>,
     watcher_subscription: Option<Subscription>,
@@ -78,6 +79,7 @@ impl SidebarFileTree {
             selected_path: None,
             loader: FileTreeLoader::new(backend),
             expanded_folders: HashSet::new(),
+            root_expanded: true,
             hovered_path: None,
             flat_cache: None,
             watcher_subscription,
@@ -479,6 +481,90 @@ impl SidebarFileTree {
         cx.notify();
     }
 
+    fn render_root_row(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let root_path = self.root_path.clone();
+        let is_expanded = self.root_expanded;
+        let is_hovered = self.hovered_path.as_ref() == Some(&root_path);
+        let theme = cx.theme().ui;
+        let display_name = root_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root_path.to_string_lossy().to_string())
+            .to_uppercase();
+
+        let row_background = if is_hovered {
+            theme.tab_hover_background
+        } else {
+            theme.elevated_background.opacity(0.0)
+        };
+
+        let hover_path = root_path.clone();
+        let row = div()
+            .id("sidebar-file-tree-root")
+            .w_full()
+            .h(px(LIST_ROW_HEIGHT))
+            .pl(px(4.0))
+            .pr(px(4.0))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                this.set_hovered_path(hover_path.clone(), *hovered, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _window, cx| {
+                    this.root_expanded = !this.root_expanded;
+                    this.invalidate_flat_cache();
+                    cx.notify();
+                }),
+            );
+
+        row.child(
+            div()
+                .w_full()
+                .h_full()
+                .px(px(2.0))
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .bg(row_background)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .w(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_subtle)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(if is_expanded { "▾" } else { "▸" }),
+                        )
+                        .child(
+                            svg()
+                                .size(px(14.0))
+                                .text_color(theme.accent)
+                                .path(Icon::Folder.path()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(display_name),
+                ),
+        )
+    }
+
     fn render_tree_row(
         &mut self,
         entry: &FileEntry,
@@ -632,13 +718,29 @@ impl Render for SidebarFileTree {
         };
 
         let is_directory_loaded = self.loader.has_cached(&directory);
+        let root_expanded = self.root_expanded;
 
-        let rows_element: gpui::AnyElement = if is_directory_loaded && flat_count == 0 {
+        let root_row_element = self.render_root_row(cx).into_any_element();
+
+        let rows_element: gpui::AnyElement = if !root_expanded {
             div()
                 .id("sidebar-file-tree")
                 .w_full()
                 .flex_1()
                 .min_h_0()
+                .flex()
+                .flex_col()
+                .child(root_row_element)
+                .into_any_element()
+        } else if is_directory_loaded && flat_count == 0 {
+            div()
+                .id("sidebar-file-tree")
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(root_row_element)
                 .child(
                     div()
                         .w_full()
@@ -658,10 +760,12 @@ impl Render for SidebarFileTree {
                 .min_h_0()
                 .overflow_y_scroll()
                 .flex()
-                .flex_col();
+                .flex_col()
+                .child(root_row_element);
 
             for (entry, depth) in flat_rows {
-                list = list.child(self.render_tree_row(&entry, depth, cx));
+                // Children are indented one level deeper (depth + 1) relative to root row
+                list = list.child(self.render_tree_row(&entry, depth + 1, cx));
             }
 
             list.into_any_element()
