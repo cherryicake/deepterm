@@ -18,7 +18,8 @@ use crate::components::menu::{PopupMenu, PopupMenuItem};
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::file_tree_event::FileTreeEvent;
 use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
-use crate::sidebar_view::file_tree::SidebarFileTree;
+use crate::sidebar_view::file_tree::{FileTreePanel, FileTreePanelTabs, SidebarFileTree};
+use crate::sidebar_view::file_tree_panel_tabs::{self, TAB_ITEMS};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
@@ -128,14 +129,6 @@ pub enum SidebarView {
     FileTree,
 }
 
-/// 文件树侧边栏内的子面板
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileTreePanel {
-    Files,
-    Search,
-    Git,
-}
-
 /// macOS 风格侧边栏组件
 ///
 /// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
@@ -177,9 +170,7 @@ pub struct MacosSidebar {
     file_tree_terminal_view: Option<Entity<TerminalView>>,
     file_tree_subscription: Option<Subscription>,
     file_tree_event_subscription: Option<Subscription>,
-    file_tree_panel: FileTreePanel,
-    file_tree_panel_prev: FileTreePanel,
-    file_tree_panel_anim: u32,
+    file_tree_panel_tabs: FileTreePanelTabs,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
@@ -240,9 +231,7 @@ impl MacosSidebar {
             file_tree_terminal_view: None,
             file_tree_subscription: None,
             file_tree_event_subscription: None,
-            file_tree_panel: FileTreePanel::Files,
-            file_tree_panel_prev: FileTreePanel::Files,
-            file_tree_panel_anim: 0,
+            file_tree_panel_tabs: FileTreePanelTabs::new(),
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
@@ -617,8 +606,7 @@ impl MacosSidebar {
         }
         self.file_tree_terminal_view = None;
         self.file_tree_target_label = None;
-        self.file_tree_panel = FileTreePanel::Files;
-        self.file_tree_panel_prev = FileTreePanel::Files;
+        self.file_tree_panel_tabs = FileTreePanelTabs::new();
         self.current_view = SidebarView::Menu;
         self.selected_id = Some(DEFAULT_TAB_GROUP_ID.to_string());
     }
@@ -1927,7 +1915,7 @@ impl MacosSidebar {
             .h(px(36.0))
             .flex()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(8.0))
             .px(px(4.0))
             .mb(px(8.0))
             .child(
@@ -1957,7 +1945,7 @@ impl MacosSidebar {
             )
             .child(self.render_file_tree_panel_tabs(is_dark, cx));
 
-        let content_element: gpui::AnyElement = match self.file_tree_panel {
+        let content_element: gpui::AnyElement = match self.file_tree_panel_tabs.current {
             FileTreePanel::Files => {
                 let file_tree_content = self
                     .file_tree_view
@@ -2013,105 +2001,80 @@ impl MacosSidebar {
         &self,
         is_dark: bool,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::AnyElement {
         let theme = cx.theme().ui;
-        let current = self.file_tree_panel.clone();
-        let prev = self.file_tree_panel_prev.clone();
-        let anim_epoch = self.file_tree_panel_anim;
-
-        let items: Vec<(&'static str, Icon, FileTreePanel, f32)> = vec![
-            ("文件", Icon::Folder, FileTreePanel::Files, 60.0),
-            ("搜索", Icon::MagnifyingGlass, FileTreePanel::Search, 60.0),
-            ("Git", Icon::Git, FileTreePanel::Git, 60.0),
-        ];
+        let current = &self.file_tree_panel_tabs.current;
+        let prev = &self.file_tree_panel_tabs.prev;
+        let anim_epoch = self.file_tree_panel_tabs.anim_epoch;
 
         let mut container = div()
             .h(px(28.0))
             .flex()
             .items_center()
-            .gap(px(10.0));
+            .gap(px(file_tree_panel_tabs::TAB_GAP));
 
-        for (label, icon, panel, active_w) in items {
-            let is_active = current == panel;
-            let was_active = prev == panel;
-            let panel_clone = panel.clone();
-            let icon_path = icon.path();
-            let text_color = if is_active {
-                theme.accent_foreground
-            } else {
-                theme.text
-            };
+        for item in TAB_ITEMS {
+            let is_active = *current == item.panel;
+            let is_prev = *prev == item.panel;
+            let panel_clone = item.panel.clone();
+            let active_w = item.active_width;
+            let label = item.label;
 
-            let factor_target: f32 = if is_active { 1.0 } else { 0.0 };
-            let factor_source: f32 = if was_active { 1.0 } else { 0.0 };
-
-            let base = div()
-                .id(format!("panel-tab-{}", label))
-                .h(px(28.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(14.0))
-                .bg(button_bg(is_dark))
-                .when(is_active, |this| this.bg(theme.accent))
-                .cursor_pointer()
-                .hover(move |style| {
-                    if is_active {
-                        style
-                    } else {
-                        style.bg(button_bg_hover(is_dark))
-                    }
-                })
+            let btn = file_tree_panel_tabs::build_tab_button(item, is_active, is_dark, &theme)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(move |this, _, _window, cx| {
-                        let old = this.file_tree_panel.clone();
+                        let old = this.file_tree_panel_tabs.current.clone();
                         if old != panel_clone {
-                            this.file_tree_panel_prev = old;
-                            this.file_tree_panel = panel_clone.clone();
-                            this.file_tree_panel_anim += 1;
+                            this.file_tree_panel_tabs.select(panel_clone.clone());
                             cx.notify();
                             this.notify_app_window(cx);
                         }
                     }),
                 )
-                .child(
-                    gpui::svg()
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(text_color)
-                        .path(icon_path.clone()),
-                );
+                .with_animation(
+                    (label, anim_epoch),
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                    move |this, delta| {
+                        let factor_target: f32 = if is_active { 1.0 } else { 0.0 };
+                        let factor_source: f32 = if is_prev { 1.0 } else { 0.0 };
+                        let width_factor =
+                            factor_source + (factor_target - factor_source) * delta;
+                        let w = 28.0 + (active_w - 28.0) * width_factor;
+                        let text_w = 28.0 * width_factor;
+                        let gap_w = 4.0 * width_factor;
 
-            let btn = base.with_animation(
-                format!("panel-tab-{}-{}", label, anim_epoch),
-                gpui::Animation::new(Duration::from_millis(200))
-                    .with_easing(gpui::ease_in_out),
-                move |this, delta| {
-                    let width_factor =
-                        factor_source + (factor_target - factor_source) * delta;
-                    let w = 28.0 + (active_w - 28.0) * width_factor;
-                    let this = this
-                        .w(px(w))
-                        .gap(px(4.0) * width_factor);
-                    if width_factor > 0.9 {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.accent_foreground)
-                                .child(label),
-                        )
-                    } else {
-                        this
-                    }
-                },
-            );
+                        let this = this.w(px(w)).gap(px(gap_w));
+
+                        if width_factor > 0.0 {
+                            this.child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if is_active {
+                                        theme.accent_foreground
+                                    } else {
+                                        theme.text
+                                    })
+                                    .flex_none()
+                                    .w(px(text_w))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .opacity(width_factor)
+                                    .overflow_hidden()
+                                    .child(label),
+                            )
+                        } else {
+                            this
+                        }
+                    },
+                );
 
             container = container.child(btn);
         }
 
-        container
+        container.into_any_element()
     }
 
     fn render_host_content(&self) -> gpui::Div {

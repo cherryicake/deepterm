@@ -780,3 +780,35 @@ impl Render for SidebarFileTree {
             .child(rows_element)
     }
 }
+
+/// 文件树侧边栏内的子面板
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileTreePanel {
+    Files,
+    Search,
+    Git,
+}
+
+/// 文件树面板标签页状态（current/prev）
+pub struct FileTreePanelTabs {
+    pub current: FileTreePanel,
+    pub prev: FileTreePanel,
+    pub anim_epoch: u32,
+}
+
+impl FileTreePanelTabs {
+    pub fn new() -> Self {
+        Self {
+            current: FileTreePanel::Files,
+            prev: FileTreePanel::Files,
+            anim_epoch: 0,
+        }
+    }
+
+    pub fn select(&mut self, panel: FileTreePanel) {
+        if self.current != panel {
+            self.prev = std::mem::replace(&mut self.current, panel);
+            self.anim_epoch = self.anim_epoch.wrapping_add(1);
+        }
+    }
+}
