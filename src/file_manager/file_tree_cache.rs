@@ -14,6 +14,18 @@ struct DirNode {
     loaded_at: Instant,
 }
 
+/// 远程文件内容缓存条目
+struct FileContentEntry {
+    content: String,
+    loaded_at: Instant,
+}
+
+/// 单台远程服务器的文件内容缓存
+struct ServerFileCache {
+    /// path -> FileContentEntry，按文件路径索引
+    files: HashMap<PathBuf, FileContentEntry>,
+}
+
 /// 单台远程服务器的目录树（文件系统已浏览子集）
 struct ServerTree {
     /// path -> DirNode，扁平映射，隐式形成树结构
@@ -30,6 +42,8 @@ struct ServerTree {
 /// 当没有终端引用某台服务器时，整棵树从内存中清除。
 pub struct RemoteFileTreeCache {
     servers: HashMap<String, ServerTree>,
+    /// 远程文件内容缓存：server_key -> ServerFileCache
+    file_caches: HashMap<String, ServerFileCache>,
 }
 
 static GLOBAL_CACHE: OnceLock<Mutex<RemoteFileTreeCache>> = OnceLock::new();
@@ -38,6 +52,7 @@ impl RemoteFileTreeCache {
     fn new() -> Self {
         Self {
             servers: HashMap::new(),
+            file_caches: HashMap::new(),
         }
     }
 
@@ -106,7 +121,8 @@ impl RemoteFileTreeCache {
             );
             if tree.ref_count == 0 {
                 self.servers.remove(&key);
-                log::debug!("FileTreeCache evicted server tree: {}", key);
+                self.file_caches.remove(&key);
+                log::debug!("FileTreeCache evicted server tree and file cache: {}", key);
             }
         }
     }
@@ -126,6 +142,51 @@ impl RemoteFileTreeCache {
             .get(&key)
             .map(|tree| tree.expanded.clone())
             .unwrap_or_default()
+    }
+
+    /// 缓存远程文件内容
+    pub fn insert_file_content(
+        &mut self,
+        config: &SshConnectionConfig,
+        path: &Path,
+        content: String,
+    ) {
+        let key = Self::server_key(config);
+        let file_cache = self
+            .file_caches
+            .entry(key.clone())
+            .or_insert_with(ServerFileCache::new);
+        log::debug!("FileTreeCache insert file content: {}{}", key, path.display());
+        file_cache.files.insert(
+            path.to_path_buf(),
+            FileContentEntry {
+                content,
+                loaded_at: Instant::now(),
+            },
+        );
+    }
+
+    /// 获取缓存的远程文件内容
+    pub fn get_file_content(
+        &self,
+        config: &SshConnectionConfig,
+        path: &Path,
+    ) -> Option<String> {
+        let key = Self::server_key(config);
+        let file_cache = self.file_caches.get(&key)?;
+        let entry = file_cache.files.get(path)?;
+        log::debug!("FileTreeCache get file content: {}{}", key, path.display());
+        Some(entry.content.clone())
+    }
+
+    /// 移除单个文件的内容缓存
+    pub fn remove_file(&mut self, config: &SshConnectionConfig, path: &Path) {
+        let key = Self::server_key(config);
+        if let Some(file_cache) = self.file_caches.get_mut(&key) {
+            if file_cache.files.remove(path).is_some() {
+                log::debug!("FileTreeCache remove file: {}{}", key, path.display());
+            }
+        }
     }
 
     /// 处理文件系统事件：更新或移除对应的缓存条目
@@ -160,6 +221,14 @@ impl ServerTree {
             nodes: HashMap::new(),
             expanded: HashSet::new(),
             ref_count: 0,
+        }
+    }
+}
+
+impl ServerFileCache {
+    fn new() -> Self {
+        Self {
+            files: HashMap::new(),
         }
     }
 }

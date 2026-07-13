@@ -31,7 +31,7 @@ use crate::components::macos_sidebar::{
 };
 use crate::components::notification::{NotificationKind, NotificationManager};
 use crate::components::title_bar::TitleBar;
-use crate::editor::{Editor, EditorRuntimeState};
+use crate::editor::{Editor, FileTreeEditorState, FileTreeKey};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
@@ -42,7 +42,7 @@ use crate::workspace::client_decorations::client_side_decorations;
 use crate::workspace::ToggleSidebar;
 use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
-    AppSessionState, EditorSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
+    AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
 };
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::{Workspace, WorkspaceEvent};
@@ -62,8 +62,8 @@ struct TabGroupWorkspace {
     id: String,
     workspace: Option<Entity<Workspace>>,
     pending_session: Option<WorkspaceSessionState>,
-    editor_runtime_state: Option<EditorRuntimeState>,
-    editor_session_state: Option<EditorSessionState>,
+    /// 每个文件树的编辑器状态
+    file_tree_editor_states: HashMap<FileTreeKey, FileTreeEditorState>,
 }
 
 pub struct AppWindow {
@@ -76,8 +76,10 @@ pub struct AppWindow {
     editor: Entity<Editor>,
     notification_manager: Entity<NotificationManager>,
     tab_group_select: Entity<MacosSelect>,
-    default_editor_runtime_state: Option<EditorRuntimeState>,
-    default_editor_session_state: Option<EditorSessionState>,
+    /// 默认标签页组的文件树编辑器状态
+    default_file_tree_editor_states: HashMap<FileTreeKey, FileTreeEditorState>,
+    /// 当前活动的文件树标识符
+    current_file_tree_key: Option<FileTreeKey>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
@@ -183,9 +185,9 @@ impl AppWindow {
                     cx,
                 ) {
                     this.show_file_tree_page();
-                    window.defer(cx, move |_window, cx| {
+                    window.defer(cx, move |window, cx| {
                         let _ = workspace.update(cx, |ws, cx| {
-                            ws.handle_sidebar_tab_double_click(&tab_id, sidebar, cx);
+                            ws.handle_sidebar_tab_double_click(&tab_id, sidebar, window, cx);
                         });
                     });
                 }
@@ -245,19 +247,6 @@ impl AppWindow {
             editor.bind_app_window(app_window.downgrade());
         });
 
-        let default_editor_session_state = session.as_ref().and_then(|session| {
-            session
-                .groups
-                .iter()
-                .find(|group| group.id == DEFAULT_TAB_GROUP_ID)
-                .and_then(|group| group.editor.clone())
-        });
-        if let Some(ref state) = default_editor_session_state {
-            editor.update(cx, |editor, cx| {
-                editor.restore_from_session_state(state.clone(), window, cx);
-            });
-        }
-
         // 文件树点击 → Editor 打开文件
         let editor_for_open = editor.downgrade();
         let sidebar_subscription = cx.subscribe_in(
@@ -301,8 +290,8 @@ impl AppWindow {
             editor,
             notification_manager: cx.new(|_cx| NotificationManager::new()),
             tab_group_select,
-            default_editor_runtime_state: None,
-            default_editor_session_state,
+            default_file_tree_editor_states: HashMap::new(),
+            current_file_tree_key: None,
             _sidebar_hide_task: None,
             host_view,
             keychain_view,
@@ -373,13 +362,13 @@ impl AppWindow {
                     this.defer_save_session(cx);
                     let sidebar = this.sidebar.clone();
                     let workspace = this.workspace.clone();
-                    window.defer(cx, move |_window, cx| {
+                    window.defer(cx, move |window, cx| {
                         if sidebar.read(cx).current_view() != &crate::components::macos_sidebar::SidebarView::FileTree {
                             return;
                         }
                         let active_tab_id = workspace.read(cx).active_tab_id().to_string();
                         let _ = workspace.update(cx, |ws, cx| {
-                            ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+                            ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, window, cx);
                         });
                     });
                 }
@@ -455,8 +444,7 @@ impl AppWindow {
                 id: group.id.clone(),
                 workspace: None,
                 pending_session: group.workspace.clone(),
-                editor_runtime_state: None,
-                editor_session_state: group.editor.clone(),
+                file_tree_editor_states: HashMap::new(),
             })
             .collect();
 
@@ -472,20 +460,11 @@ impl AppWindow {
         let active_group_id = self.active_tab_group_id();
         let mut groups = Vec::with_capacity(self.tab_group_workspaces.len() + 1);
 
-        let default_editor = if active_group_id == DEFAULT_TAB_GROUP_ID {
-            Some(self.editor.read(cx).session_state())
-        } else {
-            self.default_editor_runtime_state
-                .as_ref()
-                .map(|state| state.to_session_state())
-                .or_else(|| self.default_editor_session_state.clone())
-        };
         groups.push(WorkspaceGroupSessionState {
             id: DEFAULT_TAB_GROUP_ID.to_string(),
             label: Some("标签页".to_string()),
             collapsed: false,
             workspace: Some(self.default_workspace.read(cx).session_state(cx)),
-            editor: default_editor,
         });
 
         let sidebar_groups = self.sidebar.read(cx).tab_group_states();
@@ -498,17 +477,6 @@ impl AppWindow {
                 .tab_group_workspaces
                 .iter()
                 .find(|group| group.id == sidebar_group.id);
-            let editor = workspace_entry.and_then(|group| {
-                if group.id == active_group_id {
-                    Some(self.editor.read(cx).session_state())
-                } else {
-                    group
-                        .editor_runtime_state
-                        .as_ref()
-                        .map(|state| state.to_session_state())
-                        .or_else(|| group.editor_session_state.clone())
-                }
-            });
             Some(WorkspaceGroupSessionState {
                 id: sidebar_group.id,
                 label: Some(sidebar_group.label),
@@ -520,7 +488,6 @@ impl AppWindow {
                         .map(|workspace| workspace.read(cx).session_state(cx))
                         .or_else(|| group.pending_session.clone())
                 }),
-                editor,
             })
         }));
 
@@ -647,8 +614,7 @@ impl AppWindow {
             id: group_id.clone(),
             workspace: Some(workspace.clone()),
             pending_session: None,
-            editor_runtime_state: None,
-            editor_session_state: None,
+            file_tree_editor_states: HashMap::new(),
         });
         self.switch_tab_group_workspace(&group_id, window, cx);
     }
@@ -664,33 +630,32 @@ impl AppWindow {
             return;
         }
 
-        // 保存当前组的运行时状态（不重新读取文件）。
-        let current_runtime_state =
-            self.editor
-                .update(cx, |editor, cx| editor.take_runtime_state(cx));
-        if from_group_id == DEFAULT_TAB_GROUP_ID {
-            self.default_editor_runtime_state = Some(current_runtime_state);
-        } else if let Some(group) = self
-            .tab_group_workspaces
-            .iter_mut()
-            .find(|group| group.id == from_group_id)
-        {
-            group.editor_runtime_state = Some(current_runtime_state);
+        // 保存当前组的编辑器状态到对应的文件树
+        if let Some(file_tree_key) = self.current_file_tree_key.clone() {
+            let file_tree_state = self
+                .editor
+                .update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+
+            if from_group_id == DEFAULT_TAB_GROUP_ID {
+                self.default_file_tree_editor_states
+                    .insert(file_tree_key, file_tree_state);
+            } else if let Some(group) = self
+                .tab_group_workspaces
+                .iter_mut()
+                .find(|group| group.id == from_group_id)
+            {
+                group.file_tree_editor_states
+                    .insert(file_tree_key, file_tree_state);
+            }
         }
+
+        // 清空当前文件树标识符
+        self.current_file_tree_key = None;
 
         if group_id == DEFAULT_TAB_GROUP_ID {
             self.bind_active_workspace(self.default_workspace.clone(), window, cx);
-            let target_state = self.default_editor_runtime_state.take();
-            if let Some(state) = target_state {
-                self.editor.update(cx, |editor, cx| {
-                    editor.restore_runtime_state(state, window, cx);
-                });
-            } else if let Some(ref state) = self.default_editor_session_state {
-                self.editor.update(cx, |editor, cx| {
-                    editor.restore_from_session_state(state.clone(), window, cx);
-                });
-                self.default_editor_session_state = None;
-            }
+            // 恢复默认标签页组的编辑器状态（如果有的话）
+            // 注意：此时 current_file_tree_key 为 None，文件树切换时会自动恢复
             self.sync_file_tree_with_active_tab(window, cx);
             self.defer_save_session(cx);
             return;
@@ -720,33 +685,70 @@ impl AppWindow {
                     id: group_id.to_string(),
                     workspace: Some(workspace.clone()),
                     pending_session: None,
-                    editor_runtime_state: None,
-                    editor_session_state: None,
+                    file_tree_editor_states: HashMap::new(),
                 });
             }
             workspace
         };
 
         self.bind_active_workspace(workspace, window, cx);
-
-        let group = self
-            .tab_group_workspaces
-            .iter_mut()
-            .find(|group| group.id == group_id);
-        if let Some(group) = group {
-            if let Some(state) = group.editor_runtime_state.take() {
-                self.editor.update(cx, |editor, cx| {
-                    editor.restore_runtime_state(state, window, cx);
-                });
-            } else if let Some(state) = group.editor_session_state.take() {
-                self.editor.update(cx, |editor, cx| {
-                    editor.restore_from_session_state(state, window, cx);
-                });
-            }
-        }
+        // 恢复目标标签页组的编辑器状态（如果有的话）
+        // 注意：此时 current_file_tree_key 为 None，文件树切换时会自动恢复
 
         self.sync_file_tree_with_active_tab(window, cx);
         self.defer_save_session(cx);
+    }
+
+    /// 文件树切换时调用：保存旧文件树的编辑器状态，恢复新文件树的编辑器状态
+    pub fn on_file_tree_switched(
+        &mut self,
+        old_key: Option<FileTreeKey>,
+        new_key: FileTreeKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 1. 保存旧文件树的编辑器状态
+        if let Some(old_key) = old_key {
+            let file_tree_state = self
+                .editor
+                .update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+
+            let from_group_id = self.active_tab_group_id();
+            if from_group_id == DEFAULT_TAB_GROUP_ID {
+                self.default_file_tree_editor_states
+                    .insert(old_key, file_tree_state);
+            } else if let Some(group) = self
+                .tab_group_workspaces
+                .iter_mut()
+                .find(|group| group.id == from_group_id)
+            {
+                group.file_tree_editor_states
+                    .insert(old_key, file_tree_state);
+            }
+        }
+
+        // 2. 更新当前文件树标识符
+        self.current_file_tree_key = Some(new_key.clone());
+
+        // 3. 从新文件树的存储中恢复之前保存的文件
+        let from_group_id = self.active_tab_group_id();
+        let file_tree_state = if from_group_id == DEFAULT_TAB_GROUP_ID {
+            self.default_file_tree_editor_states.remove(&new_key)
+        } else {
+            self.tab_group_workspaces
+                .iter_mut()
+                .find(|group| group.id == from_group_id)
+                .and_then(|group| group.file_tree_editor_states.remove(&new_key))
+        };
+
+        // 4. 如果有需要恢复的文件，恢复到编辑器
+        if let Some(state) = file_tree_state {
+            if !state.open_files_info.is_empty() {
+                self.editor.update(cx, |editor, cx| {
+                    editor.restore_from_file_tree_state(state, window, cx);
+                });
+            }
+        }
     }
 
     /// 如果当前侧边栏处于文件树页面，将文件树同步到当前活动工作区的活动终端目录。
@@ -757,7 +759,7 @@ impl AppWindow {
     ) {
         let sidebar = self.sidebar.clone();
         let workspace = self.workspace.clone();
-        window.defer(cx, move |_window, cx| {
+        window.defer(cx, move |window, cx| {
             if *sidebar.read(cx).current_view()
                 != crate::components::macos_sidebar::SidebarView::FileTree
             {
@@ -765,7 +767,7 @@ impl AppWindow {
             }
             let active_tab_id = workspace.read(cx).active_tab_id().to_string();
             let _ = workspace.update(cx, |ws, cx| {
-                ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, cx);
+                ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, window, cx);
             });
         });
     }

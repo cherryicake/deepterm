@@ -2003,6 +2003,7 @@ impl Workspace {
         &mut self,
         tab_id: &str,
         sidebar: Entity<crate::components::macos_sidebar::MacosSidebar>,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
         if !self.tabs.contains_key(tab_id) {
@@ -2015,7 +2016,7 @@ impl Workspace {
             return;
         };
 
-        let _ = sidebar.update(cx, |s, cx| s.set_terminal_file_tree(terminal_view, cx));
+        let _ = sidebar.update(cx, |s, cx| s.set_terminal_file_tree(terminal_view, window, cx));
     }
 
     /// 拷贝地址 - 将终端连接地址写入剪贴板

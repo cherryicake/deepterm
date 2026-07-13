@@ -364,6 +364,7 @@ impl MacosSidebar {
     pub fn set_terminal_file_tree(
         &mut self,
         terminal_view: Entity<TerminalView>,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
         let (path, display_name, is_local, ssh_config) = {
@@ -377,6 +378,9 @@ impl MacosSidebar {
             return;
         }
 
+        // 获取旧的文件树标识符
+        let old_file_tree_key = self.get_current_file_tree_key(cx);
+
         // 路径+后端一致 → 复用（仅切换订阅）
         if let Some(ref path) = path {
             if let Some(tree) = &self.file_tree_view {
@@ -388,6 +392,25 @@ impl MacosSidebar {
                     self.file_tree_terminal_view = Some(terminal_view.clone());
                     self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
                     self.file_tree_target_label = Some(display_name);
+
+                    // 触发编辑器状态保存/恢复
+                    let new_key = crate::editor::FileTreeKey::new(
+                        Some(path.clone()),
+                        is_local,
+                        ssh_config.clone(),
+                    );
+                    let app_window = self.app_window.clone();
+                    let window_handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        if let Some(aw) = &app_window {
+                            cx.update_window(window_handle, |_view, window, cx| {
+                                aw.update(cx, |this, cx| {
+                                    this.on_file_tree_switched(old_file_tree_key, new_key, window, cx);
+                                }).ok();
+                            }).ok();
+                        }
+                    });
+
                     cx.notify();
                     return;
                 }
@@ -404,13 +427,13 @@ impl MacosSidebar {
             let p = path
                 .as_ref()
                 .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
-            (Arc::new(RemoteFileSystem::new(config)), p, ssh_config)
+            (Arc::new(RemoteFileSystem::new(config)), p, ssh_config.clone())
         } else {
             (Arc::new(LocalFileSystem), path.clone(), None)
         };
         let file_tree = cx.new(|cx| {
             let mut tree = SidebarFileTree::new(cx, backend, requested_path);
-            tree.open_path(path, cx);
+            tree.open_path(path.clone(), cx);
             tree
         });
 
@@ -440,7 +463,38 @@ impl MacosSidebar {
         self.file_tree_view = Some(file_tree);
         self.file_tree_target_label = Some(display_name);
         self.current_view = SidebarView::FileTree;
+
+        // 触发编辑器状态保存/恢复
+        let new_key = crate::editor::FileTreeKey::new(
+            path,
+            is_local,
+            ssh_config,
+        );
+        let app_window = self.app_window.clone();
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            if let Some(aw) = &app_window {
+                cx.update_window(window_handle, |_view, window, cx| {
+                    aw.update(cx, |this, cx| {
+                        this.on_file_tree_switched(old_file_tree_key, new_key, window, cx);
+                    }).ok();
+                }).ok();
+            }
+        });
+
         cx.notify();
+    }
+
+    /// 获取当前文件树的标识符
+    fn get_current_file_tree_key(&self, cx: &mut Context<Self>) -> Option<crate::editor::FileTreeKey> {
+        let terminal_view = self.file_tree_terminal_view.as_ref()?;
+        let state = terminal_view.read(cx).session_state(cx);
+        let (path, _display_name) = state.file_tree_target();
+        Some(crate::editor::FileTreeKey::new(
+            path,
+            state.is_local(),
+            state.ssh_config().cloned(),
+        ))
     }
 
     /// 轻量版：仅切换侧边栏到文件树页面，不设订阅、不创建实体。

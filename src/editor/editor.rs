@@ -51,29 +51,42 @@ struct EditorFile {
     is_loading: bool,
 }
 
-/// 运行时状态，包含已打开的 [`InputState`] entity，切换标签页组时直接交换，不重新读取文件。
-pub struct EditorRuntimeState {
-    open_files: Vec<EditorFile>,
-    active_file_id: Option<SharedString>,
+/// 编辑器打开文件的简化信息，用于标签页组切换时保存
+#[derive(Clone)]
+pub struct EditorOpenFileInfo {
+    pub id: SharedString,
+    pub path: String,
+    pub label: String,
+    pub ssh_config: Option<SshConnectionConfig>,
+    pub is_loading: bool,
 }
 
-impl EditorRuntimeState {
-    pub fn to_session_state(&self) -> crate::workspace::session_state::EditorSessionState {
-        use crate::workspace::session_state::{EditorFileSessionState, EditorSessionState};
-        EditorSessionState {
-            open_files: self
-                .open_files
-                .iter()
-                .map(|f| EditorFileSessionState {
-                    id: f.id.to_string(),
-                    path: f.path.clone(),
-                    label: f.label.clone(),
-                    ssh_config: f.ssh_config.clone(),
-                })
-                .collect(),
-            active_file_id: self.active_file_id.as_ref().map(|id| id.to_string()),
-        }
+/// 文件树标识符，用于区分不同的文件树（终端会话）
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct FileTreeKey(String);
+
+impl FileTreeKey {
+    pub fn new(path: Option<PathBuf>, is_local: bool, ssh_config: Option<SshConnectionConfig>) -> Self {
+        let key = match (path, is_local, ssh_config) {
+            (Some(path), true, _) => format!("local:{}", path.display()),
+            (Some(path), false, Some(config)) => {
+                format!("remote:{}@{}:{}{}", config.username, config.host, config.port, path.display())
+            }
+            (None, true, _) => "local:".to_string(),
+            (None, false, Some(config)) => {
+                format!("remote:{}@{}:{}", config.username, config.host, config.port)
+            }
+            _ => "unknown".to_string(),
+        };
+        Self(key)
     }
+}
+
+/// 每个文件树的编辑器状态
+pub struct FileTreeEditorState {
+    pub open_files_info: Vec<EditorOpenFileInfo>,
+    pub cached_editor_states: HashMap<SharedString, Entity<InputState>>,
+    pub active_file_id: Option<SharedString>,
 }
 
 pub struct Editor {
@@ -132,22 +145,161 @@ impl Editor {
         self.open_files.is_empty()
     }
 
-    pub fn session_state(&self) -> crate::workspace::session_state::EditorSessionState {
-        use crate::workspace::session_state::{EditorFileSessionState, EditorSessionState};
-        let open_files = self
-            .open_files
+    /// 获取当前活动文件 ID
+    pub fn active_file_id(&self) -> Option<&SharedString> {
+        self.active_file_id.as_ref()
+    }
+
+    /// 获取打开文件的基本信息列表，用于标签页组切换
+    pub fn get_open_files_info(&self) -> Vec<EditorOpenFileInfo> {
+        self.open_files
             .iter()
-            .map(|f| EditorFileSessionState {
-                id: f.id.to_string(),
+            .map(|f| EditorOpenFileInfo {
+                id: f.id.clone(),
                 path: f.path.clone(),
                 label: f.label.clone(),
                 ssh_config: f.ssh_config.clone(),
+                is_loading: f.is_loading,
             })
-            .collect();
-        EditorSessionState {
-            open_files,
-            active_file_id: self.active_file_id.as_ref().map(|id| id.to_string()),
+            .collect()
+    }
+
+    /// 取出远程文件的 InputState entity，用于标签页组切换
+    /// 本地文件返回 None（不需要缓存内容）
+    pub fn take_cached_editor_states(
+        &mut self,
+    ) -> HashMap<SharedString, Entity<InputState>> {
+        let mut cached_states = HashMap::new();
+        for file in &mut self.open_files {
+            if file.ssh_config.is_some() && !file.is_loading {
+                let state = file.editor_state.clone();
+                cached_states.insert(file.id.clone(), state);
+            }
         }
+        cached_states
+    }
+
+    /// 保存当前编辑器状态到文件树状态
+    pub fn save_to_file_tree_state(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> FileTreeEditorState {
+        let open_files_info = self.get_open_files_info();
+        let cached_editor_states = self.take_cached_editor_states();
+        let active_file_id = self.active_file_id.clone();
+
+        // 清空编辑器
+        self.clear(cx);
+
+        FileTreeEditorState {
+            open_files_info,
+            cached_editor_states,
+            active_file_id,
+        }
+    }
+
+    /// 从文件树状态恢复编辑器
+    pub fn restore_from_file_tree_state(
+        &mut self,
+        state: FileTreeEditorState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_from_info(
+            state.open_files_info,
+            state.active_file_id,
+            &state.cached_editor_states,
+            window,
+            cx,
+        );
+    }
+
+    /// 从缓存恢复文件列表
+    pub fn restore_from_info(
+        &mut self,
+        files_info: Vec<EditorOpenFileInfo>,
+        active_file_id: Option<SharedString>,
+        cached_states: &HashMap<SharedString, Entity<InputState>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear(cx);
+        for file_info in &files_info {
+            // 检查是否有缓存的 InputState（远程文件）
+            if let Some(cached_state) = cached_states.get(&file_info.id) {
+                // 直接使用缓存的 InputState
+                self.restore_file_from_cache(
+                    file_info,
+                    cached_state.clone(),
+                    window,
+                    cx,
+                );
+            } else {
+                // 本地文件或正在加载的文件，重新打开
+                if let Some(ref ssh_config) = file_info.ssh_config {
+                    self.open_remote_file_no_notify(
+                        file_info.path.clone(),
+                        ssh_config.clone(),
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.open_file_no_notify(
+                        std::path::PathBuf::from(&file_info.path),
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+        if let Some(ref active_id) = active_file_id {
+            self.switch_to_file(active_id, cx);
+        }
+    }
+
+    /// 从缓存恢复单个文件
+    fn restore_file_from_cache(
+        &mut self,
+        file_info: &EditorOpenFileInfo,
+        editor_state: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_str = file_info.path.clone();
+        let label = file_info.label.clone();
+        let ssh_config = file_info.ssh_config.clone();
+
+        let file = EditorFile {
+            id: file_info.id.clone(),
+            path: path_str,
+            label,
+            ssh_config: ssh_config.clone(),
+            editor_state: editor_state.clone(),
+            original_content: String::new(),
+            pending_reload: false,
+            is_loading: false,
+        };
+
+        self.open_files.push(file);
+
+        // 启动文件监视器
+        if let Some(config) = ssh_config {
+            let fs = Arc::new(RemoteFileSystem::new(config));
+            Self::watch_remote_file(Path::new(&file_info.path), fs, cx);
+        } else {
+            Self::watch_file(Path::new(&file_info.path), cx);
+        }
+
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(
+                TabItem::new(&file_info.id, &file_info.label)
+                    .with_icon(Some(Icon::File)),
+                cx,
+            );
+        });
+
+        self.switch_to_file(&file_info.id, cx);
+        cx.notify();
     }
 
     fn setup_watcher(&mut self, cx: &mut Context<Self>) {
@@ -297,144 +449,6 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn restore_from_session_state(
-        &mut self,
-        state: crate::workspace::session_state::EditorSessionState,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.clear(cx);
-        for file_state in state.open_files {
-            if let Some(ref ssh_config) = file_state.ssh_config {
-                self.open_remote_file_no_notify(file_state.path, ssh_config.clone(), window, cx);
-            } else {
-                self.open_file_no_notify(PathBuf::from(&file_state.path), window, cx);
-            }
-        }
-        if let Some(active_id) = state.active_file_id {
-            self.switch_to_file(&active_id, cx);
-        }
-    }
-
-    /// 取出当前运行状态（用于切换到其他标签页组前暂存）。
-    pub fn take_runtime_state(&mut self, cx: &mut Context<Self>) -> EditorRuntimeState {
-        self.unwatch_all_files(cx);
-        let mut open_files = Vec::new();
-        std::mem::swap(&mut open_files, &mut self.open_files);
-        let active_file_id = self.active_file_id.take();
-        // Invalidate in-flight loads for this editor instance; parked files keep
-        // `is_loading` so restore can re-kick with a new generation.
-        self.loading_gens.clear();
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.clear_tabs(cx);
-        });
-        cx.notify();
-        EditorRuntimeState {
-            open_files,
-            active_file_id,
-        }
-    }
-
-    /// 恢复运行状态（直接复用已有的 InputState entity；加载中的文件会重新发起读取）。
-    pub fn restore_runtime_state(
-        &mut self,
-        state: EditorRuntimeState,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_files = state.open_files;
-        self.active_file_id = state.active_file_id;
-        self.loading_gens.clear();
-
-        for file in &self.open_files {
-            if file.ssh_config.is_none() {
-                Self::watch_file(Path::new(&file.path), cx);
-            } else {
-                let fs = Arc::new(RemoteFileSystem::new(file.ssh_config.clone().unwrap()));
-                Self::watch_remote_file(Path::new(&file.path), fs, cx);
-            }
-        }
-
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            tab_bar.clear_tabs(cx);
-            for file in &self.open_files {
-                let tab_icon = if file.is_loading {
-                    Some(Icon::Loader)
-                } else {
-                    Some(Icon::File)
-                };
-                tab_bar.add_tab(
-                    TabItem::new(&file.id, &file.label)
-                        .with_icon(tab_icon)
-                        .with_loading(file.is_loading),
-                    cx,
-                );
-            }
-            if let Some(ref active_id) = self.active_file_id {
-                tab_bar.set_active_tab(active_id, cx);
-            }
-        });
-
-        // Re-kick loads for files that were mid-load when the tab group was swapped away.
-        let pending: Vec<(String, String, Option<SshConnectionConfig>)> = self
-            .open_files
-            .iter()
-            .filter(|f| f.is_loading)
-            .map(|f| (f.id.to_string(), f.path.clone(), f.ssh_config.clone()))
-            .collect();
-
-        for (tab_id, path, ssh_config) in pending {
-            // 重新加载前先禁用输入，避免用户编辑被覆盖
-            if let Some(file) = self.open_files.iter_mut().find(|f| f.id == tab_id) {
-                file.editor_state.update(cx, |state, _cx| {
-                    state.disabled = true;
-                });
-            }
-
-            let load_gen = self.begin_load(&tab_id);
-            if let Some(config) = ssh_config {
-                let path_for_task = path.clone();
-                let path_for_log = path.clone();
-                self.spawn_file_load(
-                    tab_id,
-                    load_gen,
-                    Arc::new(move || {
-                        match crate::ssh::sftp_fs::read_text_preview(&config, &path_for_task) {
-                            Ok(Some(text)) => Ok(text),
-                            Ok(None) => {
-                                log::warn!("远程文件为二进制或空，无法打开编辑: {}", path_for_log);
-                                Ok(String::new())
-                            }
-                            Err(e) => {
-                                log::warn!("读取远程文件失败 {}: {}", path_for_log, e);
-                                Err(e.to_string())
-                            }
-                        }
-                    }),
-                    "读取文件失败",
-                    "无法读取远程文件",
-                    window,
-                    cx,
-                );
-            } else {
-                let path_for_task = PathBuf::from(&path);
-                self.spawn_file_load(
-                    tab_id,
-                    load_gen,
-                    Arc::new(move || {
-                        std::fs::read_to_string(&path_for_task).map_err(|e| e.to_string())
-                    }),
-                    "读取文件失败",
-                    "无法读取本地文件",
-                    window,
-                    cx,
-                );
-            }
-        }
-
-        cx.notify();
-    }
-
     fn begin_load(&mut self, tab_id: &str) -> u64 {
         self.next_load_generation = self.next_load_generation.wrapping_add(1);
         let load_gen = self.next_load_generation;
@@ -500,16 +514,6 @@ impl Editor {
     pub fn notify_app_window(&self, cx: &mut App) {
         if let Some(aw) = &self.app_window {
             aw.update(cx, |_, cx| cx.notify()).ok();
-        }
-    }
-
-    pub fn notify_app_window_to_save(&self, cx: &mut App) {
-        if let Some(aw) = &self.app_window {
-            aw.update(cx, |this, cx| {
-                this.defer_save_session(cx);
-                cx.notify();
-            })
-            .ok();
         }
     }
 
@@ -632,6 +636,17 @@ impl Editor {
                             {
                                 file.original_content = content.clone();
                                 file.is_loading = false;
+                                // 缓存远程文件内容到 RemoteFileTreeCache
+                                if let Some(ref ssh_config) = file.ssh_config {
+                                    crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                                        .lock()
+                                        .unwrap()
+                                        .insert_file_content(
+                                            ssh_config,
+                                            std::path::Path::new(&file.path),
+                                            content.clone(),
+                                        );
+                                }
                                 file.editor_state.update(cx, |state, cx| {
                                     state.disabled = false;
                                     state.set_text(content, cx);
@@ -730,6 +745,29 @@ impl Editor {
             return;
         }
 
+        // 检查是否有缓存的文件内容
+        let cached_content = crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+            .lock()
+            .unwrap()
+            .get_file_content(&ssh_config, std::path::Path::new(&path));
+
+        if let Some(content) = cached_content {
+            // 有缓存，直接使用缓存内容打开文件
+            self.open_file_with_content(
+                tab_id,
+                path.clone(),
+                content,
+                PathBuf::from(&path),
+                Some(ssh_config),
+                window,
+                cx,
+                notify_app,
+                false, // is_loading = false，因为有缓存内容
+            );
+            return;
+        }
+
+        // 没有缓存，正常异步加载
         let load_gen = self.begin_load(&tab_id);
         let ssh_config_for_task = ssh_config.clone();
         let path_for_task = path.clone();
@@ -840,9 +878,6 @@ impl Editor {
 
         self.switch_to_file(&tab_id, cx);
         cx.notify();
-        if notify_app {
-            self.notify_app_window_to_save(cx);
-        }
     }
 
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -858,6 +893,18 @@ impl Editor {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let file = &self.open_files[index];
+            // 缓存远程文件内容到 RemoteFileTreeCache
+            if file.ssh_config.is_some() && !file.is_loading {
+                let content = file.editor_state.read(cx).value().to_string();
+                crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                    .lock()
+                    .unwrap()
+                    .insert_file_content(
+                        file.ssh_config.as_ref().unwrap(),
+                        std::path::Path::new(&file.path),
+                        content,
+                    );
+            }
             if file.ssh_config.is_none() {
                 Self::unwatch_file(Path::new(&file.path), cx);
             } else {
@@ -885,7 +932,6 @@ impl Editor {
             }
         }
         cx.notify();
-        self.notify_app_window_to_save(cx);
     }
 
     fn close_other_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -955,7 +1001,6 @@ impl Editor {
                 let capped = insert_idx.min(self.open_files.len());
                 self.open_files.insert(capped, file);
                 cx.notify();
-                self.notify_app_window_to_save(cx);
             }
         }
     }
