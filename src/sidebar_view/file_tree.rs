@@ -1,9 +1,13 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, Stateful, Styled, Subscription, Task, Window, div, px, svg,
+    uniform_list, AnyElement, App, Bounds, Context, FocusHandle, Focusable, GlobalElementId,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ParentElement,
+    Pixels, Point, Render, Size, Stateful, Styled, Subscription, Task, UniformListDecoration,
+    UniformListScrollHandle, Window, div, point, px, size, svg, AvailableSpace,
 };
+use smallvec::SmallVec;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +20,7 @@ use crate::file_manager::types::{FileEntry, FileEntryKind};
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
+use crate::theme::UiTheme;
 
 impl gpui::EventEmitter<crate::file_manager::file_tree_event::FileTreeEvent> for SidebarFileTree {}
 
@@ -29,6 +34,25 @@ fn entry_icon(kind: &FileEntryKind) -> Icon {
 const LIST_ROW_HEIGHT: f32 = 24.0;
 const INDENT_SIZE: f32 = 14.0;
 const MAX_TREE_DEPTH: usize = 20;
+
+#[derive(Clone)]
+struct StickyFolderCandidate {
+    global_index: usize,
+    depth: usize,
+}
+
+impl StickyFolderCandidate {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
+#[derive(Clone)]
+struct StickyAnchor {
+    candidate: StickyFolderCandidate,
+    index: usize,
+    drifting: bool,
+}
 
 /// 侧边栏文件树组件 - 单列模式，类似 VSCode 文件树
 ///
@@ -45,6 +69,8 @@ pub struct SidebarFileTree {
     flat_cache: Option<Vec<(FileEntry, usize)>>,
     watcher_subscription: Option<Subscription>,
     watched_paths: HashSet<PathBuf>,
+    scroll_handle: UniformListScrollHandle,
+    sticky_items_count: usize,
 }
 
 impl SidebarFileTree {
@@ -84,6 +110,8 @@ impl SidebarFileTree {
             flat_cache: None,
             watcher_subscription,
             watched_paths: HashSet::new(),
+            scroll_handle: UniformListScrollHandle::new(),
+            sticky_items_count: 0,
         };
 
         // 从共享缓存恢复之前的展开状态
@@ -565,6 +593,143 @@ impl SidebarFileTree {
         )
     }
 
+    fn render_sticky_folders(
+        &self,
+        anchor: &StickyAnchor,
+        scroll_offset: Point<Pixels>,
+        item_height: Pixels,
+        theme: &UiTheme,
+    ) -> SmallVec<[AnyElement; 8]> {
+        let flat = self.flat_cache.as_ref().unwrap();
+        let anchor_depth = anchor.candidate.depth;
+
+        // 收集所有ancestor folders（从anchor向上追溯，不包含anchor本身）
+        // anchor本身已经在正常列表中渲染，不需要在sticky中重复显示
+        let mut sticky_parents: Vec<(FileEntry, usize)> = Vec::new();
+        let mut current_depth = anchor_depth;
+        let mut idx = anchor.candidate.global_index;
+
+        while idx > 0 {
+            idx -= 1;
+            if let Some((entry, depth)) = flat.get(idx) {
+                if *depth < current_depth {
+                    sticky_parents.push((entry.clone(), *depth + 1));
+                    current_depth = *depth;
+                    if current_depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        sticky_parents.reverse();
+
+        // 计算drifting偏移
+        let drifting_y_offset = if anchor.drifting {
+            let scroll_top = -scroll_offset.y;
+            let anchor_top = item_height * (anchor.index + 1) as f32;
+            let sticky_area_height = item_height * sticky_parents.len() as f32;
+            (anchor_top - scroll_top - sticky_area_height).min(Pixels::ZERO)
+        } else {
+            Pixels::ZERO
+        };
+
+        sticky_parents
+            .iter()
+            .enumerate()
+            .map(|(index, (entry, depth))| {
+                let is_last = index == sticky_parents.len() - 1;
+                self.render_sticky_row(entry, *depth, is_last, drifting_y_offset, theme)
+                    .into_any()
+            })
+            .collect()
+    }
+
+    fn render_sticky_row(
+        &self,
+        entry: &FileEntry,
+        depth: usize,
+        is_bottom: bool,
+        y_offset: Pixels,
+        theme: &UiTheme,
+    ) -> gpui::Div {
+        let indent = px(depth as f32 * INDENT_SIZE);
+        let name = entry.name.clone();
+        let icon = entry_icon(&entry.kind);
+
+        let row = div()
+            .w_full()
+            .h(px(LIST_ROW_HEIGHT))
+            .pl(px(4.0) + indent)
+            .pr(px(4.0));
+
+        let inner = div()
+            .w_full()
+            .h_full()
+            .px(px(2.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .bg(theme.elevated_background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("▾"),
+                    )
+                    .child(
+                        svg()
+                            .size(px(14.0))
+                            .text_color(theme.accent)
+                            .path(icon.path()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(name),
+            );
+
+        let mut result = row.child(inner);
+
+        if is_bottom {
+            let shadow = div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(-1.5))
+                .h(px(1.5))
+                .bg(gpui::linear_gradient(
+                    0.0,
+                    gpui::linear_color_stop(theme.shadow.opacity(0.15), 1.0),
+                    gpui::linear_color_stop(theme.shadow.opacity(0.0), 0.0),
+                ));
+            result = result.child(shadow);
+        }
+
+        if y_offset != Pixels::ZERO {
+            result = result.relative().top(y_offset);
+        }
+
+        result
+    }
+
     fn render_tree_row(
         &mut self,
         entry: &FileEntry,
@@ -696,6 +861,215 @@ impl Focusable for SidebarFileTree {
     }
 }
 
+struct StickyFolderDecoration {
+    entity: gpui::Entity<SidebarFileTree>,
+}
+
+impl UniformListDecoration for StickyFolderDecoration {
+    fn compute(
+        &self,
+        visible_range: Range<usize>,
+        bounds: Bounds<Pixels>,
+        scroll_offset: Point<Pixels>,
+        item_height: Pixels,
+        _item_count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        // 获取可见范围内的entries
+        let entries: Vec<(FileEntry, usize)> = self.entity.read_with(cx, |this, _cx| {
+            if let Some(flat) = &this.flat_cache {
+                visible_range
+                    .clone()
+                    .filter_map(|ix| flat.get(ix).cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        });
+
+        // 找到sticky anchor
+        let anchor = Self::find_sticky_anchor_from_entries(&entries, visible_range.start);
+
+        if let Some(anchor) = anchor {
+            let theme = cx.theme().ui;
+            let sticky_items = self.entity.read_with(cx, |this, _cx| {
+                this.render_sticky_folders(&anchor, scroll_offset, item_height, &theme)
+            });
+
+            let items_count = sticky_items.len();
+            if items_count == 0 {
+                return StickyItemsElement {
+                    drifting_element: None,
+                    rest_elements: SmallVec::new(),
+                }
+                .into_any();
+            }
+
+            // ★★★ 关键：计算base_origin，抵消滚动偏移 ★★★
+            let base_origin = bounds.origin - point(px(0.), scroll_offset.y);
+
+            // 计算drifting偏移
+            let drifting_y_offset = if anchor.drifting {
+                let scroll_top = -scroll_offset.y;
+                let anchor_top = item_height * (anchor.index + 1) as f32;
+                let sticky_area_height = item_height * items_count as f32;
+                (anchor_top - scroll_top - sticky_area_height).min(Pixels::ZERO)
+            } else {
+                Pixels::ZERO
+            };
+
+            // 分离drifting和rest元素
+            let mut elements = sticky_items;
+            let (mut drifting_element, mut rest_elements) = if anchor.drifting && !elements.is_empty() {
+                let last = elements.pop().unwrap();
+                (Some(last), elements)
+            } else {
+                (None, elements)
+            };
+
+            let element_available_space = size(
+                AvailableSpace::Definite(bounds.size.width),
+                AvailableSpace::Definite(item_height),
+            );
+
+            // 定位drifting元素（有额外y偏移）
+            if let Some(ref mut drifting_element) = drifting_element {
+                let sticky_origin = base_origin + point(px(0.), item_height * rest_elements.len() + drifting_y_offset);
+                drifting_element.layout_as_root(element_available_space, window, cx);
+                drifting_element.prepaint_at(sticky_origin, window, cx);
+            }
+
+            // 定位rest元素
+            for (ix, element) in rest_elements.iter_mut().enumerate() {
+                let sticky_origin = base_origin + point(px(0.), item_height * ix);
+                element.layout_as_root(element_available_space, window, cx);
+                element.prepaint_at(sticky_origin, window, cx);
+            }
+
+            StickyItemsElement {
+                drifting_element,
+                rest_elements,
+            }
+            .into_any()
+        } else {
+            StickyItemsElement {
+                drifting_element: None,
+                rest_elements: SmallVec::new(),
+            }
+            .into_any()
+        }
+    }
+}
+
+impl StickyFolderDecoration {
+    fn find_sticky_anchor_from_entries(
+        entries: &[(FileEntry, usize)],
+        visible_range_start: usize,
+    ) -> Option<StickyAnchor> {
+        let mut iter = entries.iter().enumerate().peekable();
+        while let Some((ix, (_entry, depth))) = iter.next() {
+            // 情况1: depth < ix → 该项的缩进层级小于它在可见区域的偏移
+            if *depth < ix {
+                return Some(StickyAnchor {
+                    candidate: StickyFolderCandidate {
+                        global_index: visible_range_start + ix,
+                        depth: *depth,
+                    },
+                    index: visible_range_start + ix,
+                    drifting: false,
+                });
+            }
+
+            // 情况2: 检查下一项是否"外缩"
+            if let Some(&(_next_ix, (_next_entry, next_depth))) = iter.peek() {
+                let next_item_outdented = *next_depth + 1 == *depth;
+                let depth_same_as_index = *depth == ix;
+                let depth_greater_than_index = *depth == ix + 1;
+
+                if next_item_outdented && (depth_same_as_index || depth_greater_than_index) {
+                    return Some(StickyAnchor {
+                        candidate: StickyFolderCandidate {
+                            global_index: visible_range_start + ix,
+                            depth: *depth,
+                        },
+                        index: visible_range_start + ix,
+                        drifting: depth_greater_than_index,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+struct StickyItemsElement {
+    drifting_element: Option<AnyElement>,
+    rest_elements: SmallVec<[AnyElement; 8]>,
+}
+
+impl IntoElement for StickyItemsElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for StickyItemsElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (window.request_layout(gpui::Style::default(), [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 先画drifting元素
+        if let Some(ref mut drifting_element) = self.drifting_element {
+            drifting_element.paint(window, cx);
+        }
+        // 再画rest元素
+        for item in self.rest_elements.iter_mut().rev() {
+            item.paint(window, cx);
+        }
+    }
+}
+
 impl Render for SidebarFileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -720,8 +1094,6 @@ impl Render for SidebarFileTree {
         let is_directory_loaded = self.loader.has_cached(&directory);
         let root_expanded = self.root_expanded;
 
-        let root_row_element = self.render_root_row(cx).into_any_element();
-
         let rows_element: gpui::AnyElement = if !root_expanded {
             div()
                 .id("sidebar-file-tree")
@@ -730,7 +1102,7 @@ impl Render for SidebarFileTree {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(root_row_element)
+                .child(self.render_root_row(cx))
                 .into_any_element()
         } else if is_directory_loaded && flat_count == 0 {
             div()
@@ -740,7 +1112,7 @@ impl Render for SidebarFileTree {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(root_row_element)
+                .child(self.render_root_row(cx))
                 .child(
                     div()
                         .w_full()
@@ -752,23 +1124,43 @@ impl Render for SidebarFileTree {
                 )
                 .into_any_element()
         } else {
-            let flat_rows = self.flat_cache.take().unwrap_or_default();
-            let mut list = div()
+            let scroll_handle = self.scroll_handle.clone();
+
+            let list = uniform_list(
+                "sidebar-file-tree-list",
+                flat_count,
+                cx.processor(|this, range: Range<usize>, _window, _cx| {
+                    let entries: Vec<(FileEntry, usize)> = if let Some(flat) = &this.flat_cache {
+                        range
+                            .filter_map(|ix| flat.get(ix).cloned())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    entries
+                        .iter()
+                        .map(|(entry, depth)| this.render_tree_row(entry, depth + 1, _cx))
+                        .collect()
+                }),
+            )
+            .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+            .track_scroll(&scroll_handle)
+            .with_decoration(StickyFolderDecoration {
+                entity: cx.entity(),
+            })
+            .flex_1()
+            .min_h_0();
+
+            div()
                 .id("sidebar-file-tree")
                 .w_full()
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .child(root_row_element);
-
-            for (entry, depth) in flat_rows {
-                // Children are indented one level deeper (depth + 1) relative to root row
-                list = list.child(self.render_tree_row(&entry, depth + 1, cx));
-            }
-
-            list.into_any_element()
+                .child(self.render_root_row(cx))
+                .child(list)
+                .into_any_element()
         };
 
         div()
