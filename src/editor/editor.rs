@@ -544,6 +544,55 @@ impl Editor {
         self.open_local_file(path, window, cx, false);
     }
 
+    /// Open a diff view for a file
+    pub fn open_diff_file(
+        &mut self,
+        path: String,
+        diff_content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = format!("diff-{}", path);
+
+        // If already open, just switch to it
+        if self.open_files.iter().any(|f| f.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            return;
+        }
+
+        let label = format!("Diff: {}", path);
+        let editor_state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .code_editor("text")
+                .multi_line(true);
+            state.set_value(&diff_content, window, cx);
+            state.disabled = true; // Read-only for diff view
+            state
+        });
+
+        self.open_files.push(EditorFile {
+            id: tab_id.clone().into(),
+            path: path.clone(),
+            label,
+            ssh_config: None,
+            editor_state,
+            original_content: diff_content,
+            pending_reload: false,
+            is_loading: false,
+        });
+
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(
+                TabItem::new(&tab_id, &format!("Diff: {}", path))
+                    .with_icon(Some(Icon::Git)),
+                cx,
+            );
+        });
+
+        self.switch_to_file(&tab_id, cx);
+        cx.notify();
+    }
+
     fn open_local_file(
         &mut self,
         path: PathBuf,

@@ -140,6 +140,10 @@ pub enum SidebarEvent {
         path: PathBuf,
         ssh_config: Option<SshConnectionConfig>,
     },
+    OpenDiff {
+        path: String,
+        diff_content: String,
+    },
 }
 
 pub struct MacosSidebar {
@@ -171,6 +175,8 @@ pub struct MacosSidebar {
     file_tree_subscription: Option<Subscription>,
     file_tree_event_subscription: Option<Subscription>,
     file_tree_panel_tabs: FileTreePanelTabs,
+    git_panel: Option<Entity<crate::sidebar_view::git_panel::GitPanel>>,
+    git_panel_subscription: Option<Subscription>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
@@ -232,6 +238,8 @@ impl MacosSidebar {
             file_tree_subscription: None,
             file_tree_event_subscription: None,
             file_tree_panel_tabs: FileTreePanelTabs::new(),
+            git_panel: None,
+            git_panel_subscription: None,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,
@@ -463,6 +471,46 @@ impl MacosSidebar {
         self.file_tree_view = Some(file_tree);
         self.file_tree_target_label = Some(display_name);
         self.current_view = SidebarView::FileTree;
+
+        // Create git panel if not exists and subscribe to events
+        if self.git_panel.is_none() {
+            let git_panel = cx.new(|cx| {
+                crate::sidebar_view::git_panel::GitPanel::new(cx)
+            });
+            self.git_panel = Some(git_panel);
+        }
+
+        // Subscribe to git panel events
+        self.git_panel_subscription.take();
+        if let Some(ref git_panel) = self.git_panel {
+            // Set workspace path
+            if let Some(ref file_tree) = self.file_tree_view {
+                let workspace_path = file_tree.read(cx).root_path().to_path_buf();
+                git_panel.update(cx, |panel, cx| {
+                    panel.set_workspace_path(workspace_path, cx);
+                });
+            }
+
+            // Subscribe to events
+            let sub = cx.subscribe(
+                git_panel,
+                |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| {
+                    match event {
+                        crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
+                            path,
+                            diff_content,
+                        } => {
+                            cx.emit(SidebarEvent::OpenDiff {
+                                path: path.clone(),
+                                diff_content: diff_content.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                },
+            );
+            self.git_panel_subscription = Some(sub);
+        }
 
         // 触发编辑器状态保存/恢复
         let new_key = crate::editor::FileTreeKey::new(
@@ -2021,19 +2069,26 @@ impl MacosSidebar {
                         .child("搜索"),
                 )
                 .into_any_element(),
-            FileTreePanel::Git => div()
-                .w_full()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
+            FileTreePanel::Git => {
+                if let Some(ref git_panel) = self.git_panel {
                     div()
+                        .w_full()
+                        .h_full()
+                        .child(git_panel.clone())
+                        .into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .text_sm()
                         .text_color(theme.text_subtle)
-                        .child("Git"),
-                )
-                .into_any_element(),
+                        .child("Git")
+                        .into_any_element()
+                }
+            }
         };
 
         div()

@@ -81,6 +81,11 @@ pub enum Icon {
     Clock,
     FolderOutline,
     XmarkCircleFill,
+    // Git status icons
+    SquareDot,    // Modified
+    SquarePlus,   // Added
+    SquareMinus,  // Deleted
+    Warning,      // Conflicted
 }
 
 impl Icon {
@@ -139,6 +144,10 @@ impl Icon {
             Icon::Clock => SharedString::new_static("icons/clock.svg"),
             Icon::FolderOutline => SharedString::new_static("icons/folder.svg"),
             Icon::XmarkCircleFill => SharedString::new_static("icons/xmark.circle.fill.svg"),
+            Icon::SquareDot => SharedString::new_static("icons/square_dot.svg"),
+            Icon::SquarePlus => SharedString::new_static("icons/square_plus.svg"),
+            Icon::SquareMinus => SharedString::new_static("icons/square_minus.svg"),
+            Icon::Warning => SharedString::new_static("icons/warning.svg"),
         }
     }
 }

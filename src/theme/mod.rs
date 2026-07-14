@@ -62,6 +62,11 @@ pub struct UiTheme {
     pub error_foreground: Hsla,
     pub notification_background: Hsla,
     pub shadow: Hsla,
+    // Git status colors
+    pub status_modified: Hsla,
+    pub status_added: Hsla,
+    pub status_deleted: Hsla,
+    pub status_conflict: Hsla,
 }
 
 impl UiTheme {
@@ -397,6 +402,15 @@ struct UiThemeFile {
     error_foreground: String,
     notification_background: String,
     shadow: String,
+    // Git status colors
+    #[serde(default = "default_status_modified")]
+    status_modified: String,
+    #[serde(default = "default_status_added")]
+    status_added: String,
+    #[serde(default = "default_status_deleted")]
+    status_deleted: String,
+    #[serde(default = "default_status_conflict")]
+    status_conflict: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -568,6 +582,22 @@ fn parse_color(value: &str) -> anyhow::Result<Hsla> {
     }
 }
 
+fn default_status_modified() -> String {
+    "#e2b93d".to_string()
+}
+
+fn default_status_added() -> String {
+    "#4caf50".to_string()
+}
+
+fn default_status_deleted() -> String {
+    "#f44336".to_string()
+}
+
+fn default_status_conflict() -> String {
+    "#ff9800".to_string()
+}
+
 impl TryFrom<UiThemeFile> for UiTheme {
     type Error = anyhow::Error;
 
@@ -606,6 +636,10 @@ impl TryFrom<UiThemeFile> for UiTheme {
             error_foreground: parse_color(&value.error_foreground)?,
             notification_background: parse_color(&value.notification_background)?,
             shadow: parse_color(&value.shadow)?,
+            status_modified: parse_color(&value.status_modified)?,
+            status_added: parse_color(&value.status_added)?,
+            status_deleted: parse_color(&value.status_deleted)?,
+            status_conflict: parse_color(&value.status_conflict)?,
         })
     }
 }
