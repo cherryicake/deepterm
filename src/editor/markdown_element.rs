@@ -2,14 +2,14 @@ use std::ops::Range;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ClickEvent, ClipboardItem, Div, EdgesRefinement, IntoElement, Length, ParentElement,
-    SharedString, Stateful, StyleRefinement, Styled, StyledText, TextRun, TextStyleRefinement, div,
-    px, rems,
+    AnyElement, ClickEvent, ClipboardItem, Div, EdgesRefinement, Entity, IntoElement, Length,
+    ParentElement, SharedString, Stateful, StyleRefinement, Styled, StyledText, TextRun,
+    TextStyleRefinement, div, px, rems,
 };
 
 use crate::theme::ActiveTheme;
 
-use super::markdown::{MarkdownStyle, highlight_code_runs};
+use super::markdown::{Markdown, MarkdownStyle, highlight_code_runs};
 use super::markdown_parser::{
     ColumnAlign, MarkdownEvent, MarkdownTag, MarkdownTagEnd,
 };
@@ -20,10 +20,10 @@ pub enum AnyDiv {
 }
 
 impl AnyDiv {
-    fn into_any_element(self) -> AnyElement {
+    fn style(&mut self) -> &mut StyleRefinement {
         match self {
-            Self::Div(div) => div.into_any_element(),
-            Self::Stateful(div) => div.into_any_element(),
+            Self::Div(div) => div.style(),
+            Self::Stateful(div) => div.style(),
         }
     }
 }
@@ -88,6 +88,12 @@ struct TableState {
     current_row: Vec<String>,
 }
 
+struct LinkState {
+    url: String,
+    text: String,
+    runs: Vec<TextRun>,
+}
+
 pub struct MarkdownElementBuilder {
     style: MarkdownStyle,
     div_stack: Vec<DivStackEntry>,
@@ -101,10 +107,19 @@ pub struct MarkdownElementBuilder {
     blockquote_depth: usize,
     heading_level: u8,
     pending_task: Option<(bool, Range<usize>)>,
+    link_state: Option<LinkState>,
+    copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
+    wrapped_code_blocks: std::collections::HashSet<usize>,
+    markdown: Entity<Markdown>,
 }
 
 impl MarkdownElementBuilder {
-    pub fn new(style: MarkdownStyle) -> Self {
+    pub fn new(
+        style: MarkdownStyle,
+        copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
+        wrapped_code_blocks: std::collections::HashSet<usize>,
+        markdown: Entity<Markdown>,
+    ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
         Self {
@@ -124,6 +139,10 @@ impl MarkdownElementBuilder {
             blockquote_depth: 0,
             heading_level: 0,
             pending_task: None,
+            link_state: None,
+            copied_code_blocks,
+            wrapped_code_blocks,
+            markdown,
         }
     }
 
@@ -153,7 +172,11 @@ impl MarkdownElementBuilder {
         match event {
             MarkdownEvent::Start(tag) => match tag {
                 MarkdownTag::Paragraph => {
-                    self.push_div(div().mb_2().line_height(rems(1.3)), &range, markdown_end);
+                    self.push_div(
+                        div().flex().flex_wrap().items_center().mb_2().line_height(rems(1.3)),
+                        &range,
+                        markdown_end,
+                    );
                     if self.blockquote_depth > 0 {
                         self.push_text_style(self.style.block_quote.clone());
                     }
@@ -185,18 +208,40 @@ impl MarkdownElementBuilder {
                     );
                     self.code_block_content.push(String::new());
                     self.code_block_index += 1;
-                    let mut code_block = div().group("code-block").relative().w_full();
-                    code_block.style().refine(&self.style.code_block);
-                    let code_block = if self.style.code_block_overflow_x_scroll {
-                        code_block.id("code-block-scroll").overflow_x_scroll()
+                    let index = self.code_block_index;
+                    let has_language = self
+                        .code_block_language
+                        .last()
+                        .and_then(|l| l.as_ref())
+                        .is_some();
+                    let is_wrapped = self.wrapped_code_blocks.contains(&index);
+                    let mut outer = div().group("code-block").relative().w_full();
+                    outer.style().refine(&self.style.code_block);
+                    self.push_div(outer, &range, markdown_end);
+                    let inner: AnyDiv = if is_wrapped {
+                        let mut d = div().w_full();
+                        if has_language {
+                            d = d.pt(px(20.0));
+                        }
+                        d.into()
                     } else {
-                        code_block.id("code-block")
+                        let mut d = div()
+                            .id(format!("code-inner-{}", index))
+                            .overflow_x_scroll();
+                        if has_language {
+                            d = d.pt(px(20.0));
+                        }
+                        d.into()
                     };
-                    self.push_div(code_block, &range, markdown_end);
+                    self.push_div(inner, &range, markdown_end);
                     self.push_text_style(TextStyleRefinement {
                         font_family: self.style.code_block.text.font_family.clone(),
                         font_size: self.style.code_block.text.font_size,
-                        white_space: self.style.code_block.text.white_space,
+                        white_space: if is_wrapped {
+                            Some(gpui::WhiteSpace::Normal)
+                        } else {
+                            Some(gpui::WhiteSpace::Nowrap)
+                        },
                         ..Default::default()
                     });
                 }
@@ -293,9 +338,15 @@ impl MarkdownElementBuilder {
                     });
                 }
                 MarkdownTag::Link { dest_url } => {
+                    self.flush_text();
+                    self.link_state = Some(LinkState {
+                        url: dest_url.clone(),
+                        text: String::new(),
+                        runs: Vec::new(),
+                    });
                     self.push_text_style(self.style.link.clone());
                 }
-                MarkdownTag::Image { dest_url } => {
+                MarkdownTag::Image { dest_url: _ } => {
                     // Images not supported in this simplified version
                 }
             },
@@ -311,24 +362,83 @@ impl MarkdownElementBuilder {
                     self.pop_div();
                 }
                 MarkdownTagEnd::CodeBlock => {
+                    self.pop_div();
                     let content = self.code_block_content.pop().unwrap_or_default();
-                    let id = SharedString::from(format!("copy-{}", self.code_block_index));
-                    let button = div()
-                        .id(id.clone())
-                        .absolute()
-                        .top(px(8.0))
-                        .right(px(8.0))
+                    let index = self.code_block_index;
+                    let language = self.code_block_language.last().cloned().flatten();
+                    let copy_id = gpui::ElementId::Name(SharedString::from(format!(
+                        "copy-{}",
+                        index
+                    )));
+                    let copied = self.copied_code_blocks.contains(&copy_id);
+                    let is_wrapped = self.wrapped_code_blocks.contains(&index);
+
+                    if let Some(lang) = language {
+                        let label = div()
+                            .absolute()
+                            .top(px(8.0))
+                            .left(px(8.0))
+                            .px_1()
+                            .text_size(px(10.0))
+                            .text_color(cx.theme().ui.text_muted)
+                            .child(lang.to_uppercase())
+                            .into_any_element();
+                        self.append_child(label);
+                    }
+
+                    let copy_content = content.clone();
+                    let copy_id_for_click = copy_id.clone();
+                    let markdown_copy = self.markdown.clone();
+                    let copy_label = if copied { "Copied" } else { "Copy" };
+                    let copy_btn = div()
+                        .id(copy_id)
                         .px_2()
                         .py_1()
                         .rounded(px(4.0))
                         .text_size(px(11.0))
                         .cursor_pointer()
-                        .child("Copy")
+                        .child(copy_label)
                         .on_click(move |_: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                copy_content.clone(),
+                            ));
+                            markdown_copy.update(cx, |markdown, cx| {
+                                markdown.mark_code_block_copied(
+                                    copy_id_for_click.clone(),
+                                    cx,
+                                );
+                            });
                         })
                         .into_any_element();
-                    self.append_child(button);
+
+                    let wrap_label = if is_wrapped { "Unwrap" } else { "Wrap" };
+                    let markdown_wrap = self.markdown.clone();
+                    let wrap_btn = div()
+                        .id(format!("wrap-{}", index))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .text_size(px(11.0))
+                        .cursor_pointer()
+                        .child(wrap_label)
+                        .on_click(move |_: &ClickEvent, _, cx| {
+                            markdown_wrap.update(cx, |markdown, cx| {
+                                markdown.toggle_code_block_wrap(index, cx);
+                            });
+                        })
+                        .into_any_element();
+
+                    let buttons = div()
+                        .absolute()
+                        .top(px(8.0))
+                        .right(px(8.0))
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .children([copy_btn, wrap_btn])
+                        .into_any_element();
+                    self.append_child(buttons);
+
                     self.pop_text_style();
                     self.code_block_language.pop();
                     self.pop_div();
@@ -363,9 +473,26 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTagEnd::Emphasis
                 | MarkdownTagEnd::Strong
-                | MarkdownTagEnd::Strikethrough
-                | MarkdownTagEnd::Link => {
+                | MarkdownTagEnd::Strikethrough => {
                     self.pop_text_style();
+                }
+                MarkdownTagEnd::Link => {
+                    self.pop_text_style();
+                    if let Some(link) = self.link_state.take() {
+                        let styled_text =
+                            StyledText::new(link.text).with_runs(link.runs);
+                        let url = link.url.clone();
+                        let url_for_id = SharedString::from(url.clone());
+                        let link_el = div()
+                            .id(url_for_id)
+                            .cursor_pointer()
+                            .on_click(move |_: &ClickEvent, _, _cx| {
+                                let _ = open::that(&url);
+                            })
+                            .child(styled_text)
+                            .into_any_element();
+                        self.append_child(link_el);
+                    }
                 }
                 MarkdownTagEnd::Image => {}
             },
@@ -417,6 +544,17 @@ impl MarkdownElementBuilder {
 
     fn push_text(
         &mut self, text: &str, _range: &Range<usize>, cx: &mut gpui::App) {
+        if self.link_state.is_some() {
+            let run = {
+                let style = self.text_style();
+                style.to_run(text.len())
+            };
+            if let Some(ref mut link) = self.link_state {
+                link.text.push_str(text);
+                link.runs.push(run);
+            }
+            return;
+        }
         if self.code_block_language.last().and_then(|l| l.as_ref()).is_some() {
             self.push_code_text(text, cx);
             return;

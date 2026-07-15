@@ -16,7 +16,6 @@ pub struct MarkdownStyle {
     pub base_text_style: gpui::TextStyle,
     pub container_style: StyleRefinement,
     pub code_block: StyleRefinement,
-    pub code_block_overflow_x_scroll: bool,
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
@@ -63,8 +62,6 @@ impl MarkdownStyle {
             background: Some(ui.panel_background.into()),
             text: TextStyleRefinement {
                 font_family: Some(SharedString::from("monospace")),
-                font_size: Some(px(13.).into()),
-                white_space: Some(gpui::WhiteSpace::Nowrap),
                 ..Default::default()
             },
             ..Default::default()
@@ -118,7 +115,6 @@ impl MarkdownStyle {
             base_text_style,
             container_style: StyleRefinement::default(),
             code_block,
-            code_block_overflow_x_scroll: true,
             inline_code,
             block_quote: TextStyleRefinement {
                 color: Some(ui.text_muted),
@@ -148,6 +144,7 @@ pub struct Markdown {
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
+    wrapped_code_blocks: std::collections::HashSet<usize>,
 }
 
 impl Markdown {
@@ -160,6 +157,7 @@ impl Markdown {
             focus_handle,
             scroll_handle: ScrollHandle::new(),
             copied_code_blocks: std::collections::HashSet::new(),
+            wrapped_code_blocks: std::collections::HashSet::new(),
         };
         this.set_text(source, cx);
         this
@@ -199,6 +197,19 @@ impl Markdown {
         self.copied_code_blocks.insert(id);
         cx.notify();
     }
+
+    pub fn toggle_code_block_wrap(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wrapped_code_blocks.contains(&index) {
+            self.wrapped_code_blocks.remove(&index);
+        } else {
+            self.wrapped_code_blocks.insert(index);
+        }
+        cx.notify();
+    }
 }
 
 impl Focusable for Markdown {
@@ -208,12 +219,16 @@ impl Focusable for Markdown {
 }
 
 impl Render for Markdown {
-    fn render(&mut self,
+    fn render(
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let style = MarkdownStyle::themed(window, cx);
-        let elements = MarkdownElementBuilder::new(style)
+        let copied = self.copied_code_blocks.clone();
+        let wrapped = self.wrapped_code_blocks.clone();
+        let markdown = cx.entity();
+        let elements = MarkdownElementBuilder::new(style, copied, wrapped, markdown)
             .build(self.events.clone(), cx);
         let theme = cx.theme().ui;
         let scroll_handle = self.scroll_handle.clone();
