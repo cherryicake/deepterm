@@ -1,6 +1,6 @@
 use gpui::SharedString;
 
-use crate::components::input::highlighter::LanguageConfig;
+use crate::syntax::LanguageConfig;
 
 #[cfg(not(feature = "tree-sitter-languages"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]

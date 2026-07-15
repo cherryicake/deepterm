@@ -6,7 +6,6 @@ pub mod history;
 pub mod blink_cursor;
 pub mod display_map;
 pub mod element;
-pub mod highlighter;
 pub mod indent;
 pub mod input;
 pub mod mode;

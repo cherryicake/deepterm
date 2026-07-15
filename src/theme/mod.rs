@@ -9,7 +9,7 @@ pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::components::input::highlighter::{
+use crate::syntax::{
     HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
 };
 

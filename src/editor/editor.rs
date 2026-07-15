@@ -49,6 +49,7 @@ struct EditorFile {
     original_content: String,
     pending_reload: bool,
     is_loading: bool,
+    markdown: Option<Entity<crate::editor::markdown::Markdown>>,
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -269,6 +270,16 @@ impl Editor {
         let label = file_info.label.clone();
         let ssh_config = file_info.ssh_config.clone();
 
+        let is_markdown = path_str.ends_with(".md");
+        let markdown = if is_markdown {
+            let content = editor_state.read(cx).value().to_string();
+            Some(cx.new(|cx| {
+                crate::editor::markdown::Markdown::new(content, cx)
+            }))
+        } else {
+            None
+        };
+
         let file = EditorFile {
             id: file_info.id.clone(),
             path: path_str,
@@ -278,6 +289,7 @@ impl Editor {
             original_content: String::new(),
             pending_reload: false,
             is_loading: false,
+            markdown,
         };
 
         self.open_files.push(file);
@@ -378,8 +390,13 @@ impl Editor {
                             if current == file.original_content {
                                 file.original_content = content.clone();
                                 file.editor_state.update(cx, |state, cx| {
-                                    state.set_text(content, cx);
+                                    state.set_text(content.clone(), cx);
                                 });
+                                if let Some(ref markdown) = file.markdown {
+                                    markdown.update(cx, |renderer, cx| {
+                                        renderer.set_text(content.clone(), cx);
+                                    });
+                                }
                             } else {
                                 log::info!(
                                     "File changed externally but has unsaved changes: {}",
@@ -579,6 +596,7 @@ impl Editor {
             original_content: diff_content,
             pending_reload: false,
             is_loading: false,
+            markdown: None,
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -698,8 +716,13 @@ impl Editor {
                                 }
                                 file.editor_state.update(cx, |state, cx| {
                                     state.disabled = false;
-                                    state.set_text(content, cx);
+                                    state.set_text(content.clone(), cx);
                                 });
+                                if let Some(ref markdown) = file.markdown {
+                                    markdown.update(cx, |renderer, cx| {
+                                        renderer.set_text(content.clone(), cx);
+                                    });
+                                }
                             }
                             this.tab_bar.update(cx, |tab_bar, cx| {
                                 tab_bar.modify_tab(
@@ -886,6 +909,16 @@ impl Editor {
             state
         });
 
+        let is_markdown = path.extension().and_then(|e| e.to_str()) == Some("md");
+        let markdown = if is_markdown {
+            let content_clone = content.clone();
+            Some(cx.new(|cx| {
+                crate::editor::markdown::Markdown::new(content_clone, cx)
+            }))
+        } else {
+            None
+        };
+
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),
             path: path_str,
@@ -895,6 +928,7 @@ impl Editor {
             original_content: content.clone(),
             pending_reload: false,
             is_loading,
+            markdown,
         });
 
         let is_local = self
@@ -1155,20 +1189,37 @@ impl Render for Editor {
         let content: gpui::AnyElement = if !is_empty {
             if let Some(active_id) = &self.active_file_id {
                 if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
-                    div()
-                        .w_full()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .bg(theme.app_background)
-                        .when(self.content_left_padding > 0.0, |this| {
-                            this.pl(px(self.content_left_padding))
-                        })
-                        .when(self.content_bottom_padding > 0.0, |this| {
-                            this.pb(px(self.content_bottom_padding))
-                        })
-                        .child(EditorInput::new(&file.editor_state))
-                        .into_any_element()
+                    if let Some(markdown) = &file.markdown {
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .bg(theme.app_background)
+                            .when(self.content_left_padding > 0.0, |this| {
+                                this.pl(px(self.content_left_padding))
+                            })
+                            .when(self.content_bottom_padding > 0.0, |this| {
+                                this.pb(px(self.content_bottom_padding))
+                            })
+                            .child(markdown.clone())
+                            .into_any_element()
+                    } else {
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .bg(theme.app_background)
+                            .when(self.content_left_padding > 0.0, |this| {
+                                this.pl(px(self.content_left_padding))
+                            })
+                            .when(self.content_bottom_padding > 0.0, |this| {
+                                this.pb(px(self.content_bottom_padding))
+                            })
+                            .child(EditorInput::new(&file.editor_state))
+                            .into_any_element()
+                    }
                 } else {
                     div().into_any_element()
                 }

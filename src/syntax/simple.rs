@@ -6,8 +6,6 @@ use streaming_iterator::StreamingIterator;
 use sum_tree::Bias;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-use crate::components::input::RopeExt as _;
-
 pub struct InjectionParseData;
 pub struct InjectionLayer;
 
@@ -17,6 +15,29 @@ pub struct SimpleHighlighter {
     query: Option<Query>,
     tree: Option<Tree>,
     text: Rope,
+}
+
+fn clip_offset(rope: &Rope, offset: usize, bias: Bias) -> usize {
+    if offset > rope.len() {
+        return rope.len();
+    }
+    if rope.is_char_boundary(offset) {
+        return offset;
+    }
+    if bias == Bias::Left {
+        let mut o = offset;
+        while o > 0 && !rope.is_char_boundary(o) {
+            o -= 1;
+        }
+        o
+    } else {
+        let mut o = offset;
+        let len = rope.len();
+        while o < len && !rope.is_char_boundary(o) {
+            o += 1;
+        }
+        o
+    }
 }
 
 impl SimpleHighlighter {
@@ -169,7 +190,7 @@ impl SimpleHighlighter {
     pub fn styles(
         &mut self,
         range: &Range<usize>,
-        theme: &crate::components::input::highlighter::HighlightTheme,
+        theme: &crate::syntax::HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         let query = match &self.query {
             Some(q) => q,
@@ -195,8 +216,8 @@ impl SimpleHighlighter {
                 let mut s = cap_range.start.max(range.start).min(range.end);
                 let mut e = cap_range.end.min(range.end).max(s);
                 // Ensure byte offsets are on char boundaries to avoid invalid UTF-8 slices
-                s = self.text.clip_offset(s, Bias::Right);
-                e = self.text.clip_offset(e, Bias::Left);
+                s = clip_offset(&self.text, s, Bias::Right);
+                e = clip_offset(&self.text, e, Bias::Left);
                 if e > s {
                     styles.push((s..e, theme.style(name).unwrap_or_default()));
                 }
@@ -404,9 +425,7 @@ fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::input::highlighter::{
-        HighlightTheme, HighlightThemeStyle, registry::SyntaxColors,
-    };
+    use crate::syntax::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
     use crate::theme::ThemeAppearance;
 
     fn test_theme() -> HighlightTheme {
@@ -415,22 +434,22 @@ mod tests {
             appearance: ThemeAppearance::Dark,
             style: HighlightThemeStyle {
                 syntax: SyntaxColors {
-                    keyword: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    keyword: Some(crate::syntax::ThemeStyle::color(
                         gpui::red(),
                     )),
-                    type_: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    type_: Some(crate::syntax::ThemeStyle::color(
                         gpui::blue(),
                     )),
-                    function: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    function: Some(crate::syntax::ThemeStyle::color(
                         gpui::green(),
                     )),
-                    number: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    number: Some(crate::syntax::ThemeStyle::color(
                         gpui::yellow(),
                     )),
-                    string: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    string: Some(crate::syntax::ThemeStyle::color(
                         gpui::blue(),
                     )),
-                    comment: Some(crate::components::input::highlighter::ThemeStyle::color(
+                    comment: Some(crate::syntax::ThemeStyle::color(
                         gpui::red(),
                     )),
                     ..Default::default()
