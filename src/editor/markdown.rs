@@ -1,9 +1,12 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    Context, FocusHandle, Focusable, Hsla, IntoElement, Render, ScrollHandle, SharedString,
-    StyleRefinement, TextRun, TextStyleRefinement, Window, div, px, rems,
+    Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, ListAlignment, ListState, Render,
+    SharedString, StyleRefinement, TextRun, TextStyleRefinement, Window, div, list, px, rems,
 };
 
 use crate::syntax::SyntaxHighlighter;
@@ -12,6 +15,7 @@ use crate::theme::{ActiveTheme, AppTheme};
 use super::markdown_element::MarkdownElementBuilder;
 use super::markdown_parser::{MarkdownEvent, parse_markdown};
 
+#[derive(Clone)]
 pub struct MarkdownStyle {
     pub base_text_style: gpui::TextStyle,
     pub container_style: StyleRefinement,
@@ -141,10 +145,12 @@ impl MarkdownStyle {
 pub struct Markdown {
     source: SharedString,
     events: Vec<(Range<usize>, MarkdownEvent)>,
+    item_ranges: Vec<Range<usize>>,
     focus_handle: FocusHandle,
-    scroll_handle: ScrollHandle,
     copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
     wrapped_code_blocks: std::collections::HashSet<usize>,
+    highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
+    list_state: ListState,
 }
 
 impl Markdown {
@@ -154,10 +160,12 @@ impl Markdown {
         let mut this = Self {
             source: SharedString::default(),
             events: Vec::new(),
+            item_ranges: Vec::new(),
             focus_handle,
-            scroll_handle: ScrollHandle::new(),
             copied_code_blocks: std::collections::HashSet::new(),
             wrapped_code_blocks: std::collections::HashSet::new(),
+            highlight_cache: Rc::new(RefCell::new(HashMap::new())),
+            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
         };
         this.set_text(source, cx);
         this
@@ -169,12 +177,17 @@ impl Markdown {
             return;
         }
         self.source = text;
+        self.copied_code_blocks.clear();
+        self.wrapped_code_blocks.clear();
+        self.highlight_cache.borrow_mut().clear();
         self.parse();
         cx.notify();
     }
 
     fn parse(&mut self) {
         self.events = parse_markdown(&self.source);
+        self.item_ranges = compute_item_ranges(&self.events);
+        self.list_state.reset(self.item_ranges.len());
     }
 
     pub fn source(&self) -> &SharedString {
@@ -200,14 +213,15 @@ impl Markdown {
 
     pub fn toggle_code_block_wrap(
         &mut self,
-        index: usize,
+        source_offset: usize,
         cx: &mut Context<Self>,
     ) {
-        if self.wrapped_code_blocks.contains(&index) {
-            self.wrapped_code_blocks.remove(&index);
+        if self.wrapped_code_blocks.contains(&source_offset) {
+            self.wrapped_code_blocks.remove(&source_offset);
         } else {
-            self.wrapped_code_blocks.insert(index);
+            self.wrapped_code_blocks.insert(source_offset);
         }
+        self.list_state.reset(self.item_ranges.len());
         cx.notify();
     }
 }
@@ -221,38 +235,95 @@ impl Focusable for Markdown {
 impl Render for Markdown {
     fn render(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let style = MarkdownStyle::themed(window, cx);
-        let copied = self.copied_code_blocks.clone();
-        let wrapped = self.wrapped_code_blocks.clone();
-        let markdown = cx.entity();
-        let elements = MarkdownElementBuilder::new(style, copied, wrapped, markdown)
-            .build(self.events.clone(), cx);
         let theme = cx.theme().ui;
-        let scroll_handle = self.scroll_handle.clone();
+        let markdown = cx.entity();
+        let list_state = self.list_state.clone();
+        let style = MarkdownStyle::themed(_window, cx);
 
         div()
             .id("markdown")
             .key_context("Markdown")
             .track_focus(&self.focus_handle)
-            .w_full()
-            .h_full()
+            .size_full()
             .overflow_hidden()
             .bg(theme.app_background)
             .child(
                 div()
-                    .id("markdown-scroll")
-                    .w_full()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&scroll_handle)
                     .px_8()
                     .py_6()
-                    .children(elements),
+                    .size_full()
+                    .child(
+                        list(list_state, move |ix, window, cx| {
+                            Self::render_item(markdown.clone(), ix, window, cx, style.clone())
+                        })
+                        .size_full(),
+                    ),
             )
     }
+}
+
+impl Markdown {
+    fn render_item(
+        markdown: Entity<Markdown>,
+        ix: usize,
+        _window: &mut Window,
+        cx: &mut gpui::App,
+        style: MarkdownStyle,
+    ) -> gpui::AnyElement {
+        let (copied, wrapped, events, highlight_cache) = markdown
+            .update(cx, |markdown, _cx| {
+                let range = markdown.item_ranges[ix].clone();
+                (
+                    markdown.copied_code_blocks.clone(),
+                    markdown.wrapped_code_blocks.clone(),
+                    markdown.events[range].to_vec(),
+                    markdown.highlight_cache.clone(),
+                )
+            });
+
+        let elements = MarkdownElementBuilder::new(
+            style,
+            copied,
+            wrapped,
+            markdown,
+            highlight_cache,
+        )
+        .build(&events, cx);
+
+        div().children(elements).into_any_element()
+    }
+}
+
+fn compute_item_ranges(events: &[(Range<usize>, MarkdownEvent)]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    for (i, (_, event)) in events.iter().enumerate() {
+        match event {
+            MarkdownEvent::Start(_) => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            MarkdownEvent::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    ranges.push(start..i + 1);
+                }
+            }
+            MarkdownEvent::Rule => {
+                if depth == 0 {
+                    ranges.push(i..i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
 }
 
 pub fn highlight_code_runs(

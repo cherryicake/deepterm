@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -101,7 +104,7 @@ pub struct MarkdownElementBuilder {
     text_style_stack: Vec<TextStyleRefinement>,
     code_block_language: Vec<Option<String>>,
     code_block_content: Vec<String>,
-    code_block_index: usize,
+    code_block_ids: Vec<usize>,
     list_stack: Vec<Option<u64>>,
     table: TableState,
     blockquote_depth: usize,
@@ -111,6 +114,7 @@ pub struct MarkdownElementBuilder {
     copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
     wrapped_code_blocks: std::collections::HashSet<usize>,
     markdown: Entity<Markdown>,
+    highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
 }
 
 impl MarkdownElementBuilder {
@@ -119,6 +123,7 @@ impl MarkdownElementBuilder {
         copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
         wrapped_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
+        highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
     ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
@@ -129,7 +134,7 @@ impl MarkdownElementBuilder {
             text_style_stack: Vec::new(),
             code_block_language: Vec::new(),
             code_block_content: Vec::new(),
-            code_block_index: 0,
+            code_block_ids: Vec::new(),
             list_stack: Vec::new(),
             table: TableState {
                 alignments: Vec::new(),
@@ -143,17 +148,18 @@ impl MarkdownElementBuilder {
             copied_code_blocks,
             wrapped_code_blocks,
             markdown,
+            highlight_cache,
         }
     }
 
     pub fn build(
         mut self,
-        events: Vec<(Range<usize>, MarkdownEvent)>,
+        events: &[(Range<usize>, MarkdownEvent)],
         cx: &mut gpui::App,
     ) -> Vec<AnyElement> {
         let markdown_end = events.last().map(|(r, _)| r.end).unwrap_or(0);
         for (range, event) in events {
-            self.process_event(range, event, markdown_end, cx);
+            self.process_event(range.clone(), event.clone(), markdown_end, cx);
         }
         self.flush_text();
         while self.div_stack.len() > 1 {
@@ -207,14 +213,14 @@ impl MarkdownElementBuilder {
                         }
                     );
                     self.code_block_content.push(String::new());
-                    self.code_block_index += 1;
-                    let index = self.code_block_index;
+                    let code_block_id = range.start;
+                    self.code_block_ids.push(code_block_id);
                     let has_language = self
                         .code_block_language
                         .last()
                         .and_then(|l| l.as_ref())
                         .is_some();
-                    let is_wrapped = self.wrapped_code_blocks.contains(&index);
+                    let is_wrapped = self.wrapped_code_blocks.contains(&code_block_id);
                     let mut outer = div().group("code-block").relative().w_full();
                     outer.style().refine(&self.style.code_block);
                     self.push_div(outer, &range, markdown_end);
@@ -226,7 +232,7 @@ impl MarkdownElementBuilder {
                         d.into()
                     } else {
                         let mut d = div()
-                            .id(format!("code-inner-{}", index))
+                            .id(format!("code-inner-{}", code_block_id))
                             .overflow_x_scroll();
                         if has_language {
                             d = d.pt(px(20.0));
@@ -364,14 +370,14 @@ impl MarkdownElementBuilder {
                 MarkdownTagEnd::CodeBlock => {
                     self.pop_div();
                     let content = self.code_block_content.pop().unwrap_or_default();
-                    let index = self.code_block_index;
+                    let code_block_id = self.code_block_ids.pop().unwrap_or_default();
                     let language = self.code_block_language.last().cloned().flatten();
                     let copy_id = gpui::ElementId::Name(SharedString::from(format!(
                         "copy-{}",
-                        index
+                        code_block_id
                     )));
                     let copied = self.copied_code_blocks.contains(&copy_id);
-                    let is_wrapped = self.wrapped_code_blocks.contains(&index);
+                    let is_wrapped = self.wrapped_code_blocks.contains(&code_block_id);
 
                     if let Some(lang) = language {
                         let label = div()
@@ -414,7 +420,7 @@ impl MarkdownElementBuilder {
                     let wrap_label = if is_wrapped { "Unwrap" } else { "Wrap" };
                     let markdown_wrap = self.markdown.clone();
                     let wrap_btn = div()
-                        .id(format!("wrap-{}", index))
+                        .id(format!("wrap-{}", code_block_id))
                         .px_2()
                         .py_1()
                         .rounded(px(4.0))
@@ -423,7 +429,7 @@ impl MarkdownElementBuilder {
                         .child(wrap_label)
                         .on_click(move |_: &ClickEvent, _, cx| {
                             markdown_wrap.update(cx, |markdown, cx| {
-                                markdown.toggle_code_block_wrap(index, cx);
+                                markdown.toggle_code_block_wrap(code_block_id, cx);
                             });
                         })
                         .into_any_element();
@@ -543,7 +549,7 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(
-        &mut self, text: &str, _range: &Range<usize>, cx: &mut gpui::App) {
+        &mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         if self.link_state.is_some() {
             let run = {
                 let style = self.text_style();
@@ -556,7 +562,7 @@ impl MarkdownElementBuilder {
             return;
         }
         if self.code_block_language.last().and_then(|l| l.as_ref()).is_some() {
-            self.push_code_text(text, cx);
+            self.push_code_text(text, range, cx);
             return;
         }
         let style = self.text_style();
@@ -565,12 +571,16 @@ impl MarkdownElementBuilder {
     }
 
     fn push_code_text(
-        &mut self, text: &str, cx: &mut gpui::App) {
+        &mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         let style = self.text_style();
         let language = self.code_block_language.last().unwrap().clone().unwrap();
-        let runs = highlight_code_runs(text, &language, &style, cx.theme());
+        let key = (language.clone(), range.clone());
+        let mut cache = self.highlight_cache.borrow_mut();
+        let cached = cache
+            .entry(key)
+            .or_insert_with(|| highlight_code_runs(text, &language, &style, cx.theme()));
+        self.pending_line.runs.extend(cached.iter().cloned());
         self.pending_line.text.push_str(text);
-        self.pending_line.runs.extend(runs);
         if let Some(content) = self.code_block_content.last_mut() {
             content.push_str(text);
         }
