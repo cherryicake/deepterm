@@ -4,8 +4,8 @@
 //! 持久化范式与 `theme.json` / `ssh.json` 一致：`~/.config/deepterm/command_history.json`，
 //! serde + 同步小 JSON 读写。记录只发生在回车提交时（低频），开销可忽略。
 
-use std::path::PathBuf;
 use parking_lot::Mutex;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -129,10 +129,7 @@ impl CommandHistory {
             })
             .collect();
 
-        hits.sort_by(|a, b| {
-            b.last_used
-                .cmp(&a.last_used)
-        });
+        hits.sort_by(|a, b| b.last_used.cmp(&a.last_used));
         hits.into_iter().take(MAX_MATCHES).cloned().collect()
     }
 

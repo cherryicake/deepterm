@@ -1,8 +1,8 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gpui::{
     AnyWindowHandle, App, Context, CursorStyle, Element, Entity, FocusHandle, Focusable,
@@ -20,7 +20,6 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
 
 use crate::components::button::Icon as MenuIcon;
 use crate::components::tab_bar::{CopyTabAddress, DraggedTab, DuplicateTab, TabBar, TabItem};
-use crate::terminal_view::TerminalView;
 use crate::file_manager::TransferStatusReporter;
 use crate::file_manager::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
@@ -30,9 +29,12 @@ use crate::file_manager::{
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
+use crate::terminal_view::TerminalView;
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
-use crate::workspace::session_state::{TabSessionState, TabSessionType, TerminalSessionState, WorkspaceSessionState};
+use crate::workspace::session_state::{
+    TabSessionState, TabSessionType, TerminalSessionState, WorkspaceSessionState,
+};
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 
 // Define workspace actions
@@ -42,7 +44,10 @@ actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
 pub enum WorkspaceEvent {
     SessionChanged,
     TabBarChanged,
-    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
+    OpenPath {
+        path: String,
+        ssh_config: Option<SshConnectionConfig>,
+    },
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
@@ -748,9 +753,13 @@ impl Workspace {
                     if let Some(os) = os {
                         let icon = os.icon();
                         self.tab_bar.update(cx, |tab_bar, cx| {
-                            tab_bar.modify_tab(&tab_id, |tab| {
-                                tab.icon = Some(icon);
-                            }, cx);
+                            tab_bar.modify_tab(
+                                &tab_id,
+                                |tab| {
+                                    tab.icon = Some(icon);
+                                },
+                                cx,
+                            );
                         });
                         cx.emit(WorkspaceEvent::TabBarChanged);
                     }
@@ -773,7 +782,11 @@ impl Workspace {
                     }
                 }
             }
-            PanelEvent::OpenPath { panel_id, path, ssh_config } => {
+            PanelEvent::OpenPath {
+                panel_id,
+                path,
+                ssh_config,
+            } => {
                 // 判断路径是文件还是目录
                 cx.emit(WorkspaceEvent::OpenPath {
                     path: path.clone(),
@@ -811,9 +824,13 @@ impl Workspace {
                             tab_info.label = label.clone();
                         }
                         self.tab_bar.update(cx, |tab_bar, cx| {
-                            tab_bar.modify_tab(&tab_id, |tab| {
-                                tab.label = label.clone().into();
-                            }, cx);
+                            tab_bar.modify_tab(
+                                &tab_id,
+                                |tab| {
+                                    tab.label = label.clone().into();
+                                },
+                                cx,
+                            );
                         });
                         cx.emit(WorkspaceEvent::SessionChanged);
                         cx.emit(WorkspaceEvent::TabBarChanged);
@@ -1393,10 +1410,14 @@ impl Workspace {
                 .unwrap_or_else(|| tab_info.label.clone());
             tab_info.label = label.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.modify_tab(&target_tab_id, |tab| {
-                    tab.label = label.clone().into();
-                    tab.icon = remaining_icon;
-                }, cx);
+                tab_bar.modify_tab(
+                    &target_tab_id,
+                    |tab| {
+                        tab.label = label.clone().into();
+                        tab.icon = remaining_icon;
+                    },
+                    cx,
+                );
             });
         }
 
@@ -1464,10 +1485,14 @@ impl Workspace {
         // 更新TabBar显示（Workspace使用统一图标）
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
-            tab_bar.modify_tab(&target_tab_id, |tab| {
-                tab.label = workspace_label.clone().into();
-                tab.icon = Some(crate::assets::Icon::Workspace);
-            }, cx);
+            tab_bar.modify_tab(
+                &target_tab_id,
+                |tab| {
+                    tab.label = workspace_label.clone().into();
+                    tab.icon = Some(crate::assets::Icon::Workspace);
+                },
+                cx,
+            );
         });
 
         // 重新订阅所有panel
@@ -1569,10 +1594,14 @@ impl Workspace {
             // 更新TabBar显示（Workspace使用统一图标）
             let workspace_label = self.generate_workspace_label();
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.modify_tab(&active_tab_id, |tab| {
-                    tab.label = workspace_label.clone().into();
-                    tab.icon = Some(crate::assets::Icon::Workspace);
-                }, cx);
+                tab_bar.modify_tab(
+                    &active_tab_id,
+                    |tab| {
+                        tab.label = workspace_label.clone().into();
+                        tab.icon = Some(crate::assets::Icon::Workspace);
+                    },
+                    cx,
+                );
             });
         }
 
@@ -1685,9 +1714,13 @@ impl Workspace {
                 .and_then(|p| p.read(cx).remote_os)
                 .map(|os| os.icon());
             self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.modify_tab(&active_tab_id, |tab| {
-                    tab.icon = remaining_icon;
-                }, cx);
+                tab_bar.modify_tab(
+                    &active_tab_id,
+                    |tab| {
+                        tab.icon = remaining_icon;
+                    },
+                    cx,
+                );
             });
         }
 
@@ -1985,11 +2018,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn terminal_view_for_tab(
-        &self,
-        tab_id: &str,
-        cx: &App,
-    ) -> Option<Entity<TerminalView>> {
+    pub fn terminal_view_for_tab(&self, tab_id: &str, cx: &App) -> Option<Entity<TerminalView>> {
         let tab_info = self.tabs.get(tab_id)?;
         let panel = tab_info
             .container
@@ -2016,7 +2045,9 @@ impl Workspace {
             return;
         };
 
-        let _ = sidebar.update(cx, |s, cx| s.set_terminal_file_tree(terminal_view, window, cx));
+        let _ = sidebar.update(cx, |s, cx| {
+            s.set_terminal_file_tree(terminal_view, window, cx)
+        });
     }
 
     /// 拷贝地址 - 将终端连接地址写入剪贴板
@@ -2046,22 +2077,14 @@ impl Workspace {
     }
 
     /// 复制标签页 - 创建新的终端标签页并初始化到相同的工作目录
-    fn handle_tab_duplicate(
-        &mut self,
-        tab_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_tab_duplicate(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(terminal_view) = self.terminal_view_for_tab(tab_id, cx) else {
             return;
         };
 
         let state = terminal_view.read(cx).session_state(cx);
         match state {
-            TerminalSessionState::Ssh {
-                config,
-                remote_cwd,
-            } => {
+            TerminalSessionState::Ssh { config, remote_cwd } => {
                 let panel = cx.new(|cx| {
                     Panel::with_ssh_terminal(
                         format!("panel-{}", self.next_panel_id),

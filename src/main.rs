@@ -21,7 +21,7 @@ pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, Entity, IntoElement, InteractiveElement, KeyBinding, ParentElement,
+    AnimationExt, App, Context, Entity, InteractiveElement, IntoElement, KeyBinding, ParentElement,
     Render, SharedString, Styled, Subscription, WeakEntity, Window, actions, div, px, svg,
 };
 
@@ -39,8 +39,8 @@ use crate::sidebar_view::keychain_view::KeychainSidebarView;
 
 use crate::ssh_view::picker::{ShowSshPicker, SshPicker};
 use crate::theme::ActiveTheme;
-use crate::workspace::client_decorations::client_side_decorations;
 use crate::workspace::ToggleSidebar;
+use crate::workspace::client_decorations::client_side_decorations;
 use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
     AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
@@ -270,7 +270,12 @@ impl AppWindow {
                         if let Some(editor) = editor.upgrade() {
                             editor.update(cx, |e, cx| {
                                 if let Some(config) = config {
-                                    e.open_remote_file(path.to_string_lossy().to_string(), config, window, cx);
+                                    e.open_remote_file(
+                                        path.to_string_lossy().to_string(),
+                                        config,
+                                        window,
+                                        cx,
+                                    );
                                 } else {
                                     e.open_file(path, window, cx);
                                 }
@@ -376,7 +381,9 @@ impl AppWindow {
                     let sidebar = this.sidebar.clone();
                     let workspace = this.workspace.clone();
                     window.defer(cx, move |window, cx| {
-                        if sidebar.read(cx).current_view() != &crate::components::macos_sidebar::SidebarView::FileTree {
+                        if sidebar.read(cx).current_view()
+                            != &crate::components::macos_sidebar::SidebarView::FileTree
+                        {
                             return;
                         }
                         let active_tab_id = workspace.read(cx).active_tab_id().to_string();
@@ -657,7 +664,8 @@ impl AppWindow {
                 .iter_mut()
                 .find(|group| group.id == from_group_id)
             {
-                group.file_tree_editor_states
+                group
+                    .file_tree_editor_states
                     .insert(file_tree_key, file_tree_state);
             }
         }
@@ -735,7 +743,8 @@ impl AppWindow {
                 .iter_mut()
                 .find(|group| group.id == from_group_id)
             {
-                group.file_tree_editor_states
+                group
+                    .file_tree_editor_states
                     .insert(old_key, file_tree_state);
             }
         }
@@ -765,11 +774,7 @@ impl AppWindow {
     }
 
     /// 如果当前侧边栏处于文件树页面，将文件树同步到当前活动工作区的活动终端目录。
-    fn sync_file_tree_with_active_tab(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn sync_file_tree_with_active_tab(&self, window: &mut Window, cx: &mut Context<Self>) {
         let sidebar = self.sidebar.clone();
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
@@ -786,11 +791,7 @@ impl AppWindow {
     }
 
     /// 切换侧边栏显示/隐藏
-    fn toggle_sidebar(
-        &mut self,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn toggle_sidebar(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) {
         let needs_hide_task = self.sidebar.update(cx, |s, _cx| s.toggle());
         if needs_hide_task {
             let sidebar = self.sidebar.clone();
@@ -957,9 +958,7 @@ impl AppWindow {
         let entity = self.notification_manager.downgrade();
         cx.spawn(async move |_, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(4))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(4)).await;
                 let should_dismiss = entity
                     .update(cx, |manager, _cx| manager.should_auto_dismiss(id))
                     .unwrap_or(true);
@@ -999,7 +998,11 @@ impl Render for AppWindow {
                 editor.set_paddings(0.0, 0.0, cx);
             });
         } else {
-            let pad = if sidebar_visible { 6.0 } else { closed_tab_bar_pad() };
+            let pad = if sidebar_visible {
+                6.0
+            } else {
+                closed_tab_bar_pad()
+            };
             let content_left = if sidebar_visible { 0.0 } else { 12.0 };
             let content_bottom = 8.0;
             self.editor.update(cx, |editor, cx| {
@@ -1008,9 +1011,11 @@ impl Render for AppWindow {
             });
         }
 
-        let is_menu_view = *self.sidebar.read(cx).current_view() == crate::components::macos_sidebar::SidebarView::Menu;
+        let is_menu_view = *self.sidebar.read(cx).current_view()
+            == crate::components::macos_sidebar::SidebarView::Menu;
         let top_control: gpui::AnyElement = if is_menu_view {
-            self.render_new_tab_group_button(window, cx).into_any_element()
+            self.render_new_tab_group_button(window, cx)
+                .into_any_element()
         } else {
             self.render_tab_group_select(window, cx).into_any_element()
         };
@@ -1058,15 +1063,17 @@ impl Render for AppWindow {
                 NotificationKind::Error => {
                     (theme.error_background, theme.error, Icon::XmarkCircleFill)
                 }
-                NotificationKind::Warning => {
-                    (theme.warning_background, theme.warning, Icon::EllipsisCircleFill)
-                }
-                NotificationKind::Success => {
-                    (theme.success_background, theme.success, Icon::PlusCircleFull)
-                }
-                NotificationKind::Info => {
-                    (theme.notification_background, theme.text, Icon::Bell)
-                }
+                NotificationKind::Warning => (
+                    theme.warning_background,
+                    theme.warning,
+                    Icon::EllipsisCircleFill,
+                ),
+                NotificationKind::Success => (
+                    theme.success_background,
+                    theme.success,
+                    Icon::PlusCircleFull,
+                ),
+                NotificationKind::Info => (theme.notification_background, theme.text, Icon::Bell),
             };
 
             let entity_hover = self.notification_manager.clone();
@@ -1099,14 +1106,14 @@ impl Render for AppWindow {
                             svg()
                                 .size(px(18.0))
                                 .text_color(icon_color)
-                                .path(icon.path())
+                                .path(icon.path()),
                         )
                         .child(
                             div()
                                 .flex_1()
                                 .text_sm()
                                 .text_color(theme.text)
-                                .child(notification.message.clone())
+                                .child(notification.message.clone()),
                         )
                         .child(
                             div()
@@ -1122,9 +1129,9 @@ impl Render for AppWindow {
                                     svg()
                                         .size(px(16.0))
                                         .text_color(theme.text_muted)
-                                        .path(Icon::WindowClose.path())
-                                )
-                        )
+                                        .path(Icon::WindowClose.path()),
+                                ),
+                        ),
                 )
                 .into_any_element();
             root = root.child(toast);
@@ -1147,14 +1154,14 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
-        theme::init(cx);
-        sidebar_view::font_settings::FontState::init(cx);
-        file_manager::watcher::init(cx);
-        components::init(cx);
-        terminal_view::init(cx);
-        workspace::init(cx);
-        editor::init(cx);
-        WindowManager::init(cx);
+            theme::init(cx);
+            sidebar_view::font_settings::FontState::init(cx);
+            file_manager::watcher::init(cx);
+            components::init(cx);
+            terminal_view::init(cx);
+            workspace::init(cx);
+            editor::init(cx);
+            WindowManager::init(cx);
             crate::builtin_commands::executor::init_global_executor();
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),

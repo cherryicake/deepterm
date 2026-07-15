@@ -1,8 +1,8 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::Mutex;
 
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -165,19 +165,18 @@ impl FsWatcher {
         let watched_paths = Arc::new(Mutex::new(HashMap::new()));
         let weak = cx.entity().downgrade();
 
-        let _task = cx
-            .spawn(async move |_, cx| {
-                while let Ok(event) = rx.recv().await {
-                    let kind = FsChangeKind::from(&event.kind);
-                    if let Some(watcher) = weak.upgrade() {
-                        watcher.update(cx, |_, cx| {
-                            for path in &event.paths {
-                                cx.emit(FsChangeEvent::new(path.clone(), kind.clone()));
-                            }
-                        });
-                    }
+        let _task = cx.spawn(async move |_, cx| {
+            while let Ok(event) = rx.recv().await {
+                let kind = FsChangeKind::from(&event.kind);
+                if let Some(watcher) = weak.upgrade() {
+                    watcher.update(cx, |_, cx| {
+                        for path in &event.paths {
+                            cx.emit(FsChangeEvent::new(path.clone(), kind.clone()));
+                        }
+                    });
                 }
-            });
+            }
+        });
 
         Self {
             watcher,
@@ -190,9 +189,10 @@ impl FsWatcher {
         let path = path.to_path_buf();
         let (need_start, need_upgrade) = {
             let mut refs = self.watched_paths.lock();
-            let entry = refs
-                .entry(path.clone())
-                .or_insert(WatchRefs { non_recursive: 0, recursive: 0 });
+            let entry = refs.entry(path.clone()).or_insert(WatchRefs {
+                non_recursive: 0,
+                recursive: 0,
+            });
             let was_recursive = entry.recursive > 0;
             entry.recursive += 1;
             if !was_recursive {
@@ -225,9 +225,10 @@ impl FsWatcher {
         let path = path.to_path_buf();
         let need_start = {
             let mut refs = self.watched_paths.lock();
-            let entry = refs
-                .entry(path.clone())
-                .or_insert(WatchRefs { non_recursive: 0, recursive: 0 });
+            let entry = refs.entry(path.clone()).or_insert(WatchRefs {
+                non_recursive: 0,
+                recursive: 0,
+            });
             entry.non_recursive += 1;
             entry.non_recursive == 1 && entry.recursive == 0
         };
@@ -358,9 +359,7 @@ impl RemoteFsWatcher {
 
         let _task = cx.spawn(async move |_, cx| {
             loop {
-                cx.background_executor()
-                    .timer(REMOTE_POLL_INTERVAL)
-                    .await;
+                cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
 
                 let to_check: Vec<(PathBuf, Arc<dyn FileSystem>)> = {
                     let lock = watched_clone.lock();
@@ -394,11 +393,7 @@ impl RemoteFsWatcher {
                     let meta = match meta {
                         Ok(m) => m,
                         Err(e) => {
-                            log::warn!(
-                                "Remote metadata failed for {}: {}",
-                                path.display(),
-                                e
-                            );
+                            log::warn!("Remote metadata failed for {}: {}", path.display(), e);
                             let should_emit = {
                                 let mut lock = watched_clone.lock();
                                 if let Some(state) = lock.get_mut(&path) {
@@ -475,11 +470,7 @@ impl RemoteFsWatcher {
                             let event = if reported_missing {
                                 FsChangeEvent::new(path.clone(), FsChangeKind::Create)
                             } else if let Some(entries) = entries {
-                                FsChangeEvent::with_entries(
-                                    path.clone(),
-                                    kind,
-                                    entries,
-                                )
+                                FsChangeEvent::with_entries(path.clone(), kind, entries)
                             } else {
                                 FsChangeEvent::new(path.clone(), kind)
                             };

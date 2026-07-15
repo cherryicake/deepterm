@@ -82,10 +82,10 @@ pub enum Icon {
     FolderOutline,
     XmarkCircleFill,
     // Git status icons
-    SquareDot,    // Modified
-    SquarePlus,   // Added
-    SquareMinus,  // Deleted
-    Warning,      // Conflicted
+    SquareDot,   // Modified
+    SquarePlus,  // Added
+    SquareMinus, // Deleted
+    Warning,     // Conflicted
 }
 
 impl Icon {

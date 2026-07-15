@@ -1,10 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Element, ElementId, Entity, Focusable,
-    GlobalElementId, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, StyleRefinement, Styled, Subscription, Window,
-    anchored, deferred, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, DismissEvent, Element, ElementId, Entity, Focusable, GlobalElementId,
+    Hitbox, HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, StyleRefinement, Styled, Subscription, Window, anchored,
+    deferred, div, prelude::FluentBuilder, px,
 };
 
 use crate::components::menu::PopupMenu;

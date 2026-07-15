@@ -413,9 +413,16 @@ impl MacosSidebar {
                         if let Some(aw) = &app_window {
                             cx.update_window(window_handle, |_view, window, cx| {
                                 aw.update(cx, |this, cx| {
-                                    this.on_file_tree_switched(old_file_tree_key, new_key, window, cx);
-                                }).ok();
-                            }).ok();
+                                    this.on_file_tree_switched(
+                                        old_file_tree_key,
+                                        new_key,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            })
+                            .ok();
                         }
                     });
 
@@ -435,7 +442,11 @@ impl MacosSidebar {
             let p = path
                 .as_ref()
                 .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
-            (Arc::new(RemoteFileSystem::new(config)), p, ssh_config.clone())
+            (
+                Arc::new(RemoteFileSystem::new(config)),
+                p,
+                ssh_config.clone(),
+            )
         } else {
             (Arc::new(LocalFileSystem), path.clone(), None)
         };
@@ -474,9 +485,7 @@ impl MacosSidebar {
 
         // Create git panel if not exists and subscribe to events
         if self.git_panel.is_none() {
-            let git_panel = cx.new(|cx| {
-                crate::sidebar_view::git_panel::GitPanel::new(cx)
-            });
+            let git_panel = cx.new(|cx| crate::sidebar_view::git_panel::GitPanel::new(cx));
             self.git_panel = Some(git_panel);
         }
 
@@ -494,30 +503,24 @@ impl MacosSidebar {
             // Subscribe to events
             let sub = cx.subscribe(
                 git_panel,
-                |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| {
-                    match event {
-                        crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
-                            path,
-                            diff_content,
-                        } => {
-                            cx.emit(SidebarEvent::OpenDiff {
-                                path: path.clone(),
-                                diff_content: diff_content.clone(),
-                            });
-                        }
-                        _ => {}
+                |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
+                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
+                        path,
+                        diff_content,
+                    } => {
+                        cx.emit(SidebarEvent::OpenDiff {
+                            path: path.clone(),
+                            diff_content: diff_content.clone(),
+                        });
                     }
+                    _ => {}
                 },
             );
             self.git_panel_subscription = Some(sub);
         }
 
         // 触发编辑器状态保存/恢复
-        let new_key = crate::editor::FileTreeKey::new(
-            path,
-            is_local,
-            ssh_config,
-        );
+        let new_key = crate::editor::FileTreeKey::new(path, is_local, ssh_config);
         let app_window = self.app_window.clone();
         let window_handle = window.window_handle();
         cx.defer(move |cx| {
@@ -525,8 +528,10 @@ impl MacosSidebar {
                 cx.update_window(window_handle, |_view, window, cx| {
                     aw.update(cx, |this, cx| {
                         this.on_file_tree_switched(old_file_tree_key, new_key, window, cx);
-                    }).ok();
-                }).ok();
+                    })
+                    .ok();
+                })
+                .ok();
             }
         });
 
@@ -534,7 +539,10 @@ impl MacosSidebar {
     }
 
     /// 获取当前文件树的标识符
-    fn get_current_file_tree_key(&self, cx: &mut Context<Self>) -> Option<crate::editor::FileTreeKey> {
+    fn get_current_file_tree_key(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::editor::FileTreeKey> {
         let terminal_view = self.file_tree_terminal_view.as_ref()?;
         let state = terminal_view.read(cx).session_state(cx);
         let (path, _display_name) = state.file_tree_target();
@@ -2062,12 +2070,7 @@ impl MacosSidebar {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.text_subtle)
-                        .child("搜索"),
-                )
+                .child(div().text_sm().text_color(theme.text_subtle).child("搜索"))
                 .into_any_element(),
             FileTreePanel::Git => {
                 if let Some(ref git_panel) = self.git_panel {
@@ -2147,8 +2150,7 @@ impl MacosSidebar {
                     move |this, delta| {
                         let factor_target: f32 = if is_active { 1.0 } else { 0.0 };
                         let factor_source: f32 = if is_prev { 1.0 } else { 0.0 };
-                        let width_factor =
-                            factor_source + (factor_target - factor_source) * delta;
+                        let width_factor = factor_source + (factor_target - factor_source) * delta;
                         let w = 28.0 + (active_w - 28.0) * width_factor;
                         let text_w = 28.0 * width_factor;
                         let gap_w = 4.0 * width_factor;

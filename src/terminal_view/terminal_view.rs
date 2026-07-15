@@ -24,13 +24,22 @@ pub enum Event {
     /// 子进程退出（带退出状态）
     ProcessExited(i32),
     /// Open a file or directory in the editor or file tree
-    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
+    OpenPath {
+        path: String,
+        ssh_config: Option<SshConnectionConfig>,
+    },
     /// 发起一次文件传输（由 /scp 等内建命令触发）
-    StartTransfer { request: TransferRequest },
+    StartTransfer {
+        request: TransferRequest,
+    },
     /// SSH 重新连接请求
-    SshReconnect { config: SshConnectionConfig },
+    SshReconnect {
+        config: SshConnectionConfig,
+    },
     /// 远程操作系统已检测到
-    RemoteOsDetected { os: RemoteOS },
+    RemoteOsDetected {
+        os: RemoteOS,
+    },
     WorkingDirectoryChanged,
     /// 终端标题变化（可能由前台进程设置）
     TitleChanged,
@@ -835,11 +844,7 @@ impl TerminalView {
                             return format!("~/{}", rest);
                         }
                     }
-                    if p == "/home" {
-                        "/home".to_string()
-                    } else {
-                        p
-                    }
+                    if p == "/home" { "/home".to_string() } else { p }
                 })
                 .unwrap_or_default();
             let mut parts = Vec::with_capacity(2);
@@ -897,7 +902,9 @@ impl TerminalView {
         if self.tab_label_debounce_task.is_none() {
             self.do_check_tab_label_changed(cx);
             self.tab_label_debounce_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(TAB_LABEL_DEBOUNCE_DELAY).await;
+                cx.background_executor()
+                    .timer(TAB_LABEL_DEBOUNCE_DELAY)
+                    .await;
                 let _ = this.update(cx, |this, cx| {
                     this.tab_label_debounce_task = None;
                     if this.tab_label_pending {

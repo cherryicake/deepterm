@@ -8,9 +8,9 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
     rc::Rc,
     sync::Arc,
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -336,8 +336,7 @@ pub struct TerminalContent {
     /// Current selection range, resolved while the term lock is already held
     /// in `update_last_content`. Read by the render hot path so it does not
     /// need to acquire the `FairMutex<Term>` a second time per frame.
-    pub selection_range:
-        Option<alacritty_terminal::selection::SelectionRange>,
+    pub selection_range: Option<alacritty_terminal::selection::SelectionRange>,
 }
 
 impl Default for TerminalContent {
@@ -1161,7 +1160,8 @@ impl Terminal {
             self.extract_and_handle_osc_sequences(data, require_local_osc7_host, cx);
 
         let mut term = self.term.lock();
-        self.vte_processor.advance(&mut *term, filtered_data.as_ref());
+        self.vte_processor
+            .advance(&mut *term, filtered_data.as_ref());
 
         // 标记内容已更新
         self.content_dirty = true;
@@ -1630,8 +1630,7 @@ impl Terminal {
         // Resolve the current selection range now that the lock is held, so the
         // render path can read it from `last_content` instead of acquiring the
         // term lock a second time per frame.
-        self.last_content.selection_range =
-            term.selection.as_ref().and_then(|s| s.to_range(&term));
+        self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
 
         let rebuild_all_urls =
             force_full_damage || self.last_content.url_ranges.len() != row_ranges.len();
@@ -2046,8 +2045,7 @@ impl Terminal {
         // Resolve the new selection immediately so the first frame after a
         // "select all" action shows the highlight without waiting for a
         // content-dirty cycle.
-        self.last_content.selection_range =
-            term.selection.as_ref().and_then(|s| s.to_range(&term));
+        self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
     }
 
     // Scrolling

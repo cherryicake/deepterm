@@ -1,10 +1,10 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -88,7 +88,8 @@ impl BlockingSftpSession {
         if let Some(existing) = &self.bulk {
             return Ok(existing.clone());
         }
-        let session = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(open_raw_sftp_session(&self.handle))?;
+        let session = crate::ssh::shared_runtime::shared_ssh_runtime()
+            .block_on(open_raw_sftp_session(&self.handle))?;
         let arc = Arc::new(session);
         self.bulk = Some(arc.clone());
         Ok(arc)
@@ -353,16 +354,17 @@ impl BlockingSftpSession {
         let bulk = self.bulk_session()?;
         let config = ParallelTransferConfig::from_env();
 
-        let transferred = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
-            bulk.clone(),
-            source_path,
-            bulk,
-            &temporary_path,
-            size,
-            config,
-            cancelled,
-            progress,
-        ));
+        let transferred =
+            crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
+                bulk.clone(),
+                source_path,
+                bulk,
+                &temporary_path,
+                size,
+                config,
+                cancelled,
+                progress,
+            ));
 
         // 传输完成后重命名为最终文件名，失败时清理临时文件
         match transferred {
@@ -689,7 +691,9 @@ fn evict_stale_sessions() {
     let now = std::time::Instant::now();
     let stale_keys: Vec<String> = cache
         .iter()
-        .filter(|(_, entry)| now.duration_since(entry.last_access).as_secs() > SFTP_SESSION_IDLE_TIMEOUT)
+        .filter(|(_, entry)| {
+            now.duration_since(entry.last_access).as_secs() > SFTP_SESSION_IDLE_TIMEOUT
+        })
         .map(|(key, _)| key.clone())
         .collect();
     for key in stale_keys {

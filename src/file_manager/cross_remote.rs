@@ -267,7 +267,8 @@ pub fn copy_remote_to_different_remote(
             is_safe_for_direct_scp(remote_path) && is_safe_for_direct_scp(&destination_path);
 
         const SMALL_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
-        let force_stream = metadata.kind == RemoteFileKind::File && metadata.size < SMALL_FILE_THRESHOLD;
+        let force_stream =
+            metadata.kind == RemoteFileKind::File && metadata.size < SMALL_FILE_THRESHOLD;
         if force_stream {
             log::info!(
                 "文件大小 {:.2} MiB 小于 10MB，跳过直连尝试，直接使用本地中转传输",

@@ -43,17 +43,10 @@ impl client::Handler for SshClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        match russh::keys::known_hosts::check_known_hosts(
-            &self.host,
-            self.port,
-            server_public_key,
-        ) {
+        match russh::keys::known_hosts::check_known_hosts(&self.host, self.port, server_public_key)
+        {
             Ok(true) => {
-                log::debug!(
-                    "russh: 主机密钥已知且匹配: {}:{}",
-                    self.host,
-                    self.port
-                );
+                log::debug!("russh: 主机密钥已知且匹配: {}:{}", self.host, self.port);
                 Ok(true)
             }
             Ok(false) => {

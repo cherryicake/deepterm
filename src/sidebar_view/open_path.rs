@@ -27,13 +27,15 @@ pub fn handle_open_path(
             .unwrap_or(false);
         if is_dir {
             let file_tree = cx.new(|cx| {
-                let mut tree =
-                    SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
+                let mut tree = SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
                 tree.open_path(Some(remote_path), cx);
                 tree
             });
             // 为新树注册共享缓存引用
-            RemoteFileTreeCache::global().lock().unwrap().acquire(&ssh_config);
+            RemoteFileTreeCache::global()
+                .lock()
+                .unwrap()
+                .acquire(&ssh_config);
             sidebar.update(cx, |s, cx| {
                 s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
                 if !s.is_visible() {
@@ -50,8 +52,7 @@ pub fn handle_open_path(
         if local_path.is_dir() {
             let backend = Arc::new(LocalFileSystem) as Arc<dyn FileSystem>;
             let file_tree = cx.new(|cx| {
-                let mut tree =
-                    SidebarFileTree::new(cx, backend, Some(local_path.clone()));
+                let mut tree = SidebarFileTree::new(cx, backend, Some(local_path.clone()));
                 tree.open_path(Some(local_path), cx);
                 tree
             });

@@ -34,8 +34,8 @@ pub mod error;
 pub mod keychain;
 pub mod platform;
 pub mod russh_terminal;
-pub mod shared_runtime;
 pub mod sftp_fs;
+pub mod shared_runtime;
 pub mod ssh_pty;
 
 pub use config::{AuthMethod, SshConnectionConfig};

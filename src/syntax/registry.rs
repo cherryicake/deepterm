@@ -231,32 +231,47 @@ impl SyntaxColors {
     /// part of the canonical 41-token palette to a supported token name.
     fn normalize_name(name: &str) -> &str {
         match name {
-            "escape" | "string.documentation" | "string.doc" | "comment.documentation" => "string.escape",
+            "escape" | "string.documentation" | "string.doc" | "comment.documentation" => {
+                "string.escape"
+            }
             "character" | "char" => "string",
             "import" | "cImport" => "keyword",
-            "function.macro" | "function.method" | "function.call"
-            | "function.builtin" | "function.special" => "function",
+            "function.macro" | "function.method" | "function.call" | "function.builtin"
+            | "function.special" => "function",
             "constant.builtin" | "constant.macro" => "constant",
             "float" | "number.float" => "number",
-            "variable.builtin" | "variable.parameter" | "variable.member"
-            | "variable.special" => "variable.special",
+            "variable.builtin" | "variable.parameter" | "variable.member" | "variable.special" => {
+                "variable.special"
+            }
             "namespace" | "module" => "type",
-            "type.builtin" | "type.definition" | "type.interface"
-            | "type.super" | "type.class.definition" => "type",
-            "keyword.control" | "keyword.modifier" | "keyword.type"
-            | "keyword.coroutine" | "keyword.function" | "keyword.import"
-            | "keyword.repeat" | "keyword.return" | "keyword.debug"
-            | "keyword.exception" | "keyword.conditional"
-            | "keyword.conditional.ternary" | "keyword.directive"
-            | "keyword.directive.define" | "keyword.export"
+            "type.builtin"
+            | "type.definition"
+            | "type.interface"
+            | "type.super"
+            | "type.class.definition" => "type",
+            "keyword.control"
+            | "keyword.modifier"
+            | "keyword.type"
+            | "keyword.coroutine"
+            | "keyword.function"
+            | "keyword.import"
+            | "keyword.repeat"
+            | "keyword.return"
+            | "keyword.debug"
+            | "keyword.exception"
+            | "keyword.conditional"
+            | "keyword.conditional.ternary"
+            | "keyword.directive"
+            | "keyword.directive.define"
+            | "keyword.export"
             | "keyword.operator" => "keyword",
             "tag.error" | "tag.attribute" | "tag.delimiter" => "tag",
             "text.reference" | "text.uri" => "link_text",
             "selector" | "selector.pseudo" => "type",
             "punctuation.markup" => "punctuation",
             "diff.plus" | "diff.minus" => "string.special",
-            "_class" | "_function" | "_jsdoc_comment" | "_name" | "spell"
-            | "injection.content" | "injection.language" => "",
+            "_class" | "_function" | "_jsdoc_comment" | "_name" | "spell" | "injection.content"
+            | "injection.language" => "",
             "boolean" => "boolean",
             "none" => "",
             _ => name,

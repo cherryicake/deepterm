@@ -434,24 +434,12 @@ mod tests {
             appearance: ThemeAppearance::Dark,
             style: HighlightThemeStyle {
                 syntax: SyntaxColors {
-                    keyword: Some(crate::syntax::ThemeStyle::color(
-                        gpui::red(),
-                    )),
-                    type_: Some(crate::syntax::ThemeStyle::color(
-                        gpui::blue(),
-                    )),
-                    function: Some(crate::syntax::ThemeStyle::color(
-                        gpui::green(),
-                    )),
-                    number: Some(crate::syntax::ThemeStyle::color(
-                        gpui::yellow(),
-                    )),
-                    string: Some(crate::syntax::ThemeStyle::color(
-                        gpui::blue(),
-                    )),
-                    comment: Some(crate::syntax::ThemeStyle::color(
-                        gpui::red(),
-                    )),
+                    keyword: Some(crate::syntax::ThemeStyle::color(gpui::red())),
+                    type_: Some(crate::syntax::ThemeStyle::color(gpui::blue())),
+                    function: Some(crate::syntax::ThemeStyle::color(gpui::green())),
+                    number: Some(crate::syntax::ThemeStyle::color(gpui::yellow())),
+                    string: Some(crate::syntax::ThemeStyle::color(gpui::blue())),
+                    comment: Some(crate::syntax::ThemeStyle::color(gpui::red())),
                     ..Default::default()
                 },
                 ..Default::default()

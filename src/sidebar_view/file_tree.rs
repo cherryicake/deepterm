@@ -1,9 +1,9 @@
 use gpui::prelude::*;
 use gpui::{
-    uniform_list, AnyElement, App, Bounds, Context, FocusHandle, Focusable, GlobalElementId,
+    AnyElement, App, AvailableSpace, Bounds, Context, FocusHandle, Focusable, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ParentElement,
     Pixels, Point, Render, Size, Stateful, Styled, Subscription, Task, UniformListDecoration,
-    UniformListScrollHandle, Window, div, point, px, size, svg, AvailableSpace,
+    UniformListScrollHandle, Window, div, point, px, size, svg, uniform_list,
 };
 use smallvec::SmallVec;
 use std::collections::HashSet;
@@ -921,12 +921,13 @@ impl UniformListDecoration for StickyFolderDecoration {
 
             // 分离drifting和rest元素
             let mut elements = sticky_items;
-            let (mut drifting_element, mut rest_elements) = if anchor.drifting && !elements.is_empty() {
-                let last = elements.pop().unwrap();
-                (Some(last), elements)
-            } else {
-                (None, elements)
-            };
+            let (mut drifting_element, mut rest_elements) =
+                if anchor.drifting && !elements.is_empty() {
+                    let last = elements.pop().unwrap();
+                    (Some(last), elements)
+                } else {
+                    (None, elements)
+                };
 
             let element_available_space = size(
                 AvailableSpace::Definite(bounds.size.width),
@@ -935,7 +936,11 @@ impl UniformListDecoration for StickyFolderDecoration {
 
             // 定位drifting元素（有额外y偏移）
             if let Some(ref mut drifting_element) = drifting_element {
-                let sticky_origin = base_origin + point(px(0.), item_height * rest_elements.len() + drifting_y_offset);
+                let sticky_origin = base_origin
+                    + point(
+                        px(0.),
+                        item_height * rest_elements.len() + drifting_y_offset,
+                    );
                 drifting_element.layout_as_root(element_available_space, window, cx);
                 drifting_element.prepaint_at(sticky_origin, window, cx);
             }
@@ -1131,9 +1136,7 @@ impl Render for SidebarFileTree {
                 flat_count,
                 cx.processor(|this, range: Range<usize>, _window, _cx| {
                     let entries: Vec<(FileEntry, usize)> = if let Some(flat) = &this.flat_cache {
-                        range
-                            .filter_map(|ix| flat.get(ix).cloned())
-                            .collect()
+                        range.filter_map(|ix| flat.get(ix).cloned()).collect()
                     } else {
                         Vec::new()
                     };

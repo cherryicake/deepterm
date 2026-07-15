@@ -1,5 +1,7 @@
 use gpui::prelude::*;
-use gpui::{App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative};
+use gpui::{
+    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative,
+};
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
 use crate::theme::ActiveTheme;

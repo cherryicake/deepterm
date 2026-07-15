@@ -4,15 +4,15 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
-    Focusable, IntoElement, Pixels, Point, Render, ScrollHandle, SharedString, TextRun, TextStyle,
-    Transformation, Window, actions, canvas, div, ease_in_out, ease_out_quint, percentage, px, svg,
-    MouseButton,
+    Focusable, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle, SharedString,
+    TextRun, TextStyle, Transformation, Window, actions, canvas, div, ease_in_out, ease_out_quint,
+    percentage, px, svg,
 };
 
 use crate::assets::Icon;
+use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
-use crate::components::menu::{ContextMenuExt, PopupMenu};
 
 actions!(tab_context_menu, [CopyTabAddress, DuplicateTab]);
 
@@ -236,16 +236,13 @@ pub struct TabBar {
     /// 右键菜单的目标标签 ID
     context_menu_tab_id: Option<SharedString>,
     /// 拷贝地址回调
-    on_tab_copy_address:
-        Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_copy_address: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     /// 复制标签页回调
-    on_tab_duplicate:
-        Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_duplicate: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
-    on_context_menu:
-        Option<
-            Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
-        >,
+    on_context_menu: Option<
+        Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
+    >,
 }
 
 impl TabBar {
@@ -408,8 +405,7 @@ impl TabBar {
     /// 右键菜单构建回调（由调用方设置）
     pub fn on_context_menu<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu
-            + 'static,
+        F: Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     {
         self.on_context_menu = Some(Rc::new(callback));
     }
@@ -513,17 +509,17 @@ impl TabBar {
         let available_width = self.measured_container_width - NEW_TAB_BUTTON_SPACE;
 
         // 当存在真实 bounds 数据时，直接用真实尺寸判断；否则用估算值
-        let would_overflow = if self.tab_bounds.len() >= self.tabs.len()
-            && self.tab_list_bounds.is_some()
-        {
-            let tab_list_left = self.tab_list_bounds.unwrap().origin.x.as_f32();
-            let last_tab = &self.tab_bounds[self.tabs.len() - 1];
-            let last_tab_right = tab_list_left + last_tab.origin.x.as_f32() + last_tab.size.width.as_f32();
-            last_tab_right >= available_width
-        } else {
-            // 非滚动模式或无 layout 数据：用估算值
-            self.tabs.len() as f32 * TAB_MAX_WIDTH_PX > available_width
-        };
+        let would_overflow =
+            if self.tab_bounds.len() >= self.tabs.len() && self.tab_list_bounds.is_some() {
+                let tab_list_left = self.tab_list_bounds.unwrap().origin.x.as_f32();
+                let last_tab = &self.tab_bounds[self.tabs.len() - 1];
+                let last_tab_right =
+                    tab_list_left + last_tab.origin.x.as_f32() + last_tab.size.width.as_f32();
+                last_tab_right >= available_width
+            } else {
+                // 非滚动模式或无 layout 数据：用估算值
+                self.tabs.len() as f32 * TAB_MAX_WIDTH_PX > available_width
+            };
 
         if self.last_overflow != Some(would_overflow) {
             self.last_overflow = Some(would_overflow);
@@ -1025,7 +1021,13 @@ impl Render for TabBar {
                                         .rounded(px(8.0))
                                         .border_1()
                                         .border_color(if is_active {
-                                            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if cx.theme().appearance.is_dark() { 0.1 } else { 0.6 })
+                                            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(
+                                                if cx.theme().appearance.is_dark() {
+                                                    0.1
+                                                } else {
+                                                    0.6
+                                                },
+                                            )
                                         } else {
                                             theme.transparent()
                                         })
@@ -1158,7 +1160,8 @@ impl Render for TabBar {
                                             }
                                         }))
                                         .child({
-                                            let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
+                                            let is_hovered =
+                                                self.hovered_tab_id.as_ref() == Some(&tab_id);
 
                                             // Hover close takes priority over loading spinner so
                                             // slow remote opens can still be dismissed from the tab.
@@ -1178,8 +1181,14 @@ impl Render for TabBar {
                                                         gpui::MouseButton::Left,
                                                         cx.listener(
                                                             move |_this, _event, window, cx| {
-                                                                if let Some(ref callback) = on_tab_close {
-                                                                    callback(tab_id_close.clone(), window, cx);
+                                                                if let Some(ref callback) =
+                                                                    on_tab_close
+                                                                {
+                                                                    callback(
+                                                                        tab_id_close.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
                                                                 }
                                                             },
                                                         ),
@@ -1201,7 +1210,9 @@ impl Render for TabBar {
                                                             .with_easing(ease_in_out),
                                                         |this, delta| {
                                                             this.with_transformation(
-                                                                Transformation::rotate(percentage(delta)),
+                                                                Transformation::rotate(percentage(
+                                                                    delta,
+                                                                )),
                                                             )
                                                         },
                                                     )
@@ -1245,7 +1256,8 @@ impl Render for TabBar {
                                                         .child(label),
                                                 )
                                                 .when(!is_active, |this| {
-                                                    let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
+                                                    let is_hovered = self.hovered_tab_id.as_ref()
+                                                        == Some(&tab_id);
                                                     let tab_bg = if is_hovered {
                                                         theme.tab_hover_background
                                                     } else {
@@ -1260,8 +1272,13 @@ impl Render for TabBar {
                                                             .w(px(TAB_FADE_WIDTH_PX))
                                                             .bg(gpui::linear_gradient(
                                                                 90.0,
-                                                                gpui::linear_color_stop(tab_bg.opacity(0.0), 0.0),
-                                                                gpui::linear_color_stop(tab_bg, 1.0),
+                                                                gpui::linear_color_stop(
+                                                                    tab_bg.opacity(0.0),
+                                                                    0.0,
+                                                                ),
+                                                                gpui::linear_color_stop(
+                                                                    tab_bg, 1.0,
+                                                                ),
                                                             )),
                                                     )
                                                 }),

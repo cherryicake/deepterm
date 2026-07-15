@@ -78,7 +78,6 @@ impl TransferRequest {
             }
         })
     }
-
 }
 
 #[cfg(test)]

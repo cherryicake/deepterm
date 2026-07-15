@@ -16,11 +16,11 @@
 //! - DeepTerm 正常退出时所有 guard 被 Drop，归零触发同步清理。
 //!   崩溃 / kill -9 路径走 60 分钟兜底。
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::utils::shell_single_quote;

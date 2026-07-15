@@ -156,7 +156,11 @@ impl RemoteFileTreeCache {
             .file_caches
             .entry(key.clone())
             .or_insert_with(ServerFileCache::new);
-        log::debug!("FileTreeCache insert file content: {}{}", key, path.display());
+        log::debug!(
+            "FileTreeCache insert file content: {}{}",
+            key,
+            path.display()
+        );
         file_cache.files.insert(
             path.to_path_buf(),
             FileContentEntry {
@@ -167,11 +171,7 @@ impl RemoteFileTreeCache {
     }
 
     /// 获取缓存的远程文件内容
-    pub fn get_file_content(
-        &self,
-        config: &SshConnectionConfig,
-        path: &Path,
-    ) -> Option<String> {
+    pub fn get_file_content(&self, config: &SshConnectionConfig, path: &Path) -> Option<String> {
         let key = Self::server_key(config);
         let file_cache = self.file_caches.get(&key)?;
         let entry = file_cache.files.get(path)?;

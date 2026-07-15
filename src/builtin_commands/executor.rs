@@ -36,7 +36,10 @@ pub struct CommandContext {
 ///   `s`（handler 可能已改写）。用于将来像 `/plan` 这样"做完内建动作后把 prompt 交回下一层"的命令。
 pub enum CommandResult {
     /// 打开路径：文件→编辑器，目录→文件树
-    OpenPath { path: String, ssh_config: Option<SshConnectionConfig> },
+    OpenPath {
+        path: String,
+        ssh_config: Option<SshConnectionConfig>,
+    },
     /// 启动一次文件传输（由 workspace 层挂接进度/冲突弹窗/任务列表）
     StartTransfer { request: TransferRequest },
     /// 仅记录日志
@@ -1251,8 +1254,8 @@ mod tests {
 
 // ── Global Executor ──────────────────────────────────────────────────────────
 
-use std::sync::OnceLock;
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 static GLOBAL_EXECUTOR: OnceLock<Mutex<CommandExecutor>> = OnceLock::new();
 

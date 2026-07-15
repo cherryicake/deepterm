@@ -92,9 +92,7 @@ fn terminfo_exists(name: &str) -> bool {
     macro_rules! check_path {
         ($path:expr) => {{
             let p = $path;
-            if p.join(first).join(name).exists()
-                || p.join(&first_hex).join(name).exists()
-            {
+            if p.join(first).join(name).exists() || p.join(&first_hex).join(name).exists() {
                 return true;
             }
         }};

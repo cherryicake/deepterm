@@ -113,7 +113,9 @@ impl GitRepository {
         if diff.is_empty() {
             let file_path = self.root.join(path);
             if let Ok(content) = std::fs::read_to_string(&file_path) {
-                diff = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+                diff = format!(
+                    "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
+                );
                 for line in content.lines() {
                     diff.push_str(&format!("+{line}\n"));
                 }

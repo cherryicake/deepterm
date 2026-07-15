@@ -1,8 +1,8 @@
 use gpui::prelude::*;
 use gpui::{
-    uniform_list, App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, Stateful, Subscription, Styled, UniformListScrollHandle, Window,
-    div, px, svg,
+    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
+    Pixels, Render, Stateful, Styled, Subscription, UniformListScrollHandle, Window, div, px, svg,
+    uniform_list,
 };
 
 use crate::assets::Icon;
@@ -15,16 +15,9 @@ const LIST_ROW_HEIGHT: f32 = 28.0;
 
 /// Git panel events
 pub enum GitPanelEvent {
-    OpenDiff {
-        path: String,
-        diff_content: String,
-    },
-    StageFile {
-        path: String,
-    },
-    UnstageFile {
-        path: String,
-    },
+    OpenDiff { path: String, diff_content: String },
+    StageFile { path: String },
+    UnstageFile { path: String },
 }
 
 /// A single entry in the git panel list
@@ -282,10 +275,7 @@ impl GitPanel {
 
             if let Ok(diff_content) = diff_result {
                 let _ = weak.update(cx, |_, cx| {
-                    cx.emit(GitPanelEvent::OpenDiff {
-                        path,
-                        diff_content,
-                    });
+                    cx.emit(GitPanelEvent::OpenDiff { path, diff_content });
                 });
             }
         })
@@ -494,16 +484,13 @@ impl GitPanel {
                                     }
                                 }),
                             )
-                            .child(
-                                svg()
-                                    .size(px(12.0))
-                                    .text_color(theme.text_subtle)
-                                    .path(if entry.should_stage() {
-                                        Icon::SquarePlus.path()
-                                    } else {
-                                        Icon::SquareMinus.path()
-                                    }),
-                            )
+                            .child(svg().size(px(12.0)).text_color(theme.text_subtle).path(
+                                if entry.should_stage() {
+                                    Icon::SquarePlus.path()
+                                } else {
+                                    Icon::SquareMinus.path()
+                                },
+                            ))
                     }),
             )
     }
@@ -575,9 +562,9 @@ impl Render for GitPanel {
                         GitListEntry::Header(section) => {
                             this.render_header(section, _cx).into_any_element()
                         }
-                        GitListEntry::File(file_entry) => {
-                            this.render_file_entry(&file_entry, i, _cx).into_any_element()
-                        }
+                        GitListEntry::File(file_entry) => this
+                            .render_file_entry(&file_entry, i, _cx)
+                            .into_any_element(),
                     })
                     .collect()
             }),

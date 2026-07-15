@@ -84,11 +84,17 @@ pub enum PanelEvent {
         request: TransferRequest,
     },
     /// 关闭panel事件
-    Close { panel_id: String },
+    Close {
+        panel_id: String,
+    },
     /// 选中状态变更事件
-    Selected { panel_id: String },
+    Selected {
+        panel_id: String,
+    },
     /// 广播状态切换事件
-    BroadcastToggle { panel_id: String },
+    BroadcastToggle {
+        panel_id: String,
+    },
     SessionChanged,
     /// Tab 标签变更事件（由终端工作目录/前台进程变化触发）
     TabLabelChanged {

@@ -208,7 +208,11 @@ impl NewHostForm {
         };
 
         let mut labels: Vec<SharedString> = vec![default_label.into()];
-        labels.extend(items.iter().map(|item| SharedString::from(item.label.clone())));
+        labels.extend(
+            items
+                .iter()
+                .map(|item| SharedString::from(item.label.clone())),
+        );
 
         self.keychain_options = items
             .iter()

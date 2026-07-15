@@ -21,9 +21,7 @@ pub fn client_side_decorations(
     };
 
     match decorations {
-        Decorations::Client { .. } => {
-            window.set_client_inset(CLIENT_SIDE_DECORATION_SHADOW)
-        }
+        Decorations::Client { .. } => window.set_client_inset(CLIENT_SIDE_DECORATION_SHADOW),
         Decorations::Server => window.set_client_inset(px(0.0)),
     }
 
@@ -33,38 +31,27 @@ pub fn client_side_decorations(
         .map(|div| match decorations {
             Decorations::Server => div,
             Decorations::Client { .. } => div
-                .when(
-                    !(tiling.top || tiling.right),
-                    |div| div.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING),
-                )
-                .when(
-                    !(tiling.top || tiling.left),
-                    |div| div.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING),
-                )
-                .when(
-                    !(tiling.bottom || tiling.right),
-                    |div| div.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING),
-                )
-                .when(
-                    !(tiling.bottom || tiling.left),
-                    |div| div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING),
-                )
-                .when(!tiling.top, |div| div.pt(CLIENT_SIDE_DECORATION_SHADOW))
-                .when(!tiling.bottom, |div| {
-                    div.pb(CLIENT_SIDE_DECORATION_SHADOW)
+                .when(!(tiling.top || tiling.right), |div| {
+                    div.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING)
                 })
+                .when(!(tiling.top || tiling.left), |div| {
+                    div.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING)
+                })
+                .when(!(tiling.bottom || tiling.right), |div| {
+                    div.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING)
+                })
+                .when(!(tiling.bottom || tiling.left), |div| {
+                    div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
+                })
+                .when(!tiling.top, |div| div.pt(CLIENT_SIDE_DECORATION_SHADOW))
+                .when(!tiling.bottom, |div| div.pb(CLIENT_SIDE_DECORATION_SHADOW))
                 .when(!tiling.left, |div| div.pl(CLIENT_SIDE_DECORATION_SHADOW))
                 .when(!tiling.right, |div| div.pr(CLIENT_SIDE_DECORATION_SHADOW))
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
                     let size = window.window_bounds().get_bounds().size;
                     let pos = e.position;
 
-                    let edge = match resize_edge(
-                        pos,
-                        CLIENT_SIDE_DECORATION_SHADOW,
-                        size,
-                        tiling,
-                    ) {
+                    let edge = match resize_edge(pos, CLIENT_SIDE_DECORATION_SHADOW, size, tiling) {
                         Some(value) => value,
                         None => return,
                     };
@@ -80,22 +67,18 @@ pub fn client_side_decorations(
                     Decorations::Server => div,
                     Decorations::Client { .. } => div
                         .border_color(cx.theme().ui.border)
-                        .when(
-                            !(tiling.top || tiling.right),
-                            |div| div.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING),
-                        )
-                        .when(
-                            !(tiling.top || tiling.left),
-                            |div| div.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING),
-                        )
-                        .when(
-                            !(tiling.bottom || tiling.right),
-                            |div| div.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING),
-                        )
-                        .when(
-                            !(tiling.bottom || tiling.left),
-                            |div| div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING),
-                        )
+                        .when(!(tiling.top || tiling.right), |div| {
+                            div.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(!(tiling.top || tiling.left), |div| {
+                            div.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(!(tiling.bottom || tiling.right), |div| {
+                            div.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(!(tiling.bottom || tiling.left), |div| {
+                            div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
                         .when(!tiling.top, |div| div.border_t(BORDER_SIZE))
                         .when(!tiling.bottom, |div| div.border_b(BORDER_SIZE))
                         .when(!tiling.left, |div| div.border_l(BORDER_SIZE))
@@ -137,19 +120,14 @@ pub fn client_side_decorations(
                     move |_bounds, hitbox, window, _cx| {
                         let mouse = window.mouse_position();
                         let size = window.window_bounds().get_bounds().size;
-                        let Some(edge) = resize_edge(
-                            mouse,
-                            CLIENT_SIDE_DECORATION_SHADOW,
-                            size,
-                            tiling,
-                        ) else {
+                        let Some(edge) =
+                            resize_edge(mouse, CLIENT_SIDE_DECORATION_SHADOW, size, tiling)
+                        else {
                             return;
                         };
                         window.set_cursor_style(
                             match edge {
-                                ResizeEdge::Top | ResizeEdge::Bottom => {
-                                    CursorStyle::ResizeUpDown
-                                }
+                                ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
                                 ResizeEdge::Left | ResizeEdge::Right => {
                                     CursorStyle::ResizeLeftRight
                                 }

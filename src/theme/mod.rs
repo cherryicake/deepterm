@@ -9,9 +9,7 @@ pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::syntax::{
-    HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
-};
+use crate::syntax::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -193,21 +191,20 @@ impl TerminalTheme {
         name: &str,
         appearance: ThemeAppearance,
     ) -> Arc<HighlightTheme> {
-        let (editor_bg, editor_fg, active_line, line_number, active_line_number, invisible) =
-            (
-                Some(self.background),
-                Some(self.foreground),
-                Some(gpui::Hsla::from(
-                    gpui::Rgba::from(self.background).blend(if appearance.is_dark() {
-                        gpui::rgba(0xFFFFFF10)
-                    } else {
-                        gpui::rgba(0x0000000C)
-                    }),
-                )),
-                Some(self.dim_foreground),
-                Some(self.foreground),
-                Some(self.dim_foreground),
-            );
+        let (editor_bg, editor_fg, active_line, line_number, active_line_number, invisible) = (
+            Some(self.background),
+            Some(self.foreground),
+            Some(gpui::Hsla::from(gpui::Rgba::from(self.background).blend(
+                if appearance.is_dark() {
+                    gpui::rgba(0xFFFFFF10)
+                } else {
+                    gpui::rgba(0x0000000C)
+                },
+            ))),
+            Some(self.dim_foreground),
+            Some(self.foreground),
+            Some(self.dim_foreground),
+        );
 
         let syntax: SyntaxColors = if appearance.is_dark() {
             // Default Dark: approximate One Dark / gpui-component Default Dark

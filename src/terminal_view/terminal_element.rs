@@ -1141,14 +1141,12 @@ impl Element for TerminalElement {
         // the view/terminal cannot survive those), then put them back at the end
         // so the capacity is reused on the next frame.
         let (mut dirty_rows, mut dirty_row_bounds, mouse_mode, selection_range, cursor_cell) = {
-            let (mut dirty_rows, mut dirty_row_bounds) = self
-                .view
-                .update(cx, |view, _cx| {
-                    (
-                        std::mem::take(&mut view.scratch_dirty_rows),
-                        std::mem::take(&mut view.scratch_dirty_row_bounds),
-                    )
-                });
+            let (mut dirty_rows, mut dirty_row_bounds) = self.view.update(cx, |view, _cx| {
+                (
+                    std::mem::take(&mut view.scratch_dirty_rows),
+                    std::mem::take(&mut view.scratch_dirty_row_bounds),
+                )
+            });
             let terminal_snapshot = self.terminal.read(cx);
             dirty_rows.clear();
             dirty_rows.extend_from_slice(terminal_snapshot.dirty_rows());
@@ -1255,12 +1253,12 @@ impl Element for TerminalElement {
 
             for row_idx in 0..viewport_lines {
                 let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
-                let row_cells: &[IndexedCell] =
-                    if let Some((start, end)) = row_ranges.get(row_idx) {
-                        &content_cells[*start..*end]
-                    } else {
-                        &[]
-                    };
+                let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx)
+                {
+                    &content_cells[*start..*end]
+                } else {
+                    &[]
+                };
                 let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
                     if link.row == row_idx {
                         Some((link.start_col, link.end_col))
@@ -1435,8 +1433,10 @@ impl Element for TerminalElement {
                     }
                 } else if rebuild_flattened_cache {
                     let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                    selection_spans
-                        .extend(Self::selection_spans_for_cols(row_idx, cached_selected_cols));
+                    selection_spans.extend(Self::selection_spans_for_cols(
+                        row_idx,
+                        cached_selected_cols,
+                    ));
                 }
 
                 #[cfg(debug_assertions)]

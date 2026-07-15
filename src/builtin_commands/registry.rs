@@ -149,9 +149,7 @@ pub fn init_global_registry() -> CommandRegistry {
         description: "Open a file or directory in the editor or file tree.",
         icon: Icon::FolderOutline,
         availability: Availability::Always,
-        argument: ArgumentType::Required {
-            hint: "path",
-        },
+        argument: ArgumentType::Required { hint: "path" },
         handler_id: CommandHandlerId("open_path"),
     });
 

@@ -67,11 +67,21 @@ pub struct EditorOpenFileInfo {
 pub struct FileTreeKey(String);
 
 impl FileTreeKey {
-    pub fn new(path: Option<PathBuf>, is_local: bool, ssh_config: Option<SshConnectionConfig>) -> Self {
+    pub fn new(
+        path: Option<PathBuf>,
+        is_local: bool,
+        ssh_config: Option<SshConnectionConfig>,
+    ) -> Self {
         let key = match (path, is_local, ssh_config) {
             (Some(path), true, _) => format!("local:{}", path.display()),
             (Some(path), false, Some(config)) => {
-                format!("remote:{}@{}:{}{}", config.username, config.host, config.port, path.display())
+                format!(
+                    "remote:{}@{}:{}{}",
+                    config.username,
+                    config.host,
+                    config.port,
+                    path.display()
+                )
             }
             (None, true, _) => "local:".to_string(),
             (None, false, Some(config)) => {
@@ -167,9 +177,7 @@ impl Editor {
 
     /// 取出远程文件的 InputState entity，用于标签页组切换
     /// 本地文件返回 None（不需要缓存内容）
-    pub fn take_cached_editor_states(
-        &mut self,
-    ) -> HashMap<SharedString, Entity<InputState>> {
+    pub fn take_cached_editor_states(&mut self) -> HashMap<SharedString, Entity<InputState>> {
         let mut cached_states = HashMap::new();
         for file in &mut self.open_files {
             if file.ssh_config.is_some() && !file.is_loading {
@@ -181,10 +189,7 @@ impl Editor {
     }
 
     /// 保存当前编辑器状态到文件树状态
-    pub fn save_to_file_tree_state(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> FileTreeEditorState {
+    pub fn save_to_file_tree_state(&mut self, cx: &mut Context<Self>) -> FileTreeEditorState {
         let open_files_info = self.get_open_files_info();
         let cached_editor_states = self.take_cached_editor_states();
         let active_file_id = self.active_file_id.clone();
@@ -229,12 +234,7 @@ impl Editor {
             // 检查是否有缓存的 InputState（远程文件）
             if let Some(cached_state) = cached_states.get(&file_info.id) {
                 // 直接使用缓存的 InputState
-                self.restore_file_from_cache(
-                    file_info,
-                    cached_state.clone(),
-                    window,
-                    cx,
-                );
+                self.restore_file_from_cache(file_info, cached_state.clone(), window, cx);
             } else {
                 // 本地文件或正在加载的文件，重新打开
                 if let Some(ref ssh_config) = file_info.ssh_config {
@@ -245,11 +245,7 @@ impl Editor {
                         cx,
                     );
                 } else {
-                    self.open_file_no_notify(
-                        std::path::PathBuf::from(&file_info.path),
-                        window,
-                        cx,
-                    );
+                    self.open_file_no_notify(std::path::PathBuf::from(&file_info.path), window, cx);
                 }
             }
         }
@@ -273,9 +269,7 @@ impl Editor {
         let is_markdown = path_str.ends_with(".md");
         let markdown = if is_markdown {
             let content = editor_state.read(cx).value().to_string();
-            Some(cx.new(|cx| {
-                crate::editor::markdown::Markdown::new(content, cx)
-            }))
+            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content, cx)))
         } else {
             None
         };
@@ -304,8 +298,7 @@ impl Editor {
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&file_info.id, &file_info.label)
-                    .with_icon(Some(Icon::File)),
+                TabItem::new(&file_info.id, &file_info.label).with_icon(Some(Icon::File)),
                 cx,
             );
         });
@@ -601,8 +594,7 @@ impl Editor {
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&tab_id, &format!("Diff: {}", path))
-                    .with_icon(Some(Icon::Git)),
+                TabItem::new(&tab_id, &format!("Diff: {}", path)).with_icon(Some(Icon::Git)),
                 cx,
             );
         });
@@ -912,9 +904,7 @@ impl Editor {
         let is_markdown = path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
             let content_clone = content.clone();
-            Some(cx.new(|cx| {
-                crate::editor::markdown::Markdown::new(content_clone, cx)
-            }))
+            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content_clone, cx)))
         } else {
             None
         };

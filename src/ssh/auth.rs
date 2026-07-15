@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use parking_lot::Mutex;
 
 use russh::client::{AuthResult, Handle};
 use russh::keys::PrivateKeyWithHashAlg;

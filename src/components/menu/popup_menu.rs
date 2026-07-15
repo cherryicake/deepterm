@@ -4,10 +4,10 @@ use crate::components::menu::menu_item::MenuItemElement;
 
 use crate::theme::ActiveTheme;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
-    ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, actions, anchored, div, prelude::FluentBuilder, px, rems,
+    Action, AnyElement, App, AppContext as _, Bounds, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    actions, anchored, div, prelude::FluentBuilder, px, rems,
 };
 use gpui::{ClickEvent, MouseDownEvent, Point, Subscription};
 use std::rc::Rc;
@@ -787,7 +787,10 @@ impl PopupMenu {
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft) {
+        let handled = if matches!(
+            self.submenu_anchor.0,
+            gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft
+        ) {
             self._unselect_submenu(window, cx)
         } else {
             self._select_submenu(window, cx)
@@ -808,7 +811,10 @@ impl PopupMenu {
     }
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft) {
+        let handled = if matches!(
+            self.submenu_anchor.0,
+            gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft
+        ) {
             self._select_submenu(window, cx)
         } else {
             self._unselect_submenu(window, cx)
@@ -879,8 +885,14 @@ impl PopupMenu {
         };
 
         match parent.read(cx).submenu_anchor.0 {
-            gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft | gpui::Anchor::LeftCenter => Side::Left,
-            gpui::Anchor::TopRight | gpui::Anchor::BottomRight | gpui::Anchor::RightCenter | gpui::Anchor::TopCenter | gpui::Anchor::BottomCenter => Side::Right,
+            gpui::Anchor::TopLeft | gpui::Anchor::BottomLeft | gpui::Anchor::LeftCenter => {
+                Side::Left
+            }
+            gpui::Anchor::TopRight
+            | gpui::Anchor::BottomRight
+            | gpui::Anchor::RightCenter
+            | gpui::Anchor::TopCenter
+            | gpui::Anchor::BottomCenter => Side::Right,
         }
     }
 
@@ -1007,7 +1019,11 @@ impl PopupMenu {
 
                 let mut content = div().flex().flex_row().items_center();
 
-                let icon_color = if *disabled { theme.text_muted } else { theme.text };
+                let icon_color = if *disabled {
+                    theme.text_muted
+                } else {
+                    theme.text
+                };
 
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
@@ -1048,7 +1064,11 @@ impl PopupMenu {
                 let this = this.disabled(*disabled);
 
                 let mut content = div().flex().flex_row().items_center();
-                let icon_color = if *disabled { theme.text_muted } else { theme.text };
+                let icon_color = if *disabled {
+                    theme.text_muted
+                } else {
+                    theme.text
+                };
 
                 if let Some(icon) = icon {
                     content = content.gap(px(6.)).child(
@@ -1120,7 +1140,8 @@ impl Render for PopupMenu {
         } else {
             gpui::Hsla::from(gpui::rgb(0xFFFFFF))
         };
-        let menu_border = gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
+        let menu_border =
+            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
         let separator_color = if is_dark {
             gpui::Hsla::from(gpui::rgb(0x48484A))
         } else {
