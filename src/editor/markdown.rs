@@ -6,7 +6,8 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, ListAlignment, ListState, Render,
-    SharedString, StyleRefinement, TextRun, TextStyleRefinement, Window, div, list, px, rems,
+    SharedString, StyleRefinement, TextRun, TextStyleRefinement, WhiteSpace, Window, div, list, px,
+    rems,
 };
 
 use crate::syntax::SyntaxHighlighter;
@@ -39,15 +40,24 @@ impl MarkdownStyle {
         base_text_style.refine(&TextStyleRefinement {
             color: Some(ui.text),
             line_height: Some(rems(1.3).into()),
+            white_space: Some(WhiteSpace::Normal),
             ..Default::default()
         });
 
         let code_block = StyleRefinement {
             padding: gpui::EdgesRefinement {
-                top: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                left: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                right: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                bottom: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
+                top: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                left: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                right: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                bottom: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
             },
             margin: gpui::EdgesRefinement {
                 top: Some(gpui::Length::Definite(px(8.).into())),
@@ -202,20 +212,12 @@ impl Markdown {
         &self.copied_code_blocks
     }
 
-    pub fn mark_code_block_copied(
-        &mut self,
-        id: gpui::ElementId,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn mark_code_block_copied(&mut self, id: gpui::ElementId, cx: &mut Context<Self>) {
         self.copied_code_blocks.insert(id);
         cx.notify();
     }
 
-    pub fn toggle_code_block_wrap(
-        &mut self,
-        source_offset: usize,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toggle_code_block_wrap(&mut self, source_offset: usize, cx: &mut Context<Self>) {
         if self.wrapped_code_blocks.contains(&source_offset) {
             self.wrapped_code_blocks.remove(&source_offset);
         } else {
@@ -233,11 +235,7 @@ impl Focusable for Markdown {
 }
 
 impl Render for Markdown {
-    fn render(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let markdown = cx.entity();
         let list_state = self.list_state.clone();
@@ -247,20 +245,19 @@ impl Render for Markdown {
             .id("markdown")
             .key_context("Markdown")
             .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
             .size_full()
             .overflow_hidden()
             .bg(theme.app_background)
             .child(
-                div()
-                    .px_8()
-                    .py_6()
-                    .size_full()
-                    .child(
-                        list(list_state, move |ix, window, cx| {
-                            Self::render_item(markdown.clone(), ix, window, cx, style.clone())
-                        })
-                        .size_full(),
-                    ),
+                div().flex().flex_col().px_8().py_6().size_full().child(
+                    list(list_state, move |ix, window, cx| {
+                        Self::render_item(markdown.clone(), ix, window, cx, style.clone())
+                    })
+                    .w_full()
+                    .h_full(),
+                ),
             )
     }
 }
@@ -273,27 +270,21 @@ impl Markdown {
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
-        let (copied, wrapped, events, highlight_cache) = markdown
-            .update(cx, |markdown, _cx| {
-                let range = markdown.item_ranges[ix].clone();
-                (
-                    markdown.copied_code_blocks.clone(),
-                    markdown.wrapped_code_blocks.clone(),
-                    markdown.events[range].to_vec(),
-                    markdown.highlight_cache.clone(),
-                )
-            });
+        let (copied, wrapped, events, highlight_cache) = markdown.update(cx, |markdown, _cx| {
+            let range = markdown.item_ranges[ix].clone();
+            (
+                markdown.copied_code_blocks.clone(),
+                markdown.wrapped_code_blocks.clone(),
+                markdown.events[range].to_vec(),
+                markdown.highlight_cache.clone(),
+            )
+        });
 
-        let elements = MarkdownElementBuilder::new(
-            style,
-            copied,
-            wrapped,
-            markdown,
-            highlight_cache,
-        )
-        .build(&events, cx);
+        let elements =
+            MarkdownElementBuilder::new(style, copied, wrapped, markdown, highlight_cache)
+                .build(&events, cx);
 
-        div().children(elements).into_any_element()
+        div().w_full().children(elements).into_any_element()
     }
 }
 
@@ -335,9 +326,7 @@ pub fn highlight_code_runs(
     let mut highlighter = SyntaxHighlighter::new(language);
     let rope = ropey::Rope::from_str(content);
     highlighter.update(None, &rope, None);
-    let styles = highlighter.styles(&(0..content.len()),
-        &theme.highlight_theme,
-    );
+    let styles = highlighter.styles(&(0..content.len()), &theme.highlight_theme);
 
     let mut runs = Vec::new();
     let mut offset = 0;

@@ -13,9 +13,7 @@ use gpui::{
 use crate::theme::ActiveTheme;
 
 use super::markdown::{Markdown, MarkdownStyle, highlight_code_runs};
-use super::markdown_parser::{
-    ColumnAlign, MarkdownEvent, MarkdownTag, MarkdownTagEnd,
-};
+use super::markdown_parser::{ColumnAlign, MarkdownEvent, MarkdownTag, MarkdownTagEnd};
 
 pub enum AnyDiv {
     Div(Div),
@@ -165,7 +163,10 @@ impl MarkdownElementBuilder {
         while self.div_stack.len() > 1 {
             self.pop_div();
         }
-        self.div_stack.pop().map(|entry| entry.children).unwrap_or_default()
+        self.div_stack
+            .pop()
+            .map(|entry| entry.children)
+            .unwrap_or_default()
     }
 
     fn process_event(
@@ -179,7 +180,13 @@ impl MarkdownElementBuilder {
             MarkdownEvent::Start(tag) => match tag {
                 MarkdownTag::Paragraph => {
                     self.push_div(
-                        div().flex().flex_wrap().items_center().mb_2().line_height(rems(1.3)),
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .mb_2()
+                            .line_height(rems(1.3)),
                         &range,
                         markdown_end,
                     );
@@ -191,7 +198,13 @@ impl MarkdownElementBuilder {
                     self.heading_level = level;
                     let mut heading = div();
                     heading.style().refine(&self.style.heading);
-                    if let Some(refinement) = self.style.heading_level_styles.get(level as usize - 1).cloned().flatten() {
+                    if let Some(refinement) = self
+                        .style
+                        .heading_level_styles
+                        .get(level as usize - 1)
+                        .cloned()
+                        .flatten()
+                    {
                         heading.style().refine(&StyleRefinement {
                             text: refinement,
                             ..Default::default()
@@ -205,13 +218,11 @@ impl MarkdownElementBuilder {
                     self.push_div(heading, &range, markdown_end);
                 }
                 MarkdownTag::CodeBlock(info) => {
-                    self.code_block_language.push(
-                        if info.language.is_empty() {
-                            None
-                        } else {
-                            Some(info.language.clone())
-                        }
-                    );
+                    self.code_block_language.push(if info.language.is_empty() {
+                        None
+                    } else {
+                        Some(info.language.clone())
+                    });
                     self.code_block_content.push(String::new());
                     let code_block_id = range.start;
                     self.code_block_ids.push(code_block_id);
@@ -263,7 +274,11 @@ impl MarkdownElementBuilder {
                     );
                     let bullet = if let Some(task) = &self.pending_task {
                         let checked = task.0;
-                        if checked { "☑".to_string() } else { "☐".to_string() }
+                        if checked {
+                            "☑".to_string()
+                        } else {
+                            "☐".to_string()
+                        }
                     } else if let Some(Some(n)) = self.list_stack.last().cloned() {
                         let s = format!("{}.", n);
                         if let Some(last) = self.list_stack.last_mut() {
@@ -274,7 +289,10 @@ impl MarkdownElementBuilder {
                         "•".to_string()
                     };
                     self.pending_task = None;
-                    let bullet_el = div().w(px(20.0)).child(bullet).text_color(cx.theme().ui.text_muted);
+                    let bullet_el = div()
+                        .w(px(20.0))
+                        .child(bullet)
+                        .text_color(cx.theme().ui.text_muted);
                     self.push_div(bullet_el, &range, markdown_end);
                     self.pop_div();
                     self.push_div(div().flex_1().w_0(), &range, markdown_end);
@@ -282,20 +300,20 @@ impl MarkdownElementBuilder {
                 MarkdownTag::BlockQuote => {
                     self.blockquote_depth += 1;
                     let mut block = div();
-                    block.style().refine(
-                        &StyleRefinement {
-                            padding: gpui::EdgesRefinement {
-                                left: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(16.)))),
-                                ..Default::default()
-                            },
-                            border_widths: gpui::EdgesRefinement {
-                                left: Some(gpui::AbsoluteLength::Pixels(px(4.))),
-                                ..Default::default()
-                            },
-                            border_color: Some(self.style.block_quote_border_color),
+                    block.style().refine(&StyleRefinement {
+                        padding: gpui::EdgesRefinement {
+                            left: Some(gpui::DefiniteLength::Absolute(
+                                gpui::AbsoluteLength::Pixels(px(16.)),
+                            )),
                             ..Default::default()
-                        }
-                    );
+                        },
+                        border_widths: gpui::EdgesRefinement {
+                            left: Some(gpui::AbsoluteLength::Pixels(px(4.))),
+                            ..Default::default()
+                        },
+                        border_color: Some(self.style.block_quote_border_color),
+                        ..Default::default()
+                    });
                     self.push_div(block, &range, markdown_end);
                     self.push_text_style(self.style.block_quote.clone());
                 }
@@ -405,14 +423,9 @@ impl MarkdownElementBuilder {
                         .cursor_pointer()
                         .child(copy_label)
                         .on_click(move |_: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                copy_content.clone(),
-                            ));
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
                             markdown_copy.update(cx, |markdown, cx| {
-                                markdown.mark_code_block_copied(
-                                    copy_id_for_click.clone(),
-                                    cx,
-                                );
+                                markdown.mark_code_block_copied(copy_id_for_click.clone(), cx);
                             });
                         })
                         .into_any_element();
@@ -485,8 +498,7 @@ impl MarkdownElementBuilder {
                 MarkdownTagEnd::Link => {
                     self.pop_text_style();
                     if let Some(link) = self.link_state.take() {
-                        let styled_text =
-                            StyledText::new(link.text).with_runs(link.runs);
+                        let styled_text = StyledText::new(link.text).with_runs(link.runs);
                         let url = link.url.clone();
                         let url_for_id = SharedString::from(url.clone());
                         let link_el = div()
@@ -548,8 +560,7 @@ impl MarkdownElementBuilder {
         style
     }
 
-    fn push_text(
-        &mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
+    fn push_text(&mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         if self.link_state.is_some() {
             let run = {
                 let style = self.text_style();
@@ -561,7 +572,12 @@ impl MarkdownElementBuilder {
             }
             return;
         }
-        if self.code_block_language.last().and_then(|l| l.as_ref()).is_some() {
+        if self
+            .code_block_language
+            .last()
+            .and_then(|l| l.as_ref())
+            .is_some()
+        {
             self.push_code_text(text, range, cx);
             return;
         }
@@ -570,8 +586,7 @@ impl MarkdownElementBuilder {
         self.pending_line.runs.push(style.to_run(text.len()));
     }
 
-    fn push_code_text(
-        &mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
+    fn push_code_text(&mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         let style = self.text_style();
         let language = self.code_block_language.last().unwrap().clone().unwrap();
         let key = (language.clone(), range.clone());
@@ -592,7 +607,7 @@ impl MarkdownElementBuilder {
         }
         let styled_text = StyledText::new(self.pending_line.text.clone())
             .with_runs(self.pending_line.runs.clone());
-        self.append_child(styled_text.into_any_element());
+        self.append_child(div().min_w_0().child(styled_text).into_any_element());
         self.pending_line = PendingLine::default();
     }
 
@@ -602,12 +617,7 @@ impl MarkdownElementBuilder {
         }
     }
 
-    fn push_div(
-        &mut self,
-        div: impl Into<AnyDiv>,
-        range: &Range<usize>,
-        markdown_end: usize,
-    ) {
+    fn push_div(&mut self, div: impl Into<AnyDiv>, range: &Range<usize>, markdown_end: usize) {
         let mut div = div.into();
         self.flush_text();
 
