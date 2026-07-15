@@ -7,9 +7,10 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, ClickEvent, ClipboardItem, Div, EdgesRefinement, Entity, IntoElement, Length,
     ParentElement, SharedString, Stateful, StyleRefinement, Styled, StyledText, TextRun,
-    TextStyleRefinement, div, px, rems,
+    TextStyleRefinement, div, px, rems, svg,
 };
 
+use crate::assets::Icon;
 use crate::theme::ActiveTheme;
 
 use super::markdown::{Markdown, MarkdownStyle, highlight_code_runs};
@@ -109,8 +110,8 @@ pub struct MarkdownElementBuilder {
     heading_level: u8,
     pending_task: Option<(bool, Range<usize>)>,
     link_state: Option<LinkState>,
-    copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
     wrapped_code_blocks: std::collections::HashSet<usize>,
+    copied_code_blocks: std::collections::HashSet<usize>,
     markdown: Entity<Markdown>,
     highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
 }
@@ -118,8 +119,8 @@ pub struct MarkdownElementBuilder {
 impl MarkdownElementBuilder {
     pub fn new(
         style: MarkdownStyle,
-        copied_code_blocks: std::collections::HashSet<gpui::ElementId>,
         wrapped_code_blocks: std::collections::HashSet<usize>,
+        copied_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
         highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
     ) -> Self {
@@ -143,8 +144,8 @@ impl MarkdownElementBuilder {
             heading_level: 0,
             pending_task: None,
             link_state: None,
-            copied_code_blocks,
             wrapped_code_blocks,
+            copied_code_blocks,
             markdown,
             highlight_cache,
         }
@@ -232,7 +233,11 @@ impl MarkdownElementBuilder {
                         .and_then(|l| l.as_ref())
                         .is_some();
                     let is_wrapped = self.wrapped_code_blocks.contains(&code_block_id);
-                    let mut outer = div().group("code-block").relative().w_full();
+                    let mut outer = div()
+                        .group("code-block")
+                        .relative()
+                        .w_full()
+                        .rounded(px(6.0));
                     outer.style().refine(&self.style.code_block);
                     self.push_div(outer, &range, markdown_end);
                     let inner: AnyDiv = if is_wrapped {
@@ -251,16 +256,13 @@ impl MarkdownElementBuilder {
                         d.into()
                     };
                     self.push_div(inner, &range, markdown_end);
-                    self.push_text_style(TextStyleRefinement {
-                        font_family: self.style.code_block.text.font_family.clone(),
-                        font_size: self.style.code_block.text.font_size,
-                        white_space: if is_wrapped {
-                            Some(gpui::WhiteSpace::Normal)
-                        } else {
-                            Some(gpui::WhiteSpace::Nowrap)
-                        },
-                        ..Default::default()
+                    let mut code_text_style = self.style.code_block.text.clone();
+                    code_text_style.white_space = Some(if is_wrapped {
+                        gpui::WhiteSpace::Normal
+                    } else {
+                        gpui::WhiteSpace::Nowrap
                     });
+                    self.push_text_style(code_text_style);
                 }
                 MarkdownTag::List(start) => {
                     self.list_stack.push(start);
@@ -329,7 +331,7 @@ impl MarkdownElementBuilder {
                         .mb_2()
                         .border(px(1.0))
                         .border_color(cx.theme().ui.border)
-                        .rounded_sm()
+                        .rounded(px(6.0))
                         .overflow_hidden();
                     self.push_div(grid, &range, markdown_end);
                 }
@@ -386,6 +388,7 @@ impl MarkdownElementBuilder {
                     self.pop_div();
                 }
                 MarkdownTagEnd::CodeBlock => {
+                    self.trim_trailing_newline();
                     self.pop_div();
                     let content = self.code_block_content.pop().unwrap_or_default();
                     let code_block_id = self.code_block_ids.pop().unwrap_or_default();
@@ -394,8 +397,6 @@ impl MarkdownElementBuilder {
                         "copy-{}",
                         code_block_id
                     )));
-                    let copied = self.copied_code_blocks.contains(&copy_id);
-                    let is_wrapped = self.wrapped_code_blocks.contains(&code_block_id);
 
                     if let Some(lang) = language {
                         let label = div()
@@ -411,38 +412,32 @@ impl MarkdownElementBuilder {
                     }
 
                     let copy_content = content.clone();
-                    let copy_id_for_click = copy_id.clone();
+                    let is_copied = self.copied_code_blocks.contains(&code_block_id);
+                    let copy_icon = if is_copied {
+                        svg()
+                            .size(px(16.0))
+                            .text_color(cx.theme().ui.success)
+                            .path(Icon::Check.path())
+                    } else {
+                        svg()
+                            .size(px(16.0))
+                            .text_color(cx.theme().ui.text_muted)
+                            .path(Icon::Copy.path())
+                    };
                     let markdown_copy = self.markdown.clone();
-                    let copy_label = if copied { "Copied" } else { "Copy" };
                     let copy_btn = div()
                         .id(copy_id)
                         .px_2()
                         .py_1()
                         .rounded(px(4.0))
-                        .text_size(px(11.0))
                         .cursor_pointer()
-                        .child(copy_label)
+                        .invisible()
+                        .group_hover("code-block", |style| style.visible())
+                        .child(copy_icon)
                         .on_click(move |_: &ClickEvent, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
                             markdown_copy.update(cx, |markdown, cx| {
-                                markdown.mark_code_block_copied(copy_id_for_click.clone(), cx);
-                            });
-                        })
-                        .into_any_element();
-
-                    let wrap_label = if is_wrapped { "Unwrap" } else { "Wrap" };
-                    let markdown_wrap = self.markdown.clone();
-                    let wrap_btn = div()
-                        .id(format!("wrap-{}", code_block_id))
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.0))
-                        .text_size(px(11.0))
-                        .cursor_pointer()
-                        .child(wrap_label)
-                        .on_click(move |_: &ClickEvent, _, cx| {
-                            markdown_wrap.update(cx, |markdown, cx| {
-                                markdown.toggle_code_block_wrap(code_block_id, cx);
+                                markdown.mark_code_block_copied(code_block_id, cx);
                             });
                         })
                         .into_any_element();
@@ -453,8 +448,8 @@ impl MarkdownElementBuilder {
                         .right(px(8.0))
                         .flex()
                         .flex_row()
-                        .gap_1()
-                        .children([copy_btn, wrap_btn])
+                        .bg(cx.theme().editor_background())
+                        .child(copy_btn)
                         .into_any_element();
                     self.append_child(buttons);
 
@@ -581,6 +576,11 @@ impl MarkdownElementBuilder {
             self.push_code_text(text, range, cx);
             return;
         }
+        if !self.code_block_language.is_empty() {
+            if let Some(content) = self.code_block_content.last_mut() {
+                content.push_str(text);
+            }
+        }
         let style = self.text_style();
         self.pending_line.text.push_str(text);
         self.pending_line.runs.push(style.to_run(text.len()));
@@ -598,6 +598,15 @@ impl MarkdownElementBuilder {
         self.pending_line.text.push_str(text);
         if let Some(content) = self.code_block_content.last_mut() {
             content.push_str(text);
+        }
+    }
+
+    fn trim_trailing_newline(&mut self) {
+        if self.pending_line.text.ends_with('\n') {
+            self.pending_line.text.pop();
+            if let Some(last_run) = self.pending_line.runs.last_mut() {
+                last_run.len -= 1;
+            }
         }
     }
 

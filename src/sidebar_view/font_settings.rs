@@ -165,11 +165,26 @@ pub fn platform_default_font_family() -> SharedString {
 pub fn platform_default_fallbacks() -> gpui::FontFallbacks {
     #[cfg(target_os = "macos")]
     {
-        gpui::FontFallbacks::from_fonts(vec!["Monaco".to_string(), "Courier New".to_string()])
+        gpui::FontFallbacks::from_fonts(vec![
+            "Monaco".to_string(),
+            "Courier New".to_string(),
+            "Sarasa Mono SC".to_string(),
+            "Maple Mono CN".to_string(),
+            "Noto Sans Mono CJK SC".to_string(),
+            "Source Han Mono SC".to_string(),
+            "JetBrainsMono Nerd Font".to_string(),
+        ])
     }
     #[cfg(target_os = "windows")]
     {
-        gpui::FontFallbacks::from_fonts(vec!["Courier New".to_string()])
+        gpui::FontFallbacks::from_fonts(vec![
+            "Courier New".to_string(),
+            "Sarasa Mono SC".to_string(),
+            "Maple Mono CN".to_string(),
+            "Noto Sans Mono CJK SC".to_string(),
+            "Source Han Mono SC".to_string(),
+            "JetBrainsMono Nerd Font".to_string(),
+        ])
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -177,6 +192,11 @@ pub fn platform_default_fallbacks() -> gpui::FontFallbacks {
             "Noto Sans Mono".to_string(),
             "Source Code Pro".to_string(),
             "DejaVu Sans Mono".to_string(),
+            "Sarasa Mono SC".to_string(),
+            "Maple Mono CN".to_string(),
+            "Noto Sans Mono CJK SC".to_string(),
+            "Source Han Mono SC".to_string(),
+            "JetBrainsMono Nerd Font".to_string(),
         ])
     }
 }
