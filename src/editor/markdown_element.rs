@@ -197,7 +197,7 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTag::Heading(level) => {
                     self.heading_level = level;
-                    let mut heading = div().mt_4().mb_2();
+                    let mut heading = div().mt_4().mb_4();
                     heading.style().refine(&self.style.heading);
                     if let Some(refinement) = self
                         .style
