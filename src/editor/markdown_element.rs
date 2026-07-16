@@ -186,6 +186,7 @@ impl MarkdownElementBuilder {
                             .flex()
                             .flex_wrap()
                             .items_center()
+                            .mt_4()
                             .mb_2()
                             .line_height(rems(1.3)),
                         &range,
