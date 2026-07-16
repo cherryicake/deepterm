@@ -13,6 +13,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::file_icons::file_icon_or_default;
 use crate::file_manager::filesystem::RemoteFileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
@@ -180,7 +181,8 @@ impl Editor {
     pub fn take_cached_editor_states(&mut self) -> HashMap<SharedString, Entity<InputState>> {
         let mut cached_states = HashMap::new();
         for file in &mut self.open_files {
-            if file.ssh_config.is_some() && !file.is_loading {
+            // 缓存所有非加载中的文件，避免本地文件切换时重复从磁盘读取。
+            if !file.is_loading {
                 let state = file.editor_state.clone();
                 cached_states.insert(file.id.clone(), state);
             }
@@ -266,10 +268,10 @@ impl Editor {
         let label = file_info.label.clone();
         let ssh_config = file_info.ssh_config.clone();
 
+        let content = editor_state.read(cx).value().to_string();
         let is_markdown = path_str.ends_with(".md");
         let markdown = if is_markdown {
-            let content = editor_state.read(cx).value().to_string();
-            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content, cx)))
+            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content.clone(), cx)))
         } else {
             None
         };
@@ -280,7 +282,7 @@ impl Editor {
             label,
             ssh_config: ssh_config.clone(),
             editor_state: editor_state.clone(),
-            original_content: String::new(),
+            original_content: content,
             pending_reload: false,
             is_loading: false,
             markdown,
@@ -298,7 +300,8 @@ impl Editor {
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&file_info.id, &file_info.label).with_icon(Some(Icon::File)),
+                TabItem::new(&file_info.id, &file_info.label)
+                    .with_icon(Some(file_icon_or_default(Path::new(&file_info.path)))),
                 cx,
             );
         });
@@ -716,16 +719,25 @@ impl Editor {
                                     });
                                 }
                             }
-                            this.tab_bar.update(cx, |tab_bar, cx| {
-                                tab_bar.modify_tab(
-                                    &tab_id,
-                                    |tab| {
-                                        tab.icon = Some(Icon::File);
-                                        tab.is_loading = false;
-                                    },
-                                    cx,
-                                );
-                            });
+                            let file_path = this
+                                .open_files
+                                .iter()
+                                .find(|f| f.id == tab_id)
+                                .map(|f| f.path.clone());
+                            if let Some(file_path) = file_path {
+                                this.tab_bar.update(cx, |tab_bar, cx| {
+                                    tab_bar.modify_tab(
+                                        &tab_id,
+                                        |tab| {
+                                            tab.icon = Some(file_icon_or_default(Path::new(
+                                                &file_path,
+                                            )));
+                                            tab.is_loading = false;
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }
                             cx.notify();
                         });
                         break;
@@ -938,7 +950,7 @@ impl Editor {
         let tab_icon = if is_loading {
             Some(Icon::Loader)
         } else {
-            Some(Icon::File)
+            Some(file_icon_or_default(&path))
         };
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(

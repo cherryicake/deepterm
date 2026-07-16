@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::file_icons::file_icon_or_default;
+
 /// 补全项的语义分类
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionKind {
@@ -140,6 +142,11 @@ impl PathCompletionEngine {
 
                 let is_directory = entry.file_type().ok()?.is_dir();
                 let path = entry.path();
+                let icon = if is_directory {
+                    None
+                } else {
+                    Some(file_icon_or_default(&path))
+                };
 
                 Some(PathCompletionItem {
                     name,
@@ -151,7 +158,7 @@ impl PathCompletionEngine {
                         CompletionKind::File
                     },
                     description: None,
-                    icon: None,
+                    icon,
                     replacement: None,
                 })
             })

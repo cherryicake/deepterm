@@ -88,6 +88,8 @@ pub enum Icon {
     SquarePlus,  // Added
     SquareMinus, // Deleted
     Warning,     // Conflicted
+    /// Dynamic file icon loaded by extension/name (e.g., language icons from Seti UI).
+    FileIcon(&'static str),
 }
 
 impl Icon {
@@ -152,6 +154,7 @@ impl Icon {
             Icon::SquarePlus => SharedString::new_static("icons/square_plus.svg"),
             Icon::SquareMinus => SharedString::new_static("icons/square_minus.svg"),
             Icon::Warning => SharedString::new_static("icons/warning.svg"),
+            Icon::FileIcon(path) => SharedString::new_static(path),
         }
     }
 }

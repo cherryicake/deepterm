@@ -401,30 +401,32 @@ impl MacosSidebar {
                     self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
                     self.file_tree_target_label = Some(display_name);
 
-                    // 触发编辑器状态保存/恢复
+                    // 文件树 key 发生变化时才触发编辑器状态保存/恢复
                     let new_key = crate::editor::FileTreeKey::new(
                         Some(path.clone()),
                         is_local,
                         ssh_config.clone(),
                     );
-                    let app_window = self.app_window.clone();
-                    let window_handle = window.window_handle();
-                    cx.defer(move |cx| {
-                        if let Some(aw) = &app_window {
-                            cx.update_window(window_handle, |_view, window, cx| {
-                                aw.update(cx, |this, cx| {
-                                    this.on_file_tree_switched(
-                                        old_file_tree_key,
-                                        new_key,
-                                        window,
-                                        cx,
-                                    );
+                    if old_file_tree_key != Some(new_key.clone()) {
+                        let app_window = self.app_window.clone();
+                        let window_handle = window.window_handle();
+                        cx.defer(move |cx| {
+                            if let Some(aw) = &app_window {
+                                cx.update_window(window_handle, |_view, window, cx| {
+                                    aw.update(cx, |this, cx| {
+                                        this.on_file_tree_switched(
+                                            old_file_tree_key,
+                                            new_key,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
                                 })
                                 .ok();
-                            })
-                            .ok();
-                        }
-                    });
+                            }
+                        });
+                    }
 
                     cx.notify();
                     return;

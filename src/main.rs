@@ -9,6 +9,7 @@ pub mod assets;
 pub mod builtin_commands;
 pub mod components;
 pub mod editor;
+pub mod file_icons;
 pub mod file_manager;
 mod sidebar_view;
 pub mod ssh;

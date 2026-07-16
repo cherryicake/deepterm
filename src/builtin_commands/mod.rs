@@ -2274,7 +2274,7 @@ where
                                 })
                                 .child({
                                     let svg_element = svg()
-                                        .size(px(14.0))
+                                        .size(px(16.0))
                                         .text_color(theme.text_muted)
                                         .path(icon_path);
                                     if item.icon == Some(crate::assets::Icon::ProgressIndicator) {

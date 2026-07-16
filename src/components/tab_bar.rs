@@ -1163,72 +1163,100 @@ impl Render for TabBar {
                                             let is_hovered =
                                                 self.hovered_tab_id.as_ref() == Some(&tab_id);
 
-                                            // Hover close takes priority over loading spinner so
-                                            // slow remote opens can still be dismissed from the tab.
-                                            if is_hovered && icon.is_some() {
-                                                let on_tab_close = on_tab_close.clone();
-                                                let tab_id_close = tab_id.clone();
-                                                svg()
-                                                    .size(px(16.0))
-                                                    .cursor_pointer()
-                                                    .text_color(if is_active {
-                                                        theme.text
-                                                    } else {
-                                                        theme.text_muted
-                                                    })
-                                                    .path(Icon::XmarkCircleFill.path())
-                                                    .on_mouse_down(
-                                                        gpui::MouseButton::Left,
-                                                        cx.listener(
-                                                            move |_this, _event, window, cx| {
-                                                                if let Some(ref callback) =
-                                                                    on_tab_close
-                                                                {
-                                                                    callback(
-                                                                        tab_id_close.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            },
-                                                        ),
-                                                    )
-                                                    .into_any_element()
-                                            } else if tab.is_loading {
-                                                svg()
-                                                    .size(px(16.0))
-                                                    .text_color(if is_active {
-                                                        theme.text
-                                                    } else {
-                                                        theme.text_muted
-                                                    })
-                                                    .path(Icon::Loader.path())
-                                                    .with_animation(
-                                                        format!("tab-loading-{}", tab_id),
-                                                        Animation::new(Duration::from_millis(800))
+                                            let icon_slot_width = if icon
+                                                .map_or(false, |i| matches!(i, Icon::FileIcon(_)))
+                                            {
+                                                px(22.0)
+                                            } else {
+                                                px(16.0)
+                                            };
+
+                                            let has_icon = icon.is_some() || tab.is_loading;
+                                            if !has_icon {
+                                                div().into_any_element()
+                                            } else {
+                                                // Hover close takes priority over loading spinner so
+                                                // slow remote opens can still be dismissed from the tab.
+                                                let content = if is_hovered && icon.is_some() {
+                                                    let on_tab_close = on_tab_close.clone();
+                                                    let tab_id_close = tab_id.clone();
+                                                    svg()
+                                                        .size(px(16.0))
+                                                        .cursor_pointer()
+                                                        .text_color(if is_active {
+                                                            theme.text
+                                                        } else {
+                                                            theme.text_muted
+                                                        })
+                                                        .path(Icon::XmarkCircleFill.path())
+                                                        .on_mouse_down(
+                                                            gpui::MouseButton::Left,
+                                                            cx.listener(
+                                                                move |_this, _event, window, cx| {
+                                                                    if let Some(ref callback) =
+                                                                        on_tab_close
+                                                                    {
+                                                                        callback(
+                                                                            tab_id_close.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                },
+                                                            ),
+                                                        )
+                                                        .into_any_element()
+                                                } else if tab.is_loading {
+                                                    svg()
+                                                        .size(px(16.0))
+                                                        .text_color(if is_active {
+                                                            theme.text
+                                                        } else {
+                                                            theme.text_muted
+                                                        })
+                                                        .path(Icon::Loader.path())
+                                                        .with_animation(
+                                                            format!("tab-loading-{}", tab_id),
+                                                            Animation::new(
+                                                                Duration::from_millis(800),
+                                                            )
                                                             .repeat()
                                                             .with_easing(ease_in_out),
-                                                        |this, delta| {
-                                                            this.with_transformation(
-                                                                Transformation::rotate(percentage(
-                                                                    delta,
-                                                                )),
-                                                            )
-                                                        },
-                                                    )
-                                                    .into_any_element()
-                                            } else if let Some(icon) = icon {
-                                                svg()
-                                                    .size(px(16.0))
-                                                    .text_color(if is_active {
-                                                        theme.text
+                                                            |this, delta| {
+                                                                this.with_transformation(
+                                                                    Transformation::rotate(
+                                                                        percentage(delta),
+                                                                    ),
+                                                                )
+                                                            },
+                                                        )
+                                                        .into_any_element()
+                                                } else if let Some(icon) = icon {
+                                                    let icon_size = if matches!(icon, Icon::FileIcon(_)) {
+                                                        px(22.0)
                                                     } else {
-                                                        theme.text_muted
-                                                    })
-                                                    .path(icon.path())
+                                                        px(16.0)
+                                                    };
+                                                    svg()
+                                                        .size(icon_size)
+                                                        .text_color(if is_active {
+                                                            theme.text
+                                                        } else {
+                                                            theme.text_muted
+                                                        })
+                                                        .path(icon.path())
+                                                        .into_any_element()
+                                                } else {
+                                                    div().into_any_element()
+                                                };
+
+                                                div()
+                                                    .w(icon_slot_width)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(content)
                                                     .into_any_element()
-                                            } else {
-                                                div().into_any_element()
                                             }
                                         })
                                         .child(

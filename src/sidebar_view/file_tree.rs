@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::assets::Icon;
+use crate::file_icons::file_icon_or_default;
 use crate::file_manager::FileSystem;
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::file_tree_event::FileTreeEvent;
@@ -24,10 +25,12 @@ use crate::theme::UiTheme;
 
 impl gpui::EventEmitter<crate::file_manager::file_tree_event::FileTreeEvent> for SidebarFileTree {}
 
-fn entry_icon(kind: &FileEntryKind) -> Icon {
-    match kind {
+fn entry_icon(entry: &FileEntry) -> Icon {
+    match entry.kind {
         FileEntryKind::Directory => Icon::Folder,
-        FileEntryKind::File | FileEntryKind::Symlink | FileEntryKind::Other => Icon::File,
+        FileEntryKind::File | FileEntryKind::Symlink | FileEntryKind::Other => {
+            file_icon_or_default(&entry.path)
+        }
     }
 }
 
@@ -654,7 +657,7 @@ impl SidebarFileTree {
     ) -> gpui::Div {
         let indent = px(depth as f32 * INDENT_SIZE);
         let name = entry.name.clone();
-        let icon = entry_icon(&entry.kind);
+        let icon = entry_icon(entry);
 
         let row = div()
             .w_full()
@@ -741,7 +744,7 @@ impl SidebarFileTree {
         let is_directory = entry.kind == FileEntryKind::Directory;
         let is_expanded = is_directory && self.expanded_folders.contains(&path);
         let name = entry.name.clone();
-        let icon = entry_icon(&entry.kind);
+        let icon = entry_icon(entry);
         let is_hovered = self.hovered_path.as_ref() == Some(&path);
         let theme = cx.theme().ui;
 
@@ -828,7 +831,7 @@ impl SidebarFileTree {
                         )
                         .child(
                             svg()
-                                .size(px(14.0))
+                                .size(if is_directory { px(14.0) } else { px(18.0) })
                                 .text_color(if is_directory {
                                     theme.accent
                                 } else if is_selected {

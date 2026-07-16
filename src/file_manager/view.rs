@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -7,6 +8,7 @@ use gpui::prelude::*;
 use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
 
 use crate::assets::Icon;
+use crate::file_icons::file_icon_or_default;
 fn format_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = size as f64;
@@ -433,7 +435,7 @@ fn render_transfer_list_item(
             gpui::svg()
                 .size(px(34.0))
                 .text_color(theme.text_subtle)
-                .path(Icon::File.path()),
+                .path(file_icon_or_default(Path::new(&task.item_name)).path()),
         );
 
     let mut row = div()
