@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use gpui::prelude::*;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
@@ -8,7 +10,9 @@ use gpui::{
 use crate::assets::Icon;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::git_status::{DiffStat, FileStatus, Section, StatusCode, TrackedStatus};
+use crate::file_manager::filesystem::FileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, WatcherContext};
+use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
 const LIST_ROW_HEIGHT: f32 = 28.0;
@@ -93,6 +97,9 @@ impl GitFileEntry {
 pub struct GitPanel {
     focus_handle: FocusHandle,
     workspace_path: Option<std::path::PathBuf>,
+    is_local: bool,
+    ssh_config: Option<SshConnectionConfig>,
+    filesystem: Option<Arc<dyn FileSystem>>,
     repo: Option<GitRepository>,
     entries: Vec<GitListEntry>,
     file_entries: Vec<GitFileEntry>,
@@ -107,6 +114,9 @@ impl GitPanel {
         Self {
             focus_handle: cx.focus_handle(),
             workspace_path: None,
+            is_local: true,
+            ssh_config: None,
+            filesystem: None,
             repo: None,
             entries: Vec::new(),
             file_entries: Vec::new(),
@@ -118,42 +128,81 @@ impl GitPanel {
     }
 
     /// Set the workspace path and refresh git status
-    pub fn set_workspace_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        // Skip if same path
-        if self.workspace_path.as_ref() == Some(&path) {
+    pub fn set_workspace_path(
+        &mut self,
+        path: std::path::PathBuf,
+        is_local: bool,
+        ssh_config: Option<SshConnectionConfig>,
+        filesystem: Option<Arc<dyn FileSystem>>,
+        cx: &mut Context<Self>,
+    ) {
+        // Skip if same path and backend
+        if self.workspace_path.as_ref() == Some(&path)
+            && self.is_local == is_local
+            && self.ssh_config == ssh_config
+        {
             return;
         }
 
         // Unwatch old path if exists
         if let Some(ref old_path) = self.workspace_path {
             self.watcher_subscription.take();
-            cx.unwatch_recursive_path(old_path);
+            if self.is_local {
+                cx.unwatch_recursive_path(old_path);
+            } else {
+                cx.unwatch_remote_path(old_path);
+            }
         }
 
         self.workspace_path = Some(path.clone());
-        self.repo = GitRepository::find(&path);
+        self.is_local = is_local;
+        self.ssh_config = ssh_config.clone();
+        self.filesystem = filesystem.clone();
+        self.repo = GitRepository::find(&path, is_local, ssh_config);
 
         // Watch the workspace directory recursively
-        cx.watch_recursive_path(&path);
+        if is_local {
+            cx.watch_recursive_path(&path);
+        } else if let Some(ref fs) = filesystem {
+            cx.watch_remote_path(&path, fs.clone());
+        }
 
         // Set up file watching for auto-refresh
         // Use a separate subscription that checks if we're already loading
-        let watcher = cx.fs_watcher();
         let weak = cx.entity().downgrade();
-        self.watcher_subscription = Some(cx.subscribe(
-            &watcher,
-            move |_, _, _event: &FsChangeEvent, cx| {
-                // Use cx.defer to avoid re-entrancy issues
-                let weak = weak.clone();
-                cx.defer(move |cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        if !this.loading {
-                            this.refresh(cx);
-                        }
+        self.watcher_subscription = if is_local {
+            let watcher = cx.fs_watcher();
+            Some(cx.subscribe(
+                &watcher,
+                move |_, _, _event: &FsChangeEvent, cx| {
+                    // Use cx.defer to avoid re-entrancy issues
+                    let weak = weak.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if !this.loading {
+                                this.refresh(cx);
+                            }
+                        });
                     });
-                });
-            },
-        ));
+                },
+            ))
+        } else {
+            let watcher = cx.remote_fs_watcher();
+            Some(cx.subscribe(
+                &watcher,
+                move |_, _, _event: &FsChangeEvent, cx| {
+                    // Use cx.defer to avoid re-entrancy issues
+                    let weak = weak.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if !this.loading {
+                                this.refresh(cx);
+                            }
+                        });
+                    });
+                },
+            ))
+        };
 
         self.refresh(cx);
     }
@@ -170,27 +219,25 @@ impl GitPanel {
         self.loading = true;
         cx.notify();
 
-        let repo_root = repo.root().to_path_buf();
+        let repo = repo.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
-            let status_result = {
-                let repo = GitRepository {
-                    root: repo_root.clone(),
-                };
-                cx.background_executor()
-                    .spawn(async move { repo.status() })
-                    .await
-            };
+            let status_result = cx
+                .background_executor()
+                .spawn({
+                    let repo = repo.clone();
+                    async move { repo.status() }
+                })
+                .await;
 
-            let diff_stat_result = {
-                let repo = GitRepository {
-                    root: repo_root.clone(),
-                };
-                cx.background_executor()
-                    .spawn(async move { repo.diff_stat() })
-                    .await
-            };
+            let diff_stat_result = cx
+                .background_executor()
+                .spawn({
+                    let repo = repo.clone();
+                    async move { repo.diff_stat() }
+                })
+                .await;
 
             let _ = weak.update(cx, |this, cx| {
                 this.loading = false;
@@ -259,19 +306,15 @@ impl GitPanel {
         };
 
         let path = entry.path.clone();
-        let path_clone = path.clone();
-        let repo_root = repo.root().to_path_buf();
+        let path_for_spawn = path.clone();
+        let repo = repo.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
-            let diff_result = {
-                let repo = GitRepository {
-                    root: repo_root.clone(),
-                };
-                cx.background_executor()
-                    .spawn(async move { repo.diff_file(&path_clone) })
-                    .await
-            };
+            let diff_result = cx
+                .background_executor()
+                .spawn(async move { repo.diff_file(&path_for_spawn) })
+                .await;
 
             if let Ok(diff_content) = diff_result {
                 let _ = weak.update(cx, |_, cx| {
@@ -289,19 +332,15 @@ impl GitPanel {
         };
 
         let path = path.to_string();
-        let repo_root = repo.root().to_path_buf();
+        let path_for_spawn = path.clone();
+        let repo = repo.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
-            let result = {
-                let repo = GitRepository {
-                    root: repo_root.clone(),
-                };
-                let path_ref = path.clone();
-                cx.background_executor()
-                    .spawn(async move { repo.stage(&[&path_ref]) })
-                    .await
-            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.stage(&[&path_for_spawn]) })
+                .await;
 
             if result.is_ok() {
                 let _ = weak.update(cx, |this, cx| {
@@ -320,19 +359,15 @@ impl GitPanel {
         };
 
         let path = path.to_string();
-        let repo_root = repo.root().to_path_buf();
+        let path_for_spawn = path.clone();
+        let repo = repo.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
-            let result = {
-                let repo = GitRepository {
-                    root: repo_root.clone(),
-                };
-                let path_ref = path.clone();
-                cx.background_executor()
-                    .spawn(async move { repo.unstage(&[&path_ref]) })
-                    .await
-            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.unstage(&[&path_for_spawn]) })
+                .await;
 
             if result.is_ok() {
                 let _ = weak.update(cx, |this, cx| {

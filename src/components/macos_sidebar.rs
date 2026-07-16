@@ -496,9 +496,27 @@ impl MacosSidebar {
         if let Some(ref git_panel) = self.git_panel {
             // Set workspace path
             if let Some(ref file_tree) = self.file_tree_view {
-                let workspace_path = file_tree.read(cx).root_path().to_path_buf();
+                let (workspace_path, is_local, ssh_config, filesystem) = {
+                    let tree = file_tree.read(cx);
+                    (
+                        tree.root_path().to_path_buf(),
+                        tree.is_local(),
+                        tree.ssh_config().cloned(),
+                        if tree.is_local() {
+                            None
+                        } else {
+                            Some(tree.filesystem().clone())
+                        },
+                    )
+                };
                 git_panel.update(cx, |panel, cx| {
-                    panel.set_workspace_path(workspace_path, cx);
+                    panel.set_workspace_path(
+                        workspace_path,
+                        is_local,
+                        ssh_config,
+                        filesystem,
+                        cx,
+                    );
                 });
             }
 

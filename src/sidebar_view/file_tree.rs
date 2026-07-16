@@ -273,6 +273,14 @@ impl SidebarFileTree {
         self.loader.is_local()
     }
 
+    pub fn ssh_config(&self) -> Option<&SshConnectionConfig> {
+        self.loader.ssh_config()
+    }
+
+    pub fn filesystem(&self) -> &Arc<dyn FileSystem> {
+        self.loader.backend()
+    }
+
     pub fn matches_location(
         &self,
         path: &Path,
