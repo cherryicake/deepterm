@@ -155,6 +155,8 @@ impl GitPanel {
         // Unwatch old path if exists
         if let Some(ref old_path) = self.workspace_path {
             self.watcher_subscription.take();
+            self.refresh_debounce_task.take();
+            self.refresh_pending = false;
             if self.is_local {
                 cx.unwatch_recursive_path(old_path);
             } else {
@@ -166,6 +168,8 @@ impl GitPanel {
         self.is_local = is_local;
         self.ssh_config = ssh_config.clone();
         self.filesystem = filesystem.clone();
+        self.refresh_debounce_task.take();
+        self.refresh_pending = false;
         match GitRepository::find(&path, is_local, ssh_config) {
             Ok(Some(repo)) => {
                 self.repo = Some(repo);
