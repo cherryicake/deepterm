@@ -197,7 +197,7 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTag::Heading(level) => {
                     self.heading_level = level;
-                    let mut heading = div();
+                    let mut heading = div().mt_4().mb_2();
                     heading.style().refine(&self.style.heading);
                     if let Some(refinement) = self
                         .style
@@ -213,8 +213,11 @@ impl MarkdownElementBuilder {
                     }
                     if level <= 2 {
                         if let Some(color) = self.style.heading_border_color {
-                            heading = heading.border_b(px(1.0)).border_color(color);
+                            heading = heading.pb_1().border_b_1().border_color(color);
                         }
+                    }
+                    if level != 1 {
+                        heading = heading.mt_6();
                     }
                     self.push_div(heading, &range, markdown_end);
                 }
@@ -270,7 +273,7 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTag::Item => {
                     self.push_div(
-                        div().flex().flex_row().items_start().gap_1().w_full(),
+                        div().flex().flex_row().items_start().gap_1().w_full().mb_1().line_height(rems(1.3)),
                         &range,
                         markdown_end,
                     );
@@ -301,7 +304,7 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTag::BlockQuote => {
                     self.blockquote_depth += 1;
-                    let mut block = div();
+                    let mut block = div().mb_2();
                     block.style().refine(&StyleRefinement {
                         padding: gpui::EdgesRefinement {
                             left: Some(gpui::DefiniteLength::Absolute(
@@ -527,9 +530,9 @@ impl MarkdownElementBuilder {
             MarkdownEvent::Rule => {
                 self.flush_text();
                 let rule = div()
+                    .border_b_1()
                     .my_4()
-                    .h(px(1.0))
-                    .bg(self.style.rule_color)
+                    .border_color(self.style.rule_color)
                     .into_any_element();
                 self.append_child(rule);
             }
@@ -683,7 +686,7 @@ impl MarkdownElementBuilder {
             let is_header = row_idx == 0;
             for col in 0..col_count {
                 let cell_text = row.get(col).map(|s| s.as_str()).unwrap_or("");
-                let mut cell = div().px_3().py_2();
+                let mut cell = div().px_1().py_0p5();
                 if row_idx < rows_len - 1 {
                     cell = cell.border_b(px(1.0)).border_color(border_color);
                 }

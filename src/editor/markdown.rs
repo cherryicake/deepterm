@@ -43,7 +43,7 @@ impl MarkdownStyle {
         let mut base_text_style = window.text_style();
         base_text_style.refine(&TextStyleRefinement {
             color: Some(ui.text),
-            line_height: Some(rems(1.3).into()),
+            line_height: Some(rems(1.75).into()),
             white_space: Some(WhiteSpace::Normal),
             ..Default::default()
         });
@@ -67,7 +67,7 @@ impl MarkdownStyle {
                 top: Some(gpui::Length::Definite(px(8.).into())),
                 left: Some(gpui::Length::Definite(px(0.).into())),
                 right: Some(gpui::Length::Definite(px(0.).into())),
-                bottom: Some(gpui::Length::Definite(px(12.).into())),
+                bottom: Some(gpui::Length::Definite(px(20.).into())),
             },
             border_style: Some(gpui::BorderStyle::Solid),
             border_widths: gpui::EdgesRefinement {
@@ -144,12 +144,6 @@ impl MarkdownStyle {
             rule_color: ui.border,
             block_quote_border_color: ui.border,
             heading: StyleRefinement {
-                margin: gpui::EdgesRefinement {
-                    top: Some(gpui::Length::Definite(px(16.).into())),
-                    bottom: Some(gpui::Length::Definite(px(8.).into())),
-                    left: Some(gpui::Length::Definite(px(0.).into())),
-                    right: Some(gpui::Length::Definite(px(0.).into())),
-                },
                 ..Default::default()
             },
             heading_level_styles,
