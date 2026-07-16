@@ -16,6 +16,7 @@ pub struct FileMetadata {
 pub trait FileSystem: Send + Sync + 'static {
     fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>, String>;
     fn metadata(&self, path: &Path) -> Result<FileMetadata, String>;
+    fn read_file_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, String>;
     fn home_dir(&self) -> Option<PathBuf>;
     fn ssh_config(&self) -> Option<SshConnectionConfig>;
     fn is_local(&self) -> bool;
@@ -44,6 +45,14 @@ impl FileSystem for LocalFileSystem {
             size: meta.len(),
             modified_at: meta.modified().ok(),
         })
+    }
+
+    fn read_file_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn home_dir(&self) -> Option<PathBuf> {
@@ -107,6 +116,11 @@ impl FileSystem for RemoteFileSystem {
             size: meta.size,
             modified_at: meta.modified_at,
         })
+    }
+
+    fn read_file_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        let path_str = path.to_string_lossy();
+        sftp_fs::read_file_bytes(&self.config, &path_str).map_err(|e| e.to_string())
     }
 
     fn home_dir(&self) -> Option<PathBuf> {

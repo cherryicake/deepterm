@@ -393,6 +393,17 @@ impl Editor {
                                         renderer.set_text(content.clone(), cx);
                                     });
                                 }
+                                // 同步更新远程文件内容缓存，避免重开后仍是旧内容
+                                if let Some(ref ssh_config) = file.ssh_config {
+                                    crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                                        .lock()
+                                        .unwrap()
+                                        .insert_file_content(
+                                            ssh_config,
+                                            std::path::Path::new(&path),
+                                            content,
+                                        );
+                                }
                             } else {
                                 log::info!(
                                     "File changed externally but has unsaved changes: {}",
@@ -978,16 +989,14 @@ impl Editor {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let file = &self.open_files[index];
-            // 缓存远程文件内容到 RemoteFileTreeCache
-            if file.ssh_config.is_some() && !file.is_loading {
-                let content = file.editor_state.read(cx).value().to_string();
+            // 文件关闭后同步清理 RemoteFileTreeCache 中的内容缓存，避免重新打开时看到旧内容
+            if file.ssh_config.is_some() {
                 crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                     .lock()
                     .unwrap()
-                    .insert_file_content(
+                    .remove_file(
                         file.ssh_config.as_ref().unwrap(),
                         std::path::Path::new(&file.path),
-                        content,
                     );
             }
             if file.ssh_config.is_none() {

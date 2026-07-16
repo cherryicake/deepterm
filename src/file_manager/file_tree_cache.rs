@@ -212,6 +212,12 @@ impl RemoteFileTreeCache {
                 }
             }
         }
+        // 文件内容缓存失效，避免重新打开文件时看到旧内容
+        if matches!(event.kind, FsChangeKind::Remove | FsChangeKind::Modify) {
+            if let Some(file_cache) = self.file_caches.get_mut(&key) {
+                file_cache.files.remove(&event.path);
+            }
+        }
     }
 }
 

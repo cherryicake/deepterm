@@ -329,6 +329,53 @@ impl FsWatcher {
 
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn detect_remote_change(
+    prev_meta: Option<&FileMetadata>,
+    prev_entries: Option<&[FileEntry]>,
+    prev_hash: Option<u64>,
+    new_meta: &FileMetadata,
+    new_entries: Option<&[FileEntry]>,
+    new_hash: Option<u64>,
+    reported_missing: bool,
+) -> (bool, FsChangeKind) {
+    let prev_is_dir = prev_meta.map(|m| m.is_dir);
+    let kind = if prev_is_dir == Some(true) && !new_meta.is_dir {
+        FsChangeKind::Remove
+    } else {
+        FsChangeKind::Modify
+    };
+
+    if reported_missing {
+        return (true, FsChangeKind::Create);
+    }
+
+    let emit = if let Some(prev_meta) = prev_meta {
+        if prev_meta.is_dir != new_meta.is_dir {
+            true
+        } else if new_meta.is_dir {
+            if let Some(new_entries) = new_entries {
+                prev_entries != Some(new_entries)
+            } else {
+                prev_entries.is_some()
+            }
+        } else {
+            prev_meta != new_meta || prev_hash != new_hash
+        }
+    } else {
+        false
+    };
+
+    (emit, kind)
+}
+
 /// Remote file system watcher that polls `metadata` for watched paths because remote SFTP
 /// directories do not support native OS-level filesystem notifications.
 ///
@@ -343,6 +390,9 @@ struct RemoteWatchState {
     fs: Arc<dyn FileSystem>,
     last_meta: Option<FileMetadata>,
     last_dir_entries: Option<Vec<FileEntry>>,
+    last_content_hash: Option<u64>,
+    /// 同一路径被多个订阅者监视时的引用计数。
+    ref_count: usize,
     /// Set to true after we emit a Remove event due to the path becoming unreachable. When the
     /// path reappears, we force an event even if the metadata matches the previous baseline, so
     /// subscribers can recover from transient errors.
@@ -350,6 +400,35 @@ struct RemoteWatchState {
 }
 
 impl EventEmitter<FsChangeEvent> for RemoteFsWatcher {}
+
+fn watch_increment(
+    watched: &mut HashMap<PathBuf, RemoteWatchState>,
+    path: &Path,
+    fs: Arc<dyn FileSystem>,
+) {
+    watched
+        .entry(path.to_path_buf())
+        .and_modify(|state| state.ref_count += 1)
+        .or_insert(RemoteWatchState {
+            fs,
+            last_meta: None,
+            last_dir_entries: None,
+            last_content_hash: None,
+            ref_count: 1,
+            reported_missing: false,
+        });
+}
+
+fn watch_decrement(watched: &mut HashMap<PathBuf, RemoteWatchState>, path: &Path) -> bool {
+    if let Some(state) = watched.get_mut(path) {
+        state.ref_count = state.ref_count.saturating_sub(1);
+        if state.ref_count == 0 {
+            watched.remove(path);
+            return true;
+        }
+    }
+    false
+}
 
 impl RemoteFsWatcher {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -369,23 +448,27 @@ impl RemoteFsWatcher {
                 };
 
                 for (path, fs) in to_check {
-                    let (meta, entries) = cx
+                    let (meta, entries, content_hash) = cx
                         .background_executor()
                         .spawn({
                             let path = path.clone();
                             let fs = fs.clone();
                             async move {
                                 let meta = fs.metadata(&path);
-                                let entries = if let Ok(ref m) = meta {
+                                let mut entries = None;
+                                let mut content_hash = None;
+                                if let Ok(ref m) = meta {
                                     if m.is_dir {
-                                        fs.read_dir(&path).ok()
+                                        entries = fs.read_dir(&path).ok();
                                     } else {
-                                        None
+                                        content_hash = fs
+                                            .read_file_bytes(&path)
+                                            .ok()
+                                            .flatten()
+                                            .map(|bytes| hash_bytes(&bytes));
                                     }
-                                } else {
-                                    None
-                                };
-                                (meta, entries)
+                                }
+                                (meta, entries, content_hash)
                             }
                         })
                         .await;
@@ -401,6 +484,7 @@ impl RemoteFsWatcher {
                                         state.reported_missing = true;
                                         state.last_meta = None;
                                         state.last_dir_entries = None;
+                                        state.last_content_hash = None;
                                         true
                                     } else {
                                         false
@@ -430,32 +514,21 @@ impl RemoteFsWatcher {
                             state.reported_missing = false;
                             let prev_meta = state.last_meta.take();
                             let prev_entries = state.last_dir_entries.take();
-                            let prev_is_dir = prev_meta.as_ref().map(|m| m.is_dir);
+                            let prev_hash = state.last_content_hash.take();
 
-                            let emit = if let Some(prev_meta) = prev_meta {
-                                if prev_meta.is_dir != meta.is_dir {
-                                    true
-                                } else if meta.is_dir {
-                                    if let Some(ref new_entries) = entries {
-                                        prev_entries.as_ref() != Some(new_entries)
-                                    } else {
-                                        prev_entries.is_some()
-                                    }
-                                } else {
-                                    prev_meta != meta
-                                }
-                            } else {
-                                false
-                            };
-
-                            let kind = if prev_is_dir == Some(true) && !meta.is_dir {
-                                FsChangeKind::Remove
-                            } else {
-                                FsChangeKind::Modify
-                            };
+                            let (emit, kind) = detect_remote_change(
+                                prev_meta.as_ref(),
+                                prev_entries.as_deref(),
+                                prev_hash,
+                                &meta,
+                                entries.as_deref(),
+                                content_hash,
+                                reported_missing,
+                            );
 
                             state.last_meta = Some(meta);
                             state.last_dir_entries = entries.clone();
+                            state.last_content_hash = content_hash;
                             (emit || reported_missing, kind, reported_missing)
                         } else {
                             (false, FsChangeKind::Modify, false)
@@ -487,21 +560,19 @@ impl RemoteFsWatcher {
     }
 
     pub fn watch(&mut self, path: &Path, fs: Arc<dyn FileSystem>, cx: &mut Context<Self>) {
-        let path = path.to_path_buf();
         let mut lock = self.watched.lock();
-        lock.entry(path).or_insert(RemoteWatchState {
-            fs,
-            last_meta: None,
-            last_dir_entries: None,
-            reported_missing: false,
-        });
+        watch_increment(&mut lock, path, fs);
         cx.notify();
     }
 
     pub fn unwatch(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let path = path.to_path_buf();
         let mut lock = self.watched.lock();
-        lock.remove(&path);
+        if !watch_decrement(&mut lock, path) {
+            log::warn!(
+                "RemoteFsWatcher unwatch called for {} which is not watched",
+                path.display()
+            );
+        }
         cx.notify();
     }
 }
@@ -595,5 +666,166 @@ impl<'a, T> WatcherContext for Context<'a, T> {
     fn unwatch_remote_path(&mut self, path: &Path) {
         let watcher = self.remote_fs_watcher();
         watcher.update(self, |w, cx| w.unwatch(path, cx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_manager::filesystem::LocalFileSystem;
+    use crate::file_manager::types::FileEntryKind;
+    use std::path::PathBuf;
+
+    fn meta(is_dir: bool, size: u64, mtime: Option<std::time::SystemTime>) -> FileMetadata {
+        FileMetadata {
+            is_dir,
+            size,
+            modified_at: mtime,
+        }
+    }
+
+    fn entry(name: &str, kind: FileEntryKind) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            kind,
+        }
+    }
+
+    #[test]
+    fn hash_bytes_detects_content_difference() {
+        let a = hash_bytes(b"hello");
+        let b = hash_bytes(b"world");
+        let c = hash_bytes(b"hello");
+        assert_ne!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn detect_remote_change_file_content_changed_same_metadata() {
+        let old = meta(false, 5, None);
+        let new = meta(false, 5, None);
+        let old_hash = Some(hash_bytes(b"hello"));
+        let new_hash = Some(hash_bytes(b"world"));
+
+        let (emit, kind) =
+            detect_remote_change(Some(&old), None, old_hash, &new, None, new_hash, false);
+        assert!(emit);
+        assert_eq!(kind, FsChangeKind::Modify);
+    }
+
+    #[test]
+    fn detect_remote_change_file_content_same() {
+        let old = meta(false, 5, None);
+        let new = meta(false, 5, None);
+        let hash = Some(hash_bytes(b"hello"));
+
+        let (emit, _) = detect_remote_change(Some(&old), None, hash, &new, None, hash, false);
+        assert!(!emit);
+    }
+
+    #[test]
+    fn detect_remote_change_file_metadata_changed() {
+        let old = meta(false, 5, None);
+        let new = meta(false, 6, None);
+        let hash = Some(hash_bytes(b"hello"));
+
+        let (emit, kind) = detect_remote_change(Some(&old), None, hash, &new, None, hash, false);
+        assert!(emit);
+        assert_eq!(kind, FsChangeKind::Modify);
+    }
+
+    #[test]
+    fn detect_remote_change_file_removed_and_recreated() {
+        let old = meta(false, 5, None);
+        let new = meta(false, 5, None);
+        let hash = Some(hash_bytes(b"hello"));
+
+        let (emit, kind) = detect_remote_change(Some(&old), None, hash, &new, None, hash, true);
+        assert!(emit);
+        assert_eq!(kind, FsChangeKind::Create);
+    }
+
+    #[test]
+    fn detect_remote_change_dir_entries_changed() {
+        let old_meta = meta(true, 0, None);
+        let new_meta = meta(true, 0, None);
+        let old_entries = vec![entry("a.txt", FileEntryKind::File)];
+        let new_entries = vec![
+            entry("a.txt", FileEntryKind::File),
+            entry("b.txt", FileEntryKind::File),
+        ];
+
+        let (emit, kind) = detect_remote_change(
+            Some(&old_meta),
+            Some(&old_entries),
+            None,
+            &new_meta,
+            Some(&new_entries),
+            None,
+            false,
+        );
+        assert!(emit);
+        assert_eq!(kind, FsChangeKind::Modify);
+    }
+
+    #[test]
+    fn detect_remote_change_dir_entries_same() {
+        let old_meta = meta(true, 0, None);
+        let new_meta = meta(true, 0, None);
+        let entries = vec![entry("a.txt", FileEntryKind::File)];
+
+        let (emit, _) = detect_remote_change(
+            Some(&old_meta),
+            Some(&entries),
+            None,
+            &new_meta,
+            Some(&entries),
+            None,
+            false,
+        );
+        assert!(!emit);
+    }
+
+    #[test]
+    fn detect_remote_change_file_to_dir() {
+        let old = meta(false, 5, None);
+        let new = meta(true, 0, None);
+        let hash = Some(hash_bytes(b"hello"));
+
+        let (emit, kind) = detect_remote_change(Some(&old), None, hash, &new, None, None, false);
+        assert!(emit);
+        // 沿用原有逻辑：只有 dir -> file 才返回 Remove，file -> dir 返回 Modify
+        assert_eq!(kind, FsChangeKind::Modify);
+    }
+
+    #[test]
+    fn detect_remote_change_first_poll_no_emit() {
+        let new = meta(false, 5, None);
+        let hash = Some(hash_bytes(b"hello"));
+
+        let (emit, _) = detect_remote_change(None, None, None, &new, None, hash, false);
+        assert!(!emit);
+    }
+
+    #[test]
+    fn watch_ref_counting() {
+        let mut watched = HashMap::new();
+        let fs = Arc::new(LocalFileSystem) as Arc<dyn FileSystem>;
+        let path = Path::new("/tmp/test.txt");
+
+        watch_increment(&mut watched, path, fs.clone());
+        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(1));
+
+        watch_increment(&mut watched, path, fs.clone());
+        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(2));
+
+        assert!(!watch_decrement(&mut watched, path));
+        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(1));
+
+        assert!(watch_decrement(&mut watched, path));
+        assert!(watched.get(path).is_none());
+
+        assert!(!watch_decrement(&mut watched, path));
     }
 }

@@ -493,6 +493,16 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 读取完整远程文件原始字节。
+    pub fn read_file_bytes(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let mut file = self.sftp.open(path).await?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+            Ok(Some(bytes))
+        })
+    }
+
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
     pub fn execute_command(
@@ -915,6 +925,13 @@ pub fn read_file_to_string(
     path: &str,
 ) -> anyhow::Result<Option<String>> {
     with_cached_session(config, |session| session.read_file_to_string(path))
+}
+
+pub fn read_file_bytes(
+    config: &SshConnectionConfig,
+    path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    with_cached_session(config, |session| session.read_file_bytes(path))
 }
 
 async fn connect_sftp(
