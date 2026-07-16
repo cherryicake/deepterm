@@ -13,6 +13,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::file_icons::file_icon_or_default;
 use crate::file_manager::filesystem::RemoteFileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
@@ -38,6 +39,12 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+        KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
+        KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
+        KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
+        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
     ]);
 }
 
@@ -51,6 +58,7 @@ struct EditorFile {
     pending_reload: bool,
     is_loading: bool,
     markdown: Option<Entity<crate::editor::markdown::Markdown>>,
+    image: Option<Entity<crate::editor::image_viewer::ImageViewer>>,
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -182,7 +190,8 @@ impl Editor {
         let mut cached_states = HashMap::new();
         for file in &mut self.open_files {
             // 缓存所有非加载中的文件，避免本地文件切换时重复从磁盘读取。
-            if !file.is_loading {
+            // 图片文件不走文本 InputState 恢复，无需缓存。
+            if !file.is_loading && file.image.is_none() {
                 let state = file.editor_state.clone();
                 cached_states.insert(file.id.clone(), state);
             }
@@ -233,6 +242,23 @@ impl Editor {
     ) {
         self.clear(cx);
         for file_info in &files_info {
+            let is_image = crate::editor::image_viewer::is_image_file(Path::new(&file_info.path));
+
+            // 图片文件不能从文本 InputState 缓存恢复，必须重新加载二进制
+            if is_image {
+                if let Some(ref ssh_config) = file_info.ssh_config {
+                    self.open_remote_file_no_notify(
+                        file_info.path.clone(),
+                        ssh_config.clone(),
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.open_file_no_notify(std::path::PathBuf::from(&file_info.path), window, cx);
+                }
+                continue;
+            }
+
             // 检查是否有缓存的 InputState（远程文件）
             if let Some(cached_state) = cached_states.get(&file_info.id) {
                 // 直接使用缓存的 InputState
@@ -261,7 +287,7 @@ impl Editor {
         &mut self,
         file_info: &EditorOpenFileInfo,
         editor_state: Entity<InputState>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let path_str = file_info.path.clone();
@@ -286,6 +312,7 @@ impl Editor {
             pending_reload: false,
             is_loading: false,
             markdown,
+            image: None,
         };
 
         self.open_files.push(file);
@@ -343,7 +370,70 @@ impl Editor {
             file.pending_reload = true;
             let path = file.path.clone();
             let ssh_config = file.ssh_config.clone();
+            let is_image = file.image.is_some();
             let weak = cx.entity().downgrade();
+
+            if is_image {
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+
+                    let result = if let Some(config) = ssh_config {
+                        let path_for_task = path.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                let bytes =
+                                    crate::ssh::sftp_fs::read_file_bytes(&config, &path_for_task)?;
+                                bytes
+                                    .ok_or_else(|| anyhow::anyhow!("Empty file"))
+                                    .and_then(|b| {
+                                        crate::editor::image_viewer::load_image_from_bytes(
+                                            &b,
+                                            Path::new(&path_for_task),
+                                        )
+                                    })
+                            })
+                            .await
+                    } else {
+                        let path_for_task = path.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                let bytes = std::fs::read(&path_for_task)?;
+                                crate::editor::image_viewer::load_image_from_bytes(
+                                    &bytes,
+                                    Path::new(&path_for_task),
+                                )
+                            })
+                            .await
+                    };
+
+                    if let Ok((image, size)) = result {
+                        let _ = weak.update(cx, |this, cx| {
+                            if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path)
+                            {
+                                if let Some(ref viewer) = file.image {
+                                    viewer.update(cx, |viewer, cx| {
+                                        viewer.set_image(image, size, cx);
+                                    });
+                                }
+                                file.pending_reload = false;
+                            }
+                            cx.notify();
+                        });
+                    } else {
+                        let _ = weak.update(cx, |this, _cx| {
+                            if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path)
+                            {
+                                file.pending_reload = false;
+                            }
+                        });
+                    }
+                })
+                .detach();
+
+                return;
+            }
 
             cx.spawn(async move |_, cx| {
                 cx.background_executor()
@@ -604,6 +694,7 @@ impl Editor {
             pending_reload: false,
             is_loading: false,
             markdown: None,
+            image: None,
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -626,6 +717,8 @@ impl Editor {
     ) {
         let path_str = path.to_string_lossy().to_string();
         let tab_id = format!("editor-{}", path_str);
+        let is_image = crate::editor::image_viewer::is_image_file(&path);
+        log::debug!("open_local_file: path={:?}, is_image={}", path, is_image);
 
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
@@ -633,6 +726,11 @@ impl Editor {
         }
 
         if self.loading_gens.contains_key(&tab_id) {
+            return;
+        }
+
+        if is_image {
+            self.open_image_file(tab_id, path_str, path, None, window, cx, notify_app);
             return;
         }
 
@@ -832,6 +930,19 @@ impl Editor {
             return;
         }
 
+        if crate::editor::image_viewer::is_image_file(Path::new(&path)) {
+            self.open_image_file(
+                tab_id,
+                path.clone(),
+                PathBuf::from(&path),
+                Some(ssh_config),
+                window,
+                cx,
+                notify_app,
+            );
+            return;
+        }
+
         // 检查是否有缓存的文件内容
         let cached_content = crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
             .lock()
@@ -895,6 +1006,159 @@ impl Editor {
         );
     }
 
+    fn open_image_file(
+        &mut self,
+        tab_id: String,
+        path_str: String,
+        path: PathBuf,
+        ssh_config: Option<SshConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
+    ) {
+        let load_gen = self.begin_load(&tab_id);
+
+        self.open_file_with_content(
+            tab_id.clone(),
+            path_str.clone(),
+            String::new(),
+            path.clone(),
+            ssh_config.clone(),
+            window,
+            cx,
+            notify_app,
+            true,
+        );
+
+        let load_image: Arc<
+            dyn Fn() -> Result<(Arc<gpui::Image>, (u32, u32)), String> + Send + Sync,
+        > = if let Some(config) = ssh_config {
+            Arc::new(move || {
+                let bytes = crate::ssh::sftp_fs::read_file_bytes(&config, &path_str)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Empty file".to_string())?;
+                crate::editor::image_viewer::load_image_from_bytes(&bytes, Path::new(&path_str))
+                    .map_err(|e| e.to_string())
+            })
+        } else {
+            let path_for_task = path.clone();
+            let path_for_log = path_str.clone();
+            Arc::new(move || {
+                let bytes = std::fs::read(&path_for_task).map_err(|e| e.to_string())?;
+                crate::editor::image_viewer::load_image_from_bytes(&bytes, &path_for_task)
+                    .map_err(|e| format!("{}: {}", path_for_log, e))
+            })
+        };
+
+        self.spawn_image_load(tab_id, load_gen, load_image, window, cx);
+    }
+
+    fn spawn_image_load(
+        &mut self,
+        tab_id: String,
+        load_generation: u64,
+        load_image: Arc<dyn Fn() -> Result<(Arc<gpui::Image>, (u32, u32)), String> + Send + Sync>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let window_handle = window.window_handle();
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            loop {
+                let still_current = weak
+                    .update(cx, |this, _cx| {
+                        this.is_load_current(&tab_id, load_generation)
+                            && this.open_files.iter().any(|f| f.id == tab_id)
+                    })
+                    .unwrap_or(false);
+                if !still_current {
+                    let _ = weak.update(cx, |this, _cx| {
+                        if this.is_load_current(&tab_id, load_generation) {
+                            this.loading_gens.remove(&tab_id);
+                        }
+                    });
+                    break;
+                }
+
+                let load_image = load_image.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { load_image() })
+                    .await;
+
+                match result {
+                    Ok((image, size)) => {
+                        let _ = weak.update(cx, |this, cx| {
+                            if !this.is_load_current(&tab_id, load_generation) {
+                                return;
+                            }
+                            this.loading_gens.remove(&tab_id);
+                            if let Some(file) = this.open_files.iter_mut().find(|f| f.id == tab_id)
+                            {
+                                file.is_loading = false;
+                                if let Some(ref viewer) = file.image {
+                                    viewer.update(cx, |viewer, cx| {
+                                        viewer.set_image(image, size, cx);
+                                    });
+                                }
+                                this.tab_bar.update(cx, |tab_bar, cx| {
+                                    tab_bar.modify_tab(
+                                        &tab_id,
+                                        |tab| {
+                                            tab.icon =
+                                                Some(file_icon_or_default(Path::new(&file.path)));
+                                            tab.is_loading = false;
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    Err(msg) => {
+                        let still_current = weak
+                            .update(cx, |this, _cx| {
+                                this.is_load_current(&tab_id, load_generation)
+                                    && this.open_files.iter().any(|f| f.id == tab_id)
+                            })
+                            .unwrap_or(false);
+                        if !still_current {
+                            break;
+                        }
+
+                        log::warn!("加载图片失败: {}", msg);
+                        let close = match cx.update_window(window_handle, |_view, window, cx| {
+                            window.prompt(
+                                gpui::PromptLevel::Warning,
+                                "加载图片失败",
+                                Some(&format!("无法加载图片:\n{}\n\n重试或关闭标签页?", msg)),
+                                &["重新加载", "关闭标签页"],
+                                cx,
+                            )
+                        }) {
+                            Ok(promise) => promise.await.unwrap_or(1) != 0,
+                            Err(_) => true,
+                        };
+
+                        if close {
+                            let _ = weak.update(cx, |this, cx| {
+                                if this.is_load_current(&tab_id, load_generation) {
+                                    this.loading_gens.remove(&tab_id);
+                                    this.close_file(&tab_id, cx);
+                                }
+                                cx.notify();
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_file_with_content(
         &mut self,
@@ -905,7 +1169,7 @@ impl Editor {
         ssh_config: Option<SshConnectionConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        notify_app: bool,
+        _notify_app: bool,
         is_loading: bool,
     ) {
         let label = path
@@ -913,6 +1177,7 @@ impl Editor {
             .and_then(|n| n.to_str())
             .unwrap_or(&path_str)
             .to_string();
+        let is_image = crate::editor::image_viewer::is_image_file(&path);
         let language = guess_language_from_extension(&path);
 
         let editor_state = cx.new(|cx| {
@@ -920,14 +1185,20 @@ impl Editor {
                 .code_editor(language)
                 .multi_line(true);
             state.set_value(&content, window, cx);
-            state.disabled = is_loading;
+            state.disabled = is_image || is_loading;
             state
         });
 
-        let is_markdown = path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_markdown = !is_image && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
             let content_clone = content.clone();
             Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content_clone, cx)))
+        } else {
+            None
+        };
+
+        let image = if is_image {
+            Some(cx.new(crate::editor::image_viewer::ImageViewer::new))
         } else {
             None
         };
@@ -942,6 +1213,7 @@ impl Editor {
             pending_reload: false,
             is_loading,
             markdown,
+            image,
         });
 
         let is_local = self
@@ -1200,7 +1472,22 @@ impl Render for Editor {
         let content: gpui::AnyElement = if !is_empty {
             if let Some(active_id) = &self.active_file_id {
                 if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
-                    if let Some(markdown) = &file.markdown {
+                    if let Some(image) = &file.image {
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .bg(theme.app_background)
+                            .when(self.content_left_padding > 0.0, |this| {
+                                this.pl(px(self.content_left_padding))
+                            })
+                            .when(self.content_bottom_padding > 0.0, |this| {
+                                this.pb(px(self.content_bottom_padding))
+                            })
+                            .child(image.clone())
+                            .into_any_element()
+                    } else if let Some(markdown) = &file.markdown {
                         div()
                             .w_full()
                             .flex_1()
