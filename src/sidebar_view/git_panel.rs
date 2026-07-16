@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
-    Pixels, Render, Stateful, Styled, Subscription, UniformListScrollHandle, Window, div, px, svg,
+    Pixels, Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px, svg,
     uniform_list,
 };
 
@@ -16,6 +17,7 @@ use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
 const LIST_ROW_HEIGHT: f32 = 28.0;
+const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
 
 /// Git panel events
 pub enum GitPanelEvent {
@@ -101,12 +103,15 @@ pub struct GitPanel {
     ssh_config: Option<SshConnectionConfig>,
     filesystem: Option<Arc<dyn FileSystem>>,
     repo: Option<GitRepository>,
+    repo_error: Option<String>,
     entries: Vec<GitListEntry>,
     file_entries: Vec<GitFileEntry>,
     scroll_handle: UniformListScrollHandle,
     loading: bool,
     hovered_index: Option<usize>,
     watcher_subscription: Option<Subscription>,
+    refresh_debounce_task: Option<Task<()>>,
+    refresh_pending: bool,
 }
 
 impl GitPanel {
@@ -118,12 +123,15 @@ impl GitPanel {
             ssh_config: None,
             filesystem: None,
             repo: None,
+            repo_error: None,
             entries: Vec::new(),
             file_entries: Vec::new(),
             scroll_handle: UniformListScrollHandle::new(),
             loading: false,
             hovered_index: None,
             watcher_subscription: None,
+            refresh_debounce_task: None,
+            refresh_pending: false,
         }
     }
 
@@ -158,7 +166,20 @@ impl GitPanel {
         self.is_local = is_local;
         self.ssh_config = ssh_config.clone();
         self.filesystem = filesystem.clone();
-        self.repo = GitRepository::find(&path, is_local, ssh_config);
+        match GitRepository::find(&path, is_local, ssh_config) {
+            Ok(Some(repo)) => {
+                self.repo = Some(repo);
+                self.repo_error = None;
+            }
+            Ok(None) => {
+                self.repo = None;
+                self.repo_error = None;
+            }
+            Err(e) => {
+                self.repo = None;
+                self.repo_error = Some(e);
+            }
+        }
 
         // Watch the workspace directory recursively
         if is_local {
@@ -179,9 +200,7 @@ impl GitPanel {
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
-                            if !this.loading {
-                                this.refresh(cx);
-                            }
+                            this.schedule_refresh(cx);
                         });
                     });
                 },
@@ -195,9 +214,7 @@ impl GitPanel {
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
-                            if !this.loading {
-                                this.refresh(cx);
-                            }
+                            this.schedule_refresh(cx);
                         });
                     });
                 },
@@ -293,10 +310,38 @@ impl GitPanel {
                     }
                 }
 
+                // If a refresh was requested while we were loading, schedule another one
+                if this.refresh_pending && this.repo.is_some() {
+                    this.refresh_pending = false;
+                    this.schedule_refresh(cx);
+                }
+
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Schedule a refresh with a debounce to avoid refreshing too frequently
+    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_pending = true;
+        if self.refresh_debounce_task.is_some() {
+            return;
+        }
+
+        let weak = cx.entity().downgrade();
+        self.refresh_debounce_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(REFRESH_DEBOUNCE_DELAY)
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.refresh_debounce_task = None;
+                if this.refresh_pending && !this.loading {
+                    this.refresh_pending = false;
+                    this.refresh(cx);
+                }
+            });
+        }));
     }
 
     /// Open diff for a file
@@ -545,6 +590,10 @@ impl Render for GitPanel {
         let is_dark = cx.theme().appearance.is_dark();
 
         if self.repo.is_none() {
+            let message = self
+                .repo_error
+                .clone()
+                .unwrap_or_else(|| "Not a git repository".to_string());
             return div()
                 .w_full()
                 .h_full()
@@ -553,7 +602,7 @@ impl Render for GitPanel {
                 .justify_center()
                 .text_sm()
                 .text_color(theme.text_subtle)
-                .child("Not a git repository")
+                .child(message)
                 .into_any_element();
         }
 

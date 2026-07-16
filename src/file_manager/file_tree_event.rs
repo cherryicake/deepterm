@@ -8,4 +8,5 @@ pub enum FileTreeEvent {
         path: PathBuf,
         ssh_config: Option<SshConnectionConfig>,
     },
+    RootChanged,
 }

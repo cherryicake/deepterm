@@ -474,6 +474,25 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 读取完整远程文件内容，若检测到二进制内容则返回 None。
+    pub fn read_file_to_string(&mut self, path: &str) -> anyhow::Result<Option<String>> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let mut file = self.sftp.open(path).await?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+
+            if bytes.is_empty() {
+                return Ok(Some(String::new()));
+            }
+
+            if is_binary_content(&bytes) {
+                return Ok(None);
+            }
+
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        })
+    }
+
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
     pub fn execute_command(
@@ -889,6 +908,13 @@ pub fn read_text_preview(
     path: &str,
 ) -> anyhow::Result<Option<String>> {
     with_cached_session(config, |session| session.read_text_preview(path))
+}
+
+pub fn read_file_to_string(
+    config: &SshConnectionConfig,
+    path: &str,
+) -> anyhow::Result<Option<String>> {
+    with_cached_session(config, |session| session.read_file_to_string(path))
 }
 
 async fn connect_sftp(

@@ -325,12 +325,38 @@ impl MacosSidebar {
         self.file_tree_event_subscription.take();
         let sub = cx.subscribe(
             &file_tree,
-            move |_this, _emitter, event: &FileTreeEvent, cx| match event {
+            move |this, emitter, event: &FileTreeEvent, cx| match event {
                 FileTreeEvent::OpenFile { path, ssh_config } => {
                     cx.emit(SidebarEvent::OpenFile {
                         path: path.clone(),
                         ssh_config: ssh_config.clone(),
                     });
+                }
+                FileTreeEvent::RootChanged => {
+                    if let Some(ref git_panel) = this.git_panel {
+                        let (workspace_path, is_local, ssh_config, filesystem) = {
+                            let tree = emitter.read(cx);
+                            (
+                                tree.root_path().to_path_buf(),
+                                tree.is_local(),
+                                tree.ssh_config().cloned(),
+                                if tree.is_local() {
+                                    None
+                                } else {
+                                    Some(tree.filesystem().clone())
+                                },
+                            )
+                        };
+                        git_panel.update(cx, |panel, cx| {
+                            panel.set_workspace_path(
+                                workspace_path,
+                                is_local,
+                                ssh_config,
+                                filesystem,
+                                cx,
+                            );
+                        });
+                    }
                 }
             },
         );

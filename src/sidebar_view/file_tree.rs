@@ -158,6 +158,9 @@ impl SidebarFileTree {
                 return;
             }
             self.root_path = path;
+            if old_root != self.root_path {
+                cx.emit(FileTreeEvent::RootChanged);
+            }
         }
 
         if self.loader.is_local() {
