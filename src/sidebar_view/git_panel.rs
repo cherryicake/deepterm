@@ -12,7 +12,7 @@ use crate::assets::Icon;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::git_status::{DiffStat, FileStatus, Section, StatusCode, TrackedStatus};
 use crate::file_manager::filesystem::FileSystem;
-use crate::file_manager::watcher::{FsChangeEvent, WatcherContext};
+use crate::file_manager::watcher::{FsChangeKind, FsChangeEvent, WatcherContext};
 use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
@@ -108,7 +108,6 @@ pub struct GitPanel {
     file_entries: Vec<GitFileEntry>,
     scroll_handle: UniformListScrollHandle,
     loading: bool,
-    hovered_index: Option<usize>,
     watcher_subscription: Option<Subscription>,
     refresh_debounce_task: Option<Task<()>>,
     refresh_pending: bool,
@@ -129,7 +128,6 @@ impl GitPanel {
             file_entries: Vec::new(),
             scroll_handle: UniformListScrollHandle::new(),
             loading: false,
-            hovered_index: None,
             watcher_subscription: None,
             refresh_debounce_task: None,
             refresh_pending: false,
@@ -193,8 +191,10 @@ impl GitPanel {
             let watcher = cx.fs_watcher();
             Some(cx.subscribe(
                 &watcher,
-                move |_, _, _event: &FsChangeEvent, cx| {
-                    // Use cx.defer to avoid re-entrancy issues
+                move |_, _, event: &FsChangeEvent, cx| {
+                    if matches!(event.kind, FsChangeKind::Other) {
+                        return;
+                    }
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
@@ -207,8 +207,10 @@ impl GitPanel {
             let watcher = cx.remote_fs_watcher();
             Some(cx.subscribe(
                 &watcher,
-                move |_, _, _event: &FsChangeEvent, cx| {
-                    // Use cx.defer to avoid re-entrancy issues
+                move |_, _, event: &FsChangeEvent, cx| {
+                    if matches!(event.kind, FsChangeKind::Other) {
+                        return;
+                    }
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
@@ -489,18 +491,11 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
-        let is_hovered = self.hovered_index == Some(index);
         let status_color = entry.status_color(&theme);
         let status_icon = entry.status_icon();
         let path = entry.path.clone();
         let path_clone = path.clone();
         let entry_clone = entry.clone();
-
-        let row_background = if is_hovered {
-            theme.tab_hover_background
-        } else {
-            theme.elevated_background.opacity(0.0)
-        };
 
         div()
             .id(format!("git-entry-{index}"))
@@ -508,14 +503,6 @@ impl GitPanel {
             .h(px(LIST_ROW_HEIGHT))
             .px(px(4.0))
             .cursor_pointer()
-            .on_hover(cx.listener(move |this, hovered, _, cx| {
-                if *hovered {
-                    this.hovered_index = Some(index);
-                } else if this.hovered_index == Some(index) {
-                    this.hovered_index = None;
-                }
-                cx.notify();
-            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {
@@ -531,7 +518,7 @@ impl GitPanel {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .bg(row_background)
+                    .hover(|style| style.bg(theme.tab_hover_background))
                     .child(
                         // Status icon
                         svg()
