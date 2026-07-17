@@ -112,6 +112,7 @@ pub struct GitPanel {
     watcher_subscription: Option<Subscription>,
     refresh_debounce_task: Option<Task<()>>,
     refresh_pending: bool,
+    workspace_generation: u64,
 }
 
 impl GitPanel {
@@ -132,6 +133,7 @@ impl GitPanel {
             watcher_subscription: None,
             refresh_debounce_task: None,
             refresh_pending: false,
+            workspace_generation: 0,
         }
     }
 
@@ -170,20 +172,12 @@ impl GitPanel {
         self.filesystem = filesystem.clone();
         self.refresh_debounce_task.take();
         self.refresh_pending = false;
-        match GitRepository::find(&path, is_local, ssh_config) {
-            Ok(Some(repo)) => {
-                self.repo = Some(repo);
-                self.repo_error = None;
-            }
-            Ok(None) => {
-                self.repo = None;
-                self.repo_error = None;
-            }
-            Err(e) => {
-                self.repo = None;
-                self.repo_error = Some(e);
-            }
-        }
+        self.repo = None;
+        self.repo_error = None;
+        self.entries.clear();
+        self.file_entries.clear();
+        self.loading = true;
+        cx.notify();
 
         // Watch the workspace directory recursively
         if is_local {
@@ -225,7 +219,38 @@ impl GitPanel {
             ))
         };
 
-        self.refresh(cx);
+        self.workspace_generation += 1;
+        let generation = self.workspace_generation;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { GitRepository::find(&path, is_local, ssh_config) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if generation != this.workspace_generation {
+                    return;
+                }
+                this.loading = false;
+                match result {
+                    Ok(Some(repo)) => {
+                        this.repo = Some(repo);
+                        this.repo_error = None;
+                        this.refresh(cx);
+                    }
+                    Ok(None) => {
+                        this.repo = None;
+                        this.repo_error = None;
+                    }
+                    Err(e) => {
+                        this.repo = None;
+                        this.repo_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Refresh git status
@@ -593,6 +618,19 @@ impl Render for GitPanel {
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
 
+        if self.loading && self.entries.is_empty() {
+            return div()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(theme.text_subtle)
+                .child("Loading...")
+                .into_any_element();
+        }
+
         if self.repo.is_none() {
             let message = self
                 .repo_error
@@ -607,19 +645,6 @@ impl Render for GitPanel {
                 .text_sm()
                 .text_color(theme.text_subtle)
                 .child(message)
-                .into_any_element();
-        }
-
-        if self.loading && self.entries.is_empty() {
-            return div()
-                .w_full()
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(theme.text_subtle)
-                .child("Loading...")
                 .into_any_element();
         }
 

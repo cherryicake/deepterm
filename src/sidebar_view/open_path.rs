@@ -21,32 +21,44 @@ pub fn handle_open_path(
     if let Some(ssh_config) = ssh_config {
         let backend = Arc::new(RemoteFileSystem::new(ssh_config.clone())) as Arc<dyn FileSystem>;
         let remote_path = PathBuf::from(&path);
-        let is_dir = backend
-            .metadata(&remote_path)
-            .map(|m| m.is_dir)
-            .unwrap_or(false);
-        if is_dir {
-            let file_tree = cx.new(|cx| {
-                let mut tree = SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
-                tree.open_path(Some(remote_path), cx);
-                tree
-            });
-            // 为新树注册共享缓存引用
-            RemoteFileTreeCache::global()
-                .lock()
-                .unwrap()
-                .acquire(&ssh_config);
-            sidebar.update(cx, |s, cx| {
-                s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
-                if !s.is_visible() {
-                    s.toggle();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |cx| {
+            let is_dir = cx
+                .background_executor()
+                .spawn({
+                    let backend = backend.clone();
+                    let remote_path = remote_path.clone();
+                    async move { backend.metadata(&remote_path).map(|m| m.is_dir).unwrap_or(false) }
+                })
+                .await;
+            cx.update_window(window_handle, |_view, window, cx| {
+                if is_dir {
+                    let file_tree = cx.new(|cx| {
+                        let mut tree =
+                            SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
+                        tree.open_path(Some(remote_path), cx);
+                        tree
+                    });
+                    // 为新树注册共享缓存引用
+                    RemoteFileTreeCache::global()
+                        .lock()
+                        .unwrap()
+                        .acquire(&ssh_config);
+                    sidebar.update(cx, |s, cx| {
+                        s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
+                        if !s.is_visible() {
+                            s.toggle();
+                        }
+                    });
+                } else {
+                    editor.update(cx, |e, cx| {
+                        e.open_remote_file_no_notify(path, ssh_config, window, cx);
+                    });
                 }
-            });
-        } else {
-            editor.update(cx, |e, cx| {
-                e.open_remote_file_no_notify(path, ssh_config, window, cx);
-            });
-        }
+            })
+            .ok();
+        })
+        .detach();
     } else {
         let local_path = PathBuf::from(&path);
         if local_path.is_dir() {

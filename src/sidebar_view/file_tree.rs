@@ -74,6 +74,7 @@ pub struct SidebarFileTree {
     watched_paths: HashSet<PathBuf>,
     scroll_handle: UniformListScrollHandle,
     sticky_items_count: usize,
+    resolving_home: bool,
 }
 
 impl SidebarFileTree {
@@ -82,8 +83,8 @@ impl SidebarFileTree {
         backend: Arc<dyn FileSystem>,
         root_path: Option<PathBuf>,
     ) -> Self {
-        let root_path =
-            root_path.unwrap_or_else(|| backend.home_dir().unwrap_or_else(|| PathBuf::from("/")));
+        let resolving_home = root_path.is_none() && !backend.is_local();
+        let root_path = root_path.unwrap_or_else(|| PathBuf::from("/"));
         let is_local = backend.is_local();
 
         let watcher_subscription = if is_local {
@@ -115,6 +116,7 @@ impl SidebarFileTree {
             watched_paths: HashSet::new(),
             scroll_handle: UniformListScrollHandle::new(),
             sticky_items_count: 0,
+            resolving_home,
         };
 
         // 从共享缓存恢复之前的展开状态
@@ -147,10 +149,36 @@ impl SidebarFileTree {
             }
         }
 
+        if resolving_home {
+            let backend = this.loader.backend().clone();
+            let weak = cx.weak_entity();
+            cx.spawn(async move |_, cx| {
+                let home = cx
+                    .background_executor()
+                    .spawn(async move { backend.home_dir() })
+                    .await;
+                let _ = weak.update(cx, |this, cx| {
+                    this.resolving_home = false;
+                    let home = home.unwrap_or_else(|| PathBuf::from("/"));
+                    if home == this.root_path {
+                        let root = this.root_path.clone();
+                        this.load_directory(root, cx);
+                        cx.notify();
+                    } else {
+                        this.open_path(Some(home), cx);
+                    }
+                });
+            })
+            .detach();
+        }
+
         this
     }
 
     pub fn open_path(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.resolving_home && path.is_none() {
+            return;
+        }
         let old_root = self.root_path.clone();
 
         if let Some(path) = path {
