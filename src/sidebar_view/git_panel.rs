@@ -4,8 +4,8 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
-    Pixels, Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px, svg,
-    uniform_list,
+    Pixels, Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
+    svg, uniform_list,
 };
 
 use crate::assets::Icon;
@@ -193,8 +193,10 @@ impl GitPanel {
             let watcher = cx.fs_watcher();
             Some(cx.subscribe(
                 &watcher,
-                move |_, _, _event: &FsChangeEvent, cx| {
-                    // Use cx.defer to avoid re-entrancy issues
+                move |_, _, event: &FsChangeEvent, cx| {
+                    if is_git_path(event) {
+                        return;
+                    }
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
@@ -207,8 +209,10 @@ impl GitPanel {
             let watcher = cx.remote_fs_watcher();
             Some(cx.subscribe(
                 &watcher,
-                move |_, _, _event: &FsChangeEvent, cx| {
-                    // Use cx.defer to avoid re-entrancy issues
+                move |_, _, event: &FsChangeEvent, cx| {
+                    if is_git_path(event) {
+                        return;
+                    }
                     let weak = weak.clone();
                     cx.defer(move |cx| {
                         let _ = weak.update(cx, |this, cx| {
@@ -693,4 +697,11 @@ impl Render for GitPanel {
             .child(list.flex_1().min_h_0())
             .into_any_element()
     }
+}
+
+fn is_git_path(event: &FsChangeEvent) -> bool {
+    event
+        .path
+        .components()
+        .any(|c| c.as_os_str() == ".git")
 }
