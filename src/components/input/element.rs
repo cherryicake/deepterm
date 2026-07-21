@@ -446,16 +446,99 @@ impl TextElement {
             }
         }
 
-        // print_points_as_svg_path(&line_corners, &points);
-
         let path_origin = bounds.origin + point(line_number_width, px(0.));
-        let Some(&first_p) = points.first() else {
+        let n = points.len();
+        if n < 3 {
             return None;
-        };
+        }
+
+        let corner_radius = px(4.);
+        let r = f32::from(corner_radius);
+
+        // Determine which vertices are convex (exposed outer corners) using cross product.
+        // The polygon is counterclockwise, so convex corners have positive cross product.
+        let is_convex: Vec<bool> = (0..n)
+            .map(|i| {
+                let prev = points[(i + n - 1) % n];
+                let curr = points[i];
+                let next = points[(i + 1) % n];
+                let cross = (f32::from(curr.x) - f32::from(prev.x))
+                    * (f32::from(next.y) - f32::from(prev.y))
+                    - (f32::from(curr.y) - f32::from(prev.y))
+                        * (f32::from(next.x) - f32::from(prev.x));
+                cross > 0.
+            })
+            .collect();
+
+        // Build path with rounded corners at convex vertices
         let mut builder = gpui::PathBuilder::fill();
-        builder.move_to(path_origin + first_p);
-        for p in points.iter().skip(1) {
-            builder.line_to(path_origin + *p);
+
+        // For vertex[0], compute the arrive point and move there directly
+        // so that close() draws the closing edge correctly.
+        if is_convex[0] {
+            let prev = points[n - 1];
+            let curr = points[0];
+            let dx = f32::from(curr.x) - f32::from(prev.x);
+            let dy = f32::from(curr.y) - f32::from(prev.y);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 0. {
+                let ux = dx / len;
+                let uy = dy / len;
+                builder.move_to(path_origin + point(
+                    curr.x - px(ux * r),
+                    curr.y - px(uy * r),
+                ));
+            } else {
+                builder.move_to(path_origin + curr);
+            }
+        } else {
+            builder.move_to(path_origin + points[0]);
+        }
+
+        for i in 0..n {
+            let curr = points[i];
+            let next = points[(i + 1) % n];
+
+            if is_convex[i] {
+                let prev = points[(i + n - 1) % n];
+                let dx_in = f32::from(curr.x) - f32::from(prev.x);
+                let dy_in = f32::from(curr.y) - f32::from(prev.y);
+                let len_in = (dx_in * dx_in + dy_in * dy_in).sqrt();
+                if len_in > 0. {
+                    let ux_in = dx_in / len_in;
+                    let uy_in = dy_in / len_in;
+                    let start = point(
+                        curr.x - px(ux_in * r),
+                        curr.y - px(uy_in * r),
+                    );
+
+                    let dx_out = f32::from(next.x) - f32::from(curr.x);
+                    let dy_out = f32::from(next.y) - f32::from(curr.y);
+                    let len_out = (dx_out * dx_out + dy_out * dy_out).sqrt();
+                    if len_out > 0. {
+                        let ux_out = dx_out / len_out;
+                        let uy_out = dy_out / len_out;
+                        let end = point(
+                            curr.x + px(ux_out * r),
+                            curr.y + px(uy_out * r),
+                        );
+
+                        // Skip line_to for vertex[0] since move_to already placed us at start
+                        if i > 0 {
+                            builder.line_to(path_origin + start);
+                        }
+                        builder.curve_to(path_origin + end, path_origin + curr);
+                    } else {
+                        if i > 0 {
+                            builder.line_to(path_origin + curr);
+                        }
+                    }
+                } else if i > 0 {
+                    builder.line_to(path_origin + curr);
+                }
+            } else if i > 0 {
+                builder.line_to(path_origin + curr);
+            }
         }
 
         builder.build().ok()
@@ -1427,7 +1510,7 @@ impl Element for TextElement {
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let height = line_height * lines.len() as f32;
                 // Paint the current line background
-                if is_active {
+                if is_active && selected_range.is_empty() {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
                             Bounds::new(p, size(bounds.size.width, height)),
@@ -1517,7 +1600,7 @@ impl Element for TextElement {
 
                 let height = line_height * lines.len() as f32;
                 // paint active line number background
-                if is_active {
+                if is_active && selected_range.is_empty() {
                     if let Some(bg_color) = active_line_color {
                         window.paint_quad(fill(
                             Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),
