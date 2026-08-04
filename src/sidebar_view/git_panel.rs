@@ -22,7 +22,11 @@ const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
 
 /// Git panel events
 pub enum GitPanelEvent {
-    OpenDiff { path: String, diff: DiffFile },
+    OpenDiff {
+        path: String,
+        diff: DiffFile,
+        repo: GitRepository,
+    },
     StageFile { path: String },
     UnstageFile { path: String },
 }
@@ -387,24 +391,27 @@ impl GitPanel {
         let path = entry.path.clone();
         let path_for_spawn = path.clone();
         let repo = repo.clone();
+        let repo_for_spawn = repo.clone();
         let weak = cx.entity().downgrade();
 
         cx.spawn(async move |_, cx| {
             let diff_result = cx
                 .background_executor()
                 .spawn(async move {
-                    repo.diff_file_contents(&path_for_spawn).map(|(old, new)| {
-                        let language = crate::editor::guess_language_from_extension(
-                            std::path::Path::new(&path_for_spawn),
-                        );
-                        DiffFile::build(path_for_spawn.clone(), language, old, new, &[])
-                    })
+                    repo_for_spawn
+                        .diff_file_contents(&path_for_spawn)
+                        .map(|(old, new)| {
+                            let language = crate::editor::guess_language_from_extension(
+                                std::path::Path::new(&path_for_spawn),
+                            );
+                            DiffFile::build(path_for_spawn.clone(), language, old, new, &[])
+                        })
                 })
                 .await;
 
             if let Ok(diff) = diff_result {
                 let _ = weak.update(cx, |_, cx| {
-                    cx.emit(GitPanelEvent::OpenDiff { path, diff });
+                    cx.emit(GitPanelEvent::OpenDiff { path, diff, repo });
                 });
             }
         })

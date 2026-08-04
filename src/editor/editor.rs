@@ -665,6 +665,7 @@ impl Editor {
         &mut self,
         path: String,
         diff: crate::editor::diff_model::DiffFile,
+        repo: crate::editor::git_repository::GitRepository,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -683,7 +684,7 @@ impl Editor {
             state.disabled = true;
             state
         });
-        let diff_view = cx.new(|cx| crate::editor::diff_view::DiffView::new(diff, cx));
+        let diff_view = cx.new(|cx| crate::editor::diff_view::DiffView::new(diff, repo, cx));
 
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),

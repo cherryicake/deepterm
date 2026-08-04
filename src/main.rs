@@ -284,14 +284,15 @@ impl AppWindow {
                         }
                     });
                 }
-                SidebarEvent::OpenDiff { path, diff } => {
+                SidebarEvent::OpenDiff { path, diff, repo } => {
                     let editor = editor_for_open.clone();
                     let path = path.clone();
                     let diff = diff.clone();
+                    let repo = repo.clone();
                     window.defer(cx, move |window, cx| {
                         if let Some(editor) = editor.upgrade() {
                             editor.update(cx, |e, cx| {
-                                e.open_diff_file(path, diff, window, cx);
+                                e.open_diff_file(path, diff, repo, window, cx);
                             });
                         }
                     });

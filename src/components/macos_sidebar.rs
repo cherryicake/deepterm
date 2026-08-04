@@ -133,7 +133,7 @@ pub enum SidebarView {
 ///
 /// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
 /// 内部包含多组菜单结构，支持选中高亮和点击回调。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum SidebarEvent {
     TabGroupsChanged,
     OpenFile {
@@ -143,7 +143,18 @@ pub enum SidebarEvent {
     OpenDiff {
         path: String,
         diff: crate::editor::diff_model::DiffFile,
+        repo: crate::editor::git_repository::GitRepository,
     },
+}
+
+impl std::fmt::Debug for SidebarEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
+            Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
+            Self::OpenDiff { path, .. } => f.debug_struct("OpenDiff").field("path", path).finish(),
+        }
+    }
 }
 
 pub struct MacosSidebar {
@@ -550,10 +561,15 @@ impl MacosSidebar {
             let sub = cx.subscribe(
                 git_panel,
                 |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
-                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff { path, diff } => {
+                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
+                        path,
+                        diff,
+                        repo,
+                    } => {
                         cx.emit(SidebarEvent::OpenDiff {
                             path: path.clone(),
                             diff: diff.clone(),
+                            repo: repo.clone(),
                         });
                     }
                     _ => {}
