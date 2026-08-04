@@ -142,7 +142,7 @@ pub enum SidebarEvent {
     },
     OpenDiff {
         path: String,
-        diff_content: String,
+        diff: crate::editor::diff_model::DiffFile,
     },
 }
 
@@ -550,13 +550,10 @@ impl MacosSidebar {
             let sub = cx.subscribe(
                 git_panel,
                 |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
-                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
-                        path,
-                        diff_content,
-                    } => {
+                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff { path, diff } => {
                         cx.emit(SidebarEvent::OpenDiff {
                             path: path.clone(),
-                            diff_content: diff_content.clone(),
+                            diff: diff.clone(),
                         });
                     }
                     _ => {}

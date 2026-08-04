@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::editor::diff_model::DiffFile;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::git_status::{DiffStat, FileStatus, Section, StatusCode, TrackedStatus};
 use crate::file_manager::filesystem::FileSystem;
@@ -21,7 +22,7 @@ const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
 
 /// Git panel events
 pub enum GitPanelEvent {
-    OpenDiff { path: String, diff_content: String },
+    OpenDiff { path: String, diff: DiffFile },
     StageFile { path: String },
     UnstageFile { path: String },
 }
@@ -391,12 +392,19 @@ impl GitPanel {
         cx.spawn(async move |_, cx| {
             let diff_result = cx
                 .background_executor()
-                .spawn(async move { repo.diff_file(&path_for_spawn) })
+                .spawn(async move {
+                    repo.diff_file_contents(&path_for_spawn).map(|(old, new)| {
+                        let language = crate::editor::guess_language_from_extension(
+                            std::path::Path::new(&path_for_spawn),
+                        );
+                        DiffFile::build(path_for_spawn.clone(), language, old, new, &[])
+                    })
+                })
                 .await;
 
-            if let Ok(diff_content) = diff_result {
+            if let Ok(diff) = diff_result {
                 let _ = weak.update(cx, |_, cx| {
-                    cx.emit(GitPanelEvent::OpenDiff { path, diff_content });
+                    cx.emit(GitPanelEvent::OpenDiff { path, diff });
                 });
             }
         })

@@ -59,6 +59,7 @@ struct EditorFile {
     is_loading: bool,
     markdown: Option<Entity<crate::editor::markdown::Markdown>>,
     image: Option<Entity<crate::editor::image_viewer::ImageViewer>>,
+    diff: Option<Entity<crate::editor::diff_view::DiffView>>,
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -313,6 +314,7 @@ impl Editor {
             is_loading: false,
             markdown,
             image: None,
+            diff: None,
         };
 
         self.open_files.push(file);
@@ -662,7 +664,7 @@ impl Editor {
     pub fn open_diff_file(
         &mut self,
         path: String,
-        diff_content: String,
+        diff: crate::editor::diff_model::DiffFile,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -675,14 +677,13 @@ impl Editor {
         }
 
         let label = format!("Diff: {}", path);
+        // Placeholder editor state; the diff tab renders `diff` instead.
         let editor_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor("text")
-                .multi_line(true);
-            state.set_value(&diff_content, window, cx);
-            state.disabled = true; // Read-only for diff view
+            let mut state = InputState::new(window, cx).multi_line(true);
+            state.disabled = true;
             state
         });
+        let diff_view = cx.new(|cx| crate::editor::diff_view::DiffView::new(diff, cx));
 
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),
@@ -690,11 +691,12 @@ impl Editor {
             label,
             ssh_config: None,
             editor_state,
-            original_content: diff_content,
+            original_content: String::new(),
             pending_reload: false,
             is_loading: false,
             markdown: None,
             image: None,
+            diff: Some(diff_view),
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1214,6 +1216,7 @@ impl Editor {
             is_loading,
             markdown,
             image,
+            diff: None,
         });
 
         let is_local = self
@@ -1472,7 +1475,22 @@ impl Render for Editor {
         let content: gpui::AnyElement = if !is_empty {
             if let Some(active_id) = &self.active_file_id {
                 if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
-                    if let Some(image) = &file.image {
+                    if let Some(diff) = &file.diff {
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .bg(theme.app_background)
+                            .when(self.content_left_padding > 0.0, |this| {
+                                this.pl(px(self.content_left_padding))
+                            })
+                            .when(self.content_bottom_padding > 0.0, |this| {
+                                this.pb(px(self.content_bottom_padding))
+                            })
+                            .child(diff.clone())
+                            .into_any_element()
+                    } else if let Some(image) = &file.image {
                         div()
                             .w_full()
                             .flex_1()
@@ -1598,7 +1616,7 @@ impl Render for Editor {
     }
 }
 
-fn guess_language_from_extension(path: &Path) -> String {
+pub(crate) fn guess_language_from_extension(path: &Path) -> String {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| match ext {

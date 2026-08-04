@@ -153,6 +153,22 @@ impl GitRepository {
         Ok(diff)
     }
 
+    /// Get the old (HEAD) and new (working tree) contents of a file for the
+    /// structured diff view.
+    ///
+    /// - Old content comes from `git show HEAD:<path>`; empty for untracked
+    ///   files or repositories without a HEAD commit yet.
+    /// - New content is the working-tree file; empty if the file was deleted.
+    ///
+    /// Diffing the working tree against HEAD matches the previous behavior of
+    /// `diff_file` (staged + unstaged changes combined).
+    pub fn diff_file_contents(&self, path: &str) -> Result<(String, String), String> {
+        let head_ref = format!("HEAD:{path}");
+        let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+        let new = self.read_file(path).unwrap_or_default();
+        Ok((old, new))
+    }
+
     fn read_file(&self, path: &str) -> Result<String, String> {
         match &self.backend {
             GitBackend::Local => {
