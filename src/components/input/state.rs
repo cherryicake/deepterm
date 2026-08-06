@@ -4,9 +4,9 @@
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, Subscription, UTF16Selection, Window, actions, point, px,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, KeyBinding, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent,
+    ShapedLine, SharedString, Subscription, UTF16Selection, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
@@ -342,6 +342,20 @@ pub struct InputState {
     /// The first element is the x-coordinate (Pixels), preferred to use this.
     /// The second element is the column (usize), fallback to use this.
     pub(crate) preferred_column: Option<(Pixels, usize)>,
+    /// Diff decorations: per-buffer-line background colors (e.g. added /
+    /// deleted lines in a diff view), painted full-width behind the text.
+    pub(crate) diff_line_colors: std::collections::HashMap<u32, gpui::Hsla>,
+    /// Diff decorations: word-level background colors over byte ranges.
+    pub(crate) diff_range_colors: Vec<(Range<usize>, gpui::Hsla)>,
+    /// Diff decorations: per-buffer-line line-number label override.
+    /// `Some(vec)` indexed by buffer row; `None` entry = blank label (e.g.
+    /// deleted lines on the new side of a unified diff).
+    pub(crate) diff_line_labels: Option<Vec<Option<u32>>>,
+    /// Precomputed syntax highlight runs for the whole buffer (used by the
+    /// unified diff view, which cannot parse its merged text with one tree).
+    /// Sorted, contiguous and gap-free over `[0, text.len())`; when set, the
+    /// internal tree-sitter highlighter is bypassed.
+    pub(crate) external_highlight_runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -415,7 +429,62 @@ impl InputState {
             _subscriptions,
             _pending_update: false,
             cursor_line_end_affinity: false,
+            diff_line_colors: std::collections::HashMap::new(),
+            diff_range_colors: Vec::new(),
+            diff_line_labels: None,
+            external_highlight_runs: None,
         }
+    }
+
+    /// Override the line-number labels (indexed by buffer row; `None` entry
+    /// renders a blank gutter cell). Pass `None` to restore default numbering.
+    pub fn set_diff_line_labels(&mut self, labels: Option<Vec<Option<u32>>>, cx: &mut Context<Self>) {
+        self.diff_line_labels = labels;
+        cx.notify();
+    }
+
+    /// Set diff decorations: per-line background colors (buffer line index →
+    /// color) and word-level background colors (byte range → color).
+    /// Used by the git diff view to render added/deleted lines and inline
+    /// word highlights on top of the regular editor rendering.
+    pub fn set_diff_decorations(
+        &mut self,
+        line_colors: Vec<(u32, gpui::Hsla)>,
+        range_colors: Vec<(Range<usize>, gpui::Hsla)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_line_colors = line_colors.into_iter().collect();
+        self.diff_range_colors = range_colors;
+        cx.notify();
+    }
+
+    /// Remove all diff decorations.
+    #[allow(dead_code)]
+    pub fn clear_diff_decorations(&mut self, cx: &mut Context<Self>) {
+        self.diff_line_colors.clear();
+        self.diff_range_colors.clear();
+        self.diff_line_labels = None;
+        self.external_highlight_runs = None;
+        cx.notify();
+    }
+
+    /// Replace the syntax highlight runs with externally computed ones (e.g.
+    /// per-source-tree highlights for the unified diff view). `Some(runs)`
+    /// must be sorted, contiguous and gap-free over the whole buffer, and
+    /// takes over rendering from the internal tree-sitter highlighter (which
+    /// is reset to avoid wasted parses of the merged text); `None` restores
+    /// normal highlighting.
+    pub fn set_external_highlight_runs(
+        &mut self,
+        runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_highlight_runs = runs;
+        if self.external_highlight_runs.is_some() {
+            self.reset_highlighter(cx);
+            self._pending_update = false;
+        }
+        cx.notify();
     }
 
     /// Set Input to use multi line mode.

@@ -169,6 +169,41 @@ impl GitRepository {
         Ok((old, new))
     }
 
+    /// Write content to a working-tree file (local fs or remote via SFTP).
+    pub fn write_file(&self, path: &str, content: &str) -> Result<(), String> {
+        match &self.backend {
+            GitBackend::Local => {
+                let file_path = Path::new(&self.root).join(path);
+                std::fs::write(&file_path, content)
+                    .map_err(|e| format!("Failed to write file: {e}"))
+            }
+            GitBackend::Remote { config } => {
+                let remote_path = join_remote_path(&self.root, path);
+                sftp_fs::write_file_string(config, &remote_path, content)
+                    .map_err(|e| format!("Failed to write remote file: {e}"))
+            }
+        }
+    }
+
+    /// The SSH config when this is a remote repository.
+    pub fn ssh_config(&self) -> Option<SshConnectionConfig> {
+        match &self.backend {
+            GitBackend::Local => None,
+            GitBackend::Remote { config } => Some(config.clone()),
+        }
+    }
+
+    /// Resolve a repo-relative path to a full filesystem path (local or remote).
+    pub fn resolve_path(&self, path: &str) -> String {
+        match &self.backend {
+            GitBackend::Local => Path::new(&self.root)
+                .join(path)
+                .to_string_lossy()
+                .to_string(),
+            GitBackend::Remote { .. } => join_remote_path(&self.root, path),
+        }
+    }
+
     fn read_file(&self, path: &str) -> Result<String, String> {
         match &self.backend {
             GitBackend::Local => {

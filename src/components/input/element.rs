@@ -935,67 +935,115 @@ impl TextElement {
             } => (highlighter.borrow_mut(), diagnostics.clone()),
             _ => return None,
         };
-        let highlighter = highlighter_ref.as_mut()?;
 
         let mut styles = Vec::with_capacity(visible_buffer_lines.len());
-        let highlight_theme = cx.theme().highlight_theme.clone();
 
-        // Helper to flush a contiguous range of lines
-        let mut flush_range =
-            |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
-                let byte_start = text.line_start_offset(start_line);
-                let byte_end = if is_multi_line {
-                    // +1 for `\n`
-                    text.line_start_offset(end_line + 1)
-                } else {
-                    text.line_end_offset(end_line)
-                };
-                let range_styles = if skip {
-                    vec![(byte_start..byte_end, HighlightStyle::default())]
-                } else {
-                    highlighter.styles(&(byte_start..byte_end), &highlight_theme)
-                };
-
-                *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
+        if let Some(external) = &state.external_highlight_runs {
+            // Externally computed runs (unified diff view): the list covers
+            // the whole buffer gap-free; clip it to the visible span. The
+            // internal tree-sitter highlighter is bypassed because the merged
+            // diff text is not valid source code.
+            let first = *visible_buffer_lines.first()?;
+            let last = *visible_buffer_lines.last()?;
+            let byte_start = text.line_start_offset(first);
+            let byte_end = if is_multi_line {
+                // +1 for `\n`, same as flush_range below
+                text.line_start_offset(last + 1)
+            } else {
+                text.line_end_offset(last)
             };
+            let mut cursor = byte_start;
+            for (range, style) in external {
+                if range.end <= byte_start || range.start >= byte_end {
+                    continue;
+                }
+                let start = range.start.max(byte_start);
+                let end = range.end.min(byte_end);
+                if start > cursor {
+                    styles.push((cursor..start, HighlightStyle::default()));
+                }
+                styles.push((start..end, style.clone()));
+                cursor = end.max(cursor);
+            }
+            if cursor < byte_end {
+                styles.push((cursor..byte_end, HighlightStyle::default()));
+            }
+        } else {
+            let highlighter = highlighter_ref.as_mut()?;
 
-        // Group contiguous visible lines into ranges and call styles() once per range
-        let mut visible_iter = visible_buffer_lines.iter().peekable();
-        let mut range_start: Option<usize> = None;
+            let highlight_theme = cx.theme().highlight_theme.clone();
 
-        while let Some(&line) = visible_iter.next() {
-            // Check if this line is too long for highlighting
-            let line_len = text.slice_line(line).len();
-            if line_len > MAX_HIGHLIGHT_LINE_LENGTH {
-                // Flush any accumulated range first
-                if let Some(start) = range_start.take() {
-                    flush_range(start, line - 1, false, &mut styles);
+            // Helper to flush a contiguous range of lines
+            let mut flush_range =
+                |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
+                    let byte_start = text.line_start_offset(start_line);
+                    let byte_end = if is_multi_line {
+                        // +1 for `\n`
+                        text.line_start_offset(end_line + 1)
+                    } else {
+                        text.line_end_offset(end_line)
+                    };
+                    let range_styles = if skip {
+                        vec![(byte_start..byte_end, HighlightStyle::default())]
+                    } else {
+                        highlighter.styles(&(byte_start..byte_end), &highlight_theme)
+                    };
+
+                    *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
+                };
+
+            // Group contiguous visible lines into ranges and call styles() once per range
+            let mut visible_iter = visible_buffer_lines.iter().peekable();
+            let mut range_start: Option<usize> = None;
+
+            while let Some(&line) = visible_iter.next() {
+                // Check if this line is too long for highlighting
+                let line_len = text.slice_line(line).len();
+                if line_len > MAX_HIGHLIGHT_LINE_LENGTH {
+                    // Flush any accumulated range first
+                    if let Some(start) = range_start.take() {
+                        flush_range(start, line - 1, false, &mut styles);
+                    }
+
+                    flush_range(line, line, true, &mut styles);
+                    continue;
                 }
 
-                flush_range(line, line, true, &mut styles);
-                continue;
+                range_start.get_or_insert(line);
+
+                // Check if next line is contiguous, if so keep accumulating
+                if visible_iter
+                    .peek()
+                    .map(|&&next| next == line + 1)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                // Flush the contiguous range
+                let start_line = range_start.take().unwrap();
+                flush_range(start_line, line, false, &mut styles);
             }
 
-            range_start.get_or_insert(line);
-
-            // Check if next line is contiguous, if so keep accumulating
-            if visible_iter
-                .peek()
-                .map(|&&next| next == line + 1)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            // Flush the contiguous range
-            let start_line = range_start.take().unwrap();
-            flush_range(start_line, line, false, &mut styles);
+            let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
+            styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
         }
-
-        let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
         drop(highlighter_ref);
 
-        styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
+        // Merge diff word-level decorations (e.g. inline changed-word
+        // backgrounds in the git diff view).
+        if !state.diff_range_colors.is_empty() {
+            let diff_styles = state.diff_range_colors.iter().map(|(range, color)| {
+                (
+                    range.clone(),
+                    HighlightStyle {
+                        background_color: Some(*color),
+                        ..Default::default()
+                    },
+                )
+            });
+            styles = gpui::combine_highlights(styles, diff_styles).collect();
+        }
 
         if styles.is_empty() {
             None
@@ -1425,8 +1473,14 @@ impl Element for TextElement {
                 .iter()
                 .zip(last_layout.visible_buffer_lines.iter())
             {
-                let line_no: SharedString =
-                    format!("{:>width$}", buffer_line + 1, width = line_number_len).into();
+                let line_no: SharedString = if let Some(labels) = &state.diff_line_labels {
+                    match labels.get(buffer_line).copied().flatten() {
+                        Some(n) => format!("{:>width$}", n + 1, width = line_number_len).into(),
+                        None => " ".repeat(line_number_len).into(),
+                    }
+                } else {
+                    format!("{:>width$}", buffer_line + 1, width = line_number_len).into()
+                };
 
                 let runs = if current_row == Some(buffer_line) {
                     &current_line_runs
@@ -1501,6 +1555,8 @@ impl Element for TextElement {
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             offset_y += invisible_top_padding;
 
+            let diff_line_colors = &self.state.read(cx).diff_line_colors;
+
             // Each item is the normal lines.
             for (lines, &buffer_line) in line_numbers
                 .iter()
@@ -1509,6 +1565,13 @@ impl Element for TextElement {
                 let is_active = prepaint.current_row == Some(buffer_line);
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let height = line_height * lines.len() as f32;
+                // Paint diff line background (added/deleted) below everything else
+                if let Some(bg_color) = diff_line_colors.get(&(buffer_line as u32)) {
+                    window.paint_quad(fill(
+                        Bounds::new(p, size(bounds.size.width, height)),
+                        *bg_color,
+                    ));
+                }
                 // Paint the current line background
                 if is_active && selected_range.is_empty() {
                     if let Some(bg_color) = active_line_color {

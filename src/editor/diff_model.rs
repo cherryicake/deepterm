@@ -79,9 +79,219 @@ impl DiffRow {
     }
 }
 
+/// One changed hunk between old and new text, with word-level detail.
+#[derive(Clone, Debug)]
+pub struct DiffHunk {
+    pub old_rows: Range<u32>,
+    pub new_rows: Range<u32>,
+    /// Word-level changed byte ranges, absolute in the old text.
+    pub old_word_ranges: Vec<Range<usize>>,
+    /// Word-level changed byte ranges, absolute in the new text.
+    pub new_word_ranges: Vec<Range<usize>>,
+}
+
+impl DiffHunk {
+    pub fn deletions(&self) -> usize {
+        (self.old_rows.end - self.old_rows.start) as usize
+    }
+
+    pub fn additions(&self) -> usize {
+        (self.new_rows.end - self.new_rows.start) as usize
+    }
+}
+
+/// Compute line-level hunks plus word-level ranges (for small hunks).
+pub fn compute_hunks(old_text: &str, new_text: &str) -> Vec<DiffHunk> {
+    let old_starts = line_starts(old_text);
+    let new_starts = line_starts(new_text);
+
+    line_diff(old_text, new_text)
+        .into_iter()
+        .map(|(old_rows, new_rows)| {
+            let old_byte_range = if old_rows.start < old_rows.end {
+                let s = old_starts[old_rows.start as usize];
+                let e = line_range(old_text, &old_starts, old_rows.end - 1).end;
+                s..e
+            } else {
+                0..0
+            };
+            let new_byte_range = if new_rows.start < new_rows.end {
+                let s = new_starts[new_rows.start as usize];
+                let e = line_range(new_text, &new_starts, new_rows.end - 1).end;
+                s..e
+            } else {
+                0..0
+            };
+
+            let (old_word_ranges, new_word_ranges) = if should_word_diff(
+                &old_rows,
+                &old_byte_range,
+                &new_rows,
+                &new_byte_range,
+            ) {
+                let (mut o, mut n) = word_diff_ranges(
+                    &old_text[old_byte_range.clone()],
+                    &new_text[new_byte_range.clone()],
+                );
+                for r in &mut o {
+                    r.start += old_byte_range.start;
+                    r.end += old_byte_range.start;
+                }
+                for r in &mut n {
+                    r.start += new_byte_range.start;
+                    r.end += new_byte_range.start;
+                }
+                (o, n)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            DiffHunk {
+                old_rows,
+                new_rows,
+                old_word_ranges,
+                new_word_ranges,
+            }
+        })
+        .collect()
+}
+
+/// Line kind in the merged unified display text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LineKind {
+    Context,
+    Add,
+    Del,
+}
+
+/// One line of the merged unified display text.
+#[derive(Clone, Debug)]
+pub struct UnifiedLine {
+    pub kind: LineKind,
+    pub old_lineno: Option<u32>,
+    pub new_lineno: Option<u32>,
+    /// Byte range of this line in the merged text (no trailing newline).
+    pub merged_range: Range<usize>,
+    /// Word-level changed byte ranges in the merged text.
+    pub word_ranges: Vec<Range<usize>>,
+}
+
+/// Merged old+new text for the unified diff editor, with per-line metadata.
+#[derive(Clone, Debug)]
+pub struct UnifiedSource {
+    pub text: String,
+    pub lines: Vec<UnifiedLine>,
+}
+
+/// Build the merged unified display: context lines interleaved with deleted
+/// (old) and added (new) lines, hunks in file order, nothing collapsed.
+pub fn build_unified(old_text: &str, new_text: &str) -> UnifiedSource {
+    let hunks = compute_hunks(old_text, new_text);
+    let old_starts = line_starts(old_text);
+    let new_starts = line_starts(new_text);
+    let old_line_count = line_count(old_text, &old_starts);
+    let new_line_count = line_count(new_text, &new_starts);
+
+    let mut text = String::new();
+    let mut lines = Vec::new();
+
+    let mut push_line = |kind: LineKind,
+                         old_lineno: Option<u32>,
+                         new_lineno: Option<u32>,
+                         source: &str,
+                         source_range: Range<usize>,
+                         word_ranges: &[Range<usize>],
+                         text: &mut String,
+                         lines: &mut Vec<UnifiedLine>| {
+        let merged_start = text.len();
+        text.push_str(&source[source_range.clone()]);
+        let merged_end = text.len();
+        text.push('\n');
+        let word_ranges = word_ranges
+            .iter()
+            .filter(|r| r.start < source_range.end && r.end > source_range.start)
+            .map(|r| {
+                let s = r.start.max(source_range.start) - source_range.start + merged_start;
+                let e = r.end.min(source_range.end) - source_range.start + merged_start;
+                s..e
+            })
+            .collect();
+        lines.push(UnifiedLine {
+            kind,
+            old_lineno,
+            new_lineno,
+            merged_range: merged_start..merged_end,
+            word_ranges,
+        });
+    };
+
+    let mut old_cursor = 0u32;
+    let mut new_cursor = 0u32;
+    for hunk in &hunks {
+        // Context before this hunk (identical in both texts, use new).
+        for row in new_cursor..hunk.new_rows.start {
+            let range = line_range(new_text, &new_starts, row);
+            push_line(
+                LineKind::Context,
+                Some(old_cursor + (row - new_cursor)),
+                Some(row),
+                new_text,
+                range,
+                &[],
+                &mut text,
+                &mut lines,
+            );
+        }
+        for row in hunk.old_rows.start..hunk.old_rows.end {
+            let range = line_range(old_text, &old_starts, row);
+            push_line(
+                LineKind::Del,
+                Some(row),
+                None,
+                old_text,
+                range,
+                &hunk.old_word_ranges,
+                &mut text,
+                &mut lines,
+            );
+        }
+        for row in hunk.new_rows.start..hunk.new_rows.end {
+            let range = line_range(new_text, &new_starts, row);
+            push_line(
+                LineKind::Add,
+                None,
+                Some(row),
+                new_text,
+                range,
+                &hunk.new_word_ranges,
+                &mut text,
+                &mut lines,
+            );
+        }
+        old_cursor = hunk.old_rows.end;
+        new_cursor = hunk.new_rows.end;
+    }
+    // Trailing context.
+    for row in new_cursor..new_line_count {
+        let range = line_range(new_text, &new_starts, row);
+        push_line(
+            LineKind::Context,
+            Some(old_cursor + (row - new_cursor)),
+            Some(row),
+            new_text,
+            range,
+            &[],
+            &mut text,
+            &mut lines,
+        );
+    }
+
+    UnifiedSource { text, lines }
+}
+
 /// Byte offsets of every line start in a text, plus a sentinel past the end
 /// so `line_range` works for the last line.
-fn line_starts(text: &str) -> Vec<usize> {
+pub(crate) fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
     for (ix, b) in text.bytes().enumerate() {
         if b == b'\n' {
@@ -93,7 +303,7 @@ fn line_starts(text: &str) -> Vec<usize> {
 }
 
 /// Number of content lines. A trailing newline does not start a new line.
-fn line_count(text: &str, starts: &[usize]) -> u32 {
+pub(crate) fn line_count(text: &str, starts: &[usize]) -> u32 {
     let n = starts.len() - 1; // exclude sentinel
     if text.is_empty() || text.ends_with('\n') {
         n.saturating_sub(1) as u32
@@ -103,7 +313,7 @@ fn line_count(text: &str, starts: &[usize]) -> u32 {
 }
 
 /// Byte range of line `row` (0-based), excluding the trailing newline.
-fn line_range(text: &str, starts: &[usize], row: u32) -> Range<usize> {
+pub(crate) fn line_range(text: &str, starts: &[usize], row: u32) -> Range<usize> {
     let start = starts[row as usize];
     let mut end = starts[row as usize + 1].min(text.len());
     if end > start && text.as_bytes()[end - 1] == b'\n' {
@@ -124,9 +334,9 @@ impl DiffFile {
         new_text: String,
         expanded_separators: &[u32],
     ) -> Self {
-        let hunks = line_diff(&old_text, &new_text);
-        let old_starts = line_starts(&old_text);
+        let hunks = compute_hunks(&old_text, &new_text);
         let new_starts = line_starts(&new_text);
+        let old_starts = line_starts(&old_text);
         let old_line_count = line_count(&old_text, &old_starts);
         let new_line_count = line_count(&new_text, &new_starts);
 
@@ -176,7 +386,9 @@ impl DiffFile {
             }
         };
 
-        for (old_rows, new_rows) in &hunks {
+        for hunk in &hunks {
+            let old_rows = &hunk.old_rows;
+            let new_rows = &hunk.new_rows;
             // Context before this hunk.
             push_context(
                 old_cursor,
@@ -186,47 +398,11 @@ impl DiffFile {
                 &mut rows,
             );
 
-            // Word-level diff for small hunks (same policy as zed).
-            let old_byte_range = if old_rows.start < old_rows.end {
-                let s = old_starts[old_rows.start as usize];
-                let e = line_range(&old_text, &old_starts, old_rows.end - 1).end;
-                s..e
-            } else {
-                0..0
-            };
-            let new_byte_range = if new_rows.start < new_rows.end {
-                let s = new_starts[new_rows.start as usize];
-                let e = line_range(&new_text, &new_starts, new_rows.end - 1).end;
-                s..e
-            } else {
-                0..0
-            };
+            let old_word_ranges = &hunk.old_word_ranges;
+            let new_word_ranges = &hunk.new_word_ranges;
 
-            let (old_word_ranges, new_word_ranges) = if should_word_diff(
-                old_rows,
-                &old_byte_range,
-                new_rows,
-                &new_byte_range,
-            ) {
-                let (mut o, mut n) = word_diff_ranges(
-                    &old_text[old_byte_range.clone()],
-                    &new_text[new_byte_range.clone()],
-                );
-                for r in &mut o {
-                    r.start += old_byte_range.start;
-                    r.end += old_byte_range.start;
-                }
-                for r in &mut n {
-                    r.start += new_byte_range.start;
-                    r.end += new_byte_range.start;
-                }
-                (o, n)
-            } else {
-                (Vec::new(), Vec::new())
-            };
-
-            deletions += (old_rows.end - old_rows.start) as usize;
-            additions += (new_rows.end - new_rows.start) as usize;
+            deletions += hunk.deletions();
+            additions += hunk.additions();
 
             for row in old_rows.start..old_rows.end {
                 let range = line_range(&old_text, &old_starts, row);
@@ -554,5 +730,45 @@ mod tests {
         assert!(!diff2.rows.iter().any(|r| r.is_separator()));
         // 39 context lines + 1 del + 1 add
         assert_eq!(diff2.rows.len(), 41);
+    }
+
+    #[test]
+    fn test_build_unified() {
+        let old = "fn main() {\n    let x = 1;\n}\n".to_string();
+        let new = "fn main() {\n    let x = 2;\n    dbg!(x);\n}\n".to_string();
+        let unified = build_unified(&old, &new);
+        // context: "fn main() {" ; del x=1 ; add x=2 ; add dbg! ; context "}"
+        assert_eq!(unified.lines.len(), 5);
+        assert_eq!(unified.lines[0].kind, LineKind::Context);
+        assert_eq!(unified.lines[1].kind, LineKind::Del);
+        assert_eq!(unified.lines[2].kind, LineKind::Add);
+        assert_eq!(unified.lines[3].kind, LineKind::Add);
+        assert_eq!(unified.lines[4].kind, LineKind::Context);
+
+        let del = &unified.lines[1];
+        assert_eq!(&unified.text[del.merged_range.clone()], "    let x = 1;");
+        // word range should point at `1` in the merged text
+        assert_eq!(del.word_ranges.len(), 1);
+        assert_eq!(&unified.text[del.word_ranges[0].clone()], "1");
+
+        let add = &unified.lines[2];
+        assert_eq!(add.word_ranges.len(), 1);
+        // Histogram alignment may include the trailing `;` in the changed run
+        // (same merging behavior as zed); the range must start at `2`.
+        assert!(unified.text[add.word_ranges[0].clone()].starts_with('2'));
+
+        // Merged text reconstructs all lines
+        assert_eq!(unified.text.lines().count(), 5);
+    }
+
+    #[test]
+    fn test_compute_hunks_pure_addition() {
+        let old = "a\nb\n".to_string();
+        let new = "a\nx\nb\n".to_string();
+        let hunks = compute_hunks(&old, &new);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_rows, 1..1);
+        assert_eq!(hunks[0].new_rows, 1..2);
+        assert!(hunks[0].old_word_ranges.is_empty());
     }
 }

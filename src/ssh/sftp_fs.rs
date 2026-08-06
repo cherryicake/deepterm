@@ -503,6 +503,18 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
+    pub fn write_file_string(&mut self, path: &str, content: &str) -> anyhow::Result<()> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let mut file = self.sftp.create(path).await?;
+            file.write_all(content.as_bytes()).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            file.shutdown().await?;
+            Ok(())
+        })
+    }
+
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
     pub fn execute_command(
@@ -925,6 +937,15 @@ pub fn read_file_to_string(
     path: &str,
 ) -> anyhow::Result<Option<String>> {
     with_cached_session(config, |session| session.read_file_to_string(path))
+}
+
+/// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
+pub fn write_file_string(
+    config: &SshConnectionConfig,
+    path: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    with_cached_session(config, |session| session.write_file_string(path, content))
 }
 
 pub fn read_file_bytes(

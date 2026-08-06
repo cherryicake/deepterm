@@ -23,7 +23,7 @@ use crate::theme::ActiveTheme;
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 
-actions!(editor_panel, [CloseActiveEditorTab]);
+actions!(editor_panel, [CloseActiveEditorTab, SaveActiveEditorTab]);
 actions!(
     editor_tab_context_menu,
     [
@@ -39,6 +39,10 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
         KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
         KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
         KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
@@ -684,7 +688,10 @@ impl Editor {
             state.disabled = true;
             state
         });
-        let diff_view = cx.new(|cx| crate::editor::diff_view::DiffView::new(diff, repo, cx));
+        let editor_weak = cx.entity().downgrade();
+        let diff_view = cx.new(|cx| {
+            crate::editor::diff_view::DiffView::new(diff, repo, editor_weak, window, cx)
+        });
 
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),
@@ -1477,6 +1484,11 @@ impl Render for Editor {
             if let Some(active_id) = &self.active_file_id {
                 if let Some(file) = self.open_files.iter().find(|f| f.id == *active_id) {
                     if let Some(diff) = &file.diff {
+                        // Report the available content width so `Auto` layout can
+                        // switch between unified (default) and split.
+                        diff.update(cx, |view, cx| {
+                            view.set_available_width(self.width - self.content_left_padding, cx)
+                        });
                         div()
                             .w_full()
                             .flex_1()
@@ -1574,6 +1586,15 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &CloseActiveEditorTab, _window, cx| {
                 if let Some(active_id) = this.active_file_id.clone() {
                     this.close_file(active_id.as_ref(), cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SaveActiveEditorTab, _window, cx| {
+                if let Some(active_id) = this.active_file_id.clone() {
+                    if let Some(file) = this.open_files.iter().find(|f| f.id == *active_id) {
+                        if let Some(diff) = &file.diff {
+                            diff.update(cx, |view, cx| view.save(cx));
+                        }
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
