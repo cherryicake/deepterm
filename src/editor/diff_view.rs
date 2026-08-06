@@ -1017,4 +1017,79 @@ mod tests {
         assert_eq!(runs[4].0, 6..8);
         assert!(runs[4].1.color.is_none());
     }
+
+    /// Simulate the renderer's consumption of the external runs for a large
+    /// file with a hunk in the middle: the visible-window clip in
+    /// `highlight_lines` plus the `layout_lines` run-length walk must cover
+    /// the visible span exactly, and a line far below the hunk must keep
+    /// keyword colors from its own source tree (not be swallowed by an
+    /// unclosed string in the hunk).
+    #[test]
+    fn test_below_hunk_window_keeps_highlighting() {
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..200 {
+            old.push_str(&format!("fn fn_{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"));
+        }
+        new.push_str(&old[..old.len()]);
+        // Mid-file hunk: replace one block, leaving an unclosed string in the
+        // added line so a merged-text parse would swallow everything below.
+        let marker = "fn fn_100";
+        let start = new.find(marker).unwrap();
+        let end = new[start..].find("\n}\n").map(|p| start + p).unwrap() + 3;
+        new.replace_range(
+            start..end,
+            "fn fn_100() -> u32 {\n    let s = \"unclosed\n    s.len() as u32\n}\n",
+        );
+
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+
+        // Pick a window below the hunk (hunk occupies merged lines 400..404),
+        // clip like highlight_lines does (first..last visible buffer line
+        // incl. trailing newline).
+        let merged_starts = line_starts(&unified.text);
+        let first = 410;
+        let last = 450;
+        let byte_start = merged_starts[first];
+        let byte_end = merged_starts[last + 1];
+        let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let mut cursor = byte_start;
+        for (range, style) in &runs {
+            if range.end <= byte_start || range.start >= byte_end {
+                continue;
+            }
+            let s = range.start.max(byte_start);
+            let e = range.end.min(byte_end);
+            if s > cursor {
+                styles.push((cursor..s, HighlightStyle::default()));
+            }
+            styles.push((s..e, style.clone()));
+            cursor = e.max(cursor);
+        }
+        if cursor < byte_end {
+            styles.push((cursor..byte_end, HighlightStyle::default()));
+        }
+
+        // Run lengths must sum exactly to the visible span (layout consumes
+        // line bytes + trailing '\n' per visible line).
+        let consumed: usize = styles.iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(consumed, byte_end - byte_start);
+
+        // A `fn` keyword far below the hunk must be keyword-colored, proving
+        // the unclosed string did not leak into the below-hunk region.
+        let line_ix = (0..unified.lines.len())
+            .find(|&ix| {
+                unified.text[unified.lines[ix].merged_range.clone()].starts_with("fn fn_103")
+            })
+            .expect("fn_103 line in merged text");
+        let line = &unified.text[merged_starts[line_ix]..merged_starts[line_ix + 1]];
+        let kw = line.find("fn ").unwrap();
+        let off = merged_starts[line_ix] + kw;
+        let run = styles
+            .iter()
+            .find(|(r, _)| r.start <= off && r.end > off)
+            .unwrap();
+        assert_eq!(run.1.color, Some(gpui::red()), "keyword below hunk");
+    }
 }
