@@ -7,14 +7,34 @@ use streaming_iterator::StreamingIterator;
 use sum_tree::Bias;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
-pub struct InjectionParseData;
-pub struct InjectionLayer;
+/// Data needed to compute injection layers on a background thread.
+pub struct InjectionParseData {
+    /// The injection query (`injections.scm`) of the host language.
+    pub(crate) query: std::sync::Arc<Query>,
+}
+
+/// A parsed injection layer: a byte range of the host document, the embedded
+/// language name, its parsed tree, and the embedded text (the layer's styles
+/// are in the embedded text's coordinate space and offset when composed).
+#[derive(Clone)]
+pub struct InjectionLayer {
+    /// Byte range of the embedded region in the host document.
+    pub byte_range: std::ops::Range<usize>,
+    /// Language name of the embedded content.
+    pub language_name: gpui::SharedString,
+    /// Parsed tree of the embedded content.
+    pub tree: Option<Tree>,
+    /// The embedded text.
+    pub text: Rope,
+}
 
 pub struct SimpleHighlighter {
     _language: String,
     parser: Parser,
     query: Option<Query>,
+    injections_query: Option<std::sync::Arc<Query>>,
     tree: Option<Tree>,
+    injection_layers: Vec<InjectionLayer>,
     text: Rope,
     /// Bounds a single `styles()` query run; on expiry the query halts early
     /// and remaining bytes fall back to the default style.
@@ -140,11 +160,18 @@ impl SimpleHighlighter {
             ),
             _ => None,
         };
+        let injections_query = crate::syntax::LanguageRegistry::singleton()
+            .language(lang)
+            .and_then(|config| Query::new(&config.language, &config.injections).ok())
+            .map(std::sync::Arc::new);
+
         Self {
             _language: lang.to_string(),
             parser,
             query,
+            injections_query,
             tree: None,
+            injection_layers: Vec::new(),
             text: Rope::new(),
             query_timeout: Some(Duration::from_secs(1)),
         }
@@ -253,11 +280,61 @@ impl SimpleHighlighter {
         }
         styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
 
-        // If the matched styles is empty, return a default range.
-        if styles.is_empty() {
+        // Empty range (e.g. cursor on an empty document): a single default
+        // segment, like the pre-injection behavior.
+        if range.is_empty() {
             return vec![(range.start..range.end, HighlightStyle::default())];
         }
+        // If the matched styles is empty, return a default range.
+        if styles.is_empty() {
+            styles.push((range.start..range.end, HighlightStyle::default()));
+        }
 
+        // Compose embedded-language (injection) styles on top of the host
+        // styles. Each layer's subtree styles are in the embedded text's
+        // coordinate space; offset them into the host document.
+        let layers = std::mem::take(&mut self.injection_layers);
+        for layer in &layers {
+            let Some(tree) = &layer.tree else {
+                continue;
+            };
+            let Some(config) = crate::syntax::LanguageRegistry::singleton()
+                .language(&layer.language_name)
+            else {
+                continue;
+            };
+            let Ok(sub_query) = Query::new(&config.language, &config.highlights) else {
+                continue;
+            };
+
+            let mut cursor = QueryCursor::new();
+            let provider = RopeTextProvider(&layer.text);
+            let mut matches = cursor.matches(&sub_query, tree.root_node(), provider);
+            while let Some(m) = matches.next() {
+                for capture in m.captures {
+                    let name = sub_query.capture_names()[capture.index as usize];
+                    let cap_range = capture.node.byte_range();
+                    let mut s = layer.byte_range.start + cap_range.start;
+                    let mut e = layer.byte_range.start + cap_range.end;
+                    // Clip to the host range and char boundaries.
+                    if e <= range.start || s >= range.end {
+                        continue;
+                    }
+                    s = s.max(range.start);
+                    e = e.min(range.end);
+                    s = clip_offset(&self.text, s, Bias::Right);
+                    e = clip_offset(&self.text, e, Bias::Left);
+                    if e > s {
+                        if let Some(style) = theme.style(name) {
+                            styles.push((s..e, style));
+                        }
+                    }
+                }
+            }
+        }
+        self.injection_layers = layers;
+
+        styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
         unique_styles(range, styles)
     }
 
@@ -271,24 +348,127 @@ impl SimpleHighlighter {
     }
 
     pub fn injection_parse_data(&self) -> Option<InjectionParseData> {
-        None
+        self.injections_query
+            .clone()
+            .map(|query| InjectionParseData { query })
     }
 
     pub fn apply_background_tree(
         &mut self,
         tree: Tree,
         _text: &Rope,
-        _injection_layers: std::collections::HashMap<gpui::SharedString, InjectionLayer>,
+        injection_layers: std::collections::HashMap<gpui::SharedString, InjectionLayer>,
     ) {
         self.tree = Some(tree);
+        self.injection_layers = injection_layers.into_values().collect();
     }
 
+    /// Find embedded regions (`injections.scm` of the host language), parse
+    /// each embedded language's content and return one layer per language.
+    /// Single-level only (no recursive injection).
     pub fn compute_injection_layers(
-        _data: InjectionParseData,
-        _tree: &Tree,
-        _text: &Rope,
+        data: InjectionParseData,
+        tree: &Tree,
+        text: &Rope,
     ) -> std::collections::HashMap<gpui::SharedString, InjectionLayer> {
-        std::collections::HashMap::new()
+        // 1. Match the host injections query for (content_range, language).
+        let mut regions: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
+        {
+            let mut cursor = QueryCursor::new();
+            let provider = RopeTextProvider(text);
+            let mut matches = cursor.matches(&data.query, tree.root_node(), provider);
+            while let Some(m) = matches.next() {
+                let mut content: Option<Range<usize>> = None;
+                let mut language: Option<gpui::SharedString> = None;
+                for capture in m.captures {
+                    let name = data.query.capture_names()[capture.index as usize];
+                    let r = capture.node.byte_range();
+                    match name {
+                        "injection.content" => content = Some(r),
+                        "injection.language" => {
+                            language = Some(gpui::SharedString::from(
+                                text.slice(r).to_string().trim().to_owned(),
+                            ))
+                        }
+                        _ => {}
+                    }
+                }
+                // `(#set! injection.language "js")` is a property setting, not
+                // a capture — read it from the pattern's settings.
+                if language.is_none() {
+                    for prop in data.query.property_settings(m.pattern_index) {
+                        if prop.key.as_ref() == "injection.language" {
+                            if let Some(value) = prop.value.as_ref() {
+                                language = Some(gpui::SharedString::from(value.as_ref()));
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let (Some(content), Some(language)) = (content, language) {
+                    regions.push((content, language));
+                }
+            }
+        }
+
+        // 2. Group by language.
+        let mut by_lang: std::collections::HashMap<gpui::SharedString, Vec<Range<usize>>> =
+            std::collections::HashMap::new();
+        for (range, lang) in regions {
+            by_lang.entry(lang).or_default().push(range);
+        }
+
+        // 3. Parse each language's embedded content (merged ranges).
+        let mut layers = std::collections::HashMap::new();
+        for (lang, ranges) in by_lang {
+            let Some(config) = crate::syntax::LanguageRegistry::singleton().language(&lang) else {
+                continue;
+            };
+            let mut parser = Parser::new();
+            if parser.set_language(&config.language).is_err() {
+                continue;
+            }
+
+            // Parse each range independently (embedded regions can be
+            // disjoint); combine into one layer with one tree per range is
+            // complex, so parse the union span and clip styles per region.
+            for range in ranges {
+                if range.len() > 64 * 1024 {
+                    continue; // guard against pathological embeddings
+                }
+                let sub_text = Rope::from(text.slice(range.clone()));
+                let tree = parser.parse_with_options(
+                    &mut |offset, _| {
+                        if offset >= sub_text.len() {
+                            return &[] as &[u8];
+                        }
+                        let (chunk, chunk_byte_ix) = sub_text.chunk(offset);
+                        let start_in_chunk = offset - chunk_byte_ix;
+                        chunk.as_bytes().get(start_in_chunk..).unwrap_or(&[])
+                    },
+                    None,
+                    None,
+                );
+                let layer = InjectionLayer {
+                    byte_range: range.clone(),
+                    language_name: lang.clone(),
+                    tree,
+                    text: sub_text,
+                };
+                layers
+                    .entry(lang.clone())
+                    .and_modify(|existing: &mut InjectionLayer| {
+                        // Keep the first (or largest) layer per language;
+                        // multi-region embedding is rare.
+                        if range.len() > existing.byte_range.len() {
+                            *existing = layer.clone();
+                        }
+                    })
+                    .or_insert(layer);
+            }
+        }
+
+        layers
     }
 }
 
@@ -468,6 +648,9 @@ mod tests {
                     number: Some(crate::syntax::ThemeStyle::color(gpui::yellow())),
                     string: Some(crate::syntax::ThemeStyle::color(gpui::blue())),
                     comment: Some(crate::syntax::ThemeStyle::color(gpui::red())),
+                    property: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
+                    constant: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x00bcd4).into())),
+                    tag: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -603,6 +786,55 @@ mod tests {
         assert!(
             restored_color,
             "restored text should still have syntax highlights after undo"
+        );
+    }
+
+    /// HTML embeds `<script>` (JavaScript) and `<style>` (CSS); the injected
+    /// content must be highlighted with its own language's query, composed
+    /// onto the host (HTML) styles at the correct byte offsets.
+    #[test]
+    fn test_html_injection_script_and_style() {
+        let code = "<html>\n<style>body { color: red; }</style>\n<script>let x = 1;</script>\n</html>\n";
+        let mut h = SimpleHighlighter::new("html");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let data = h.injection_parse_data().expect("html has an injections query");
+        let tree = h.tree().expect("host tree").clone();
+        let layers = SimpleHighlighter::compute_injection_layers(data, &tree, &rope);
+        assert!(
+            layers.len() >= 2,
+            "expected script + style layers, got {}",
+            layers.len()
+        );
+
+        h.apply_background_tree(tree, &rope, layers);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+
+        // `let` inside <script> is a JavaScript keyword → red.
+        let let_pos = code.find("let").expect("let in script");
+        let run = styles
+            .iter()
+            .find(|(r, _)| r.start <= let_pos && r.end > let_pos)
+            .unwrap_or_else(|| panic!("no style covers `let` at {let_pos}"));
+        assert_eq!(
+            run.1.color,
+            Some(gpui::red()),
+            "`let` inside <script> should be keyword-colored (injected JS)"
+        );
+
+        // Inside <style>, some run must carry a non-default color from the
+        // injected CSS query (e.g. the `body` selector / `red` value).
+        let style_start = code.find("<style>").expect("style tag") + "<style>".len();
+        let style_end = code.find("</style>").expect("style close");
+        let styled = styles.iter().any(|(r, s)| {
+            r.start >= style_start && r.end <= style_end && s.color.is_some()
+        });
+        assert!(
+            styled,
+            "expected injected CSS styles inside <style> (range {style_start}..{style_end})"
         );
     }
 }
