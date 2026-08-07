@@ -99,6 +99,8 @@ actions!(
 pub enum InputEvent {
     Change,
     PressEnter { secondary: bool },
+    /// Emitted when a single-line input with `submit_on_enter` confirms.
+    Submit,
     Focus,
     Blur,
 }
@@ -376,6 +378,15 @@ pub struct InputState {
     pub(crate) hover_popover: Option<HoverPopoverData>,
     /// Code completion popup state.
     pub(crate) completion_menu: Option<CompletionMenu>,
+    /// Extra empty rows below the last line the editor can scroll into.
+    /// See [`Self::scroll_beyond_last_line`].
+    pub(crate) scroll_beyond_last_line: Option<usize>,
+    /// Minimum visible rows kept above/below the cursor when scrolling.
+    /// See [`Self::cursor_surrounding_lines`].
+    pub(crate) cursor_surrounding_lines: Option<usize>,
+    /// Single-line inputs: pressing Enter emits the submit event instead of
+    /// just propagating.
+    pub(crate) submit_on_enter: bool,
     /// True while a completion is being inserted (suppresses re-triggers).
     pub(crate) completion_inserting: bool,
     _subscriptions: Vec<Subscription>,
@@ -462,6 +473,9 @@ impl InputState {
             hover_popover: None,
             completion_menu: None,
             completion_inserting: false,
+            scroll_beyond_last_line: None,
+            cursor_surrounding_lines: None,
+            submit_on_enter: false,
         }
     }
 
@@ -919,6 +933,26 @@ impl InputState {
         self
     }
 
+    /// `editor.scrollBeyondLastLine`: allow scrolling `rows` empty rows past
+    /// the last line.
+    pub fn scroll_beyond_last_line(mut self, rows: Option<usize>) -> Self {
+        self.scroll_beyond_last_line = rows;
+        self
+    }
+
+    /// Keep at least `lines` visible rows above/below the cursor when the
+    /// editor scrolls.
+    pub fn cursor_surrounding_lines(mut self, lines: Option<usize>) -> Self {
+        self.cursor_surrounding_lines = lines;
+        self
+    }
+
+    /// Single-line inputs: pressing Enter emits the submit event.
+    pub fn submit_on_enter(mut self, submit: bool) -> Self {
+        self.submit_on_enter = submit;
+        self
+    }
+
     /// Set whether to show whitespace characters.
     pub fn show_whitespaces(mut self, show: bool) -> Self {
         self.show_whitespaces = show;
@@ -1009,6 +1043,12 @@ impl InputState {
 
     /// Return the value of the input field.
     pub fn value(&self) -> SharedString {
+        SharedString::new(self.text.to_string())
+    }
+
+    /// The unmasked value: identical to [`Self::value`] when not masked
+    /// (deepterm stores the raw text; masking is a display-time concern).
+    pub fn unmask_value(&self) -> SharedString {
         SharedString::new(self.text.to_string())
     }
 
@@ -1388,6 +1428,10 @@ impl InputState {
             let new_line_text = format!("\n{}", indent);
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
             self.pause_blink_cursor(cx);
+        } else if self.submit_on_enter {
+            // Single line input with submit_on_enter: emit the submit event.
+            self.clean_on_escape = false;
+            cx.emit(InputEvent::Submit);
         } else {
             // Single line input, just emit the event (e.g.: In a dialog to confirm).
             cx.propagate();
@@ -1651,9 +1695,14 @@ impl InputState {
         }
 
         // Check if row_offset_y is out of the viewport
-        // If row offset is not in the viewport, scroll to make it visible
+        // If row offset is not in the viewport, scroll to make it visible.
         let edge_height = if direction.is_some() && self.mode.is_code_editor() {
-            3 * line_height
+            match self.cursor_surrounding_lines {
+                Some(lines) => (lines as f32 * line_height).min(
+                    (last_layout.visible_range.len() as f32 * line_height).half(),
+                ),
+                None => 3 * line_height,
+            }
         } else {
             line_height
         };

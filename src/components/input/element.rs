@@ -1496,11 +1496,17 @@ impl Element for TextElement {
 
         let total_wrapped_lines = state.display_map.wrap_row_count();
         let empty_bottom_height = if state.mode.is_code_editor() {
-            bounds
+            let base = bounds
                 .size
                 .height
                 .half()
-                .max(BOTTOM_MARGIN_ROWS * line_height)
+                .max(BOTTOM_MARGIN_ROWS * line_height);
+            // `scroll_beyond_last_line`: allow scrolling extra empty rows
+            // past the last line.
+            match state.scroll_beyond_last_line {
+                Some(rows) => base.max(rows as f32 * line_height),
+                None => base,
+            }
         } else {
             px(0.)
         };
