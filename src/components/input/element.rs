@@ -89,6 +89,7 @@ impl TextElement {
                     InputState::dispatch_background_parse(bg, window, cx);
                 }
                 state.update_fold_candidates();
+                state.lsp.update(&state.text, window, cx);
                 state._pending_update = false;
             }
             state.display_map.set_font(
@@ -1070,6 +1071,18 @@ impl TextElement {
             styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
         }
         drop(highlighter_ref);
+
+        // LSP semantic tokens layered on top of the tree-sitter styles
+        // (composed below the diff word colors). Colors resolve from the
+        // token type name against the active highlight theme at paint time.
+        let semantic_styles = state.lsp.semantic_tokens_for_range(
+            &state.text,
+            &visible_byte_range,
+            &cx.theme().highlight_theme,
+        );
+        if !semantic_styles.is_empty() {
+            styles = gpui::combine_highlights(semantic_styles, styles).collect();
+        }
 
         // Merge diff word-level decorations (e.g. inline changed-word
         // backgrounds in the git diff view).

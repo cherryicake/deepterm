@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
+use crate::components::input::lsp::LspServerSpec;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::file_icons::file_icon_or_default;
@@ -1192,12 +1193,23 @@ impl Editor {
 
         let editor_state = cx.new(|cx| {
             let mut state = InputState::new(window, cx)
-                .code_editor(language)
+                .code_editor(language.clone())
                 .multi_line(true);
             state.set_value(&content, window, cx);
             state.disabled = is_image || is_loading;
             state
         });
+
+        // LSP: start a session for supported languages on local files so
+        // semantic highlighting can layer on top of tree-sitter.
+        if !is_image && !is_loading && ssh_config.is_none() && !content.is_empty() {
+            if let Some(spec) = lsp_server_spec(&language, &path) {
+                let uri = path_to_file_uri(&path);
+                editor_state.update(cx, |state, cx| {
+                    state.attach_lsp(uri, spec, cx);
+                });
+            }
+        }
 
         let is_markdown = !is_image && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
@@ -1673,6 +1685,31 @@ pub(crate) fn guess_language_from_extension(path: &Path) -> String {
         })
         .unwrap_or("text")
         .to_string()
+}
+
+/// Map a local file path to a `file://` URI for LSP.
+fn path_to_file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+/// LSP server configuration for a language, when one is available on this
+/// machine. Only local (non-SSH) files get a session.
+fn lsp_server_spec(language: &str, path: &Path) -> Option<LspServerSpec> {
+    let root_uri = path
+        .parent()
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap_or_default();
+
+    let spec = match language {
+        "rust" => LspServerSpec {
+            language_id: "rust",
+            command: "rust-analyzer",
+            args: &[],
+            root_uri,
+        },
+        _ => return None,
+    };
+    Some(spec)
 }
 
 struct EditorResizeElement {

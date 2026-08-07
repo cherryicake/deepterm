@@ -8,6 +8,7 @@ pub mod display_map;
 pub mod element;
 pub mod indent;
 pub mod input;
+pub mod lsp;
 pub mod mode;
 pub mod movement;
 pub mod rope_ext;

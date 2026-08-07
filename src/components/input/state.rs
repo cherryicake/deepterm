@@ -16,7 +16,9 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
-use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
+use super::{
+    DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, lsp::Lsp, mode::InputMode,
+};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -29,6 +31,8 @@ use crate::syntax::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::syntax::LanguageRegistry;
 use lsp_types::Position;
+
+use super::lsp::{LspChange, LspServerSpec, start_lsp_session};
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = editor, no_json)]
@@ -361,6 +365,8 @@ pub struct InputState {
     /// Sorted, contiguous and gap-free over `[0, text.len())`; when set, the
     /// internal tree-sitter highlighter is bypassed.
     pub(crate) external_highlight_runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
+    /// LSP-provided editor features (semantic tokens, hover, …).
+    pub(crate) lsp: Lsp,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -440,6 +446,7 @@ impl InputState {
             diff_range_colors: Vec::new(),
             diff_line_labels: None,
             external_highlight_runs: None,
+            lsp: Lsp::default(),
         }
     }
 
@@ -761,9 +768,6 @@ impl InputState {
     /// async completion paths (e.g. background file loads). It updates the rope, display map,
     /// and schedules a highlight refresh for code editors.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.history.ignore = true;
-        let text: SharedString = text.into();
-        self.text = Rope::from(text.as_ref());
         if self.mode.is_single_line() {
             self.selected_range = (self.text.len()..self.text.len()).into();
         } else {
@@ -780,6 +784,29 @@ impl InputState {
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
+    }
+
+    /// Attach an LSP session for this document (spawns the server, registers
+    /// the document, and starts streaming semantic tokens).
+    pub(crate) fn attach_lsp(
+        &mut self,
+        uri: String,
+        spec: LspServerSpec,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.entity().downgrade();
+        if let Some(tx) = start_lsp_session(editor, uri, spec, cx) {
+            self.lsp.change_tx = Some(tx);
+            self.push_lsp_change(cx);
+        }
+    }
+
+    /// Push the current text to the LSP session (full-document sync).
+    pub(crate) fn push_lsp_change(&mut self, cx: &mut App) {
+        if let Some(tx) = self.lsp.change_tx.as_ref() {
+            let text = self.text.to_string();
+            let _ = tx.try_send(LspChange::Text(text));
+        }
     }
 
     /// Clear the input text.
@@ -2272,6 +2299,8 @@ impl EntityInputHandler for InputState {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
+        self.lsp.update(&self.text, window, cx);
+        self.push_lsp_change(cx);
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
