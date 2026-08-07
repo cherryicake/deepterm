@@ -14,12 +14,14 @@ use ropey::Rope;
 use crate::components::input::{InputState, RopeExt as _};
 
 pub mod client;
+pub mod completions;
 pub mod definitions;
 pub mod hover;
 pub mod semantic_tokens;
 pub mod session;
 
 pub use client::*;
+pub use completions::*;
 pub use definitions::*;
 pub use hover::*;
 pub use semantic_tokens::*;
@@ -55,6 +57,11 @@ pub enum LspChange {
         offset: usize,
         reply: async_channel::Sender<Result<Vec<lsp_types::LocationLink>>>,
     },
+    /// A completion request at a byte offset.
+    Completion {
+        offset: usize,
+        reply: async_channel::Sender<Result<lsp_types::CompletionResponse>>,
+    },
     /// The document was closed; the session should shut down.
     Close,
 }
@@ -68,13 +75,15 @@ pub struct Lsp {
     pub hover_provider: Option<Rc<dyn HoverProvider>>,
     /// The definition provider.
     pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
-
+    /// The completion provider.
+    pub completion_provider: Option<Rc<dyn CompletionProvider>>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
     _semantic_tokens_task: Task<()>,
     _hover_task: Task<Result<()>>,
+    _completion_task: Task<()>,
 
     /// The change channel the editor pushes document edits into; the LSP
     /// session task consumes it to sync content and refetch tokens.
@@ -89,9 +98,11 @@ impl Default for Lsp {
             semantic_tokens_provider: None,
             hover_provider: None,
             definition_provider: None,
+            completion_provider: None,
             semantic_tokens: vec![],
             _semantic_tokens_task: Task::ready(()),
             _hover_task: Task::ready(Ok(())),
+            _completion_task: Task::ready(()),
             change_tx: None,
             document_uri: String::new(),
         }

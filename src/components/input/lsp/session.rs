@@ -127,6 +127,11 @@ async fn run_session(
                 let result = client.definition(&uri, (position.line, position.character)).await;
                 let _ = reply.try_send(result);
             }
+            Ok(LspChange::Completion { offset, reply }) => {
+                let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                let result = client.completion(&uri, (position.line, position.character)).await;
+                let _ = reply.try_send(result);
+            }
             Ok(LspChange::Close) | Err(_) => break,
         }
     }

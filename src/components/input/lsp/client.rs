@@ -338,6 +338,30 @@ impl LspClient {
         Ok(Vec::new())
     }
 
+    /// textDocument/completion.
+    pub async fn completion(
+        &mut self,
+        uri: &str,
+        position: (u32, u32),
+    ) -> Result<lsp_types::CompletionResponse> {
+        let resp = self
+            .send_request(
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": position.0, "character": position.1 },
+                    "context": {
+                        "triggerKind": 1, // Invoked
+                    },
+                }),
+            )
+            .await?;
+        if resp.is_null() {
+            return Ok(lsp_types::CompletionResponse::Array(vec![]));
+        }
+        serde_json::from_value(resp).context("invalid completion response")
+    }
+
     /// Graceful shutdown: `shutdown` request, `exit` notification.
     pub async fn shutdown(mut self) {
         let _ = self.send_request("shutdown", json!(null)).await;
@@ -438,6 +462,33 @@ mod tests {
                 !tokens.data.is_empty(),
                 "rust-analyzer returned no semantic tokens"
             );
+
+            // Completion: the request must succeed; rust-analyzer may return
+            // empty items for a bare temp file without a crate context.
+            let completions = client
+                .completion("file:///tmp/main.rs", (0, 5))
+                .await
+                .expect("completion request failed");
+            let items = match completions {
+                lsp_types::CompletionResponse::Array(items) => items,
+                lsp_types::CompletionResponse::List(list) => list.items,
+            };
+            eprintln!("E2E: completion items = {}", items.len());
+
+            // Hover over the `x` binding (line 1, col 8). A bare temp file
+            // may have no crate context, so only the request must succeed.
+            let hover = client
+                .hover("file:///tmp/main.rs", (1, 8))
+                .await
+                .expect("hover request failed");
+            eprintln!("E2E: hover = {}", hover.is_some());
+
+            // Definition of `main` (line 0, col 3); same context caveat.
+            let defs = client
+                .definition("file:///tmp/main.rs", (0, 3))
+                .await
+                .expect("definition request failed");
+            eprintln!("E2E: definitions = {}", defs.len());
 
             client.shutdown().await;
             read_task.abort();

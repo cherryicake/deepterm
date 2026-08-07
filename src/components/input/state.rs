@@ -33,7 +33,8 @@ use crate::syntax::LanguageRegistry;
 use lsp_types::Position;
 
 use super::lsp::{
-    HoverDefinition, HoverPopoverData, LspChange, LspServerSpec, start_lsp_session,
+    CompletionMenu, HoverDefinition, HoverPopoverData, LspChange, LspServerSpec,
+    start_lsp_session,
 };
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
@@ -373,6 +374,10 @@ pub struct InputState {
     pub(crate) hover_definition: HoverDefinition,
     /// Hover popover contents (symbol range + text).
     pub(crate) hover_popover: Option<HoverPopoverData>,
+    /// Code completion popup state.
+    pub(crate) completion_menu: Option<CompletionMenu>,
+    /// True while a completion is being inserted (suppresses re-triggers).
+    pub(crate) completion_inserting: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -455,6 +460,8 @@ impl InputState {
             lsp: Lsp::default(),
             hover_definition: HoverDefinition::default(),
             hover_popover: None,
+            completion_menu: None,
+            completion_inserting: false,
         }
     }
 
@@ -1364,6 +1371,11 @@ impl InputState {
     }
 
     pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // Accept the completion popup instead of inserting a newline.
+        if self.is_completion_open() {
+            self.accept_completion(window, cx);
+            return;
+        }
         if self.mode.is_multi_line() {
             // Get current line indent
             let indent = if self.mode.is_code_editor() {
@@ -1393,6 +1405,11 @@ impl InputState {
     }
 
     pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        // Close the completion popup first.
+        if self.is_completion_open() {
+            self.close_completion(cx);
+            return;
+        }
         if self.clean_on_escape {}
 
         if self.ime_marked_range.is_some() {
@@ -1972,7 +1989,12 @@ impl InputState {
         });
     }
 
-    pub(crate) fn on_key_down(&mut self, _: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pause_blink_cursor(cx);
     }
 
@@ -2340,6 +2362,12 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.display_map);
         self.lsp.update(&self.text, window, cx);
         self.push_lsp_change(cx);
+        // Request completions when typing (non-whitespace input).
+        if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting {
+            self.schedule_completion(window, cx);
+        } else if new_text.is_empty() && !self.completion_inserting {
+            self.close_completion(cx);
+        }
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();

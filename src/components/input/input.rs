@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative,
+    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, SharedString, Window, div, px,
+    relative,
 };
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
@@ -81,6 +82,82 @@ impl EditorInput {
                     window.focus(&focus_handle, cx);
                 }
             })
+    }
+
+    /// Floating completion popup (anchored at the bottom of the editor).
+    fn render_completion_menu(state: &InputState, cx: &App) -> impl IntoElement {
+        let Some(menu) = state.completion_menu.as_ref() else {
+            return div().into_any_element();
+        };
+        if !menu.visible || menu.items.is_empty() {
+            return div().into_any_element();
+        }
+        let theme = cx.theme();
+        div()
+            .id("completion-menu")
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .w_full()
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.0))
+            .children(
+                menu.items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let selected = i == menu.selected;
+                        div()
+                            .id(SharedString::from(format!("completion-item-{i}")))
+                            .px_2()
+                            .py_1()
+                            .text_color(if selected {
+                                theme.accent_foreground
+                            } else {
+                                theme.text
+                            })
+                            .bg(if selected {
+                                theme.accent
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .child(item.label.clone())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
+    /// Floating hover popover (anchored at the top of the editor).
+    fn render_hover_popover(state: &InputState, cx: &App) -> impl IntoElement {
+        let Some(popover) = state.hover_popover.as_ref() else {
+            return div().into_any_element();
+        };
+        if popover.contents.is_empty() {
+            return div().into_any_element();
+        }
+        let theme = cx.theme();
+        div()
+            .id("hover-popover")
+            .absolute()
+            .top_0()
+            .left_0()
+            .max_w(px(480.0))
+            .max_h(px(200.0))
+            .overflow_y_scroll()
+            .px_3()
+            .py_2()
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.0))
+            .text_color(theme.text)
+            .child(popover.contents.clone())
+            .into_any_element()
     }
 }
 
@@ -187,6 +264,8 @@ impl RenderOnce for EditorInput {
 
         if is_multi_line {
             // Multi-line mode: match the original InputState::render layout
+            let completion_menu = Self::render_completion_menu(&state, cx);
+            let hover_popover = Self::render_hover_popover(&state, cx);
             actions
                 .id("editor-input")
                 .flex_1()
@@ -200,6 +279,7 @@ impl RenderOnce for EditorInput {
                         .h_full()
                         .flex()
                         .flex_col()
+                        .relative()
                         .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
                         .child(
                             div()
@@ -209,7 +289,9 @@ impl RenderOnce for EditorInput {
                                     TextElement::new(self.state.clone())
                                         .placeholder(state.placeholder.clone()),
                                 ),
-                        ),
+                        )
+                        .child(completion_menu)
+                        .child(hover_popover),
                 )
                 .into_any_element()
         } else {
