@@ -1,31 +1,60 @@
 //! LSP integration framework for the code editor.
 //!
-//! Ported from gpui-component's `input/lsp` module. Providers are trait
-//! objects registered by the host (a real language server, a local
-//! analyzer, …); `Lsp` coordinates async fetching, caching and composition
-//! into the render pipeline. The actual LSP client / server management is
-//! intentionally left to the host.
+//! Ported from gpui-component's `input/lsp` module. The built-in session
+//! (`session.rs`) drives a real language server; the provider traits are also
+//! exposed for hosts that want to plug in their own.
 
 use std::rc::Rc;
 
+use anyhow::Result;
 use async_channel::Sender;
 use gpui::{Context, SharedString, Task, Window};
 use ropey::Rope;
 
-use crate::components::input::InputState;
+use crate::components::input::{InputState, RopeExt as _};
 
 pub mod client;
+pub mod definitions;
+pub mod hover;
 pub mod semantic_tokens;
 pub mod session;
 
 pub use client::*;
+pub use definitions::*;
+pub use hover::*;
 pub use semantic_tokens::*;
 pub use session::*;
+
+/// Convert a byte offset to an LSP position (UTF-16 characters).
+pub(crate) fn lsp_types_position_from_offset(
+    text: &Rope,
+    offset: usize,
+) -> lsp_types::Position {
+    let point = text.offset_to_point(offset);
+    let line = text.slice_line(point.row);
+    let character = line
+        .slice(..point.column)
+        .chars()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    lsp_types::Position::new(point.row as u32, character)
+}
 
 /// A message sent from the editor (main thread) to the LSP session task.
 pub enum LspChange {
     /// Full-document content sync after an edit.
     Text(String),
+    /// A hover request at a byte offset; the reply carries the hover or
+    /// `None`.
+    Hover {
+        offset: usize,
+        reply: async_channel::Sender<Result<Option<lsp_types::Hover>>>,
+    },
+    /// A definition request at a byte offset.
+    Definition {
+        offset: usize,
+        reply: async_channel::Sender<Result<Vec<lsp_types::LocationLink>>>,
+    },
     /// The document was closed; the session should shut down.
     Close,
 }
@@ -35,25 +64,36 @@ pub struct Lsp {
     /// The range semantic tokens provider (semantic highlighting layered on
     /// top of tree-sitter).
     pub semantic_tokens_provider: Option<Rc<dyn DocumentRangeSemanticTokensProvider>>,
+    /// The hover provider.
+    pub hover_provider: Option<Rc<dyn HoverProvider>>,
+    /// The definition provider.
+    pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
 
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
     _semantic_tokens_task: Task<()>,
+    _hover_task: Task<Result<()>>,
 
     /// The change channel the editor pushes document edits into; the LSP
     /// session task consumes it to sync content and refetch tokens.
     pub(crate) change_tx: Option<Sender<LspChange>>,
+    /// The `file://` URI of the attached document.
+    pub(crate) document_uri: String,
 }
 
 impl Default for Lsp {
     fn default() -> Self {
         Self {
             semantic_tokens_provider: None,
+            hover_provider: None,
+            definition_provider: None,
             semantic_tokens: vec![],
             _semantic_tokens_task: Task::ready(()),
+            _hover_task: Task::ready(Ok(())),
             change_tx: None,
+            document_uri: String::new(),
         }
     }
 }
@@ -74,6 +114,7 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.semantic_tokens.clear();
         self._semantic_tokens_task = Task::ready(());
+        self._hover_task = Task::ready(Ok(()));
     }
 
     /// Replace the cached semantic tokens (called by the LSP session when a
@@ -89,4 +130,7 @@ impl Lsp {
         }
     }
 
+    pub(crate) fn document_uri(&self) -> &str {
+        &self.document_uri
+    }
 }

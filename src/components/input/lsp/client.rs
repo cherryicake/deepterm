@@ -282,6 +282,62 @@ impl LspClient {
         serde_json::from_value(resp).context("invalid semanticTokens response")
     }
 
+    /// textDocument/hover.
+    pub async fn hover(
+        &mut self,
+        uri: &str,
+        position: (u32, u32),
+    ) -> Result<Option<lsp_types::Hover>> {
+        let resp = self
+            .send_request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": position.0, "character": position.1 },
+                }),
+            )
+            .await?;
+        if resp.is_null() {
+            return Ok(None);
+        }
+        serde_json::from_value(resp).context("invalid hover response")
+    }
+
+    /// textDocument/definition — returns location links.
+    pub async fn definition(
+        &mut self,
+        uri: &str,
+        position: (u32, u32),
+    ) -> Result<Vec<lsp_types::LocationLink>> {
+        let resp = self
+            .send_request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": position.0, "character": position.1 },
+                }),
+            )
+            .await?;
+        // Servers may return `Location[]` or `LocationLink[]`.
+        if let Some(links) =
+            serde_json::from_value::<Vec<lsp_types::LocationLink>>(resp.clone()).ok()
+        {
+            return Ok(links);
+        }
+        if let Ok(locations) = serde_json::from_value::<Vec<lsp_types::Location>>(resp) {
+            return Ok(locations
+                .into_iter()
+                .map(|loc| lsp_types::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: loc.uri,
+                    target_range: loc.range,
+                    target_selection_range: loc.range,
+                })
+                .collect());
+        }
+        Ok(Vec::new())
+    }
+
     /// Graceful shutdown: `shutdown` request, `exit` notification.
     pub async fn shutdown(mut self) {
         let _ = self.send_request("shutdown", json!(null)).await;

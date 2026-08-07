@@ -32,7 +32,9 @@ use crate::syntax::DiagnosticSet;
 use crate::syntax::LanguageRegistry;
 use lsp_types::Position;
 
-use super::lsp::{LspChange, LspServerSpec, start_lsp_session};
+use super::lsp::{
+    HoverDefinition, HoverPopoverData, LspChange, LspServerSpec, start_lsp_session,
+};
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = editor, no_json)]
@@ -367,6 +369,10 @@ pub struct InputState {
     pub(crate) external_highlight_runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
     /// LSP-provided editor features (semantic tokens, hover, …).
     pub(crate) lsp: Lsp,
+    /// Go-to-definition hover state (symbol underline + locations).
+    pub(crate) hover_definition: HoverDefinition,
+    /// Hover popover contents (symbol range + text).
+    pub(crate) hover_popover: Option<HoverPopoverData>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -447,6 +453,8 @@ impl InputState {
             diff_line_labels: None,
             external_highlight_runs: None,
             lsp: Lsp::default(),
+            hover_definition: HoverDefinition::default(),
+            hover_popover: None,
         }
     }
 
@@ -1401,7 +1409,7 @@ impl InputState {
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(ime_marked_range) = &self.ime_marked_range {
@@ -1414,6 +1422,13 @@ impl InputState {
         let offset = self.index_for_mouse_position(event.position);
 
         if event.button == MouseButton::Right {
+            return;
+        }
+
+        // Cmd+click on a hovered symbol jumps to its definition.
+        if event.click_count == 1
+            && self.handle_click_hover_definition(event, offset, window, cx)
+        {
             return;
         }
 
@@ -1474,8 +1489,8 @@ impl InputState {
     pub(crate) fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         // Check if mouse is within bounds
         let _within_bounds = self
@@ -1483,6 +1498,30 @@ impl InputState {
             .as_ref()
             .map(|bounds| bounds.contains(&event.position))
             .unwrap_or(false);
+
+        if !self.mode.is_code_editor() {
+            return;
+        }
+        if self.lsp.change_tx.is_none() {
+            return;
+        }
+
+        let offset = self.index_for_mouse_position(event.position);
+        let had_definition = !self.hover_definition.is_empty();
+        let had_popover = self.hover_popover.is_some();
+
+        if event.modifiers.secondary() {
+            self.handle_hover_definition(offset, window, cx);
+        } else {
+            self.hover_definition.clear();
+            self.handle_hover_popover(offset, window, cx);
+        }
+
+        let changed = had_definition == self.hover_definition.is_empty()
+            || had_popover != self.hover_popover.is_some();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub(crate) fn on_scroll_wheel(

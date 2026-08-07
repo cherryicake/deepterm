@@ -158,6 +158,10 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::copy))
                     .when(is_multi_line, |this| {
                         this.on_action(window.listener_for(&self.state, InputState::on_action_search))
+                            .on_action(window.listener_for(
+                                &self.state,
+                                InputState::on_action_go_to_definition,
+                            ))
                     })
                     .on_key_down(window.listener_for(&self.state, InputState::on_key_down))
             })

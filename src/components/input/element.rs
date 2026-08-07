@@ -1084,6 +1084,11 @@ impl TextElement {
             styles = gpui::combine_highlights(semantic_styles, styles).collect();
         }
 
+        // Hovered symbol underline (go-to-definition affordance).
+        if let Some((range, hover_style)) = self.layout_hover_definition(cx) {
+            styles.push((range, hover_style));
+        }
+
         // Merge diff word-level decorations (e.g. inline changed-word
         // backgrounds in the git diff view).
         if !state.diff_range_colors.is_empty() {

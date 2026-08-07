@@ -97,6 +97,11 @@ async fn run_session(
     };
 
     let mut version = 1i64;
+    let _ = cx.update(|cx| {
+        editor.update(cx, |state, _| {
+            state.lsp.document_uri = uri.clone();
+        })
+    });
     let _ = client
         .did_open(&uri, spec.language_id, version, &current_text)
         .await;
@@ -112,11 +117,25 @@ async fn run_session(
                 let _ =
                     fetch_and_apply(&mut client, &editor, &uri, &current_text, &legend, cx).await;
             }
+            Ok(LspChange::Hover { offset, reply }) => {
+                let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                let result = client.hover(&uri, (position.line, position.character)).await;
+                let _ = reply.try_send(result);
+            }
+            Ok(LspChange::Definition { offset, reply }) => {
+                let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                let result = client.definition(&uri, (position.line, position.character)).await;
+                let _ = reply.try_send(result);
+            }
             Ok(LspChange::Close) | Err(_) => break,
         }
     }
 
     let _ = client.shutdown().await;
+}
+
+fn current_rope(text: &str) -> Rope {
+    Rope::from_str(text)
 }
 
 async fn fetch_and_apply(
