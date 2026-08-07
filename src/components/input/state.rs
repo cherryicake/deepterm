@@ -297,6 +297,11 @@ pub struct InputState {
     /// - "💝" = 4
     pub(crate) selected_range: Selection,
     pub(crate) searchable: bool,
+    /// Whether the editor allows find-replace (replace button in the search
+    /// panel). Defaults to true for code editors.
+    pub(crate) replaceable: bool,
+    /// The find / replace panel, lazily created on the first `Search` action.
+    pub(crate) search_panel: Option<Entity<super::search::SearchPanel>>,
     /// Range for save the selected word, use to keep word range when drag move.
     pub(crate) selected_word_range: Option<Selection>,
     pub(crate) selection_reversed: bool,
@@ -398,6 +403,8 @@ impl InputState {
             history,
             selected_range: Selection::default(),
             searchable: false,
+            replaceable: false,
+            search_panel: None,
             selected_word_range: None,
             selection_reversed: false,
             ime_marked_range: None,
@@ -526,6 +533,14 @@ impl InputState {
         let language: SharedString = language.into();
         self.mode = InputMode::code_editor(language);
         self.searchable = true;
+        self.replaceable = true;
+        self
+    }
+
+    /// Set this input is replaceable (find-replace in the search panel),
+    /// default is false (Default true for Code Editor).
+    pub fn replaceable(mut self, replaceable: bool) -> Self {
+        self.replaceable = replaceable;
         self
     }
 
@@ -762,6 +777,7 @@ impl InputState {
             self._pending_update = true;
         }
         self.history.ignore = false;
+        self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -2256,6 +2272,7 @@ impl EntityInputHandler for InputState {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
+        self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
     }

@@ -583,6 +583,35 @@ impl TextElement {
         Self::layout_match_range(range, &last_layout, bounds)
     }
 
+    /// Layout highlight paths for every search match in the visible range.
+    /// Returns (path, is_current_match); the current match is painted with
+    /// the selection color on top of the weaker match color.
+    fn layout_search_matches(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &mut App,
+    ) -> Vec<(Path<Pixels>, bool)> {
+        let state = self.state.read(cx);
+        let Some(search_panel) = state.search_panel.clone() else {
+            return Vec::new();
+        };
+
+        let Some(matcher) = search_panel.read(cx).matcher() else {
+            return Vec::new();
+        };
+        let ranges = matcher.matched_ranges.clone();
+        let current_match_ix = matcher.current_match_ix;
+
+        let mut paths = Vec::with_capacity(ranges.as_ref().len());
+        for (index, range) in ranges.as_ref().iter().enumerate() {
+            if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
+                paths.push((path, current_match_ix == index));
+            }
+        }
+        paths
+    }
+
     /// Calculate the visible range of lines in the viewport.
     ///
     /// Returns
@@ -1128,6 +1157,9 @@ pub(crate) struct PrepaintState {
     /// row index (zero based), no wrap, same line as the cursor.
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
+    /// Search-match highlight paths: (path, is_current_match). Painted below
+    /// selections so both remain visible.
+    search_match_paths: Vec<(Path<Pixels>, bool)>,
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
@@ -1507,6 +1539,7 @@ impl Element for TextElement {
         last_layout.cursor_bounds = cursor_bounds;
 
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
+        let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
@@ -1576,6 +1609,7 @@ impl Element for TextElement {
             cursor_scroll_offset,
             current_row,
             selection_path,
+            search_match_paths,
             fold_icon_layout,
         }
     }
@@ -1650,6 +1684,15 @@ impl Element for TextElement {
         if window.is_window_active() {
             if let Some(path) = prepaint.selection_path.take() {
                 window.paint_path(path, cx.theme().selection);
+            }
+        }
+
+        // Paint search matches (below the text, above the background): every
+        // match gets a faint selection color, the current one a stronger one.
+        for (path, is_active) in prepaint.search_match_paths.iter() {
+            window.paint_path(path.clone(), cx.theme().selection.opacity(0.45));
+            if *is_active {
+                window.paint_path(path.clone(), cx.theme().selection);
             }
         }
 

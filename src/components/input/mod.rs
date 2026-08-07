@@ -11,6 +11,7 @@ pub mod input;
 pub mod mode;
 pub mod movement;
 pub mod rope_ext;
+pub mod search;
 pub mod selection;
 pub mod state;
 

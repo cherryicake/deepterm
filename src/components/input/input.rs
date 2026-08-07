@@ -156,6 +156,9 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::select_to_end))
                     .on_action(window.listener_for(&self.state, InputState::show_character_palette))
                     .on_action(window.listener_for(&self.state, InputState::copy))
+                    .when(is_multi_line, |this| {
+                        this.on_action(window.listener_for(&self.state, InputState::on_action_search))
+                    })
                     .on_key_down(window.listener_for(&self.state, InputState::on_key_down))
             })
             .on_mouse_down(
@@ -186,7 +189,24 @@ impl RenderOnce for EditorInput {
                 .h_full()
                 .flex_grow(1.0)
                 .overflow_x_hidden()
-                .child(TextElement::new(self.state.clone()).placeholder(state.placeholder.clone()))
+                .child(
+                    div()
+                        .id("editor-input-inner")
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(
+                                    TextElement::new(self.state.clone())
+                                        .placeholder(state.placeholder.clone()),
+                                ),
+                        ),
+                )
                 .into_any_element()
         } else {
             let mask_toggle_el = if self.mask_toggle {
