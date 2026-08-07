@@ -852,10 +852,15 @@ impl TextElement {
         }
 
         let mut lines = Vec::with_capacity(last_layout.visible_buffer_lines.len());
-        // run_offset tracks position in the runs vec coordinate space (only visible line bytes).
-        // This is separate from the visible_text offset because runs from highlight_lines
-        // only cover visible (non-folded) lines.
-        let mut run_offset = 0;
+        // run_offset is this buffer line's byte offset relative to the first
+        // visible line, in the *global* text coordinate space (folded lines
+        // count too). `highlight_lines` now returns a gap-free runs list over
+        // the whole visible span (folded lines included), so matching global
+        // offsets keep the two in sync even when lines are folded — without
+        // this, every run after a fold is shifted and words get painted
+        // half-highlighted / half-white.
+        let first_line_start = display_text
+            .line_start_offset(*last_layout.visible_buffer_lines.first().unwrap_or(&0));
 
         for (_vi, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
             let line_text: String = display_text.slice_line(buffer_line).into();
@@ -865,6 +870,7 @@ impl TextElement {
 
             debug_assert_eq!(line_item.len(), line_text.len());
 
+            let run_offset = display_text.line_start_offset(buffer_line) - first_line_start;
             let mut wrapped_lines = SmallVec::with_capacity(1);
 
             for range in &line_item.wrapped_lines {
@@ -888,12 +894,21 @@ impl TextElement {
                 let sub_line: SharedString = line_text[range.clone()].to_string().into();
                 let runs_len: usize = line_runs.iter().map(|r| r.len).sum();
                 if runs_len != sub_line.len() {
+                    let runs_total: usize = runs.iter().map(|r| r.len).sum();
+                    let vis = last_layout.visible_buffer_lines.clone();
+                    let first_line_start =
+                        display_text.line_start_offset(*vis.first().unwrap_or(&0));
                     log::error!(
-                        "layout_lines run length mismatch: sub_line.len={}, runs_len={}, buffer_line={}, range={:?}",
+                        "layout_lines run length mismatch: sub_line.len={}, runs_len={}, buffer_line={}, range={:?}, run_offset={}, runs_total={}, visible={:?}, text_len={}, first_line_start={}",
                         sub_line.len(),
                         runs_len,
                         buffer_line,
-                        range
+                        range,
+                        run_offset,
+                        runs_total,
+                        vis,
+                        display_text.len(),
+                        first_line_start
                     );
                 }
                 let shaped_line = window
@@ -907,9 +922,6 @@ impl TextElement {
                 .lines(wrapped_lines)
                 .with_whitespaces(whitespace_indicators.clone());
             lines.push(line_layout);
-
-            // +1 for the `\n`
-            run_offset += line_text.len() + 1;
         }
 
         lines
@@ -1043,6 +1055,55 @@ impl TextElement {
                 )
             });
             styles = gpui::combine_highlights(styles, diff_styles).collect();
+        }
+
+        // The internal tree-sitter branch flushes one gap-free range per
+        // contiguous visible run, and folded (hidden) lines belong to no
+        // range, so `combine_highlights` leaves byte gaps between runs.
+        // Prepaint drops offsets (runs carry only lengths) and `layout_lines`
+        // walks a contiguous offset from the first visible line — any missing
+        // bytes shift every later run, painting words half-highlighted /
+        // half-white past a fold. Fill the visible span so the runs list
+        // always covers it exactly (the external branch is already gap-free,
+        // so this is a no-op there).
+        if let (Some(first), Some(last)) = (
+            visible_buffer_lines.first().copied(),
+            visible_buffer_lines.last().copied(),
+        ) {
+            let fill_start = text.line_start_offset(first);
+            let fill_end = if is_multi_line {
+                text.line_start_offset(last + 1)
+            } else {
+                text.line_end_offset(last)
+            };
+            if fill_end > fill_start {
+                styles.sort_by(|a, b| {
+                    a.0.start.cmp(&b.0.start).then(a.0.end.cmp(&b.0.end))
+                });
+                let input = std::mem::take(&mut styles);
+                let mut filled: Vec<(Range<usize>, HighlightStyle)> =
+                    Vec::with_capacity(input.len() * 2 + 1);
+                let mut cursor = fill_start;
+                for (range, style) in input {
+                    if range.end <= fill_start || range.start >= fill_end {
+                        continue;
+                    }
+                    let s = range.start.max(fill_start);
+                    let e = range.end.min(fill_end);
+                    if e <= cursor {
+                        continue;
+                    }
+                    if s > cursor {
+                        filled.push((cursor..s, HighlightStyle::default()));
+                    }
+                    filled.push((s..e, style));
+                    cursor = e;
+                }
+                if cursor < fill_end {
+                    filled.push((cursor..fill_end, HighlightStyle::default()));
+                }
+                styles = filled;
+            }
         }
 
         if styles.is_empty() {

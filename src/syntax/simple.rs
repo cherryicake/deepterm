@@ -2,6 +2,7 @@ use gpui::HighlightStyle;
 use ropey::{ChunkCursor, Rope};
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::time::Duration;
 use streaming_iterator::StreamingIterator;
 use sum_tree::Bias;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
@@ -15,7 +16,15 @@ pub struct SimpleHighlighter {
     query: Option<Query>,
     tree: Option<Tree>,
     text: Rope,
+    /// Bounds a single `styles()` query run; on expiry the query halts early
+    /// and remaining bytes fall back to the default style.
+    query_timeout: Option<Duration>,
 }
+
+// All fields are `Send` (`Parser`/`Query`/`Tree` are marked `Send` by
+// tree-sitter; `Rope` is `Send + Sync`), so the highlighter can be moved
+// into background parse tasks.
+unsafe impl Send for SimpleHighlighter {}
 
 fn clip_offset(rope: &Rope, offset: usize, bias: Bias) -> usize {
     if offset > rope.len() {
@@ -137,6 +146,7 @@ impl SimpleHighlighter {
             query,
             tree: None,
             text: Rope::new(),
+            query_timeout: Some(Duration::from_secs(1)),
         }
     }
 
@@ -153,7 +163,7 @@ impl SimpleHighlighter {
         &mut self,
         edit: Option<tree_sitter::InputEdit>,
         text: &Rope,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> bool {
         self.text = text.clone();
         let mut old_tree = self.tree.clone();
@@ -171,6 +181,17 @@ impl SimpleHighlighter {
             }
         }
 
+        // NOTE: tree-sitter 0.25.10's `parse_with_options` / `QueryCursorOptions`
+        // progress-callback plumbing is broken: passing `ParseOptions` makes
+        // `parse_with_options` return `None` unconditionally, and passing
+        // `QueryCursorOptions` makes `matches_with_options` return only ~2
+        // captures regardless of the input. Both silently destroy syntax
+        // highlighting, so we parse/query without options here and bound the
+        // work with the C-side `set_timeout_micros` instead, which is
+        // unaffected by the binding bug.
+        #[allow(deprecated)]
+        self.parser
+            .set_timeout_micros(timeout.map_or(0, |t| t.as_micros() as u64));
         self.tree = self.parser.parse_with_options(
             &mut |offset, _| {
                 if offset >= self.text.len() {
@@ -183,7 +204,7 @@ impl SimpleHighlighter {
             old_tree.as_ref(),
             None,
         );
-        true
+        self.tree.is_some()
     }
 
     /// gpui-component compatible interface: styles for a byte range with a given theme.
@@ -205,6 +226,13 @@ impl SimpleHighlighter {
 
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(range.clone());
+        // NOTE: `matches_with_options` + progress callback is broken in
+        // tree-sitter 0.25.10 (see `update()` above); use plain `matches()`
+        // with the C-side `set_timeout_micros` bound instead.
+        if let Some(timeout) = self.query_timeout {
+            #[allow(deprecated)]
+            cursor.set_timeout_micros(timeout.as_micros() as u64);
+        }
         let provider = RopeTextProvider(&self.text);
         let mut matches = cursor.matches(query, tree.root_node(), provider);
 

@@ -37,9 +37,13 @@ use crate::theme::ActiveTheme;
 use ropey::Rope;
 
 use super::diff_model::{
-    DiffFile, DiffHunk, LineKind, UnifiedSource, build_unified, compute_hunks, line_count,
-    line_range, line_starts,
+    DiffFile, DiffHunk, LineKind, UnifiedSource, build_unified_with_hunks, compute_hunks,
+    line_count, line_range, line_starts,
 };
+
+/// Maximum length of a line that participates in syntax highlighting.
+/// Longer lines (e.g. minified content) fall back to the default color.
+const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 use super::git_repository::GitRepository;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +69,16 @@ const SPLIT_MIN_WIDTH: f32 = 960.0;
 enum Side {
     Left,
     Right,
+}
+
+/// Everything the UI needs to render the unified view, produced by the
+/// background recompute task.
+struct UnifiedPayload {
+    text: String,
+    runs: Vec<(Range<usize>, HighlightStyle)>,
+    line_colors: Vec<(u32, Hsla)>,
+    word_colors: Vec<(Range<usize>, Hsla)>,
+    labels: Vec<Option<u32>>,
 }
 
 pub struct DiffView {
@@ -228,114 +242,151 @@ impl DiffView {
     }
 
     /// Recompute hunks from HEAD content vs. current right-editor content and
-    /// push decorations into both editors.
+    /// push decorations into both editors. All heavy work (line diff,
+    /// tree-sitter parses and highlight queries) runs on the background
+    /// executor so opening a large diff — e.g. a newly added markdown file —
+    /// never blocks the UI thread. Successive calls supersede each other via
+    /// `recompute_gen`.
     fn recompute(&mut self, cx: &mut Context<Self>) {
+        self.recompute_gen += 1;
+        let generation = self.recompute_gen;
+
+        let old_text = self.old_text.clone();
         let new_text = self.right.read(cx).value().to_string();
-        self.hunks = compute_hunks(&self.old_text, &new_text);
-        self.additions = self.hunks.iter().map(|h| h.additions()).sum();
-        self.deletions = self.hunks.iter().map(|h| h.deletions()).sum();
-
-        let added_line = Self::added_line_bg(cx);
-        let deleted_line = Self::deleted_line_bg(cx);
-        let added_word = Self::added_word_bg(cx);
-        let deleted_word = Self::deleted_word_bg(cx);
-
-        let mut new_line_colors = Vec::new();
-        let mut new_word_colors = Vec::new();
-        let mut old_line_colors = Vec::new();
-        let mut old_word_colors = Vec::new();
-        for hunk in &self.hunks {
-            for row in hunk.new_rows.clone() {
-                new_line_colors.push((row, added_line));
-            }
-            for row in hunk.old_rows.clone() {
-                old_line_colors.push((row, deleted_line));
-            }
-            for r in &hunk.new_word_ranges {
-                new_word_colors.push((r.clone(), added_word));
-            }
-            for r in &hunk.old_word_ranges {
-                old_word_colors.push((r.clone(), deleted_word));
-            }
-        }
-
-        self.right.update(cx, |state, cx| {
-            state.set_diff_decorations(new_line_colors, new_word_colors, cx);
-        });
-        self.left.update(cx, |state, cx| {
-            state.set_diff_decorations(old_line_colors, old_word_colors, cx);
-        });
-
-        if self.effective_mode() == DiffMode::Unified {
-            self.rebuild_unified(cx);
-        }
-        cx.notify();
-    }
-
-    /// Rebuild the merged unified editor from HEAD + current new content.
-    fn rebuild_unified(&mut self, cx: &mut Context<Self>) {
-        let new_text = self.right.read(cx).value().to_string();
-        let unified = build_unified(&self.old_text, &new_text);
-
-        let added_line = Self::added_line_bg(cx);
-        let deleted_line = Self::deleted_line_bg(cx);
-        let added_word = Self::added_word_bg(cx);
-        let deleted_word = Self::deleted_word_bg(cx);
-
-        let mut line_colors = Vec::new();
-        let mut word_colors = Vec::new();
-        let mut labels = Vec::with_capacity(unified.lines.len());
-        for (row, line) in unified.lines.iter().enumerate() {
-            match line.kind {
-                LineKind::Context => {}
-                LineKind::Add => line_colors.push((row as u32, added_line)),
-                LineKind::Del => line_colors.push((row as u32, deleted_line)),
-            }
-            let word_bg = match line.kind {
-                LineKind::Context => None,
-                LineKind::Add => Some(added_word),
-                LineKind::Del => Some(deleted_word),
-            };
-            if let Some(bg) = word_bg {
-                for r in &line.word_ranges {
-                    word_colors.push((r.clone(), bg));
-                }
-            }
-            labels.push(line.new_lineno.or(line.old_lineno));
-        }
-
-        // Re-parse only the changed source side(s).
-        if self.old_parsed.as_deref() != Some(self.old_text.as_ref()) {
-            let rope = Rope::from_str(&self.old_text);
-            self.old_highlighter.update(None, &rope, None);
-            self.old_parsed = Some(self.old_text.clone());
-        }
-        if self.new_parsed.as_deref() != Some(new_text.as_str()) {
-            let rope = Rope::from_str(&new_text);
-            self.new_highlighter.update(None, &rope, None);
-            self.new_parsed = Some(new_text.clone());
-        }
-
+        let language = self.old_highlighter.language().to_string();
         let theme = cx.theme().highlight_theme.clone();
-        let runs = Self::merged_highlight_runs(
-            &unified,
-            &self.old_text,
-            &new_text,
-            &mut self.old_highlighter,
-            &mut self.new_highlighter,
-            &theme,
-        );
+        let added_line = Self::added_line_bg(cx);
+        let deleted_line = Self::deleted_line_bg(cx);
+        let added_word = Self::added_word_bg(cx);
+        let deleted_word = Self::deleted_word_bg(cx);
+        let old_parsed = self.old_parsed.take();
+        let new_parsed = self.new_parsed.take();
 
-        self.unified.update(cx, |state, cx| {
-            // set_value needs a window; use the windowless variant.
-            state.set_text(unified.text.clone(), cx);
-            // The merged text is not valid source code, so syntax
-            // highlighting is computed per source text above and injected
-            // here (this also skips the internal highlighter parse).
-            state.set_external_highlight_runs(Some(runs), cx);
-            state.set_diff_decorations(line_colors, word_colors, cx);
-            state.set_diff_line_labels(Some(labels), cx);
-        });
+        // Hand the highlighters to the background task; keep a fresh placeholder
+        // in the view so a superseding recompute that runs before this task
+        // finishes starts from a clean slate.
+        let mut old_hl =
+            std::mem::replace(&mut self.old_highlighter, SimpleHighlighter::new(&language));
+        let mut new_hl =
+            std::mem::replace(&mut self.new_highlighter, SimpleHighlighter::new(&language));
+
+        cx.spawn(async move |this, cx| {
+            let task_old = old_text.clone();
+            let task_new = new_text.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let hunks = compute_hunks(&task_old, &task_new);
+                    let additions = hunks.iter().map(|h| h.additions()).sum();
+                    let deletions = hunks.iter().map(|h| h.deletions()).sum();
+
+                    // Re-parse only the changed source side(s). Parses run on
+                    // the background executor, so no timeout is applied: a
+                    // wall-clock timeout here would drop the tree for large
+                    // files (the parse returns `None` on expiry) and with it
+                    // all syntax highlighting.
+                    if old_parsed.as_deref() != Some(task_old.as_ref()) {
+                        let rope = Rope::from_str(&task_old);
+                        old_hl.update(None, &rope, None);
+                    }
+                    if new_parsed.as_deref() != Some(task_new.as_str()) {
+                        let rope = Rope::from_str(&task_new);
+                        new_hl.update(None, &rope, None);
+                    }
+
+                    let unified = build_unified_with_hunks(&task_old, &task_new, &hunks);
+                    let runs = DiffView::merged_highlight_runs(
+                        &unified,
+                        &task_old,
+                        &task_new,
+                        &mut old_hl,
+                        &mut new_hl,
+                        &theme,
+                    );
+                    let (line_colors, word_colors, labels) = unified_decorations(
+                        &unified,
+                        added_line,
+                        deleted_line,
+                        added_word,
+                        deleted_word,
+                    );
+
+                    Result::<_, ()>::Ok((
+                        hunks,
+                        additions,
+                        deletions,
+                        UnifiedPayload {
+                            text: unified.text,
+                            runs,
+                            line_colors,
+                            word_colors,
+                            labels,
+                        },
+                        old_hl,
+                        new_hl,
+                    ))
+                })
+                .await;
+
+            this.update(cx, |view, cx| {
+                if view.recompute_gen != generation {
+                    // Superseded by a newer recompute; force re-parses next time.
+                    view.old_parsed = None;
+                    view.new_parsed = None;
+                    return;
+                }
+                match result {
+                    Ok((hunks, additions, deletions, payload, old_hl, new_hl)) => {
+                        view.old_highlighter = old_hl;
+                        view.new_highlighter = new_hl;
+                        view.old_parsed = Some(old_text.clone());
+                        view.new_parsed = Some(new_text.clone());
+                        view.hunks = hunks;
+                        view.additions = additions;
+                        view.deletions = deletions;
+
+                        let (nl, nw, ol, ow) = hunk_decorations(
+                            &view.hunks,
+                            added_line,
+                            deleted_line,
+                            added_word,
+                            deleted_word,
+                        );
+                        view.right.update(cx, |state, cx| {
+                            state.set_diff_decorations(nl, nw, cx);
+                        });
+                        view.left.update(cx, |state, cx| {
+                            state.set_diff_decorations(ol, ow, cx);
+                        });
+
+                        if view.effective_mode() == DiffMode::Unified {
+                            view.unified.update(cx, |state, cx| {
+                                state.set_text(payload.text.clone(), cx);
+                                // The merged text is not valid source code, so
+                                // syntax highlighting is computed per source
+                                // text above and injected here (this also skips
+                                // the internal highlighter parse).
+                                state.set_external_highlight_runs(Some(payload.runs.clone()), cx);
+                                state.set_diff_decorations(
+                                    payload.line_colors.clone(),
+                                    payload.word_colors.clone(),
+                                    cx,
+                                );
+                                state.set_diff_line_labels(Some(payload.labels.clone()), cx);
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        // Keep the last good state; force re-parses on retry.
+                        view.old_parsed = None;
+                        view.new_parsed = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Build gap-free highlight runs for the merged unified text, colored
@@ -343,6 +394,12 @@ impl DiffView {
     /// lines from the working-tree parse. Multi-line captures (strings,
     /// comments) are split at merged line boundaries and byte offsets are
     /// remapped into the merged text.
+    ///
+    /// Consecutive lines backed by the same source side form one batched
+    /// query per contiguous source range (rather than one query per line),
+    /// keeping the tree-sitter query cost proportional to the number of
+    /// changed regions instead of the file's line count. Lines longer than
+    /// `MAX_HIGHLIGHT_LINE_LENGTH` are skipped (default colors).
     fn merged_highlight_runs(
         unified: &UnifiedSource,
         old_text: &str,
@@ -354,30 +411,92 @@ impl DiffView {
         let old_starts = line_starts(old_text);
         let new_starts = line_starts(new_text);
 
-        let mut runs: Vec<(Range<usize>, HighlightStyle)> =
-            Vec::with_capacity(unified.lines.len());
-        for line in &unified.lines {
-            let (highlighter, src_start, src_end) = match line.kind {
-                LineKind::Del => {
-                    let row = line.old_lineno.unwrap_or(0);
-                    let range = line_range(old_text, &old_starts, row);
-                    (&mut *old_highlighter, range.start, range.end)
-                }
-                LineKind::Context | LineKind::Add => {
-                    let row = line.new_lineno.unwrap_or(0);
-                    let range = line_range(new_text, &new_starts, row);
-                    (&mut *new_highlighter, range.start, range.end)
-                }
+        let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let mut i = 0;
+        while i < unified.lines.len() {
+            let is_old = matches!(unified.lines[i].kind, LineKind::Del);
+            let (highlighter, src_text, src_starts) = if is_old {
+                (&mut *old_highlighter, old_text, &old_starts[..])
+            } else {
+                (&mut *new_highlighter, new_text, &new_starts[..])
             };
-            if src_start >= src_end {
+
+            let first_row = if is_old {
+                unified.lines[i].old_lineno
+            } else {
+                unified.lines[i].new_lineno
+            };
+            let Some(first_row) = first_row else {
+                i += 1;
+                continue;
+            };
+            if unified.lines[i].merged_range.len() > MAX_HIGHLIGHT_LINE_LENGTH {
+                i += 1;
                 continue;
             }
-            for (range, style) in highlighter.styles(&(src_start..src_end), theme) {
-                let start = range.start.max(src_start).min(src_end);
-                let end = range.end.min(src_end).max(start);
-                if end > start {
-                    let offset = line.merged_range.start - src_start;
-                    runs.push((start + offset..end + offset, style));
+
+            // Collect the run of consecutive lines sharing this source side.
+            // Rows within a side are emitted contiguously, so the next line's
+            // source range always begins exactly one byte (the newline) after
+            // the previous line's range end.
+            //
+            // The group is capped at `MAX_GROUP_LINES` members: tree-sitter
+            // highlight queries are bounded by a wall-clock timeout, and a
+            // group that covers a whole large file (all unchanged context
+            // lines are contiguous on one source side) would exceed it,
+            // silently dropping the styles for every line past the cut-off
+            // (e.g. everything below a mid-file hunk). Splitting into
+            // bounded segments keeps each query well inside the budget while
+            // preserving per-source-tree coloring.
+            const MAX_GROUP_LINES: usize = 40;
+
+            let first_src = line_range(src_text, src_starts, first_row);
+            let mut members: Vec<(Range<usize>, Range<usize>)> =
+                vec![(first_src.clone(), unified.lines[i].merged_range.clone())];
+            let mut group_end = first_src.end;
+            let mut j = i + 1;
+            while j < unified.lines.len() && members.len() < MAX_GROUP_LINES {
+                let line = &unified.lines[j];
+                let same_kind = match (is_old, line.kind) {
+                    (true, LineKind::Del) | (false, LineKind::Context | LineKind::Add) => true,
+                    _ => false,
+                };
+                if !same_kind {
+                    break;
+                }
+                let Some(row) = (if is_old {
+                    line.old_lineno
+                } else {
+                    line.new_lineno
+                }) else {
+                    break;
+                };
+                if line.merged_range.len() > MAX_HIGHLIGHT_LINE_LENGTH {
+                    break;
+                }
+                let src = line_range(src_text, src_starts, row);
+                if src.start != group_end + 1 {
+                    // Non-contiguous source — start a fresh group.
+                    break;
+                }
+                group_end = src.end;
+                members.push((src, line.merged_range.clone()));
+                j += 1;
+            }
+            i = j;
+
+            let group_start = members[0].0.start;
+            if group_end > group_start {
+                let group_styles = highlighter.styles(&(group_start..group_end), theme);
+                for (range, style) in group_styles {
+                    for (src, merged) in &members {
+                        let s = range.start.max(src.start);
+                        let e = range.end.min(src.end);
+                        if e > s {
+                            let offset = merged.start - src.start;
+                            runs.push((s + offset..e + offset, style.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -451,7 +570,7 @@ impl DiffView {
         self.available_width = width;
         let after = self.effective_mode();
         if after == DiffMode::Unified && before != after {
-            self.rebuild_unified(cx);
+            self.recompute(cx);
         }
         cx.notify();
     }
@@ -466,7 +585,7 @@ impl DiffView {
             LayoutPreference::Split => LayoutPreference::Auto,
         };
         if self.effective_mode() == DiffMode::Unified {
-            self.rebuild_unified(cx);
+            self.recompute(cx);
         }
         cx.notify();
     }
@@ -855,6 +974,84 @@ fn fill_gaps(runs: &mut Vec<(Range<usize>, HighlightStyle)>, total_len: usize) {
     *runs = filled;
 }
 
+/// Compute per-line and per-word background decorations plus gutter labels
+/// for the merged unified text.
+fn unified_decorations(
+    unified: &UnifiedSource,
+    added_line: Hsla,
+    deleted_line: Hsla,
+    added_word: Hsla,
+    deleted_word: Hsla,
+) -> (
+    Vec<(u32, Hsla)>,
+    Vec<(Range<usize>, Hsla)>,
+    Vec<Option<u32>>,
+) {
+    let mut line_colors = Vec::new();
+    let mut word_colors = Vec::new();
+    let mut labels = Vec::with_capacity(unified.lines.len());
+    for (row, line) in unified.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Context => {}
+            LineKind::Add => line_colors.push((row as u32, added_line)),
+            LineKind::Del => line_colors.push((row as u32, deleted_line)),
+        }
+        let word_bg = match line.kind {
+            LineKind::Context => None,
+            LineKind::Add => Some(added_word),
+            LineKind::Del => Some(deleted_word),
+        };
+        if let Some(bg) = word_bg {
+            for r in &line.word_ranges {
+                word_colors.push((r.clone(), bg));
+            }
+        }
+        labels.push(line.new_lineno.or(line.old_lineno));
+    }
+    (line_colors, word_colors, labels)
+}
+
+/// Compute per-line and per-word background decorations for the split view:
+/// `(new_line, new_word, old_line, old_word)` in the two editors' coordinate
+/// spaces.
+fn hunk_decorations(
+    hunks: &[DiffHunk],
+    added_line: Hsla,
+    deleted_line: Hsla,
+    added_word: Hsla,
+    deleted_word: Hsla,
+) -> (
+    Vec<(u32, Hsla)>,
+    Vec<(Range<usize>, Hsla)>,
+    Vec<(u32, Hsla)>,
+    Vec<(Range<usize>, Hsla)>,
+) {
+    let mut new_line_colors = Vec::new();
+    let mut new_word_colors = Vec::new();
+    let mut old_line_colors = Vec::new();
+    let mut old_word_colors = Vec::new();
+    for hunk in hunks {
+        for row in hunk.new_rows.clone() {
+            new_line_colors.push((row, added_line));
+        }
+        for row in hunk.old_rows.clone() {
+            old_line_colors.push((row, deleted_line));
+        }
+        for r in &hunk.new_word_ranges {
+            new_word_colors.push((r.clone(), added_word));
+        }
+        for r in &hunk.old_word_ranges {
+            old_word_colors.push((r.clone(), deleted_word));
+        }
+    }
+    (
+        new_line_colors,
+        new_word_colors,
+        old_line_colors,
+        old_word_colors,
+    )
+}
+
 /// Map a line number on the old side to the corresponding line on the new
 /// side, using cumulative hunk deltas (context regions map exactly).
 fn map_line_old_to_new(old_line: u32, hunks: &[DiffHunk]) -> u32 {
@@ -897,6 +1094,7 @@ fn map_line_new_to_old(new_line: u32, hunks: &[DiffHunk]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::diff_model::build_unified;
     use crate::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
     use crate::theme::ThemeAppearance;
 
@@ -1086,10 +1284,580 @@ mod tests {
         let line = &unified.text[merged_starts[line_ix]..merged_starts[line_ix + 1]];
         let kw = line.find("fn ").unwrap();
         let off = merged_starts[line_ix] + kw;
+        eprintln!(
+            "DEBUG line_ix={line_ix} off={off} kw={:?} kind={:?}",
+            &line[..kw + 8],
+            unified.lines[line_ix].kind
+        );
+        eprintln!(
+            "DEBUG styles around: {:?}",
+            styles
+                .iter()
+                .filter(|(r, _)| r.end >= off.saturating_sub(400) && r.start <= off + 400)
+                .map(|(r, s)| format!("{r:?} {:?}", s.color))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "DEBUG runs around: {:?}",
+            runs
+                .iter()
+                .filter(|(r, _)| r.end >= off.saturating_sub(400) && r.start <= off + 400)
+                .map(|(r, s)| format!("{r:?} {:?}", s.color))
+                .collect::<Vec<_>>()
+        );
         let run = styles
             .iter()
             .find(|(r, _)| r.start <= off && r.end > off)
             .unwrap();
         assert_eq!(run.1.color, Some(gpui::red()), "keyword below hunk");
+    }
+
+    /// Full render-consumption chain: `highlight_lines` clips the gap-free
+    /// external runs to the visible window, prepaint converts them to a
+    /// length-only `TextRun` list (offsets dropped), and `layout_lines`
+    /// walks `run_offset` over visible buffer lines (line bytes + trailing
+    /// '\n'). Every wrapped sub-line must pull back exactly its own byte
+    /// length of runs, for every possible visible window of a large file.
+    #[test]
+    fn test_layout_consumption_matches_runs_for_all_windows() {
+        use crate::components::input::rope_ext::RopeExt;
+
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..120 {
+            old.push_str(&format!("fn f{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"));
+        }
+        new.push_str(&old[..old.len()]);
+        // Mid-file hunk with an unclosed string in an added line.
+        let marker = "fn f60";
+        let start = new.find(marker).unwrap();
+        let end = new[start..].find("\n}").map(|p| start + p).unwrap() + 2;
+        new.replace_range(
+            start..end,
+            "fn f60() -> u32 {\n    let s = \"unclosed\n    x + 1\n}\n",
+        );
+
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+        let rope = Rope::from_str(&unified.text);
+
+        for first in 0..rope.lines_len() {
+            for last in first..rope.lines_len().min(first + 25) {
+                // ---- highlight_lines external branch (is_multi_line) ----
+                let byte_start = rope.line_start_offset(first);
+                let byte_end = rope.line_start_offset(last + 1);
+                let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+                let mut cursor = byte_start;
+                for (range, style) in &runs {
+                    if range.end <= byte_start || range.start >= byte_end {
+                        continue;
+                    }
+                    let s = range.start.max(byte_start);
+                    let e = range.end.min(byte_end);
+                    if s > cursor {
+                        styles.push((cursor..s, HighlightStyle::default()));
+                    }
+                    styles.push((s..e, style.clone()));
+                    cursor = e.max(cursor);
+                }
+                if cursor < byte_end {
+                    styles.push((cursor..byte_end, HighlightStyle::default()));
+                }
+
+                // ---- prepaint: offsets dropped, lengths only ----
+                let run_lens: Vec<usize> = styles.iter().map(|(r, _)| r.len()).collect();
+
+                // ---- layout_lines: run_offset walk over visible lines ----
+                let mut run_offset = 0;
+                for buffer_line in first..=last {
+                    let line_text: String = rope.slice_line(buffer_line).into();
+                    let wrapped: Vec<Range<usize>> = if line_text.is_empty() {
+                        vec![0..0]
+                    } else {
+                        vec![0..line_text.len()]
+                    };
+                    for range in &wrapped {
+                        // Inline copy of runs_for_range
+                        let g_range =
+                            (run_offset + range.start)..(run_offset + range.end);
+                        let mut cur = 0usize;
+                        let mut pulled = 0usize;
+                        for &len in &run_lens {
+                            let run_start = cur;
+                            let run_end = cur + len;
+                            if run_end <= g_range.start {
+                                cur = run_end;
+                                continue;
+                            }
+                            if run_start >= g_range.end {
+                                break;
+                            }
+                            let s = g_range.start.max(run_start) - run_start;
+                            let e = g_range.end.min(run_end) - run_start;
+                            pulled += e.saturating_sub(s);
+                            cur = run_end;
+                        }
+                        assert_eq!(
+                            pulled,
+                            range.len(),
+                            "window first={first} last={last} buffer_line={buffer_line} range={range:?}"
+                        );
+                    }
+                    run_offset += line_text.len() + 1;
+                }
+            }
+        }
+    }
+
+    /// Real-world corner: CRLF line endings + multi-byte (Chinese) text. The
+    /// render consumption chain must stay in sync with the byte offsets the
+    /// background task produces, just as for plain LF/ASCII files.
+    #[test]
+    fn test_layout_consumption_crlf_and_cjk() {
+        use crate::components::input::rope_ext::RopeExt;
+
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..60 {
+            old.push_str(&format!("fn f{i}() -> u32 {{\r\n    let s = \"中文{i}；测试\\n\";\r\n    s.len()\r\n}}\r\n"));
+        }
+        new.push_str(&old[..old.len()]);
+        let marker = "fn f30";
+        let start = new.find(marker).unwrap();
+        let end = new[start..].find("\r\n}").map(|p| start + p).unwrap() + 3;
+        new.replace_range(
+            start..end,
+            "fn f30() -> u32 {\r\n    let s = \"未闭合\r\n    x + 1\r\n}\r\n",
+        );
+
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+        let rope = Rope::from_str(&unified.text);
+
+        for first in 0..rope.lines_len() {
+            for last in first..rope.lines_len().min(first + 25) {
+                let byte_start = rope.line_start_offset(first);
+                let byte_end = rope.line_start_offset(last + 1);
+                let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+                let mut cursor = byte_start;
+                for (range, style) in &runs {
+                    if range.end <= byte_start || range.start >= byte_end {
+                        continue;
+                    }
+                    let s = range.start.max(byte_start);
+                    let e = range.end.min(byte_end);
+                    if s > cursor {
+                        styles.push((cursor..s, HighlightStyle::default()));
+                    }
+                    styles.push((s..e, style.clone()));
+                    cursor = e.max(cursor);
+                }
+                if cursor < byte_end {
+                    styles.push((cursor..byte_end, HighlightStyle::default()));
+                }
+                let run_lens: Vec<usize> = styles.iter().map(|(r, _)| r.len()).collect();
+
+                let mut run_offset = 0;
+                for buffer_line in first..=last {
+                    let line_text: String = rope.slice_line(buffer_line).into();
+                    let wrapped: Vec<Range<usize>> = if line_text.is_empty() {
+                        vec![0..0]
+                    } else {
+                        vec![0..line_text.len()]
+                    };
+                    for range in &wrapped {
+                        let g_range = (run_offset + range.start)..(run_offset + range.end);
+                        let mut cur = 0usize;
+                        let mut pulled = 0usize;
+                        for &len in &run_lens {
+                            let run_start = cur;
+                            let run_end = cur + len;
+                            if run_end <= g_range.start {
+                                cur = run_end;
+                                continue;
+                            }
+                            if run_start >= g_range.end {
+                                break;
+                            }
+                            let s = g_range.start.max(run_start) - run_start;
+                            let e = g_range.end.min(run_end) - run_start;
+                            pulled += e.saturating_sub(s);
+                            cur = run_end;
+                        }
+                        assert_eq!(
+                            pulled,
+                            range.len(),
+                            "window first={first} last={last} buffer_line={buffer_line} range={range:?}"
+                        );
+                    }
+                    run_offset += line_text.len() + 1;
+                }
+            }
+        }
+    }
+
+    /// Renderer-visible symptom check: every external run segment must start
+    /// and end on a character boundary of the merged text (otherwise the
+    /// shaper renders a half-colored word, e.g. the first half of a keyword
+    /// highlighted and the rest white), and the byte at the start of every
+    /// `fn` keyword must carry the keyword color when a window covering it is
+    /// clipped like `highlight_lines` does.
+    #[test]
+    fn test_merged_runs_char_boundaries_and_keyword_colors() {
+        // Mixed CJK + ASCII + keywords, with a hunk so both source trees are
+        // exercised and merged lines remap across source sides.
+        let old = "fn main() -> u32 {\n    // 中文注释测试\n    let s = \"你好世界，hello world\";\n    println!(\"{}\", s);\n    s.len()\n}\n";
+        let new = "fn main() -> u32 {\n    // 中文注释测试\n    let s = \"你好世界，hello world\";\n    println!(\"{}\", s);\n    s.len() + 1\n}\n";
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+
+        // 1. Every run boundary is a char boundary of the merged text.
+        for (r, _) in &runs {
+            assert!(
+                unified.text.is_char_boundary(r.start),
+                "run start {} not a char boundary (text={:?})",
+                r.start,
+                &unified.text[r.start..(r.start + 4).min(unified.text.len())]
+            );
+            assert!(
+                unified.text.is_char_boundary(r.end),
+                "run end {} not a char boundary",
+                r.end
+            );
+        }
+
+        // 2. Every `fn` keyword byte carries the keyword color.
+        for (ix, line) in unified.lines.iter().enumerate() {
+            let text = &unified.text[line.merged_range.clone()];
+            let mut search_from = 0;
+            while let Some(rel) = text[search_from..].find("fn ") {
+                let off = line.merged_range.start + search_from + rel;
+                // Skip `fn ` inside a string literal (e.g. "xxx fn yyy")
+                if off > 0 && unified.text.as_bytes()[off - 1].is_ascii_alphanumeric() {
+                    search_from += rel + 1;
+                    continue;
+                }
+                let run = runs
+                    .iter()
+                    .find(|(r, _)| r.start <= off && r.end > off)
+                    .unwrap_or_else(|| panic!("no run covers fn at {off} (line {ix})"));
+                assert_eq!(
+                    run.1.color,
+                    Some(gpui::red()),
+                    "fn at {off} not keyword-colored (line {ix}, kind={:?})",
+                    line.kind
+                );
+                search_from += rel + 1;
+            }
+        }
+    }
+
+    /// Full render reconstruction: for scrolled windows (first visible line
+    /// > 0), clip the external runs like `highlight_lines` does, drop offsets
+    /// like prepaint does, then walk `layout_lines`' `run_offset` and rebuild
+    /// the per-byte colors each visible line would be painted with. These
+    /// must match the colors the original runs assign to that line's bytes —
+    /// otherwise a keyword is painted half-colored (front half highlighted,
+    /// tail white), which is the visible regression reported.
+    #[test]
+    fn test_render_reconstruction_matches_original_colors_scrolled() {
+        use crate::components::input::rope_ext::RopeExt;
+
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..80 {
+            old.push_str(&format!(
+                "fn fn_{i}() -> u32 {{\n    let s = \"测试 {i} abc\";\n    s.len()\n}}\n"
+            ));
+        }
+        new.push_str(&old[..old.len()]);
+        let marker = "fn fn_40";
+        let start = new.find(marker).unwrap();
+        let end = new[start..].find("\n}").map(|p| start + p).unwrap() + 2;
+        new.replace_range(start..end, "fn fn_40() -> u32 {\n    let t = 42;\n}\n");
+
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+        let rope = Rope::from_str(&unified.text);
+
+        for first in [0usize, 20, 60, 100] {
+            let last = (first + 25).min(rope.lines_len().saturating_sub(1));
+            if first >= rope.lines_len() {
+                continue;
+            }
+
+            // ---- highlight_lines external branch (is_multi_line) ----
+            let byte_start = rope.line_start_offset(first);
+            let byte_end = rope.line_start_offset(last + 1);
+            let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+            let mut cursor = byte_start;
+            for (range, style) in &runs {
+                if range.end <= byte_start || range.start >= byte_end {
+                    continue;
+                }
+                let s = range.start.max(byte_start);
+                let e = range.end.min(byte_end);
+                if s > cursor {
+                    styles.push((cursor..s, HighlightStyle::default()));
+                }
+                styles.push((s..e, style.clone()));
+                cursor = e.max(cursor);
+            }
+            if cursor < byte_end {
+                styles.push((cursor..byte_end, HighlightStyle::default()));
+            }
+
+            // ---- prepaint: offset-dropped TextRun list (len + color) ----
+            let text_runs: Vec<(usize, Option<gpui::Hsla>)> = styles
+                .iter()
+                .map(|(r, s)| (r.len(), s.color))
+                .collect();
+
+            // ---- layout_lines walk ----
+            let mut run_offset = 0;
+            for buffer_line in first..=last {
+                let line_text: String = rope.slice_line(buffer_line).into();
+                let wrapped: Vec<Range<usize>> = if line_text.is_empty() {
+                    vec![0..0]
+                } else {
+                    vec![0..line_text.len()]
+                };
+                for range in &wrapped {
+                    // runs_for_range equivalent, returning (len, color)
+                    let g_range = (run_offset + range.start)..(run_offset + range.end);
+                    let mut line_runs: Vec<(usize, Option<gpui::Hsla>)> = Vec::new();
+                    let mut cur = 0usize;
+                    for &(len, color) in &text_runs {
+                        let run_start = cur;
+                        let run_end = cur + len;
+                        if run_end <= g_range.start {
+                            cur = run_end;
+                            continue;
+                        }
+                        if run_start >= g_range.end {
+                            break;
+                        }
+                        let s = g_range.start.max(run_start) - run_start;
+                        let e = g_range.end.min(run_end) - run_start;
+                        if e > s {
+                            line_runs.push((e - s, color));
+                        }
+                        cur = run_end;
+                    }
+
+                    // Rebuild per-byte colors for this line.
+                    let mut line_colors = vec![None; range.len()];
+                    let mut pos = 0usize;
+                    for &(len, color) in &line_runs {
+                        for b in pos..(pos + len).min(line_colors.len()) {
+                            line_colors[b] = color;
+                        }
+                        pos += len;
+                    }
+
+                    // Expected colors straight from the original runs.
+                    let line_global = (byte_start + run_offset + range.start)
+                        ..(byte_start + run_offset + range.end);
+                    let mut expected = vec![None; range.len()];
+                    for (r, s) in &runs {
+                        let s0 = r.start.max(line_global.start);
+                        let e0 = r.end.min(line_global.end);
+                        if e0 > s0 {
+                            for b in (s0 - line_global.start)..(e0 - line_global.start) {
+                                expected[b] = s.color;
+                            }
+                        }
+                    }
+
+                    assert_eq!(
+                        line_colors, expected,
+                        "window first={first} last={last} buffer_line={buffer_line} range={range:?}"
+                    );
+                }
+                run_offset += line_text.len() + 1;
+            }
+        }
+    }
+
+    /// Extreme Unicode: emoji (multi-code-unit), combining marks, ZWJ
+    /// sequences, CJK. Run segments must still start/end on char boundaries
+    /// and every `let`/`fn` keyword byte must keep its color — otherwise the
+    /// shaper paints a word half-highlighted / half-white.
+    #[test]
+    fn test_merged_runs_extreme_unicode_boundaries() {
+        let old = "fn f() -> u32 {\n    let emoji = \"🎉🚀 test\";\n    let combo = \"e\u{301} x\";\n    let zwj = \"👨‍👩‍👧\";\n    let cjk = \"中文测试\";\n    f()\n}\n";
+        let mut new = String::from(old);
+        new.push_str("// added\n");
+        let (unified, runs) = build_runs(&old, &new);
+        assert_contiguous(&runs, unified.text.len());
+
+        for (r, _) in &runs {
+            assert!(
+                unified.text.is_char_boundary(r.start),
+                "run start {} not char boundary",
+                r.start
+            );
+            assert!(
+                unified.text.is_char_boundary(r.end),
+                "run end {} not char boundary",
+                r.end
+            );
+        }
+
+        // Every `fn` / `let` keyword byte is keyword-colored.
+        let mut off = 0;
+        for needle in ["fn ", "let "] {
+            while let Some(rel) = unified.text[off..].find(needle) {
+                let pos = off + rel;
+                if pos > 0 && unified.text.as_bytes()[pos - 1].is_ascii_alphanumeric() {
+                    off = pos + 1;
+                    continue;
+                }
+                let run = runs
+                    .iter()
+                    .find(|(r, _)| r.start <= pos && r.end > pos)
+                    .unwrap_or_else(|| panic!("no run at {pos}"));
+                assert_eq!(
+                    run.1.color,
+                    Some(gpui::red()),
+                    "keyword at {pos} not red"
+                );
+                off = pos + 1;
+            }
+        }
+    }
+
+    /// Fold scenario: `highlight_lines` flushes one gap-free range per
+    /// contiguous visible run; folded lines belong to no range, so styles are
+    /// sparse. The fix (1) fills the visible span with default runs and
+    /// (2) makes `layout_lines` walk *global* byte offsets (folded lines
+    /// count), keeping runs and layout in the same coordinate space. Without
+    /// either, every run past a fold shifts and words are painted
+    /// half-highlighted / half-white. This test simulates the full chain and
+    /// asserts per-byte colors land where the original runs say.
+    #[test]
+    fn test_layout_consumption_sparse_styles_fold() {
+        use crate::components::input::rope_ext::RopeExt;
+
+        // 3 lines, middle one folded away. Byte layout:
+        //   line0: "abcd\n" (0..5)  line1(folded): "EFGH\n" (5..10)  line2: "ijkl\n" (10..15)
+        let text = "abcd\nEFGH\nijkl\n";
+        let rope = Rope::from_str(text);
+        let visible = vec![0usize, 2]; // line 1 folded
+
+        // Internal branch output before the fill: two disjoint ranges with
+        // distinct colors so misalignment is visible.
+        let mut styles: Vec<(Range<usize>, HighlightStyle)> = vec![
+            (
+                0..4,
+                HighlightStyle {
+                    color: Some(gpui::red()),
+                    ..Default::default()
+                },
+            ),
+            (
+                10..14,
+                HighlightStyle {
+                    color: Some(gpui::blue()),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        // ---- fix (1): fill the visible span [line0_start, line2_end+\n) ----
+        let first = *visible.first().unwrap();
+        let last = *visible.last().unwrap();
+        let fill_start = rope.line_start_offset(first);
+        let fill_end = rope.line_start_offset(last + 1);
+        styles.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(a.0.end.cmp(&b.0.end)));
+        let input = std::mem::take(&mut styles);
+        let mut filled: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(input.len() * 2 + 1);
+        let mut cursor = fill_start;
+        for (range, style) in input {
+            if range.end <= fill_start || range.start >= fill_end {
+                continue;
+            }
+            let s = range.start.max(fill_start);
+            let e = range.end.min(fill_end);
+            if e <= cursor {
+                continue;
+            }
+            if s > cursor {
+                filled.push((cursor..s, HighlightStyle::default()));
+            }
+            filled.push((s..e, style));
+            cursor = e;
+        }
+        if cursor < fill_end {
+            filled.push((cursor..fill_end, HighlightStyle::default()));
+        }
+        styles = filled;
+
+        // The runs list now covers the whole visible span exactly.
+        let consumed_total: usize = styles.iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(consumed_total, fill_end - fill_start);
+
+        // prepaint: offsets dropped, (len, color) kept.
+        let text_runs: Vec<(usize, Option<gpui::Hsla>)> =
+            styles.iter().map(|(r, s)| (r.len(), s.color)).collect();
+
+        // ---- fix (2): layout_lines walks global offsets ----
+        let first_line_start = rope.line_start_offset(first);
+        let mut total_consumed = 0usize;
+        for &buffer_line in &visible {
+            let line_text: String = rope.slice_line(buffer_line).into();
+            let run_offset = rope.line_start_offset(buffer_line) - first_line_start;
+            let g_range = run_offset..(run_offset + line_text.len());
+
+            let mut line_runs: Vec<(usize, Option<gpui::Hsla>)> = Vec::new();
+            let mut cur = 0usize;
+            for &(len, color) in &text_runs {
+                let run_start = cur;
+                let run_end = cur + len;
+                if run_end <= g_range.start {
+                    cur = run_end;
+                    continue;
+                }
+                if run_start >= g_range.end {
+                    break;
+                }
+                let s = g_range.start.max(run_start) - run_start;
+                let e = g_range.end.min(run_end) - run_start;
+                if e > s {
+                    line_runs.push((e - s, color));
+                }
+                cur = run_end;
+            }
+
+            // Rebuild per-byte colors for this line.
+            let mut line_colors = vec![None; line_text.len()];
+            let mut pos = 0usize;
+            for &(len, color) in &line_runs {
+                for b in pos..(pos + len).min(line_colors.len()) {
+                    line_colors[b] = color;
+                }
+                pos += len;
+            }
+
+            // Expected colors from the original (pre-fill) styles.
+            let line_global = g_range;
+            let mut expected: Vec<Option<gpui::Hsla>> = vec![None; line_text.len()];
+            for (r, s) in &[(0..4, gpui::red()), (10..14, gpui::blue())] {
+                let s0 = r.start.max(line_global.start);
+                let e0 = r.end.min(line_global.end);
+                if e0 > s0 {
+                    for b in (s0 - line_global.start)..(e0 - line_global.start) {
+                        expected[b] = Some(*s);
+                    }
+                }
+            }
+
+            assert_eq!(
+                line_colors, expected,
+                "line {buffer_line} colors misaligned after fold"
+            );
+            total_consumed += line_text.len();
+        }
+        assert_eq!(total_consumed, 8, "only visible bytes consumed");
     }
 }

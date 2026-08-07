@@ -187,15 +187,24 @@ pub struct UnifiedSource {
 /// (old) and added (new) lines, hunks in file order, nothing collapsed.
 pub fn build_unified(old_text: &str, new_text: &str) -> UnifiedSource {
     let hunks = compute_hunks(old_text, new_text);
+    build_unified_with_hunks(old_text, new_text, &hunks)
+}
+
+/// Like [`build_unified`], but reuses already-computed hunks so the
+/// (potentially expensive) line diff runs only once per recompute.
+pub(crate) fn build_unified_with_hunks(
+    old_text: &str,
+    new_text: &str,
+    hunks: &[DiffHunk],
+) -> UnifiedSource {
     let old_starts = line_starts(old_text);
     let new_starts = line_starts(new_text);
-    let old_line_count = line_count(old_text, &old_starts);
     let new_line_count = line_count(new_text, &new_starts);
 
     let mut text = String::new();
     let mut lines = Vec::new();
 
-    let mut push_line = |kind: LineKind,
+    let push_line = |kind: LineKind,
                          old_lineno: Option<u32>,
                          new_lineno: Option<u32>,
                          source: &str,
@@ -227,7 +236,7 @@ pub fn build_unified(old_text: &str, new_text: &str) -> UnifiedSource {
 
     let mut old_cursor = 0u32;
     let mut new_cursor = 0u32;
-    for hunk in &hunks {
+    for hunk in hunks {
         // Context before this hunk (identical in both texts, use new).
         for row in new_cursor..hunk.new_rows.start {
             let range = line_range(new_text, &new_starts, row);
