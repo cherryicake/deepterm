@@ -833,6 +833,24 @@ impl Editor {
                                     state.disabled = false;
                                     state.set_text(content.clone(), cx);
                                 });
+                                // LSP: the initial open skipped attach while
+                                // `is_loading`; now that content is loaded,
+                                // start the session for supported languages on
+                                // local files.
+                                if file.ssh_config.is_none() && file.image.is_none() {
+                                    let lang = guess_language_from_extension(Path::new(&file.path));
+                                    let file_path = file.path.clone();
+                                    file.editor_state.update(cx, |state, cx| {
+                                        if state.lsp.change_tx.is_none() {
+                                            if let Some(spec) =
+                                                lsp_server_spec(&lang, Path::new(&file_path))
+                                            {
+                                                let uri = path_to_file_uri(Path::new(&file_path));
+                                                state.attach_lsp(uri, spec, cx);
+                                            }
+                                        }
+                                    });
+                                }
                                 if let Some(ref markdown) = file.markdown {
                                     markdown.update(cx, |renderer, cx| {
                                         renderer.set_text(content.clone(), cx);
@@ -1687,15 +1705,26 @@ pub(crate) fn guess_language_from_extension(path: &Path) -> String {
         .to_string()
 }
 
-/// Map a local file path to a `file://` URI for LSP.
+/// Map a local file path to an absolute `file://` URI for LSP (the LSP
+/// server rejects relative paths).
 fn path_to_file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    format!("file://{}", abs.display())
 }
 
 /// LSP server configuration for a language, when one is available on this
 /// machine. Only local (non-SSH) files get a session.
 fn lsp_server_spec(language: &str, path: &Path) -> Option<LspServerSpec> {
-    let root_uri = path
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let root_uri = abs
         .parent()
         .map(|p| format!("file://{}", p.display()))
         .unwrap_or_default();

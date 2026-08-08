@@ -72,7 +72,6 @@ pub(crate) async fn read_loop(
             match decode_message(&buf) {
                 Ok(Some((value, consumed))) => {
                     buf.drain(..consumed);
-                    eprintln!("LSP read: {}", serde_json::to_string(&value).unwrap_or_default().chars().take(120).collect::<String>());
                     handle_server_message(value, &pending);
                     break;
                 }
@@ -118,6 +117,8 @@ pub struct LspClient {
     stdout: Option<ChildStdout>,
     next_id: u64,
     pending: Arc<Mutex<HashMap<u64, Sender<Result<Value>>>>>,
+    /// Server capabilities from the `initialize` response.
+    capabilities: Option<Value>,
 }
 
 impl LspClient {
@@ -156,9 +157,15 @@ impl LspClient {
             stdout: Some(stdout),
             next_id: 0,
             pending,
+            capabilities: None,
         };
 
         Ok(client)
+    }
+
+    /// Take the server capabilities from the initialize response.
+    pub fn take_initialize_capabilities(&mut self) -> Option<Value> {
+        self.capabilities.take()
     }
 
     /// Send the `initialize` request (must be the first message) and return
@@ -175,6 +182,7 @@ impl LspClient {
                 }),
             )
             .await?;
+        self.capabilities = Some(capabilities.clone());
         self.send_notification("initialized", json!({})).await?;
         Ok(capabilities)
     }

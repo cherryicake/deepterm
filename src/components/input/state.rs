@@ -797,6 +797,9 @@ impl InputState {
     /// async completion paths (e.g. background file loads). It updates the rope, display map,
     /// and schedules a highlight refresh for code editors.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.history.ignore = true;
+        let text: SharedString = text.into();
+        self.text = Rope::from(text.as_ref());
         if self.mode.is_single_line() {
             self.selected_range = (self.text.len()..self.text.len()).into();
         } else {

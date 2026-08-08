@@ -45,6 +45,65 @@ pub fn start_lsp_session(
     Some(tx)
 }
 
+/// Spawn the LSP server and complete the initialize handshake, trying a
+/// fallback command when the primary one fails or stalls.
+///
+/// rust-analyzer is often installed through rustup, where `rust-analyzer`
+/// on the shim resolves to the active toolchain's component — which may be
+/// missing (e.g. nightly without the rust-analyzer component). The shim then
+/// exits immediately and the initialize request never gets a response, so we
+/// race it against a timeout and retry with `rustup run stable`.
+async fn spawn_and_initialize(
+    spec: &LspServerSpec,
+    cx: &AsyncApp,
+) -> Option<LspClient> {
+    let mut commands: Vec<(&str, Vec<&'static str>)> = vec![(spec.command, spec.args.to_vec())];
+    if spec.command == "rust-analyzer" {
+        commands.push(("rustup", vec!["run", "stable", "rust-analyzer"]));
+    }
+
+    for (cmd, args) in commands {
+        let spawned = cx
+            .background_executor()
+            .spawn({
+                let cmd = cmd.to_string();
+                let args = args.clone();
+                async move { LspClient::spawn(&cmd, &args).await }
+            })
+            .await;
+        let Ok(mut client) = spawned else {
+            continue;
+        };
+
+        // Drive the read loop so responses are dispatched while awaiting.
+        if let Some(reader) = client.take_reader() {
+            let pending = client.pending();
+            cx.background_executor()
+                .spawn(async move {
+                    super::client::read_loop(reader, pending).await;
+                })
+                .detach();
+        }
+
+        let root = spec.root_uri.clone();
+        let init = async { client.initialize(&root).await };
+        let timeout = async {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(8))
+                .await;
+            Err::<serde_json::Value, anyhow::Error>(anyhow::anyhow!("initialize timeout"))
+        };
+        match smol::future::race(init, timeout).await {
+            Ok(_) => return Some(client),
+            Err(e) => {
+                log::warn!("LSP initialize failed via {cmd}: {e}");
+                let _ = client.shutdown().await;
+            }
+        }
+    }
+    None
+}
+
 async fn run_session(
     editor: WeakEntity<InputState>,
     uri: String,
@@ -52,37 +111,17 @@ async fn run_session(
     rx: Receiver<LspChange>,
     cx: &AsyncApp,
 ) {
-    // Spawn the server and run the initialize handshake on the background
-    // executor (rust-analyzer can take a moment to start).
-    let mut client = match cx
-        .background_executor()
-        .spawn(async move { LspClient::spawn(spec.command, spec.args).await })
-        .await
-    {
-        Ok(client) => client,
-        Err(_) => return,
-    };
-
-    // Drive the server's stdout read loop on the background executor so
-    // responses are dispatched while this task awaits them.
-    if let Some(reader) = client.take_reader() {
-        let pending = client.pending();
-        cx.background_executor()
-            .spawn(async move {
-                super::client::read_loop(reader, pending).await;
-            })
-            .detach();
-    }
-
-    // Complete the initialize handshake. This awaits the server response;
-    // the read loop above runs on the background executor so the await
-    // resolves without blocking the UI.
-    let capabilities = match client.initialize(&spec.root_uri).await {
-        Ok(capabilities) => capabilities,
-        Err(_) => return,
+    let mut client = match spawn_and_initialize(&spec, cx).await {
+        Some(client) => client,
+        None => {
+            log::warn!("LSP session could not be established for {}", spec.command);
+            return;
+        }
     };
 
     // Extract the semantic-tokens legend advertised by the server.
+    let capabilities = client.take_initialize_capabilities().unwrap_or_default();
+
     let legend = capabilities
         .get("capabilities")
         .and_then(|c| c.get("semanticTokensProvider"))

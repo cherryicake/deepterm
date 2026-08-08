@@ -23,7 +23,11 @@ impl WindowManager {
     }
 
     /// Open a new DeepTerm window with the default size and options.
-    pub fn open_window(cx: &mut App) {
+    /// Open a new DeepTerm window with the default size and options.
+    ///
+    /// `open_path`, when given, is opened in the editor once the window is
+    /// ready (supports `deepterm <file>` from the command line).
+    pub fn open_window(cx: &mut App, open_path: Option<std::path::PathBuf>) {
         let bounds =
             gpui::Bounds::centered(None, gpui::size(gpui::px(1400.0), gpui::px(900.0)), cx);
 
@@ -47,6 +51,11 @@ impl WindowManager {
                 window.defer(cx, move |window, cx| {
                     window_handle.update(cx, |app, cx| {
                         app.setup_initial_focus(window, cx);
+                        if let Some(path) = &open_path {
+                            app.editor.update(cx, |editor, cx| {
+                                editor.open_file(path.clone(), window, cx);
+                            });
+                        }
                     });
                     // 窗口内容初始化完成后，再显示并激活窗口
                     // 避免 Windows 上启动时出现空白窗口/闪烁问题
