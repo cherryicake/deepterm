@@ -75,8 +75,10 @@ impl InputState {
             })
             .is_err()
         {
+            log::debug!("completion: channel send failed (full/closed)");
             return;
         }
+        log::debug!("completion: requested at offset={offset}");
 
         let editor = cx.entity();
         self.lsp._completion_task = cx.spawn_in(window, async move |_, cx| {
@@ -110,6 +112,7 @@ impl InputState {
                     cx.notify();
                     return;
                 }
+                log::debug!("completion: showing {} items", items.len());
                 editor.completion_menu = Some(super::CompletionMenu {
                     items,
                     selected: 0,

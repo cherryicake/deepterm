@@ -2438,6 +2438,10 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.display_map);
         self.text_version = self.text_version.wrapping_add(1);
         self.last_edit_time = Some(std::time::Instant::now());
+        // Shift cached semantic-token byte ranges so highlights stay put
+        // while typing (zed shifts its anchors on edits).
+        self.lsp
+            .adjust_semantic_tokens_for_edit(&range, new_text);
         self.lsp.update(&self.text, window, cx);
         self.push_lsp_change(cx);
         // Request completions when typing (non-whitespace input).

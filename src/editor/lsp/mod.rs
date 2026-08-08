@@ -101,10 +101,10 @@ pub struct Lsp {
     pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
     /// The completion provider.
     pub completion_provider: Option<Rc<dyn CompletionProvider>>,
-    /// Cached semantic tokens as absolute position ranges + theme token-type
-    /// names. Color is resolved from the name at paint time so theme switches
-    /// take effect without a refetch.
-    semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
+    /// Cached semantic tokens as byte ranges + theme token-type names. Byte
+    /// ranges (instead of LSP positions) let the cache be shifted on edits so
+    /// highlights stay put while typing instead of disappearing / flickering.
+    semantic_tokens: Vec<(std::ops::Range<usize>, SharedString)>,
     /// The editor text version the cached tokens were generated for. Tokens
     /// are only composed when it matches the current text version, so stale
     /// tokens never flicker over a newer document (they are simply skipped
@@ -162,7 +162,7 @@ impl Lsp {
     /// server response arrives) and notify on change.
     pub(crate) fn set_semantic_tokens(
         &mut self,
-        tokens: Vec<(lsp_types::Range, SharedString)>,
+        tokens: Vec<(std::ops::Range<usize>, SharedString)>,
         version: u64,
         cx: &mut Context<InputState>,
     ) {
@@ -171,6 +171,35 @@ impl Lsp {
             self.semantic_tokens_version = version;
             cx.notify();
         }
+    }
+
+    /// Shift cached semantic-token byte ranges for an edit at `edit_range`
+    /// (old-text bytes) that inserts `new_text` (old length was
+    /// `edit_range.len()`). Tokens before the edit keep their offsets; tokens
+    /// after it move by the delta; tokens overlapping the edit are dropped.
+    pub(crate) fn adjust_semantic_tokens_for_edit(
+        &mut self,
+        edit_range: &std::ops::Range<usize>,
+        new_text: &str,
+    ) {
+        if self.semantic_tokens.is_empty() {
+            return;
+        }
+        let delta = new_text.len() as isize - edit_range.len() as isize;
+        let mut adjusted = Vec::with_capacity(self.semantic_tokens.len());
+        for (range, name) in std::mem::take(&mut self.semantic_tokens) {
+            if range.end <= edit_range.start {
+                adjusted.push((range, name));
+            } else if range.start >= edit_range.end {
+                adjusted.push((
+                    (range.start as isize + delta).max(0) as usize
+                        ..(range.end as isize + delta).max(0) as usize,
+                    name,
+                ));
+            }
+            // Overlapping the edit: drop (a fresh fetch is scheduled).
+        }
+        self.semantic_tokens = adjusted;
     }
 
     /// The version of the document the cached tokens were generated for.

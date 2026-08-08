@@ -1077,16 +1077,10 @@ impl TextElement {
         // were fetched for the *current* text version — stale tokens (byte
         // ranges from a pre-edit document) would flicker as the text shifts
         // while typing.
-        let semantic_styles = if state.lsp.semantic_tokens_version() == state.text_version
-            // Only compose semantic tokens once the user pauses typing
-            // (300ms). While typing, the tokens for the new text are still
-            // in flight and swapping between tree-sitter and semantic
-            // colours on every keystroke reads as constant flicker.
-            && state
-                .last_edit_time
-                .map(|t| t.elapsed() >= std::time::Duration::from_millis(300))
-                .unwrap_or(true)
-        {
+        // Semantic tokens are byte-ranged and shifted on each edit, so they
+        // stay composed while typing (no flicker); they are only dropped for
+        // tokens overlapping the edited region, which the next fetch replaces.
+        let semantic_styles = if state.lsp.semantic_tokens_version() == state.text_version {
             state.lsp.semantic_tokens_for_range(
                 &state.text,
                 &visible_byte_range,

@@ -187,7 +187,9 @@ impl LspClient {
         Ok(capabilities)
     }
 
-    /// Send a request and await its response.
+    /// Send a request and await its response (bounded by
+    /// [`REQUEST_TIMEOUT`] so a stalled server cannot block the session loop
+    /// forever, which would starve every other request).
     pub async fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
@@ -202,7 +204,17 @@ impl LspClient {
         });
         self.write_message(&message).await?;
 
-        rx.recv().await.context("LSP server closed while awaiting response")?
+        let recv = async {
+            match rx.recv().await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("LSP server closed while awaiting response")),
+            }
+        };
+        let timeout = async {
+            smol::Timer::after(std::time::Duration::from_secs(10)).await;
+            Err::<Value, anyhow::Error>(anyhow!("LSP request {method} timed out after 10s"))
+        };
+        smol::future::race(recv, timeout).await
     }
 
     /// Fire-and-forget notification.

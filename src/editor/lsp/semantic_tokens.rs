@@ -56,7 +56,7 @@ impl Lsp {
     /// instead of scanning the whole document.
     pub(crate) fn semantic_tokens_for_range(
         &self,
-        text: &Rope,
+        _text: &Rope,
         visible_range: &Range<usize>,
         theme: &HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -64,31 +64,23 @@ impl Lsp {
             return Vec::new();
         }
 
-        let visible_start = lsp_types_position_from_offset(text, visible_range.start);
-        let visible_end = lsp_types_position_from_offset(text, visible_range.end);
-
-        // Cache is sorted by `range.start`. A token can only touch the
-        // viewport if its start is before `visible_end` (upper bound) and it
-        // is not on a line entirely above the viewport's first line (lower
-        // bound — tokens are single-line, so an earlier line cannot reach in).
+        // Byte ranges are kept sorted; binary-search the window that can
+        // touch the viewport.
         let hi = self
             .semantic_tokens
-            .partition_point(|(range, _)| range.start < visible_end);
+            .partition_point(|(range, _)| range.start < visible_range.end);
         let lo = self
             .semantic_tokens
-            .partition_point(|(range, _)| range.start.line < visible_start.line);
+            .partition_point(|(range, _)| range.end <= visible_range.start);
 
         self.semantic_tokens[lo..hi]
             .iter()
             .filter_map(|(range, name)| {
-                let start = lsp_position_to_offset(text, &range.start);
-                let end = lsp_position_to_offset(text, &range.end);
-                if start >= end || start >= visible_range.end || end <= visible_range.start {
+                if range.start >= range.end {
                     return None;
                 }
-
                 let style = theme.style(name.as_ref())?;
-                Some((start..end, style))
+                Some((range.clone(), style))
             })
             .collect()
     }
@@ -124,11 +116,19 @@ impl Lsp {
             if let Some(task) = task_result {
                 if let Ok(tokens) = task.await {
                     let decoded = decode_semantic_tokens(&tokens, &legend);
+                    let byte_tokens: Vec<(Range<usize>, SharedString)> = decoded
+                        .iter()
+                        .filter_map(|(range, name)| {
+                            let start = lsp_position_to_offset(&text, &range.start);
+                            let end = lsp_position_to_offset(&text, &range.end);
+                            (end > start).then_some((start..end, name.clone()))
+                        })
+                        .collect();
                     let _ = input_state.update(cx, |input_state, cx| {
-                        if decoded != input_state.lsp.semantic_tokens {
-                            input_state.lsp.semantic_tokens = decoded;
-                            cx.notify();
-                        }
+                        let version = input_state.text_version;
+                        input_state
+                            .lsp
+                            .set_semantic_tokens(byte_tokens, version, cx);
                     });
                 }
             }
@@ -261,20 +261,8 @@ mod tests {
 
         let mut lsp = Lsp::default();
         lsp.semantic_tokens = vec![
-            (
-                lsp_types::Range {
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 6),
-                },
-                SharedString::from("keyword"),
-            ),
-            (
-                lsp_types::Range {
-                    start: Position::new(1, 0),
-                    end: Position::new(1, 17),
-                },
-                SharedString::from("comment"),
-            ),
+            (0..6, SharedString::from("keyword")),
+            (20..37, SharedString::from("comment")),
         ];
 
         // Visible range covering only line 0 (bytes 0..19).
@@ -314,19 +302,13 @@ mod tests {
         let theme = test_theme();
 
         let mut lsp = Lsp::default();
-        lsp.semantic_tokens = (0..100u32)
+        let line_bytes = "foo bar\n".len();
+        lsp.semantic_tokens = (0..100usize)
             .map(|line| {
-                (
-                    lsp_types::Range {
-                        start: Position::new(line, 0),
-                        end: Position::new(line, 3),
-                    },
-                    SharedString::from("keyword"),
-                )
+                (line * line_bytes..line * line_bytes + 3, SharedString::from("keyword"))
             })
             .collect();
 
-        let line_bytes = "foo bar\n".len();
         let start = 50 * line_bytes;
         let styles = lsp.semantic_tokens_for_range(&text, &(start..start + 3), &theme);
         assert_eq!(styles.len(), 1);

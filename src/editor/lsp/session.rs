@@ -173,17 +173,26 @@ async fn run_session(
             }
             Ok(LspChange::Hover { offset, reply }) => {
                 let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                log::debug!("LSP session hover at {offset} -> {position:?}");
                 let result = client.hover(&uri, (position.line, position.character)).await;
+                log::debug!("LSP hover result: {:?}", result.as_ref().map(|h| h.is_some()));
                 let _ = reply.try_send(result);
             }
             Ok(LspChange::Definition { offset, reply }) => {
                 let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                log::debug!("LSP session definition at {offset} -> {position:?}");
                 let result = client.definition(&uri, (position.line, position.character)).await;
+                log::debug!("LSP definition result: {:?}", result.as_ref().map(|v| v.len()));
                 let _ = reply.try_send(result);
             }
             Ok(LspChange::Completion { offset, reply }) => {
                 let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
+                log::debug!("LSP session completion at {offset} -> {position:?}");
                 let result = client.completion(&uri, (position.line, position.character)).await;
+                log::debug!("LSP completion result: {:?}", result.as_ref().map(|r| match r {
+                    lsp_types::CompletionResponse::Array(items) => items.len(),
+                    lsp_types::CompletionResponse::List(l) => l.items.len(),
+                }));
                 let _ = reply.try_send(result);
             }
             Ok(LspChange::Close) | Err(_) => break,
@@ -220,9 +229,20 @@ async fn fetch_and_apply(
     let decoded = decode_semantic_tokens(&tokens, legend);
     log::debug!("LSP semantic tokens: {} (uri={})", decoded.len(), uri);
 
+    // Convert LSP positions (UTF-16) to byte ranges so the cache can be
+    // shifted on edits.
+    let byte_tokens: Vec<(std::ops::Range<usize>, gpui::SharedString)> = decoded
+        .iter()
+        .filter_map(|(range, name)| {
+            let start = super::lsp_position_to_offset(&rope, &range.start);
+            let end = super::lsp_position_to_offset(&rope, &range.end);
+            (end > start).then_some((start..end, name.clone()))
+        })
+        .collect();
+
     let _ = cx.update(|cx| editor.update(cx, |state, cx| {
         let version = state.text_version;
-        state.lsp.set_semantic_tokens(decoded, version, cx);
+        state.lsp.set_semantic_tokens(byte_tokens, version, cx);
     }));
     Ok(())
 }
