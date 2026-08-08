@@ -87,6 +87,33 @@ impl EditorInput {
     /// Floating completion popup, anchored just below the cursor. Returns
     /// `None` when there is nothing to show so the element tree stays stable
     /// when the popup closes.
+    /// Zed-style completion-kind letter + colour (function ƒ, variable x,
+    /// struct S, keyword k, …). Rendered as a small coloured prefix so the
+    /// list reads at a glance.
+    fn completion_kind_letter(
+        kind: Option<lsp_types::CompletionItemKind>,
+        theme: &crate::theme::AppTheme,
+    ) -> (char, gpui::Hsla) {
+        use lsp_types::CompletionItemKind;
+        use lsp_types::CompletionItemKind as K;
+        match kind {
+            Some(K::FUNCTION) | Some(K::METHOD) | Some(K::CONSTRUCTOR) => ('ƒ', theme.success),
+            Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => ('x', theme.accent),
+            Some(K::STRUCT)
+            | Some(K::CLASS)
+            | Some(K::ENUM)
+            | Some(K::INTERFACE)
+            | Some(K::TYPE_PARAMETER) => ('S', gpui::rgb(0x9b59b6).into()),
+            Some(K::KEYWORD) => ('k', theme.error),
+            Some(K::TEXT) | Some(K::FILE) => {
+                ('s', gpui::rgb(0xe67e22).into())
+            }
+            Some(K::CONSTANT) => ('n', theme.warning),
+            Some(K::MODULE) => ('m', gpui::rgb(0x16a085).into()),
+            _ => ('•', theme.text_muted),
+        }
+    }
+
     fn completion_menu_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
         let menu = state.completion_menu.as_ref()?;
         if !menu.visible || menu.items.is_empty() {
@@ -121,10 +148,16 @@ impl EditorInput {
                     .enumerate()
                     .map(|(i, item)| {
                         let selected = i == menu.selected;
-                        div()
+                        let (kind_char, kind_color) = Self::completion_kind_letter(item.kind, theme);
+                        let row = div()
                             .id(SharedString::from(format!("completion-item-{i}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
                             .px_2()
                             .py_1()
+                            .rounded(px(4.0))
                             .text_color(if selected {
                                 theme.accent_foreground
                             } else {
@@ -135,7 +168,36 @@ impl EditorInput {
                             } else {
                                 gpui::transparent_black()
                             })
-                            .child(item.label.clone())
+                            .child(
+                                div()
+                                    .w(px(16.0))
+                                    .text_color(if selected {
+                                        theme.accent_foreground
+                                    } else {
+                                        kind_color
+                                    })
+                                    .text_center()
+                                    .child(kind_char.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .overflow_x_hidden()
+                                    .child(item.label.clone()),
+                            );
+                        match item.detail.as_ref() {
+                            Some(detail) => row
+                                .child(
+                                    div()
+                                        .text_color(if selected {
+                                            theme.accent_foreground.opacity(0.8)
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(detail.clone()),
+                                ),
+                            None => row,
+                        }
                     })
                     .collect::<Vec<_>>(),
             );
