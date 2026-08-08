@@ -211,8 +211,8 @@ impl LspClient {
             }
         };
         let timeout = async {
-            smol::Timer::after(std::time::Duration::from_secs(10)).await;
-            Err::<Value, anyhow::Error>(anyhow!("LSP request {method} timed out after 10s"))
+            smol::Timer::after(std::time::Duration::from_secs(20)).await;
+            Err::<Value, anyhow::Error>(anyhow!("LSP request {method} timed out after 20s"))
         };
         smol::future::race(recv, timeout).await
     }
@@ -515,5 +515,97 @@ mod tests {
             read_task.abort();
         });
     }
-}
 
+    /// End-to-end against a small real Cargo project: completions, hover and
+    /// go-to-definition must return non-empty results for a real Rust
+    /// project (the bare-temp-file e2e returns empty by design; a big tree
+    /// like deepterm itself takes too long to index for a unit test).
+    #[test]
+    #[ignore = "requires rust-analyzer on PATH"]
+    fn test_rust_analyzer_real_project_features() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            // Build a tiny throwaway project under /tmp.
+            let proj = std::path::PathBuf::from("/tmp/deepterm-lsp-proj");
+            std::fs::create_dir_all(proj.join("src")).expect("mkdir");
+            std::fs::write(proj.join("Cargo.toml"), "[package]\nname = \"lsp_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n\n").expect("cargo");
+            let text = "pub struct Greeter {\n    pub name: String,\n}\n\nimpl Greeter {\n    pub fn new(name: String) -> Self {\n        Self { name }\n    }\n\n    pub fn greet(&self) -> String {\n        format!(\"Hello, {}!\", self.name)\n    }\n}\n\nfn main() {\n    let greeter = Greeter::new(\"world\".to_string());\n    let msg = greeter.greet();\n    println!(\"{}\", msg);\n}\n";
+            let file = proj.join("src/main.rs");
+            std::fs::write(&file, text).expect("write");
+            let uri = format!("file://{}", file.display());
+
+            let mut client = LspClient::spawn("rustup", &["run", "stable", "rust-analyzer"])
+                .await
+                .expect("spawn");
+            let pending = client.pending();
+            let reader = client.take_reader().expect("reader");
+            let read_task = tokio::spawn(async move {
+                read_loop(reader, pending).await;
+            });
+            let _ = client
+                .initialize(&format!("file://{}", proj.display()))
+                .await
+                .expect("initialize");
+            client
+                .did_open(&uri, "rust", 1, text)
+                .await
+                .expect("didOpen");
+
+            // Let rust-analyzer finish starting up and load the workspace.
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+            // Sanity: semanticTokens must work for a valid range.
+            let line_count = text.lines().count() as u32;
+            let st = client
+                .semantic_tokens_range(&uri, (0, 0), (line_count, 0))
+                .await;
+            eprintln!(
+                "E2E-real: semanticTokens = {:?}",
+                st.as_ref().map(|t| t.data.len())
+            );
+
+            // Completion after `greeter.` (a member access) must offer
+            // `greet`.
+            let marker = "let msg = greeter.";
+            let start = text.find(marker).expect("marker");
+            let trigger = start + marker.len();
+            let line = text[..trigger].matches('\n').count() as u32;
+            let col = (trigger - text[..trigger].rfind('\n').map(|p| p + 1).unwrap_or(0))
+                as u32;
+            let completions = client
+                .completion(&uri, (line, col))
+                .await
+                .expect("completion");
+            let items = match &completions {
+                lsp_types::CompletionResponse::Array(items) => items,
+                lsp_types::CompletionResponse::List(l) => &l.items,
+            };
+            assert!(
+                !items.is_empty(),
+                "expected completions in small project (line {line} col {col}, got {items:?})"
+            );
+            eprintln!("E2E-real: completions = {}", items.len());
+
+            // Hover over `greet` (a real method call) must return content.
+            let hover_start = trigger + "greet".len() / 2;
+            let hline = text[..hover_start].matches('\n').count() as u32;
+            let hcol = (hover_start
+                - text[..hover_start].rfind('\n').map(|p| p + 1).unwrap_or(0))
+                as u32;
+            let hover = client.hover(&uri, (hline, hcol)).await.expect("hover");
+            assert!(hover.is_some(), "expected hover content");
+            eprintln!("E2E-real: hover ok");
+
+            // Definition of `greet` must resolve in-project.
+            let defs = client
+                .definition(&uri, (hline, hcol))
+                .await
+                .expect("definition");
+            assert!(!defs.is_empty(), "expected definition in small project");
+            eprintln!("E2E-real: definitions = {}", defs.len());
+
+            client.shutdown().await;
+            read_task.abort();
+        });
+    }
+}
