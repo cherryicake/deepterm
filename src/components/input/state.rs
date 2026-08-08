@@ -381,6 +381,9 @@ pub struct InputState {
     /// carry the version they were fetched for; mismatches are not composed
     /// (prevents stale-token flicker while typing).
     pub(crate) text_version: u64,
+    /// When the last edit happened (used to defer semantic-token composition
+    /// until the user pauses typing, avoiding colour flicker on every key).
+    pub(crate) last_edit_time: Option<std::time::Instant>,
     /// Extra empty rows below the last line the editor can scroll into.
     /// See [`Self::scroll_beyond_last_line`].
     pub(crate) scroll_beyond_last_line: Option<usize>,
@@ -477,6 +480,7 @@ impl InputState {
             completion_menu: None,
             completion_inserting: false,
             text_version: 0,
+            last_edit_time: None,
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             submit_on_enter: false,
@@ -2248,6 +2252,13 @@ impl InputState {
             .as_ref()
             .and_then(|h| h.injection_parse_data());
 
+        // The text version this parse was started for. When the parse
+        // finishes, if the document has changed meanwhile (the user kept
+        // typing), the result is discarded instead of being applied: applying
+        // a stale tree would repaint the whole file's highlights, which reads
+        // as constant flicker on every keystroke (the fresh parse for the new
+        // text is already scheduled by the edit).
+        let parse_version = cx.entity().read(cx).text_version;
         let text_for_apply = text.clone();
         let task = cx.spawn_in(window, async move |entity, cx| {
             let result = cx
@@ -2291,6 +2302,15 @@ impl InputState {
                 .await;
 
             if let Some((new_tree, injection_layers)) = result {
+                let stale = entity
+                    .update(cx, |state, _| state.text_version != parse_version)
+                    .unwrap_or(true);
+                if stale {
+                    // Document changed while parsing; the fresh parse for the
+                    // current text is already scheduled. Do not apply a stale
+                    // tree (would repaint the whole file's highlights).
+                    return;
+                }
                 if let Some(h) = highlighter_rc.borrow_mut().as_mut() {
                     h.apply_background_tree(new_tree, &text_for_apply, injection_layers);
                 }
@@ -2417,6 +2437,7 @@ impl EntityInputHandler for InputState {
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
         self.text_version = self.text_version.wrapping_add(1);
+        self.last_edit_time = Some(std::time::Instant::now());
         self.lsp.update(&self.text, window, cx);
         self.push_lsp_change(cx);
         // Request completions when typing (non-whitespace input).

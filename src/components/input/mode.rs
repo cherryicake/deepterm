@@ -240,7 +240,7 @@ impl InputMode {
                     new_end_position: new_end_pos,
                 };
 
-                const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
+                const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(30);
                 let completed = h.update(Some(edit), text, Some(SYNC_PARSE_TIMEOUT));
                 if completed {
                     // Sync parse succeeded, cancel any pending background parse.
