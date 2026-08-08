@@ -25,10 +25,17 @@ const CONTEXT: &'static str = "SearchPanel";
 
 actions!(input, [Tab]);
 
+/// The active search query: a literal (aho-corasick) or a regex.
+#[derive(Debug, Clone)]
+enum SearchQuery {
+    Literal(AhoCorasick),
+    Regex(regex::Regex),
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
-    pub query: Option<AhoCorasick>,
+    pub query: Option<SearchQuery>,
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
@@ -62,11 +69,18 @@ impl SearchMatcher {
         let mut new_ranges = Vec::new();
         if let Some(query) = &self.query {
             let text = self.text.to_string();
-            let matches = query.stream_find_iter(text.as_bytes());
-
-            for query_match in matches.into_iter() {
-                let query_match = query_match.expect("query match for select all action");
-                new_ranges.push(query_match.range());
+            match query {
+                SearchQuery::Literal(matcher) => {
+                    for query_match in matcher.stream_find_iter(text.as_bytes()) {
+                        let query_match = query_match.expect("query match");
+                        new_ranges.push(query_match.range());
+                    }
+                }
+                SearchQuery::Regex(re) => {
+                    for m in re.find_iter(&text) {
+                        new_ranges.push(m.range());
+                    }
+                }
             }
         }
         self.matched_ranges = Rc::new(new_ranges);
@@ -81,16 +95,23 @@ impl SearchMatcher {
     }
 
     /// Update the search query and reset the current match index.
-    pub fn update_query(&mut self, query: &str, case_insensitive: bool) {
-        if query.len() > 0 {
-            self.query = Some(
+    pub fn update_query(&mut self, query: &str, case_insensitive: bool, use_regex: bool) {
+        if query.is_empty() {
+            self.query = None;
+        } else if use_regex {
+            let expr = if case_insensitive {
+                format!("(?i){query}")
+            } else {
+                query.to_string()
+            };
+            self.query = regex::Regex::new(&expr).ok().map(SearchQuery::Regex);
+        } else {
+            self.query = Some(SearchQuery::Literal(
                 AhoCorasick::builder()
                     .ascii_case_insensitive(case_insensitive)
                     .build(&[query.to_string()])
                     .expect("failed to build AhoCorasick query in SearchMatcher"),
-            );
-        } else {
-            self.query = None;
+            ));
         }
         self.update_matches();
     }
@@ -171,6 +192,7 @@ pub(crate) struct SearchPanel {
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     case_insensitive: bool,
+    use_regex: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
 
@@ -261,6 +283,7 @@ impl SearchPanel {
                 search_input,
                 replace_input,
                 case_insensitive: true,
+                use_regex: false,
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
@@ -301,7 +324,7 @@ impl SearchPanel {
             .map(|l| l.visible_range_offset.clone());
 
         self.matcher
-            .update_query(query.as_str(), self.case_insensitive);
+            .update_query(query.as_str(), self.case_insensitive, self.use_regex);
 
         if let Some(visible_range_offset) = visible_range_offset {
             self.matcher
@@ -486,6 +509,31 @@ impl Render for SearchPanel {
                 cx.notify();
             }));
 
+        let regex_toggle = Button::new("search-regex")
+            .label(".*")
+            .compact()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(if self.use_regex {
+                        theme.accent
+                    } else {
+                        ui.elevated_background
+                    })
+                    .foreground(if self.use_regex {
+                        theme.accent_foreground
+                    } else {
+                        theme.text
+                    })
+                    .hover(ui.tab_hover_background)
+                    .active(theme.accent),
+            )
+            .tooltip("正则表达式")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.use_regex = !this.use_regex;
+                this.update_search_query(cx);
+                cx.notify();
+            }));
+
         let replace_toggle = Button::new("search-replace-mode")
             .label("替换")
             .compact()
@@ -525,6 +573,7 @@ impl Render for SearchPanel {
             .child(div().flex().flex_1().child(EditorInput::new(&self.search_input).transparent()))
             .when(allow_replace, |this| this.child(replace_toggle))
             .child(case_toggle)
+            .child(regex_toggle)
             .child(
                 Button::new("search-prev")
                     .label("‹")
@@ -610,7 +659,7 @@ mod tests {
     fn test_search() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", true, false);
 
         assert_eq!(matcher.len(), 3);
         let mut matches = matcher.clone();
@@ -628,7 +677,7 @@ mod tests {
         assert_eq!(matches.current_match_ix, 0);
         assert_eq!(matches.next_back(), Some(23..25));
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", false, false);
         assert_eq!(matcher.len(), 0);
         assert_eq!(matcher.next(), None);
         assert_eq!(matcher.next_back(), None);
@@ -638,7 +687,7 @@ mod tests {
     fn test_search_label() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
-        matcher.update_query("Is", true);
+        matcher.update_query("Is", true, false);
         assert_eq!(matcher.label(), "1/3");
         matcher.next();
         assert_eq!(matcher.label(), "2/3");
@@ -647,7 +696,7 @@ mod tests {
         matcher.next();
         assert_eq!(matcher.label(), "1/3");
 
-        matcher.update_query("IS", false);
+        matcher.update_query("IS", false, false);
         assert_eq!(matcher.label(), "0/0");
     }
 
@@ -687,7 +736,7 @@ mod tests {
     fn test_update_matches_clamps_current_match_index_while_replacing() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("foo foo foo"));
-        matcher.update_query("foo", true);
+        matcher.update_query("foo", true, false);
         matcher.current_match_ix = 2;
         matcher.replacing = true;
 
