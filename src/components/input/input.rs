@@ -85,15 +85,15 @@ impl EditorInput {
     }
 
     /// Floating completion popup (anchored at the bottom of the editor).
-    fn render_completion_menu(state: &InputState, cx: &App) -> impl IntoElement {
-        let Some(menu) = state.completion_menu.as_ref() else {
-            return div().into_any_element();
-        };
+    /// Returns `None` when there is nothing to show so the element tree stays
+    /// stable when the popup closes.
+    fn completion_menu_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
+        let menu = state.completion_menu.as_ref()?;
         if !menu.visible || menu.items.is_empty() {
-            return div().into_any_element();
+            return None;
         }
         let theme = cx.theme();
-        div()
+        let el = div()
             .id("completion-menu")
             .absolute()
             .bottom_0()
@@ -128,20 +128,18 @@ impl EditorInput {
                             .child(item.label.clone())
                     })
                     .collect::<Vec<_>>(),
-            )
-            .into_any_element()
+            );
+        Some(el.into_any_element())
     }
 
     /// Floating hover popover (anchored at the top of the editor).
-    fn render_hover_popover(state: &InputState, cx: &App) -> impl IntoElement {
-        let Some(popover) = state.hover_popover.as_ref() else {
-            return div().into_any_element();
-        };
+    fn hover_popover_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
+        let popover = state.hover_popover.as_ref()?;
         if popover.contents.is_empty() {
-            return div().into_any_element();
+            return None;
         }
         let theme = cx.theme();
-        div()
+        let el = div()
             .id("hover-popover")
             .absolute()
             .top_0()
@@ -156,8 +154,8 @@ impl EditorInput {
             .border_color(theme.border)
             .rounded(px(8.0))
             .text_color(theme.text)
-            .child(popover.contents.clone())
-            .into_any_element()
+            .child(popover.contents.clone());
+        Some(el.into_any_element())
     }
 }
 
@@ -263,36 +261,29 @@ impl RenderOnce for EditorInput {
             .when(self.transparent, |this| this.flex_1());
 
         if is_multi_line {
-            // Multi-line mode: match the original InputState::render layout
-            let completion_menu = Self::render_completion_menu(&state, cx);
-            let hover_popover = Self::render_hover_popover(&state, cx);
+            // Multi-line mode: match the original InputState::render layout.
+            // TextElement stays a direct flex child (wrapping it in an extra
+            // div broke layout → blank editor); popups are absolutely
+            // positioned overlays on the editor container.
+            // Popups are conditionally-rendered overlays; when none is open
+            // the children list stays identical to the plain editor (single
+            // TextElement), which keeps the element tree stable.
+            let completion_menu = Self::completion_menu_element(&state, cx);
+            let hover_popover = Self::hover_popover_element(&state, cx);
             actions
                 .id("editor-input")
                 .flex_1()
                 .h_full()
                 .flex_grow(1.0)
                 .overflow_x_hidden()
+                .relative()
+                .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
                 .child(
-                    div()
-                        .id("editor-input-inner")
-                        .flex_1()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .relative()
-                        .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
-                        .child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .child(
-                                    TextElement::new(self.state.clone())
-                                        .placeholder(state.placeholder.clone()),
-                                ),
-                        )
-                        .child(completion_menu)
-                        .child(hover_popover),
+                    TextElement::new(self.state.clone())
+                        .placeholder(state.placeholder.clone()),
                 )
+                .when_some(completion_menu, |this, el| this.child(el))
+                .when_some(hover_popover, |this, el| this.child(el))
                 .into_any_element()
         } else {
             let mask_toggle_el = if self.mask_toggle {

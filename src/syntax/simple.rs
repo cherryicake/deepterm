@@ -316,6 +316,11 @@ impl SimpleHighlighter {
                     let cap_range = capture.node.byte_range();
                     let mut s = layer.byte_range.start + cap_range.start;
                     let mut e = layer.byte_range.start + cap_range.end;
+                    // Guard against a stale layer after an edit: the layer's
+                    // byte range may no longer fit the (edited) host text.
+                    if s >= self.text.len() || e > self.text.len() {
+                        continue;
+                    }
                     // Clip to the host range and char boundaries.
                     if e <= range.start || s >= range.end {
                         continue;
