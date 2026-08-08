@@ -16,9 +16,8 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
-use super::{
-    DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, lsp::Lsp, mode::InputMode,
-};
+use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
+use crate::editor::lsp::Lsp;
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -27,12 +26,12 @@ use crate::components::input::movement::MoveDirection;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
-use crate::syntax::DiagnosticSet;
+use crate::editor::syntax::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
-use crate::syntax::LanguageRegistry;
+use crate::editor::syntax::LanguageRegistry;
 use lsp_types::Position;
 
-use super::lsp::{
+use crate::editor::lsp::{
     CompletionMenu, HoverDefinition, HoverPopoverData, LspChange, LspServerSpec,
     start_lsp_session,
 };
@@ -378,6 +377,10 @@ pub struct InputState {
     pub(crate) hover_popover: Option<HoverPopoverData>,
     /// Code completion popup state.
     pub(crate) completion_menu: Option<CompletionMenu>,
+    /// Monotonic text version, incremented on every edit. Semantic tokens
+    /// carry the version they were fetched for; mismatches are not composed
+    /// (prevents stale-token flicker while typing).
+    pub(crate) text_version: u64,
     /// Extra empty rows below the last line the editor can scroll into.
     /// See [`Self::scroll_beyond_last_line`].
     pub(crate) scroll_beyond_last_line: Option<usize>,
@@ -473,6 +476,7 @@ impl InputState {
             hover_popover: None,
             completion_menu: None,
             completion_inserting: false,
+            text_version: 0,
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             submit_on_enter: false,
@@ -2275,7 +2279,7 @@ impl InputState {
                     // Compute injection layers in the background to avoid blocking the
                     // main thread with combined-injection parsing (e.g. PHP, HTML+JS/CSS).
                     let injection_layers = if let Some(data) = injection_data {
-                        crate::syntax::SyntaxHighlighter::compute_injection_layers(
+                        crate::editor::syntax::SyntaxHighlighter::compute_injection_layers(
                             data, &new_tree, &text,
                         )
                     } else {
@@ -2412,11 +2416,8 @@ impl EntityInputHandler for InputState {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
+        self.text_version = self.text_version.wrapping_add(1);
         self.lsp.update(&self.text, window, cx);
-        // Invalidate stale semantic tokens (their byte ranges refer to the
-        // pre-edit text) so the editor doesn't flicker while fresh tokens
-        // are fetched.
-        self.lsp.invalidate_semantic_tokens(cx);
         self.push_lsp_change(cx);
         // Request completions when typing (non-whitespace input).
         if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting {

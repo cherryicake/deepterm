@@ -5,6 +5,8 @@ pub mod git_repository;
 pub mod git_status;
 pub mod image_viewer;
 pub mod markdown;
+pub mod lsp;
 pub mod markdown_element;
+pub mod syntax;
 pub mod markdown_parser;
 pub use editor::*;

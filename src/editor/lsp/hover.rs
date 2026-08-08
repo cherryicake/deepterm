@@ -8,7 +8,7 @@ use anyhow::Result;
 use gpui::{App, Context, Task, Window};
 use ropey::Rope;
 
-use super::LspChange;
+use super::{LspChange, lsp_position_to_offset};
 use crate::components::input::{InputState, RopeExt as _};
 
 /// Hover provider.
@@ -86,8 +86,8 @@ impl InputState {
             let _ = editor.update(cx, |editor, _cx| match hover {
                 Some(hover) => {
                     if let Some(range) = hover.range {
-                        let start = editor.text.position_to_offset(&range.start);
-                        let end = editor.text.position_to_offset(&range.end);
+                        let start = lsp_position_to_offset(&editor.text, &range.start);
+                        let end = lsp_position_to_offset(&editor.text, &range.end);
                         symbol_range = start..end;
                     }
                     let contents = hover_contents_to_plain_text(&hover.contents);

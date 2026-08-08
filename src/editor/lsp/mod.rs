@@ -27,7 +27,7 @@ pub use hover::*;
 pub use semantic_tokens::*;
 pub use session::*;
 
-/// Convert a byte offset to an LSP position (UTF-16 characters).
+/// Convert a byte offset to an LSP position (UTF-16 columns).
 pub(crate) fn lsp_types_position_from_offset(
     text: &Rope,
     offset: usize,
@@ -40,6 +40,30 @@ pub(crate) fn lsp_types_position_from_offset(
         .map(|c| c.len_utf16() as u32)
         .sum();
     lsp_types::Position::new(point.row as u32, character)
+}
+
+/// Convert an LSP position (UTF-16 columns) to a byte offset.
+///
+/// LSP positions are UTF-16 code units; deepterm's `RopeExt::position_to_offset`
+/// is char-based, so LSP callers must use this. Clips to the end of the line
+/// when the column falls inside a surrogate pair.
+pub(crate) fn lsp_position_to_offset(text: &Rope, pos: &lsp_types::Position) -> usize {
+    let line = text.slice_line(pos.line as usize);
+    let mut utf16 = 0u32;
+    let mut byte = 0usize;
+    for c in line.chars() {
+        if utf16 >= pos.character {
+            break;
+        }
+        let c_len = c.len_utf16() as u32;
+        if utf16 + c_len > pos.character {
+            // Column lands inside a surrogate pair: clip before this char.
+            break;
+        }
+        utf16 += c_len;
+        byte += c.len_utf8();
+    }
+    text.line_start_offset(pos.line as usize) + byte
 }
 
 /// A message sent from the editor (main thread) to the LSP session task.
@@ -81,6 +105,11 @@ pub struct Lsp {
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
+    /// The editor text version the cached tokens were generated for. Tokens
+    /// are only composed when it matches the current text version, so stale
+    /// tokens never flicker over a newer document (they are simply skipped
+    /// until fresh ones arrive).
+    semantic_tokens_version: u64,
     _semantic_tokens_task: Task<()>,
     _hover_task: Task<Result<()>>,
     _completion_task: Task<()>,
@@ -100,6 +129,7 @@ impl Default for Lsp {
             definition_provider: None,
             completion_provider: None,
             semantic_tokens: vec![],
+            semantic_tokens_version: 0,
             _semantic_tokens_task: Task::ready(()),
             _hover_task: Task::ready(Ok(())),
             _completion_task: Task::ready(()),
@@ -133,24 +163,21 @@ impl Lsp {
     pub(crate) fn set_semantic_tokens(
         &mut self,
         tokens: Vec<(lsp_types::Range, SharedString)>,
+        version: u64,
         cx: &mut Context<InputState>,
     ) {
-        if tokens != self.semantic_tokens {
+        if tokens != self.semantic_tokens || version != self.semantic_tokens_version {
             self.semantic_tokens = tokens;
+            self.semantic_tokens_version = version;
             cx.notify();
         }
     }
 
-    /// Drop cached semantic tokens when the document changes. Without this,
-    /// stale tokens (byte ranges from the pre-edit text) are composed onto
-    /// the new text and flicker as the cursor moves / text shifts; the fresh
-    /// tokens arrive asynchronously right after.
-    pub(crate) fn invalidate_semantic_tokens(&mut self, cx: &mut Context<InputState>) {
-        if !self.semantic_tokens.is_empty() {
-            self.semantic_tokens.clear();
-            cx.notify();
-        }
+    /// The version of the document the cached tokens were generated for.
+    pub(crate) fn semantic_tokens_version(&self) -> u64 {
+        self.semantic_tokens_version
     }
+
 
     pub(crate) fn document_uri(&self) -> &str {
         &self.document_uri

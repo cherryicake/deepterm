@@ -7,7 +7,7 @@ use ropey::Rope;
 
 use super::display_map::DisplayMap;
 use crate::components::input::{InputEdit, RopeExt as _};
-use crate::syntax::{DiagnosticSet, SyntaxHighlighter};
+use crate::editor::syntax::{DiagnosticSet, SyntaxHighlighter};
 
 pub(crate) struct PendingBackgroundParse {
     pub highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
@@ -282,7 +282,7 @@ impl InputMode {
 mod tests {
     use ropey::Rope;
 
-    use crate::syntax::DiagnosticSet;
+    use crate::editor::syntax::DiagnosticSet;
 
     use super::InputMode;
 

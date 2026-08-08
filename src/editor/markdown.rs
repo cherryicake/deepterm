@@ -14,7 +14,7 @@ use gpui::{
 use crate::sidebar_view::font_settings::{
     platform_default_fallbacks, platform_default_font_family,
 };
-use crate::syntax::SyntaxHighlighter;
+use crate::editor::syntax::SyntaxHighlighter;
 use crate::theme::{ActiveTheme, AppTheme};
 
 use super::markdown_element::MarkdownElementBuilder;

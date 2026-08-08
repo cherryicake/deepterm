@@ -268,7 +268,7 @@ impl LspClient {
     }
 
     /// textDocument/semanticTokens/range — returns the raw delta-encoded
-    /// tokens (decode with [`crate::components::input::lsp::decode_semantic_tokens`]).
+    /// tokens (decode with [`crate::editor::lsp::decode_semantic_tokens`]).
     pub async fn semantic_tokens_range(
         &mut self,
         uri: &str,

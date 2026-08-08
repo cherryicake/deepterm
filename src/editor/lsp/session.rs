@@ -221,7 +221,8 @@ async fn fetch_and_apply(
     log::debug!("LSP semantic tokens: {} (uri={})", decoded.len(), uri);
 
     let _ = cx.update(|cx| editor.update(cx, |state, cx| {
-        state.lsp.set_semantic_tokens(decoded, cx);
+        let version = state.text_version;
+        state.lsp.set_semantic_tokens(decoded, version, cx);
     }));
     Ok(())
 }

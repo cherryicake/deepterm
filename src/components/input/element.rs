@@ -1073,13 +1073,19 @@ impl TextElement {
         drop(highlighter_ref);
 
         // LSP semantic tokens layered on top of the tree-sitter styles
-        // (composed below the diff word colors). Colors resolve from the
-        // token type name against the active highlight theme at paint time.
-        let semantic_styles = state.lsp.semantic_tokens_for_range(
-            &state.text,
-            &visible_byte_range,
-            &cx.theme().highlight_theme,
-        );
+        // (composed below the diff word colors). Only compose tokens that
+        // were fetched for the *current* text version — stale tokens (byte
+        // ranges from a pre-edit document) would flicker as the text shifts
+        // while typing.
+        let semantic_styles = if state.lsp.semantic_tokens_version() == state.text_version {
+            state.lsp.semantic_tokens_for_range(
+                &state.text,
+                &visible_byte_range,
+                &cx.theme().highlight_theme,
+            )
+        } else {
+            Vec::new()
+        };
         if !semantic_styles.is_empty() {
             styles = gpui::combine_highlights(semantic_styles, styles).collect();
         }

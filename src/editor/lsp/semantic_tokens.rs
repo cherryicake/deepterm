@@ -12,8 +12,8 @@ use lsp_types::{Position, SemanticTokens, SemanticTokensLegend};
 use ropey::Rope;
 
 use crate::components::input::{InputState, RopeExt};
-use crate::components::input::lsp::Lsp;
-use crate::syntax::HighlightTheme;
+use crate::editor::lsp::{Lsp, lsp_position_to_offset, lsp_types_position_from_offset};
+use crate::editor::syntax::HighlightTheme;
 
 /// A provider of semantic highlighting tokens, layered on top of the
 /// built-in tree-sitter highlighter.
@@ -27,7 +27,7 @@ use crate::syntax::HighlightTheme;
 /// Returned tokens are delta-encoded with a numeric `token_type` that
 /// indexes [`legend`](Self::legend)`.token_types`. The editor resolves each
 /// type *name* against the active
-/// [`HighlightTheme`](crate::syntax::HighlightTheme) at paint time — the
+/// [`HighlightTheme`](crate::editor::syntax::HighlightTheme) at paint time — the
 /// same vocabulary the tree-sitter path uses (`"keyword"`, `"comment"`,
 /// `"string"`, …; `"keyword.modifier"` falls back to `"keyword"`).
 pub trait DocumentRangeSemanticTokensProvider {
@@ -64,8 +64,8 @@ impl Lsp {
             return Vec::new();
         }
 
-        let visible_start = text.offset_to_position(visible_range.start);
-        let visible_end = text.offset_to_position(visible_range.end);
+        let visible_start = lsp_types_position_from_offset(text, visible_range.start);
+        let visible_end = lsp_types_position_from_offset(text, visible_range.end);
 
         // Cache is sorted by `range.start`. A token can only touch the
         // viewport if its start is before `visible_end` (upper bound) and it
@@ -81,8 +81,8 @@ impl Lsp {
         self.semantic_tokens[lo..hi]
             .iter()
             .filter_map(|(range, name)| {
-                let start = text.position_to_offset(&range.start);
-                let end = text.position_to_offset(&range.end);
+                let start = lsp_position_to_offset(text, &range.start);
+                let end = lsp_position_to_offset(text, &range.end);
                 if start >= end || start >= visible_range.end || end <= visible_range.start {
                     return None;
                 }
@@ -180,7 +180,7 @@ pub(crate) fn decode_semantic_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
+    use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
 
     fn test_theme() -> HighlightTheme {
         HighlightTheme {
@@ -285,6 +285,27 @@ mod tests {
             styles[0].1 != HighlightStyle::default(),
             "'keyword' should resolve to a non-default style"
         );
+    }
+
+    #[test]
+    fn test_utf16_position_conversion() {
+        // LSP positions are UTF-16 code units; CJK chars are 1 unit, emoji
+        // are 2. Conversions must be exact or highlights land on the wrong
+        // bytes for any file containing non-ASCII text.
+        use crate::editor::lsp::{lsp_position_to_offset, lsp_types_position_from_offset};
+
+        let text = Rope::from("fn 中文() {}\n");
+        // 中 (bytes 3..6), 文 (6..9). UTF-16 col 5 = after 文.
+        assert_eq!(lsp_position_to_offset(&text, &Position::new(0, 5)), 9);
+        // Round trip: byte 9 (after 文) -> UTF-16 col 5.
+        assert_eq!(lsp_types_position_from_offset(&text, 9), Position::new(0, 5));
+
+        let emoji = Rope::from("let 🎉 = 1\n");
+        // 🎉 is 4 bytes / 2 UTF-16 units. UTF-16 col 5 = inside the emoji ->
+        // clipped to its start (byte 4 = "let ").
+        assert_eq!(lsp_position_to_offset(&emoji, &Position::new(0, 5)), 4);
+        // Round trip from after the emoji: bytes 4+4=8 ("let 🎉") -> col 6.
+        assert_eq!(lsp_types_position_from_offset(&emoji, 8), Position::new(0, 6));
     }
 
     #[test]

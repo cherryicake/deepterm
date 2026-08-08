@@ -2,7 +2,7 @@
 //!
 //! Ported from gpui-component's `input/lsp/definitions.rs`, adapted so the
 //! actual LSP round-trip happens in the session task (which owns the async
-//! client); the editor sends [`LspChange::Definition`](crate::components::input::lsp::LspChange)
+//! client); the editor sends [`LspChange::Definition`](crate::editor::lsp::LspChange)
 //! through the change channel and updates [`HoverDefinition`] when the reply
 //! arrives.
 
@@ -16,7 +16,7 @@ use std::{ops::Range, rc::Rc};
 use crate::components::input::{GoToDefinition, InputState, RopeExt as _, element::TextElement};
 use crate::theme::ActiveTheme;
 
-use super::LspChange;
+use super::{LspChange, lsp_position_to_offset};
 
 /// Definition provider.
 ///
@@ -110,8 +110,8 @@ impl InputState {
                 } else {
                     if let Some(location) = locations.first() {
                         if let Some(range) = location.origin_selection_range {
-                            let start = editor.text.position_to_offset(&range.start);
-                            let end = editor.text.position_to_offset(&range.end);
+                            let start = lsp_position_to_offset(&editor.text, &range.start);
+                            let end = lsp_position_to_offset(&editor.text, &range.end);
                             symbol_range = start..end;
                         }
                     }
@@ -193,8 +193,8 @@ impl InputState {
         }
 
         let target_range = location.target_selection_range;
-        let start = self.text.position_to_offset(&target_range.start);
-        let end = self.text.position_to_offset(&target_range.end);
+        let start = lsp_position_to_offset(&self.text, &target_range.start);
+        let end = lsp_position_to_offset(&self.text, &target_range.end);
 
         self.move_to(start, None, cx);
         self.select_to(end, cx);

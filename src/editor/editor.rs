@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
-use crate::components::input::lsp::LspServerSpec;
+use crate::editor::lsp::LspServerSpec;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::file_icons::file_icon_or_default;
@@ -1716,6 +1716,26 @@ fn path_to_file_uri(path: &Path) -> String {
     format!("file://{}", abs.display())
 }
 
+/// Walk up from `path` to find a workspace root (a `Cargo.toml` or `.git`
+/// directory). LSP servers (rust-analyzer especially) need the project root,
+/// not the file's directory, to resolve completions and definitions.
+fn workspace_root(path: &Path) -> PathBuf {
+    let mut dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
+    loop {
+        if dir.join("Cargo.toml").exists() || dir.join(".git").exists() {
+            return dir;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    dir
+}
+
 /// LSP server configuration for a language, when one is available on this
 /// machine. Only local (non-SSH) files get a session.
 fn lsp_server_spec(language: &str, path: &Path) -> Option<LspServerSpec> {
@@ -1724,10 +1744,7 @@ fn lsp_server_spec(language: &str, path: &Path) -> Option<LspServerSpec> {
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    let root_uri = abs
-        .parent()
-        .map(|p| format!("file://{}", p.display()))
-        .unwrap_or_default();
+    let root_uri = format!("file://{}", workspace_root(&abs).display());
 
     let spec = match language {
         "rust" => LspServerSpec {

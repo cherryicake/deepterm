@@ -32,7 +32,7 @@ use gpui::{
 
 use crate::components::input::{EditorInput, InputState};
 use crate::editor::editor::Editor;
-use crate::syntax::{HighlightTheme, SimpleHighlighter};
+use crate::editor::syntax::{HighlightTheme, SimpleHighlighter};
 use crate::theme::ActiveTheme;
 use ropey::Rope;
 
@@ -1095,7 +1095,7 @@ fn map_line_new_to_old(new_line: u32, hunks: &[DiffHunk]) -> u32 {
 mod tests {
     use super::*;
     use crate::editor::diff_model::build_unified;
-    use crate::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
+    use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
     use crate::theme::ThemeAppearance;
 
     fn test_theme() -> HighlightTheme {

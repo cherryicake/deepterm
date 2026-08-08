@@ -9,7 +9,7 @@ pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::syntax::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
+use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

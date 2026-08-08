@@ -160,7 +160,7 @@ impl SimpleHighlighter {
             ),
             _ => None,
         };
-        let injections_query = crate::syntax::LanguageRegistry::singleton()
+        let injections_query = crate::editor::syntax::LanguageRegistry::singleton()
             .language(lang)
             .and_then(|config| Query::new(&config.language, &config.injections).ok())
             .map(std::sync::Arc::new);
@@ -246,7 +246,7 @@ impl SimpleHighlighter {
     pub fn styles(
         &mut self,
         range: &Range<usize>,
-        theme: &crate::syntax::HighlightTheme,
+        theme: &crate::editor::syntax::HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         let query = match &self.query {
             Some(q) => q,
@@ -306,7 +306,7 @@ impl SimpleHighlighter {
             let Some(tree) = &layer.tree else {
                 continue;
             };
-            let Some(config) = crate::syntax::LanguageRegistry::singleton()
+            let Some(config) = crate::editor::syntax::LanguageRegistry::singleton()
                 .language(&layer.language_name)
             else {
                 continue;
@@ -434,7 +434,7 @@ impl SimpleHighlighter {
         // 3. Parse each language's embedded content (merged ranges).
         let mut layers = std::collections::HashMap::new();
         for (lang, ranges) in by_lang {
-            let Some(config) = crate::syntax::LanguageRegistry::singleton().language(&lang) else {
+            let Some(config) = crate::editor::syntax::LanguageRegistry::singleton().language(&lang) else {
                 continue;
             };
             let mut parser = Parser::new();
@@ -646,7 +646,7 @@ fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
+    use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, registry::SyntaxColors};
     use crate::theme::ThemeAppearance;
 
     fn test_theme() -> HighlightTheme {
@@ -655,15 +655,15 @@ mod tests {
             appearance: ThemeAppearance::Dark,
             style: HighlightThemeStyle {
                 syntax: SyntaxColors {
-                    keyword: Some(crate::syntax::ThemeStyle::color(gpui::red())),
-                    type_: Some(crate::syntax::ThemeStyle::color(gpui::blue())),
-                    function: Some(crate::syntax::ThemeStyle::color(gpui::green())),
-                    number: Some(crate::syntax::ThemeStyle::color(gpui::yellow())),
-                    string: Some(crate::syntax::ThemeStyle::color(gpui::blue())),
-                    comment: Some(crate::syntax::ThemeStyle::color(gpui::red())),
-                    property: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
-                    constant: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x00bcd4).into())),
-                    tag: Some(crate::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
+                    keyword: Some(crate::editor::syntax::ThemeStyle::color(gpui::red())),
+                    type_: Some(crate::editor::syntax::ThemeStyle::color(gpui::blue())),
+                    function: Some(crate::editor::syntax::ThemeStyle::color(gpui::green())),
+                    number: Some(crate::editor::syntax::ThemeStyle::color(gpui::yellow())),
+                    string: Some(crate::editor::syntax::ThemeStyle::color(gpui::blue())),
+                    comment: Some(crate::editor::syntax::ThemeStyle::color(gpui::red())),
+                    property: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
+                    constant: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x00bcd4).into())),
+                    tag: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
                     ..Default::default()
                 },
                 ..Default::default()
