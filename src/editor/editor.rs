@@ -310,7 +310,7 @@ impl Editor {
 
         let file = EditorFile {
             id: file_info.id.clone(),
-            path: path_str,
+            path: path_str.clone(),
             label,
             ssh_config: ssh_config.clone(),
             editor_state: editor_state.clone(),
@@ -323,6 +323,23 @@ impl Editor {
         };
 
         self.open_files.push(file);
+
+        // Restart the LSP session for supported languages: the cached editor
+        // state's change channel points at a session from before the cache
+        // was taken (possibly another window or a process that has since
+        // exited), so a fresh attach is required.
+        if ssh_config.is_none() && !is_markdown {
+            let lang = guess_language_from_extension(Path::new(&path_str));
+            let path = PathBuf::from(&path_str);
+            if let Some(spec) = lsp_server_spec(&lang, &path) {
+                let uri = path_to_file_uri(&path);
+                editor_state.update(cx, |state, cx| {
+                    if state.lsp.change_tx.is_none() {
+                        state.attach_lsp(uri, spec, cx);
+                    }
+                });
+            }
+        }
 
         // 启动文件监视器
         if let Some(config) = ssh_config {

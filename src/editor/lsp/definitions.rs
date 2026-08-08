@@ -71,10 +71,22 @@ impl HoverDefinition {
 
 impl InputState {
     /// Send a definition request to the LSP session and update the hover
-    /// underline when the reply arrives.
+    /// underline when the reply arrives. When `jump_on_result` is set (Cmd+
+    /// click without a prior hover), the editor jumps to the definition once
+    /// the reply arrives.
     pub(crate) fn handle_hover_definition(
         &mut self,
         offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_definition(offset, false, window, cx);
+    }
+
+    fn request_definition(
+        &mut self,
+        offset: usize,
+        jump_on_result: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -83,6 +95,11 @@ impl InputState {
         };
 
         if self.hover_definition.is_same(offset) {
+            if jump_on_result {
+                if let Some(location) = self.hover_definition.locations.first().cloned() {
+                    self.go_to_definition(&location, cx);
+                }
+            }
             return;
         }
 
@@ -119,6 +136,11 @@ impl InputState {
                     editor
                         .hover_definition
                         .update(symbol_range.clone(), locations.clone());
+                    if jump_on_result {
+                        if let Some(location) = locations.first().cloned() {
+                            editor.go_to_definition(&location, cx);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -140,12 +162,14 @@ impl InputState {
             }
 
             if let Some(location) = locations.first().cloned() {
-                self.go_to_definition(&location, window, cx);
+                self.go_to_definition(&location, cx);
             }
         }
     }
 
-    /// Return true if handled (Cmd+click on a hovered symbol).
+    /// Return true if handled (Cmd+click on a symbol). Jumps immediately when
+    /// the hover definition is already cached; otherwise requests it and
+    /// jumps on the reply.
     pub(crate) fn handle_click_hover_definition(
         &mut self,
         event: &MouseDownEvent,
@@ -157,23 +181,22 @@ impl InputState {
             return false;
         }
 
-        if self.hover_definition.is_empty() || !self.hover_definition.is_same(offset) {
-            return false;
+        if !self.hover_definition.is_empty() && self.hover_definition.is_same(offset) {
+            if let Some(location) = self.hover_definition.locations.first().cloned() {
+                self.go_to_definition(&location, cx);
+                return true;
+            }
         }
 
-        let Some(location) = self.hover_definition.locations.first().cloned() else {
-            return false;
-        };
-
-        self.go_to_definition(&location, window, cx);
-
+        // No cached definition (user clicked without hovering first): request
+        // it and jump when the reply arrives.
+        self.request_definition(offset, true, window, cx);
         true
     }
 
     pub(crate) fn go_to_definition(
         &mut self,
         location: &lsp_types::LocationLink,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let uri = location.target_uri.to_string();

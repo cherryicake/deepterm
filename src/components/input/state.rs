@@ -2051,8 +2051,8 @@ impl InputState {
 
     pub(crate) fn on_key_down(
         &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
+        _event: &KeyDownEvent,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pause_blink_cursor(cx);
