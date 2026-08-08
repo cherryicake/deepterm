@@ -2413,6 +2413,10 @@ impl EntityInputHandler for InputState {
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
         self.lsp.update(&self.text, window, cx);
+        // Invalidate stale semantic tokens (their byte ranges refer to the
+        // pre-edit text) so the editor doesn't flicker while fresh tokens
+        // are fetched.
+        self.lsp.invalidate_semantic_tokens(cx);
         self.push_lsp_change(cx);
         // Request completions when typing (non-whitespace input).
         if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting {

@@ -219,7 +219,7 @@ impl SimpleHighlighter {
         #[allow(deprecated)]
         self.parser
             .set_timeout_micros(timeout.map_or(0, |t| t.as_micros() as u64));
-        self.tree = self.parser.parse_with_options(
+        let new_tree = self.parser.parse_with_options(
             &mut |offset, _| {
                 if offset >= self.text.len() {
                     return &[] as &[u8];
@@ -231,6 +231,14 @@ impl SimpleHighlighter {
             old_tree.as_ref(),
             None,
         );
+        if new_tree.is_some() {
+            self.tree = new_tree;
+        }
+        // On timeout/failure keep the previous tree (already shifted by the
+        // edit): dropping it would blank the highlights until the background
+        // parse lands, making the editor flicker on every keystroke in large
+        // files. The return value still reports success so callers schedule a
+        // background parse when the sync parse did not finish.
         self.tree.is_some()
     }
 

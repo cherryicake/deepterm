@@ -84,21 +84,31 @@ impl EditorInput {
             })
     }
 
-    /// Floating completion popup (anchored at the bottom of the editor).
-    /// Returns `None` when there is nothing to show so the element tree stays
-    /// stable when the popup closes.
+    /// Floating completion popup, anchored just below the cursor. Returns
+    /// `None` when there is nothing to show so the element tree stays stable
+    /// when the popup closes.
     fn completion_menu_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
         let menu = state.completion_menu.as_ref()?;
         if !menu.visible || menu.items.is_empty() {
             return None;
         }
         let theme = cx.theme();
+        // Anchor below the cursor (fall back to the top-left when the editor
+        // has not laid out yet).
+        let (left, top) = state
+            .last_layout
+            .as_ref()
+            .and_then(|l| {
+                l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
+            })
+            .unwrap_or((px(0.0), px(0.0)));
         let el = div()
             .id("completion-menu")
             .absolute()
-            .bottom_0()
-            .left_0()
-            .w_full()
+            .left(left)
+            .top(top)
+            .min_w(px(260.0))
+            .max_w(px(520.0))
             .max_h(px(240.0))
             .overflow_y_scroll()
             .bg(theme.elevated_background)
@@ -132,18 +142,25 @@ impl EditorInput {
         Some(el.into_any_element())
     }
 
-    /// Floating hover popover (anchored at the top of the editor).
+    /// Floating hover popover, anchored just below the cursor.
     fn hover_popover_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
         let popover = state.hover_popover.as_ref()?;
         if popover.contents.is_empty() {
             return None;
         }
         let theme = cx.theme();
+        let (left, top) = state
+            .last_layout
+            .as_ref()
+            .and_then(|l| {
+                l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
+            })
+            .unwrap_or((px(0.0), px(0.0)));
         let el = div()
             .id("hover-popover")
             .absolute()
-            .top_0()
-            .left_0()
+            .left(left)
+            .top(top)
             .max_w(px(480.0))
             .max_h(px(200.0))
             .overflow_y_scroll()

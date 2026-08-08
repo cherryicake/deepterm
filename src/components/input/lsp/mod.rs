@@ -141,6 +141,17 @@ impl Lsp {
         }
     }
 
+    /// Drop cached semantic tokens when the document changes. Without this,
+    /// stale tokens (byte ranges from the pre-edit text) are composed onto
+    /// the new text and flicker as the cursor moves / text shifts; the fresh
+    /// tokens arrive asynchronously right after.
+    pub(crate) fn invalidate_semantic_tokens(&mut self, cx: &mut Context<InputState>) {
+        if !self.semantic_tokens.is_empty() {
+            self.semantic_tokens.clear();
+            cx.notify();
+        }
+    }
+
     pub(crate) fn document_uri(&self) -> &str {
         &self.document_uri
     }
