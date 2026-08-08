@@ -142,7 +142,8 @@ impl EditorInput {
         Some(el.into_any_element())
     }
 
-    /// Floating hover popover, anchored just below the cursor.
+    /// Floating hover popover, anchored just below the hovered symbol (the
+    /// mouse position — NOT the text cursor, which may be far away).
     fn hover_popover_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
         let popover = state.hover_popover.as_ref()?;
         if popover.contents.is_empty() {
@@ -150,10 +151,12 @@ impl EditorInput {
         }
         let theme = cx.theme();
         let (left, top) = state
-            .last_layout
-            .as_ref()
-            .and_then(|l| {
-                l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
+            .range_to_bounds(&popover.symbol_range)
+            .map(|b| (b.origin.x, b.origin.y + b.size.height))
+            .or_else(|| {
+                state.last_layout.as_ref().and_then(|l| {
+                    l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
+                })
             })
             .unwrap_or((px(0.0), px(0.0)));
         let el = div()

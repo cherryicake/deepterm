@@ -83,7 +83,7 @@ impl InputState {
                 _ => None,
             };
 
-            let _ = editor.update(cx, |editor, _cx| match hover {
+            let _ = editor.update(cx, |editor, cx| match hover {
                 Some(hover) => {
                     if let Some(range) = hover.range {
                         let start = lsp_position_to_offset(&editor.text, &range.start);
@@ -91,13 +91,21 @@ impl InputState {
                         symbol_range = start..end;
                     }
                     let contents = hover_contents_to_plain_text(&hover.contents);
+                    let had_popover = editor.hover_popover.is_some();
                     editor.hover_popover = Some(super::HoverPopoverData {
                         symbol_range: symbol_range.clone(),
                         contents,
                     });
+                    if !had_popover {
+                        // Must repaint so the popup appears (mouse-move
+                        // handlers already ran with the old state).
+                        cx.notify();
+                    }
                 }
                 None => {
-                    editor.hover_popover = None;
+                    if editor.hover_popover.take().is_some() {
+                        cx.notify();
+                    }
                 }
             });
 
