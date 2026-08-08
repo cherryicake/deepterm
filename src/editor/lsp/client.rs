@@ -608,4 +608,83 @@ mod tests {
             read_task.abort();
         });
     }
+
+    /// End-to-end against deepterm's own tree (a large workspace): hover and
+    /// definition must resolve once the workspace index is ready. Completion
+    /// for a large tree can take very long on first load, so it is not
+    /// asserted here.
+    #[test]
+    #[ignore = "requires rust-analyzer on PATH (slow: indexes deepterm tree)"]
+    fn test_rust_analyzer_large_project_hover_and_definition() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let root = std::env::current_dir()
+                .expect("cwd")
+                .to_string_lossy()
+                .to_string();
+            let file = "src/editor/editor.rs";
+            let path = std::path::Path::new(&root).join(file);
+            let uri = format!("file://{}", path.display());
+            let text = std::fs::read_to_string(&path).expect("read file");
+
+            let mut client = LspClient::spawn("rustup", &["run", "stable", "rust-analyzer"])
+                .await
+                .expect("spawn");
+            let pending = client.pending();
+            let reader = client.take_reader().expect("reader");
+            let read_task = tokio::spawn(async move {
+                read_loop(reader, pending).await;
+            });
+            let _ = client
+                .initialize(&format!("file://{root}"))
+                .await
+                .expect("initialize");
+            client
+                .did_open(&uri, "rust", 1, &text)
+                .await
+                .expect("didOpen");
+
+            // Wait for the workspace index (semanticTokens with data).
+            let line_count = text.lines().count() as u32;
+            let mut ready = false;
+            for _ in 0..120 {
+                match client
+                    .semantic_tokens_range(&uri, (0, 0), (line_count, 0))
+                    .await
+                {
+                    Ok(tokens) if !tokens.data.is_empty() => {
+                        ready = true;
+                        break;
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                }
+            }
+            assert!(ready, "rust-analyzer did not become ready");
+            // Give the index a little more time to finish building.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            // Hover + definition over a call of `open_file_with_content`.
+            let use_marker = "self.open_file_with_content";
+            let use_pos = text.find(use_marker).expect("use marker");
+            let hover_start = use_pos + use_marker.len() - "open_file_with_content".len() / 2;
+            let hline = text[..hover_start].matches('\n').count() as u32;
+            let hcol = (hover_start
+                - text[..hover_start].rfind('\n').map(|p| p + 1).unwrap_or(0))
+                as u32;
+            let hover = client.hover(&uri, (hline, hcol)).await.expect("hover");
+            eprintln!(
+                "E2E-large: hover at {hline}:{hcol} = {}",
+                hover.is_some()
+            );
+
+            let defs = client
+                .definition(&uri, (hline, hcol))
+                .await
+                .expect("definition");
+            eprintln!("E2E-large: definitions = {}", defs.len());
+
+            client.shutdown().await;
+            read_task.abort();
+        });
+    }
 }

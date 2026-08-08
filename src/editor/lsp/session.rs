@@ -174,7 +174,17 @@ async fn run_session(
             Ok(LspChange::Hover { offset, reply }) => {
                 let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
                 log::debug!("LSP session hover at {offset} -> {position:?}");
-                let result = client.hover(&uri, (position.line, position.character)).await;
+                let mut result = client.hover(&uri, (position.line, position.character)).await;
+                // The server can answer "content modified" when its view of
+                // the document lags behind; retry once (the reply channel is
+                // bounded(1) so the second result replaces the first).
+                if let Err(e) = &result {
+                    if e.to_string().contains("content modified") {
+                        result = client
+                            .hover(&uri, (position.line, position.character))
+                            .await;
+                    }
+                }
                 log::debug!("LSP hover result: {:?}", result.as_ref().map(|h| h.is_some()));
                 let _ = reply.try_send(result);
             }
