@@ -370,9 +370,10 @@ impl LspClient {
         serde_json::from_value(resp).context("invalid completion response")
     }
 
-    /// Graceful shutdown: `shutdown` request, `exit` notification.
+    /// Graceful shutdown: send `exit`, then kill. Never awaits a response —
+    /// the server may already have exited (e.g. a rustup shim that died at
+    /// startup), in which case waiting would hang the caller.
     pub async fn shutdown(mut self) {
-        let _ = self.send_request("shutdown", json!(null)).await;
         let _ = self.send_notification("exit", json!(null)).await;
         let _ = self._child.kill();
     }

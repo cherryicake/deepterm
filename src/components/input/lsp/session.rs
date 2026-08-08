@@ -57,12 +57,21 @@ async fn spawn_and_initialize(
     spec: &LspServerSpec,
     cx: &AsyncApp,
 ) -> Option<LspClient> {
-    let mut commands: Vec<(&str, Vec<&'static str>)> = vec![(spec.command, spec.args.to_vec())];
+    // The primary command fails fast (a rustup shim that lacks the component
+    // exits immediately and the initialize request would hang); the fallback
+    // gets a generous budget because a real rust-analyzer can take a while to
+    // start for the first time.
+    let mut attempts: Vec<(&str, Vec<&'static str>, std::time::Duration)> =
+        vec![(spec.command, spec.args.to_vec(), std::time::Duration::from_secs(3))];
     if spec.command == "rust-analyzer" {
-        commands.push(("rustup", vec!["run", "stable", "rust-analyzer"]));
+        attempts.push((
+            "rustup",
+            vec!["run", "stable", "rust-analyzer"],
+            std::time::Duration::from_secs(30),
+        ));
     }
 
-    for (cmd, args) in commands {
+    for (cmd, args, timeout) in attempts {
         let spawned = cx
             .background_executor()
             .spawn({
@@ -72,6 +81,7 @@ async fn spawn_and_initialize(
             })
             .await;
         let Ok(mut client) = spawned else {
+            log::warn!("LSP spawn failed for {cmd}");
             continue;
         };
 
@@ -87,14 +97,15 @@ async fn spawn_and_initialize(
 
         let root = spec.root_uri.clone();
         let init = async { client.initialize(&root).await };
-        let timeout = async {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(8))
-                .await;
+        let timeout_fut = async {
+            cx.background_executor().timer(timeout).await;
             Err::<serde_json::Value, anyhow::Error>(anyhow::anyhow!("initialize timeout"))
         };
-        match smol::future::race(init, timeout).await {
-            Ok(_) => return Some(client),
+        match smol::future::race(init, timeout_fut).await {
+            Ok(_) => {
+                log::info!("LSP initialized via {cmd}");
+                return Some(client);
+            }
             Err(e) => {
                 log::warn!("LSP initialize failed via {cmd}: {e}");
                 let _ = client.shutdown().await;
@@ -132,8 +143,12 @@ async fn run_session(
     // Wait for the first content push from the editor.
     let mut current_text = match rx.recv().await {
         Ok(LspChange::Text(text)) => text,
-        _ => return,
+        _ => {
+            log::warn!("LSP session: no initial text received");
+            return;
+        }
     };
+    log::debug!("LSP session: got initial text len={}", current_text.len());
 
     let mut version = 1i64;
     let _ = cx.update(|cx| {
@@ -203,6 +218,7 @@ async fn fetch_and_apply(
         .await
         .context("semanticTokens/range failed")?;
     let decoded = decode_semantic_tokens(&tokens, legend);
+    log::debug!("LSP semantic tokens: {} (uri={})", decoded.len(), uri);
 
     let _ = cx.update(|cx| editor.update(cx, |state, cx| {
         state.lsp.set_semantic_tokens(decoded, cx);
