@@ -130,6 +130,11 @@ pub struct Editor {
     content_bottom_padding: f32,
     watcher_subscription: Option<Subscription>,
     remote_watcher_subscription: Option<Subscription>,
+    /// Subscriptions to each open editor's InputState so that state changes
+    /// (hover popup, completion menu, search matches, cursor, …) re-render
+    /// the Editor — the popups are rendered by EditorInput, not by the input
+    /// element itself, so without this the UI never updates.
+    editor_state_subscriptions: Vec<Subscription>,
     /// tab_id -> in-flight load generation (supersedes stale tasks after tab-group swap).
     loading_gens: HashMap<String, u64>,
     next_load_generation: u64,
@@ -154,6 +159,7 @@ impl Editor {
             content_bottom_padding: 0.0,
             watcher_subscription: None,
             remote_watcher_subscription: None,
+            editor_state_subscriptions: Vec::new(),
             loading_gens: HashMap::new(),
             next_load_generation: 0,
         };
@@ -307,6 +313,11 @@ impl Editor {
         } else {
             None
         };
+
+        // Re-render the Editor when the restored editor's InputState changes
+        // (hover popup / completion menu / search matches).
+        self.editor_state_subscriptions
+            .push(cx.observe(&editor_state, |_, _, cx| cx.notify()));
 
         let file = EditorFile {
             id: file_info.id.clone(),
@@ -1234,6 +1245,14 @@ impl Editor {
             state.disabled = is_image || is_loading;
             state
         });
+
+        // Re-render the Editor when this editor's InputState changes
+        // (hover popup / completion menu / search matches / cursor): the
+        // popups are rendered by EditorInput, which only re-renders when the
+        // Editor does.
+        self.editor_state_subscriptions.push(
+            cx.observe(&editor_state, |_, _, cx| cx.notify()),
+        );
 
         // LSP: start a session for supported languages on local files so
         // semantic highlighting can layer on top of tree-sitter.
