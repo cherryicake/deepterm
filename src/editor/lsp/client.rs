@@ -211,8 +211,8 @@ impl LspClient {
             }
         };
         let timeout = async {
-            smol::Timer::after(std::time::Duration::from_secs(20)).await;
-            Err::<Value, anyhow::Error>(anyhow!("LSP request {method} timed out after 20s"))
+            smol::Timer::after(std::time::Duration::from_secs(8)).await;
+            Err::<Value, anyhow::Error>(anyhow!("LSP request {method} timed out after 8s"))
         };
         smol::future::race(recv, timeout).await
     }
@@ -662,6 +662,11 @@ mod tests {
             assert!(ready, "rust-analyzer did not become ready");
             // Give the index a little more time to finish building.
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            // Re-sync the document version (the server can answer "content
+            // modified" otherwise) before the hover request.
+            let _ = client.did_change(&uri, 2, &text).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             // Hover + definition over a call of `open_file_with_content`.
             let use_marker = "self.open_file_with_content";

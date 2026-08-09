@@ -175,11 +175,14 @@ async fn run_session(
                 let position = super::lsp_types_position_from_offset(&current_rope(&current_text), offset);
                 log::debug!("LSP session hover at {offset} -> {position:?}");
                 let mut result = client.hover(&uri, (position.line, position.character)).await;
-                // The server can answer "content modified" when its view of
-                // the document lags behind; retry once (the reply channel is
-                // bounded(1) so the second result replaces the first).
+                // The server answers "content modified" when its document
+                // version lags behind; re-sync with didChange and retry once.
                 if let Err(e) = &result {
                     if e.to_string().contains("content modified") {
+                        version += 1;
+                        let _ = client
+                            .did_change(&uri, version, &current_text)
+                            .await;
                         result = client
                             .hover(&uri, (position.line, position.character))
                             .await;
