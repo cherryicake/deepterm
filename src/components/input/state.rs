@@ -2445,8 +2445,13 @@ impl EntityInputHandler for InputState {
             .adjust_semantic_tokens_for_edit(&range, new_text);
         self.lsp.update(&self.text, window, cx);
         self.push_lsp_change(cx);
-        // Request completions when typing (non-whitespace input).
-        if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting {
+        // When the completion menu is already open, filter it locally as the
+        // user types (no server round-trip — avoids flicker); only a fresh
+        // word triggers a new request.
+        if self.is_completion_open() && !self.completion_inserting {
+            self.filter_completion(cx);
+        } else if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting
+        {
             self.schedule_completion(window, cx);
         } else if new_text.is_empty() && !self.completion_inserting {
             self.close_completion(cx);

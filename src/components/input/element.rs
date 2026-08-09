@@ -639,8 +639,14 @@ impl TextElement {
                     state.line_and_position_for_offset(popover.symbol_range.start).2
                 {
                     let below = bounds.origin + pos + point(px(0.), line_height);
+                    // When flipping above, leave the hovered symbol's own
+                    // line visible (popup bottom sits one line above it), so
+                    // it never covers the symbol being inspected.
                     let origin = if below.y + px(200.0) > viewport_bottom {
-                        point(below.x, (below.y - px(200.0)).max(viewport_top))
+                        point(
+                            below.x,
+                            (below.y - px(200.0) - line_height).max(viewport_top),
+                        )
                     } else {
                         below
                     };
@@ -715,6 +721,8 @@ impl TextElement {
                     .px_2()
                     .py_1()
                     .rounded(px(4.0))
+                    .whitespace_nowrap()
+                    .flex_nowrap()
                     .text_color(if selected {
                         theme.accent_foreground
                     } else {
@@ -736,10 +744,20 @@ impl TextElement {
                             .text_center()
                             .child(kind_char.to_string()),
                     )
-                    .child(div().flex_1().overflow_x_hidden().child(item.label.clone()));
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_x_hidden()
+                            .text_ellipsis()
+                            .child(item.label.clone()),
+                    );
                 match item.detail.as_ref() {
                     Some(detail) => row.child(
                         div()
+                            .max_w(px(200.0))
+                            .overflow_x_hidden()
+                            .text_ellipsis()
                             .text_color(if selected {
                                 theme.accent_foreground.opacity(0.8)
                             } else {

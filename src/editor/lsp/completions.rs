@@ -30,12 +30,36 @@ pub trait CompletionProvider {
 /// The completion popup state rendered by the editor element.
 #[derive(Clone, Default)]
 pub(crate) struct CompletionMenu {
+    /// Items currently shown (filtered by the typed prefix).
     pub(crate) items: Vec<CompletionItem>,
+    /// The full item list from the server (used to re-filter locally while
+    /// typing, avoiding flicker from repeated requests).
+    pub(crate) full_items: Vec<CompletionItem>,
     pub(crate) selected: usize,
     /// Byte offset where the current word started (completion replaces from
     /// here to the cursor).
     pub(crate) trigger_start: usize,
     pub(crate) visible: bool,
+}
+
+impl CompletionMenu {
+    /// Re-filter the full item list by the typed prefix (zed filters locally
+    /// while the menu is open instead of re-requesting on every keystroke).
+    pub(crate) fn filter(&mut self, query: &str) {
+        if query.is_empty() {
+            self.items = self.full_items.clone();
+        } else {
+            let lower = query.to_lowercase();
+            self.items = self
+                .full_items
+                .iter()
+                .filter(|it| it.label.to_lowercase().contains(&lower))
+                .cloned()
+                .collect();
+        }
+        self.selected = 0;
+        self.visible = !self.items.is_empty();
+    }
 }
 
 impl CompletionMenu {
@@ -114,6 +138,7 @@ impl InputState {
                 }
                 log::debug!("completion: showing {} items", items.len());
                 editor.completion_menu = Some(super::CompletionMenu {
+                    full_items: items.clone(),
                     items,
                     selected: 0,
                     trigger_start,
@@ -122,6 +147,29 @@ impl InputState {
                 cx.notify();
             });
         });
+    }
+
+    /// Re-filter the open menu by the text typed since it opened (local,
+    /// no server round-trip — prevents the popup from flickering on every
+    /// keystroke).
+    pub(crate) fn filter_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.completion_menu.as_ref() else {
+            return;
+        };
+        let trigger_start = menu.trigger_start;
+        let cursor = self.cursor();
+        if cursor < trigger_start {
+            if menu.visible {
+                self.completion_menu.as_mut().unwrap().visible = false;
+                cx.notify();
+            }
+            return;
+        }
+        let query = self.text.slice(trigger_start..cursor).to_string();
+        if let Some(menu) = self.completion_menu.as_mut() {
+            menu.filter(&query);
+        }
+        cx.notify();
     }
 
     /// Navigate the completion list. Returns true when handled (menu open).
