@@ -56,7 +56,7 @@ impl Lsp {
     /// instead of scanning the whole document.
     pub(crate) fn semantic_tokens_for_range(
         &self,
-        _text: &Rope,
+        text: &Rope,
         visible_range: &Range<usize>,
         theme: &HighlightTheme,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -79,8 +79,16 @@ impl Lsp {
                 if range.start >= range.end {
                     return None;
                 }
+                // Shifted ranges can land inside a multi-byte character
+                // (edits with CJK/emoji shift by arbitrary byte counts);
+                // clip to char boundaries or the shaper panics on a bad run.
+                let start = clip_char_boundary(text, range.start, true);
+                let end = clip_char_boundary(text, range.end, false);
+                if end <= start {
+                    return None;
+                }
                 let style = theme.style(name.as_ref())?;
-                Some((range.clone(), style))
+                Some((start..end, style))
             })
             .collect()
     }
@@ -133,6 +141,30 @@ impl Lsp {
                 }
             }
         });
+    }
+}
+
+/// Clip a byte offset to the nearest character boundary of `text`.
+fn clip_char_boundary(text: &Rope, offset: usize, backwards: bool) -> usize {
+    let len = text.len();
+    if offset >= len {
+        return len;
+    }
+    if text.is_char_boundary(offset) {
+        return offset;
+    }
+    if backwards {
+        let mut o = offset;
+        while o > 0 && !text.is_char_boundary(o) {
+            o -= 1;
+        }
+        o
+    } else {
+        let mut o = offset;
+        while o < len && !text.is_char_boundary(o) {
+            o += 1;
+        }
+        o
     }
 }
 
