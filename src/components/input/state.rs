@@ -2232,6 +2232,7 @@ impl InputState {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn dispatch_background_parse(
         pending: super::mode::PendingBackgroundParse,
+        text_version: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2258,7 +2259,7 @@ impl InputState {
         // a stale tree would repaint the whole file's highlights, which reads
         // as constant flicker on every keystroke (the fresh parse for the new
         // text is already scheduled by the edit).
-        let parse_version = cx.entity().read(cx).text_version;
+        let parse_version = text_version;
         let text_for_apply = text.clone();
         let task = cx.spawn_in(window, async move |entity, cx| {
             let result = cx
@@ -2428,7 +2429,7 @@ impl EntityInputHandler for InputState {
             .mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         if let Some(bg) = bg {
-            Self::dispatch_background_parse(bg, window, cx);
+            Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
 
         self.update_fold_candidates_incremental(&range, new_text);
@@ -2501,7 +2502,7 @@ impl EntityInputHandler for InputState {
             .mode
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         if let Some(bg) = bg {
-            Self::dispatch_background_parse(bg, window, cx);
+            Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
 
         self.update_fold_candidates_incremental(&range, new_text);

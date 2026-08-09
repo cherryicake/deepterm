@@ -88,7 +88,7 @@ impl TextElement {
                     .mode
                     .update_highlighter(&(0..0), &state.text, "", false, cx);
                 if let Some(bg) = bg {
-                    InputState::dispatch_background_parse(bg, window, cx);
+                    InputState::dispatch_background_parse(bg, state.text_version, window, cx);
                 }
                 state.update_fold_candidates();
                 state.lsp.update(&state.text, window, cx);
@@ -618,53 +618,58 @@ impl TextElement {
     /// Draw the hover and completion popups as window overlays, anchored at
     /// the symbol / cursor (zed's `window.defer_draw` approach — no CSS
     /// absolute positioning, so coordinates are exact).
-    fn draw_popups(&self, bounds: &Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-        // Build popups inside the state borrow (creating elements only needs
-        // immutable cx), then defer_draw them after the borrow ends.
-        let popups: Vec<(AnyElement, Point<Pixels>)> = {
-            let state = self.state.read(cx);
-            let line_height = state
-                .last_layout
-                .as_ref()
-                .map(|l| l.line_height)
-                .unwrap_or(px(16.0));
-            let viewport_top = bounds.origin.y;
-            let viewport_bottom = bounds.origin.y + bounds.size.height;
-            let mut popups = Vec::new();
+    /// Build the hover / completion popup elements and their window-anchored
+    /// origins. Called while the `state` borrow is live (element creation
+    /// only reads `cx`); the actual `defer_draw` happens in
+    /// [`Self::defer_popups`] after the borrow ends.
+    fn build_popups(
+        state: &InputState,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &App,
+    ) -> Vec<(AnyElement, Point<Pixels>)> {
+        let line_height = last_layout.line_height;
+        let viewport_top = bounds.origin.y;
+        let viewport_bottom = bounds.origin.y + bounds.size.height;
+        let mut popups = Vec::new();
 
-            if let Some(popover) = &state.hover_popover {
-                if !popover.contents.is_empty() {
-                    if let Some(pos) =
-                        state.line_and_position_for_offset(popover.symbol_range.start).2
-                    {
-                        let below = bounds.origin + pos + point(px(0.), line_height);
-                        let origin = if below.y + px(200.0) > viewport_bottom {
-                            point(below.x, (below.y - px(200.0)).max(viewport_top))
-                        } else {
-                            below
-                        };
-                        popups.push((Self::hover_popup_element(state, cx), origin));
-                    }
+        if let Some(popover) = &state.hover_popover {
+            if !popover.contents.is_empty() {
+                if let Some(pos) =
+                    state.line_and_position_for_offset(popover.symbol_range.start).2
+                {
+                    let below = bounds.origin + pos + point(px(0.), line_height);
+                    let origin = if below.y + px(200.0) > viewport_bottom {
+                        point(below.x, (below.y - px(200.0)).max(viewport_top))
+                    } else {
+                        below
+                    };
+                    popups.push((Self::hover_popup_element(state, cx), origin));
                 }
             }
+        }
 
-            if let Some(menu) = &state.completion_menu {
-                if menu.visible && !menu.items.is_empty() {
-                    if let Some(pos) = state.line_and_position_for_offset(state.cursor()).2 {
-                        let below = bounds.origin + pos + point(px(0.), line_height);
-                        let origin = if below.y + px(240.0) > viewport_bottom {
-                            point(below.x, (below.y - px(240.0)).max(viewport_top))
-                        } else {
-                            below
-                        };
-                        popups.push((Self::completion_popup_element(state, cx), origin));
-                    }
+        if let Some(menu) = &state.completion_menu {
+            if menu.visible && !menu.items.is_empty() {
+                if let Some(pos) = state.line_and_position_for_offset(state.cursor()).2 {
+                    let below = bounds.origin + pos + point(px(0.), line_height);
+                    let origin = if below.y + px(240.0) > viewport_bottom {
+                        point(below.x, (below.y - px(240.0)).max(viewport_top))
+                    } else {
+                        below
+                    };
+                    popups.push((Self::completion_popup_element(state, cx), origin));
                 }
             }
-            popups
-        };
+        }
+        popups
+    }
 
-        for (popup, origin) in popups {
+    /// Lay out and draw deferred popups (zed's `window.defer_draw`; gpui
+    /// requires `layout_as_root` first). Runs after the state borrow ends.
+    fn defer_popups(popups: Vec<(AnyElement, Point<Pixels>)>, window: &mut Window, cx: &mut App) {
+        for (mut popup, origin) in popups {
+            let _ = popup.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
             window.defer_draw(popup, origin, 2, None);
         }
     }
@@ -1800,17 +1805,15 @@ impl Element for TextElement {
             None
         };
 
+        // Zed-style popovers: build the hover / completion popup elements
+        // while the `state` borrow is still live (element creation only reads
+        // `cx`), then defer_draw them after the borrow ends.
+        let popups: Vec<(AnyElement, Point<Pixels>)> =
+            Self::build_popups(&state, &last_layout, &bounds, cx);
+
         let fold_icon_layout = self.layout_fold_icons(&bounds, &last_layout, window, cx);
 
-        // Zed-style popovers: hover + completion popups are drawn as window
-        // overlays (`defer_draw` with window coordinates) from the input
-        // element itself. Because TextElement observes InputState, setting
-        // the popup state repaints it, so the popups show up and follow the
-        // cursor — no CSS-absolute coordinate juggling, no external
-        // subscription needed.
-        self.draw_popups(&bounds, window, cx);
-
-        PrepaintState {
+        let prepaint_state = PrepaintState {
             bounds,
             last_layout,
             scroll_size,
@@ -1821,7 +1824,14 @@ impl Element for TextElement {
             selection_path,
             search_match_paths,
             fold_icon_layout,
-        }
+        };
+
+        // Zed-style popovers: hover + completion popups are drawn as window
+        // overlays (`defer_draw` with window coordinates) from the input
+        // element itself. Because TextElement observes InputState, setting
+        Self::defer_popups(popups, window, cx);
+
+        prepaint_state
     }
 
     fn paint(
