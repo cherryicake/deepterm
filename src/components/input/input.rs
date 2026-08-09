@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, SharedString, Window, div, px,
+    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px,
     relative,
 };
 
@@ -84,217 +84,7 @@ impl EditorInput {
             })
     }
 
-    /// Floating completion popup, anchored just below the cursor. Returns
-    /// `None` when there is nothing to show so the element tree stays stable
-    /// when the popup closes.
-    /// Zed-style popup placement: anchor below the target point, but flip
-    /// above when there is not enough room below (matches zed's
-    /// `layout_popovers_above_or_below_line`), so the popup is never clipped
-    /// by the editor viewport.
-    fn popup_top_for_below(
-        anchor_y: gpui::Pixels,
-        popup_height: gpui::Pixels,
-        viewport_height: gpui::Pixels,
-    ) -> gpui::Pixels {
-        let below_end = anchor_y + popup_height;
-        if below_end > viewport_height {
-            (anchor_y - popup_height).max(gpui::px(0.0))
-        } else {
-            anchor_y
-        }
-    }
 
-    /// Zed-style completion-kind letter + colour (function ƒ, variable x,
-    /// struct S, keyword k, …). Rendered as a small coloured prefix so the
-    /// list reads at a glance.
-    fn completion_kind_letter(
-        kind: Option<lsp_types::CompletionItemKind>,
-        theme: &crate::theme::AppTheme,
-    ) -> (char, gpui::Hsla) {
-        use lsp_types::CompletionItemKind;
-        use lsp_types::CompletionItemKind as K;
-        match kind {
-            Some(K::FUNCTION) | Some(K::METHOD) | Some(K::CONSTRUCTOR) => ('ƒ', theme.success),
-            Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => ('x', theme.accent),
-            Some(K::STRUCT)
-            | Some(K::CLASS)
-            | Some(K::ENUM)
-            | Some(K::INTERFACE)
-            | Some(K::TYPE_PARAMETER) => ('S', gpui::rgb(0x9b59b6).into()),
-            Some(K::KEYWORD) => ('k', theme.error),
-            Some(K::TEXT) | Some(K::FILE) => {
-                ('s', gpui::rgb(0xe67e22).into())
-            }
-            Some(K::CONSTANT) => ('n', theme.warning),
-            Some(K::MODULE) => ('m', gpui::rgb(0x16a085).into()),
-            _ => ('•', theme.text_muted),
-        }
-    }
-
-    fn completion_menu_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
-        let menu = state.completion_menu.as_ref()?;
-        if !menu.visible || menu.items.is_empty() {
-            return None;
-        }
-        let theme = cx.theme();
-        // Anchor below the cursor (fall back to the top-left when the editor
-        // has not laid out yet).
-        let viewport_height = state
-            .last_bounds
-            .map(|b| b.size.height)
-            .unwrap_or(px(480.0));
-        let line_height = state
-            .last_layout
-            .as_ref()
-            .map(|l| l.line_height)
-            .unwrap_or(px(16.0));
-        // Content coordinates of the text cursor (relative to the editor
-        // text area), matching the popup's absolute positioning container.
-        let (left, top) = state
-            .line_and_position_for_offset(state.cursor())
-            .2
-            .map(|p| {
-                (
-                    p.x,
-                    Self::popup_top_for_below(p.y + line_height, px(240.0), viewport_height),
-                )
-            })
-            .or_else(|| {
-                state.last_layout.as_ref().and_then(|l| {
-                    l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
-                })
-            })
-            .unwrap_or((px(0.0), px(0.0)));
-        let el = div()
-            .id("completion-menu")
-            .absolute()
-            .left(left)
-            .top(top)
-            .min_w(px(260.0))
-            .max_w(px(520.0))
-            .max_h(px(240.0))
-            .overflow_y_scroll()
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(px(8.0))
-            .children(
-                menu.items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let selected = i == menu.selected;
-                        let (kind_char, kind_color) = Self::completion_kind_letter(item.kind, theme);
-                        let row = div()
-                            .id(SharedString::from(format!("completion-item-{i}")))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(4.0))
-                            .text_color(if selected {
-                                theme.accent_foreground
-                            } else {
-                                theme.text
-                            })
-                            .bg(if selected {
-                                theme.accent
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .child(
-                                div()
-                                    .w(px(16.0))
-                                    .text_color(if selected {
-                                        theme.accent_foreground
-                                    } else {
-                                        kind_color
-                                    })
-                                    .text_center()
-                                    .child(kind_char.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_x_hidden()
-                                    .child(item.label.clone()),
-                            );
-                        match item.detail.as_ref() {
-                            Some(detail) => row
-                                .child(
-                                    div()
-                                        .text_color(if selected {
-                                            theme.accent_foreground.opacity(0.8)
-                                        } else {
-                                            theme.text_muted
-                                        })
-                                        .child(detail.clone()),
-                                ),
-                            None => row,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        Some(el.into_any_element())
-    }
-
-    /// Floating hover popover, anchored just below the hovered symbol (the
-    /// mouse position — NOT the text cursor, which may be far away).
-    fn hover_popover_element(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
-        let popover = state.hover_popover.as_ref()?;
-        if popover.contents.is_empty() {
-            return None;
-        }
-        let theme = cx.theme();
-        let viewport_height = state
-            .last_bounds
-            .map(|b| b.size.height)
-            .unwrap_or(px(480.0));
-        let line_height = state
-            .last_layout
-            .as_ref()
-            .map(|l| l.line_height)
-            .unwrap_or(px(16.0));
-        // Use the *content* coordinates (relative to the editor text area)
-        // from `line_and_position_for_offset`. `range_to_bounds` / cursor
-        // bounds are window coordinates, which do not match the popup's
-        // absolute positioning inside the editor container — mixing them puts
-        // the popup far from the hovered symbol.
-        let (left, top) = state
-            .line_and_position_for_offset(popover.symbol_range.start)
-            .2
-            .map(|p| {
-                (
-                    p.x,
-                    Self::popup_top_for_below(p.y + line_height, px(200.0), viewport_height),
-                )
-            })
-            .or_else(|| {
-                state.last_layout.as_ref().and_then(|l| {
-                    l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
-                })
-            })
-            .unwrap_or((px(0.0), px(0.0)));
-        let el = div()
-            .id("hover-popover")
-            .absolute()
-            .left(left)
-            .top(top)
-            .max_w(px(480.0))
-            .max_h(px(200.0))
-            .overflow_y_scroll()
-            .px_3()
-            .py_2()
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(px(8.0))
-            .text_color(theme.text)
-            .child(popover.contents.clone());
-        Some(el.into_any_element())
-    }
 }
 
 impl RenderOnce for EditorInput {
@@ -403,25 +193,19 @@ impl RenderOnce for EditorInput {
             // TextElement stays a direct flex child (wrapping it in an extra
             // div broke layout → blank editor); popups are absolutely
             // positioned overlays on the editor container.
-            // Popups are conditionally-rendered overlays; when none is open
-            // the children list stays identical to the plain editor (single
-            // TextElement), which keeps the element tree stable.
-            let completion_menu = Self::completion_menu_element(&state, cx);
-            let hover_popover = Self::hover_popover_element(&state, cx);
+            // Popups (hover / completion) are drawn by TextElement via
+            // window.defer_draw (zed-style), not as children here.
             actions
                 .id("editor-input")
                 .flex_1()
                 .h_full()
                 .flex_grow(1.0)
                 .overflow_x_hidden()
-                .relative()
                 .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
                 .child(
                     TextElement::new(self.state.clone())
                         .placeholder(state.placeholder.clone()),
                 )
-                .when_some(completion_menu, |this, el| this.child(el))
-                .when_some(hover_popover, |this, el| this.child(el))
                 .into_any_element()
         } else {
             let mask_toggle_el = if self.mask_toggle {

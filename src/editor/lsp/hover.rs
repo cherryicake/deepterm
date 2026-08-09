@@ -154,3 +154,29 @@ fn hover_contents_to_plain_text(contents: &lsp_types::HoverContents) -> String {
             .join("\n\n"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hover_contents_extraction_markdown() {
+        // rust-analyzer 风格：MarkupContent（markdown），代码块包裹签名
+        let contents = lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: "```rust\npub fn open_file(&mut self, path: PathBuf) {\n```\n\nOpens a file.".to_string(),
+        });
+        let text = hover_contents_to_plain_text(&contents);
+        assert!(!text.is_empty(), "extracted hover text must not be empty");
+        assert!(text.contains("pub fn"), "signature preserved: {text}");
+    }
+
+    #[test]
+    fn test_hover_contents_extraction_plain() {
+        let contents = lsp_types::HoverContents::Scalar(lsp_types::MarkedString::String(
+            "fn open_file".to_string(),
+        ));
+        let text = hover_contents_to_plain_text(&contents);
+        assert_eq!(text, "fn open_file");
+    }
+}

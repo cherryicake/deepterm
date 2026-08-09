@@ -1,11 +1,13 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity, GlobalElementId, Half,
-    HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId, MouseButton,
-    MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString, Size, Style, TextAlign, TextRun,
-    TextStyle, UnderlineStyle, Window, fill, point, px, relative, size,
+    AnyElement, App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity,
+    GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
+    MouseButton, MouseMoveEvent, ParentElement as _, Path, Pixels, Point, ShapedLine, SharedString,
+    Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, div, fill, point, px,
+    relative, size,
 };
+use gpui::prelude::*;
 use ropey::Rope;
 use smallvec::SmallVec;
 
@@ -611,6 +613,173 @@ impl TextElement {
             }
         }
         paths
+    }
+
+    /// Draw the hover and completion popups as window overlays, anchored at
+    /// the symbol / cursor (zed's `window.defer_draw` approach — no CSS
+    /// absolute positioning, so coordinates are exact).
+    fn draw_popups(&self, bounds: &Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        // Build popups inside the state borrow (creating elements only needs
+        // immutable cx), then defer_draw them after the borrow ends.
+        let popups: Vec<(AnyElement, Point<Pixels>)> = {
+            let state = self.state.read(cx);
+            let line_height = state
+                .last_layout
+                .as_ref()
+                .map(|l| l.line_height)
+                .unwrap_or(px(16.0));
+            let viewport_top = bounds.origin.y;
+            let viewport_bottom = bounds.origin.y + bounds.size.height;
+            let mut popups = Vec::new();
+
+            if let Some(popover) = &state.hover_popover {
+                if !popover.contents.is_empty() {
+                    if let Some(pos) =
+                        state.line_and_position_for_offset(popover.symbol_range.start).2
+                    {
+                        let below = bounds.origin + pos + point(px(0.), line_height);
+                        let origin = if below.y + px(200.0) > viewport_bottom {
+                            point(below.x, (below.y - px(200.0)).max(viewport_top))
+                        } else {
+                            below
+                        };
+                        popups.push((Self::hover_popup_element(state, cx), origin));
+                    }
+                }
+            }
+
+            if let Some(menu) = &state.completion_menu {
+                if menu.visible && !menu.items.is_empty() {
+                    if let Some(pos) = state.line_and_position_for_offset(state.cursor()).2 {
+                        let below = bounds.origin + pos + point(px(0.), line_height);
+                        let origin = if below.y + px(240.0) > viewport_bottom {
+                            point(below.x, (below.y - px(240.0)).max(viewport_top))
+                        } else {
+                            below
+                        };
+                        popups.push((Self::completion_popup_element(state, cx), origin));
+                    }
+                }
+            }
+            popups
+        };
+
+        for (popup, origin) in popups {
+            window.defer_draw(popup, origin, 2, None);
+        }
+    }
+
+    /// The hover popup element (markdown-ish contents).
+    fn hover_popup_element(state: &InputState, cx: &App) -> AnyElement {
+        let popover = state.hover_popover.as_ref().expect("hover popover set");
+        let theme = cx.theme();
+        div()
+            .id("hover-popover")
+            .max_w(px(480.0))
+            .max_h(px(200.0))
+            .overflow_y_scroll()
+            .px_3()
+            .py_2()
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.0))
+            .text_color(theme.text)
+            .child(popover.contents.clone())
+            .into_any_element()
+    }
+
+    /// The completion popup element (zed-style: kind letter + label + detail).
+    fn completion_popup_element(state: &InputState, cx: &App) -> AnyElement {
+        let menu = state.completion_menu.as_ref().expect("completion menu set");
+        let theme = cx.theme();
+        let items = menu
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let selected = i == menu.selected;
+                let (kind_char, kind_color) =
+                    Self::completion_kind_letter(item.kind, theme);
+                let row = div()
+                    .id(SharedString::from(format!("completion-item-{i}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.0))
+                    .text_color(if selected {
+                        theme.accent_foreground
+                    } else {
+                        theme.text
+                    })
+                    .bg(if selected {
+                        theme.accent
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .text_color(if selected {
+                                theme.accent_foreground
+                            } else {
+                                kind_color
+                            })
+                            .text_center()
+                            .child(kind_char.to_string()),
+                    )
+                    .child(div().flex_1().overflow_x_hidden().child(item.label.clone()));
+                match item.detail.as_ref() {
+                    Some(detail) => row.child(
+                        div()
+                            .text_color(if selected {
+                                theme.accent_foreground.opacity(0.8)
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(detail.clone()),
+                    ),
+                    None => row,
+                }
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("completion-menu")
+            .min_w(px(260.0))
+            .max_w(px(520.0))
+            .max_h(px(240.0))
+            .overflow_y_scroll()
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.0))
+            .children(items)
+            .into_any_element()
+    }
+
+    /// Zed-style completion-kind letter + colour.
+    fn completion_kind_letter(
+        kind: Option<lsp_types::CompletionItemKind>,
+        theme: &crate::theme::AppTheme,
+    ) -> (char, gpui::Hsla) {
+        use lsp_types::CompletionItemKind as K;
+        match kind {
+            Some(K::FUNCTION) | Some(K::METHOD) | Some(K::CONSTRUCTOR) => ('ƒ', theme.success),
+            Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => ('x', theme.accent),
+            Some(K::STRUCT)
+            | Some(K::CLASS)
+            | Some(K::ENUM)
+            | Some(K::INTERFACE)
+            | Some(K::TYPE_PARAMETER) => ('S', gpui::rgb(0x9b59b6).into()),
+            Some(K::KEYWORD) => ('k', theme.error),
+            Some(K::TEXT) | Some(K::FILE) => ('s', gpui::rgb(0xe67e22).into()),
+            Some(K::CONSTANT) => ('n', theme.warning),
+            Some(K::MODULE) => ('m', gpui::rgb(0x16a085).into()),
+            _ => ('•', theme.text_muted),
+        }
     }
 
     /// Calculate the visible range of lines in the viewport.
@@ -1632,6 +1801,14 @@ impl Element for TextElement {
         };
 
         let fold_icon_layout = self.layout_fold_icons(&bounds, &last_layout, window, cx);
+
+        // Zed-style popovers: hover + completion popups are drawn as window
+        // overlays (`defer_draw` with window coordinates) from the input
+        // element itself. Because TextElement observes InputState, setting
+        // the popup state repaints it, so the popups show up and follow the
+        // cursor — no CSS-absolute coordinate juggling, no external
+        // subscription needed.
+        self.draw_popups(&bounds, window, cx);
 
         PrepaintState {
             bounds,
