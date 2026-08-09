@@ -635,8 +635,13 @@ impl TextElement {
 
         if let Some(popover) = &state.hover_popover {
             if !popover.contents.is_empty() {
-                if let Some(pos) =
-                    state.line_and_position_for_offset(popover.symbol_range.start).2
+                // The cached symbol range may be stale (document edited /
+                // switched away and back); guard before indexing.
+                let off = popover.symbol_range.start;
+                if off >= state.text.len() || !state.text.is_char_boundary(off) {
+                    return popups;
+                }
+                if let Some(pos) = state.line_and_position_for_offset(off).2
                 {
                     let below = bounds.origin + pos + point(px(0.), line_height);
                     // When flipping above, leave the hovered symbol's own

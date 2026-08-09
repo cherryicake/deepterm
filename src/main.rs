@@ -1033,7 +1033,7 @@ impl Render for AppWindow {
                     .update(cx, |picker, cx| picker.toggle(window, cx));
             }))
             .on_action(cx.listener(|_this, _: &NewWindow, _window, cx| {
-                WindowManager::open_window(cx, None);
+                WindowManager::open_window(cx, Vec::new());
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_sidebar(window, cx);
@@ -1174,17 +1174,18 @@ fn main() {
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
-            // `deepterm <file>` opens the file in the editor on startup.
-            let open_path = std::env::args()
-                .nth(1)
+            // `deepterm <file>...` opens files in the editor on startup.
+            let open_paths: Vec<std::path::PathBuf> = std::env::args()
+                .skip(1)
                 .filter(|a| !a.starts_with('-'))
-                .map(std::path::PathBuf::from);
-            if let Some(ref path) = open_path {
+                .map(std::path::PathBuf::from)
+                .collect();
+            for path in &open_paths {
                 if !path.exists() {
                     log::warn!("open_path does not exist: {:?}", path);
                 }
             }
-            WindowManager::open_window(cx, open_path);
+            WindowManager::open_window(cx, open_paths);
             cx.activate(true);
         });
 }
