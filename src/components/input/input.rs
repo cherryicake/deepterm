@@ -87,6 +87,23 @@ impl EditorInput {
     /// Floating completion popup, anchored just below the cursor. Returns
     /// `None` when there is nothing to show so the element tree stays stable
     /// when the popup closes.
+    /// Zed-style popup placement: anchor below the target point, but flip
+    /// above when there is not enough room below (matches zed's
+    /// `layout_popovers_above_or_below_line`), so the popup is never clipped
+    /// by the editor viewport.
+    fn popup_top_for_below(
+        anchor_y: gpui::Pixels,
+        popup_height: gpui::Pixels,
+        viewport_height: gpui::Pixels,
+    ) -> gpui::Pixels {
+        let below_end = anchor_y + popup_height;
+        if below_end > viewport_height {
+            (anchor_y - popup_height).max(gpui::px(0.0))
+        } else {
+            anchor_y
+        }
+    }
+
     /// Zed-style completion-kind letter + colour (function ƒ, variable x,
     /// struct S, keyword k, …). Rendered as a small coloured prefix so the
     /// list reads at a glance.
@@ -122,11 +139,24 @@ impl EditorInput {
         let theme = cx.theme();
         // Anchor below the cursor (fall back to the top-left when the editor
         // has not laid out yet).
+        let viewport_height = state
+            .last_bounds
+            .map(|b| b.size.height)
+            .unwrap_or(px(480.0));
         let (left, top) = state
             .last_layout
             .as_ref()
             .and_then(|l| {
-                l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
+                l.cursor_bounds.map(|b| {
+                    (
+                        b.origin.x,
+                        Self::popup_top_for_below(
+                            b.origin.y + b.size.height,
+                            px(240.0),
+                            viewport_height,
+                        ),
+                    )
+                })
             })
             .unwrap_or((px(0.0), px(0.0)));
         let el = div()
@@ -212,9 +242,22 @@ impl EditorInput {
             return None;
         }
         let theme = cx.theme();
+        let viewport_height = state
+            .last_bounds
+            .map(|b| b.size.height)
+            .unwrap_or(px(480.0));
         let (left, top) = state
             .range_to_bounds(&popover.symbol_range)
-            .map(|b| (b.origin.x, b.origin.y + b.size.height))
+            .map(|b| {
+                (
+                    b.origin.x,
+                    Self::popup_top_for_below(
+                        b.origin.y + b.size.height,
+                        px(200.0),
+                        viewport_height,
+                    ),
+                )
+            })
             .or_else(|| {
                 state.last_layout.as_ref().and_then(|l| {
                     l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
