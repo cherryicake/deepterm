@@ -143,19 +143,25 @@ impl EditorInput {
             .last_bounds
             .map(|b| b.size.height)
             .unwrap_or(px(480.0));
-        let (left, top) = state
+        let line_height = state
             .last_layout
             .as_ref()
-            .and_then(|l| {
-                l.cursor_bounds.map(|b| {
-                    (
-                        b.origin.x,
-                        Self::popup_top_for_below(
-                            b.origin.y + b.size.height,
-                            px(240.0),
-                            viewport_height,
-                        ),
-                    )
+            .map(|l| l.line_height)
+            .unwrap_or(px(16.0));
+        // Content coordinates of the text cursor (relative to the editor
+        // text area), matching the popup's absolute positioning container.
+        let (left, top) = state
+            .line_and_position_for_offset(state.cursor())
+            .2
+            .map(|p| {
+                (
+                    p.x,
+                    Self::popup_top_for_below(p.y + line_height, px(240.0), viewport_height),
+                )
+            })
+            .or_else(|| {
+                state.last_layout.as_ref().and_then(|l| {
+                    l.cursor_bounds.map(|b| (b.origin.x, b.origin.y + b.size.height))
                 })
             })
             .unwrap_or((px(0.0), px(0.0)));
@@ -246,16 +252,23 @@ impl EditorInput {
             .last_bounds
             .map(|b| b.size.height)
             .unwrap_or(px(480.0));
+        let line_height = state
+            .last_layout
+            .as_ref()
+            .map(|l| l.line_height)
+            .unwrap_or(px(16.0));
+        // Use the *content* coordinates (relative to the editor text area)
+        // from `line_and_position_for_offset`. `range_to_bounds` / cursor
+        // bounds are window coordinates, which do not match the popup's
+        // absolute positioning inside the editor container — mixing them puts
+        // the popup far from the hovered symbol.
         let (left, top) = state
-            .range_to_bounds(&popover.symbol_range)
-            .map(|b| {
+            .line_and_position_for_offset(popover.symbol_range.start)
+            .2
+            .map(|p| {
                 (
-                    b.origin.x,
-                    Self::popup_top_for_below(
-                        b.origin.y + b.size.height,
-                        px(200.0),
-                        viewport_height,
-                    ),
+                    p.x,
+                    Self::popup_top_for_below(p.y + line_height, px(200.0), viewport_height),
                 )
             })
             .or_else(|| {
