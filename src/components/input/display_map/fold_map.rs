@@ -17,7 +17,7 @@ pub struct FoldMap {
     /// index = wrap_row, value = Some(display_row) if visible, None if folded
     wrap_row_to_display_row: Vec<Option<usize>>,
 
-    /// Candidate fold ranges (from tree-sitter/LSP)
+    /// Candidate fold ranges (from tree-sitter)
     /// Sorted by start_line, unique start_line
     candidates: Vec<FoldRange>,
 
@@ -105,7 +105,7 @@ impl FoldMap {
         }
     }
 
-    /// Set fold candidates (from tree-sitter/LSP), full replacement.
+    /// Set fold candidates (from tree-sitter), full replacement.
     pub fn set_candidates(&mut self, mut candidates: Vec<FoldRange>) {
         // Sort and deduplicate by start_line
         candidates.sort_by_key(|r| r.start_line);

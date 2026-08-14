@@ -1,13 +1,12 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    AnyElement, App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity,
+    App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity,
     GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
-    MouseButton, MouseMoveEvent, ParentElement as _, Path, Pixels, Point, ShapedLine, SharedString,
-    Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, div, fill, point, px,
+    MouseButton, MouseMoveEvent, Path, Pixels, Point, ShapedLine, SharedString,
+    Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, fill, point, px,
     relative, size,
 };
-use gpui::prelude::*;
 use ropey::Rope;
 use smallvec::SmallVec;
 
@@ -91,7 +90,6 @@ impl TextElement {
                     InputState::dispatch_background_parse(bg, state.text_version, window, cx);
                 }
                 state.update_fold_candidates();
-                state.lsp.update(&state.text, window, cx);
                 state._pending_update = false;
             }
             state.display_map.set_font(
@@ -615,201 +613,6 @@ impl TextElement {
         paths
     }
 
-    /// Draw the hover and completion popups as window overlays, anchored at
-    /// the symbol / cursor (zed's `window.defer_draw` approach — no CSS
-    /// absolute positioning, so coordinates are exact).
-    /// Build the hover / completion popup elements and their window-anchored
-    /// origins. Called while the `state` borrow is live (element creation
-    /// only reads `cx`); the actual `defer_draw` happens in
-    /// [`Self::defer_popups`] after the borrow ends.
-    fn build_popups(
-        state: &InputState,
-        last_layout: &LastLayout,
-        bounds: &Bounds<Pixels>,
-        cx: &App,
-    ) -> Vec<(AnyElement, Point<Pixels>)> {
-        let line_height = last_layout.line_height;
-        let viewport_top = bounds.origin.y;
-        let viewport_bottom = bounds.origin.y + bounds.size.height;
-        let mut popups = Vec::new();
-
-        if let Some(popover) = &state.hover_popover {
-            if !popover.contents.is_empty() {
-                // The cached symbol range may be stale (document edited /
-                // switched away and back); guard before indexing.
-                let off = popover.symbol_range.start;
-                if off >= state.text.len() || !state.text.is_char_boundary(off) {
-                    return popups;
-                }
-                if let Some(pos) = state.line_and_position_for_offset(off).2
-                {
-                    let below = bounds.origin + pos + point(px(0.), line_height);
-                    // When flipping above, leave the hovered symbol's own
-                    // line visible (popup bottom sits one line above it), so
-                    // it never covers the symbol being inspected.
-                    let origin = if below.y + px(200.0) > viewport_bottom {
-                        point(
-                            below.x,
-                            (below.y - px(200.0) - line_height).max(viewport_top),
-                        )
-                    } else {
-                        below
-                    };
-                    popups.push((Self::hover_popup_element(state, cx), origin));
-                }
-            }
-        }
-
-        if let Some(menu) = &state.completion_menu {
-            if menu.visible && !menu.items.is_empty() {
-                if let Some(pos) = state.line_and_position_for_offset(state.cursor()).2 {
-                    let below = bounds.origin + pos + point(px(0.), line_height);
-                    let origin = if below.y + px(240.0) > viewport_bottom {
-                        point(below.x, (below.y - px(240.0)).max(viewport_top))
-                    } else {
-                        below
-                    };
-                    popups.push((Self::completion_popup_element(state, cx), origin));
-                }
-            }
-        }
-        popups
-    }
-
-    /// Lay out and draw deferred popups (zed's `window.defer_draw`; gpui
-    /// requires `layout_as_root` first). Runs after the state borrow ends.
-    fn defer_popups(popups: Vec<(AnyElement, Point<Pixels>)>, window: &mut Window, cx: &mut App) {
-        for (mut popup, origin) in popups {
-            let _ = popup.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
-            window.defer_draw(popup, origin, 2, None);
-        }
-    }
-
-    /// The hover popup element (markdown-ish contents).
-    fn hover_popup_element(state: &InputState, cx: &App) -> AnyElement {
-        let popover = state.hover_popover.as_ref().expect("hover popover set");
-        let theme = cx.theme();
-        div()
-            .id("hover-popover")
-            .max_w(px(480.0))
-            .max_h(px(200.0))
-            .overflow_y_scroll()
-            .px_3()
-            .py_2()
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(px(8.0))
-            .text_color(theme.text)
-            .child(popover.contents.clone())
-            .into_any_element()
-    }
-
-    /// The completion popup element (zed-style: kind letter + label + detail).
-    fn completion_popup_element(state: &InputState, cx: &App) -> AnyElement {
-        let menu = state.completion_menu.as_ref().expect("completion menu set");
-        let theme = cx.theme();
-        let items = menu
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let selected = i == menu.selected;
-                let (kind_char, kind_color) =
-                    Self::completion_kind_letter(item.kind, theme);
-                let row = div()
-                    .id(SharedString::from(format!("completion-item-{i}")))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.0))
-                    .whitespace_nowrap()
-                    .flex_nowrap()
-                    .text_color(if selected {
-                        theme.accent_foreground
-                    } else {
-                        theme.text
-                    })
-                    .bg(if selected {
-                        theme.accent
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .child(
-                        div()
-                            .w(px(16.0))
-                            .text_color(if selected {
-                                theme.accent_foreground
-                            } else {
-                                kind_color
-                            })
-                            .text_center()
-                            .child(kind_char.to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_x_hidden()
-                            .text_ellipsis()
-                            .child(item.label.clone()),
-                    );
-                match item.detail.as_ref() {
-                    Some(detail) => row.child(
-                        div()
-                            .max_w(px(200.0))
-                            .overflow_x_hidden()
-                            .text_ellipsis()
-                            .text_color(if selected {
-                                theme.accent_foreground.opacity(0.8)
-                            } else {
-                                theme.text_muted
-                            })
-                            .child(detail.clone()),
-                    ),
-                    None => row,
-                }
-            })
-            .collect::<Vec<_>>();
-        div()
-            .id("completion-menu")
-            .min_w(px(260.0))
-            .max_w(px(520.0))
-            .max_h(px(240.0))
-            .overflow_y_scroll()
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(px(8.0))
-            .children(items)
-            .into_any_element()
-    }
-
-    /// Zed-style completion-kind letter + colour.
-    fn completion_kind_letter(
-        kind: Option<lsp_types::CompletionItemKind>,
-        theme: &crate::theme::AppTheme,
-    ) -> (char, gpui::Hsla) {
-        use lsp_types::CompletionItemKind as K;
-        match kind {
-            Some(K::FUNCTION) | Some(K::METHOD) | Some(K::CONSTRUCTOR) => ('ƒ', theme.success),
-            Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => ('x', theme.accent),
-            Some(K::STRUCT)
-            | Some(K::CLASS)
-            | Some(K::ENUM)
-            | Some(K::INTERFACE)
-            | Some(K::TYPE_PARAMETER) => ('S', gpui::rgb(0x9b59b6).into()),
-            Some(K::KEYWORD) => ('k', theme.error),
-            Some(K::TEXT) | Some(K::FILE) => ('s', gpui::rgb(0xe67e22).into()),
-            Some(K::CONSTANT) => ('n', theme.warning),
-            Some(K::MODULE) => ('m', gpui::rgb(0x16a085).into()),
-            _ => ('•', theme.text_muted),
-        }
-    }
-
     /// Calculate the visible range of lines in the viewport.
     ///
     /// Returns
@@ -1268,32 +1071,6 @@ impl TextElement {
             styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
         }
         drop(highlighter_ref);
-
-        // LSP semantic tokens layered on top of the tree-sitter styles
-        // (composed below the diff word colors). Only compose tokens that
-        // were fetched for the *current* text version — stale tokens (byte
-        // ranges from a pre-edit document) would flicker as the text shifts
-        // while typing.
-        // Semantic tokens are byte-ranged and shifted on each edit, so they
-        // stay composed while typing (no flicker); they are only dropped for
-        // tokens overlapping the edited region, which the next fetch replaces.
-        let semantic_styles = if state.lsp.semantic_tokens_version() == state.text_version {
-            state.lsp.semantic_tokens_for_range(
-                &state.text,
-                &visible_byte_range,
-                &cx.theme().highlight_theme,
-            )
-        } else {
-            Vec::new()
-        };
-        if !semantic_styles.is_empty() {
-            styles = gpui::combine_highlights(semantic_styles, styles).collect();
-        }
-
-        // Hovered symbol underline (go-to-definition affordance).
-        if let Some((range, hover_style)) = self.layout_hover_definition(cx) {
-            styles.push((range, hover_style));
-        }
 
         // Merge diff word-level decorations (e.g. inline changed-word
         // backgrounds in the git diff view).
@@ -1828,12 +1605,6 @@ impl Element for TextElement {
             None
         };
 
-        // Zed-style popovers: build the hover / completion popup elements
-        // while the `state` borrow is still live (element creation only reads
-        // `cx`), then defer_draw them after the borrow ends.
-        let popups: Vec<(AnyElement, Point<Pixels>)> =
-            Self::build_popups(&state, &last_layout, &bounds, cx);
-
         let fold_icon_layout = self.layout_fold_icons(&bounds, &last_layout, window, cx);
 
         let prepaint_state = PrepaintState {
@@ -1848,11 +1619,6 @@ impl Element for TextElement {
             search_match_paths,
             fold_icon_layout,
         };
-
-        // Zed-style popovers: hover + completion popups are drawn as window
-        // overlays (`defer_draw` with window coordinates) from the input
-        // element itself. Because TextElement observes InputState, setting
-        Self::defer_popups(popups, window, cx);
 
         prepaint_state
     }

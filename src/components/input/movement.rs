@@ -153,10 +153,6 @@ impl InputState {
     }
 
     pub(crate) fn up(&mut self, _action: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_completion_open() {
-            self.completion_move(false, cx);
-            return;
-        }
         if self.mode.is_single_line() {
             return;
         }
@@ -173,10 +169,6 @@ impl InputState {
     }
 
     pub(crate) fn down(&mut self, _action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_completion_open() {
-            self.completion_move(true, cx);
-            return;
-        }
         if self.mode.is_single_line() {
             return;
         }

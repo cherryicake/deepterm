@@ -17,24 +17,18 @@ use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
-use crate::editor::lsp::Lsp;
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
 use crate::components::input::history::History;
 use crate::components::input::movement::MoveDirection;
+use crate::components::input::rope_ext::Position;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
 use crate::editor::syntax::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::editor::syntax::LanguageRegistry;
-use lsp_types::Position;
-
-use crate::editor::lsp::{
-    CompletionMenu, HoverDefinition, HoverPopoverData, LspChange, LspServerSpec,
-    start_lsp_session,
-};
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = editor, no_json)]
@@ -88,9 +82,7 @@ actions!(
         MoveToPreviousWord,
         MoveToNextWord,
         Escape,
-        ToggleCodeActions,
         Search,
-        GoToDefinition,
     ]
 );
 
@@ -221,10 +213,6 @@ pub fn init(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-.", ToggleCodeActions, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-f", Search, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
@@ -345,10 +333,8 @@ pub struct InputState {
 
     /// A flag to indicate if we have a pending update to the text.
     ///
-    /// If true, will call some update (for example LSP, Syntax Highlight) before render.
+    /// If true, will call some update (for example Syntax Highlight) before render.
     pub(crate) _pending_update: bool,
-    /// A flag to indicate if we should ignore the next completion event.
-    pub(crate) silent_replace_text: bool,
 
     /// To remember the horizontal column (x-coordinate) of the cursor position for keep column for move up/down.
     ///
@@ -369,21 +355,10 @@ pub struct InputState {
     /// Sorted, contiguous and gap-free over `[0, text.len())`; when set, the
     /// internal tree-sitter highlighter is bypassed.
     pub(crate) external_highlight_runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
-    /// LSP-provided editor features (semantic tokens, hover, …).
-    pub(crate) lsp: Lsp,
-    /// Go-to-definition hover state (symbol underline + locations).
-    pub(crate) hover_definition: HoverDefinition,
-    /// Hover popover contents (symbol range + text).
-    pub(crate) hover_popover: Option<HoverPopoverData>,
-    /// Code completion popup state.
-    pub(crate) completion_menu: Option<CompletionMenu>,
-    /// Monotonic text version, incremented on every edit. Semantic tokens
-    /// carry the version they were fetched for; mismatches are not composed
-    /// (prevents stale-token flicker while typing).
+    /// Monotonic text version, incremented on every edit. Background
+    /// parses carry the version they were started for; mismatches are
+    /// discarded (prevents stale-tree flicker while typing).
     pub(crate) text_version: u64,
-    /// When the last edit happened (used to defer semantic-token composition
-    /// until the user pauses typing, avoiding colour flicker on every key).
-    pub(crate) last_edit_time: Option<std::time::Instant>,
     /// Extra empty rows below the last line the editor can scroll into.
     /// See [`Self::scroll_beyond_last_line`].
     pub(crate) scroll_beyond_last_line: Option<usize>,
@@ -393,8 +368,6 @@ pub struct InputState {
     /// Single-line inputs: pressing Enter emits the submit event instead of
     /// just propagating.
     pub(crate) submit_on_enter: bool,
-    /// True while a completion is being inserted (suppresses re-triggers).
-    pub(crate) completion_inserting: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -465,7 +438,6 @@ impl InputState {
             placeholder_font_size: None,
             font_size: None,
             text_align: TextAlign::Left,
-            silent_replace_text: false,
             size: Size::default(),
             _subscriptions,
             _pending_update: false,
@@ -474,13 +446,7 @@ impl InputState {
             diff_range_colors: Vec::new(),
             diff_line_labels: None,
             external_highlight_runs: None,
-            lsp: Lsp::default(),
-            hover_definition: HoverDefinition::default(),
-            hover_popover: None,
-            completion_menu: None,
-            completion_inserting: false,
             text_version: 0,
-            last_edit_time: None,
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             submit_on_enter: false,
@@ -802,7 +768,7 @@ impl InputState {
     /// Set the text of the input field without requiring a window.
     ///
     /// Unlike [`Self::set_value`], this does not need a `Window` and is safe to call from
-    /// async completion paths (e.g. background file loads). It updates the rope, display map,
+    /// background file loads. It updates the rope, display map,
     /// and schedules a highlight refresh for code editors.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.history.ignore = true;
@@ -824,29 +790,6 @@ impl InputState {
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
-    }
-
-    /// Attach an LSP session for this document (spawns the server, registers
-    /// the document, and starts streaming semantic tokens).
-    pub(crate) fn attach_lsp(
-        &mut self,
-        uri: String,
-        spec: LspServerSpec,
-        cx: &mut Context<Self>,
-    ) {
-        let editor = cx.entity().downgrade();
-        if let Some(tx) = start_lsp_session(editor, uri, spec, cx) {
-            self.lsp.change_tx = Some(tx);
-            self.push_lsp_change(cx);
-        }
-    }
-
-    /// Push the current text to the LSP session (full-document sync).
-    pub(crate) fn push_lsp_change(&mut self, cx: &mut App) {
-        if let Some(tx) = self.lsp.change_tx.as_ref() {
-            let text = self.text.to_string();
-            let _ = tx.try_send(LspChange::Text(text));
-        }
     }
 
     /// Clear the input text.
@@ -1422,11 +1365,6 @@ impl InputState {
     }
 
     pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        // Accept the completion popup instead of inserting a newline.
-        if self.is_completion_open() {
-            self.accept_completion(window, cx);
-            return;
-        }
         if self.mode.is_multi_line() {
             // Get current line indent
             let indent = if self.mode.is_code_editor() {
@@ -1460,11 +1398,6 @@ impl InputState {
     }
 
     pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        // Close the completion popup first.
-        if self.is_completion_open() {
-            self.close_completion(cx);
-            return;
-        }
         if self.clean_on_escape {}
 
         if self.ime_marked_range.is_some() {
@@ -1481,7 +1414,7 @@ impl InputState {
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(ime_marked_range) = &self.ime_marked_range {
@@ -1494,13 +1427,6 @@ impl InputState {
         let offset = self.index_for_mouse_position(event.position);
 
         if event.button == MouseButton::Right {
-            return;
-        }
-
-        // Cmd+click on a hovered symbol jumps to its definition.
-        if event.click_count == 1
-            && self.handle_click_hover_definition(event, offset, window, cx)
-        {
             return;
         }
 
@@ -1556,44 +1482,6 @@ impl InputState {
         }
         self.selecting = false;
         self.selected_word_range = None;
-    }
-
-    pub(crate) fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Check if mouse is within bounds
-        let _within_bounds = self
-            .last_bounds
-            .as_ref()
-            .map(|bounds| bounds.contains(&event.position))
-            .unwrap_or(false);
-
-        if !self.mode.is_code_editor() {
-            return;
-        }
-        if self.lsp.change_tx.is_none() {
-            return;
-        }
-
-        let offset = self.index_for_mouse_position(event.position);
-        let had_definition = !self.hover_definition.is_empty();
-        let had_popover = self.hover_popover.is_some();
-
-        if event.modifiers.secondary() {
-            self.handle_hover_definition(offset, window, cx);
-        } else {
-            self.hover_definition.clear();
-            self.handle_hover_popover(offset, window, cx);
-        }
-
-        let changed = had_definition == self.hover_definition.is_empty()
-            || had_popover != self.hover_popover.is_some();
-        if changed {
-            cx.notify();
-        }
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -2158,8 +2046,6 @@ impl InputState {
     }
 
     /// Replace text in range in silent.
-    ///
-    /// This will not trigger any UI interaction, such as auto-completion.
     pub(crate) fn replace_text_in_range_silent(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -2167,9 +2053,7 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.silent_replace_text = true;
         self.replace_text_in_range(range_utf16, new_text, window, cx);
-        self.silent_replace_text = false;
     }
 
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
@@ -2438,24 +2322,6 @@ impl EntityInputHandler for InputState {
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
         self.text_version = self.text_version.wrapping_add(1);
-        self.last_edit_time = Some(std::time::Instant::now());
-        // Shift cached semantic-token byte ranges so highlights stay put
-        // while typing (zed shifts its anchors on edits).
-        self.lsp
-            .adjust_semantic_tokens_for_edit(&range, new_text);
-        self.lsp.update(&self.text, window, cx);
-        self.push_lsp_change(cx);
-        // When the completion menu is already open, filter it locally as the
-        // user types (no server round-trip — avoids flicker); only a fresh
-        // word triggers a new request.
-        if self.is_completion_open() && !self.completion_inserting {
-            self.filter_completion(cx);
-        } else if !new_text.is_empty() && self.lsp.change_tx.is_some() && !self.completion_inserting
-        {
-            self.schedule_completion(window, cx);
-        } else if new_text.is_empty() && !self.completion_inserting {
-            self.close_completion(cx);
-        }
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();

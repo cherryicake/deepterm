@@ -33,7 +33,27 @@ pub struct InputEdit {
     pub new_end_position: Point,
 }
 
-pub use lsp_types::Position;
+/// A zero-based line/character position in a text document.
+///
+/// `line` is the 0-based line index, `character` the 0-based character
+/// column within that line (in characters, not bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+impl Position {
+    pub fn new(line: u32, character: u32) -> Self {
+        Self { line, character }
+    }
+}
+
+impl From<(u32, u32)> for Position {
+    fn from((line, character): (u32, u32)) -> Self {
+        Self { line, character }
+    }
+}
 
 /// An iterator over the lines of a `Rope`.
 pub struct RopeLines<'a> {

@@ -12,7 +12,6 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
-use crate::editor::lsp::LspServerSpec;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::file_icons::file_icon_or_default;
@@ -334,23 +333,6 @@ impl Editor {
         };
 
         self.open_files.push(file);
-
-        // Restart the LSP session for supported languages: the cached editor
-        // state's change channel points at a session from before the cache
-        // was taken (possibly another window or a process that has since
-        // exited), so a fresh attach is required.
-        if ssh_config.is_none() && !is_markdown {
-            let lang = guess_language_from_extension(Path::new(&path_str));
-            let path = PathBuf::from(&path_str);
-            if let Some(spec) = lsp_server_spec(&lang, &path) {
-                let uri = path_to_file_uri(&path);
-                editor_state.update(cx, |state, cx| {
-                    if state.lsp.change_tx.is_none() {
-                        state.attach_lsp(uri, spec, cx);
-                    }
-                });
-            }
-        }
 
         // 启动文件监视器
         if let Some(config) = ssh_config {
@@ -861,24 +843,6 @@ impl Editor {
                                     state.disabled = false;
                                     state.set_text(content.clone(), cx);
                                 });
-                                // LSP: the initial open skipped attach while
-                                // `is_loading`; now that content is loaded,
-                                // start the session for supported languages on
-                                // local files.
-                                if file.ssh_config.is_none() && file.image.is_none() {
-                                    let lang = guess_language_from_extension(Path::new(&file.path));
-                                    let file_path = file.path.clone();
-                                    file.editor_state.update(cx, |state, cx| {
-                                        if state.lsp.change_tx.is_none() {
-                                            if let Some(spec) =
-                                                lsp_server_spec(&lang, Path::new(&file_path))
-                                            {
-                                                let uri = path_to_file_uri(Path::new(&file_path));
-                                                state.attach_lsp(uri, spec, cx);
-                                            }
-                                        }
-                                    });
-                                }
                                 if let Some(ref markdown) = file.markdown {
                                     markdown.update(cx, |renderer, cx| {
                                         renderer.set_text(content.clone(), cx);
@@ -1247,23 +1211,11 @@ impl Editor {
         });
 
         // Re-render the Editor when this editor's InputState changes
-        // (hover popup / completion menu / search matches / cursor): the
-        // popups are rendered by EditorInput, which only re-renders when the
-        // Editor does.
+        // (search matches / cursor): the popups are rendered by EditorInput,
+        // which only re-renders when the Editor does.
         self.editor_state_subscriptions.push(
             cx.observe(&editor_state, |_, _, cx| cx.notify()),
         );
-
-        // LSP: start a session for supported languages on local files so
-        // semantic highlighting can layer on top of tree-sitter.
-        if !is_image && !is_loading && ssh_config.is_none() && !content.is_empty() {
-            if let Some(spec) = lsp_server_spec(&language, &path) {
-                let uri = path_to_file_uri(&path);
-                editor_state.update(cx, |state, cx| {
-                    state.attach_lsp(uri, spec, cx);
-                });
-            }
-        }
 
         let is_markdown = !is_image && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
@@ -1739,59 +1691,6 @@ pub(crate) fn guess_language_from_extension(path: &Path) -> String {
         })
         .unwrap_or("text")
         .to_string()
-}
-
-/// Map a local file path to an absolute `file://` URI for LSP (the LSP
-/// server rejects relative paths).
-fn path_to_file_uri(path: &Path) -> String {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    format!("file://{}", abs.display())
-}
-
-/// Walk up from `path` to find a workspace root (a `Cargo.toml` or `.git`
-/// directory). LSP servers (rust-analyzer especially) need the project root,
-/// not the file's directory, to resolve completions and definitions.
-fn workspace_root(path: &Path) -> PathBuf {
-    let mut dir = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    };
-    loop {
-        if dir.join("Cargo.toml").exists() || dir.join(".git").exists() {
-            return dir;
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    dir
-}
-
-/// LSP server configuration for a language, when one is available on this
-/// machine. Only local (non-SSH) files get a session.
-fn lsp_server_spec(language: &str, path: &Path) -> Option<LspServerSpec> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    let root_uri = format!("file://{}", workspace_root(&abs).display());
-
-    let spec = match language {
-        "rust" => LspServerSpec {
-            language_id: "rust",
-            command: "rust-analyzer",
-            args: &[],
-            root_uri,
-        },
-        _ => return None,
-    };
-    Some(spec)
 }
 
 struct EditorResizeElement {

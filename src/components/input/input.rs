@@ -161,10 +161,6 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::copy))
                     .when(is_multi_line, |this| {
                         this.on_action(window.listener_for(&self.state, InputState::on_action_search))
-                            .on_action(window.listener_for(
-                                &self.state,
-                                InputState::on_action_go_to_definition,
-                            ))
                     })
                     .on_key_down(window.listener_for(&self.state, InputState::on_key_down))
             })
@@ -184,17 +180,13 @@ impl RenderOnce for EditorInput {
                 MouseButton::Right,
                 window.listener_for(&self.state, InputState::on_mouse_up),
             )
-            .on_mouse_move(window.listener_for(&self.state, InputState::on_mouse_move))
             .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel))
             .when(self.transparent, |this| this.flex_1());
 
         if is_multi_line {
             // Multi-line mode: match the original InputState::render layout.
             // TextElement stays a direct flex child (wrapping it in an extra
-            // div broke layout → blank editor); popups are absolutely
-            // positioned overlays on the editor container.
-            // Popups (hover / completion) are drawn by TextElement via
-            // window.defer_draw (zed-style), not as children here.
+            // div broke layout → blank editor).
             actions
                 .id("editor-input")
                 .flex_1()

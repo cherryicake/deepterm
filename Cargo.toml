@@ -76,7 +76,6 @@ ropey = { version = "2.0.0-beta.1", features = [
 ] }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 smallvec = "1"
-lsp-types = { version = "0.97.0", features = ["proposed"] }
 tree-sitter = "0.25"
 streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"

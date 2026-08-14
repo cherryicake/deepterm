@@ -18,7 +18,7 @@ pub mod state;
 pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange};
 pub use indent::TabSize;
 pub use input::EditorInput;
-pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
+pub use rope_ext::{InputEdit, Point, Position, RopeExt, RopeLines};
 pub use ropey::Rope;
 pub use selection::Selection;
 pub use state::*;
