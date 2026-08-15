@@ -276,6 +276,7 @@ impl GitPanel {
 
         let repo = repo.clone();
         let weak = cx.entity().downgrade();
+        let generation = self.workspace_generation;
 
         cx.spawn(async move |_, cx| {
             let status_result = cx
@@ -296,6 +297,10 @@ impl GitPanel {
 
             let _ = weak.update(cx, |this, cx| {
                 this.loading = false;
+                // 刷新期间切换过工作区：丢弃过期结果，避免旧仓库状态覆盖新列表。
+                if generation != this.workspace_generation {
+                    return;
+                }
 
                 match status_result {
                     Ok(status_entries) => {
@@ -377,6 +382,10 @@ impl GitPanel {
                 if this.refresh_pending && !this.loading {
                     this.refresh_pending = false;
                     this.refresh(cx);
+                } else if this.refresh_pending {
+                    // 上一次刷新尚未完成（loading）：保留 pending，稍后重试，
+                    // 避免刷新请求在 loading 期间丢失后永远停滞。
+                    this.schedule_refresh(cx);
                 }
             });
         }));

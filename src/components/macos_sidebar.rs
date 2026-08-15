@@ -336,7 +336,7 @@ impl MacosSidebar {
         self.file_tree_event_subscription.take();
         let sub = cx.subscribe(
             &file_tree,
-            move |this, emitter, event: &FileTreeEvent, cx| match event {
+            move |this, _emitter, event: &FileTreeEvent, cx| match event {
                 FileTreeEvent::OpenFile { path, ssh_config } => {
                     cx.emit(SidebarEvent::OpenFile {
                         path: path.clone(),
@@ -344,30 +344,7 @@ impl MacosSidebar {
                     });
                 }
                 FileTreeEvent::RootChanged => {
-                    if let Some(ref git_panel) = this.git_panel {
-                        let (workspace_path, is_local, ssh_config, filesystem) = {
-                            let tree = emitter.read(cx);
-                            (
-                                tree.root_path().to_path_buf(),
-                                tree.is_local(),
-                                tree.ssh_config().cloned(),
-                                if tree.is_local() {
-                                    None
-                                } else {
-                                    Some(tree.filesystem().clone())
-                                },
-                            )
-                        };
-                        git_panel.update(cx, |panel, cx| {
-                            panel.set_workspace_path(
-                                workspace_path,
-                                is_local,
-                                ssh_config,
-                                filesystem,
-                                cx,
-                            );
-                        });
-                    }
+                    this.ensure_git_panel(cx);
                 }
             },
         );
@@ -396,6 +373,7 @@ impl MacosSidebar {
         self.file_tree_view = Some(view);
         self.file_tree_target_label = Some(target_label);
         self.current_view = SidebarView::FileTree;
+        self.ensure_git_panel(cx);
         cx.notify();
         let app_window = self.app_window.clone();
         cx.defer(move |cx| {
@@ -403,6 +381,68 @@ impl MacosSidebar {
                 aw.update(cx, |_, cx| cx.notify()).ok();
             }
         });
+    }
+
+    /// 确保 Git 面板已创建，并让它指向当前文件树的 workspace 路径。
+    ///
+    /// 首次调用会创建面板并建立文件监视订阅；路径变化时重建订阅；
+    /// 路径相同时保持现有订阅不动。
+    fn ensure_git_panel(&mut self, cx: &mut Context<Self>) {
+        if self.git_panel.is_none() {
+            let git_panel = cx.new(|cx| crate::sidebar_view::git_panel::GitPanel::new(cx));
+            self.git_panel = Some(git_panel);
+        }
+
+        let Some(ref git_panel) = self.git_panel else {
+            return;
+        };
+        let Some(ref file_tree) = self.file_tree_view else {
+            return;
+        };
+
+        let (workspace_path, is_local, ssh_config, filesystem) = {
+            let tree = file_tree.read(cx);
+            (
+                tree.root_path().to_path_buf(),
+                tree.is_local(),
+                tree.ssh_config().cloned(),
+                if tree.is_local() {
+                    None
+                } else {
+                    Some(tree.filesystem().clone())
+                },
+            )
+        };
+        git_panel.update(cx, |panel, cx| {
+            panel.set_workspace_path(
+                workspace_path,
+                is_local,
+                ssh_config,
+                filesystem,
+                cx,
+            );
+        });
+
+        // 订阅 Git 面板事件（OpenDiff 等）转发给侧边栏
+        self.git_panel_subscription.take();
+        let sub = cx.subscribe(
+            git_panel,
+            |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
+                crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
+                    path,
+                    diff,
+                    repo,
+                } => {
+                    cx.emit(SidebarEvent::OpenDiff {
+                        path: path.clone(),
+                        diff: diff.clone(),
+                        repo: repo.clone(),
+                    });
+                }
+                _ => {}
+            },
+        );
+        self.git_panel_subscription = Some(sub);
     }
 
     /// 将文件树切换到指定终端。路径+后端相同时复用现有树（仅切换订阅），否则重建。
@@ -437,6 +477,7 @@ impl MacosSidebar {
                     self.file_tree_terminal_view = Some(terminal_view.clone());
                     self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
                     self.file_tree_target_label = Some(display_name);
+                    self.ensure_git_panel(cx);
 
                     // 文件树 key 发生变化时才触发编辑器状态保存/恢复
                     let new_key = crate::editor::FileTreeKey::new(
@@ -522,61 +563,7 @@ impl MacosSidebar {
         self.file_tree_target_label = Some(display_name);
         self.current_view = SidebarView::FileTree;
 
-        // Create git panel if not exists and subscribe to events
-        if self.git_panel.is_none() {
-            let git_panel = cx.new(|cx| crate::sidebar_view::git_panel::GitPanel::new(cx));
-            self.git_panel = Some(git_panel);
-        }
-
-        // Subscribe to git panel events
-        self.git_panel_subscription.take();
-        if let Some(ref git_panel) = self.git_panel {
-            // Set workspace path
-            if let Some(ref file_tree) = self.file_tree_view {
-                let (workspace_path, is_local, ssh_config, filesystem) = {
-                    let tree = file_tree.read(cx);
-                    (
-                        tree.root_path().to_path_buf(),
-                        tree.is_local(),
-                        tree.ssh_config().cloned(),
-                        if tree.is_local() {
-                            None
-                        } else {
-                            Some(tree.filesystem().clone())
-                        },
-                    )
-                };
-                git_panel.update(cx, |panel, cx| {
-                    panel.set_workspace_path(
-                        workspace_path,
-                        is_local,
-                        ssh_config,
-                        filesystem,
-                        cx,
-                    );
-                });
-            }
-
-            // Subscribe to events
-            let sub = cx.subscribe(
-                git_panel,
-                |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
-                    crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff {
-                        path,
-                        diff,
-                        repo,
-                    } => {
-                        cx.emit(SidebarEvent::OpenDiff {
-                            path: path.clone(),
-                            diff: diff.clone(),
-                            repo: repo.clone(),
-                        });
-                    }
-                    _ => {}
-                },
-            );
-            self.git_panel_subscription = Some(sub);
-        }
+        self.ensure_git_panel(cx);
 
         // 触发编辑器状态保存/恢复
         let new_key = crate::editor::FileTreeKey::new(path, is_local, ssh_config);
@@ -2198,6 +2185,10 @@ impl MacosSidebar {
                         let old = this.file_tree_panel_tabs.current.clone();
                         if old != panel_clone {
                             this.file_tree_panel_tabs.select(panel_clone.clone());
+                            // 切到 Git 标签时确保面板已创建并初始化（订阅文件监视）
+                            if panel_clone == FileTreePanel::Git {
+                                this.ensure_git_panel(cx);
+                            }
                             cx.notify();
                             this.notify_app_window(cx);
                         }
