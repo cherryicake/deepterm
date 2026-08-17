@@ -1391,6 +1391,160 @@ impl InputState {
         });
     }
 
+    /// 代码编辑器中 Tab / Shift+Tab 的缩进单元：
+    /// 统一使用 Tab 字符（Makefile 等对制表符敏感的格式依赖它；
+    /// 后续若引入软缩进配置可替换此处）。
+    const INDENT_UNIT: &'static str = "\t";
+    /// 无 Tab 风格（空格缩进）下 outdent 一次最多删除的空格数。
+    const SPACE_OUTDENT_WIDTH: usize = 4;
+
+    pub(crate) fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        self.indent_or_outdent_lines(false, window, cx);
+    }
+
+    pub(crate) fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
+        self.indent_or_outdent_lines(true, window, cx);
+    }
+
+    pub(crate) fn indent_inline(
+        &mut self,
+        _: &IndentInline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.indent_or_outdent_lines(false, window, cx);
+    }
+
+    pub(crate) fn outdent_inline(
+        &mut self,
+        _: &OutdentInline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.indent_or_outdent_lines(true, window, cx);
+    }
+
+    /// 行首一个缩进单元的长度（字节）：优先 Tab，其次最多 4 个空格。
+    fn outdent_unit_len(line: &str) -> usize {
+        let bytes = line.as_bytes();
+        if bytes.first() == Some(&b'\t') {
+            1
+        } else {
+            bytes
+                .iter()
+                .take_while(|&&b| b == b' ')
+                .take(Self::SPACE_OUTDENT_WIDTH)
+                .count()
+        }
+    }
+
+    /// Tab / Shift+Tab / Cmd+] / Cmd+[ 的核心实现。
+    ///
+    /// - 无选区（光标）：Tab 在光标处插入缩进单元；Shift+Tab 删除当前行行首一个缩进单元。
+    /// - 有选区：对选区涉及的所有行整体缩进 / 反缩进，选区范围按实际插入/删除量平移。
+    fn indent_or_outdent_lines(
+        &mut self,
+        outdent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled || !self.mode.is_multi_line() {
+            return;
+        }
+        self.pause_blink_cursor(cx);
+
+        let sel = self.selected_range;
+        let (start, end) = if sel.start <= sel.end {
+            (sel.start, sel.end)
+        } else {
+            (sel.end, sel.start)
+        };
+
+        // 无选区：仅光标位置操作。
+        if start == end {
+            if outdent {
+                self.outdent_cursor_line(start, window, cx);
+            } else {
+                self.replace_text_in_range_silent(None, Self::INDENT_UNIT, window, cx);
+            }
+            return;
+        }
+
+        // 多行/行内选区：定位涉及的行范围。
+        let start_row = self.text.offset_to_point(start).row;
+        let end_point = self.text.offset_to_point(end);
+        let mut last_row = end_point.row;
+        // 选区恰好结束在「某行行首」（多行选择）时，最后一行不属于选区。
+        if last_row > start_row && self.text.line_start_offset(last_row) == end {
+            last_row -= 1;
+        }
+
+        let line_start = self.text.line_start_offset(start_row);
+        let line_end = self.text.line_end_offset(last_row);
+
+        let mut new_text = String::new();
+        let mut removed = Vec::with_capacity(last_row - start_row + 1);
+        for row in start_row..=last_row {
+            let line = self.text.slice_line(row).to_string();
+            if outdent {
+                let n = Self::outdent_unit_len(&line);
+                removed.push(n);
+                new_text.push_str(&line[n..]);
+            } else {
+                new_text.push_str(Self::INDENT_UNIT);
+                new_text.push_str(&line);
+            }
+            if row != last_row {
+                new_text.push('\n');
+            }
+        }
+
+        let range_utf16 = self.range_to_utf16(&(line_start..line_end));
+        self.replace_text_in_range(Some(range_utf16), &new_text, window, cx);
+
+        // 恢复选区：按每行行首的插入/删除量平移开始与结束。
+        let (new_start, new_end) = if outdent {
+            let edits: Vec<(usize, usize)> = (start_row..=last_row)
+                .zip(removed.iter().copied())
+                .map(|(row, n)| (self.text.line_start_offset(row), n))
+                .collect();
+            (
+                shifted_outdent_offset(start, &edits),
+                shifted_outdent_offset(end, &edits),
+            )
+        } else {
+            (start + 1, end + (last_row - start_row + 1))
+        };
+        self.selected_range = Selection::new(new_start, new_end);
+        self.update_preferred_column();
+    }
+
+    /// Shift+Tab：删除光标所在行行首的一个缩进单元，光标按删除量回退。
+    fn outdent_cursor_line(
+        &mut self,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self.text.offset_to_point(offset).row;
+        let line_start = self.text.line_start_offset(row);
+        let line = self.text.slice_line(row).to_string();
+        let n = Self::outdent_unit_len(&line);
+        if n == 0 {
+            return;
+        }
+        let range_utf16 = self.range_to_utf16(&(line_start..line_start + n));
+        self.replace_text_in_range(Some(range_utf16), "", window, cx);
+        // 光标若在被删除区间内（含行首），钳制到新行首；否则回退删除量。
+        let new_cursor = if offset >= line_start + n {
+            offset - n
+        } else {
+            line_start
+        };
+        self.selected_range = Selection::new(new_cursor, new_cursor);
+        self.update_preferred_column();
+    }
+
     pub(crate) fn clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text("", window, cx);
         self.selected_range = (0..0).into();
@@ -2482,7 +2636,76 @@ impl Focusable for InputState {
     }
 }
 
+/// 将原始偏移 o 映射到 outdent 后的新偏移（module 级，便于单元测试）：
+/// `edits` 为 (行首偏移, 该行删除的字节数) 列表，按行序排列。
+/// 累计此前各行的删除量；位置落在某个被删除区间内时钳制到该行新行首。
+fn shifted_outdent_offset(o: usize, edits: &[(usize, usize)]) -> usize {
+    let mut shift: isize = 0;
+    for &(line_start, n) in edits {
+        if n == 0 {
+            continue;
+        }
+        if o >= line_start + n {
+            shift -= n as isize;
+        } else if o >= line_start {
+            // 位置落在被删除区间内：取该行被删除后的行首。
+            return (line_start as isize + shift).max(0) as usize;
+        } else {
+            break;
+        }
+    }
+    (o as isize + shift).max(0) as usize
+}
+
 #[cfg(test)]
 mod tests {
-    // Tests disabled: gpui testing utilities not available in DeepTerm
+    use super::*;
+    use crate::components::input::InputState;
+
+    #[test]
+    fn outdent_unit_len_prefers_tab() {
+        assert_eq!(InputState::outdent_unit_len("\tfoo"), 1);
+        assert_eq!(InputState::outdent_unit_len("\t\tfoo"), 1);
+        assert_eq!(InputState::outdent_unit_len("foo"), 0);
+        assert_eq!(InputState::outdent_unit_len("    foo"), 4); // 空格缩进
+        assert_eq!(InputState::outdent_unit_len("  foo"), 2);
+        assert_eq!(InputState::outdent_unit_len("      foo"), 4); // 最多 4 个
+        assert_eq!(InputState::outdent_unit_len("  \tfoo"), 2); // 空格在 tab 前
+        assert_eq!(InputState::outdent_unit_len(""), 0);
+    }
+
+    #[test]
+    fn shifted_outdent_offset_basic() {
+        // 两行均删除 2 空格："  foo\n  bar" -> "foo\nbar"
+        let edits = [(0, 2), (6, 2)];
+        // 选区起点 0 不变
+        assert_eq!(shifted_outdent_offset(0, &edits), 0);
+        // 选区终点 11（全文结尾）回退 4
+        assert_eq!(shifted_outdent_offset(11, &edits), 7);
+        // 光标在第二行行首 6：落在删除区间内 → 钳制到新行首 4
+        assert_eq!(shifted_outdent_offset(6, &edits), 4);
+        // 光标在第二行内容 (8)：回退 2（第一行 2 + 第二行 2）
+        assert_eq!(shifted_outdent_offset(8, &edits), 4);
+    }
+
+    #[test]
+    fn shifted_outdent_offset_single_line_selection() {
+        // 光标在行中间 3（"  foo" 内），行首删除 2 → 新位置 1
+        let edits = [(0, 2)];
+        assert_eq!(shifted_outdent_offset(3, &edits), 1);
+        // 光标在行首：钳制到 0
+        assert_eq!(shifted_outdent_offset(0, &edits), 0);
+        // 光标在删除区中间 (1)：钳制到 0
+        assert_eq!(shifted_outdent_offset(1, &edits), 0);
+    }
+
+    #[test]
+    fn shifted_outdent_offset_uneven_removals() {
+        // 第一行删 1 (tab)，第二行删 4："\tfoo\n    bar" -> "foo\nbar"
+        let edits = [(0, 1), (5, 4)];
+        assert_eq!(shifted_outdent_offset(0, &edits), 0);
+        assert_eq!(shifted_outdent_offset(4, &edits), 3); // “foo” 末尾
+        assert_eq!(shifted_outdent_offset(9, &edits), 4); // 第二行内容
+        assert_eq!(shifted_outdent_offset(14, &edits), 9); // 全文结尾
+    }
 }

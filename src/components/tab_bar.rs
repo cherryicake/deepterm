@@ -1264,8 +1264,24 @@ impl Render for TabBar {
                                                 .relative()
                                                 .overflow_hidden()
                                                 .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(4.0))
                                                 .when(!is_active, |this| {
                                                     this.max_w(px(TAB_MAX_WIDTH_PX))
+                                                })
+                                                .when(tab.is_modified, |this| {
+                                                    this.child(
+                                                        div()
+                                                            .size(px(6.0))
+                                                            .flex_none()
+                                                            .rounded_full()
+                                                            .bg(if is_active {
+                                                                theme.text_muted
+                                                            } else {
+                                                                theme.text_muted.opacity(0.7)
+                                                            }),
+                                                    )
                                                 })
                                                 .child(
                                                     div()

@@ -32,6 +32,11 @@ static FILE_NAME_ICONS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock
     map.insert("ionic.config.json", "icons/file_icons/ionic.svg");
     map.insert("ionic.project", "icons/file_icons/ionic.svg");
     map.insert("jenkinsfile", "icons/file_icons/jenkins.svg");
+    map.insert("makefile", "icons/file_icons/makefile.svg");
+    map.insert("gnumakefile", "icons/file_icons/makefile.svg");
+    map.insert("bsdmakefile", "icons/file_icons/makefile.svg");
+    map.insert("makefile.am", "icons/file_icons/makefile.svg");
+    map.insert("makefile.in", "icons/file_icons/makefile.svg");
     map.insert("karma.conf.cjs", "icons/file_icons/karma.svg");
     map.insert("karma.conf.coffee", "icons/file_icons/karma.svg");
     map.insert("karma.conf.js", "icons/file_icons/karma.svg");
@@ -259,6 +264,9 @@ static FILE_EXTENSION_ICONS: LazyLock<HashMap<&'static str, &'static str>> = Laz
     map.insert("ls", "icons/file_icons/livescript.svg");
     map.insert("lua", "icons/file_icons/lua.svg");
     map.insert("m", "icons/file_icons/c.svg");
+    map.insert("mk", "icons/file_icons/makefile.svg");
+    map.insert("mak", "icons/file_icons/makefile.svg");
+    map.insert("make", "icons/file_icons/makefile.svg");
     map.insert("markdown", "icons/file_icons/markdown.svg");
     map.insert("master", "icons/file_icons/html.svg");
     map.insert("md", "icons/file_icons/markdown.svg");

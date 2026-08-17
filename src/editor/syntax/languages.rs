@@ -22,6 +22,7 @@ pub enum Language {
     JavaScript,
     Kotlin,
     Lua,
+    Makefile,
     Markdown,
     MarkdownInline,
     Python,
@@ -60,6 +61,7 @@ impl Language {
             Self::Json => "json",
             Self::Kotlin => "kotlin",
             Self::Lua => "lua",
+            Self::Makefile => "make",
             Self::Markdown => "markdown",
             Self::MarkdownInline => "markdown_inline",
             Self::Python => "python",
@@ -88,6 +90,7 @@ impl Language {
             "json" | "jsonc" => Self::Json,
             "kotlin" | "kt" | "kts" => Self::Kotlin,
             "lua" => Self::Lua,
+            "make" | "makefile" | "mk" | "mak" => Self::Makefile,
             "markdown" | "md" | "mdx" => Self::Markdown,
             "markdown_inline" | "markdown-inline" => Self::MarkdownInline,
             "python" | "py" => Self::Python,
@@ -228,6 +231,12 @@ impl Language {
                 "",
                 "",
             ),
+            Self::Makefile => (
+                tree_sitter_make::LANGUAGE,
+                include_str!("languages/makefile/highlights.scm"),
+                "",
+                "",
+            ),
             Self::TypeScript => (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
                 include_str!("languages/typescript/highlights.scm"),
@@ -278,5 +287,9 @@ mod tests {
         assert_eq!(Language::JavaScript.name(), "javascript");
         assert_eq!(Language::TypeScript.name(), "typescript");
         assert_eq!(Language::Tsx.name(), "tsx");
+        assert_eq!(Language::Makefile.name(), "make");
+        assert_eq!(Language::from_str("make"), Language::Makefile);
+        assert_eq!(Language::from_str("mk"), Language::Makefile);
+        assert_eq!(Language::from_str("makefile"), Language::Makefile);
     }
 }

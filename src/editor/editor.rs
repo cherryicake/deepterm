@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
+use crate::components::notification::NotificationKind;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::file_icons::file_icon_or_default;
@@ -64,6 +65,14 @@ struct EditorFile {
     original_content: String,
     pending_reload: bool,
     is_loading: bool,
+    /// 正在保存中：防止并发保存（与 DiffView 相同的防护）。
+    saving: bool,
+    /// 关闭确认弹窗已打开：防止重复弹窗。
+    close_prompt_pending: bool,
+    /// 上一次脏检查时的 InputState::text_version（O(1) 闸门，避免每次光标移动全量比较）。
+    last_checked_text_version: u64,
+    /// 当前标签页是否显示未保存标记。
+    dirty: bool,
     markdown: Option<Entity<crate::editor::markdown::Markdown>>,
     image: Option<Entity<crate::editor::image_viewer::ImageViewer>>,
     diff: Option<Entity<crate::editor::diff_view::DiffView>>,
@@ -77,6 +86,9 @@ pub struct EditorOpenFileInfo {
     pub label: String,
     pub ssh_config: Option<SshConnectionConfig>,
     pub is_loading: bool,
+    /// 磁盘上的内容基线（最后一次加载/保存后的内容），用于跨文件树切换后恢复未保存状态。
+    /// 加载中的文件为 None。
+    pub original_content: Option<String>,
 }
 
 /// 文件树标识符，用于区分不同的文件树（终端会话）
@@ -231,6 +243,11 @@ impl Editor {
                 label: f.label.clone(),
                 ssh_config: f.ssh_config.clone(),
                 is_loading: f.is_loading,
+                original_content: if f.is_loading {
+                    None
+                } else {
+                    Some(f.original_content.clone())
+                },
             })
             .collect()
     }
@@ -349,6 +366,11 @@ impl Editor {
         let ssh_config = file_info.ssh_config.clone();
 
         let content = editor_state.read(cx).value().to_string();
+        let original_content = file_info
+            .original_content
+            .clone()
+            .unwrap_or_else(|| content.clone());
+        let is_dirty = content.as_str() != original_content.as_str();
         let is_markdown = path_str.ends_with(".md")
             && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX);
         let markdown = if is_markdown {
@@ -359,8 +381,29 @@ impl Editor {
 
         // Re-render the Editor when the restored editor's InputState changes
         // (hover popup / completion menu / search matches).
-        self.editor_state_subscriptions
-            .push(cx.observe(&editor_state, |_, _, cx| cx.notify()));
+        let restored_tab_id = file_info.id.clone();
+        self.editor_state_subscriptions.push(cx.observe(
+            &editor_state,
+            move |this, state_entity, cx| {
+                // 与 open_file_with_content 相同的脏检查逻辑，恢复后同样需要维护未保存标记。
+                let text_version = state_entity.read(cx).text_version;
+                let idx = this
+                    .open_files
+                    .iter()
+                    .position(|f| f.id == restored_tab_id);
+                if let Some(idx) = idx
+                    && this.open_files[idx].last_checked_text_version != text_version
+                {
+                    let dirty = this.file_is_dirty(&this.open_files[idx], cx);
+                    this.open_files[idx].last_checked_text_version = text_version;
+                    if this.open_files[idx].dirty != dirty {
+                        this.open_files[idx].dirty = dirty;
+                        this.sync_tab_modified(&restored_tab_id, dirty, cx);
+                    }
+                }
+                cx.notify();
+            },
+        ));
 
         let file = EditorFile {
             id: file_info.id.clone(),
@@ -368,9 +411,15 @@ impl Editor {
             label,
             ssh_config: ssh_config.clone(),
             editor_state: editor_state.clone(),
-            original_content: content,
+            // 恢复磁盘基线，保留文件树切换前的未保存状态；
+            // 旧状态可能没有该字段（兼容 None = 以缓存内容为准）。
+            original_content,
             pending_reload: false,
             is_loading: false,
+            saving: false,
+            close_prompt_pending: false,
+            last_checked_text_version: 0,
+            dirty: is_dirty,
             markdown,
             image: None,
             diff: None,
@@ -389,7 +438,8 @@ impl Editor {
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
                 TabItem::new(&file_info.id, &file_info.label)
-                    .with_icon(Some(file_icon_or_default(Path::new(&file_info.path)))),
+                    .with_icon(Some(file_icon_or_default(Path::new(&file_info.path))))
+                    .with_modified(is_dirty),
                 cx,
             );
         });
@@ -506,7 +556,9 @@ impl Editor {
                     match cx
                         .background_executor()
                         .spawn(async move {
-                            crate::ssh::sftp_fs::read_text_preview(&config, &path_for_task)
+                            // 必须读完整文件：read_text_preview 只读前 64KB，
+                            // 重载/保存后会把大文件截断成预览内容。
+                            crate::ssh::sftp_fs::read_file_to_string(&config, &path_for_task)
                         })
                         .await
                     {
@@ -547,6 +599,7 @@ impl Editor {
                             let current = file.editor_state.read(cx).value().to_string();
                             if current == file.original_content {
                                 file.original_content = content.clone();
+                                file.dirty = false;
                                 file.editor_state.update(cx, |state, cx| {
                                     state.set_text(content.clone(), cx);
                                 });
@@ -555,6 +608,15 @@ impl Editor {
                                         renderer.set_text(content.clone(), cx);
                                     });
                                 }
+                                // 外部变更已重载：同步标签栏未保存标记（通常本就不亮）
+                                let id = id.clone();
+                                this.tab_bar.update(cx, |tab_bar, cx| {
+                                    tab_bar.modify_tab(
+                                        id.as_ref(),
+                                        |tab| tab.is_modified = false,
+                                        cx,
+                                    );
+                                });
                                 // 同步更新远程文件内容缓存，避免重开后仍是旧内容
                                 if let Some(ref ssh_config) = file.ssh_config {
                                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
@@ -571,6 +633,18 @@ impl Editor {
                                     "File changed externally but has unsaved changes: {}",
                                     path
                                 );
+                                // 已有本地未保存修改：不覆盖编辑器内容，保持脏标记。
+                                file.dirty = true;
+                                if !file.close_prompt_pending {
+                                    let id = id.clone();
+                                    this.tab_bar.update(cx, |tab_bar, cx| {
+                                        tab_bar.modify_tab(
+                                            id.as_ref(),
+                                            |tab| tab.is_modified = true,
+                                            cx,
+                                        );
+                                    });
+                                }
                             }
                             file.pending_reload = false;
                         }
@@ -782,6 +856,10 @@ impl Editor {
             original_content: String::new(),
             pending_reload: false,
             is_loading: false,
+            saving: false,
+            close_prompt_pending: false,
+            last_checked_text_version: 0,
+            dirty: false,
             markdown: None,
             image: None,
             diff: Some(diff_view),
@@ -923,6 +1001,8 @@ impl Editor {
                             {
                                 file.original_content = content.clone();
                                 file.is_loading = false;
+                                // 加载完成：尚未编辑，不显示未保存标记。
+                                file.dirty = false;
                                 // 缓存远程文件内容到 RemoteFileTreeCache
                                 if let Some(ref ssh_config) = file.ssh_config {
                                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
@@ -994,7 +1074,7 @@ impl Editor {
                             let _ = weak.update(cx, |this, cx| {
                                 if this.is_load_current(&tab_id, load_generation) {
                                     this.loading_gens.remove(&tab_id);
-                                    this.close_file(&tab_id, cx);
+                                    this.close_file_direct(&tab_id, cx);
                                 }
                                 cx.notify();
                             });
@@ -1121,10 +1201,14 @@ impl Editor {
             tab_id,
             load_gen,
             Arc::new(move || {
-                match crate::ssh::sftp_fs::read_text_preview(&ssh_config_for_task, &path_for_task) {
+                // 必须读完整文件：read_text_preview 只读前 64KB，编辑后保存会把大文件截断。
+                match crate::ssh::sftp_fs::read_file_to_string(
+                    &ssh_config_for_task,
+                    &path_for_task,
+                ) {
                     Ok(Some(text)) => Ok(text),
                     Ok(None) => {
-                        log::warn!("远程文件为二进制或空，无法打开编辑: {}", path_for_log);
+                        log::warn!("远程文件为二进制：{} ", path_for_log);
                         Ok(String::new())
                     }
                     Err(e) => {
@@ -1281,7 +1365,7 @@ impl Editor {
                             let _ = weak.update(cx, |this, cx| {
                                 if this.is_load_current(&tab_id, load_generation) {
                                     this.loading_gens.remove(&tab_id);
-                                    this.close_file(&tab_id, cx);
+                                    this.close_file_direct(&tab_id, cx);
                                 }
                                 cx.notify();
                             });
@@ -1338,6 +1422,24 @@ impl Editor {
         let sync_tab_id = tab_id.clone();
         self.editor_state_subscriptions.push(
             cx.observe(&editor_state, move |this, state_entity, cx| {
+                // 未保存标记：仅在文本版本变化时重新比较（O(1) 闸门，
+                // 避免每次光标移动 / 重绘都对整个缓冲区做全量比较）。
+                let text_version = state_entity.read(cx).text_version;
+                let idx = this
+                    .open_files
+                    .iter()
+                    .position(|f| f.id.as_ref() == sync_tab_id.as_str());
+                if let Some(idx) = idx
+                    && this.open_files[idx].last_checked_text_version != text_version
+                {
+                    let dirty = this.file_is_dirty(&this.open_files[idx], cx);
+                    this.open_files[idx].last_checked_text_version = text_version;
+                    if this.open_files[idx].dirty != dirty {
+                        this.open_files[idx].dirty = dirty;
+                        this.sync_tab_modified(&sync_tab_id, dirty, cx);
+                    }
+                }
+
                 // 编辑 tab 内容变化时，同步刷新同路径的 markdown 预览 tab，
                 // 保证双击进入编辑模式后，预览不会停留在旧内容上。
                 // 先用轻量检查确认存在同路径预览，避免普通文件/大文件
@@ -1397,6 +1499,10 @@ impl Editor {
             original_content: content.clone(),
             pending_reload: false,
             is_loading,
+            saving: false,
+            close_prompt_pending: false,
+            last_checked_text_version: 0,
+            dirty: false,
             markdown,
             image,
             diff: None,
@@ -1442,13 +1548,194 @@ impl Editor {
         cx.notify();
     }
 
-    fn close_file(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// 判断文件当前是否有未保存的修改（编辑器文本 vs 磁盘基线）。
+    fn file_is_dirty(&self, file: &EditorFile, cx: &mut App) -> bool {
+        file.editor_state.read(cx).value().as_ref() != file.original_content.as_str()
+    }
+
+    /// 同步标签栏的未保存标记。
+    fn sync_tab_modified(&self, tab_id: &str, dirty: bool, cx: &mut Context<Self>) {
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.modify_tab(tab_id, |tab| tab.is_modified = dirty, cx);
+        });
+    }
+
+    /// 保存当前激活的标签页（普通编辑文件 / diff 视图）。
+    fn save_active_file(&mut self, cx: &mut Context<Self>) {
+        let Some(active_id) = self.active_file_id.clone() else {
+            return;
+        };
+        self.save_file_by_id(&active_id, cx, false);
+    }
+
+    /// 保存指定标签页的编辑文件；`close_after_save` 用于关闭确认弹窗选「保存」后的流程。
+    ///
+    /// 保存失败时绝不关闭标签页，也绝不清除脏标记：编辑器内容必须保留，
+    /// 并通过通知提示用户重试，避免静默丢数据。
+    fn save_file_by_id(
+        &mut self,
+        tab_id: &str,
+        cx: &mut Context<Self>,
+        close_after_save: bool,
+    ) {
+        let idx = self.open_files.iter().position(|f| f.id.as_ref() == tab_id);
+        let Some(idx) = idx else {
+            return;
+        };
+
+        // diff 视图走 DiffView 自己的保存逻辑（基于 Git 后端，本地/远程）。
+        if let Some(diff) = self.open_files[idx].diff.clone() {
+            diff.update(cx, |view, cx| view.save(cx));
+            return;
+        }
+
+        if self.open_files[idx].saving || self.open_files[idx].is_loading {
+            return;
+        }
+
+        let text = self.open_files[idx].editor_state.read(cx).value().to_string();
+        let original = self.open_files[idx].original_content.clone();
+        if text == original {
+            // 无修改：无需写入磁盘。
+            return;
+        }
+
+        self.open_files[idx].saving = true;
+        cx.notify();
+
+        let path = self.open_files[idx].path.clone();
+        let label = self.open_files[idx].label.clone();
+        let ssh_config = self.open_files[idx].ssh_config.clone();
+        let weak = cx.entity().downgrade();
+        let tab_id = tab_id.to_string();
+
+        cx.spawn(async move |_, cx| {
+            // 后台写入，绝不阻塞 UI 线程（远程 SFTP 可能较慢）。
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    save_text_to_file(&path, ssh_config.as_ref(), &original, &text)
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                let Some(file) = this
+                    .open_files
+                    .iter_mut()
+                    .find(|f| f.id.as_ref() == tab_id)
+                else {
+                    return;
+                };
+                file.saving = false;
+                match result {
+                    Ok(written) => {
+                        // 磁盘基线更新为实际写入的内容：脏标记清除，
+                        // 且随后的 watcher 事件（本地 notify / 远程轮询）
+                        // 会走「无变化重载」路径，不会覆盖编辑器内容。
+                        file.original_content = written.clone();
+                        file.dirty = false;
+                        if let Some(config) = &file.ssh_config {
+                            crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                                .lock()
+                                .unwrap()
+                                .insert_file_content(
+                                    config,
+                                    std::path::Path::new(&file.path),
+                                    written,
+                                );
+                        }
+                        let msg = format!("已保存 {label}");
+                        this.sync_tab_modified(&tab_id, false, cx);
+                        this.show_notification(msg, NotificationKind::Success, cx);
+                        if close_after_save {
+                            this.close_file_direct(&tab_id, cx);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        this.show_notification(
+                            format!("保存失败: {e}"),
+                            NotificationKind::Error,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_file(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.loading_gens.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
-            let file = &self.open_files[index];
-            let path = file.path.clone();
-            let is_remote = file.ssh_config.is_some();
+            // 保存进行中：不允许关闭，否则保存结束前的额外编辑可能丢失；
+            // 保存完成（或失败）后标签页会保持打开，用户可再次关闭。
+            if self.open_files[index].saving {
+                return;
+            }
+            // 有未保存更改时先弹出确认框，避免误关丢数据。
+            if self.file_is_dirty(&self.open_files[index], cx)
+                && !self.open_files[index].close_prompt_pending
+            {
+                // 已有其它标签页的确认框在弹出：原生弹窗不可叠加，
+                // 本次不弹、也不关闭，等用户处理完当前弹窗后再试。
+                if self.open_files.iter().any(|f| f.close_prompt_pending) {
+                    return;
+                }
+                let label = self.open_files[index].label.clone();
+                self.open_files[index].close_prompt_pending = true;
+                cx.notify();
+                let weak = cx.entity().downgrade();
+                let tab_id = id.to_string();
+                let receiver = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &format!("“{label}”有未保存的更改"),
+                    Some("关闭前是否保存？"),
+                    &["保存", "不保存", "取消"],
+                    cx,
+                );
+                cx.spawn(async move |_, cx| {
+                    let answer = receiver.await.unwrap_or(2);
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(file) = this
+                            .open_files
+                            .iter_mut()
+                            .find(|f| f.id.as_ref() == tab_id)
+                        {
+                            file.close_prompt_pending = false;
+                        }
+                        match answer {
+                            // 保存成功后由 save_file_by_id 的 close_after_save 关闭；
+                            // 保存失败则保持打开并提示错误。
+                            0 => this.save_file_by_id(&tab_id, cx, true),
+                            1 => this.close_file_direct(&tab_id, cx),
+                            _ => {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+            self.close_file_direct(id, cx);
+        }
+    }
+
+    /// 直接关闭标签页（不做未保存确认）。
+    ///
+    /// 仅在以下场景使用：
+    /// - 已通过 close_file 的弹窗确认；
+    /// - 文件加载失败后关闭（加载失败的文件保持 disabled，不可能有未保存内容）。
+    fn close_file_direct(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.loading_gens.remove(id);
+        let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
+        if let Some(index) = pos {
+            let path = self.open_files[index].path.clone();
+            let is_remote = self.open_files[index].ssh_config.is_some();
             // 同一路径可能同时打开预览/编辑两个 tab：
             // 仅当这是最后一个引用该路径的 tab 时才取消文件监听并清理内容缓存。
             let has_other_tab = self
@@ -1502,7 +1789,7 @@ impl Editor {
         cx.notify();
     }
 
-    fn close_other_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn close_other_tabs(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .open_files
             .iter()
@@ -1510,11 +1797,11 @@ impl Editor {
             .map(|f| f.id.to_string())
             .collect();
         for file_id in ids {
-            self.close_file(&file_id, cx);
+            self.close_file(&file_id, window, cx);
         }
     }
 
-    fn close_right_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn close_right_tabs(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let ids: Vec<String> = self.open_files[index + 1..]
@@ -1522,12 +1809,12 @@ impl Editor {
                 .map(|f| f.id.to_string())
                 .collect();
             for file_id in ids {
-                self.close_file(&file_id, cx);
+                self.close_file(&file_id, window, cx);
             }
         }
     }
 
-    fn close_left_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn close_left_tabs(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let ids: Vec<String> = self.open_files[..index]
@@ -1535,15 +1822,15 @@ impl Editor {
                 .map(|f| f.id.to_string())
                 .collect();
             for file_id in ids {
-                self.close_file(&file_id, cx);
+                self.close_file(&file_id, window, cx);
             }
         }
     }
 
-    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+    fn close_all_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<String> = self.open_files.iter().map(|f| f.id.to_string()).collect();
         for file_id in ids {
-            self.close_file(&file_id, cx);
+            self.close_file(&file_id, window, cx);
         }
     }
 
@@ -1593,8 +1880,8 @@ impl Editor {
                 move |tab_id, window, cx| {
                     let id = tab_id.to_string();
                     editor.update(cx, |_, cx| {
-                        cx.defer_in(window, move |this, _window, cx| {
-                            this.close_file(&id, cx);
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.close_file(&id, window, cx);
                         });
                     });
                 }
@@ -1816,41 +2103,36 @@ impl Render for Editor {
 
         let root: gpui::AnyElement = div()
             .key_context("EditorPanel")
-            .on_action(cx.listener(|this, _: &CloseActiveEditorTab, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseActiveEditorTab, window, cx| {
                 if let Some(active_id) = this.active_file_id.clone() {
-                    this.close_file(active_id.as_ref(), cx);
+                    let id = active_id.as_ref().to_string();
+                    this.close_file(&id, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SaveActiveEditorTab, _window, cx| {
-                if let Some(active_id) = this.active_file_id.clone() {
-                    if let Some(file) = this.open_files.iter().find(|f| f.id == *active_id) {
-                        if let Some(diff) = &file.diff {
-                            diff.update(cx, |view, cx| view.save(cx));
-                        }
-                    }
+                this.save_active_file(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                    this.close_file(&tab_id, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseTab, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
                 if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_file(&tab_id, cx);
+                    this.close_other_tabs(&tab_id, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseOtherTabs, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseRightTabs, window, cx| {
                 if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_other_tabs(&tab_id, cx);
+                    this.close_right_tabs(&tab_id, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &CloseRightTabs, _window, cx| {
-                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_right_tabs(&tab_id, cx);
-                }
+            .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
+                this.close_all_tabs(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseAllTabs, _window, cx| {
-                this.close_all_tabs(cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseLeftTabs, _window, cx| {
+            .on_action(cx.listener(|this, _: &CloseLeftTabs, window, cx| {
                 if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_left_tabs(&tab_id, cx);
+                    this.close_left_tabs(&tab_id, window, cx);
                 }
             }))
             .w_full()
@@ -1886,10 +2168,98 @@ impl Render for Editor {
     }
 }
 
+/// 文件换行风格：保存时按文件的原始风格还原，避免 CRLF 文件被改写成 LF（或反之）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineEnding {
+    Unix,
+    Windows,
+}
+
+impl LineEnding {
+    /// 检测文本的换行风格：只看前 1000 字符内第一个换行符（与 Zed 一致）。
+    pub(crate) fn detect(text: &str) -> Self {
+        let mut max_ix = std::cmp::min(text.len(), 1000);
+        while !text.is_char_boundary(max_ix) {
+            max_ix -= 1;
+        }
+
+        if let Some(ix) = text[..max_ix].find('\n') {
+            if ix > 0 && text.as_bytes()[ix - 1] == b'\r' {
+                Self::Windows
+            } else {
+                Self::Unix
+            }
+        } else {
+            #[cfg(windows)]
+            {
+                Self::Windows
+            }
+            #[cfg(not(windows))]
+            {
+                Self::Unix
+            }
+        }
+    }
+}
+
+/// 保存前的换行统一与还原：
+/// 先把编辑器中可能混用的 `\r\n` 统一为 `\n`，再按文件原始风格还原，
+/// 避免把 `\r\n` 直接 `.replace('\n', "\r\n")` 变成 `\r\r\n`。
+pub(crate) fn normalize_line_endings(text: &str, line_ending: LineEnding) -> String {
+    let unified = text.replace("\r\n", "\n");
+    match line_ending {
+        LineEnding::Unix => unified,
+        LineEnding::Windows => unified.replace('\n', "\r\n"),
+    }
+}
+
+/// 将文本写入本地或远程文件，返回实际写入的内容（用于更新磁盘基线）。
+///
+/// - 本地：创建缺失的父目录后直接覆盖写入（与 Zed 的 LocalFs::save 一致，
+///   保留已存在 inode 的权限位）。
+/// - 远程：通过 SFTP 覆盖写入（复用连接缓存，失败自动重连一次）。
+pub(crate) fn save_text_to_file(
+    path: &str,
+    ssh_config: Option<&SshConnectionConfig>,
+    original: &str,
+    text: &str,
+) -> Result<String, String> {
+    let line_ending = LineEnding::detect(original);
+    let output = normalize_line_endings(text, line_ending);
+
+    if let Some(config) = ssh_config {
+        crate::ssh::sftp_fs::write_file_string(config, path, &output)
+            .map_err(|e| format!("写入远程文件失败: {e}"))?;
+    } else {
+        let p = Path::new(path);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建目录失败: {e}"))?;
+            }
+        }
+        std::fs::write(p, &output).map_err(|e| format!("写入本地文件失败: {e}"))?;
+    }
+    Ok(output)
+}
+
 pub(crate) fn guess_language_from_extension(path: &Path) -> String {
+    // Makefile 通常没有扩展名：按文件名匹配（Makefile / GNUmakefile / BSDmakefile）。
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if lower == "makefile"
+            || lower == "gnumakefile"
+            || lower == "bsdmakefile"
+            || lower == "makefile.am"
+            || lower == "makefile.in"
+        {
+            return "make".to_string();
+        }
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| match ext {
+            "mk" | "mak" | "make" => "make",
             "rs" => "rust",
             "js" | "jsx" => "javascript",
             "ts" => "typescript",
@@ -2006,5 +2376,94 @@ impl IntoElement for EditorResizeElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_line_ending_lf() {
+        assert_eq!(LineEnding::detect("line1\nline2\n"), LineEnding::Unix);
+        assert_eq!(LineEnding::detect("hello world"), LineEnding::Unix); // 无换行 → 平台默认
+    }
+
+    #[test]
+    fn detect_line_ending_crlf() {
+        assert_eq!(
+            LineEnding::detect("line1\r\nline2\r\n"),
+            LineEnding::Windows
+        );
+        // 混合换行：以第一个换行符为准
+        assert_eq!(
+            LineEnding::detect("first\r\nsecond\nthird"),
+            LineEnding::Windows
+        );
+        assert_eq!(
+            LineEnding::detect("first\nsecond\r\nthird"),
+            LineEnding::Unix
+        );
+    }
+
+    #[test]
+    fn normalize_line_endings_unix() {
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc", LineEnding::Unix),
+            "a\nb\nc"
+        );
+        // 无任何换行
+        assert_eq!(normalize_line_endings("plain", LineEnding::Unix), "plain");
+    }
+
+    #[test]
+    fn normalize_line_endings_windows() {
+        // 编辑器中已含 CRLF：不能双份转换（\r\r\n）
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc", LineEnding::Windows),
+            "a\r\nb\r\nc"
+        );
+        assert_eq!(
+            normalize_line_endings("a\nb\nc", LineEnding::Windows),
+            "a\r\nb\r\nc"
+        );
+    }
+
+    #[test]
+    fn save_text_to_file_local_roundtrip_preserves_crlf() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm-save-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crlf.txt");
+        let original = "a\r\nb\r\nc\r\n";
+        let edited = "a\r\nX\nc\r\n"; // 用户编辑混入了 LF
+        std::fs::write(&path, original).unwrap();
+        let written = save_text_to_file(
+            path.to_str().unwrap(),
+            None,
+            original,
+            edited,
+        )
+        .unwrap();
+        assert_eq!(written, "a\r\nX\r\nc\r\n");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "a\r\nX\r\nc\r\n");
+        assert!(!on_disk.contains("\r\r\n"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_text_to_file_local_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm-save-test-{}-parent",
+            std::process::id()
+        ));
+        let path = dir.join("sub").join("new.txt");
+        let written = save_text_to_file(path.to_str().unwrap(), None, "", "hello\n").unwrap();
+        assert_eq!(written, "hello\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

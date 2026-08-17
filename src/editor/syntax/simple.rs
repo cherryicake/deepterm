@@ -153,6 +153,11 @@ impl SimpleHighlighter {
                 tree_sitter_kotlin_ng::LANGUAGE.into(),
                 include_str!("languages/kotlin/highlights.scm"),
             ),
+            "make" | "makefile" | "mk" => Self::setup_language(
+                &mut parser,
+                tree_sitter_make::LANGUAGE.into(),
+                include_str!("languages/makefile/highlights.scm"),
+            ),
             "zig" => Self::setup_language(
                 &mut parser,
                 tree_sitter_zig::LANGUAGE.into(),

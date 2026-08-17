@@ -264,9 +264,15 @@ impl SyntaxColors {
             | "keyword.directive"
             | "keyword.directive.define"
             | "keyword.export"
-            | "keyword.operator" => "keyword",
+            | "keyword.operator"
+            | "conditional"
+            | "repeat"
+            | "exception"
+            | "include"
+            | "directive" => "keyword",
             "tag.error" | "tag.attribute" | "tag.delimiter" => "tag",
             "text.reference" | "text.uri" => "link_text",
+            "text.danger" | "text.warning" | "text.note" => "string.special",
             "selector" | "selector.pseudo" => "type",
             "punctuation.markup" => "punctuation",
             "diff.plus" | "diff.minus" => "string.special",
