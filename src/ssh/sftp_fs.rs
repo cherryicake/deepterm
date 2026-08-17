@@ -709,11 +709,18 @@ impl RemoteCommandResult {
 
 type SharedBlockingSftpSession = Arc<Mutex<BlockingSftpSession>>;
 
-/// SFTP 会话缓存条目：会话 + 最后访问时间
+/// SFTP 会话缓存条目：空闲会话池 + 最后访问时间。
+///
+/// 会话按「取用-归还」周转：正在使用的会话不在池中（并行传输各自独占一条连接），
+/// 归还时若池未满则放回复用，否则直接丢弃（`Drop` 时干净断开）。
 struct CacheEntry {
-    session: SharedBlockingSftpSession,
+    idle: Vec<SharedBlockingSftpSession>,
     last_access: std::time::Instant,
 }
+
+/// 每个主机最多保留的空闲会话数。并行传输期间会临时创建更多连接，用完即弃，
+/// 避免池无限增长；UI 的读目录 / 统计等高频小操作始终能复用池中会话。
+const MAX_IDLE_SESSIONS_PER_HOST: usize = 2;
 
 /// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理
 const SFTP_SESSION_IDLE_TIMEOUT: u64 = 1800; // 30 分钟（原 5 分钟，通过心跳减少断连）
@@ -805,6 +812,10 @@ fn cache_key(config: &SshConnectionConfig) -> String {
     key
 }
 
+/// 取出一条空闲会话供独占使用；无空闲时新建连接。
+///
+/// 注意：新连接**不会**放入缓存 —— 调用方正在使用它；使用完毕后必须调用
+/// [`checkin_session`] 归还，否则该连接会被直接丢弃（`Drop` 时干净断开）。
 fn get_or_connect_session(
     config: &SshConnectionConfig,
     key: &str,
@@ -813,15 +824,24 @@ fn get_or_connect_session(
     evict_stale_sessions();
 
     // 在持锁期间只做轻量判断；网络 ping 放到锁外，避免阻塞其他 SFTP 访问。
+    // 有空闲会话直接取走（独占）。
+    {
+        let mut cache = session_cache().lock();
+        if let Some(entry) = cache.get_mut(key) {
+            if let Some(session) = entry.idle.pop() {
+                entry.last_access = std::time::Instant::now();
+                return Ok(session);
+            }
+        }
+    }
+
+    // 没有空闲会话：锁外 ping 保活检查（决定保留还是重建缓存条目）。
     let session_to_ping: Option<SharedBlockingSftpSession> = {
         let mut cache = session_cache().lock();
         match cache.get_mut(key) {
             Some(entry) => match idle_check(entry) {
-                IdleCheck::Fresh => {
-                    entry.last_access = std::time::Instant::now();
-                    return Ok(entry.session.clone());
-                }
-                IdleCheck::NeedsPing => Some(entry.session.clone()),
+                IdleCheck::Fresh => None,
+                IdleCheck::NeedsPing => entry.idle.last().cloned(),
                 IdleCheck::Expired => {
                     cache.remove(key);
                     None
@@ -835,42 +855,44 @@ fn get_or_connect_session(
         let ping_ok = session.lock().ping().is_ok();
         let mut cache = session_cache().lock();
         if let Some(entry) = cache.get_mut(key) {
-            // 仅在缓存仍指向同一 session 时更新/移除，避免覆盖并发重连结果。
-            if Arc::ptr_eq(&entry.session, &session) {
-                if ping_ok {
-                    entry.last_access = std::time::Instant::now();
-                    log::debug!("Ping kept session alive: {}", key);
-                    return Ok(entry.session.clone());
-                }
-                log::debug!("Ping failed, session stale: {}", key);
-                cache.remove(key);
-            } else if ping_ok {
-                // 已被替换为新 session，直接复用缓存中的新条目。
+            if ping_ok {
                 entry.last_access = std::time::Instant::now();
-                return Ok(entry.session.clone());
+                log::debug!("Ping kept session alive: {}", key);
+            } else {
+                log::debug!("Ping failed, session stale: {}", key);
+                entry.idle.retain(|s| !Arc::ptr_eq(s, &session));
+                if entry.idle.is_empty() {
+                    cache.remove(key);
+                }
             }
         }
     }
 
-    let session = Arc::new(Mutex::new(BlockingSftpSession::connect(config)?));
-    let mut cache = session_cache().lock();
-    Ok(cache
-        .entry(key.to_string())
-        .or_insert_with(|| CacheEntry {
-            session: session.clone(),
-            last_access: std::time::Instant::now(),
-        })
-        .session
-        .clone())
+    // 新建连接：直接交给调用方独占使用（不入池）。
+    Ok(Arc::new(Mutex::new(BlockingSftpSession::connect(config)?)))
 }
 
+/// 归还使用完毕的会话：池未满则放回复用，否则直接丢弃（`Drop` 时干净断开）。
+fn checkin_session(key: &str, session: SharedBlockingSftpSession) {
+    let mut cache = session_cache().lock();
+    if let Some(entry) = cache.get_mut(key) {
+        entry.last_access = std::time::Instant::now();
+        if entry.idle.len() < MAX_IDLE_SESSIONS_PER_HOST {
+            entry.idle.push(session);
+        }
+    }
+    // 条目已被过期清理：什么都不做，session 在此 drop 并干净断开。
+}
+
+/// 移除指定会话：用于传输失败后剔除疑似损坏的连接（`Drop` 时干净断开）。
+/// 若条目已空则删除整条缓存。
 fn evict_session(key: &str, session: &SharedBlockingSftpSession) {
     let mut cache = session_cache().lock();
-    if cache
-        .get(key)
-        .is_some_and(|entry| Arc::ptr_eq(&entry.session, session))
-    {
-        cache.remove(key);
+    if let Some(entry) = cache.get_mut(key) {
+        entry.idle.retain(|s| !Arc::ptr_eq(s, session));
+        if entry.idle.is_empty() {
+            cache.remove(key);
+        }
     }
 }
 
@@ -881,14 +903,17 @@ pub fn with_cached_session<T>(
     let key = cache_key(config);
     let session = get_or_connect_session(config, &key)?;
 
-    match f(&mut session.lock()) {
+    let result = match f(&mut session.lock()) {
         Ok(result) => Ok(result),
         Err(_) => {
+            // 失败一次：剔除该会话并重连一次（连接可能在传输中被服务端关闭）。
             evict_session(&key, &session);
             let session = get_or_connect_session(config, &key)?;
             f(&mut session.lock())
         }
-    }
+    };
+    checkin_session(&key, session);
+    result
 }
 
 pub fn with_cached_session_once<T>(
@@ -897,7 +922,9 @@ pub fn with_cached_session_once<T>(
 ) -> anyhow::Result<T> {
     let key = cache_key(config);
     let session = get_or_connect_session(config, &key)?;
-    f(&mut session.lock())
+    let result = f(&mut session.lock());
+    checkin_session(&key, session);
+    result
 }
 
 impl Drop for BlockingSftpSession {

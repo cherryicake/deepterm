@@ -87,6 +87,13 @@ pub struct AppWindow {
     persistence: PersistenceManager,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
     _sidebar_subscription: Option<Subscription>,
+    /// 标题栏 padding 动画状态：侧边栏 + 编辑器共同驱动（render_main_area 内检测翻转后更新）
+    title_pad_epoch: u32,
+    title_pad_start: f32,
+    title_pad_end: f32,
+    title_pad_ms: u64,
+    last_sidebar_epoch: u32,
+    last_editor_epoch: u32,
 }
 
 impl AppWindow {
@@ -317,6 +324,12 @@ impl AppWindow {
             persistence,
             workspace_subscriptions: HashMap::new(),
             _sidebar_subscription: Some(sidebar_subscription),
+            title_pad_epoch: 0,
+            title_pad_start: 0.0,
+            title_pad_end: 0.0,
+            title_pad_ms: 0,
+            last_sidebar_epoch: 0,
+            last_editor_epoch: 0,
         };
 
         this.subscribe_workspace_events(workspace.clone(), window, cx);
@@ -864,23 +877,30 @@ impl AppWindow {
     }
 
     /// 渲染右侧主内容区域（TitleBar + Workspace）。
-    /// TitleBar 的 padding 补偿动画与侧边栏显隐同步。
-    fn render_main_area(&self, window: &gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// TitleBar 的 padding 补偿动画与侧边栏显隐/编辑器展开收起同步。
+    fn render_main_area(
+        &mut self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         const TITLE_BAR_EXTRA_PAD_MACOS: f32 = 116.0;
         const TITLE_BAR_EXTRA_PAD_MACOS_FS: f32 = 40.0;
         const TITLE_BAR_EXTRA_PAD_WIN: f32 = 44.0;
         const SIDEBAR_ENTER_MS: u64 = 300;
         const SIDEBAR_EXIT_MS: u64 = 250;
+        const EDITOR_ANIM_MS: u64 = 120;
 
         let is_fullscreen = window.is_fullscreen();
 
-        // 从 Sidebar Entity 读取状态
-        let (is_visible, epoch) = {
+        // 从 Sidebar / Editor Entity 读取状态
+        let (is_visible, sidebar_epoch) = {
             let sidebar = self.sidebar.read(cx);
             (sidebar.is_visible(), sidebar.animation_epoch())
         };
-
-        let editor_is_empty = self.editor.read(cx).is_empty();
+        let (editor_is_empty, editor_epoch) = {
+            let editor = self.editor.read(cx);
+            (editor.is_empty(), editor.open_anim_epoch())
+        };
 
         // 编辑器打开时，由 TitleBar 内部 left_padding 控制 3px 间距，
         // 外层无需额外偏移；编辑器关闭时才需要外层 padding 为交通灯+toggle预留空间。
@@ -890,18 +910,49 @@ impl AppWindow {
         } else {
             TITLE_BAR_EXTRA_PAD_WIN
         };
-        let closed_pad = if !editor_is_empty {
-            0.0
-        } else if needs_traffic_pad {
+        // 编辑器为空时的标题栏预留宽度（平台/全屏相关常量，不随编辑器状态变化）
+        let closed_pad = if needs_traffic_pad {
             TITLE_BAR_EXTRA_PAD_MACOS
         } else {
             compact_pad
         };
-        let (start_pl, end_pl, dur_ms) = if is_visible {
-            (closed_pad, 0.0, SIDEBAR_ENTER_MS)
+        // 最终目标：编辑器打开或侧边栏可见时为 0，否则为 closed_pad
+        let pad_target = if editor_is_empty && !is_visible {
+            closed_pad
         } else {
-            (0.0, closed_pad, SIDEBAR_EXIT_MS)
+            0.0
         };
+
+        // 检测动画触发源：编辑器展开/收起（150ms）或侧边栏显隐（300/250ms）。
+        // 两个源共用一个动画元素（key = title_pad_epoch），翻转时从「上一目标」滑向「新目标」。
+        if editor_epoch != self.last_editor_epoch {
+            self.last_editor_epoch = editor_epoch;
+            self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
+            // 编辑器翻转前的目标：打开侧恒为 0；空侧取决于侧边栏是否可见
+            self.title_pad_start = if editor_is_empty || is_visible {
+                0.0
+            } else {
+                closed_pad
+            };
+            self.title_pad_end = pad_target;
+            self.title_pad_ms = EDITOR_ANIM_MS;
+        } else if sidebar_epoch != self.last_sidebar_epoch {
+            self.last_sidebar_epoch = sidebar_epoch;
+            self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
+            // 翻转前侧边栏处于相反可见状态
+            let before_visible = !is_visible;
+            self.title_pad_start = if editor_is_empty && !before_visible {
+                closed_pad
+            } else {
+                0.0
+            };
+            self.title_pad_end = pad_target;
+            self.title_pad_ms = if is_visible {
+                SIDEBAR_ENTER_MS
+            } else {
+                SIDEBAR_EXIT_MS
+            };
+        }
 
         // 编辑器打开时，TitleBar 内部 left_padding 设为 3px，
         // 使终端 TabBar 与编辑器分割线统一保持 3px 间距；
@@ -914,20 +965,22 @@ impl AppWindow {
             }
         });
 
-        // 初始状态（epoch == 0）直接应用最终 padding，避免打开时出现一次不必要的展开动画
-        let animated_title_bar: gpui::AnyElement = if epoch == 0 {
+        // 初始状态（title_pad_epoch == 0）直接应用最终 padding，避免启动时出现不必要的展开动画
+        let animated_title_bar: gpui::AnyElement = if self.title_pad_epoch == 0 {
             div()
                 .child(self.title_bar.clone())
-                .pl(px(end_pl))
+                .pl(px(pad_target))
                 .into_any_element()
         } else {
+            let (start, end, ms) = (self.title_pad_start, self.title_pad_end, self.title_pad_ms);
+            let epoch = self.title_pad_epoch;
             div()
                 .child(self.title_bar.clone())
                 .with_animation(
                     ("titlebar-pad-anim", epoch),
-                    gpui::Animation::new(std::time::Duration::from_millis(dur_ms))
+                    gpui::Animation::new(std::time::Duration::from_millis(ms))
                         .with_easing(gpui::ease_in_out),
-                    move |this, delta| this.pl(px(start_pl + (end_pl - start_pl) * delta)),
+                    move |this, delta| this.pl(px(start + (end - start) * delta)),
                 )
                 .into_any_element()
         };

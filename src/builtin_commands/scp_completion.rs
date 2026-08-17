@@ -1,6 +1,6 @@
 //! `/scp` 命令专用补全引擎。
 //!
-//! `/scp` 有两个参数（源、目的），每个参数可能是：
+//! `/scp` 有多个参数（除最后一个目的外，其余都是源），每个参数可能是：
 //! - 本地路径（无 `:`）
 //! - `host:path`：host 可未填完（列出已保存主机），path 端可能是远端目录
 //!
@@ -223,7 +223,9 @@ pub enum ScpCompletionPhase {
 /// 分析 `/scp` 缓冲区的当前补全焦点（光标默认在末尾）。
 ///
 /// `buffer` 应当以 `/scp` 开头，后面跟 token。
-/// 返回 `None` 表示还不在可补全的位置（比如刚敲完 `/scp `、两个 token 都输入完了也回车位置）。
+/// 返回 `None` 表示还不在可补全的位置（比如光标还停在命令名区域内）。
+/// 多源时除最后一个 token 为目的外，其余 token 都是源 —— 每个 token 的补全规则
+/// 相同（本地路径 / 主机名 / `host:远端路径`），故任意 token 位置都可补全。
 pub fn analyse(buffer: &str) -> Option<ScpCompletionQuery> {
     analyse_at(buffer, buffer.len())
 }
@@ -256,11 +258,6 @@ pub fn analyse_at(buffer: &str, cursor: usize) -> Option<ScpCompletionQuery> {
     let args_area = &buffer[after_cmd_offset..];
     let tokens = shell_split_tokens(args_area, after_cmd_offset);
 
-    // /scp 只接受两个参数
-    if tokens.len() > 2 {
-        return None;
-    }
-
     // 找到光标所在 token：`start <= cursor <= end`。
     // token 之间至少隔一个空白，故 `cursor == end(前)` 与 `cursor == start(后)`
     // 不会同时命中两个 token（区间不重叠）。
@@ -270,7 +267,8 @@ pub fn analyse_at(buffer: &str, cursor: usize) -> Option<ScpCompletionQuery> {
         Some(t) => (t.start, t.end, &buffer[t.start..t.end]),
         None => {
             // 光标落在空白 / 空位：当前位置是一个空 token。
-            // 若两个参数都已填满，则没有可补的第三参数 ⇒ None。
+            // 已有两个完整 token 后不再自动弹候选（多源时用户敲入新 token
+            // 的首字符即会触发该 token 的补全）。
             if tokens.len() >= 2 {
                 return None;
             }
@@ -501,8 +499,47 @@ mod tests {
     }
 
     #[test]
-    fn analyse_three_tokens_stops() {
-        assert!(analyse("/scp a b c").is_none());
+    fn analyse_third_source_token() {
+        // 多源：第三个 token 也是源，应正常补全（不再受“只能两个参数”限制）。
+        let q = analyse("/scp a b c").unwrap();
+        match &q.phase {
+            ScpCompletionPhase::HostOrLocal { prefix } => assert_eq!(prefix, "c"),
+            _ => panic!("expected HostOrLocal"),
+        }
+        assert_eq!(&"/scp a b c"[q.token_start..q.token_end], "c");
+    }
+
+    #[test]
+    fn analyse_third_token_remote_path() {
+        // 多源：第三个 token（目的）也可以是 host:path。
+        let q = analyse("/scp a.txt alice:/dst/ bob:/tm").unwrap();
+        match &q.phase {
+            ScpCompletionPhase::RemotePath { host_token, prefix } => {
+                assert_eq!(host_token, "bob");
+                assert_eq!(prefix, "/tm");
+            }
+            _ => panic!("expected RemotePath"),
+        }
+    }
+
+    #[test]
+    fn analyse_cursor_on_third_token_targets_it() {
+        // 光标在第三个 token（源）上，末尾是目的：补全焦点在光标处。
+        let buffer = "/scp a.txt bob:/tm alice:/dst/";
+        let cursor = "/scp a.txt ".len() + 3; // 光标在 "bob" 中间
+        let q = analyse_at(buffer, cursor).unwrap();
+        match &q.phase {
+            ScpCompletionPhase::RemotePath { host_token, prefix } => {
+                assert_eq!(host_token, "bob");
+            }
+            _ => panic!("expected RemotePath"),
+        }
+    }
+
+    #[test]
+    fn analyse_whitespace_after_two_tokens_still_stops() {
+        // 两个完整 token 后的空白位不弹候选（与多源前的行为一致）。
+        assert!(analyse("/scp a.txt prod:/tmp/ ").is_none());
     }
 
     #[test]

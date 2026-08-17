@@ -661,7 +661,8 @@ impl BuiltinCommandManager {
             return false;
         }
         // 命令名 + 后续 token 总数；< 期望参数个数 ⇒ 还需要 advance
-        // /scp 期望 2 个参数 ⇒ 总 token 数 3 时已满
+        // /scp 至少 2 个参数（多源时可在最后一个 token 前手动继续追加源），
+        // 因此参数 token ≥ 2 后不再自动前移。
         let total_tokens = scp_completion::shell_split_tokens(
             buffer
                 .splitn(2, |c: char| c.is_whitespace())
@@ -1022,7 +1023,7 @@ impl BuiltinCommandManager {
         // 补全焦点跟随光标所在 token；无活跃 state 时退化为末尾。
         let cursor = self.cursor().unwrap_or(query.len());
 
-        // `/scp` 专用分支：两个参数、可能是主机、远端目录
+        // `/scp` 专用分支：多参数（多源 + 目的）、可能是主机、远端目录
         if is_scp_command(&query) {
             self.refresh_scp_completions(&query, cursor);
             return;

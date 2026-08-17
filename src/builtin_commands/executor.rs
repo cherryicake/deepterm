@@ -187,7 +187,7 @@ impl CommandHandler for LogOnlyHandler {
 
 /// `/scp` 处理器：在已配置主机（或本地）之间触发一次文件传输。
 ///
-/// 语法：`/scp <src> <dst>`
+/// 语法：`/scp <src> [<src> ...] <dst>`（多源时并行传输，目标必须是目录）
 ///
 /// 每个 token 形式：
 /// - `<host>:/abs/path` / `<host>:~/rel` / `<host>:rel` / `<host>:/dir/`
@@ -209,13 +209,13 @@ impl ScpHandler {
     ) -> CommandResult {
         let Some(raw) = argument else {
             return CommandResult::Error {
-                message: "用法: /scp <src> <dst>（需要两个参数）".to_string(),
+                message: "用法: /scp <src> [<src> ...] <dst>（至少两个参数）".to_string(),
             };
         };
         let raw = raw.trim();
         if raw.is_empty() {
             return CommandResult::Error {
-                message: "用法: /scp <src> <dst>（需要两个参数）".to_string(),
+                message: "用法: /scp <src> [<src> ...] <dst>（至少两个参数）".to_string(),
             };
         }
 
@@ -224,25 +224,13 @@ impl ScpHandler {
 
         if tokens.len() < 2 {
             return CommandResult::Error {
-                message: "用法: /scp <src> <dst>（需要两个参数）".to_string(),
-            };
-        }
-        if tokens.len() > 2 {
-            return CommandResult::Error {
-                message: "/scp 只支持单个源与单个目的，路径含空格请用双引号包裹".to_string(),
+                message: "用法: /scp <src> [<src> ...] <dst>（至少两个参数）".to_string(),
             };
         }
 
-        let src_raw = &raw[tokens[0].start..tokens[0].end];
-        let dst_raw = &raw[tokens[1].start..tokens[1].end];
-
-        let src_spec = match parse_scp_token(src_raw, &ctx, saved_configs) {
-            Ok(spec) => spec,
-            Err(msg) => {
-                return CommandResult::Error { message: msg };
-            }
-        };
-
+        // 与 scp CLI 一致：除最后一个 token 外都是源，最后一个为目的。
+        let dst_token = &tokens[tokens.len() - 1];
+        let dst_raw = &raw[dst_token.start..dst_token.end];
         let dst_spec = match parse_scp_token(dst_raw, &ctx, saved_configs) {
             Ok(spec) => spec,
             Err(msg) => {
@@ -254,8 +242,26 @@ impl ScpHandler {
         let (destination_endpoint, rename_to) =
             split_destination(dst_spec.endpoint, dst_spec.trailing_slash);
 
+        let mut sources = Vec::with_capacity(tokens.len() - 1);
+        for token in &tokens[..tokens.len() - 1] {
+            let src_raw = &raw[token.start..token.end];
+            let spec = match parse_scp_token(src_raw, &ctx, saved_configs) {
+                Ok(spec) => spec,
+                Err(msg) => {
+                    return CommandResult::Error { message: msg };
+                }
+            };
+            sources.push(spec.endpoint);
+        }
+
+        if sources.len() > 1 && rename_to.is_some() {
+            return CommandResult::Error {
+                message: "/scp 多文件传输时目标必须是目录，不要指定目标文件名".to_string(),
+            };
+        }
+
         let request = TransferRequest {
-            sources: vec![src_spec.endpoint],
+            sources,
             destination: destination_endpoint,
             operation: TransferOperation::Copy,
             conflict_policy: ConflictPolicy::Ask,
@@ -860,6 +866,89 @@ mod tests {
             _ => panic!("expected local"),
         }
         assert_eq!(req.rename_to.as_deref(), Some("b.txt"));
+    }
+
+    #[test]
+    fn scp_handler_multi_source_local_to_remote() {
+        // 多源：前 N-1 个 token 都是源，最后一个为目的目录，不生成 rename。
+        let saved = vec![host(Some("prod"), "deploy", "prod.example.com")];
+        let result = ScpHandler.execute_with_configs(
+            Some("a.txt b.txt c.txt prod:/tmp/"),
+            scp_ctx(),
+            &saved,
+        );
+        let req = unwrap_transfer(result);
+
+        assert_eq!(req.sources.len(), 3);
+        match &req.sources[0] {
+            FileEndpoint::Local { path } => {
+                assert_eq!(path, &PathBuf::from("/home/user/project/a.txt"))
+            }
+            _ => panic!("expected local source"),
+        }
+        match &req.sources[2] {
+            FileEndpoint::Local { path } => {
+                assert_eq!(path, &PathBuf::from("/home/user/project/c.txt"))
+            }
+            _ => panic!("expected local source"),
+        }
+        match &req.destination {
+            FileEndpoint::Remote { ssh_config, path } => {
+                assert_eq!(ssh_config.nickname.as_deref(), Some("prod"));
+                assert_eq!(path, "/tmp/");
+            }
+            _ => panic!("expected remote destination"),
+        }
+        assert!(req.rename_to.is_none());
+    }
+
+    #[test]
+    fn scp_handler_multi_source_mixed_hosts() {
+        // 多源可来自不同主机（引擎并行传输时会各自建立独立连接）。
+        let saved = vec![
+            host(Some("alice"), "root", "1.2.3.4"),
+            host(Some("bob"), "deploy", "5.6.7.8"),
+        ];
+        let result = ScpHandler.execute_with_configs(
+            Some("alice:/a.txt bob:/b.txt alice:/dst/"),
+            scp_ctx(),
+            &saved,
+        );
+        let req = unwrap_transfer(result);
+
+        assert_eq!(req.sources.len(), 2);
+        match &req.sources[0] {
+            FileEndpoint::Remote { ssh_config, path } => {
+                assert_eq!(ssh_config.nickname.as_deref(), Some("alice"));
+                assert_eq!(path, "/a.txt");
+            }
+            _ => panic!("expected remote source"),
+        }
+        match &req.sources[1] {
+            FileEndpoint::Remote { ssh_config, path } => {
+                assert_eq!(ssh_config.nickname.as_deref(), Some("bob"));
+                assert_eq!(path, "/b.txt");
+            }
+            _ => panic!("expected remote source"),
+        }
+        assert!(req.rename_to.is_none());
+    }
+
+    #[test]
+    fn scp_handler_multi_source_requires_dir_destination() {
+        // 多源时目标不能是具体文件名（无尾斜杠会被 split_destination 视为重命名）。
+        let saved = vec![host(Some("prod"), "deploy", "prod.example.com")];
+        let result = ScpHandler.execute_with_configs(
+            Some("a.txt b.txt prod:/tmp/x"),
+            scp_ctx(),
+            &saved,
+        );
+        match result {
+            CommandResult::Error { message } => {
+                assert!(message.contains("目录"), "msg: {}", message);
+            }
+            _ => panic!("expected error"),
+        }
     }
 
     #[test]

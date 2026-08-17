@@ -23,6 +23,9 @@ use crate::theme::ActiveTheme;
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 
+/// 编辑器展开/收起动画时长（与侧边栏展开动画一致，ease_in_out）。
+const EDITOR_OPEN_ANIMATION_MS: u64 = 120;
+
 actions!(editor_panel, [CloseActiveEditorTab, SaveActiveEditorTab]);
 actions!(
     editor_tab_context_menu,
@@ -125,6 +128,14 @@ pub struct Editor {
     tab_bar_pad_start: f32,
     tab_bar_pad_end: f32,
     tab_bar_pad_duration_ms: u64,
+    /// 编辑器展开/收起动画纪元：每次「空 ↔ 非空」转变 +1，作为 with_animation 的 key。
+    open_anim_epoch: u32,
+    /// 展开/收起动画起始宽度
+    open_anim_start: f32,
+    /// 展开/收起动画目标宽度
+    open_anim_end: f32,
+    /// 恢复文件树/会话状态期间为 true：禁止播放展开动画（避免切换标签页组/文件树时闪动）
+    suppress_open_animation: bool,
     content_left_padding: f32,
     content_bottom_padding: f32,
     watcher_subscription: Option<Subscription>,
@@ -140,6 +151,9 @@ pub struct Editor {
 }
 
 impl Editor {
+    /// Markdown 编辑模式 tab 的 id 后缀：预览中双击后新开的纯编辑 tab。
+    const MARKDOWN_EDIT_SUFFIX: &str = "#edit";
+
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tab_bar = TabBar::new("editor-tab-bar", cx);
 
@@ -154,6 +168,10 @@ impl Editor {
             tab_bar_pad_start: 6.0,
             tab_bar_pad_end: 6.0,
             tab_bar_pad_duration_ms: 0,
+            open_anim_epoch: 0,
+            open_anim_start: 0.0,
+            open_anim_end: 0.0,
+            suppress_open_animation: false,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
             watcher_subscription: None,
@@ -174,6 +192,28 @@ impl Editor {
 
     pub fn is_empty(&self) -> bool {
         self.open_files.is_empty()
+    }
+
+    /// 展开/收起动画纪元（供 AppWindow 同步标题栏 padding 动画）。
+    pub fn open_anim_epoch(&self) -> u32 {
+        self.open_anim_epoch
+    }
+
+    /// 编辑器从关闭 → 打开（首个文件打开）：记录展开动画（0 → 当前宽度）。
+    fn begin_open_animation(&mut self) {
+        if self.suppress_open_animation {
+            return;
+        }
+        self.open_anim_epoch = self.open_anim_epoch.wrapping_add(1);
+        self.open_anim_start = 0.0;
+        self.open_anim_end = self.width;
+    }
+
+    /// 编辑器从打开 → 关闭（最后一个文件关闭）：记录收起动画（当前宽度 → 0）。
+    fn begin_close_animation(&mut self) {
+        self.open_anim_epoch = self.open_anim_epoch.wrapping_add(1);
+        self.open_anim_start = self.width;
+        self.open_anim_end = 0.0;
     }
 
     /// 获取当前活动文件 ID
@@ -252,6 +292,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.clear(cx);
+        // 恢复期间不播放展开动画（编辑器宽度保持原值，标题栏 padding 同步保持瞬时）
+        self.suppress_open_animation = true;
         for file_info in &files_info {
             let is_image = crate::editor::image_viewer::is_image_file(Path::new(&file_info.path));
 
@@ -291,6 +333,7 @@ impl Editor {
         if let Some(ref active_id) = active_file_id {
             self.switch_to_file(active_id, cx);
         }
+        self.suppress_open_animation = false;
     }
 
     /// 从缓存恢复单个文件
@@ -306,7 +349,8 @@ impl Editor {
         let ssh_config = file_info.ssh_config.clone();
 
         let content = editor_state.read(cx).value().to_string();
-        let is_markdown = path_str.ends_with(".md");
+        let is_markdown = path_str.ends_with(".md")
+            && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX);
         let markdown = if is_markdown {
             Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content.clone(), cx)))
         } else {
@@ -488,7 +532,18 @@ impl Editor {
 
                 if let Some(content) = content {
                     let _ = weak.update(cx, |this, cx| {
-                        if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path) {
+                        // 同一路径可能同时打开预览/编辑两个 tab，需要全部同步重载
+                        let matched_ids: Vec<SharedString> = this
+                            .open_files
+                            .iter()
+                            .filter(|f| f.path == path)
+                            .map(|f| f.id.clone())
+                            .collect();
+                        for id in matched_ids {
+                            let Some(file) = this.open_files.iter_mut().find(|f| f.id == id)
+                            else {
+                                continue;
+                            };
                             let current = file.editor_state.read(cx).value().to_string();
                             if current == file.original_content {
                                 file.original_content = content.clone();
@@ -508,7 +563,7 @@ impl Editor {
                                         .insert_file_content(
                                             ssh_config,
                                             std::path::Path::new(&path),
-                                            content,
+                                            content.clone(),
                                         );
                                 }
                             } else {
@@ -519,11 +574,20 @@ impl Editor {
                             }
                             file.pending_reload = false;
                         }
+                        cx.notify();
                     });
                 } else {
                     let _ = weak.update(cx, |this, _cx| {
-                        if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path) {
-                            file.pending_reload = false;
+                        let ids: Vec<SharedString> = this
+                            .open_files
+                            .iter()
+                            .filter(|f| f.path == path)
+                            .map(|f| f.id.clone())
+                            .collect();
+                        for id in ids {
+                            if let Some(file) = this.open_files.iter_mut().find(|f| f.id == id) {
+                                file.pending_reload = false;
+                            }
                         }
                     });
                 }
@@ -555,11 +619,13 @@ impl Editor {
     }
 
     fn unwatch_all_files(&mut self, cx: &mut Context<Self>) {
-        let paths: Vec<(PathBuf, bool)> = self
-            .open_files
-            .iter()
-            .map(|f| (PathBuf::from(&f.path), f.ssh_config.is_some()))
-            .collect();
+        let mut paths: Vec<(PathBuf, bool)> = Vec::new();
+        for f in &self.open_files {
+            let path = PathBuf::from(&f.path);
+            if !paths.iter().any(|(p, _)| p == &path) {
+                paths.push((path, f.ssh_config.is_some()));
+            }
+        }
         for (path, is_remote) in paths {
             if is_remote {
                 Self::unwatch_remote_file(&path, cx);
@@ -704,6 +770,9 @@ impl Editor {
             crate::editor::diff_view::DiffView::new(diff, repo, editor_weak, window, cx)
         });
 
+        if self.open_files.is_empty() {
+            self.begin_open_animation();
+        }
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),
             path: path.clone(),
@@ -729,6 +798,16 @@ impl Editor {
         cx.notify();
     }
 
+    /// 在 Markdown 预览中双击：以纯编辑模式（代码编辑器）在新 tab 中打开同一文件。
+    pub fn open_file_in_edit_mode(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_local_file_inner(path, window, cx, true, true);
+    }
+
     fn open_local_file(
         &mut self,
         path: PathBuf,
@@ -736,8 +815,23 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
     ) {
+        self.open_local_file_inner(path, window, cx, notify_app, false);
+    }
+
+    fn open_local_file_inner(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
+        edit_mode: bool,
+    ) {
         let path_str = path.to_string_lossy().to_string();
-        let tab_id = format!("editor-{}", path_str);
+        let tab_id = if edit_mode {
+            format!("editor-{}{}", path_str, Self::MARKDOWN_EDIT_SUFFIX)
+        } else {
+            format!("editor-{}", path_str)
+        };
         let is_image = crate::editor::image_viewer::is_image_file(&path);
         log::debug!("open_local_file: path={:?}, is_image={}", path, is_image);
 
@@ -768,6 +862,7 @@ impl Editor {
             cx,
             notify_app,
             true,
+            edit_mode,
         );
 
         self.spawn_file_load(
@@ -919,7 +1014,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, false);
     }
 
     pub fn open_remote_file_no_notify(
@@ -929,7 +1024,18 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, false, false);
+    }
+
+    /// 在 Markdown 预览中双击：以纯编辑模式（代码编辑器）在新 tab 中打开同一远程文件。
+    pub fn open_remote_file_in_edit_mode(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, true);
     }
 
     fn open_remote_file_inner(
@@ -939,8 +1045,13 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
         notify_app: bool,
+        edit_mode: bool,
     ) {
-        let tab_id = format!("editor-remote-{}", path);
+        let tab_id = if edit_mode {
+            format!("editor-remote-{}{}", path, Self::MARKDOWN_EDIT_SUFFIX)
+        } else {
+            format!("editor-remote-{}", path)
+        };
 
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
@@ -982,6 +1093,7 @@ impl Editor {
                 cx,
                 notify_app,
                 false, // is_loading = false，因为有缓存内容
+                edit_mode,
             );
             return;
         }
@@ -1002,6 +1114,7 @@ impl Editor {
             cx,
             notify_app,
             true,
+            edit_mode,
         );
 
         self.spawn_file_load(
@@ -1049,6 +1162,7 @@ impl Editor {
             cx,
             notify_app,
             true,
+            false, // 图片没有编辑模式
         );
 
         let load_image: Arc<
@@ -1192,12 +1306,19 @@ impl Editor {
         cx: &mut Context<Self>,
         _notify_app: bool,
         is_loading: bool,
+        edit_mode: bool,
     ) {
         let label = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&path_str)
             .to_string();
+        // 编辑模式 tab 与预览 tab 区分标识，避免两个同名 tab 混淆
+        let label = if edit_mode {
+            format!("{} (编辑)", label)
+        } else {
+            label
+        };
         let is_image = crate::editor::image_viewer::is_image_file(&path);
         let language = guess_language_from_extension(&path);
 
@@ -1213,11 +1334,44 @@ impl Editor {
         // Re-render the Editor when this editor's InputState changes
         // (search matches / cursor): the popups are rendered by EditorInput,
         // which only re-renders when the Editor does.
+        let sync_path = path_str.clone();
+        let sync_tab_id = tab_id.clone();
         self.editor_state_subscriptions.push(
-            cx.observe(&editor_state, |_, _, cx| cx.notify()),
+            cx.observe(&editor_state, move |this, state_entity, cx| {
+                // 编辑 tab 内容变化时，同步刷新同路径的 markdown 预览 tab，
+                // 保证双击进入编辑模式后，预览不会停留在旧内容上。
+                // 先用轻量检查确认存在同路径预览，避免普通文件/大文件
+                // 每次按键都深拷贝整个缓冲区（value() 会 to_string 全文）。
+                if edit_mode
+                    && this.open_files.iter().any(|f| {
+                        f.id.as_ref() != sync_tab_id.as_str()
+                            && f.path == sync_path
+                            && f.markdown.is_some()
+                    })
+                {
+                    let content = state_entity.read(cx).value().to_string();
+                    let previews: Vec<Entity<crate::editor::markdown::Markdown>> = this
+                        .open_files
+                        .iter()
+                        .filter(|f| {
+                            f.id.as_ref() != sync_tab_id.as_str() && f.path == sync_path
+                        })
+                        .filter_map(|f| f.markdown.clone())
+                        .collect();
+                    for preview in previews {
+                        let content = content.clone();
+                        preview.update(cx, |renderer, cx| {
+                            renderer.set_text(content, cx);
+                        });
+                    }
+                }
+                cx.notify();
+            }),
         );
 
-        let is_markdown = !is_image && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_markdown = !is_image
+            && !edit_mode
+            && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
             let content_clone = content.clone();
             Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content_clone, cx)))
@@ -1231,6 +1385,9 @@ impl Editor {
             None
         };
 
+        if self.open_files.is_empty() {
+            self.begin_open_animation();
+        }
         self.open_files.push(EditorFile {
             id: tab_id.clone().into(),
             path: path_str,
@@ -1290,20 +1447,32 @@ impl Editor {
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let file = &self.open_files[index];
-            // 文件关闭后同步清理 RemoteFileTreeCache 中的内容缓存，避免重新打开时看到旧内容
-            if file.ssh_config.is_some() {
-                crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
-                    .lock()
-                    .unwrap()
-                    .remove_file(
-                        file.ssh_config.as_ref().unwrap(),
-                        std::path::Path::new(&file.path),
-                    );
-            }
-            if file.ssh_config.is_none() {
-                Self::unwatch_file(Path::new(&file.path), cx);
-            } else {
-                Self::unwatch_remote_file(Path::new(&file.path), cx);
+            let path = file.path.clone();
+            let is_remote = file.ssh_config.is_some();
+            // 同一路径可能同时打开预览/编辑两个 tab：
+            // 仅当这是最后一个引用该路径的 tab 时才取消文件监听并清理内容缓存。
+            let has_other_tab = self
+                .open_files
+                .iter()
+                .filter(|f| f.path == path && f.id.as_ref() != id)
+                .next()
+                .is_some();
+            if !has_other_tab {
+                // 文件关闭后同步清理 RemoteFileTreeCache 中的内容缓存，避免重新打开时看到旧内容
+                if is_remote {
+                    crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                        .lock()
+                        .unwrap()
+                        .remove_file(
+                            self.open_files[index].ssh_config.as_ref().unwrap(),
+                            std::path::Path::new(&path),
+                        );
+                }
+                if is_remote {
+                    Self::unwatch_remote_file(Path::new(&path), cx);
+                } else {
+                    Self::unwatch_file(Path::new(&path), cx);
+                }
             }
             self.open_files.remove(index);
             self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1324,6 +1493,10 @@ impl Editor {
                 } else {
                     self.active_file_id = None;
                 }
+            }
+            // 最后一个文件关闭：编辑器收起（宽度动画到 0）
+            if self.open_files.is_empty() {
+                self.begin_close_animation();
             }
         }
         cx.notify();
@@ -1537,7 +1710,10 @@ impl Render for Editor {
                             .child(image.clone())
                             .into_any_element()
                     } else if let Some(markdown) = &file.markdown {
+                        let path = file.path.clone();
+                        let ssh_config = file.ssh_config.clone();
                         div()
+                            .id("md-preview")
                             .w_full()
                             .flex_1()
                             .min_h_0()
@@ -1549,6 +1725,30 @@ impl Render for Editor {
                             .when(self.content_bottom_padding > 0.0, |this| {
                                 this.pb(px(self.content_bottom_padding))
                             })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        // 双击预览区域：新开 tab 进入 md 编辑模式
+                                        if event.click_count == 2 {
+                                            if let Some(config) = &ssh_config {
+                                                this.open_remote_file_in_edit_mode(
+                                                    path.clone(),
+                                                    config.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.open_file_in_edit_mode(
+                                                    PathBuf::from(&path),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                    },
+                                ),
+                            )
                             .child(markdown.clone())
                             .into_any_element()
                     } else {
@@ -1599,7 +1799,22 @@ impl Render for Editor {
             div().into_any_element()
         };
 
-        div()
+        // 展开/收起动画：外层 wrapper 控制可见宽度（动画期间由 with_animation 从
+        // anim_start 驱动到 anim_end），内层 root 用 w_full() 填满 wrapper ——
+        // 否则内层固定在 anim_start(=0) 会导致内容/分割线全部 0 宽不可见。
+        // epoch == 0（从未播放过动画，如启动/恢复）或动画目标与当前状态不匹配
+        // （clear() 等状态突变但 epoch 未变）时直接应用目标宽度，避免残留旧动画终值。
+        let anim_epoch = self.open_anim_epoch;
+        let (anim_start, anim_end) = (self.open_anim_start, self.open_anim_end);
+        let target_width = if is_empty { 0.0 } else { self.width };
+        let animating = anim_epoch > 0 && (anim_end - target_width).abs() <= 0.5;
+        let display_width = if animating {
+            anim_start
+        } else {
+            target_width
+        };
+
+        let root: gpui::AnyElement = div()
             .key_context("EditorPanel")
             .on_action(cx.listener(|this, _: &CloseActiveEditorTab, _window, cx| {
                 if let Some(active_id) = this.active_file_id.clone() {
@@ -1638,12 +1853,13 @@ impl Render for Editor {
                     this.close_left_tabs(&tab_id, cx);
                 }
             }))
-            .w(px(if is_empty { 0.0 } else { self.width }))
+            .w_full()
             .h_full()
             .relative()
             .flex()
             .flex_col()
             .items_start()
+            .overflow_hidden()
             .child(tab_bar)
             .child(content)
             .child(resize_handle)
@@ -1652,7 +1868,21 @@ impl Render for Editor {
                     editor: cx.entity().downgrade(),
                 })
             })
-            .into_any_element()
+            .into_any_element();
+
+        let wrapper = div().w(px(display_width)).h_full().child(root);
+        if animating {
+            wrapper
+                .with_animation(
+                    ("editor-open-anim", anim_epoch),
+                    Animation::new(Duration::from_millis(EDITOR_OPEN_ANIMATION_MS))
+                        .with_easing(gpui::ease_in_out),
+                    move |this, delta| this.w(px(anim_start + (anim_end - anim_start) * delta)),
+                )
+                .into_any_element()
+        } else {
+            wrapper.into_any_element()
+        }
     }
 }
 
