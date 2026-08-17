@@ -78,7 +78,7 @@ impl DivStackEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PendingLine {
     text: String,
     runs: Vec<TextRun>,
@@ -86,8 +86,9 @@ struct PendingLine {
 
 struct TableState {
     alignments: Vec<ColumnAlign>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
+    /// 每个单元格保留文本与样式 runs（加粗/斜体等），渲染时逐格重建 StyledText。
+    rows: Vec<Vec<PendingLine>>,
+    current_row: Vec<PendingLine>,
 }
 
 struct LinkState {
@@ -188,7 +189,7 @@ impl MarkdownElementBuilder {
                             .items_center()
                             .mt_4()
                             .mb_2()
-                            .line_height(rems(1.3)),
+                            .line_height(rems(1.5)),
                         &range,
                         markdown_end,
                     );
@@ -274,7 +275,7 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTag::Item => {
                     self.push_div(
-                        div().flex().flex_row().items_start().gap_1().w_full().mb_1().line_height(rems(1.3)),
+                        div().flex().flex_row().items_start().gap_1().w_full().mb_1().line_height(rems(1.5)),
                         &range,
                         markdown_end,
                     );
@@ -485,9 +486,9 @@ impl MarkdownElementBuilder {
                     self.table.rows.push(self.table.current_row.clone());
                 }
                 MarkdownTagEnd::TableCell => {
-                    let text = self.pending_line.text.clone();
-                    self.pending_line = PendingLine::default();
-                    self.table.current_row.push(text);
+                    // 整个 pending_line 入格（含样式 runs），避免丢失加粗/斜体等
+                    let line = std::mem::take(&mut self.pending_line);
+                    self.table.current_row.push(line);
                 }
                 MarkdownTagEnd::Emphasis
                 | MarkdownTagEnd::Strong
@@ -685,8 +686,9 @@ impl MarkdownElementBuilder {
         for (row_idx, row) in self.table.rows.iter().enumerate() {
             let is_header = row_idx == 0;
             for col in 0..col_count {
-                let cell_text = row.get(col).map(|s| s.as_str()).unwrap_or("");
-                let mut cell = div().px_1().py_0p5();
+                let cell = row.get(col);
+                let cell_text = cell.map(|c| c.text.as_str()).unwrap_or("");
+                let mut cell_div = div().px_1().py_0p5();
                 // 分割线画在自身元素上（同元素内先背景后边框，边框不会被覆盖）。
                 // 因此用左/上边框而非右/下边框：右/下边框属于前一个单元格，
                 // 会被相邻（后绘制）单元格的背景盖住（表头/隔行背景尤甚）。
@@ -694,29 +696,33 @@ impl MarkdownElementBuilder {
                 let has_left_divider = col > 0;
                 let has_top_divider = row_idx > 0;
                 if has_left_divider || has_top_divider {
-                    cell = cell.border_color(border_color);
+                    cell_div = cell_div.border_color(border_color);
                     if has_left_divider {
-                        cell = cell.border_l(px(1.0));
+                        cell_div = cell_div.border_l(px(1.0));
                     }
                     if has_top_divider {
-                        cell = cell.border_t(px(1.0));
+                        cell_div = cell_div.border_t(px(1.0));
                     }
                 }
                 if is_header {
-                    cell = cell.bg(elevated_bg);
+                    cell_div = cell_div.bg(elevated_bg);
                 } else if row_idx % 2 == 0 {
-                    cell = cell.bg(panel_bg);
+                    cell_div = cell_div.bg(panel_bg);
                 }
                 match alignments.get(col).unwrap_or(&ColumnAlign::None) {
-                    ColumnAlign::Left => cell = cell.justify_start(),
-                    ColumnAlign::Center => cell = cell.justify_center(),
-                    ColumnAlign::Right => cell = cell.justify_end(),
+                    ColumnAlign::Left => cell_div = cell_div.justify_start(),
+                    ColumnAlign::Center => cell_div = cell_div.justify_center(),
+                    ColumnAlign::Right => cell_div = cell_div.justify_end(),
                     ColumnAlign::None => {}
                 }
-                let cell_text = StyledText::new(cell_text.to_string())
-                    .with_runs(vec![base_style.to_run(cell_text.len())]);
-                cell = cell.child(cell_text);
-                children.push(cell.into_any_element());
+                // 优先使用单元格自身保留的样式 runs；空单元格/缺列回退到 base 样式
+                let cell_runs = cell
+                    .map(|c| c.runs.clone())
+                    .filter(|runs| !runs.is_empty())
+                    .unwrap_or_else(|| vec![base_style.to_run(cell_text.len())]);
+                let cell_styled = StyledText::new(cell_text.to_string()).with_runs(cell_runs);
+                cell_div = cell_div.child(cell_styled);
+                children.push(cell_div.into_any_element());
             }
         }
 
