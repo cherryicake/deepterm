@@ -94,6 +94,10 @@ pub struct AppWindow {
     title_pad_ms: u64,
     last_sidebar_epoch: u32,
     last_editor_epoch: u32,
+    /// 编辑器 tab 栏左内边距动画纪元：与侧边栏/编辑器翻转同步递增。
+    tab_pad_epoch: u32,
+    /// 上次渲染时的全屏状态，用于全屏切换后重新同步静态 pad。
+    last_fullscreen: bool,
 }
 
 impl AppWindow {
@@ -330,6 +334,8 @@ impl AppWindow {
             title_pad_ms: 0,
             last_sidebar_epoch: 0,
             last_editor_epoch: 0,
+            tab_pad_epoch: 0,
+            last_fullscreen: window.is_fullscreen(),
         };
 
         this.subscribe_workspace_events(workspace.clone(), window, cx);
@@ -892,6 +898,14 @@ impl AppWindow {
 
         let is_fullscreen = window.is_fullscreen();
 
+        // 全屏切换会改变 closed pad 的目标值；重置 tab 栏 pad 动画纪元，
+        // 以便下方的静态分支重新与目标同步。
+        let fullscreen_changed = is_fullscreen != self.last_fullscreen;
+        self.last_fullscreen = is_fullscreen;
+        if fullscreen_changed {
+            self.tab_pad_epoch = 0;
+        }
+
         // 从 Sidebar / Editor Entity 读取状态
         let (is_visible, sidebar_epoch) = {
             let sidebar = self.sidebar.read(cx);
@@ -925,6 +939,22 @@ impl AppWindow {
 
         // 检测动画触发源：编辑器展开/收起（150ms）或侧边栏显隐（300/250ms）。
         // 两个源共用一个动画元素（key = title_pad_epoch），翻转时从「上一目标」滑向「新目标」。
+        // 编辑器的 tab 栏左内边距同步驱动：侧边栏显隐时与侧边栏宽度动画同时长/同缓动，
+        // 保证 tab 标签随编辑器整体平滑移动而不是先瞬时弹开再滑回。
+        let tab_pad_open = 6.0;
+        let tab_pad_closed = if cfg!(target_os = "macos") && !is_fullscreen {
+            124.0
+        } else if cfg!(target_os = "macos") {
+            48.0
+        } else {
+            50.0
+        };
+        let tab_pad_target = if editor_is_empty || is_visible {
+            tab_pad_open
+        } else {
+            tab_pad_closed
+        };
+
         if editor_epoch != self.last_editor_epoch {
             self.last_editor_epoch = editor_epoch;
             self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
@@ -936,6 +966,12 @@ impl AppWindow {
             };
             self.title_pad_end = pad_target;
             self.title_pad_ms = EDITOR_ANIM_MS;
+            // 编辑器展开/收起时 tab 栏处于裁剪渐显/渐隐中，pad 瞬时应用即可
+            if !editor_is_empty {
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_tab_bar_pad_animation(0, tab_pad_target, tab_pad_target, 0, cx);
+                });
+            }
         } else if sidebar_epoch != self.last_sidebar_epoch {
             self.last_sidebar_epoch = sidebar_epoch;
             self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
@@ -952,6 +988,31 @@ impl AppWindow {
             } else {
                 SIDEBAR_EXIT_MS
             };
+            // tab 栏 pad 与侧边栏动画同步：从翻转前的 pad 滑向目标 pad
+            if !editor_is_empty {
+                let before = if before_visible {
+                    tab_pad_open
+                } else {
+                    tab_pad_closed
+                };
+                self.tab_pad_epoch = self.tab_pad_epoch.wrapping_add(1);
+                let epoch = self.tab_pad_epoch;
+                let ms = if is_visible {
+                    SIDEBAR_ENTER_MS
+                } else {
+                    SIDEBAR_EXIT_MS
+                };
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_tab_bar_pad_animation(epoch, before, tab_pad_target, ms, cx);
+                });
+            }
+        } else if self.tab_pad_epoch == 0 {
+            // 无翻转（初始状态/全屏切换等）：保持静态 pad 与目标同步
+            if !editor_is_empty {
+                self.editor.update(cx, |editor, cx| {
+                    editor.set_tab_bar_pad_animation(0, tab_pad_target, tab_pad_target, 0, cx);
+                });
+            }
         }
 
         // 编辑器打开时，TitleBar 内部 left_padding 设为 3px，
@@ -1037,31 +1098,15 @@ impl Render for AppWindow {
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let editor_is_empty = self.editor.read(cx).is_empty();
 
-        let closed_tab_bar_pad = || -> f32 {
-            if cfg!(target_os = "macos") && !window.is_fullscreen() {
-                124.0
-            } else if cfg!(target_os = "macos") {
-                48.0
-            } else {
-                50.0
-            }
-        };
-
         if editor_is_empty {
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(0.0, 0.0, cx);
             });
         } else {
-            let pad = if sidebar_visible {
-                6.0
-            } else {
-                closed_tab_bar_pad()
-            };
             let content_left = if sidebar_visible { 0.0 } else { 12.0 };
             let content_bottom = 8.0;
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(content_left, content_bottom, cx);
-                editor.set_tab_bar_pad_animation(0, pad, pad, 0, cx);
             });
         }
 
