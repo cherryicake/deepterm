@@ -42,7 +42,6 @@ const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
 const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
 const TAB_MAX_WIDTH_PX: f32 = 180.0;
-const TAB_FADE_WIDTH_PX: f32 = 24.0;
 
 /// Tab 放置事件
 pub struct TabDropEvent {
@@ -1285,8 +1284,11 @@ impl Render for TabBar {
                                                 })
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w_0()
                                                         .text_sm()
                                                         .whitespace_nowrap()
+                                                        .text_ellipsis()
                                                         .font_weight(if is_active {
                                                             gpui::FontWeight::SEMIBOLD
                                                         } else {
@@ -1298,34 +1300,7 @@ impl Render for TabBar {
                                                             theme.text_muted
                                                         })
                                                         .child(label),
-                                                )
-                                                .when(!is_active, |this| {
-                                                    let is_hovered = self.hovered_tab_id.as_ref()
-                                                        == Some(&tab_id);
-                                                    let tab_bg = if is_hovered {
-                                                        theme.tab_hover_background
-                                                    } else {
-                                                        theme.tab_inactive_background
-                                                    };
-                                                    this.child(
-                                                        div()
-                                                            .absolute()
-                                                            .right_0()
-                                                            .top_0()
-                                                            .bottom_0()
-                                                            .w(px(TAB_FADE_WIDTH_PX))
-                                                            .bg(gpui::linear_gradient(
-                                                                90.0,
-                                                                gpui::linear_color_stop(
-                                                                    tab_bg.opacity(0.0),
-                                                                    0.0,
-                                                                ),
-                                                                gpui::linear_color_stop(
-                                                                    tab_bg, 1.0,
-                                                                ),
-                                                            )),
-                                                    )
-                                                }),
+                                                ),
                                         )
                                         .on_click(cx.listener({
                                             let on_tab_click = on_tab_click.clone();
