@@ -333,6 +333,7 @@ impl MarkdownElementBuilder {
                         .grid()
                         .grid_cols(col_count as u16)
                         .w_full()
+                        .mt_4()
                         .mb_2()
                         .border(px(1.0))
                         .border_color(cx.theme().ui.border)
