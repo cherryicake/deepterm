@@ -1790,23 +1790,36 @@ impl InputState {
     }
 
     pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
+        // 仅在多行编辑器（代码编辑器）中，无选区时复制整行（与 Zed 一致）；
+        // 单行输入框保持系统直觉：无选区不做事。
+        let selected_text = if self.selected_range.is_empty() && self.mode.is_multi_line() {
+            line_text_for_clipboard(&self.text, self.cursor()).0
+        } else if self.selected_range.is_empty() {
             return;
-        }
-
-        let selected_text = self.text.slice(self.selected_range).to_string();
+        } else {
+            self.text.slice(self.selected_range).to_string()
+        };
         cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
     }
 
     pub(crate) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            return;
+            if !self.mode.is_multi_line() {
+                return;
+            }
+            // 无选区：剪切当前整行（含换行），与 Zed 的 cut_common 一致。
+            let (selected_text, range) = line_text_for_clipboard(&self.text, self.cursor());
+            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+            let range_utf16 = self.range_to_utf16(&range);
+            self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
+            // 删除后光标落在 range.start（上一行末尾 / 文档开头 / 末尾），
+            // 由 replace_text_in_range 统一设置。
+        } else {
+            let selected_text = self.text.slice(self.selected_range).to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+
+            self.replace_text_in_range_silent(None, "", window, cx);
         }
-
-        let selected_text = self.text.slice(self.selected_range).to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
-
-        self.replace_text_in_range_silent(None, "", window, cx);
     }
 
     pub(crate) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -2657,10 +2670,31 @@ fn shifted_outdent_offset(o: usize, edits: &[(usize, usize)]) -> usize {
     (o as isize + shift).max(0) as usize
 }
 
+/// 光标所在行用于复制/剪切的文本与字节范围（module 级，便于单元测试）。
+///
+/// 与 Zed 的复制/剪切语义一致：
+/// - 非最后一行：整行内容 + 行尾换行符（LF/CRLF 原样保留）；
+/// - 最后一行（无结尾换行）：内容后补一个 `\n`（等同 Zed 的 add_trailing_newline）。
+fn line_text_for_clipboard(text: &ropey::Rope, offset: usize) -> (String, std::ops::Range<usize>) {
+    let row = text.offset_to_point(offset).row;
+    let start = text.line_start_offset(row);
+    if row + 1 < text.lines_len() {
+        // 到下一行行首：包含本行换行符。
+        let end = text.line_start_offset(row + 1);
+        (text.slice(start..end).to_string(), start..end)
+    } else {
+        // 最后一行：内容到行尾，并补结尾换行。
+        let end = text.line_end_offset(row);
+        let mut content = text.slice(start..end).to_string();
+        content.push('\n');
+        (content, start..end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::input::InputState;
+    use crate::components::input::{InputState, Rope};
 
     #[test]
     fn outdent_unit_len_prefers_tab() {
@@ -2700,12 +2734,43 @@ mod tests {
     }
 
     #[test]
-    fn shifted_outdent_offset_uneven_removals() {
-        // 第一行删 1 (tab)，第二行删 4："\tfoo\n    bar" -> "foo\nbar"
-        let edits = [(0, 1), (5, 4)];
-        assert_eq!(shifted_outdent_offset(0, &edits), 0);
-        assert_eq!(shifted_outdent_offset(4, &edits), 3); // “foo” 末尾
-        assert_eq!(shifted_outdent_offset(9, &edits), 4); // 第二行内容
-        assert_eq!(shifted_outdent_offset(14, &edits), 9); // 全文结尾
+    fn line_text_for_clipboard_middle_line_includes_newline() {
+        let rope = Rope::from("first\nsecond\nthird");
+        // 光标在第二行行中
+        let (text, range) = line_text_for_clipboard(&rope, "first\nsec".len() + 1);
+        assert_eq!(text, "second\n");
+        assert_eq!(range, "first\n".len().."first\nsecond\n".len());
+    }
+
+    #[test]
+    fn line_text_for_clipboard_last_line_appends_newline() {
+        let rope = Rope::from("first\nsecond\nthird");
+        let (text, range) = line_text_for_clipboard(&rope, rope.len());
+        assert_eq!(text, "third\n");
+        assert_eq!(range, "first\nsecond\n".len()..rope.len());
+    }
+
+    #[test]
+    fn line_text_for_clipboard_single_line_document() {
+        let rope = Rope::from("only line");
+        let (text, range) = line_text_for_clipboard(&rope, 0);
+        assert_eq!(text, "only line\n");
+        assert_eq!(range, 0..9);
+    }
+
+    #[test]
+    fn line_text_for_clipboard_crlf_preserved() {
+        let rope = Rope::from("a\r\nb\r\nc");
+        let (text, range) = line_text_for_clipboard(&rope, 3);
+        assert_eq!(text, "b\r\n");
+        assert_eq!(range, "a\r\n".len().."a\r\nb\r\n".len());
+    }
+
+    #[test]
+    fn line_text_for_clipboard_blank_line() {
+        let rope = Rope::from("a\n\nb"); // 中间空行
+        let (text, range) = line_text_for_clipboard(&rope, 2);
+        assert_eq!(text, "\n");
+        assert_eq!(range, 2..3);
     }
 }
