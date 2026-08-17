@@ -676,7 +676,6 @@ impl MarkdownElementBuilder {
         }
         let col_count = self.table.alignments.len().max(1);
         let base_style = self.style.base_text_style.clone();
-        let rows_len = self.table.rows.len();
         let alignments = self.table.alignments.clone();
         let border_color = cx.theme().ui.border;
         let elevated_bg = cx.theme().ui.elevated_background;
@@ -688,8 +687,20 @@ impl MarkdownElementBuilder {
             for col in 0..col_count {
                 let cell_text = row.get(col).map(|s| s.as_str()).unwrap_or("");
                 let mut cell = div().px_1().py_0p5();
-                if row_idx < rows_len - 1 {
-                    cell = cell.border_b(px(1.0)).border_color(border_color);
+                // 分割线画在自身元素上（同元素内先背景后边框，边框不会被覆盖）。
+                // 因此用左/上边框而非右/下边框：右/下边框属于前一个单元格，
+                // 会被相邻（后绘制）单元格的背景盖住（表头/隔行背景尤甚）。
+                // 第一行/第一列由容器外框兜底。
+                let has_left_divider = col > 0;
+                let has_top_divider = row_idx > 0;
+                if has_left_divider || has_top_divider {
+                    cell = cell.border_color(border_color);
+                    if has_left_divider {
+                        cell = cell.border_l(px(1.0));
+                    }
+                    if has_top_divider {
+                        cell = cell.border_t(px(1.0));
+                    }
                 }
                 if is_header {
                     cell = cell.bg(elevated_bg);
