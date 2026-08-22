@@ -447,6 +447,29 @@ impl BuiltinCommandManager {
         self.refresh_state();
     }
 
+    /// 以远端广播的整段缓冲替换当前缓冲（文本 + 光标）。供广播接收方镜像输入使用。
+    ///
+    /// 与 `update` / `pop` 不同，这里直接整体替换而不做增量编辑；会重置所有高亮、
+    /// 恢复浮层可见，并按新缓冲重算当前阶段与补全列表。
+    pub fn set_buffer(&mut self, text: &str, cursor: usize) {
+        if text.is_empty() {
+            self.state = None;
+            self.entry_phase = EntryPhase::CommandName;
+            self.resolved_command = None;
+            self.path_completions.clear();
+        } else {
+            self.state = Some(BuiltinCommandState::new(text.to_string()));
+            if let Some(state) = self.state.as_mut() {
+                state.set_cursor(cursor.min(text.len()));
+            }
+        }
+        self.overlay = OverlayState::Visible;
+        self.selected_index = None;
+        self.path_selected_index = None;
+        self.history_selected_index = None;
+        self.refresh_state();
+    }
+
     /// 删除光标前一个字符（退格）。
     pub fn pop(&mut self) {
         let was_dismissed = self.is_dismissed();
@@ -1634,6 +1657,18 @@ impl BuiltinCommandState {
         Self { buffer, cursor }
     }
 
+    /// 设置光标字节偏移。
+    ///
+    /// 会 clamp 到缓冲长度内，并回退到最近的 UTF-8 字符边界，
+    /// 避免远端同步的非法偏移导致后续 `insert_str` / 删除操作 panic。
+    pub fn set_cursor(&mut self, cursor: usize) {
+        let mut pos = cursor.min(self.buffer.len());
+        while pos > 0 && !self.buffer.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        self.cursor = pos;
+    }
+
     /// 在光标处插入文本，光标右移到插入串末尾。
     pub fn insert(&mut self, text: &str) {
         self.buffer.insert_str(self.cursor, text);
@@ -2392,6 +2427,39 @@ mod tests {
         // 选择已应用 ⇒ 高亮重置为 None（"无选中" 是新的默认）
         assert_eq!(manager.selected_index(), None);
         assert!(!manager.is_dismissed());
+    }
+
+    #[test]
+    fn set_buffer_replaces_buffer_and_clamps_cursor() {
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_buffer("/scp alice:/etc/hosts ./", 5);
+
+        assert_eq!(manager.query(), Some("/scp alice:/etc/hosts ./"));
+        assert_eq!(manager.cursor(), Some(5));
+        assert!(manager.is_active());
+
+        // 光标超出缓冲长度时 clamp 到末尾
+        manager.set_buffer("/scp a", 999);
+        assert_eq!(manager.cursor(), Some(6));
+
+        // 空缓冲清空状态
+        manager.set_buffer("", 0);
+        assert_eq!(manager.query(), None);
+        assert!(!manager.is_active());
+    }
+
+    #[test]
+    fn set_cursor_snaps_to_char_boundary() {
+        let mut manager = BuiltinCommandManager::new();
+        // "中" 占 3 字节，光标落在多字节字符中间时回退到最近边界
+        manager.set_buffer("/scp 中", 5);
+        assert_eq!(manager.cursor(), Some(5)); // "/scp " 末尾是合法边界
+
+        manager.set_buffer("中文", 4);
+        assert_eq!(manager.cursor(), Some(3)); // 回退到第一个"中"之后
+
+        manager.set_buffer("中文", 999);
+        assert_eq!(manager.cursor(), Some(6));
     }
 
     // ── overlay 状态机行为 ─────────────────────────────────────────────────────

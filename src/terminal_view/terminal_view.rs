@@ -1,7 +1,9 @@
 //! Terminal view component - Full featured
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -13,6 +15,7 @@ use gpui::{
 use gpui::{KeyBinding, prelude::*};
 use unicode_width::UnicodeWidthStr;
 
+use crate::builtin_commands::executor::CommandResult;
 use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::ssh_view::connect::Event::Reconnect;
@@ -111,8 +114,66 @@ pub(crate) fn init(cx: &mut App) {
     ]);
 }
 
+/// 广播消息 - 广播组内同步的内容。
+///
+/// - `Raw`：原始终端输入字节（普通 shell 输入），接收方直接写入 PTY。
+/// - `BuiltinSync`：内建命令缓冲的最新状态（文本 + 光标 + 浮层折叠），接收方据此镜像显示。
+/// - `BuiltinEnd`：内建命令输入结束（Ctrl+C 取消 / 提交后清理），接收方同步清空本地镜像。
+/// - `BuiltinCommand`：内建命令整行（如 `/scp ...`），接收方在各自上下文静默执行。
+#[derive(Clone, Debug)]
+pub enum BroadcastMsg {
+    Raw(Vec<u8>),
+    BuiltinSync {
+        text: String,
+        cursor: usize,
+        dismissed: bool,
+    },
+    BuiltinEnd,
+    BuiltinCommand(String),
+}
+
 /// 广播输入回调类型 - 用于将输入广播给其他终端
-pub type BroadcastInputCallback = Box<dyn Fn(&[u8])>;
+pub type BroadcastInputCallback = Box<dyn Fn(BroadcastMsg)>;
+
+/// 广播回环抑制作用域守卫。
+///
+/// 构造时把标志置为 `true`，在作用域结束时（**包括 panic unwind**）复位为 `false`。
+/// 用于广播接收逻辑（静默执行内建命令 / 镜像内建输入）期间抑制再次广播，避免回环。
+///
+/// 之所以不用「手动置 true、结尾置 false」而改用守卫：后者若中间 panic，
+/// `broadcast_suppressed` 会永久停留在 `true`，导致该面板后续所有广播被静默吞掉且无任何报错。
+///
+/// 持有 `Rc<Cell<bool>>` 而非 `&mut bool`：守卫需要与 `self` 上的其它 `&mut self`
+/// 方法调用共存，直接借用字段会产生别名冲突；共享所有权的内部可变性容器是安全做法。
+struct BroadcastSuppressionGuard {
+    flag: Rc<Cell<bool>>,
+}
+
+impl BroadcastSuppressionGuard {
+    fn new(flag: &Rc<Cell<bool>>) -> Self {
+        flag.set(true);
+        Self {
+            flag: Rc::clone(flag),
+        }
+    }
+}
+
+impl Drop for BroadcastSuppressionGuard {
+    fn drop(&mut self) {
+        self.flag.set(false);
+    }
+}
+
+/// 内建命令执行模式。
+///
+/// - `Interactive`：正常交互提交，发射 UI 事件、弹 Toast。
+/// - `Silent`：广播接收方（目标面板），静默执行：不弹 Toast、冲突策略降级
+///   （避免弹冲突对话框），其余行为与 Interactive 一致。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinExecMode {
+    Interactive,
+    Silent,
+}
 
 /// 当前鼠标悬停的可点击链接信息。
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +189,10 @@ pub struct TerminalView {
     terminal_subscription: Option<Subscription>,
     working_directory: Option<PathBuf>,
     ssh_config: Option<SshConnectionConfig>,
+    /// 本地终端以指定命令启动时保存的命令（如 wsl.exe / powershell.exe），用于会话重连
+    command: Option<String>,
+    /// 与 `command` 配套的启动参数，用于会话重连
+    command_args: Vec<String>,
     focus_handle: FocusHandle,
     /// Drives cursor blink on/off. `visible()` is the final signal
     /// consumed by the element.
@@ -152,6 +217,9 @@ pub struct TerminalView {
     can_start_builtin_command: bool,
     /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
     broadcast_callback: Option<BroadcastInputCallback>,
+    /// 应用远端同步的内建命令缓冲期间置位，阻止 mutate_builtin_command 再次广播（防回环）。
+    /// 使用 `Rc<Cell<bool>>` 以便与 `&mut self` 方法共存（见 BroadcastSuppressionGuard）。
+    broadcast_suppressed: Rc<Cell<bool>>,
     /// Pending scrollbar hide task - prevents spawning a new timer every render frame
     scrollbar_hide_task: Option<Task<()>>,
     /// Scroll timestamp used for the currently scheduled hide task.
@@ -377,6 +445,8 @@ impl TerminalView {
         working_directory: Option<PathBuf>,
         ssh_config: Option<SshConnectionConfig>,
         initial_title: SharedString,
+        command: Option<String>,
+        command_args: Vec<String>,
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
 
@@ -421,6 +491,8 @@ impl TerminalView {
                 terminal_subscription: Some(subscription),
                 working_directory,
                 ssh_config,
+                command,
+                command_args,
                 focus_handle,
                 blink_manager,
                 _blink_subscriptions: blink_subscriptions,
@@ -433,6 +505,7 @@ impl TerminalView {
                 builtin_command_manager: BuiltinCommandManager::new(),
                 can_start_builtin_command: true,
                 broadcast_callback: None,
+                broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
                 scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: None,
@@ -480,7 +553,15 @@ impl TerminalView {
         working_directory: Option<PathBuf>,
     ) -> Entity<Self> {
         let terminal = Terminal::new(cx, working_directory.clone());
-        Self::create_terminal_view(cx, terminal, working_directory, None, "Terminal".into())
+        Self::create_terminal_view(
+            cx,
+            terminal,
+            working_directory,
+            None,
+            "Terminal".into(),
+            None,
+            Vec::new(),
+        )
     }
 
     /// 使用指定命令创建新的本地终端
@@ -501,7 +582,15 @@ impl TerminalView {
         };
         let terminal =
             Terminal::new_with_command(cx, working_dir.clone(), &command_string, &args_vec);
-        Self::create_terminal_view(cx, terminal, working_dir, None, command_string.into())
+        Self::create_terminal_view(
+            cx,
+            terminal,
+            working_dir,
+            None,
+            command_string.clone().into(),
+            Some(command_string),
+            args_vec,
+        )
     }
 
     /// 创建新的 SSH 远程终端
@@ -590,6 +679,8 @@ impl TerminalView {
                 terminal_subscription: Some(terminal_subscription),
                 working_directory: None,
                 ssh_config: Some(ssh_config_clone.clone()),
+                command: None,
+                command_args: Vec::new(),
                 focus_handle,
                 blink_manager,
                 _blink_subscriptions: blink_subscriptions,
@@ -602,6 +693,7 @@ impl TerminalView {
                 builtin_command_manager: BuiltinCommandManager::new(),
                 can_start_builtin_command: true,
                 broadcast_callback: None,
+                broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
                 scrollbar_hide_scheduled_at: None,
                 ssh_connect_view: Some(connect_view.clone()),
@@ -777,9 +869,16 @@ impl TerminalView {
         let cwd = self.current_local_working_directory(cx);
         TerminalSessionState::Local {
             cwd: cwd.map(|path| path.to_string_lossy().to_string()),
-            command: None,
-            args: Vec::new(),
+            command: self.command.clone(),
+            args: self.command_args.clone(),
         }
+    }
+
+    /// 终止该视图背后的终端（本地 shell 进程 / 远程 SSH 连接），用于替换或关闭前主动回收资源。
+    pub fn kill(&self, cx: &mut App) {
+        self.terminal.update(cx, |terminal, _| {
+            terminal.kill();
+        });
     }
 
     fn current_local_working_directory(&self, cx: &App) -> Option<PathBuf> {
@@ -1371,11 +1470,18 @@ impl TerminalView {
     /// 清空内建命令状态。
     ///
     /// 只有原先处于激活状态时才触发一次通知，避免无意义刷新。
+    /// 清空意味着本面板的内建输入结束（Ctrl+C 取消 / 提交后清理等），
+    /// 广播开启时同步发送 `BuiltinEnd`，让目标面板一并清空镜像输入。
     fn clear_builtin_command(&mut self, cx: &mut Context<Self>) {
         let was_active = self.builtin_command_manager.is_active();
         self.builtin_command_manager.clear();
 
         if was_active {
+            if !self.broadcast_suppressed.get() {
+                if let Some(ref callback) = self.broadcast_callback {
+                    callback(BroadcastMsg::BuiltinEnd);
+                }
+            }
             cx.notify();
         }
     }
@@ -1403,9 +1509,14 @@ impl TerminalView {
 
     /// 执行已经解析完成的内建命令。
     ///
-    /// 返回 `true` 表示该命令由应用接管，不应再回落到 shell。
-    fn execute_builtin_command(&mut self, command_line: &str, cx: &mut Context<Self>) -> bool {
-        use crate::builtin_commands::executor::CommandResult;
+    /// 返回 `Some(result)` 表示该命令由应用接管（不应再回落到 shell）；
+    /// 返回 `None` 表示未命中注册表，调用方应把原文交给 shell。
+    fn execute_builtin_command(
+        &mut self,
+        command_line: &str,
+        cx: &mut Context<Self>,
+        mode: BuiltinExecMode,
+    ) -> Option<CommandResult> {
         use crate::builtin_commands::executor::global_executor;
         use crate::builtin_commands::{ArgumentParser, CommandContext, global_registry};
 
@@ -1418,7 +1529,7 @@ impl TerminalView {
 
         // 在注册表中查找命令
         let Some(command) = global_registry().find(command_name) else {
-            return false;
+            return None;
         };
 
         log::info!("builtin command {}: {}", command.name, command.description);
@@ -1452,33 +1563,60 @@ impl TerminalView {
             executor.execute(&command, argument, ctx)
         };
 
-        match result {
+        match &result {
             Some(CommandResult::OpenPath { path, ssh_config }) => {
-                cx.emit(Event::OpenPath { path, ssh_config });
-                true
+                // 打开编辑器 / 文件树不是弹窗，广播接收方也按各自上下文打开
+                cx.emit(Event::OpenPath {
+                    path: path.clone(),
+                    ssh_config: ssh_config.clone(),
+                });
             }
             Some(CommandResult::StartTransfer { request }) => {
-                cx.emit(Event::StartTransfer { request });
-                true
+                if mode == BuiltinExecMode::Interactive {
+                    cx.emit(Event::StartTransfer {
+                        request: request.clone(),
+                    });
+                } else {
+                    // 静默模式：冲突策略降级为 Skip，避免在目标面板弹冲突对话框
+                    let mut silent_request = request.clone();
+                    silent_request.conflict_policy = crate::file_manager::ConflictPolicy::Skip;
+                    cx.emit(Event::StartTransfer {
+                        request: silent_request,
+                    });
+                }
             }
             Some(CommandResult::Log { .. }) => {
                 // LogOnly 命令不需要发射事件
-                true
             }
-            Some(CommandResult::None) => true,
+            Some(CommandResult::None) => {}
             Some(CommandResult::Error { message }) => {
-                log::warn!("Command error: {}", message);
-                self.show_toast(message, cx);
-                true
+                if mode == BuiltinExecMode::Interactive {
+                    log::warn!("Command error: {}", message);
+                    self.show_toast(message, cx);
+                } else {
+                    // 静默模式：仅记录日志，不弹 Toast
+                    log::info!("Broadcast builtin command error (suppressed): {}", message);
+                }
             }
             Some(CommandResult::FallThrough { shell_command }) => {
                 // Handler 做完副作用 / 预处理，把（原始或改写过的）文本交给 shell
-                let to_send = shell_command.unwrap_or_else(|| command_line.to_string());
-                self.send_command_line_to_shell(&to_send, cx);
-                true
+                let to_send = shell_command.clone().unwrap_or_else(|| command_line.to_string());
+                if mode == BuiltinExecMode::Interactive {
+                    self.send_command_line_to_shell(&to_send, cx);
+                } else if self.can_trigger_builtin_command_here(cx) {
+                    // 静默模式：直接写本机 PTY，不走 write_with_broadcast，防止再次广播形成回环；
+                    // 仅在 shell 处于前台时写入，避免注入正在运行的全屏程序
+                    let mut data = to_send.as_bytes().to_vec();
+                    data.push(b'\n');
+                    self.terminal.update(cx, |terminal, _| {
+                        terminal.write(&data);
+                    });
+                }
             }
-            None => false,
+            None => {}
         }
+
+        result
     }
 
     /// 提交一条已经确定好的命令行。
@@ -1492,8 +1630,22 @@ impl TerminalView {
             crate::builtin_commands::history::record_command(&command_line);
         }
 
-        if !self.execute_builtin_command(&command_line, cx) {
-            self.send_command_line_to_shell(&command_line, cx);
+        let result = self.execute_builtin_command(&command_line, cx, BuiltinExecMode::Interactive);
+
+        match result {
+            // 未命中注册表：整行回落到 shell（内部经 write_with_broadcast 广播原始输入）
+            None => {
+                self.send_command_line_to_shell(&command_line, cx);
+            }
+            // FallThrough 已在 execute_builtin_command 内部回落到 shell 并完成原始广播
+            Some(CommandResult::FallThrough { .. }) => {}
+            // 应用层命令已接管：把整行命令广播给组内其他面板，让它们在各自上下文静默执行。
+            // 注意不能走 Raw 广播 —— 内建命令文本从未进入 PTY，其他 shell 拿到它毫无意义。
+            Some(_) => {
+                if let Some(ref callback) = self.broadcast_callback {
+                    callback(BroadcastMsg::BuiltinCommand(command_line));
+                }
+            }
         }
     }
 
@@ -1504,6 +1656,58 @@ impl TerminalView {
         };
 
         self.submit_resolved_builtin_command(command_line, cx);
+    }
+
+    /// 广播接收方入口：以静默模式执行一条内建命令。
+    ///
+    /// 各面板用自己的 cwd / ssh 上下文解析并执行（命令历史、Toast、冲突弹窗等
+    /// UI 副作用只在发起面板发生）。若本面板正处于内建命令输入中，先清空其缓冲。
+    pub fn execute_broadcast_command(&mut self, command_line: &str, cx: &mut Context<Self>) {
+        // 接收方执行不产生任何广播：清缓冲的 BuiltinEnd 已由发起面板发出，
+        // 这里再发会造成冗余消息甚至回环。用守卫确保即使在 panic 时也复位标志。
+        let _guard = BroadcastSuppressionGuard::new(&self.broadcast_suppressed);
+        if self.builtin_command_manager.is_active() {
+            self.finish_builtin_command_input(cx);
+        }
+        self.execute_builtin_command(command_line, cx, BuiltinExecMode::Silent);
+    }
+
+    /// 广播接收方入口：把发起面板的内建命令缓冲（文本 + 光标 + 浮层折叠）镜像到本面板。
+    ///
+    /// 仅在 shell 处于前台可接管输入时应用；应用期间抑制再次广播，避免回环。
+    /// 补全列表由本面板按自己的 cwd / ssh 上下文独立计算（remote 目录按需异步加载）。
+    pub fn apply_broadcast_builtin_input(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        dismissed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_trigger_builtin_command_here(cx) {
+            return;
+        }
+        // 作用域守卫：镜像期间抑制再次广播避免回环，panic 时自动复位。
+        let _guard = BroadcastSuppressionGuard::new(&self.broadcast_suppressed);
+        self.mutate_builtin_command(cx, |manager| {
+            manager.set_buffer(text, cursor);
+            if dismissed && manager.is_active() {
+                // 镜像发起面板的 ESC 折叠状态，保持浮层可见性一致
+                manager.dismiss();
+            }
+        });
+        self.can_start_builtin_command = true;
+    }
+
+    /// 广播接收方入口：同步清空本地镜像的内建输入。
+    ///
+    /// 对应发起面板的 Ctrl+C 取消 / 提交后清理；应用期间抑制广播避免回环。
+    pub fn apply_broadcast_builtin_end(&mut self, cx: &mut Context<Self>) {
+        if !self.builtin_command_manager.is_active() {
+            return;
+        }
+        // 作用域守卫：清理镜像期间抑制广播避免回环，panic 时自动复位。
+        let _guard = BroadcastSuppressionGuard::new(&self.broadcast_suppressed);
+        self.finish_builtin_command_input(cx);
     }
 
     /// 将内置命令缓冲区的内容直接发送给 shell（不执行内置命令处理）
@@ -1579,6 +1783,18 @@ impl TerminalView {
         // 远端目录按需加载：如果管理器标记为"loading"，取出请求并后台读取
         while let Some(request) = self.builtin_command_manager.pending_remote_request() {
             self.spawn_remote_dir_load(request, cx);
+        }
+
+        // 广播缓冲最新状态（文本 / 光标 / 浮层折叠），让广播组内其他面板镜像显示
+        // 同一段输入。应用远端同步（broadcast_suppressed）时不广播，防止回环。
+        if !self.broadcast_suppressed.get() {
+            if let Some(ref callback) = self.broadcast_callback {
+                callback(BroadcastMsg::BuiltinSync {
+                    text: self.builtin_command_text().to_string(),
+                    cursor: self.builtin_command_cursor(),
+                    dismissed: self.builtin_command_manager.is_dismissed(),
+                });
+            }
         }
 
         cx.notify();
@@ -1982,7 +2198,7 @@ impl TerminalView {
         });
         // 如果有广播回调，调用它来广播输入
         if let Some(ref callback) = self.broadcast_callback {
-            callback(data);
+            callback(BroadcastMsg::Raw(data.to_vec()));
         }
     }
 
@@ -2177,7 +2393,7 @@ impl TerminalView {
         // 如果有输入数据且广播回调已设置，调用广播回调
         if let Some(ref bytes) = input_bytes {
             if let Some(ref callback) = self.broadcast_callback {
-                callback(bytes);
+                callback(BroadcastMsg::Raw(bytes.clone()));
             }
         }
 

@@ -14,7 +14,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::DraggedPanel;
 
-actions!(tab_context_menu, [CopyTabAddress, DuplicateTab]);
+actions!(tab_context_menu, [CopyTabAddress, DuplicateTab, ReconnectTab]);
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +238,8 @@ pub struct TabBar {
     on_tab_copy_address: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     /// 复制标签页回调
     on_tab_duplicate: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    /// 重新连接回调
+    on_tab_reconnect: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
     on_context_menu: Option<
         Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
@@ -273,6 +275,7 @@ impl TabBar {
             context_menu_tab_id: None,
             on_tab_copy_address: None,
             on_tab_duplicate: None,
+            on_tab_reconnect: None,
             on_context_menu: None,
         })
     }
@@ -315,6 +318,7 @@ impl TabBar {
             context_menu_tab_id: None,
             on_tab_copy_address: None,
             on_tab_duplicate: None,
+            on_tab_reconnect: None,
             on_context_menu: None,
         })
     }
@@ -399,6 +403,14 @@ impl TabBar {
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_duplicate = Some(Rc::new(callback));
+    }
+
+    /// 重新连接回调
+    pub fn on_tab_reconnect<F>(&mut self, callback: F)
+    where
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_tab_reconnect = Some(Rc::new(callback));
     }
 
     /// 右键菜单构建回调（由调用方设置）
@@ -805,6 +817,16 @@ impl Render for TabBar {
                 let on_tab_duplicate = self.on_tab_duplicate.clone();
                 move |this, _: &DuplicateTab, window, cx| {
                     if let Some(ref cb) = on_tab_duplicate {
+                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
+                            cb(tab_id, window, cx);
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener({
+                let on_tab_reconnect = self.on_tab_reconnect.clone();
+                move |this, _: &ReconnectTab, window, cx| {
+                    if let Some(ref cb) = on_tab_reconnect {
                         if let Some(tab_id) = this.context_menu_tab_id.clone() {
                             cb(tab_id, window, cx);
                         }

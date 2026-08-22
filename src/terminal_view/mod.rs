@@ -8,4 +8,4 @@ pub mod terminal_view;
 pub use terminal_element::TerminalElement;
 pub use terminal_scrollbar::TerminalScrollbar;
 pub(crate) use terminal_view::init;
-pub use terminal_view::{TerminalBlink, TerminalView};
+pub use terminal_view::{BroadcastMsg, TerminalBlink, TerminalView};

@@ -1700,6 +1700,23 @@ impl Terminal {
         }
     }
 
+    /// 显式终止底层进程/连接，避免终端实体被替换或关闭后造成资源泄漏。
+    ///
+    /// - 本地 PTY：向 alacritty 事件循环发送 `Msg::Shutdown`，触发 PTY / 子 shell 回收。
+    /// - russh 远程：发送 `InputMsg::Close`（连接任务仅在收到 Close 或发送端断开时退出；
+    ///   仅 drop `RusshTerminal` 无法终止连接，因为 `state` 被任务自身持有）。
+    /// - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，随 `Terminal` 析构自动释放。
+    pub fn kill(&mut self) {
+        // 本地终端：通知底层事件循环关闭（会回收 shell 子进程）
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Msg::Shutdown);
+        }
+        // russh 远程：显式关闭 SSH 连接
+        if let Some(russh) = &self.russh_handle {
+            russh.close();
+        }
+    }
+
     pub fn resize(&mut self, bounds: TerminalBounds, _cx: &mut Context<Self>) {
         let previous_cols = self.terminal_bounds.num_columns();
         let previous_rows = self.terminal_bounds.num_lines();
@@ -2150,6 +2167,18 @@ impl Terminal {
 }
 
 impl EventEmitter<Event> for Terminal {}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        // 终端被丢弃时显式回收底层资源：
+        // - 本地 PTY：`sender` 断开会让 alacritty 事件循环退出并回收 shell；此处再补发
+        //   `Msg::Shutdown` 以确保即使仍被短暂引用也能及时关闭。
+        // - russh 远程：连接任务仅在收到 `InputMsg::Close`（或发送端断开）时退出，
+        //   仅 drop `RusshTerminal` 无法终止连接，必须显式 `close()`。
+        // - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，会随 `Terminal` 析构释放。
+        self.kill();
+    }
+}
 
 #[cfg(test)]
 mod tests {

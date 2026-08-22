@@ -12,14 +12,16 @@ use gpui::{
 use gpui::{EventEmitter, KeyBinding, actions, prelude::*};
 
 /// 广播输入队列 - 全局共享，用于从TerminalView发送输入到Workspace
-/// (workspace_id, panel_id, input_data)
-fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, Vec<u8>)>> {
-    static QUEUE: OnceLock<Mutex<Vec<(String, String, Vec<u8>)>>> = OnceLock::new();
+/// (workspace_id, panel_id, message)
+fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, BroadcastMsg)>> {
+    static QUEUE: OnceLock<Mutex<Vec<(String, String, BroadcastMsg)>>> = OnceLock::new();
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 use crate::components::button::Icon as MenuIcon;
-use crate::components::tab_bar::{CopyTabAddress, DraggedTab, DuplicateTab, TabBar, TabItem};
+use crate::components::tab_bar::{
+    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
+};
 use crate::file_manager::TransferStatusReporter;
 use crate::file_manager::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
@@ -29,7 +31,7 @@ use crate::file_manager::{
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
-use crate::terminal_view::TerminalView;
+use crate::terminal_view::{BroadcastMsg, TerminalView};
 use crate::theme::ActiveTheme;
 use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, PanelPlacement};
 use crate::workspace::session_state::{
@@ -637,6 +639,19 @@ impl Workspace {
                 }
             });
 
+            // 重新连接 - 普通标签重连单个终端，WorkSpace 标签重连其下全部终端
+            tab_bar.on_tab_reconnect({
+                let workspace = workspace.clone();
+                move |tab_id, window, cx| {
+                    let id = tab_id.to_string();
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_reconnect(&id, window, cx);
+                        });
+                    });
+                }
+            });
+
             // 右键菜单
             tab_bar.on_context_menu({
                 let workspace = workspace.clone();
@@ -661,6 +676,11 @@ impl Workspace {
                         "复制标签页",
                         MenuIcon::new("icons/plus.square.on.square.svg"),
                         Box::new(DuplicateTab),
+                    )
+                    .menu_with_icon(
+                        "重新连接",
+                        MenuIcon::new("icons/arrow.clockwise.svg"),
+                        Box::new(ReconnectTab),
                     )
                 }
             });
@@ -1180,7 +1200,7 @@ impl Workspace {
     fn handle_broadcast_input(
         &mut self,
         source_panel_id: &str,
-        data: &[u8],
+        msg: BroadcastMsg,
         cx: &mut Context<Self>,
     ) {
         // 获取当前活动tab的广播状态
@@ -1204,16 +1224,61 @@ impl Workspace {
             .collect();
 
         // 将输入发送给目标panel的终端
-        for panel in target_panels {
-            panel.update(cx, |panel_ref, _cx| {
-                if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
-                    terminal_view.update(_cx, |tv, cx| {
-                        tv.terminal().update(cx, |term, _| {
-                            term.write(data);
-                        });
+        match msg {
+            BroadcastMsg::Raw(data) => {
+                for panel in target_panels {
+                    panel.update(cx, |panel_ref, _cx| {
+                        if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
+                            terminal_view.update(_cx, |tv, cx| {
+                                tv.terminal().update(cx, |term, _| {
+                                    term.write(&data);
+                                });
+                            });
+                        }
                     });
                 }
-            });
+            }
+            BroadcastMsg::BuiltinSync {
+                text,
+                cursor,
+                dismissed,
+            } => {
+                for panel in target_panels {
+                    panel.update(cx, |panel_ref, _cx| {
+                        if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
+                            terminal_view.update(_cx, |tv, cx| {
+                                // 镜像发起面板的内建命令输入（文本 + 光标 + 浮层折叠）
+                                tv.apply_broadcast_builtin_input(&text, cursor, dismissed, cx);
+                            });
+                        }
+                    });
+                }
+            }
+            BroadcastMsg::BuiltinEnd => {
+                for panel in target_panels {
+                    panel.update(cx, |panel_ref, _cx| {
+                        if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
+                            terminal_view.update(_cx, |tv, cx| {
+                                // 同步清空镜像的内建输入（Ctrl+C 取消 / 提交清理）
+                                tv.apply_broadcast_builtin_end(cx);
+                            });
+                        }
+                    });
+                }
+            }
+            BroadcastMsg::BuiltinCommand(command_line) => {
+                for panel in target_panels {
+                    panel.update(cx, |panel_ref, _cx| {
+                        if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
+                            terminal_view.update(_cx, |tv, cx| {
+                                // 各目标面板用自己的 cwd / ssh 上下文静默执行，
+                                // 不弹 Toast / 冲突对话框（UI 副作用仅发生在源面板）
+                                tv.execute_broadcast_command(&command_line, cx);
+                            });
+                        }
+                    });
+                }
+            }
         }
     }
 
@@ -1230,35 +1295,42 @@ impl Workspace {
             return;
         }
 
-        // 从队列中取出所有待处理的输入（只处理属于当前Workspace的输入）
-        let inputs: Vec<(String, Vec<u8>)> = {
+        // 取出属于当前 Workspace 的输入，并保留其它 Workspace 的输入。
+        //
+        // 不能用 drain(..) 抽干整个全局队列：多 WorkSpace（多窗口）场景下，
+        // 先 render 的 Workspace 会把其它 Workspace 的广播消息一并丢弃，导致丢失。
+        // 这里用 retain 仅取出本 Workspace 的条目，其余保留在队列中由各自 WorkSpace 处理。
+        let inputs: Vec<(String, BroadcastMsg)> = {
             let mut queue = get_broadcast_queue().lock();
             if queue.is_empty() {
                 return;
             }
-            // 只过滤出属于当前workspace的输入
             let workspace_id = self.workspace_id.clone();
-            queue
-                .drain(..)
-                .filter(|(ws_id, _, _)| ws_id == &workspace_id)
-                .map(|(_, panel_id, data)| (panel_id, data))
-                .collect()
+            let mut taken = Vec::new();
+            queue.retain(|(ws_id, panel_id, msg)| {
+                if ws_id == &workspace_id {
+                    taken.push((panel_id.clone(), msg.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            taken
         };
 
         // 处理每个输入
-        for (panel_id, data) in inputs {
-            self.handle_broadcast_input(&panel_id, &data, cx);
+        for (panel_id, msg) in inputs {
+            self.handle_broadcast_input(&panel_id, msg, cx);
         }
     }
 
-    /// 添加输入到广播队列（由TerminalView调用）
-    pub fn queue_broadcast_input(workspace_id: &str, panel_id: &str, data: &[u8]) {
+    /// 添加广播消息到队列（由Panel的广播回调投递，Workspace 在 render 时统一消费）。
+    ///
+    /// 消息携带 workspace_id / panel_id：前者用于多 WorkSpace 场景下过滤，
+    /// 后者用于分发时排除发起面板自身。
+    pub fn queue_broadcast_msg(workspace_id: &str, panel_id: &str, msg: BroadcastMsg) {
         let mut queue = get_broadcast_queue().lock();
-        queue.push((
-            workspace_id.to_string(),
-            panel_id.to_string(),
-            data.to_vec(),
-        ));
+        queue.push((workspace_id.to_string(), panel_id.to_string(), msg));
     }
 
     /// 处理panel选中事件 - 确保同一组只有一个panel被选中
@@ -2117,6 +2189,26 @@ impl Workspace {
                     self.add_terminal_tab(label, panel, None, window, cx);
                 }
             }
+        }
+    }
+
+    /// 重新连接标签页 - WorkSpace 标签重连其下全部终端 panel，普通标签重连单个终端
+    fn handle_tab_reconnect(&mut self, tab_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            log::warn!("未找到标签页: {}", tab_id);
+            return;
+        };
+
+        let mut panels: Vec<Entity<Panel>> = Vec::new();
+        tab_info.container.collect_panels_vec_recursive(&mut panels);
+
+        if panels.is_empty() {
+            log::warn!("标签页 {} 没有可重新连接的 panel", tab_id);
+            return;
+        }
+
+        for panel in panels {
+            panel.update(cx, |panel, cx| panel.reconnect_terminal(cx));
         }
     }
 

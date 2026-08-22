@@ -259,12 +259,16 @@ impl Panel {
                         TerminalSessionState::Ssh { remote_cwd, .. } => remote_cwd,
                         TerminalSessionState::Local { .. } => None,
                     };
+                    // 主动终止被替换的旧终端（旧连接已断开，close 为幂等安全操作）
+                    view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
                     let new_terminal_view =
                         TerminalView::new_ssh_with_remote_cwd(cx, config, remote_cwd);
                     // 重新订阅新 TerminalView 的事件
                     Self::subscribe_terminal_events(&close_panel_id, &new_terminal_view, cx);
                     // 更新 panel 内容
                     this.set_content(PanelContent::Terminal(new_terminal_view), cx);
+                    // 新视图没有广播回调，若广播仍开启需要重新装配
+                    this.attach_broadcast_callback(cx);
                 }
                 TerminalViewEvent::RemoteOsDetected { os } => {
                     this.remote_os = Some(*os);
@@ -393,6 +397,44 @@ impl Panel {
         self.content = content;
     }
 
+    /// 重新连接终端：SSH 会话重建连接，本地会话在当前工作目录重启 shell
+    pub fn reconnect_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(terminal_view) = self.content.terminal_view().cloned() else {
+            return;
+        };
+
+        let state = terminal_view.read(cx).session_state(cx);
+        // 主动终止被替换的旧终端，避免进程/连接泄漏（旧实体随后被 set_content 释放）
+        terminal_view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
+        let new_terminal_view = match state {
+            TerminalSessionState::Ssh { config, remote_cwd } => {
+                log::info!(
+                    "重新连接面板 {} 的 SSH 会话: {}",
+                    self.panel_id,
+                    config.host_label()
+                );
+                TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd)
+            }
+            TerminalSessionState::Local { cwd, command, args } => {
+                log::info!("重新启动面板 {} 的本地会话", self.panel_id);
+                if let Some(cmd) = command {
+                    TerminalView::new_with_command(cx, &cmd, &args)
+                } else {
+                    TerminalView::new_with_working_directory(
+                        cx,
+                        cwd.map(std::path::PathBuf::from),
+                    )
+                }
+            }
+        };
+
+        Self::subscribe_terminal_events(&self.panel_id, &new_terminal_view, cx);
+        self.set_content(PanelContent::Terminal(new_terminal_view), cx);
+        // 新视图没有广播回调，若广播仍开启需要重新装配
+        self.attach_broadcast_callback(cx);
+        cx.notify();
+    }
+
     /// Returns true if this panel contains a terminal view.
     pub fn has_terminal_content(&self) -> bool {
         matches!(self.content, PanelContent::Terminal(_))
@@ -501,28 +543,48 @@ impl Panel {
         self.broadcast_enabled = enabled;
 
         // 根据广播状态设置或清除TerminalView的广播回调
-        if let PanelContent::Terminal(terminal_view) = &self.content {
-            let panel_id = self.panel_id.clone();
-            let workspace_id = self.workspace_id.clone();
+        if enabled {
+            self.attach_broadcast_callback(cx);
+        } else if let PanelContent::Terminal(terminal_view) = &self.content {
             terminal_view.update(cx, |tv, _cx| {
-                if enabled {
-                    // 创建广播回调，当终端有输入时添加到全局队列
-                    tv.set_broadcast_callback(Box::new(move |data: &[u8]| {
-                        // 将输入添加到全局队列，由Workspace的render方法处理
-                        // 包含workspace_id以区分不同WorkSpace的广播
-                        crate::workspace::workspace::Workspace::queue_broadcast_input(
-                            &workspace_id,
-                            &panel_id,
-                            data,
-                        );
-                    }));
-                } else {
-                    tv.clear_broadcast_callback();
-                }
+                tv.clear_broadcast_callback();
             });
         }
 
         cx.notify();
+    }
+
+    /// 为当前终端内容装配广播回调（把本面板输入投递到全局广播队列）。
+    ///
+    /// 在开启广播和终端视图被替换（SSH 重连 / 手动重连）后调用，
+    /// 确保新 TerminalView 的输入仍会广播给组内其他面板。
+    fn attach_broadcast_callback(&self, cx: &mut Context<Self>) {
+        // 若本面板当前未开启广播则直接返回，不要装配回调。
+        //
+        // 重连（SSH 断开自动重连 / 手动 reconnect_terminal）会无条件调用本函数，
+        // 若不守卫，关闭广播后重连仍会把回调重新挂上；而 process_broadcast_queue /
+        // handle_broadcast_input 在广播关闭时直接 return，全局队列永远不会被消费，
+        // 导致队列无限增长（内存泄漏），且日后开启广播会回放海量历史按键到组内其它面板。
+        if !self.broadcast_enabled {
+            return;
+        }
+
+        let Some(terminal_view) = self.content.terminal_view() else {
+            return;
+        };
+        let panel_id = self.panel_id.clone();
+        let workspace_id = self.workspace_id.clone();
+        terminal_view.update(cx, |tv, _cx| {
+            // 创建广播回调，当终端有输入时添加到全局队列，由Workspace的render方法处理；
+            // 消息携带 workspace_id 以区分不同 WorkSpace 的广播
+            tv.set_broadcast_callback(Box::new(move |msg| {
+                crate::workspace::workspace::Workspace::queue_broadcast_msg(
+                    &workspace_id,
+                    &panel_id,
+                    msg,
+                );
+            }));
+        });
     }
 
     /// 获取活动 tab ID

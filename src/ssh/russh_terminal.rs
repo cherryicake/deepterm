@@ -95,6 +95,8 @@ struct ConnectionState {
     failed: bool,
     /// 失败原因
     error_message: Option<String>,
+    /// 是否已调用过 close（保证 close 幂等；连接中调用则在连接完成后立即断开）
+    closed: bool,
 }
 
 /// russh SSH 终端句柄
@@ -125,6 +127,7 @@ impl RusshTerminal {
             pending_resize: None,
             failed: false,
             error_message: None,
+            closed: false,
         }));
 
         let state_for_task = state.clone();
@@ -149,29 +152,32 @@ impl RusshTerminal {
                         Ok((handle, channel)) => {
                             log::info!("russh: 连接成功，启动 I/O 循环");
 
-                            // 获取待处理的输入和大小调整
-                            let (pending_input, pending_resize) = {
-                                let mut state = state_for_task.lock();
-                                let input = std::mem::take(&mut state.pending_input);
-                                let resize = state.pending_resize.take();
-                                (input, resize)
-                            };
-
                             // 创建内部终端
                             let (input_tx, input_rx) = unbounded_channel::<InputMsg>();
 
-                            // 先发送待处理的输入
-                            for data in pending_input {
-                                let _ = input_tx.send(InputMsg::Data(data));
-                            }
-                            if let Some((cols, rows)) = pending_resize {
-                                let _ = input_tx.send(InputMsg::Resize(cols as u32, rows as u32));
-                            }
-
-                            // 存储到状态
-                            {
+                            // 连接期间被 close：立即丢弃连接，不进入 I/O 循环
+                            let was_closed = {
                                 let mut state = state_for_task.lock();
-                                state.terminal = Some(RusshTerminalInner { input_tx });
+                                if state.closed {
+                                    true
+                                } else {
+                                    // 先发送待处理的输入
+                                    for data in std::mem::take(&mut state.pending_input) {
+                                        let _ = input_tx.send(InputMsg::Data(data));
+                                    }
+                                    if let Some((cols, rows)) = state.pending_resize.take() {
+                                        let _ =
+                                            input_tx.send(InputMsg::Resize(cols as u32, rows as u32));
+                                    }
+                                    state.terminal = Some(RusshTerminalInner { input_tx });
+                                    false
+                                }
+                            };
+                            if was_closed {
+                                log::info!("russh: 连接建立前已被关闭，立即断开");
+                                drop(handle);
+                                drop(channel);
+                                return;
                             }
 
                             // 启动 I/O 循环
@@ -226,7 +232,7 @@ impl RusshTerminal {
         if let Some(ref terminal) = state.terminal {
             // 连接已就绪，直接发送
             terminal.input_tx.send(InputMsg::Data(data.to_vec())).ok();
-        } else if !state.failed {
+        } else if !state.failed && !state.closed {
             // 连接中，缓存数据
             state.pending_input.push_back(data.to_vec());
             // 限制缓冲区大小，防止内存无限增长
@@ -248,16 +254,20 @@ impl RusshTerminal {
                 .input_tx
                 .send(InputMsg::Resize(cols as u32, rows as u32))
                 .ok();
-        } else if !state.failed {
+        } else if !state.failed && !state.closed {
             // 连接中，缓存最后的大小
             state.pending_resize = Some((cols, rows));
         }
     }
 
     /// 关闭 SSH 连接
+    ///
+    /// 幂等：重复调用安全。若连接尚未就绪，置位 `closed`，
+    /// 连接任务在建立完成后会立即断开，避免泄漏仍在握手的连接。
     pub fn close(&self) {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
 
+        state.closed = true;
         if let Some(ref terminal) = state.terminal {
             terminal.input_tx.send(InputMsg::Close).ok();
         }
