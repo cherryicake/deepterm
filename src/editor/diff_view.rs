@@ -942,20 +942,27 @@ impl DiffView {
             .text_size(px(12.0))
             .child(
                 div()
-                    .flex_1()
                     .min_w_0()
+                    .flex_1()
                     .overflow_hidden()
                     .text_color(theme.text)
+                    .truncate()
                     .child(self.path.clone()),
             )
             .child(
                 div()
+                    .flex_none()
+                    .px(px(2.0))
                     .text_color(theme.status_added)
+                    .text_size(px(11.0))
                     .child(format!("+{}", self.additions)),
             )
             .child(
                 div()
+                    .flex_none()
+                    .px(px(2.0))
                     .text_color(theme.status_deleted)
+                    .text_size(px(11.0))
                     .child(format!("-{}", self.deletions)),
             )
             // hunk 导航：上一个 / 计数 / 下一个（循环跳转）
@@ -975,7 +982,9 @@ impl DiffView {
                     )
                     .child(
                         div()
-                            .px(px(4.0))
+                            .w(px(44.0))
+                            .flex()
+                            .justify_center()
                             .text_size(px(11.0))
                             .text_color(if nav_enabled { theme.text_muted } else { theme.text_subtle })
                             .child(if nav_enabled {
@@ -1050,32 +1059,45 @@ impl DiffView {
         // Revert buttons overlay, positioned by hunk line and scroll offset.
         let (line_height, scroll_offset) = self.right_scroll_metrics(cx);
         let revert_buttons: Vec<gpui::AnyElement> = if line_height > px(0.) {
+            let pill_height = (line_height - px(6.0)).max(px(16.0));
             self.hunks
                 .iter()
                 .enumerate()
                 .map(|(ix, hunk)| {
                     let y = line_height * hunk.new_rows.start as f32 + scroll_offset.y;
+                    // 外层占满一行高度做垂直居中，内层药丸固定高度
                     div()
-                        .id(("revert-hunk", ix))
                         .absolute()
                         .top(y)
                         .right(px(12.0))
                         .h(line_height)
-                        .px(px(6.0))
                         .flex()
                         .items_center()
-                        .rounded(px(4.0))
-                        .bg(theme.elevated_background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .text_color(theme.text_muted)
-                        .text_size(px(11.0))
-                        .hover(|s| s.text_color(theme.text).border_color(theme.accent))
-                        .child("↩ 还原")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.revert_hunk(ix, window, cx);
-                        }))
+                        .child(
+                            div()
+                                .id(("revert-hunk", ix))
+                                .h(pill_height)
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .rounded(px(999.0))
+                                .bg(theme.elevated_background)
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .text_color(theme.text_muted)
+                                .text_size(px(11.0))
+                                .hover(|s| {
+                                    s.text_color(theme.text)
+                                        .border_color(theme.accent)
+                                        .bg(theme.tab_hover_background)
+                                })
+                                .child("还原此块")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.revert_hunk(ix, window, cx);
+                                })),
+                        )
                         .into_any_element()
                 })
                 .collect()
@@ -1114,37 +1136,62 @@ impl DiffView {
     fn render_unified(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        // 折叠区分隔行的「展开」按钮浮层，按滚动偏移定位。
+        // 折叠区浮层：整行「折叠带」+ 居中展开药丸按钮（GitHub 风格）。
         let (line_height, scroll_offset) = Self::editor_scroll_metrics(&self.unified, cx);
-        let expand_buttons: Vec<gpui::AnyElement> = if line_height > px(0.) {
+        let expand_bands: Vec<gpui::AnyElement> = if line_height > px(0.) {
+            let pill_height = (line_height - px(6.0)).max(px(16.0));
             self.unified_separators
                 .iter()
                 .map(|sep| {
                     let y = line_height * sep.merged_row as f32 + scroll_offset.y;
                     div()
-                        .id(("expand-sep", sep.id))
                         .absolute()
                         .top(y)
-                        .left(px(48.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
                         .h(line_height)
-                        .px(px(8.0))
                         .flex()
                         .items_center()
-                        .rounded(px(4.0))
-                        .bg(theme.elevated_background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .cursor_pointer()
-                        .text_color(theme.text_muted)
-                        .text_size(px(11.0))
-                        .hover(|s| s.text_color(theme.text).border_color(theme.accent))
-                        .child(format!("⋯ 展开 {} 行 ⋯", sep.hidden_lines))
-                        .on_click({
-                            let id = sep.id;
-                            cx.listener(move |this, _, _, cx| {
-                                this.expand_separator(id, cx);
-                            })
-                        })
+                        .justify_center()
+                        // 折叠带底色：比编辑器底色深一档，上下缘极淡分隔线
+                        .bg(theme.panel_background)
+                        .border_t_1()
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.4))
+                        .child(
+                            div()
+                                .id(("expand-sep", sep.id))
+                                .h(pill_height)
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .rounded(px(999.0))
+                                .bg(theme.elevated_background)
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .text_color(theme.text_muted)
+                                .text_size(px(11.0))
+                                .hover(|s| {
+                                    s.text_color(theme.text)
+                                        .border_color(theme.accent)
+                                        .bg(theme.tab_hover_background)
+                                })
+                                .child(format!("展开 {} 行", sep.hidden_lines))
+                                .child(
+                                    gpui::svg()
+                                        .size(px(8.0))
+                                        .path(crate::assets::Icon::ChevronDown.path())
+                                        .text_color(theme.icon_muted),
+                                )
+                                .on_click({
+                                    let id = sep.id;
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.expand_separator(id, cx);
+                                    })
+                                }),
+                        )
                         .into_any_element()
                 })
                 .collect()
@@ -1159,7 +1206,7 @@ impl DiffView {
             .overflow_hidden()
             .bg(theme.editor_background())
             .child(EditorInput::new(&self.unified).disabled(true))
-            .children(expand_buttons)
+            .children(expand_bands)
     }
 }
 
