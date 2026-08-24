@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs;
@@ -7,6 +10,65 @@ use crate::ssh::sftp_fs;
 use super::git_status::{DiffStat, GitStatus, StatusEntry, parse_numstat};
 
 const REMOTE_GIT_TIMEOUT: u64 = 60;
+
+/// 远程 diff 内容缓存条目：以 (HEAD commit, 文件 size, mtime) 为有效性指纹。
+struct CachedRemoteDiff {
+    head_commit: String,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    contents: (String, String),
+}
+
+/// 键 = "repo_root\u{0}path"。进程级缓存，容量上限防膨胀。
+static REMOTE_DIFF_CACHE: OnceLock<Mutex<HashMap<String, CachedRemoteDiff>>> = OnceLock::new();
+const REMOTE_DIFF_CACHE_CAP: usize = 64;
+
+fn remote_diff_cache() -> &'static Mutex<HashMap<String, CachedRemoteDiff>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedRemoteDiff>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remote_diff_cache_get(
+    key: &str,
+    head_commit: &str,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+) -> Option<(String, String)> {
+    let cache = remote_diff_cache().lock();
+    let entry = cache.get(key)?;
+    (entry.head_commit == head_commit && entry.size == size && entry.mtime == mtime)
+        .then(|| entry.contents.clone())
+}
+
+fn remote_diff_cache_insert(
+    key: String,
+    head_commit: String,
+    size: u64,
+    mtime: Option<std::time::SystemTime>,
+    contents: (String, String),
+) {
+    let mut cache = remote_diff_cache().lock();
+    // 简单容量控制：满时清空（diff 场景键数有限，粗暴策略足够）
+    if cache.len() >= REMOTE_DIFF_CACHE_CAP && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        CachedRemoteDiff {
+            head_commit,
+            size,
+            mtime,
+            contents,
+        },
+    );
+}
+
+/// 使某远程仓库的全部 diff 缓存失效（写入文件后调用，避免 stat 未变化
+/// 但内容已变时读到旧缓存——SFTP mtime 精度可能不足一秒）。
+pub fn invalidate_remote_diff_cache(repo_root: &str, path: &str) {
+    let mut cache = remote_diff_cache().lock();
+    cache.remove(&format!("{}\u{0}{}", repo_root, path));
+}
 
 #[derive(Clone)]
 pub enum GitBackend {
@@ -162,11 +224,72 @@ impl GitRepository {
     ///
     /// Diffing the working tree against HEAD matches the previous behavior of
     /// `diff_file` (staged + unstaged changes combined).
+    ///
+    /// 远程仓库启用 stat 缓存：先用 `rev-parse HEAD` + SFTP stat（两次轻量
+    /// 往返）判断内容是否变化，未变化则直接复用上次全文，避免每次刷新
+    /// 都全量拉取两端内容（大文件经 SFTP 明显慢）。本地仓库文件读取廉价，
+    /// 不走缓存。
     pub fn diff_file_contents(&self, path: &str) -> Result<(String, String), String> {
-        let head_ref = format!("HEAD:{path}");
-        let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
-        let new = self.read_file(path).unwrap_or_default();
-        Ok((old, new))
+        match &self.backend {
+            GitBackend::Local => {
+                let head_ref = format!("HEAD:{path}");
+                let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+                let new = self.read_file(path).unwrap_or_default();
+                Ok((old, new))
+            }
+            GitBackend::Remote { config } => {
+                let head_commit = self.head_commit().unwrap_or_else(|| "no-head".to_string());
+                let remote_path = join_remote_path(&self.root, path);
+                // 工作区文件可能已被删除：stat 失败视为删除态，用哨兵值入键
+                let (size, mtime) = match sftp_fs::metadata(config, &remote_path) {
+                    Ok(meta) => (meta.size, meta.modified_at),
+                    Err(_) => (u64::MAX, None),
+                };
+                if let Some(cached) = remote_diff_cache_get(
+                    &format!("{}\u{0}{}", self.root, path),
+                    &head_commit,
+                    size,
+                    mtime,
+                ) {
+                    return Ok(cached);
+                }
+                let head_ref = format!("HEAD:{path}");
+                let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+                let new = self.read_file(path).unwrap_or_default();
+                remote_diff_cache_insert(
+                    format!("{}\u{0}{}", self.root, path),
+                    head_commit,
+                    size,
+                    mtime,
+                    (old.clone(), new.clone()),
+                );
+                Ok((old, new))
+            }
+        }
+    }
+
+    /// 当前 HEAD 提交 id；无提交历史时返回 None。
+    fn head_commit(&self) -> Option<String> {
+        match &self.backend {
+            GitBackend::Local => self
+                .run_git(&["rev-parse", "HEAD"])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            GitBackend::Remote { config } => {
+                let command = format!(
+                    "cd {} && git rev-parse HEAD",
+                    shell_quote(&self.root)
+                );
+                crate::ssh::sftp_fs::with_cached_session(config, |session| {
+                    session.execute_command(&command, REMOTE_GIT_TIMEOUT)
+                })
+                .ok()
+                .filter(|r| r.success())
+                .map(|r| r.stdout.trim().to_string())
+                .filter(|s| !s.is_empty())
+            }
+        }
     }
 
     /// Write content to a working-tree file (local fs or remote via SFTP).
@@ -181,6 +304,11 @@ impl GitRepository {
                 let remote_path = join_remote_path(&self.root, path);
                 sftp_fs::write_file_string(config, &remote_path, content)
                     .map_err(|e| format!("Failed to write remote file: {e}"))
+                    .inspect(|_| {
+                        // SFTP mtime 精度可能秒级：同秒内写完后 stat 指纹不变，
+                        // 必须显式失效，否则 diff 会读到旧内容
+                        invalidate_remote_diff_cache(&self.root, path);
+                    })
             }
         }
     }

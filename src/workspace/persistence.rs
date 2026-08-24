@@ -24,8 +24,17 @@ impl PersistenceManager {
         }
 
         // 自动迁移旧路径 ~/.config/deepterm -> dirs::config_dir()/deepterm
-        Self::migrate_legacy_config_dir(&config_dir);
+        if let Some(home) = dirs::home_dir() {
+            let legacy = home.join(".config").join("deepterm");
+            Self::migrate_legacy_dir(&legacy, &config_dir);
+        }
 
+        Self { config_dir }
+    }
+
+    /// 测试专用：指定配置目录，跳过系统路径探测与真实旧路径迁移。
+    #[cfg(test)]
+    fn with_config_dir(config_dir: PathBuf) -> Self {
         Self { config_dir }
     }
 
@@ -44,10 +53,9 @@ impl PersistenceManager {
         fallback
     }
 
-    /// 迁移旧配置目录（仅当新旧不同且旧存在、新不存在时）
-    fn migrate_legacy_config_dir(new_dir: &Path) {
-        let Some(home) = dirs::home_dir() else { return; };
-        let legacy = home.join(".config").join("deepterm");
+    /// 迁移旧配置目录（仅当新旧不同且旧存在、新不存在时）。
+    /// 抽为纯函数以便测试：调用方负责提供真实的旧/新路径。
+    fn migrate_legacy_dir(legacy: &Path, new_dir: &Path) {
         if legacy == new_dir {
             return;
         }
@@ -334,5 +342,142 @@ impl AutoSaveManager {
 impl Default for AutoSaveManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::workspace::session_state::WorkspaceSessionState;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm-persist-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn sample_session() -> AppSessionState {
+        let mut session = AppSessionState::default();
+        session.groups.push(crate::workspace::session_state::WorkspaceGroupSessionState {
+            id: "g1".into(),
+            label: Some("测试组".into()),
+            collapsed: false,
+            workspace: Some(WorkspaceSessionState {
+                workspace_id: "ws-1".into(),
+                active_tab_id: "tab-0".into(),
+                next_tab_id: 1,
+                next_panel_id: 1,
+                local_terminal_count: 1,
+                workspace_index: 0,
+                tabs: vec![],
+            }),
+        });
+        session
+    }
+
+    /// 清理临时目录（测试结束调用；失败静默）
+    fn cleanup(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_and_load_session_roundtrip() {
+        let dir = temp_dir("roundtrip");
+        {
+            let mgr = PersistenceManager::with_config_dir(dir.clone());
+            mgr.save_session(&sample_session()).expect("save");
+            let loaded = mgr.load_session().expect("load").expect("some session");
+            assert_eq!(loaded.groups.len(), 1);
+            assert_eq!(loaded.groups[0].id, "g1");
+            assert_eq!(loaded.version, crate::workspace::session_state::SESSION_STATE_VERSION);
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn corrupted_main_file_recovers_from_bak() {
+        let dir = temp_dir("bak-recovery");
+        {
+            let mgr = PersistenceManager::with_config_dir(dir.clone());
+            // 第一次写入生成主文件，第二次写入生成 .bak（内容不同以便区分）
+            let mut v1 = sample_session();
+            v1.active_group_id = "v1".into();
+            mgr.save_session(&v1).expect("save v1");
+            let mut v2 = sample_session();
+            v2.active_group_id = "v2".into();
+            mgr.save_session(&v2).expect("save v2");
+
+            // 模拟断电截断：主文件写坏
+            let main = dir.join("session_state.json");
+            fs::write(&main, "{\"version\":2,\"acti").expect("corrupt");
+
+            // 加载应回退到 .bak（即 v1）
+            let loaded = mgr.load_session().expect("load falls back to bak").expect("some");
+            assert_eq!(loaded.active_group_id, "v1");
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_dirs() {
+        let dir = temp_dir("parents");
+        let nested = dir.join("a").join("b").join("session_state.json");
+        PersistenceManager::atomic_write(&nested, b"{}").expect("write into nested parents");
+        assert!(nested.exists());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn legacy_dir_migrated_when_new_absent() {
+        let base = temp_dir("legacy-dir");
+        let legacy = base.join("legacy-config");
+        let new_dir = base.join("new-config");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+
+        // 旧目录里放一份会话与 ssh 配置
+        let session = sample_session();
+        fs::write(
+            legacy.join("session_state.json"),
+            serde_json::to_string_pretty(&session).unwrap(),
+        )
+        .unwrap();
+        fs::write(legacy.join("ssh.json"), "{\"saved_connections\":[]}").unwrap();
+
+        PersistenceManager::migrate_legacy_dir(&legacy, &new_dir);
+
+        // 整目录迁移：新目录存在、旧目录消失
+        assert!(new_dir.exists());
+        assert!(!legacy.exists());
+        assert!(new_dir.join("ssh.json").exists());
+        let mgr = PersistenceManager::with_config_dir(new_dir.clone());
+        let loaded = mgr.load_session().expect("load migrated session").expect("some");
+        assert_eq!(loaded.groups.len(), 1);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn migration_skipped_when_new_dir_exists() {
+        let base = temp_dir("no-overwrite");
+        let legacy = base.join("legacy");
+        let new_dir = base.join("new");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+        fs::write(legacy.join("marker.txt"), "old").unwrap();
+        fs::write(new_dir.join("marker.txt"), "new").unwrap();
+
+        PersistenceManager::migrate_legacy_dir(&legacy, &new_dir);
+
+        // 新目录已存在：绝不覆盖，两边原样保留
+        assert!(legacy.exists());
+        assert_eq!(
+            fs::read_to_string(new_dir.join("marker.txt")).unwrap(),
+            "new"
+        );
+        cleanup(&base);
     }
 }
