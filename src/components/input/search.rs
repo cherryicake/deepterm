@@ -355,19 +355,30 @@ impl SearchPanel {
             this.select_all(&super::SelectAll, window, cx);
         });
 
-        // 打开时定位到视口顶部之后的第一个匹配并选中
-        let visible_start = self
-            .editor
-            .read(cx)
-            .last_layout
-            .as_ref()
-            .map(|l| l.visible_range_offset.start);
-        if let Some(start) = visible_start {
-            self.matcher.update_cursor_by_offset(start);
-        } else {
-            self.matcher.current_match_ix = 0;
-        }
-        self.reveal_current_match(window, cx);
+        // 打开时定位到视口顶部之后的第一个匹配并选中。
+        // 注意：on_action_search 发生在编辑器 InputState 自身的 update 借用内，
+        // 此处不能同步 read/update 编辑器（重入借用会 panic），必须延迟执行。
+        let editor = self.editor.clone();
+        cx.defer_in(window, move |this, _window, cx| {
+            let visible_start = editor
+                .read(cx)
+                .last_layout
+                .as_ref()
+                .map(|l| l.visible_range_offset.start);
+            if let Some(start) = visible_start {
+                this.matcher.update_cursor_by_offset(start);
+            } else {
+                this.matcher.current_match_ix = 0;
+            }
+            if let Some(range) =
+                this.matcher.matched_ranges.get(this.matcher.current_match_ix).cloned()
+            {
+                editor.update(cx, |state, cx| {
+                    state.selected_range = range.clone().into();
+                    state.scroll_to(range.start, None, cx);
+                });
+            }
+        });
     }
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
@@ -396,17 +407,21 @@ impl SearchPanel {
     }
 
     /// 将编辑器选区设置到当前匹配并滚动到位（不抢焦点）。
+    ///
+    /// 统一经 defer 执行：本方法可能在编辑器自身 update 借用内被调用
+    /// （如 Cmd+F 打开路径），同步触碰编辑器会触发重入借用 panic。
     fn reveal_current_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(range) = self.matcher.matched_ranges.get(self.matcher.current_match_ix).cloned()
         else {
             return;
         };
         let editor = self.editor.clone();
-        editor.update(cx, |state, cx| {
-            state.selected_range = range.clone().into();
-            state.scroll_to(range.start, None, cx);
+        cx.defer_in(window, move |_, _window, cx| {
+            editor.update(cx, |state, cx| {
+                state.selected_range = range.clone().into();
+                state.scroll_to(range.start, None, cx);
+            });
         });
-        let _ = window;
     }
 
     /// 按 dir（+1 下一个 / -1 上一个）跳转：以编辑器光标为锚点对齐当前索引后 ±1（循环）。
