@@ -435,6 +435,17 @@ impl AppWindow {
             },
         );
         self.workspace_subscriptions.insert(entity_id, subscription);
+
+        // 注入「最后一个 tab 关闭、窗口即将移除」回调：
+        // 关窗会销毁本窗口的 AppWindow，防抖任务随之丢失，必须同步落盘。
+        let app_window_weak = cx.entity().downgrade();
+        workspace.update(cx, |ws, _cx| {
+            ws.set_on_last_tab_close(Box::new(move |cx| {
+                if let Some(app) = app_window_weak.upgrade() {
+                    app.update(cx, |app, cx| app.flush_pending_save(cx));
+                }
+            }));
+        });
     }
 
     fn tab_group_workspace(&self, group_id: &str) -> Option<Entity<Workspace>> {
@@ -590,6 +601,13 @@ impl AppWindow {
             });
         });
         self.pending_save_task = Some(task);
+    }
+
+    /// 同步落盘会话并取消防抖任务。退出/关窗前调用，
+    /// 避免防抖窗口内的最后变更丢失。
+    pub fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
+        self.pending_save_task.take();
+        self.save_session(cx);
     }
 
     fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {
@@ -1280,7 +1298,22 @@ fn main() {
                 KeyBinding::new("cmd-k", ShowSshPicker, None),
                 KeyBinding::new("cmd-n", NewWindow, None),
             ]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &Quit, cx| {
+                // 退出前同步落盘所有窗口的待保存会话：
+                // defer_save_session 是 300ms 防抖任务，若刚变更完立刻退出，
+                // 任务未触发就会丢失最后一次会话状态。
+                for handle in cx.windows() {
+                    let _ = handle.update(cx, |_view, window, cx| {
+                        if let Some(app) = window
+                            .root::<crate::AppWindow>()
+                            .and_then(|e| e)
+                        {
+                            app.update(cx, |app, cx| app.flush_pending_save(cx));
+                        }
+                    });
+                }
+                cx.quit();
+            });
 
             // `deepterm <file>...` opens files in the editor on startup.
             let open_paths: Vec<std::path::PathBuf> = std::env::args()

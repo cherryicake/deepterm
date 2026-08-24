@@ -152,6 +152,9 @@ pub struct Workspace {
     resize_drag: Option<ResizeDragState>,
     /// SSH picker for this window's workspace
     ssh_picker: Option<Entity<SshPicker>>,
+    /// 最后一个 tab 关闭、窗口即将移除前的回调（由 AppWindow 注入，
+    /// 用于同步落盘会话——防抖任务会随窗口销毁而丢失）。
+    on_last_tab_close: Option<Box<dyn Fn(&mut gpui::App)>>,
     /// 下一个传输任务序号
     next_transfer_id: usize,
     /// 文件传输任务状态
@@ -302,6 +305,7 @@ impl Workspace {
                 workspace_id: workspace_id.clone(),
                 resize_drag: None,
                 ssh_picker: None,
+                on_last_tab_close: None,
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
             };
@@ -421,6 +425,7 @@ impl Workspace {
                 workspace_id,
                 resize_drag: None,
                 ssh_picker: None,
+                on_last_tab_close: None,
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
             };
@@ -462,6 +467,19 @@ impl Workspace {
     /// 需要在 window 创建完成后调用
     pub fn set_initial_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active_tab_panel(window, cx);
+    }
+
+    /// 注入「最后一个 tab 关闭、窗口即将移除」回调（AppWindow 用它同步落盘会话）。
+    pub fn set_on_last_tab_close(&mut self, callback: Box<dyn Fn(&mut gpui::App)>) {
+        self.on_last_tab_close = Some(callback);
+    }
+
+    /// 注入后调用此辅助：关窗前同步落盘。
+    fn before_window_remove(&mut self, cx: &mut Context<Self>) {
+        if let Some(callback) = self.on_last_tab_close.take() {
+            // &mut Context 经 DerefMut 强转为 &mut App
+            callback(cx);
+        }
     }
 
     /// 设置该 workspace 使用的 SSH picker
@@ -522,6 +540,7 @@ impl Workspace {
             }
         } else {
             // 关闭当前窗口而不是退出整个应用
+            self.before_window_remove(cx);
             if let Some(wh) = cx.active_window() {
                 let _ = cx.update_window(wh, |_, window, _| {
                     window.remove_window();
@@ -2088,6 +2107,7 @@ impl Workspace {
                 self.switch_to_tab(&next_tab_id, cx);
                 self.focus_active_tab_panel(window, cx);
             } else {
+                self.before_window_remove(cx);
                 window.remove_window();
             }
         }
@@ -2392,6 +2412,17 @@ impl Workspace {
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl Drop for Workspace {
+    /// 窗口销毁时清理全局广播队列中属于本 workspace 的残留消息：
+    /// 队列以 workspace_id 过滤消费，Workspace 消失后其消息永远不会
+    /// 被取出，长期多开多关窗口会缓慢积压。
+    fn drop(&mut self) {
+        let workspace_id = self.workspace_id.as_str();
+        let mut queue = get_broadcast_queue().lock();
+        queue.retain(|(ws_id, _, _)| ws_id != workspace_id);
     }
 }
 

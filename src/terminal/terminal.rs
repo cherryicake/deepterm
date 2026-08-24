@@ -491,7 +491,7 @@ impl Terminal {
         let pty = match tty::new(&pty_options, default_bounds.into(), 0) {
             Ok(pty) => pty,
             Err(err) => {
-                eprintln!("{}: {}", pty_error_message, err);
+                log::error!("{}: {}", pty_error_message, err);
                 return cx.new(|_cx| Self::create_error_terminal());
             }
         };
@@ -516,7 +516,7 @@ impl Terminal {
         let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
             Ok(event_loop) => event_loop,
             Err(e) => {
-                eprintln!("Failed to create EventLoop: {}", e);
+                log::error!("Failed to create terminal EventLoop: {e}");
                 return cx.new(|_cx| Self::create_error_terminal());
             }
         };

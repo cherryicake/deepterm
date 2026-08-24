@@ -1566,27 +1566,6 @@ mod tests {
         let line = &unified.text[merged_starts[line_ix]..merged_starts[line_ix + 1]];
         let kw = line.find("fn ").unwrap();
         let off = merged_starts[line_ix] + kw;
-        eprintln!(
-            "DEBUG line_ix={line_ix} off={off} kw={:?} kind={:?}",
-            &line[..kw + 8],
-            unified.lines[line_ix].kind
-        );
-        eprintln!(
-            "DEBUG styles around: {:?}",
-            styles
-                .iter()
-                .filter(|(r, _)| r.end >= off.saturating_sub(400) && r.start <= off + 400)
-                .map(|(r, s)| format!("{r:?} {:?}", s.color))
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "DEBUG runs around: {:?}",
-            runs
-                .iter()
-                .filter(|(r, _)| r.end >= off.saturating_sub(400) && r.start <= off + 400)
-                .map(|(r, s)| format!("{r:?} {:?}", s.color))
-                .collect::<Vec<_>>()
-        );
         let run = styles
             .iter()
             .find(|(r, _)| r.start <= off && r.end > off)
