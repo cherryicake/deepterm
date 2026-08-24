@@ -83,6 +83,7 @@ actions!(
         MoveToNextWord,
         Escape,
         Search,
+        SearchPrevious,
     ]
 );
 
@@ -216,6 +217,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-f", Search, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
+        KeyBinding::new("shift-enter", SearchPrevious, Some(CONTEXT)),
     ]);
 }
 

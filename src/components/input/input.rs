@@ -193,15 +193,26 @@ impl RenderOnce for EditorInput {
             // div broke layout → blank editor).
             actions
                 .id("editor-input")
+                .relative()
                 .flex_1()
                 .h_full()
                 .flex_grow(1.0)
                 .overflow_x_hidden()
-                .when_some(state.search_panel.clone(), |this, panel| this.child(panel))
                 .child(
                     TextElement::new(self.state.clone())
                         .placeholder(state.placeholder.clone()),
                 )
+                // 搜索面板：VSCode 式悬浮卡片，绝对定位右上角，不占文档流。
+                .when_some(state.search_panel.clone(), |this, panel| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(6.0))
+                            .right(px(12.0))
+                            .max_w(px(560.0))
+                            .child(panel),
+                    )
+                })
                 .into_any_element()
         } else {
             let mask_toggle_el = if self.mask_toggle {
