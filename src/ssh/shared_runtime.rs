@@ -8,11 +8,23 @@ use tokio::runtime::Runtime;
 pub fn shared_ssh_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+        match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .thread_name("deepterm-ssh")
             .build()
-            .expect("Failed to create shared SSH runtime")
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::error!("Failed to create multi-thread SSH runtime: {e}, falling back to current_thread");
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap_or_else(|fallback_err| {
+                        // Last resort: panic with context (no runtime = cannot SSH)
+                        panic!("Failed to create SSH runtime (multi: {e}, current_thread: {fallback_err})")
+                    })
+            }
+        }
     })
 }

@@ -1,7 +1,7 @@
 //! 内建命令历史：记录用户提交过的完整命令行，下次输入同名命令时在补全弹窗中
 //! 召回历史整行，免去逐段补全长参数（尤其是 `/scp` 的远端路径）。
 //!
-//! 持久化范式与 `theme.json` / `ssh.json` 一致：`~/.config/deepterm/command_history.json`，
+//! 持久化范式与 `theme.json` / `ssh.json` 一致：`dirs::config_dir()/deepterm/command_history.json`，
 //! serde + 同步小 JSON 读写。记录只发生在回车提交时（低频），开销可忽略。
 
 use parking_lot::Mutex;

@@ -642,7 +642,9 @@ impl SidebarFileTree {
         item_height: Pixels,
         theme: &UiTheme,
     ) -> SmallVec<[AnyElement; 8]> {
-        let flat = self.flat_cache.as_ref().unwrap();
+        let Some(flat) = self.flat_cache.as_ref() else {
+            return SmallVec::new();
+        };
         let anchor_depth = anchor.candidate.depth;
 
         // 收集所有ancestor folders（从anchor向上追溯，不包含anchor本身）

@@ -1053,13 +1053,16 @@ impl Workspace {
         .detach();
 
         let task = cx.background_executor().spawn(async move {
-            let result = TransferManager::execute_blocking_with_cancel_and_progress_and_resolver_and_reporter(
-                request,
-                task_cancelled,
-                Some(progress),
-                Some(resolver_ref.as_ref()),
-                Some(&reporter),
-            );
+            let result = smol::unblock(move || {
+                TransferManager::execute_blocking_with_cancel_and_progress_and_resolver_and_reporter(
+                    request,
+                    task_cancelled,
+                    Some(progress),
+                    Some(resolver_ref.as_ref()),
+                    Some(&reporter),
+                )
+            })
+            .await;
             is_done_for_task.store(true, Ordering::Relaxed);
             result
         });
@@ -1178,11 +1181,11 @@ impl Workspace {
         // 更新当前活动tab下所有panel的广播状态
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
             let panels = tab_info.container.collect_panels_vec();
-            log::info!("Updating broadcast state for {} panels", panels.len());
+            log::debug!("Updating broadcast state for {} panels", panels.len());
             for panel in panels {
                 let panel_id = panel.read(cx).panel_id.to_string();
                 panel.update(cx, |p, cx| {
-                    log::info!(
+                    log::debug!(
                         "Setting panel {} broadcast_enabled to {}",
                         panel_id,
                         new_state
@@ -1299,22 +1302,24 @@ impl Workspace {
         //
         // 不能用 drain(..) 抽干整个全局队列：多 WorkSpace（多窗口）场景下，
         // 先 render 的 Workspace 会把其它 Workspace 的广播消息一并丢弃，导致丢失。
-        // 这里用 retain 仅取出本 Workspace 的条目，其余保留在队列中由各自 WorkSpace 处理。
+        // 使用 take+partition 避免 retain 在持锁期间 clone，并减少锁持有时间。
         let inputs: Vec<(String, BroadcastMsg)> = {
             let mut queue = get_broadcast_queue().lock();
             if queue.is_empty() {
                 return;
             }
-            let workspace_id = self.workspace_id.clone();
+            let all = std::mem::take(&mut *queue);
             let mut taken = Vec::new();
-            queue.retain(|(ws_id, panel_id, msg)| {
-                if ws_id == &workspace_id {
-                    taken.push((panel_id.clone(), msg.clone()));
-                    false
+            let mut remaining = Vec::with_capacity(all.len().saturating_sub(1));
+            let workspace_id = self.workspace_id.as_str();
+            for (ws_id, panel_id, msg) in all {
+                if ws_id == workspace_id {
+                    taken.push((panel_id, msg));
                 } else {
-                    true
+                    remaining.push((ws_id, panel_id, msg));
                 }
-            });
+            }
+            *queue = remaining;
             taken
         };
 
@@ -1881,12 +1886,11 @@ impl Workspace {
     /// 处理 TabBar 溢出事件
     /// 当标签页数量过多导致需要滚动时触发
     fn handle_tab_bar_overflow(&mut self, is_overflowing: bool, _cx: &mut Context<Self>) {
-        // TabBar 已经自动处理滚动，这里只记录日志
-        // 可以在这里添加其他视觉效果，如显示滚动指示器
+        // TabBar 已经自动处理滚动，仅 debug 级别记录
         if is_overflowing {
-            eprintln!("[WORKSPACE] TabBar is overflowing!");
+            log::debug!("[WORKSPACE] TabBar is overflowing");
         } else {
-            eprintln!("[WORKSPACE] TabBar overflow resolved");
+            log::debug!("[WORKSPACE] TabBar overflow resolved");
         }
     }
 
@@ -1937,10 +1941,11 @@ impl Workspace {
     /// 创建本地终端Tab
     pub fn create_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let icon = Some(crate::ssh::platform::detect_local_os().icon());
+        let workspace_id = self.workspace_id.clone();
         let panel = cx.new(|cx| {
             Panel::with_terminal(
                 format!("panel-{}", self.next_panel_id),
-                "group-0",
+                workspace_id,
                 Some(format!("tab-{}", self.next_tab_id).into()),
                 None,
                 cx,
@@ -1963,10 +1968,11 @@ impl Workspace {
         } else {
             Some(crate::ssh::platform::detect_local_os().icon())
         };
+        let workspace_id = self.workspace_id.clone();
         let panel = cx.new(|cx| {
             Panel::with_terminal_command(
                 format!("panel-{}", self.next_panel_id),
-                "group-0",
+                workspace_id,
                 Some(format!("tab-{}", self.next_tab_id).into()),
                 None,
                 command,
@@ -1997,10 +2003,11 @@ impl Workspace {
                 let os = guess_os_from_text(config.nickname.as_deref().unwrap_or(&config.host));
                 (os != RemoteOS::Unknown).then(|| os.icon())
             });
+        let workspace_id = self.workspace_id.clone();
         let panel = cx.new(|cx| {
             Panel::with_ssh_terminal(
                 format!("panel-{}", self.next_panel_id),
-                "group-0",
+                workspace_id,
                 Some(format!("tab-{}", self.next_tab_id).into()),
                 Some(label.clone().into()),
                 config,
@@ -2157,10 +2164,11 @@ impl Workspace {
         let state = terminal_view.read(cx).session_state(cx);
         match state {
             TerminalSessionState::Ssh { config, remote_cwd } => {
+                let workspace_id = self.workspace_id.clone();
                 let panel = cx.new(|cx| {
                     Panel::with_ssh_terminal(
                         format!("panel-{}", self.next_panel_id),
-                        "group-0",
+                        workspace_id,
                         Some(format!("tab-{}", self.next_tab_id).into()),
                         Some(config.display_name().into()),
                         &config,
@@ -2175,10 +2183,11 @@ impl Workspace {
                 if let Some(_cmd) = command {
                     self.create_local_terminal_with_command(&_cmd, &args, window, cx);
                 } else {
+                    let workspace_id = self.workspace_id.clone();
                     let panel = cx.new(|cx| {
                         Panel::with_terminal_working_directory(
                             format!("panel-{}", self.next_panel_id),
-                            "group-0",
+                            workspace_id,
                             Some(format!("tab-{}", self.next_tab_id).into()),
                             None,
                             cwd.map(std::path::PathBuf::from),

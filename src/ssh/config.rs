@@ -440,7 +440,7 @@ impl SshGlobalConfig {
     }
 
     /// 从配置文件加载
-    /// 配置文件路径: ~/.config/deepterm/ssh.json
+    /// 优先 dirs::config_dir()/deepterm/ssh.json，兼容旧路径 ~/.config/deepterm/ssh.json
     /// 如果文件不存在或解析失败，返回默认配置（不自动创建文件）
     pub fn load() -> Self {
         let config_path = match Self::config_path() {
@@ -448,13 +448,50 @@ impl SshGlobalConfig {
             None => return Self::new(),
         };
 
+        // 优先新路径，若不存在则尝试旧路径（自动迁移）
         let content = match std::fs::read_to_string(&config_path) {
-            Ok(content) => content,
-            Err(_) => return Self::new(),
+            Ok(c) => c,
+            Err(_) => {
+                if let Some(legacy) = Self::legacy_config_path() {
+                    if legacy != config_path {
+                        if let Ok(legacy_content) = std::fs::read_to_string(&legacy) {
+                            if let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content) {
+                                log::info!(
+                                    "Migrating SSH config {} -> {}",
+                                    legacy.display(),
+                                    config_path.display()
+                                );
+                                // 先完成凭据迁移（内联密码 → keychain 引用），
+                                // 否则下方 save() 会被明文阻断，导致每次启动重复尝试迁移
+                                if let Err(err) = cfg.migrate_keychain_refs() {
+                                    log::warn!("SSH 凭据迁移失败: {}", err);
+                                }
+                                if let Err(e) = cfg.save() {
+                                    log::warn!("Failed to migrate SSH config to new location: {e}");
+                                }
+                                return cfg;
+                            }
+                        }
+                    }
+                }
+                return Self::new();
+            }
         };
 
         let mut config = serde_json::from_str(&content)
             .ok()
+            .or_else(|| {
+                // 主文件损坏：尝试 .bak 恢复，避免静默清空 host 列表
+                let bak = config_path.with_extension("json.bak");
+                if let Ok(bak_content) = std::fs::read_to_string(&bak) {
+                    if let Ok(cfg) = serde_json::from_str::<Self>(&bak_content) {
+                        log::info!("Recovered SSH config from backup {}", bak.display());
+                        return Some(cfg);
+                    }
+                }
+                log::warn!("Failed to parse {} and no valid .bak, using empty config", config_path.display());
+                None
+            })
             .unwrap_or_else(Self::new);
         if let Err(err) = config.migrate_keychain_refs() {
             log::warn!("SSH 凭据迁移失败: {}", err);
@@ -462,13 +499,27 @@ impl SshGlobalConfig {
         config
     }
 
-    /// 加载配置，如果不存在则创建默认配置文件
+    /// 加载配置，如果不存在则创建默认配置文件（兼容旧路径迁移）
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
         let mut config = match std::fs::read_to_string(&config_path) {
             Ok(content) => serde_json::from_str(&content)?,
             Err(_) => {
+                // 新路径不存在，尝试旧路径迁移
+                if let Some(legacy) = Self::legacy_config_path() {
+                    if legacy != config_path {
+                        if let Ok(legacy_content) = std::fs::read_to_string(&legacy) {
+                            if let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content) {
+                                log::info!("Migrating SSH config (load_or_create) {} -> {}", legacy.display(), config_path.display());
+                                let _ = cfg.migrate_keychain_refs();
+                                // 保存到新路径
+                                let _ = cfg.save();
+                                return Ok(cfg);
+                            }
+                        }
+                    }
+                }
                 let default_config = Self::new();
                 default_config.save()?;
                 default_config
@@ -482,8 +533,20 @@ impl SshGlobalConfig {
     }
 
     /// 保存配置到文件
-    /// 配置文件路径: ~/.config/deepterm/ssh.json
+    /// 配置文件路径: dirs::config_dir()/deepterm/ssh.json，原子写入 + 明文阻断
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // 阻断明文密码/密钥落盘：若仍有旧版内联凭据，拒绝保存并提示迁移
+        for conn in &self.saved_connections {
+            match &conn.auth_method {
+                AuthMethod::Password { .. } => {
+                    return Err("拒绝保存：存在明文密码，请先完成 Keychain 迁移".into());
+                }
+                AuthMethod::PrivateKey { passphrase: Some(_), .. } => {
+                    return Err("拒绝保存：存在明文私钥口令，请先完成 Keychain 迁移".into());
+                }
+                _ => {}
+            }
+        }
         let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
         if let Some(parent) = config_path.parent() {
@@ -491,12 +554,33 @@ impl SshGlobalConfig {
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        // 原子写入，避免截断
+        let tmp = config_path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, content)?;
+        if config_path.exists() {
+            let bak = config_path.with_extension("json.bak");
+            let _ = std::fs::copy(&config_path, &bak);
+        }
+        std::fs::rename(&tmp, &config_path)?;
+        // 限制权限 600，避免同机用户读取
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
-    /// 获取配置文件路径
+    /// 获取配置文件路径：优先 dirs::config_dir，回退 ~/.config
     fn config_path() -> Option<std::path::PathBuf> {
+        if let Some(dir) = dirs::config_dir() {
+            return Some(dir.join("deepterm").join("ssh.json"));
+        }
+        let home = dirs::home_dir()?;
+        Some(home.join(".config").join("deepterm").join("ssh.json"))
+    }
+
+    fn legacy_config_path() -> Option<std::path::PathBuf> {
         let home = dirs::home_dir()?;
         Some(home.join(".config").join("deepterm").join("ssh.json"))
     }

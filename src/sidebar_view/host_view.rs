@@ -13,7 +13,7 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::hosts_view::{
-    ConnectHost, CopyHostAddress, DeleteHost, EditHost, load_hosts_from_config,
+    ConnectHost, CopyHostAddress, DeleteHost, EditHost, Host, load_hosts_from_config,
 };
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
@@ -54,6 +54,7 @@ impl HostView {
                     if let InputEvent::Change = event {
                         let text = this.search_input.read(cx).value().to_string();
                         this.search_query = text.to_lowercase().into();
+                        this.prune_selection_to_visible_hosts();
                         cx.notify();
                     }
                 },
@@ -98,6 +99,39 @@ impl HostView {
         F: Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static,
     {
         self.on_edit_host = Some(Rc::new(callback));
+    }
+
+    /// 判断主机是否匹配搜索关键字（name/hostname/username/auth_label）。
+    fn host_matches_query(host: &Host, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        host.name.to_lowercase().contains(query)
+            || host
+                .hostname
+                .as_ref()
+                .is_some_and(|h| h.to_lowercase().contains(query))
+            || host
+                .username
+                .as_ref()
+                .is_some_and(|u| u.to_lowercase().contains(query))
+            || host
+                .auth_label
+                .as_ref()
+                .is_some_and(|a| a.to_lowercase().contains(query))
+    }
+
+    /// 将选中集收敛到当前搜索过滤后仍可见的主机，
+    /// 避免搜索前选中的（现已隐藏）主机被带入批量连接/删除等操作。
+    fn prune_selection_to_visible_hosts(&mut self) {
+        let query = self.search_query.as_ref().to_string();
+        let (hosts, _) = load_hosts_from_config();
+        let visible: HashSet<SharedString> = hosts
+            .iter()
+            .filter(|host| Self::host_matches_query(host, &query))
+            .map(|host| host.id.clone())
+            .collect();
+        self.selected_ids.retain(|id| visible.contains(id));
     }
 
     fn open_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -288,42 +322,24 @@ impl Render for HostView {
             )
             .child(EditorInput::new(&self.search_input).transparent());
 
-        // 根据搜索查询过滤 hosts（复用 hosts_view.rs 的过滤逻辑）
+        // 根据搜索查询过滤 hosts
         let query = self.search_query.as_ref();
-        let filtered_hosts: Vec<_> = if query.is_empty() {
-            hosts.iter().collect()
-        } else {
-            hosts
-                .iter()
-                .filter(|host| {
-                    host.name.to_lowercase().contains(query)
-                        || host
-                            .hostname
-                            .as_ref()
-                            .map_or(false, |h| h.to_lowercase().contains(query))
-                        || host
-                            .username
-                            .as_ref()
-                            .map_or(false, |u| u.to_lowercase().contains(query))
-                        || host
-                            .auth_label
-                            .as_ref()
-                            .map_or(false, |a| a.to_lowercase().contains(query))
-                })
-                .collect()
-        };
+        let filtered_hosts: Vec<_> = hosts
+            .iter()
+            .filter(|host| Self::host_matches_query(host, query))
+            .collect();
 
         // Host 列表
         let mut host_list = div().w_full().flex().flex_col();
 
-        for (index, host) in filtered_hosts.iter().enumerate() {
+        for host in filtered_hosts.iter() {
             let icon_color = host.icon_color.to_hsla(cx);
             let host_id = host.id.to_string();
             let is_selected = self.selected_ids.iter().any(|s| s.as_ref() == host_id);
             let host_config = configs.iter().find(|c| c.id() == host_id).cloned();
 
             let row = div()
-                .id(("host-item", index))
+                .id(SharedString::from(format!("host-item-{host_id}")))
                 .w_full()
                 .h(px(52.0))
                 .px(px(10.0))
@@ -409,31 +425,32 @@ impl Render for HostView {
                     let host_config = host_config.clone();
                     let id = host_id.clone();
                     move |this, event: &gpui::ClickEvent, window, cx| {
-                        let is_cmd_pressed = event.modifiers().secondary();
-                        if event.click_count() == 1 {
-                            if is_cmd_pressed {
-                                let id_shared: SharedString = id.clone().into();
-                                if this.selected_ids.contains(&id_shared) {
-                                    this.selected_ids.remove(&id_shared);
-                                } else {
-                                    this.selected_ids.insert(id_shared);
-                                }
+                        // Cmd/Ctrl+点击：只做选中切换，不区分 click_count
+                        // （快速二次点击会被系统计为双击，若走双击分支会误触发连接并清空多选），
+                        // 也不触发 on_select 导航回调。
+                        if event.modifiers().secondary() {
+                            let id_shared: SharedString = id.clone().into();
+                            if this.selected_ids.contains(&id_shared) {
+                                this.selected_ids.remove(&id_shared);
                             } else {
-                                this.selected_ids.clear();
-                                this.selected_ids.insert(id.clone().into());
+                                this.selected_ids.insert(id_shared);
                             }
+                            cx.notify();
+                            return;
+                        }
+
+                        let is_double_click = event.click_count() >= 2;
+                        this.selected_ids.clear();
+                        this.selected_ids.insert(id.clone().into());
+                        cx.notify();
+
+                        if !is_double_click {
                             if let Some(ref f) = on_select {
                                 f(&id, window, cx);
                             }
-                            cx.notify();
-                        } else if event.click_count() == 2 {
-                            this.selected_ids.clear();
-                            this.selected_ids.insert(id.clone().into());
-                            cx.notify();
-                            if let Some(ref config) = host_config {
-                                if let Some(ref f) = on_connect {
-                                    f(config, window, cx);
-                                }
+                        } else if let Some(ref config) = host_config {
+                            if let Some(ref f) = on_connect {
+                                f(config, window, cx);
                             }
                         }
                     }
@@ -512,9 +529,13 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &ConnectHost, window, cx| {
-                    let ids: Vec<_> = this.selected_ids.iter().cloned().collect();
-                    for id in ids {
-                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
+                    // 按配置文件顺序连接，保证多选时打开终端的顺序确定
+                    for config in configs_rc.iter() {
+                        if this
+                            .selected_ids
+                            .iter()
+                            .any(|id| id.as_ref() == config.id())
+                        {
                             if let Some(ref f) = on_connect_action {
                                 f(config, window, cx);
                             }
@@ -575,7 +596,11 @@ impl Render for HostView {
                         "确定要删除该主机吗？此操作不可撤销。".to_string()
                     }
                 } else {
-                    format!("确定要删除选中的 {} 个主机吗？此操作不可撤销。", count)
+                    format!(
+                        "确定要删除选中的 {} 个主机（{}）吗？此操作不可撤销。",
+                        count,
+                        names.join("、")
+                    )
                 };
 
                 let weak = cx.weak_entity();

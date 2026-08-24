@@ -134,7 +134,7 @@ struct WatchRefs {
 /// independently; if any subscriber requests recursive mode, the OS watch is configured
 /// recursively, otherwise non-recursively.
 pub struct FsWatcher {
-    watcher: Arc<Mutex<RecommendedWatcher>>,
+    watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
     watched_paths: Arc<Mutex<HashMap<PathBuf, WatchRefs>>>,
     _task: gpui::Task<()>,
 }
@@ -154,10 +154,10 @@ impl FsWatcher {
                 },
                 notify::Config::default().with_poll_interval(Duration::from_millis(500)),
             ) {
-                Ok(w) => w,
+                Ok(w) => Some(w),
                 Err(e) => {
-                    log::error!("Failed to create file watcher: {e}");
-                    panic!("Failed to create file watcher: {e}");
+                    log::error!("Failed to create file watcher: {e} — file watching disabled");
+                    None
                 }
             },
         ));
@@ -206,14 +206,18 @@ impl FsWatcher {
             }
         };
         if need_start || need_upgrade {
-            let mut watcher = self.watcher.lock();
-            if need_upgrade {
-                if let Err(e) = watcher.unwatch(&path) {
-                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+            let mut guard = self.watcher.lock();
+            if let Some(watcher) = guard.as_mut() {
+                if need_upgrade {
+                    if let Err(e) = watcher.unwatch(&path) {
+                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+                    }
                 }
-            }
-            if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
-                log::warn!("Failed to watch {}: {e}", path.display());
+                if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
+                    log::warn!("Failed to watch {}: {e}", path.display());
+                }
+            } else {
+                log::warn!("File watcher disabled, ignoring watch for {}", path.display());
             }
         }
         cx.notify();
@@ -233,9 +237,13 @@ impl FsWatcher {
             entry.non_recursive == 1 && entry.recursive == 0
         };
         if need_start {
-            let mut watcher = self.watcher.lock();
-            if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                log::warn!("Failed to watch {}: {e}", path.display());
+            let mut guard = self.watcher.lock();
+            if let Some(watcher) = guard.as_mut() {
+                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                    log::warn!("Failed to watch {}: {e}", path.display());
+                }
+            } else {
+                log::warn!("File watcher disabled, ignoring watch for {}", path.display());
             }
         }
         cx.notify();
@@ -269,13 +277,15 @@ impl FsWatcher {
             }
         };
         if need_stop || need_downgrade {
-            let mut watcher = self.watcher.lock();
-            if let Err(e) = watcher.unwatch(&path) {
-                log::warn!("Failed to unwatch {}: {e}", path.display());
-            }
-            if need_downgrade {
-                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+            let mut guard = self.watcher.lock();
+            if let Some(watcher) = guard.as_mut() {
+                if let Err(e) = watcher.unwatch(&path) {
+                    log::warn!("Failed to unwatch {}: {e}", path.display());
+                }
+                if need_downgrade {
+                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+                    }
                 }
             }
         }
@@ -313,13 +323,15 @@ impl FsWatcher {
             }
         };
         if need_stop || need_downgrade {
-            let mut watcher = self.watcher.lock();
-            if let Err(e) = watcher.unwatch(&path) {
-                log::warn!("Failed to unwatch {}: {e}", path.display());
-            }
-            if need_downgrade {
-                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+            let mut guard = self.watcher.lock();
+            if let Some(watcher) = guard.as_mut() {
+                if let Err(e) = watcher.unwatch(&path) {
+                    log::warn!("Failed to unwatch {}: {e}", path.display());
+                }
+                if need_downgrade {
+                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
+                    }
                 }
             }
         }

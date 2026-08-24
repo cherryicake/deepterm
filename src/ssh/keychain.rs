@@ -189,23 +189,52 @@ impl KeychainStore {
 
     pub fn load() -> Option<Self> {
         let path = Self::config_path()?;
-        match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content)
-                .ok()
-                .or_else(|| Some(Self::new())),
-            Err(_) => Some(Self::new()),
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    log::warn!("Failed to parse {}: {e}, trying .bak", path.display());
+                    Self::load_from_bak(&path)
+                }
+            },
+            Err(_) => {
+                // 新路径不存在：尝试旧路径并自动迁移（仅当新文件不存在，不覆盖）
+                if let Some(legacy) = Self::legacy_config_path() {
+                    if legacy != path {
+                        if let Ok(content) = std::fs::read_to_string(&legacy) {
+                            if let Ok(store) = serde_json::from_str::<Self>(&content) {
+                                log::info!(
+                                    "Migrating keychain {} -> {}",
+                                    legacy.display(),
+                                    path.display()
+                                );
+                                if let Err(e) = store.save() {
+                                    log::warn!("Failed to migrate keychain: {e}");
+                                }
+                                return Some(store);
+                            }
+                        }
+                    }
+                }
+                Some(Self::new())
+            }
         }
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::config_path().ok_or_else(|| anyhow!("无法定位 keychain 配置路径"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// 从同名 .bak 恢复；均失败则返回空库（避免返回 None 破坏调用方）
+    fn load_from_bak(path: &Path) -> Option<Self> {
+        let bak = path.with_extension("json.bak");
+        if let Ok(content) = std::fs::read_to_string(&bak) {
+            if let Ok(store) = serde_json::from_str::<Self>(&content) {
+                log::info!("Recovered keychain from backup {}", bak.display());
+                return Some(store);
+            }
         }
+        Some(Self::new())
+    }
 
-        let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
-        Ok(())
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.persist()
     }
 
     pub fn identities(&self) -> Vec<&KeychainItem> {
@@ -424,8 +453,40 @@ impl KeychainStore {
     }
 
     fn config_path() -> Option<PathBuf> {
+        // 与 ssh.json / theme.json 统一：优先系统标准 config 目录
+        if let Some(dir) = dirs::config_dir() {
+            return Some(dir.join("deepterm").join("keychain.json"));
+        }
         let home = dirs::home_dir()?;
         Some(home.join(".config").join("deepterm").join("keychain.json"))
+    }
+
+    /// 旧版路径（~/.config/deepterm/keychain.json），用于自动迁移
+    fn legacy_config_path() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(home.join(".config").join("deepterm").join("keychain.json"))
+    }
+
+    /// 原子写入 + 权限限制，与 ssh.json 保持一致
+    fn persist(&self) -> anyhow::Result<()> {
+        let path = Self::config_path()
+            .ok_or_else(|| anyhow!("无法确定 keychain 配置路径"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, content)?;
+        if path.exists() {
+            let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+        }
+        std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 }
 

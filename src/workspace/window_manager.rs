@@ -31,7 +31,7 @@ impl WindowManager {
         let bounds =
             gpui::Bounds::centered(None, gpui::size(gpui::px(1400.0), gpui::px(900.0)), cx);
 
-        cx.open_window(
+        if let Err(e) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitleBar::title_bar_options()),
@@ -63,7 +63,8 @@ impl WindowManager {
                 });
                 app_window
             },
-        )
-        .unwrap();
+        ) {
+            log::error!("Failed to open DeepTerm window: {e:?}");
+        }
     }
 }

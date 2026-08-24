@@ -86,6 +86,7 @@ pub struct AppWindow {
     keychain_view: Entity<KeychainSidebarView>,
     persistence: PersistenceManager,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    pending_save_task: Option<gpui::Task<()>>,
     _sidebar_subscription: Option<Subscription>,
     /// 标题栏 padding 动画状态：侧边栏 + 编辑器共同驱动（render_main_area 内检测翻转后更新）
     title_pad_epoch: u32,
@@ -327,6 +328,7 @@ impl AppWindow {
             keychain_view,
             persistence,
             workspace_subscriptions: HashMap::new(),
+            pending_save_task: None,
             _sidebar_subscription: Some(sidebar_subscription),
             title_pad_epoch: 0,
             title_pad_start: 0.0,
@@ -575,16 +577,19 @@ impl AppWindow {
         cx.notify();
     }
 
-    fn defer_save_session(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn defer_save_session(&mut self, cx: &mut Context<Self>) {
+        // 去抖：300ms 内多次触发仅落盘一次，旧任务随 Task drop 自动取消
+        let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(0))
+                .timer(Duration::from_millis(300))
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // 清理句柄，避免 удерживать Task
+                this.pending_save_task = None;
                 this.save_session(cx);
             });
-        })
-        .detach();
+        });
+        self.pending_save_task = Some(task);
     }
 
     fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {
@@ -1241,8 +1246,13 @@ impl Render for AppWindow {
 }
 
 fn main() {
+    let default_level = if cfg!(debug_assertions) {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
     env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
+        .filter_level(default_level)
         .filter_module("russh", log::LevelFilter::Warn)
         .init();
 

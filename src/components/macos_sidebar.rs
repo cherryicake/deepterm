@@ -518,15 +518,19 @@ impl MacosSidebar {
             Option<PathBuf>,
             Option<SshConnectionConfig>,
         ) = if !is_local {
-            let config = ssh_config.clone().unwrap();
-            let p = path
-                .as_ref()
-                .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
-            (
-                Arc::new(RemoteFileSystem::new(config)),
-                p,
-                ssh_config.clone(),
-            )
+            if let Some(config) = ssh_config.clone() {
+                let p = path
+                    .as_ref()
+                    .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
+                (
+                    Arc::new(RemoteFileSystem::new(config)),
+                    p,
+                    ssh_config.clone(),
+                )
+            } else {
+                log::error!("非本地文件树但缺少 SSH 配置，退化为本地");
+                (Arc::new(LocalFileSystem), path.clone(), None)
+            }
         } else {
             (Arc::new(LocalFileSystem), path.clone(), None)
         };
