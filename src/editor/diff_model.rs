@@ -298,6 +298,266 @@ pub(crate) fn build_unified_with_hunks(
     UnifiedSource { text, lines }
 }
 
+/// One collapsed (hidden) region of unchanged lines in the unified view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeparatorRow {
+    /// Merged row index of the placeholder line in the collapsed text.
+    pub merged_row: u32,
+    /// Expansion key: new-side start line of the hidden region
+    /// (deterministic across recomputes).
+    pub id: u32,
+    /// Number of unchanged rows hidden between the two context strips.
+    pub hidden_lines: u32,
+}
+
+/// Collapsed unified view: merged text with unchanged gaps reduced to
+/// `CONTEXT_LINES` context strips around each hunk plus one placeholder
+/// row per collapsed region (GitHub-style expandable separators).
+pub(crate) struct CollapsedUnified {
+    pub source: UnifiedSource,
+    pub separators: Vec<SeparatorRow>,
+    /// Merged row of each hunk's first changed line (for hunk navigation
+    /// and initial scroll positioning).
+    pub hunk_rows: Vec<u32>,
+}
+
+/// Like [`build_unified_with_hunks`], but collapses unchanged regions.
+/// Regions listed in `expanded` are rendered in full; every other gap
+/// larger than `2 * CONTEXT_LINES` becomes a single placeholder row
+/// flanked by `CONTEXT_LINES`-line context strips.
+pub(crate) fn build_unified_collapsed(
+    old_text: &str,
+    new_text: &str,
+    hunks: &[DiffHunk],
+    expanded: &std::collections::HashSet<u32>,
+) -> CollapsedUnified {
+    let old_starts = line_starts(old_text);
+    let new_starts = line_starts(new_text);
+    let old_line_count = line_count(old_text, &old_starts);
+    let new_line_count = line_count(new_text, &new_starts);
+
+    let mut text = String::new();
+    let mut lines = Vec::new();
+    let mut separators = Vec::new();
+    let mut hunk_rows = Vec::with_capacity(hunks.len());
+
+    // Push context rows [from..to) from the new side. Unchanged regions have
+    // equal line counts on both sides; `old_from` is the corresponding old row.
+    fn push_context(
+        text: &mut String,
+        lines: &mut Vec<UnifiedLine>,
+        new_text: &str,
+        new_starts: &[usize],
+        new_from: u32,
+        new_to: u32,
+        old_from: u32,
+    ) {
+        for row in new_from..new_to {
+            let range = line_range(new_text, new_starts, row);
+            text.push_str(&new_text[range.clone()]);
+            let start = text.len() - range.len();
+            text.push('\n');
+            lines.push(UnifiedLine {
+                kind: LineKind::Context,
+                old_lineno: Some(old_from + (row - new_from)),
+                new_lineno: Some(row),
+                merged_range: start..text.len() - 1,
+                word_ranges: Vec::new(),
+            });
+        }
+    }
+
+    // Push a single empty placeholder row representing a collapsed region.
+    fn push_separator(
+        text: &mut String,
+        lines: &mut Vec<UnifiedLine>,
+        separators: &mut Vec<SeparatorRow>,
+        id: u32,
+        hidden_lines: u32,
+    ) {
+        let merged_row = lines.len() as u32;
+        let start = text.len();
+        text.push('\n');
+        lines.push(UnifiedLine {
+            kind: LineKind::Context,
+            old_lineno: None,
+            new_lineno: None,
+            merged_range: start..start,
+            word_ranges: Vec::new(),
+        });
+        separators.push(SeparatorRow {
+            merged_row,
+            id,
+            hidden_lines,
+        });
+    }
+
+    // Push a gap of identical lines, collapsing it when it exceeds the
+    // context budget and has not been expanded by the user.
+    fn push_gap(
+        text: &mut String,
+        lines: &mut Vec<UnifiedLine>,
+        separators: &mut Vec<SeparatorRow>,
+        new_text: &str,
+        new_starts: &[usize],
+        new_from: u32,
+        new_to: u32,
+        old_from: u32,
+        leading: bool,
+        expanded: &std::collections::HashSet<u32>,
+    ) {
+        let gap_len = new_to.saturating_sub(new_from);
+        if gap_len == 0 {
+            return;
+        }
+        if gap_len <= 2 * CONTEXT_LINES {
+            push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+            return;
+        }
+        if leading {
+            // Head/tail-of-file or post-hunk strip: visible C rows sit at the
+            // START of the gap when it precedes a hunk...
+            let visible = CONTEXT_LINES.min(gap_len);
+            let hidden = gap_len - visible;
+            let hidden_id = new_from; // hidden region starts at gap head
+            if expanded.contains(&hidden_id) {
+                push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+                return;
+            }
+            push_context(
+                text,
+                lines,
+                new_text,
+                new_starts,
+                new_from + hidden,
+                new_to,
+                old_from + hidden,
+            );
+            push_separator(text, lines, separators, hidden_id, hidden);
+        } else {
+            // ...or at the END of the gap when it follows a hunk.
+            let visible = CONTEXT_LINES.min(gap_len);
+            let hidden = gap_len - visible;
+            let hidden_id = new_from; // hidden region starts at gap head
+            if expanded.contains(&hidden_id) {
+                push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+                return;
+            }
+            push_separator(text, lines, separators, hidden_id, hidden);
+            push_context(
+                text,
+                lines,
+                new_text,
+                new_starts,
+                new_from + hidden,
+                new_to,
+                old_from + hidden,
+            );
+        }
+    }
+
+    let mut old_cursor = 0u32;
+    let mut new_cursor = 0u32;
+    for hunk in hunks {
+        // Head gap before the first hunk: keep only trailing C rows.
+        let gap_new = hunk.new_rows.start.saturating_sub(new_cursor);
+        let is_first = old_cursor == 0 && new_cursor == 0;
+        if is_first && gap_new > 0 {
+            let visible = CONTEXT_LINES.min(gap_new);
+            let hidden = gap_new - visible;
+            let hidden_id = new_cursor;
+            if hidden == 0 || expanded.contains(&hidden_id) {
+                push_context(
+                    &mut text,
+                    &mut lines,
+                    new_text,
+                    &new_starts,
+                    new_cursor,
+                    hunk.new_rows.start,
+                    old_cursor,
+                );
+            } else {
+                push_separator(&mut text, &mut lines, &mut separators, hidden_id, hidden);
+                push_context(
+                    &mut text,
+                    &mut lines,
+                    new_text,
+                    &new_starts,
+                    hunk.new_rows.start - visible,
+                    hunk.new_rows.start,
+                    hunk.old_rows.start - visible,
+                );
+            }
+        } else if gap_new > 0 {
+            // Between hunks: C trailing + separator + C leading.
+            push_gap(
+                &mut text,
+                &mut lines,
+                &mut separators,
+                new_text,
+                &new_starts,
+                new_cursor,
+                hunk.new_rows.start,
+                old_cursor,
+                false,
+                expanded,
+            );
+        }
+
+        hunk_rows.push(lines.len() as u32);
+        for row in hunk.old_rows.start..hunk.old_rows.end {
+            let range = line_range(old_text, &old_starts, row);
+            text.push_str(&old_text[range.clone()]);
+            let start = text.len() - range.len();
+            text.push('\n');
+            lines.push(UnifiedLine {
+                kind: LineKind::Del,
+                old_lineno: Some(row),
+                new_lineno: None,
+                merged_range: start..text.len() - 1,
+                word_ranges: hunk.old_word_ranges.iter().filter(|r| r.start < range.end && r.end > range.start).map(|r| { let s = r.start.max(range.start) - range.start + start; let e = r.end.min(range.end) - range.start + start; s..e }).collect(),
+            });
+        }
+        for row in hunk.new_rows.start..hunk.new_rows.end {
+            let range = line_range(new_text, &new_starts, row);
+            text.push_str(&new_text[range.clone()]);
+            let start = text.len() - range.len();
+            text.push('\n');
+            lines.push(UnifiedLine {
+                kind: LineKind::Add,
+                old_lineno: None,
+                new_lineno: Some(row),
+                merged_range: start..text.len() - 1,
+                word_ranges: hunk.new_word_ranges.iter().filter(|r| r.start < range.end && r.end > range.start).map(|r| { let s = r.start.max(range.start) - range.start + start; let e = r.end.min(range.end) - range.start + start; s..e }).collect(),
+            });
+        }
+        old_cursor = hunk.old_rows.end;
+        new_cursor = hunk.new_rows.end;
+    }
+
+    // Tail gap after the last hunk: keep only leading C rows.
+    if new_cursor < new_line_count {
+        push_gap(
+            &mut text,
+            &mut lines,
+            &mut separators,
+            new_text,
+            &new_starts,
+            new_cursor,
+            new_line_count,
+            old_cursor,
+            true,
+            expanded,
+        );
+    }
+
+    CollapsedUnified {
+        source: UnifiedSource { text, lines },
+        separators,
+        hunk_rows,
+    }
+}
+
 /// Byte offsets of every line start in a text, plus a sentinel past the end
 /// so `line_range` works for the last line.
 pub(crate) fn line_starts(text: &str) -> Vec<usize> {
@@ -779,5 +1039,94 @@ mod tests {
         assert_eq!(hunks[0].old_rows, 1..1);
         assert_eq!(hunks[0].new_rows, 1..2);
         assert!(hunks[0].old_word_ranges.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod collapsed_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// old: 20 行相同 + 改动 + 20 行相同；new 同结构
+    fn sample_texts() -> (String, String) {
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..20 {
+            old.push_str(&format!("ctx{i}\n"));
+            new.push_str(&format!("ctx{i}\n"));
+        }
+        old.push_str("old line\n");
+        new.push_str("new line A\n");
+        new.push_str("new line B\n");
+        for i in 20..40 {
+            old.push_str(&format!("tail{i}\n"));
+            new.push_str(&format!("tail{i}\n"));
+        }
+        (old, new)
+    }
+
+    #[test]
+    fn small_gap_fully_visible() {
+        // gap = 1 行，远小于 2*CONTEXT_LINES → 无分隔行
+        let hunks = compute_hunks("a\nb\nc\n", "a\nX\nc\n");
+        let out = build_unified_collapsed("a\nb\nc\n", "a\nX\nc\n", &hunks, &HashSet::new());
+        assert!(out.separators.is_empty());
+    }
+
+    #[test]
+    fn large_gap_collapsed_with_placeholder() {
+        let (old, new) = sample_texts();
+        let hunks = compute_hunks(&old, &new);
+        assert_eq!(hunks.len(), 1);
+        let out = build_unified_collapsed(&old, &new, &hunks, &HashSet::new());
+        // 头部 20 行 → 分隔(16) + 尾部 4 行上下文；尾部同理
+        assert_eq!(out.separators.len(), 2);
+        assert_eq!(out.separators[0].id, 0); // 文件头隐藏区从第 0 行开始
+        assert_eq!(out.separators[0].hidden_lines, 20 - CONTEXT_LINES);
+        assert_eq!(out.separators[1].hidden_lines, 20 - CONTEXT_LINES);
+        // 占位行是空行（merged_range 为空）
+        for sep in &out.separators {
+            let line = &out.source.lines[sep.merged_row as usize];
+            assert_eq!(line.merged_range.start, line.merged_range.end);
+            assert!(line.old_lineno.is_none() && line.new_lineno.is_none());
+        }
+        // 总行数 = 全量行数 - 两个隐藏区 + 2 个占位行
+        let full = build_unified_with_hunks(&old, &new, &hunks);
+        assert_eq!(
+            out.source.lines.len(),
+            full.lines.len() - 2 * (20 - CONTEXT_LINES as usize) + 2
+        );
+    }
+
+    #[test]
+    fn expanded_region_rendered_in_full() {
+        let (old, new) = sample_texts();
+        let hunks = compute_hunks(&old, &new);
+        let mut expanded = HashSet::new();
+        expanded.insert(0u32); // 展开头部分隔区
+        let out = build_unified_collapsed(&old, &new, &hunks, &expanded);
+        assert_eq!(out.separators.len(), 1); // 只剩尾部
+        assert_eq!(out.separators[0].id, 22); // 尾部隐藏区从 new 第 23 行(索引22，即 hunk 结束处)开始
+    }
+
+    #[test]
+    fn hunk_rows_point_at_changed_lines() {
+        let (old, new) = sample_texts();
+        let hunks = compute_hunks(&old, &new);
+        let out = build_unified_collapsed(&old, &new, &hunks, &HashSet::new());
+        assert_eq!(out.hunk_rows.len(), hunks.len());
+        // hunk 首行应是 Del 或 Add（变更行本身）
+        let line = &out.source.lines[out.hunk_rows[0] as usize];
+        assert!(matches!(line.kind, LineKind::Del | LineKind::Add));
+    }
+
+    #[test]
+    fn empty_diff_no_separators() {
+        let text = "same\nlines\n";
+        let out = build_unified_collapsed(text, text, &[], &HashSet::new());
+        // 无 hunk：尾部 gap 走 push_gap，2 行 < 2*C → 全可见
+        assert!(out.separators.is_empty());
+        assert!(out.hunk_rows.is_empty());
+        assert_eq!(out.source.lines.len(), 2);
     }
 }

@@ -37,8 +37,8 @@ use crate::theme::ActiveTheme;
 use ropey::Rope;
 
 use super::diff_model::{
-    DiffFile, DiffHunk, LineKind, UnifiedSource, build_unified_with_hunks, compute_hunks,
-    line_count, line_range, line_starts,
+    DiffFile, DiffHunk, LineKind, UnifiedSource, compute_hunks, line_count, line_range,
+    line_starts,
 };
 
 /// Maximum length of a line that participates in syntax highlighting.
@@ -79,6 +79,10 @@ struct UnifiedPayload {
     line_colors: Vec<(u32, Hsla)>,
     word_colors: Vec<(Range<usize>, Hsla)>,
     labels: Vec<Option<u32>>,
+    /// Merged row of each hunk's first changed line（导航/初始定位用）。
+    hunk_rows: Vec<u32>,
+    /// 折叠占位行信息（展开按钮定位用）。
+    separators: Vec<super::diff_model::SeparatorRow>,
 }
 
 pub struct DiffView {
@@ -110,6 +114,16 @@ pub struct DiffView {
     refreshing: bool,
     recompute_gen: u32,
     scroll_syncing: bool,
+    /// 已展开的折叠区 id（= 隐藏区 new 侧起始行）。
+    expanded_separators: std::collections::HashSet<u32>,
+    /// 最近一次 collapsed 构建产出的 hunk 行号/分隔行（导航与跳转用）。
+    unified_hunk_rows: Vec<u32>,
+    unified_separators: Vec<super::diff_model::SeparatorRow>,
+    /// 首次 recompute 是否已完成（初始跳转只做一次）。
+    initial_jump_done: bool,
+    /// 待执行的初始跳转：recompute 完成时设置，render 时等 line_height
+    /// 可用后一次性消费，滚动到首个变更处。
+    pending_jump: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -151,6 +165,11 @@ impl DiffView {
             refreshing: false,
             recompute_gen: 0,
             scroll_syncing: false,
+            expanded_separators: std::collections::HashSet::new(),
+            unified_hunk_rows: Vec::new(),
+            unified_separators: Vec::new(),
+            initial_jump_done: false,
+            pending_jump: false,
             _subscriptions: Vec::new(),
         };
 
@@ -261,6 +280,7 @@ impl DiffView {
         let deleted_word = Self::deleted_word_bg(cx);
         let old_parsed = self.old_parsed.take();
         let new_parsed = self.new_parsed.take();
+        let expanded = self.expanded_separators.clone();
 
         // Hand the highlighters to the background task; keep a fresh placeholder
         // in the view so a superseding recompute that runs before this task
@@ -294,9 +314,12 @@ impl DiffView {
                         new_hl.update(None, &rope, None);
                     }
 
-                    let unified = build_unified_with_hunks(&task_old, &task_new, &hunks);
+                    let unified =
+                        super::diff_model::build_unified_collapsed(&task_old, &task_new, &hunks, &expanded);
+                    let hunk_rows = unified.hunk_rows.clone();
+                    let separators = unified.separators.clone();
                     let runs = DiffView::merged_highlight_runs(
-                        &unified,
+                        &unified.source,
                         &task_old,
                         &task_new,
                         &mut old_hl,
@@ -304,7 +327,7 @@ impl DiffView {
                         &theme,
                     );
                     let (line_colors, word_colors, labels) = unified_decorations(
-                        &unified,
+                        &unified.source,
                         added_line,
                         deleted_line,
                         added_word,
@@ -316,11 +339,13 @@ impl DiffView {
                         additions,
                         deletions,
                         UnifiedPayload {
-                            text: unified.text,
+                            text: unified.source.text,
                             runs,
                             line_colors,
                             word_colors,
                             labels,
+                            hunk_rows,
+                            separators,
                         },
                         old_hl,
                         new_hl,
@@ -344,6 +369,8 @@ impl DiffView {
                         view.hunks = hunks;
                         view.additions = additions;
                         view.deletions = deletions;
+                        view.unified_hunk_rows = payload.hunk_rows.clone();
+                        view.unified_separators = payload.separators.clone();
 
                         let (nl, nw, ol, ow) = hunk_decorations(
                             &view.hunks,
@@ -382,11 +409,127 @@ impl DiffView {
                         view.new_parsed = None;
                     }
                 }
+                // 首次计算完成：请求初始跳转到第一个变更处（render 时消费）。
+                if !view.initial_jump_done {
+                    view.initial_jump_done = true;
+                    if !view.hunks.is_empty() {
+                        view.pending_jump = true;
+                    }
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// 滚动指定编辑器到目标 buffer 行（顶部保留 `context` 行上文）。
+    fn scroll_editor_to_row(
+        editor: &Entity<InputState>,
+        row: u32,
+        context: u32,
+        cx: &mut App,
+    ) {
+        let target = row.saturating_sub(context);
+        let line_height = editor.read(cx).last_layout.as_ref().map(|l| l.line_height);
+        let Some(line_height) = line_height else { return };
+        if line_height <= px(0.) {
+            return;
+        }
+        editor.update(cx, |state, cx| {
+            state
+                .update_scroll_offset(Some(point(px(0.), -(line_height * target as f32))), cx);
+        });
+    }
+
+    /// 消费待执行的初始跳转（需等编辑器完成首次布局拿到 line_height）。
+    fn flush_pending_jump(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_jump {
+            return;
+        }
+        match self.effective_mode() {
+            DiffMode::Unified => {
+                let Some(row) = self.unified_hunk_rows.first().copied() else {
+                    self.pending_jump = false;
+                    return;
+                };
+                let editor = self.unified.clone();
+                let before = editor.read(cx).scroll_handle.offset().y;
+                Self::scroll_editor_to_row(&editor, row, 3, cx);
+                self.pending_jump = editor.read(cx).scroll_handle.offset().y == before && row > 0;
+            }
+            DiffMode::Split => {
+                let Some(hunk) = self.hunks.first() else {
+                    self.pending_jump = false;
+                    return;
+                };
+                let right = self.right.clone();
+                let before = right.read(cx).scroll_handle.offset().y;
+                Self::scroll_editor_to_row(&right, hunk.new_rows.start, 3, cx);
+                let jumped = right.read(cx).scroll_handle.offset().y != before || hunk.new_rows.start <= 3;
+                // 左侧经映射同步（显式设置，不依赖 observe 时序）
+                let left_row = map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
+                let left = self.left.clone();
+                Self::scroll_editor_to_row(&left, left_row, 0, cx);
+                self.pending_jump = !jumped;
+            }
+        }
+    }
+
+    /// 当前视口顶部所在的 hunk 序号（导航基准）。
+    fn active_hunk_index(&self, cx: &App) -> Option<usize> {
+        if self.hunks.is_empty() {
+            return None;
+        }
+        let top_row: u32 = match self.effective_mode() {
+            DiffMode::Unified => {
+                let state = self.unified.read(cx);
+                let lh = state.last_layout.as_ref().map(|l| l.line_height).unwrap_or(px(0.));
+                if lh <= px(0.) { 0 } else { ((-state.scroll_handle.offset().y) / lh).max(0.) as u32 }
+            }
+            DiffMode::Split => {
+                let state = self.right.read(cx);
+                let lh = state.last_layout.as_ref().map(|l| l.line_height).unwrap_or(px(0.));
+                if lh <= px(0.) { 0 } else { ((-state.scroll_handle.offset().y) / lh).max(0.) as u32 }
+            }
+        };
+        // 视口顶部所在或之后的第一个 hunk；若已滚过所有 hunk 则取最后一个。
+        let rows: Vec<u32> = match self.effective_mode() {
+            DiffMode::Unified => self.unified_hunk_rows.clone(),
+            DiffMode::Split => self.hunks.iter().map(|h| h.new_rows.start).collect(),
+        };
+        let idx = rows.iter().position(|&r| r + 1 >= top_row).unwrap_or(rows.len().saturating_sub(1));
+        Some(idx)
+    }
+
+    /// 跳转到第 `ix` 个 hunk（split 双侧联动 / unified 单侧）。
+    fn jump_to_hunk(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.hunks.is_empty() {
+            return;
+        }
+        let ix = ix.min(self.hunks.len() - 1);
+        match self.effective_mode() {
+            DiffMode::Split => {
+                let hunk = &self.hunks[ix];
+                let left_row = map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
+                let (right, left) = (self.right.clone(), self.left.clone());
+                Self::scroll_editor_to_row(&right, hunk.new_rows.start, 3, cx);
+                Self::scroll_editor_to_row(&left, left_row, 0, cx);
+            }
+            DiffMode::Unified => {
+                let Some(row) = self.unified_hunk_rows.get(ix).copied() else { return };
+                let editor = self.unified.clone();
+                Self::scroll_editor_to_row(&editor, row, 3, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 展开一个折叠区：记录 id 后立即重建（滚动偏移保持不变，
+    /// 因为展开按钮只对视口内可见的分隔行渲染）。
+    fn expand_separator(&mut self, id: u32, cx: &mut Context<Self>) {
+        self.expanded_separators.insert(id);
+        self.recompute(cx);
     }
 
     /// Build gap-free highlight runs for the merged unified text, colored
@@ -725,9 +868,12 @@ impl DiffView {
         });
     }
 
-    /// Line height + scroll offset of the right editor (for overlay placement).
-    fn right_scroll_metrics(&self, cx: &App) -> (gpui::Pixels, gpui::Point<gpui::Pixels>) {
-        let state = self.right.read(cx);
+    /// Line height + scroll offset of an editor (for overlay placement).
+    fn editor_scroll_metrics(
+        editor: &Entity<InputState>,
+        cx: &App,
+    ) -> (gpui::Pixels, gpui::Point<gpui::Pixels>) {
+        let state = editor.read(cx);
         let line_height = state
             .last_layout
             .as_ref()
@@ -736,17 +882,26 @@ impl DiffView {
         (line_height, state.scroll_handle.offset())
     }
 
+    fn right_scroll_metrics(&self, cx: &App) -> (gpui::Pixels, gpui::Point<gpui::Pixels>) {
+        Self::editor_scroll_metrics(&self.right, cx)
+    }
+
     // ---- rendering ------------------------------------------------------------
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let mode_label = match self.preference {
-            LayoutPreference::Auto => "Layout: Auto",
-            LayoutPreference::Unified => "Layout: Unified",
-            LayoutPreference::Split => "Layout: Split",
+            LayoutPreference::Auto => "布局：自动",
+            LayoutPreference::Unified => "布局：统一",
+            LayoutPreference::Split => "布局：分栏",
         };
         let busy = self.refreshing || self.saving;
         let dirty = self.dirty;
+
+        // hunk 导航状态：当前序号（1-based）与总数
+        let hunk_total = self.hunks.len();
+        let hunk_current = self.active_hunk_index(cx).map(|ix| ix + 1).unwrap_or(0);
+        let nav_enabled = hunk_total > 0;
 
         let button = |id: &'static str,
                       label: &'static str,
@@ -803,8 +958,44 @@ impl DiffView {
                     .text_color(theme.status_deleted)
                     .child(format!("-{}", self.deletions)),
             )
+            // hunk 导航：上一个 / 计数 / 下一个（循环跳转）
             .child(
-                button("diff-open-file", "Open File", true, theme).on_click(cx.listener(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        button("diff-prev-hunk", "‹ 上一个", nav_enabled, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let Some(cur) = this.active_hunk_index(cx) else { return };
+                                let prev = if cur == 0 { this.hunks.len() - 1 } else { cur - 1 };
+                                this.jump_to_hunk(prev, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(if nav_enabled { theme.text_muted } else { theme.text_subtle })
+                            .child(if nav_enabled {
+                                format!("{}/{}", hunk_current.min(hunk_total), hunk_total)
+                            } else {
+                                "0/0".to_string()
+                            }),
+                    )
+                    .child(
+                        button("diff-next-hunk", "下一个 ›", nav_enabled, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let Some(cur) = this.active_hunk_index(cx) else { return };
+                                let next = (cur + 1) % this.hunks.len();
+                                this.jump_to_hunk(next, cx);
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                button("diff-open-file", "打开文件", true, theme).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.open_file(window, cx);
                     },
@@ -814,9 +1005,9 @@ impl DiffView {
                 button(
                     "diff-refresh",
                     if self.refreshing {
-                        "Refreshing…"
+                        "刷新中…"
                     } else {
-                        "Refresh"
+                        "刷新"
                     },
                     !busy,
                     theme,
@@ -829,11 +1020,11 @@ impl DiffView {
                 button(
                     "diff-save",
                     if self.saving {
-                        "Saving…"
+                        "保存中…"
                     } else if dirty {
-                        "● Save"
+                        "● 保存"
                     } else {
-                        "Save"
+                        "保存"
                     },
                     dirty && !self.saving,
                     theme,
@@ -881,7 +1072,7 @@ impl DiffView {
                         .text_color(theme.text_muted)
                         .text_size(px(11.0))
                         .hover(|s| s.text_color(theme.text).border_color(theme.accent))
-                        .child("↩ Revert")
+                        .child("↩ 还原")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.revert_hunk(ix, window, cx);
                         }))
@@ -920,14 +1111,55 @@ impl DiffView {
             )
     }
 
-    fn render_unified(&self, cx: &App) -> impl IntoElement {
+    fn render_unified(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+
+        // 折叠区分隔行的「展开」按钮浮层，按滚动偏移定位。
+        let (line_height, scroll_offset) = Self::editor_scroll_metrics(&self.unified, cx);
+        let expand_buttons: Vec<gpui::AnyElement> = if line_height > px(0.) {
+            self.unified_separators
+                .iter()
+                .map(|sep| {
+                    let y = line_height * sep.merged_row as f32 + scroll_offset.y;
+                    div()
+                        .id(("expand-sep", sep.id))
+                        .absolute()
+                        .top(y)
+                        .left(px(48.0))
+                        .h(line_height)
+                        .px(px(8.0))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.0))
+                        .bg(theme.elevated_background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .cursor_pointer()
+                        .text_color(theme.text_muted)
+                        .text_size(px(11.0))
+                        .hover(|s| s.text_color(theme.text).border_color(theme.accent))
+                        .child(format!("⋯ 展开 {} 行 ⋯", sep.hidden_lines))
+                        .on_click({
+                            let id = sep.id;
+                            cx.listener(move |this, _, _, cx| {
+                                this.expand_separator(id, cx);
+                            })
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         div()
             .flex_1()
             .min_h_0()
+            .relative()
             .overflow_hidden()
             .bg(theme.editor_background())
             .child(EditorInput::new(&self.unified).disabled(true))
+            .children(expand_buttons)
     }
 }
 
@@ -935,6 +1167,9 @@ impl Render for DiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let editor_bg = theme.editor_background();
+
+        // 初始定位：等编辑器首次布局完成后滚动到第一个变更处。
+        self.flush_pending_jump(cx);
 
         div()
             .flex()
