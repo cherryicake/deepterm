@@ -19,6 +19,10 @@ use crate::theme::ActiveTheme;
 
 const LIST_ROW_HEIGHT: f32 = 28.0;
 const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
+/// 无文件事件时的兑底轮询间隔（主要面向远程仓库：
+/// 远程 watcher 只轮询工作区根目录的元数据/条目，git commit 只改
+/// .git 内部，不会产生任何事件，必须靠定时器发现状态变化）。
+const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Git panel events
 pub enum GitPanelEvent {
@@ -116,6 +120,7 @@ pub struct GitPanel {
     hovered_index: Option<usize>,
     watcher_subscription: Option<Subscription>,
     refresh_debounce_task: Option<Task<()>>,
+    status_poll_task: Option<Task<()>>,
     refresh_pending: bool,
     workspace_generation: u64,
 }
@@ -137,6 +142,7 @@ impl GitPanel {
             hovered_index: None,
             watcher_subscription: None,
             refresh_debounce_task: None,
+            status_poll_task: None,
             refresh_pending: false,
             workspace_generation: 0,
         }
@@ -163,6 +169,7 @@ impl GitPanel {
         if let Some(ref old_path) = self.workspace_path {
             self.watcher_subscription.take();
             self.refresh_debounce_task.take();
+            self.status_poll_task.take();
             self.refresh_pending = false;
             if self.is_local {
                 cx.unwatch_recursive_path(old_path);
@@ -176,6 +183,7 @@ impl GitPanel {
         self.ssh_config = ssh_config.clone();
         self.filesystem = filesystem.clone();
         self.refresh_debounce_task.take();
+        self.status_poll_task.take();
         self.refresh_pending = false;
         self.repo = None;
         self.repo_error = None;
@@ -199,7 +207,7 @@ impl GitPanel {
             Some(cx.subscribe(
                 &watcher,
                 move |_, _, event: &FsChangeEvent, cx| {
-                    if is_git_path(event) {
+                    if is_git_noise_path(event) {
                         return;
                     }
                     let weak = weak.clone();
@@ -215,7 +223,7 @@ impl GitPanel {
             Some(cx.subscribe(
                 &watcher,
                 move |_, _, event: &FsChangeEvent, cx| {
-                    if is_git_path(event) {
+                    if is_git_noise_path(event) {
                         return;
                     }
                     let weak = weak.clone();
@@ -231,6 +239,34 @@ impl GitPanel {
         self.workspace_generation += 1;
         let generation = self.workspace_generation;
         let weak = cx.entity().downgrade();
+
+        // 远程仓库：文件事件不可靠（commit 只改 .git 内部，远程轮询看不到），
+        // 用低频定时器兑底刷新状态。本地仓库依赖 inotify 事件即可，不轮询。
+        if !is_local {
+            let poll_weak = weak.clone();
+            self.status_poll_task = Some(cx.spawn(async move |_, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(REMOTE_STATUS_POLL_INTERVAL)
+                        .await;
+                    let should_stop = poll_weak
+                        .update(cx, |this, cx| {
+                            if this.workspace_generation != generation {
+                                return true; // 已切换工作区，退出旧轮询
+                            }
+                            if this.repo.is_some() && !this.loading {
+                                this.schedule_refresh(cx);
+                            }
+                            false
+                        })
+                        .unwrap_or(true); // entity 已销毁，退出
+                    if should_stop {
+                        break;
+                    }
+                }
+            }));
+        }
+
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
@@ -723,9 +759,82 @@ impl Render for GitPanel {
     }
 }
 
-fn is_git_path(event: &FsChangeEvent) -> bool {
-    event
-        .path
-        .components()
-        .any(|c| c.as_os_str() == ".git")
+/// 判断事件是否来自 git 内部的高频噪声路径。
+///
+/// 注意：不能一刀切过滤所有 `.git` 事件——`git commit` / `add` / `checkout`
+/// 只修改 `.git/index`、`.git/HEAD`、`.git/refs/*`，工作区文件不变；
+/// 如果全部忽略，终端里提交后 Git 面板会永远停留在过期状态。
+/// 这里只过滤高频噪声（objects/logs/hooks/锁文件），
+/// 放行 index/HEAD/refs 等能反映仓库状态变化的信号路径。
+fn is_git_noise_path(event: &FsChangeEvent) -> bool {
+    let mut components = event.path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() != ".git" {
+            continue;
+        }
+        // 扫描 .git 下所有层级：锁文件/临时文件可能出现在任意深度
+        // （如 .git/index.lock、.git/refs/heads/main.lock）
+        for rest in components.by_ref() {
+            match rest.as_os_str().to_str() {
+                Some("objects") | Some("logs") | Some("hooks") | Some("info") => return true,
+                Some(name)
+                    if name.ends_with(".lock") || name.starts_with("tmp_") =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // index/HEAD/refs/MERGE_HEAD 等状态信号路径（含 rebase 中间态目录）→ 放行刷新
+        return false;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_manager::watcher::FsChangeKind;
+
+    fn event(path: &str) -> FsChangeEvent {
+        FsChangeEvent::new(std::path::PathBuf::from(path), FsChangeKind::Modify)
+    }
+
+    #[test]
+    fn git_state_signal_paths_are_not_noise() {
+        // commit/add/checkout 只改这些路径，必须触发刷新
+        assert!(!is_git_noise_path(&event("/repo/.git/index")));
+        assert!(!is_git_noise_path(&event("/repo/.git/HEAD")));
+        assert!(!is_git_noise_path(&event("/repo/.git/refs/heads/main")));
+        assert!(!is_git_noise_path(&event("/repo/.git/COMMIT_EDITMSG")));
+        assert!(!is_git_noise_path(&event("/repo/.git/MERGE_HEAD")));
+    }
+
+    #[test]
+    fn git_high_frequency_paths_are_noise() {
+        // objects/logs/hooks 每次写对象都会刷事件，必须忽略
+        assert!(is_git_noise_path(&event(
+            "/repo/.git/objects/ab/cdef123"
+        )));
+        assert!(is_git_noise_path(&event("/repo/.git/logs/HEAD")));
+        assert!(is_git_noise_path(&event("/repo/.git/hooks/pre-commit")));
+        assert!(is_git_noise_path(&event("/repo/.git/info/exclude")));
+    }
+
+    #[test]
+    fn git_lock_and_temp_files_are_noise() {
+        assert!(is_git_noise_path(&event("/repo/.git/index.lock")));
+        assert!(is_git_noise_path(&event("/repo/.git/refs/heads/main.lock")));
+        assert!(is_git_noise_path(&event("/repo/.git/tmp_obj_123")));
+    }
+
+    #[test]
+    fn working_tree_and_non_git_paths_are_not_noise() {
+        assert!(!is_git_noise_path(&event("/repo/src/main.rs")));
+        assert!(!is_git_noise_path(&event("/other/project/file.txt")));
+        // .git 目录本身变化（init 等）→ 刷新
+        assert!(!is_git_noise_path(&event("/repo/.git")));
+        // 名字恰好含 .git 的普通文件不受影响
+        assert!(!is_git_noise_path(&event("/repo/github.md")));
+    }
 }
