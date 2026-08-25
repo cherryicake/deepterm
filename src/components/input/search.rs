@@ -369,15 +369,11 @@ impl SearchPanel {
         let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换"));
 
         cx.new(|cx| {
-            let _subscriptions =
-                vec![
-                    cx.subscribe(&search_input, |this: &mut Self, _, ev, cx| match ev {
-                        InputEvent::Change => {
-                            this.update_search_query(cx);
-                        }
-                        _ => {}
-                    }),
-                ];
+            let _subscriptions = vec![cx.subscribe(&search_input, |this: &mut Self, _, ev, cx| {
+                if let InputEvent::Change = ev {
+                    this.update_search_query(cx);
+                }
+            })];
 
             Self {
                 editor,
@@ -715,7 +711,7 @@ impl Render for SearchPanel {
                     if id != "search-preserve-case" {
                         this.update_search_query(cx);
                     }
-                    // 保持焦点在查找输入框，便于继续输入。
+                    // 焦点回到开关所在行的输入框（保留大小写位于替换行）。
                     let focus_handle = match id {
                         "search-preserve-case" => this.replace_input.read(cx).focus_handle.clone(),
                         _ => this.search_input.read(cx).focus_handle.clone(),
@@ -727,19 +723,21 @@ impl Render for SearchPanel {
 
         // 图标按钮统一规格：24×24 按钮 + 13.5px 图标（16 网格、描边 2），
         // 全套图标同网格同比重，视觉大小一致；颜色用主题默认图标色。
-        let icon_btn =
-            |id: &'static str, path: &'static str, tooltip: &'static str, cx: &mut Context<Self>| {
-                Button::new(id)
-                    .icon(Icon::new(path))
-                    .with_size(Size::Size(px(18.0)))
-                    .height(px(24.0))
-                    .tooltip(tooltip)
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(gpui::transparent_black())
-                            .hover(c_hover),
-                    )
-            };
+        let icon_btn = |id: &'static str,
+                        path: &'static str,
+                        tooltip: &'static str,
+                        cx: &mut Context<Self>| {
+            Button::new(id)
+                .icon(Icon::new(path))
+                .with_size(Size::Size(px(18.0)))
+                .height(px(24.0))
+                .tooltip(tooltip)
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(gpui::transparent_black())
+                        .hover(c_hover),
+                )
+        };
 
         // ---- 计数标签：非法正则红色提示 / 无结果 / 第X项，共Y项。
         let counter: AnyElement = if self.query_invalid && !query_empty {
@@ -770,23 +768,28 @@ impl Render for SearchPanel {
                 .into_any_element()
         };
 
+        // 两行输入框共用的外壳样式：同一固定宽度（空间不足时等比收缩）、
+        // 圆角底色、聚焦 accent 描边，保证上下两行右对齐。
+        let input_shell = |focused: bool| {
+            div()
+                .w(px(344.0))
+                .flex_shrink(1.0)
+                .min_w(px(200.0))
+                .h(px(28.0))
+                .pl(px(8.0))
+                .pr(px(3.0))
+                .flex()
+                .items_center()
+                .gap(px(1.0))
+                .rounded(px(7.0))
+                .bg(c_field)
+                .border_1()
+                .border_color(if focused { c_accent } else { c_border })
+                .overflow_hidden()
+        };
+
         // ---- 查找行：内嵌开关的查找输入框 + 计数 + 导航 + 关闭。
-        // 两个输入框用同一固定宽度（空间不足时等比收缩），保证上下两行右对齐。
-        let find_field = div()
-            .w(px(344.0))
-            .flex_shrink(1.0)
-            .min_w(px(200.0))
-            .h(px(28.0))
-            .pl(px(8.0))
-            .pr(px(3.0))
-            .flex()
-            .items_center()
-            .gap(px(1.0))
-            .rounded(px(7.0))
-            .bg(c_field)
-            .border_1()
-            .border_color(if find_focused { c_accent } else { c_border })
-            .overflow_hidden()
+        let find_field = input_shell(find_focused)
             .child(EditorInput::new(&self.search_input).transparent().small())
             .child(toggle(
                 "search-case",
@@ -853,25 +856,10 @@ impl Render for SearchPanel {
             "替换时保留大小写",
             cx,
         );
-        let replace_field = div()
-            .w(px(344.0))
-            .flex_shrink(1.0)
-            .min_w(px(200.0))
-            .h(px(28.0))
-            .pl(px(8.0))
-            .pr(px(3.0))
-            .flex()
-            .items_center()
-            .gap(px(1.0))
-            .rounded(px(7.0))
-            .bg(c_field)
-            .border_1()
-            .border_color(if replace_focused { c_accent } else { c_border })
-            .overflow_hidden()
+        let replace_field = input_shell(replace_focused)
             .child(EditorInput::new(&self.replace_input).transparent().small())
             .child(preserve_toggle);
 
-        let action_disabled = !has_matches;
         let replace_row = div()
             .flex()
             .items_center()
@@ -885,7 +873,7 @@ impl Render for SearchPanel {
                     "替换当前",
                     cx,
                 )
-                .disabled(action_disabled)
+                .disabled(!has_matches)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.replace_next(window, cx);
                 })),
@@ -897,7 +885,7 @@ impl Render for SearchPanel {
                     "全部替换",
                     cx,
                 )
-                .disabled(action_disabled)
+                .disabled(!has_matches)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.replace_all(window, cx);
                 })),

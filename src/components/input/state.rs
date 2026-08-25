@@ -1808,39 +1808,34 @@ impl InputState {
             let visible_wrap_rows = self.display_map.visible_wrap_row_count_for_buffer_line(ix);
             row_offset_y += line_height * visible_wrap_rows;
         }
-        if let Some(line) = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
-        {
-            if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
-                row_offset_y += pos.y;
-            }
-        }
 
         let mut scroll_offset = self.scroll_handle.offset();
 
-        // 垂直：目标行中心对齐视口中心。
-        let viewport_height = bounds.size.height;
-        scroll_offset.y = -(row_offset_y + line_height.half() - viewport_height.half());
-
-        // 水平：与 scroll_to 相同，仅保证目标列可见。
-        let safety_margin = if last_layout.text_align == TextAlign::Left {
-            RIGHT_MARGIN
-        } else {
-            CURSOR_WIDTH
-        };
-        if let Some(line) = last_layout
+        // 行内列偏移：在前面各行总高度之上，同时供下方水平可见性逻辑复用
+        // （与 scroll_to 不同，这里只需查询一次）。
+        let pos = last_layout
             .lines
             .get(row.saturating_sub(last_layout.visible_range.start))
-        {
-            if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
-                let bounds_width = bounds.size.width - last_layout.line_number_width;
-                let col_offset_x = pos.x;
-                if col_offset_x - safety_margin < -scroll_offset.x {
-                    scroll_offset.x = -col_offset_x + safety_margin;
-                } else if col_offset_x + safety_margin > -scroll_offset.x + bounds_width {
-                    scroll_offset.x = -(col_offset_x - bounds_width + safety_margin);
-                }
+            .and_then(|line| line.position_for_index(point.column, last_layout, false));
+        if let Some(pos) = pos {
+            row_offset_y += pos.y;
+        }
+
+        // 垂直：目标行中心对齐视口中心。
+        scroll_offset.y = -(row_offset_y + line_height.half() - bounds.size.height.half());
+
+        // 水平：与 scroll_to 相同，仅保证目标列可见。
+        if let Some(pos) = pos {
+            let safety_margin = if last_layout.text_align == TextAlign::Left {
+                RIGHT_MARGIN
+            } else {
+                CURSOR_WIDTH
+            };
+            let bounds_width = bounds.size.width - last_layout.line_number_width;
+            if pos.x - safety_margin < -scroll_offset.x {
+                scroll_offset.x = -pos.x + safety_margin;
+            } else if pos.x + safety_margin > -scroll_offset.x + bounds_width {
+                scroll_offset.x = -(pos.x - bounds_width + safety_margin);
             }
         }
 
