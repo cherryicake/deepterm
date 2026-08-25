@@ -8,22 +8,80 @@ use std::{ops::Range, rc::Rc};
 use aho_corasick::AhoCorasick;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Subscription, Window, actions, div, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, Styled, Subscription, Window, actions, div,
+    px, relative,
 };
 use ropey::Rope;
 
-use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Disableable, Sizable};
+use crate::components::button::{
+    Button, ButtonCustomVariant, ButtonVariants, Disableable, Icon, Sizable, Size,
+};
 use crate::theme::ActiveTheme;
 
 use super::{
-    EditorInput, Enter, Escape, IndentInline, InputEvent, InputState, RopeExt as _, Search,
-    SearchPrevious, movement::MoveDirection,
+    EditorInput, Enter, Escape, IndentInline, InputEvent, InputState, Search, SearchPrevious,
+    movement::MoveDirection,
 };
 
 const CONTEXT: &'static str = "SearchPanel";
 
 actions!(input, [Tab]);
+
+/// 计算跳转目标匹配索引。
+///
+/// `caret` 为编辑器光标字节偏移；返回 None 表示无匹配。
+/// - dir = 1（下一个）：光标所在/之后的第一个匹配；若光标已在该匹配内，则取再下一个（循环）。
+/// - dir = -1（上一个）：光标之前的最后一个匹配；若光标在该匹配内，则取它的前一个（循环）。
+///
+/// 注意：跳转后选区落在匹配起点上，因此「上一个」不能用
+/// 「start < caret」判断是否在匹配内，否则会永远选中同一个匹配。
+fn jump_target(ranges: &[Range<usize>], caret: usize, dir: i32) -> Option<usize> {
+    let len = ranges.len();
+    if len == 0 {
+        return None;
+    }
+    // ix0：第一个结束位置在 caret 之后的匹配（即 caret 所在或之后的第一个）。
+    let ix0 = ranges.iter().position(|r| r.end > caret);
+    let inside = |i: usize| ranges[i].start <= caret; // ix0 匹配是否包含 caret 起点
+    Some(match dir {
+        -1 => match ix0 {
+            Some(i) if inside(i) => (i + len - 1) % len,
+            Some(0) | None => len - 1, // caret 在首个匹配之前 / 所有匹配之后：回绕到最后一个
+            Some(i) => i - 1,
+        },
+        _ => match ix0 {
+            Some(i) if inside(i) => (i + 1) % len,
+            Some(i) => i,
+            None => 0, // caret 越过所有匹配：回绕到第一个
+        },
+    })
+}
+
+/// 替换时按匹配文本的大小写形态变换替换文本：
+/// - 全大写匹配 → 全大写替换（FOO → BAR）
+/// - 首字母大写匹配 → 首字母大写替换（Foo → Bar）
+/// - 其他 / 无字母 → 原样
+fn apply_case_preservation(template: &str, matched: &str, preserve: bool) -> String {
+    if !preserve || template.is_empty() || matched.is_empty() {
+        return template.to_string();
+    }
+    let letters: Vec<char> = matched.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.is_empty() || !letters.iter().any(|c| c.is_uppercase()) {
+        return template.to_string();
+    }
+    if letters.iter().all(|c| c.is_uppercase()) {
+        template.to_uppercase()
+    } else if letters[0].is_uppercase() {
+        let mut chars = template.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => template.to_string(),
+        }
+    } else {
+        template.to_string()
+    }
+}
 
 /// The active search query: a literal (aho-corasick) or a regex.
 #[derive(Debug, Clone)]
@@ -166,9 +224,9 @@ impl SearchMatcher {
 
     fn label(&self) -> String {
         if self.len() == 0 {
-            return "0/0".to_string();
+            return "无结果".to_string();
         }
-        format!("{}/{}", self.current_match_ix + 1, self.len())
+        format!("第{}项，共{}项", self.current_match_ix + 1, self.len())
     }
 
     /// Update the current match index based on the given offset.
@@ -219,6 +277,8 @@ pub(crate) struct SearchPanel {
     whole_word: bool,
     /// 当前 query 为非法正则：UI 显示红色错误提示而非计数。
     query_invalid: bool,
+    /// 替换时保留大小写：按每个匹配的形态变换替换文本（Foo→Bar / FOO→BAR）。
+    preserve_case: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
 
@@ -306,17 +366,18 @@ impl SearchPanel {
 
     pub fn new(editor: Entity<InputState>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));
-        let replace_input = cx.new(|cx| InputState::new(window, cx));
+        let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换"));
 
         cx.new(|cx| {
-            let _subscriptions = vec![cx.subscribe(&search_input, |this: &mut Self, _, ev, cx| {
-                match ev {
-                    InputEvent::Change => {
-                        this.update_search_query(cx);
-                    }
-                    _ => {}
-                }
-            })];
+            let _subscriptions =
+                vec![
+                    cx.subscribe(&search_input, |this: &mut Self, _, ev, cx| match ev {
+                        InputEvent::Change => {
+                            this.update_search_query(cx);
+                        }
+                        _ => {}
+                    }),
+                ];
 
             Self {
                 editor,
@@ -326,6 +387,8 @@ impl SearchPanel {
                 use_regex: false,
                 whole_word: false,
                 query_invalid: false,
+                preserve_case: false,
+                // 替换行默认收起，通过左侧 ⌄ 折叠开关展开。
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
                 open: true,
@@ -370,12 +433,15 @@ impl SearchPanel {
             } else {
                 this.matcher.current_match_ix = 0;
             }
-            if let Some(range) =
-                this.matcher.matched_ranges.get(this.matcher.current_match_ix).cloned()
+            if let Some(range) = this
+                .matcher
+                .matched_ranges
+                .get(this.matcher.current_match_ix)
+                .cloned()
             {
                 editor.update(cx, |state, cx| {
                     state.selected_range = range.clone().into();
-                    state.scroll_to(range.start, None, cx);
+                    state.scroll_to_center(range.start, cx);
                 });
             }
         });
@@ -410,53 +476,36 @@ impl SearchPanel {
     ///
     /// 统一经 defer 执行：本方法可能在编辑器自身 update 借用内被调用
     /// （如 Cmd+F 打开路径），同步触碰编辑器会触发重入借用 panic。
-    fn reveal_current_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(range) = self.matcher.matched_ranges.get(self.matcher.current_match_ix).cloned()
+    /// 将编辑器选区设置到当前匹配并滚动到视口中部（不抢焦点）。
+    ///
+    /// 同步执行：调用方（‹/› 按钮、Enter/Shift+Enter 动作）都在事件分发
+    /// 阶段运行，不存在编辑器 update 借用；延迟一帧反而让跳转看起来迟钝。
+    /// （Cmd+F 打开路径的首次定位在 show() 自身的 defer 中处理。）
+    fn reveal_current_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = self
+            .matcher
+            .matched_ranges
+            .get(self.matcher.current_match_ix)
+            .cloned()
         else {
             return;
         };
         let editor = self.editor.clone();
-        cx.defer_in(window, move |_, _window, cx| {
-            editor.update(cx, |state, cx| {
-                state.selected_range = range.clone().into();
-                state.scroll_to(range.start, None, cx);
-            });
+        editor.update(cx, |state, cx| {
+            state.selected_range = range.clone().into();
+            // 跳转目标行对齐视口中部，避免匹配项贴在视口边缘。
+            state.scroll_to_center(range.start, cx);
         });
     }
 
     /// 按 dir（+1 下一个 / -1 上一个）跳转：以编辑器光标为锚点对齐当前索引后 ±1（循环）。
     fn jump(&mut self, dir: i32, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.matcher.matched_ranges.is_empty() {
-            return;
-        }
-        // 以光标位置为锚：确保 current 指向光标处或之后的第一个匹配
         let caret = self.editor.read(cx).selected_range.start;
-        self.matcher.update_cursor_by_offset(caret);
-
-        let len = self.matcher.matched_ranges.len();
-        let cur = self.matcher.current_match_ix;
-        self.matcher.current_match_ix = match dir {
-            1 => {
-                // 光标不在任何匹配内时，第一个命中就是「下一个」
-                let at_match = self.matcher.matched_ranges[cur].contains(&caret);
-                if at_match {
-                    (cur + 1) % len
-                } else {
-                    cur
-                }
-            }
-            -1 => {
-                let at_match = self.matcher.matched_ranges[cur].start < caret;
-                if at_match {
-                    cur.checked_sub(1).unwrap_or(len - 1)
-                } else {
-                    cur
-                }
-            }
-            _ => cur,
-        };
-        self.reveal_current_match(_window, cx);
-        cx.notify();
+        if let Some(target) = jump_target(&self.matcher.matched_ranges, caret, dir) {
+            self.matcher.current_match_ix = target;
+            self.reveal_current_match(_window, cx);
+            cx.notify();
+        }
     }
 
     fn replaceable(&self, cx: &App) -> bool {
@@ -508,7 +557,8 @@ impl SearchPanel {
             return;
         }
 
-        let new_text = self.replace_input.read(cx).value();
+        let new_text = self.replace_input.read(cx).value().to_string();
+        let preserve_case = self.preserve_case;
         self.matcher.replacing = true;
         let previous_match_ix = self.matcher.current_match_ix;
         if let Some(range) = self
@@ -526,10 +576,13 @@ impl SearchPanel {
                 cx.update(|window, cx| {
                     text_state.update(cx, |state, cx| {
                         let range_utf16 = state.range_to_utf16(&range);
+                        let matched = state.text.slice(range.clone()).to_string();
+                        let replacement =
+                            apply_case_preservation(&new_text, &matched, preserve_case);
                         state.scroll_to(next_range.end, direction, cx);
                         state.replace_text_in_range_silent(
                             Some(range_utf16),
-                            new_text.as_str(),
+                            replacement.as_str(),
                             window,
                             cx,
                         );
@@ -547,7 +600,8 @@ impl SearchPanel {
             return;
         }
 
-        let new_text = self.replace_input.read(cx).value();
+        let new_text = self.replace_input.read(cx).value().to_string();
+        let preserve_case = self.preserve_case;
         self.matcher.replacing = true;
         let ranges = self.matcher.matched_ranges.clone();
         if ranges.is_empty() {
@@ -558,14 +612,22 @@ impl SearchPanel {
         cx.spawn_in(window, async move |_, cx| {
             cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
-                    // Replace from the end to avoid messing up the ranges.
-                    let mut rope = state.text.clone();
-                    for range in ranges.iter().rev() {
-                        rope.replace(range.clone(), new_text.as_str());
+                    // 逐个匹配拼接替换结果（支持逐匹配保留大小写）。
+                    let content = state.text.clone();
+                    let mut out = String::new();
+                    let mut last = 0usize;
+                    for range in ranges.iter() {
+                        out.push_str(&content.slice(last..range.start).to_string());
+                        let matched = content.slice(range.clone()).to_string();
+                        out.push_str(&apply_case_preservation(&new_text, &matched, preserve_case));
+                        last = range.end;
                     }
+                    out.push_str(&content.slice(last..).to_string());
+
+                    let full_range_utf16 = 0..state.offset_to_utf16(state.text.len());
                     state.replace_text_in_range_silent(
-                        Some(0..state.text.len()),
-                        &rope.to_string(),
+                        Some(full_range_utf16),
+                        out.as_str(),
                         window,
                         cx,
                     );
@@ -584,255 +646,347 @@ impl Focusable for SearchPanel {
 }
 
 impl Render for SearchPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return div().into_any_element();
         }
 
         let has_matches = self.matcher.len() > 0;
         let allow_replace = self.replaceable(cx);
-        if !allow_replace {
-            self.replace_mode = false;
-        }
-        // 主题色为 Copy，提前拷出避免与后续 &mut cx 借用冲突
+        let replace_visible = self.replace_mode && allow_replace;
+        let query_empty = self.search_input.read(cx).value().is_empty();
+
+        // ---- 主题色（Copy，提前拷出避免后续 &mut cx 借用冲突）。
+        // 卡片/输入框底色从编辑器背景推导：卡片比编辑器略深、输入框比卡片
+        // 略浅，保证在任何主题下都有截图中的层次感。
+        let dark = cx.theme().appearance.is_dark();
+        let shade = |mut c: Hsla, dl: f32| -> Hsla {
+            c.l = (c.l + dl).clamp(0.0, 1.0);
+            c
+        };
+        let editor_bg = cx.theme().editor_background();
+        let c_card = shade(editor_bg, if dark { -0.035 } else { 0.04 });
+        let c_field = shade(c_card, if dark { 0.06 } else { -0.05 });
         let c_accent = cx.theme().accent;
+        let c_accent_hover = cx.theme().accent_hover;
         let c_accent_fg = cx.theme().accent_foreground;
-        let c_elevated = cx.theme().ui.elevated_background;
         let c_hover = cx.theme().ui.tab_hover_background;
         let c_border = cx.theme().border;
-        let c_panel = cx.theme().panel_background;
-        let c_overlay = cx.theme().ui.overlay_background;
-        let c_text = cx.theme().text;
         let c_text_muted = cx.theme().text_muted;
         let c_text_subtle = cx.theme().text_subtle;
         let c_error = cx.theme().error;
-        let matcher_label = self.matcher.label();
 
-        // 开关按钮工厂：激活态 accent 底 + 前景色，非激活 ghost。
-        let toggle = |
-            id: &'static str,
-            label: &'static str,
-            active: bool,
-            tooltip: &'static str,
-            cx: &mut Context<Self>,| {
+        // 输入框聚焦态：accent 描边（对应截图中紫色边框的查找输入框）。
+        let find_focused = self.search_input.read(cx).focus_handle.is_focused(window);
+        let replace_focused = self.replace_input.read(cx).focus_handle.is_focused(window);
+
+        // 开关按钮工厂：激活态 accent 实心底 + 前景色，非激活透明底灰字。
+        // 标签用 child 而非 label，以便控制字号（xsmall 档默认只有 10px）。
+        let toggle = |id: &'static str,
+                      label: &'static str,
+                      active: bool,
+                      tooltip: &'static str,
+                      cx: &mut Context<Self>| {
             Button::new(id)
-                .label(label)
-                .compact()
+                .child(div().text_size(px(12.0)).child(label))
+                .xsmall()
+                .tooltip(tooltip)
                 .custom(
                     ButtonCustomVariant::new(cx)
-                        .color(if active { c_accent } else { c_elevated })
+                        .color(if active {
+                            c_accent
+                        } else {
+                            gpui::transparent_black()
+                        })
                         .foreground(if active { c_accent_fg } else { c_text_muted })
-                        .hover(c_hover)
+                        // 激活态悬停时保持选中色（用 accent_hover 提供反馈），
+                        // 而不是被灰色悬停背景覆盖。
+                        .hover(if active { c_accent_hover } else { c_hover })
                         .active(c_accent),
                 )
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     match id {
                         "search-case" => this.case_insensitive = !this.case_insensitive,
                         "search-word" => this.whole_word = !this.whole_word,
                         "search-regex" => this.use_regex = !this.use_regex,
+                        "search-preserve-case" => this.preserve_case = !this.preserve_case,
                         _ => {}
                     }
-                    this.update_search_query(cx);
+                    if id != "search-preserve-case" {
+                        this.update_search_query(cx);
+                    }
+                    // 保持焦点在查找输入框，便于继续输入。
+                    let focus_handle = match id {
+                        "search-preserve-case" => this.replace_input.read(cx).focus_handle.clone(),
+                        _ => this.search_input.read(cx).focus_handle.clone(),
+                    };
+                    window.focus(&focus_handle, cx);
                     cx.notify();
                 }))
         };
 
-        let case_toggle = toggle("search-case", "Aa", self.case_insensitive, "区分大小写", cx);
-        let word_toggle = toggle("search-word", "W", self.whole_word, "全字匹配", cx);
-        let regex_toggle = toggle("search-regex", ".*", self.use_regex, "正则表达式", cx);
+        // 图标按钮统一规格：24×24 按钮 + 13.5px 图标（16 网格、描边 2），
+        // 全套图标同网格同比重，视觉大小一致；颜色用主题默认图标色。
+        let icon_btn =
+            |id: &'static str, path: &'static str, tooltip: &'static str, cx: &mut Context<Self>| {
+                Button::new(id)
+                    .icon(Icon::new(path))
+                    .with_size(Size::Size(px(18.0)))
+                    .height(px(24.0))
+                    .tooltip(tooltip)
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .color(gpui::transparent_black())
+                            .hover(c_hover),
+                    )
+            };
 
-        // 匹配计数：非法正则显示红色错误提示
-        let counter = if self.query_invalid {
+        // ---- 计数标签：非法正则红色提示 / 无结果 / 第X项，共Y项。
+        let counter: AnyElement = if self.query_invalid && !query_empty {
             div()
-                .px(px(6.0))
-                .text_size(px(11.0))
+                .px(px(4.0))
+                .text_size(px(12.0))
                 .whitespace_nowrap()
                 .text_color(c_error)
                 .child("正则无效")
+                .into_any_element()
+        } else if query_empty {
+            div().into_any_element()
+        } else if !has_matches {
+            div()
+                .px(px(4.0))
+                .text_size(px(12.0))
+                .whitespace_nowrap()
+                .text_color(c_text_subtle)
+                .child(self.matcher.label())
+                .into_any_element()
         } else {
             div()
-                .px(px(6.0))
-                .min_w(px(44.0))
-                .flex()
-                .justify_center()
-                .text_size(px(11.0))
-                .text_color(if has_matches { c_text_muted } else { c_text_subtle })
-                .child(matcher_label)
+                .px(px(4.0))
+                .text_size(px(12.0))
+                .whitespace_nowrap()
+                .text_color(c_text_muted)
+                .child(self.matcher.label())
+                .into_any_element()
         };
 
-        let nav_button = |id: &'static str, label: &'static str, cx: &mut Context<Self>| {
-            Button::new(id)
-                .label(label)
-                .compact()
-                .disabled(!has_matches)
-                .custom(
-                    ButtonCustomVariant::new(cx)
-                        .color(c_elevated)
-                        .foreground(c_text)
-                        .hover(c_hover)
-                        .active(c_accent),
-                )
-        };
-
-        let search_row = div().flex().items_center().gap(px(6.0)).child(
-            div()
-                .flex_1()
-                .min_w(px(120.0))
-                .h(px(26.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .bg(c_overlay)
-                .border_1()
-                .border_color(c_border)
-                .child(
-                    EditorInput::new(&self.search_input)
-                        .transparent()
-                        .small(),
-                ),
-        );
-
-        let replace_row = div()
-            .when(self.replace_mode && allow_replace, |this| this.mt_1())
+        // ---- 查找行：内嵌开关的查找输入框 + 计数 + 导航 + 关闭。
+        // 两个输入框用同一固定宽度（空间不足时等比收缩），保证上下两行右对齐。
+        let find_field = div()
+            .w(px(344.0))
+            .flex_shrink(1.0)
+            .min_w(px(200.0))
+            .h(px(28.0))
+            .pl(px(8.0))
+            .pr(px(3.0))
             .flex()
             .items_center()
-            .gap(px(6.0))
-            .when(self.replace_mode && allow_replace, |this| {
-                this.child(
-                    div()
-                        .flex_1()
-                        .min_w(px(120.0))
-                        .h(px(26.0))
-                        .px(px(8.0))
-                        .rounded(px(6.0))
-                        .bg(c_overlay)
-                        .border_1()
-                        .border_color(c_border)
-                        .child(
-                            EditorInput::new(&self.replace_input)
-                                .transparent()
-                                .small(),
-                        ),
+            .gap(px(1.0))
+            .rounded(px(7.0))
+            .bg(c_field)
+            .border_1()
+            .border_color(if find_focused { c_accent } else { c_border })
+            .overflow_hidden()
+            .child(EditorInput::new(&self.search_input).transparent().small())
+            .child(toggle(
+                "search-case",
+                "Aa",
+                !self.case_insensitive,
+                "区分大小写",
+                cx,
+            ))
+            .child(toggle("search-word", "ab", self.whole_word, "全字匹配", cx))
+            .child(toggle(
+                "search-regex",
+                ".*",
+                self.use_regex,
+                "正则表达式",
+                cx,
+            ));
+
+        let find_row = div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap(px(4.0))
+            .child(find_field)
+            .child(counter)
+            // 弹性空白：把导航/关闭按钮推到卡片右侧。
+            .child(div().flex_1().min_w(px(2.0)))
+            .child(
+                icon_btn(
+                    "search-prev",
+                    "icons/search-chevron-left.svg",
+                    "上一个 (Shift+Enter)",
+                    cx,
                 )
-                .child(
-                    Button::new("search-replace-one")
-                        .label("替换")
-                        .small()
-                        .disabled(!has_matches)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.replace_next(window, cx);
-                        })),
+                .disabled(!has_matches)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.jump(-1, window, cx);
+                })),
+            )
+            .child(
+                icon_btn(
+                    "search-next",
+                    "icons/search-chevron-right.svg",
+                    "下一个 (Enter)",
+                    cx,
                 )
-                .child(
-                    Button::new("search-replace-all")
-                        .label("全部替换")
-                        .small()
-                        .disabled(!has_matches)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.replace_all(window, cx);
-                        })),
+                .disabled(!has_matches)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.jump(1, window, cx);
+                })),
+            )
+            .child(
+                icon_btn("search-close", "icons/search-xmark.svg", "关闭 (Esc)", cx).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.on_action_escape(&Escape, window, cx);
+                    }),
+                ),
+            );
+
+        // ---- 替换行：内嵌保留大小写开关的替换输入框 + 替换当前/全部替换。
+        let preserve_toggle = toggle(
+            "search-preserve-case",
+            "Aa",
+            self.preserve_case,
+            "替换时保留大小写",
+            cx,
+        );
+        let replace_field = div()
+            .w(px(344.0))
+            .flex_shrink(1.0)
+            .min_w(px(200.0))
+            .h(px(28.0))
+            .pl(px(8.0))
+            .pr(px(3.0))
+            .flex()
+            .items_center()
+            .gap(px(1.0))
+            .rounded(px(7.0))
+            .bg(c_field)
+            .border_1()
+            .border_color(if replace_focused { c_accent } else { c_border })
+            .overflow_hidden()
+            .child(EditorInput::new(&self.replace_input).transparent().small())
+            .child(preserve_toggle);
+
+        let action_disabled = !has_matches;
+        let replace_row = div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap(px(4.0))
+            .child(replace_field)
+            .child(
+                icon_btn(
+                    "search-replace-one",
+                    "icons/search-replace.svg",
+                    "替换当前",
+                    cx,
                 )
-            });
+                .disabled(action_disabled)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.replace_next(window, cx);
+                })),
+            )
+            .child(
+                icon_btn(
+                    "search-replace-all",
+                    "icons/search-replace-all.svg",
+                    "全部替换",
+                    cx,
+                )
+                .disabled(action_disabled)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.replace_all(window, cx);
+                })),
+            );
+
+        // ---- 左侧折叠开关（⌄ / ›）：细长竖条，高度为两行整体的 90%，
+        // 垂直居中；不用 Button（其尺寸表会强制方形），直接用 div 实现。
+        let disclosure = div()
+            .id("search-toggle-replace")
+            .w(px(24.0))
+            .h(relative(0.9))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(allow_replace, |this| {
+                this.hover(|this| this.bg(c_hover))
+                    .active(|this| this.bg(c_hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.replace_mode = !this.replace_mode;
+                        let focus_handle = if this.replace_mode {
+                            this.replace_input.read(cx).focus_handle.clone()
+                        } else {
+                            this.search_input.read(cx).focus_handle.clone()
+                        };
+                        window.focus(&focus_handle, cx);
+                        cx.notify();
+                    }))
+            })
+            .when(!allow_replace, |this| this.opacity(0.4))
+            .child(
+                Icon::new(if replace_visible {
+                    "icons/search-chevron-down.svg"
+                } else {
+                    "icons/search-chevron-right.svg"
+                })
+                .size(Size::Size(px(13.5))),
+            );
+
+        let rows = div()
+            .flex()
+            .w_full()
+            // 折叠开关沟槽：从卡片左边界到输入框左边界（负外边距抵消
+            // 卡片内边距），开关在此区间内严格水平居中。
+            .child(
+                div()
+                    .ml(px(-10.0))
+                    .w(px(33.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(disclosure),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(px(6.0))
+                    .child(find_row)
+                    .when(replace_visible, |this| this.child(replace_row)),
+            );
 
         div()
             .id("search-panel")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle(cx))
+            // 阻断鼠标事件冒泡：面板悬浮在编辑器内部，若不拦截，点击面板
+            // （含 ‹/› 按钮）会同时触发编辑器的 on_mouse_down，把编辑器光标
+            // 移到面板对应的坐标处并引发竞争滚动，导致跳转错乱/延迟。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .on_action(cx.listener(Self::on_action_enter))
             .on_action(cx.listener(Self::on_action_escape))
             .on_action(cx.listener(Self::on_action_tab))
             .on_action(cx.listener(Self::on_action_search_previous))
-            .w_full()
-            .child(
-                // 卡片主体：悬浮于编辑器右上角（定位由外层 input.rs 提供）
-                div()
-                    .w(px(480.0))
-                    .max_w_full()
-                    .rounded(px(8.0))
-                    .bg(c_panel)
-                    .border_1()
-                    .border_color(c_border)
-                    .shadow_lg()
-                    .px(px(10.0))
-                    .py(px(8.0))
-                    .child(
-                        // 第一行：替换展开箭头 + 查找输入 + 计数 + 开关 + 导航 + 关闭
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                Button::new("search-toggle-replace")
-                                    .label(if self.replace_mode { "⌄" } else { "›" })
-                                    .compact()
-                                    .tooltip("切换替换模式")
-                                    .disabled(!allow_replace)
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(c_elevated)
-                                            .foreground(c_text_muted)
-                                            .hover(c_hover),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.replace_mode = !this.replace_mode;
-                                        if this.replace_mode {
-                                            this.replace_input
-                                                .read(cx)
-                                                .focus_handle
-                                                .clone()
-                                                .focus(window, cx);
-                                        } else {
-                                            this.search_input
-                                                .read(cx)
-                                                .focus_handle
-                                                .clone()
-                                                .focus(window, cx);
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(search_row)
-                            .child(counter)
-                            .child(case_toggle)
-                            .child(word_toggle)
-                            .child(regex_toggle)
-                            .child(
-                                nav_button("search-prev", "‹", cx).on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.jump(-1, window, cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                nav_button("search-next", "›", cx).on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.jump(1, window, cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                Button::new("search-close")
-                                    .label("✕")
-                                    .compact()
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(c_elevated)
-                                            .foreground(c_text_muted)
-                                            .hover(c_hover)
-                                            .active(c_error),
-                                    )
-                                    .tooltip("关闭 (Esc)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.on_action_escape(&Escape, window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(replace_row),
-            )
+            .w(px(550.0))
+            .max_w_full()
+            .rounded(px(8.0))
+            .bg(c_card)
+            .shadow_lg()
+            .px(px(10.0))
+            .py(px(8.0))
+            .child(rows)
             .into_any_element()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,16 +1024,16 @@ mod tests {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("Hello 世界 this is a Is test string."));
         matcher.update_query("Is", true, false);
-        assert_eq!(matcher.label(), "1/3");
+        assert_eq!(matcher.label(), "第1项，共3项");
         matcher.next();
-        assert_eq!(matcher.label(), "2/3");
+        assert_eq!(matcher.label(), "第2项，共3项");
         matcher.next();
-        assert_eq!(matcher.label(), "3/3");
+        assert_eq!(matcher.label(), "第3项，共3项");
         matcher.next();
-        assert_eq!(matcher.label(), "1/3");
+        assert_eq!(matcher.label(), "第1项，共3项");
 
         matcher.update_query("IS", false, false);
-        assert_eq!(matcher.label(), "0/0");
+        assert_eq!(matcher.label(), "无结果");
     }
 
     #[test]
@@ -926,7 +1080,7 @@ mod tests {
 
         assert_eq!(matcher.len(), 2);
         assert_eq!(matcher.current_match_ix, 1);
-        assert_eq!(matcher.label(), "2/2");
+        assert_eq!(matcher.label(), "第2项，共2项");
         assert!(!matcher.replacing);
     }
 }
@@ -972,5 +1126,93 @@ mod extended_tests {
         assert_eq!(m.current_match_ix, 1);
         m.update_cursor_by_offset(6); // 命中第一个匹配内部
         assert_eq!(m.current_match_ix, 0);
+    }
+}
+
+#[cfg(test)]
+mod case_preservation_tests {
+    use super::apply_case_preservation;
+
+    #[test]
+    fn disabled_passthrough() {
+        assert_eq!(apply_case_preservation("bar", "Foo", false), "bar");
+    }
+
+    #[test]
+    fn all_uppercase_match_yields_uppercase_replacement() {
+        assert_eq!(apply_case_preservation("bar", "FOO", true), "BAR");
+        // 无大写字母的匹配保持原样
+        assert_eq!(apply_case_preservation("bar", "foo", true), "bar");
+    }
+
+    #[test]
+    fn capitalized_match_capitalizes_first_letter() {
+        assert_eq!(apply_case_preservation("bar", "Foo", true), "Bar");
+        assert_eq!(apply_case_preservation("bar_baz", "Foo", true), "Bar_baz");
+    }
+
+    #[test]
+    fn mixed_or_non_alpha_match_passthrough() {
+        assert_eq!(apply_case_preservation("bar", "fOo", true), "bar");
+        assert_eq!(apply_case_preservation("bar", "123", true), "bar");
+    }
+
+    #[test]
+    fn empty_inputs_passthrough() {
+        assert_eq!(apply_case_preservation("", "FOO", true), "");
+        assert_eq!(apply_case_preservation("bar", "", true), "bar");
+    }
+
+    #[test]
+    fn multibyte_replacement() {
+        assert_eq!(apply_case_preservation("héllo", "WÖRD", true), "HÉLLO");
+    }
+}
+
+#[cfg(test)]
+mod jump_target_tests {
+    use super::jump_target;
+
+    // 匹配：M0=0..2, M1=5..7, M2=10..12, M3=15..17
+    const RANGES: &[std::ops::Range<usize>] = &[0..2, 5..7, 10..12, 15..17];
+
+    #[test]
+    fn forward_walks_all_matches_then_wraps() {
+        // caret=0 在 M0 内 → 「下一个」是 M1；依次走到末尾后回绕到 M0
+        assert_eq!(jump_target(RANGES, 0, 1), Some(1));
+        assert_eq!(jump_target(RANGES, 5, 1), Some(2));
+        assert_eq!(jump_target(RANGES, 10, 1), Some(3));
+        assert_eq!(jump_target(RANGES, 15, 1), Some(0)); // 回绕
+    }
+
+    #[test]
+    fn backward_from_match_start_goes_to_previous_match() {
+        // 关键回归用例：跳到某匹配后选区在其起点，此时按上一个必须
+        // 前移而不是停留在原匹配（旧实现会卡死在同一项）。
+        assert_eq!(jump_target(RANGES, 5, -1), Some(0)); // 在 M1 起点 → M0
+        assert_eq!(jump_target(RANGES, 10, -1), Some(1));
+        assert_eq!(jump_target(RANGES, 15, -1), Some(2));
+    }
+
+    #[test]
+    fn backward_wraps_from_first_to_last() {
+        assert_eq!(jump_target(RANGES, 0, -1), Some(3)); // 在 M0 起点 → 最后一个
+        assert_eq!(jump_target(RANGES, 1, -1), Some(3)); // 在 M0 内部任意位置同理
+    }
+
+    #[test]
+    fn anchors_by_caret_when_outside_any_match() {
+        // caret 位于两个匹配之间：下一个 = 后面那个；上一个 = 前面那个
+        assert_eq!(jump_target(RANGES, 8, 1), Some(2));
+        assert_eq!(jump_target(RANGES, 8, -1), Some(1));
+        // caret 在所有匹配之前 / 之后
+        assert_eq!(jump_target(RANGES, 20, 1), Some(0));
+        assert_eq!(jump_target(RANGES, 20, -1), Some(3));
+    }
+
+    #[test]
+    fn empty_ranges_yields_none() {
+        assert_eq!(jump_target(&[], 0, 1), None);
+        assert_eq!(jump_target(&[], 0, -1), None);
     }
 }

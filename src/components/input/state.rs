@@ -1782,6 +1782,74 @@ impl InputState {
         cx.notify();
     }
 
+    /// 滚动使给定偏移所在行垂直居中（搜索匹配跳转用）。
+    ///
+    /// 与 [`Self::scroll_to`] 的区别：不保留边缘可见性，而是把目标行
+    /// 对齐到视口中部；水平方向沿用同样的「保证可见」逻辑。
+    pub(crate) fn scroll_to_center(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(last_layout) = self.last_layout.as_ref() else {
+            return;
+        };
+        let Some(bounds) = self.last_bounds.as_ref() else {
+            return;
+        };
+
+        let line_height = last_layout.line_height;
+        let point = self.text.offset_to_point(offset);
+        let row = point.row;
+
+        let mut row_offset_y = px(0.);
+        for (ix, _wrap_line) in self.display_map.lines().iter().enumerate() {
+            if ix == row {
+                break;
+            }
+
+            // Only accumulate height for visible (non-folded) wrap rows
+            let visible_wrap_rows = self.display_map.visible_wrap_row_count_for_buffer_line(ix);
+            row_offset_y += line_height * visible_wrap_rows;
+        }
+        if let Some(line) = last_layout
+            .lines
+            .get(row.saturating_sub(last_layout.visible_range.start))
+        {
+            if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
+                row_offset_y += pos.y;
+            }
+        }
+
+        let mut scroll_offset = self.scroll_handle.offset();
+
+        // 垂直：目标行中心对齐视口中心。
+        let viewport_height = bounds.size.height;
+        scroll_offset.y = -(row_offset_y + line_height.half() - viewport_height.half());
+
+        // 水平：与 scroll_to 相同，仅保证目标列可见。
+        let safety_margin = if last_layout.text_align == TextAlign::Left {
+            RIGHT_MARGIN
+        } else {
+            CURSOR_WIDTH
+        };
+        if let Some(line) = last_layout
+            .lines
+            .get(row.saturating_sub(last_layout.visible_range.start))
+        {
+            if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
+                let bounds_width = bounds.size.width - last_layout.line_number_width;
+                let col_offset_x = pos.x;
+                if col_offset_x - safety_margin < -scroll_offset.x {
+                    scroll_offset.x = -col_offset_x + safety_margin;
+                } else if col_offset_x + safety_margin > -scroll_offset.x + bounds_width {
+                    scroll_offset.x = -(col_offset_x - bounds_width + safety_margin);
+                }
+            }
+        }
+
+        scroll_offset.x = scroll_offset.x.min(px(0.));
+        scroll_offset.y = scroll_offset.y.min(px(0.));
+        self.deferred_scroll_offset = Some(scroll_offset);
+        cx.notify();
+    }
+
     pub(crate) fn show_character_palette(
         &mut self,
         _: &ShowCharacterPalette,
