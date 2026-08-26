@@ -2047,6 +2047,11 @@ impl Terminal {
                 self.scroll_px = px(0.);
                 None
             }
+            /* Reset scroll state when the touch is cancelled */
+            gpui::TouchPhase::Cancelled => {
+                self.scroll_px = px(0.);
+                None
+            }
             /* Calculate the appropriate scroll lines */
             gpui::TouchPhase::Moved => {
                 let old_offset = (self.scroll_px / line_height) as i32;
