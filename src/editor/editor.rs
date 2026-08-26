@@ -13,7 +13,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::notification::NotificationKind;
-use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
+use crate::workspace::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::encoding::{self, FileEncoding};
 use crate::editor::git_marks::compute_git_line_marks;
 use crate::editor::git_repository::GitRepository;

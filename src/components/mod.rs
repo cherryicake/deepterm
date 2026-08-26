@@ -9,7 +9,6 @@ pub mod modal;
 pub mod notification;
 pub mod spinner;
 pub mod stepper;
-pub mod tab_bar;
 pub mod title_bar;
 
 /// Initialize the components.

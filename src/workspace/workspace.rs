@@ -19,7 +19,7 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, BroadcastMsg)>> 
 }
 
 use crate::components::button::Icon as MenuIcon;
-use crate::components::tab_bar::{
+use crate::workspace::tab_bar::{
     CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
 };
 use crate::file_manager::TransferStatusReporter;

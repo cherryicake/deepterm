@@ -17,7 +17,7 @@ use gpui::{
     WindowControlArea, div, px,
 };
 
-use crate::components::tab_bar::TabBar;
+use crate::workspace::tab_bar::TabBar;
 use crate::theme::ActiveTheme;
 use crate::workspace::workspace::Workspace;
 
