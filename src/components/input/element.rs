@@ -21,7 +21,8 @@ use super::{
     GitLineMark, InputState, LastLayout, ScrollbarGeometry, WhitespaceIndicators,
     mode::InputMode,
     state::{
-        RAINBOW_BRACKETS_MAX_TEXT_LEN, bracket_depth_spans, indent_level_bounds,
+        RAINBOW_BRACKETS_MAX_TEXT_LEN, indent_level_bounds, scan_bracket_spans_text,
+        scan_bracket_spans_tree,
     },
 };
 
@@ -851,14 +852,17 @@ impl TextElement {
     }
 
     /// 括号着色：把可见范围内的括号字符按嵌套层级覆盖为 rainbow 色。
-    /// 扫描结果按 text_version 缓存，避免每帧全文件扫描。
+    ///
+    /// 优先用 tree-sitter 树扫描（字符串/注释内的括号不参与计数，避免深度被污染），
+    /// 无树时退回纯文本扫描；配对算法一致：类型配对 + 交错容忍，未配对标错误色。
+    /// 结果按 (text_version, 树指纹) 缓存，树后台重解析落地后自动失效。
     fn merge_rainbow_brackets(
         &self,
         styles: Option<Vec<(Range<usize>, HighlightStyle)>>,
         visible: &Range<usize>,
         cx: &mut App,
     ) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
-        let (enabled, text, version) = {
+        let (enabled, text, version, highlighter) = {
             let state = self.state.read(cx);
             (
                 state.rainbow_brackets
@@ -867,6 +871,10 @@ impl TextElement {
                     && state.external_highlight_runs.is_none(),
                 state.text.clone(),
                 state.text_version,
+                match &state.mode {
+                    InputMode::CodeEditor { highlighter, .. } => Some(highlighter.clone()),
+                    _ => None,
+                },
             )
         };
         if !enabled || text.len() > RAINBOW_BRACKETS_MAX_TEXT_LEN {
@@ -874,34 +882,51 @@ impl TextElement {
         }
         let mut styles = styles?;
 
-        // 缓存命中
+        // 树指纹：树被替换（后台解析落地/换语言）时变化，缓存随之失效
+        let tree_key = highlighter
+            .as_ref()
+            .and_then(|h| h.borrow().as_ref().and_then(|h| h.tree().map(|t| t.root_node().id())));
         let cached = {
             let state = self.state.read(cx);
             match &state.rainbow_cache {
-                Some((v, spans)) if *v == version => Some(spans.clone()),
+                Some((v, k, spans)) if *v == version && *k == tree_key => Some(spans.clone()),
                 _ => None,
             }
         };
         let spans = match cached {
             Some(spans) => spans,
             None => {
-                let computed = std::rc::Rc::new(bracket_depth_spans(&text, text.len()));
+                let computed = match highlighter
+                    .as_ref()
+                    .and_then(|h| h.borrow().as_ref().and_then(|h| h.tree().cloned()))
+                {
+                    Some(tree) => scan_bracket_spans_tree(&tree),
+                    None => scan_bracket_spans_text(&text),
+                };
+                let computed = std::rc::Rc::new(computed);
                 self.state.update(cx, |state, _| {
-                    state.rainbow_cache = Some((version, computed.clone()));
+                    state.rainbow_cache = Some((version, tree_key, computed.clone()));
                 });
                 computed
             }
         };
 
         let dark = cx.theme().appearance.is_dark();
+        let error_color = cx.theme().error;
         let rainbow: Vec<(Range<usize>, HighlightStyle)> = spans
             .iter()
-            .filter(|(r, _, _)| r.start >= visible.start && r.end <= visible.end)
-            .map(|(r, _, d)| {
+            .filter(|(r, _, _, _)| r.start >= visible.start && r.end <= visible.end)
+            .map(|(r, d, is_open, matched)| {
+                // 游离闭括号标错误色；未闭合的开括号保持层级色（避免输入时闪红）
+                let color = if *matched || *is_open {
+                    Self::rainbow_bracket_color(*d, dark)
+                } else {
+                    error_color
+                };
                 (
                     r.clone(),
                     HighlightStyle {
-                        color: Some(Self::rainbow_bracket_color(*d, dark)),
+                        color: Some(color),
                         ..Default::default()
                     },
                 )
@@ -2015,7 +2040,7 @@ impl Element for TextElement {
             search_match_paths,
             bracket_paths,
             occurrence_paths,
-            sticky_lines: Vec::new(),
+            sticky_lines,
             fold_icon_layout,
         };
 

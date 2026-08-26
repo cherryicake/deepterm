@@ -265,33 +265,115 @@ fn find_word_occurrences(
     Some(result)
 }
 
-/// 括号嵌套深度扫描结果：每个括号字节的 (字节范围, 是否开括号, 自身层级)。
-///
-/// 层级取括号自身的嵌套层级（最外层 = 0，闭括号取其配对开括号的层级）。
-/// 只扫到 `scan_end`（用于缓存全文件后按可见范围过滤）。
-pub(crate) fn bracket_depth_spans(text: &Rope, scan_end: usize) -> Vec<(Range<usize>, bool, usize)> {
-    let mut result = Vec::new();
-    let mut depth = 0usize;
-    let scan_end = scan_end.min(text.len());
-    if scan_end == 0 {
-        return result;
+/// ASCII 括号字符：开括号返回 None，闭括号返回对应的开括号。
+fn matching_open(b: u8) -> Option<u8> {
+    match b {
+        b')' => Some(b'('),
+        b']' => Some(b'['),
+        b'}' => Some(b'{'),
+        _ => None,
     }
-    for (i, b) in text.slice(0..scan_end).bytes().enumerate() {
-        match b {
-            b'(' | b'[' | b'{' => {
-                result.push((i..i + 1, true, depth));
-                depth += 1;
-            }
-            b')' | b']' | b'}' => {
-                if depth > 0 {
-                    depth -= 1;
+}
+
+/// 对有序括号 token 序列做配对着色（VSCode Rainbow Brackets 同款算法）。
+///
+/// - 类型配对：`([)]` 交错时弹栈直到同类开括号，保证配对双方同色
+/// - 游离闭括号（无同类开括号）与直到结尾未闭合的开括号都标 `matched = false`
+///   （渲染上游离闭括号标错误色，未闭合开括号保持层级色，避免输入时闪红）
+///
+/// `tokens`: (字节偏移, 是否开括号, 括号字符)，必须按偏移升序。
+/// 返回每个括号的 (范围, 层级, 是否开括号, 是否配对)。
+pub(crate) fn pair_bracket_tokens(
+    tokens: &[(usize, bool, u8)],
+) -> Vec<(Range<usize>, usize, bool, bool)> {
+    // (开括号 span 下标, 开括号字符)
+    let mut stack: Vec<(usize, u8)> = Vec::new();
+    // (范围, 层级, 是否开括号, 是否配对)
+    let mut spans: Vec<(Range<usize>, usize, bool, bool)> = Vec::with_capacity(tokens.len());
+
+    for &(offset, is_open, ch) in tokens {
+        if is_open {
+            let depth = stack.len();
+            spans.push((offset..offset + 1, depth, true, false));
+            stack.push((spans.len() - 1, ch));
+        } else {
+            let Some(want) = matching_open(ch) else {
+                continue;
+            };
+            // 弹栈直到找到同类开括号（容忍交错）；被跨越的开括号视为未配对
+            while let Some(&(_, open_ch)) = stack.last() {
+                if open_ch == want {
+                    break;
                 }
-                result.push((i..i + 1, false, depth));
+                stack.pop();
             }
+            if let Some(&(ix, _)) = stack.last() {
+                stack.pop();
+                spans[ix].3 = true;
+                let depth = stack.len();
+                spans.push((offset..offset + 1, depth, false, true));
+            } else {
+                // 游离闭括号
+                spans.push((offset..offset + 1, stack.len(), false, false));
+            }
+        }
+    }
+    spans
+}
+
+/// 纯文本括号扫描（无语法树时的 fallback）：不区分字符串/注释，
+/// 但配对算法与 tree 版一致（类型配对 + 交错容忍）。
+pub(crate) fn scan_bracket_spans_text(
+    text: &Rope,
+) -> Vec<(Range<usize>, usize, bool, bool)> {
+    let mut tokens = Vec::new();
+    for (i, b) in text.bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => tokens.push((i, true, b)),
+            b')' | b']' | b'}' => tokens.push((i, false, b)),
             _ => {}
         }
     }
-    result
+    pair_bracket_tokens(&tokens)
+}
+
+/// 从 tree-sitter 语法树收集括号 token：只把「独立叶子 token」的括号算作代码括号，
+/// 字符串/注释内部的括号（它们是 string/comment 原子节点的一部分）天然被排除。
+///
+/// tree-sitter 匿名 token 的 kind 就是字面文本，故 `kind() == "("` 即括号 token。
+pub(crate) fn scan_bracket_spans_tree(
+    tree: &tree_sitter::Tree,
+) -> Vec<(Range<usize>, usize, bool, bool)> {
+    let mut tokens = Vec::new();
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        if node.child_count() == 0 {
+            match node.kind() {
+                "(" | "[" | "{" => {
+                    tokens.push((node.start_byte(), true, node.kind().as_bytes()[0]))
+                }
+                ")" | "]" | "}" => {
+                    tokens.push((node.start_byte(), false, node.kind().as_bytes()[0]))
+                }
+                _ => {}
+            }
+        }
+
+        // 深度优先遍历
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'walk;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    pair_bracket_tokens(&tokens)
 }
 
 /// 括号匹配的单向扫描上限（字节），防止超大文件下卡顿。
@@ -583,9 +665,13 @@ pub struct InputState {
     pub(crate) occurrence_cache: Option<OccurrenceCache>,
     /// 括号着色（rainbow brackets，按嵌套深度分色）。
     pub(crate) rainbow_brackets: bool,
-    /// 括号着色缓存：键为 text_version，值为全文件括号层级扫描结果。
-    pub(crate) rainbow_cache:
-        Option<(u64, std::rc::Rc<Vec<(Range<usize>, bool, usize)>>)>,
+    /// 括号着色缓存：(text_version, 语法树根指纹（无树时 None）, 全文件括号着色结果)。
+    /// 着色结果元素为 (范围, 层级, 是否开括号, 是否配对)。
+    pub(crate) rainbow_cache: Option<(
+        u64,
+        Option<usize>,
+        std::rc::Rc<Vec<(Range<usize>, usize, bool, bool)>>,
+    )>,
     /// 缩进参考线。
     pub(crate) indent_guides: bool,
     /// 悬浮滚动条。
@@ -2059,7 +2145,6 @@ impl InputState {
         // 选区/光标映射：行内 insert_point 之后的偏移叠加本行 delta，
         // 后续行叠加之前行的累计 delta
         let remap = |offset: usize| -> usize {
-            let mut result = offset;
             let mut cumulative: isize = 0;
             for (i, (orig_start, new_start, delta, insert_point)) in line_maps.iter().enumerate() {
                 let line_len = raw_lines[i].len();
@@ -2069,8 +2154,7 @@ impl InputState {
                 if offset <= *orig_start + line_len {
                     let pos = offset - orig_start;
                     let adjusted = if pos > *insert_point { pos as isize + delta } else { pos as isize };
-                    result = span.start + new_start + adjusted as usize;
-                    return result;
+                    return span.start + new_start + adjusted as usize;
                 }
                 cumulative += delta;
             }
@@ -3970,37 +4054,88 @@ mod tests {
     }
 
     #[test]
-    fn bracket_depth_spans_scan() {
+    fn rainbow_pair_basic() {
         let rope = Rope::from_str("(a[b]{c})");
-        let spans = bracket_depth_spans(&rope, rope.len())
+        let spans = scan_bracket_spans_text(&rope)
             .into_iter()
-            .map(|(r, is_open, d)| (r.start, is_open, d))
+            .map(|(r, d, is_open, m)| (r.start, d, is_open, m))
             .collect::<Vec<_>>();
-        // ( 层级0，[ 层级1，] 层级1，{ 层级1，} 层级1，) 层级0
+        // ( 层级0，[ 层级1，] 层级1，{ 层级1，} 层级1，) 层级0，全部配对
         assert_eq!(
             spans,
             vec![
-                (0, true, 0),
-                (2, true, 1),
-                (4, false, 1),
-                (5, true, 1),
-                (7, false, 1),
-                (8, false, 0),
+                (0, 0, true, true),
+                (2, 1, true, true),
+                (4, 1, false, true),
+                (5, 1, true, true),
+                (7, 1, false, true),
+                (8, 0, false, true),
             ]
         );
+    }
 
-        // 多余闭括号深度不归负
-        let rope = Rope::from_str(")((");
-        let spans = bracket_depth_spans(&rope, rope.len());
-        assert_eq!(spans.len(), 3);
-        assert_eq!(spans[0].2, 0); // 多余的 ) 归 0 层
-        assert_eq!(spans[1].2, 0);
-        assert_eq!(spans[2].2, 1);
-
-        // 扫描截至 scan_end
-        let rope = Rope::from_str("(()");
-        let spans = bracket_depth_spans(&rope, 2);
+    #[test]
+    fn rainbow_pair_unmatched() {
+        // 游离闭括号 → 未配对，深度 0
+        let rope = Rope::from_str(")(");
+        let spans = scan_bracket_spans_text(&rope);
         assert_eq!(spans.len(), 2);
+        assert_eq!(
+            (spans[0].0.start, spans[0].1, spans[0].2, spans[0].3),
+            (0, 0, false, false)
+        );
+        assert_eq!(
+            (spans[1].0.start, spans[1].1, spans[1].2, spans[1].3),
+            (1, 0, true, false)
+        );
+
+        // 未闭合的开括号 → 未配对（但保留层级，渲染不标红）
+        let rope = Rope::from_str("(((");
+        let spans = scan_bracket_spans_text(&rope);
+        assert!(spans.iter().all(|(_, _, _, m)| !m));
+        assert_eq!(spans[2].1, 2); // 第三个 ( 在第 2 层
+    }
+
+    #[test]
+    fn rainbow_pair_interleaved() {
+        // 交错括号 ([)]：配对算法保证 ( 与 ) 同色（层级 0），[ 与 ] 被跨越 → 未配对
+        let rope = Rope::from_str("([)]");
+        let spans = scan_bracket_spans_text(&rope)
+            .into_iter()
+            .map(|(r, d, is_open, m)| (r.start, d, is_open, m))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            vec![
+                (0, 0, true, true),
+                (1, 1, true, false),
+                (2, 0, false, true),
+                (3, 0, false, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn rainbow_tree_scan_excludes_strings_and_comments() {
+        // rust 语法树：字符串/注释里的括号不应参与 rainbow
+        let code = r#"fn main() {
+    let s = "a)b(c";
+    // ) comment
+    let v = (1 + 2);
+}
+"#;
+        let mut h = crate::editor::syntax::SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        assert!(h.update(None, &rope, None));
+        let tree = h.tree().expect("rust tree");
+        let spans = scan_bracket_spans_tree(tree);
+        let starts: Vec<usize> = spans.iter().map(|(r, _, _, _)| r.start).collect();
+        // 只应有 main 的 ()、(1+2) 的 () 和函数体的 {}
+        assert_eq!(starts, vec![7, 8, 10, 62, 68, 71]);
+        assert!(spans.iter().all(|(_, _, _, m)| *m));
+
+        // 纯文本扫描则会计入字符串/注释里的括号（fallback 行为，共 9 个）
+        assert_eq!(scan_bracket_spans_text(&rope).len(), 9);
     }
 
     #[test]
