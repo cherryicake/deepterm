@@ -179,7 +179,9 @@ impl Language {
             ),
             Self::C => (
                 tree_sitter_c::LANGUAGE,
-                tree_sitter_c::HIGHLIGHT_QUERY,
+                // Vendored: official query without the `(identifier) @variable`
+                // catch-all, which would override function definition names.
+                include_str!("languages/c/highlights.scm"),
                 "",
                 "",
             ),
@@ -197,7 +199,9 @@ impl Language {
             ),
             Self::Python => (
                 tree_sitter_python::LANGUAGE,
-                tree_sitter_python::HIGHLIGHTS_QUERY,
+                // Vendored: official query without the `(identifier) @variable`
+                // catch-all, which would override def/class names.
+                include_str!("languages/python/highlights.scm"),
                 "",
                 "",
             ),
@@ -227,7 +231,9 @@ impl Language {
             ),
             Self::Lua => (
                 tree_sitter_lua::LANGUAGE,
-                tree_sitter_lua::HIGHLIGHTS_QUERY,
+                // Vendored: official query without the `(identifier) @variable`
+                // catch-all, which would override function definition names.
+                include_str!("languages/lua/highlights.scm"),
                 "",
                 "",
             ),
@@ -245,13 +251,20 @@ impl Language {
             ),
             Self::Tsx => (
                 tree_sitter_typescript::LANGUAGE_TSX,
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                // NOTE: the crate's `HIGHLIGHTS_QUERY` is only the ~35-line
+                // TS-specific *addition* (types, params, keywords) without the
+                // JavaScript base rules — using it alone leaves .tsx files
+                // almost unhighlighted. Use the combined query (TS rules +
+                // JSX rules) instead.
+                include_str!("languages/tsx/highlights.scm"),
                 "",
                 tree_sitter_typescript::LOCALS_QUERY,
             ),
             Self::Zig => (
                 tree_sitter_zig::LANGUAGE,
-                tree_sitter_zig::HIGHLIGHTS_QUERY,
+                // Vendored: official query without the `(identifier) @variable`
+                // catch-all, which would override function definition names.
+                include_str!("languages/zig/highlights.scm"),
                 include_str!("languages/zig/injections.scm"),
                 "",
             ),

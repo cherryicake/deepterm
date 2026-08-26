@@ -3,6 +3,12 @@
 
 (identifier) @variable
 
+; Uppercase identifiers are treated as types/classes. Kept right after the
+; catch-all so every specific rule below (functions, constants, calls…)
+; overrides it: same-node captures resolve "later pattern wins".
+((identifier) @type
+ (#match? @type "^[A-Z]"))
+
 ; Properties
 ;-----------
 
@@ -51,8 +57,16 @@
 ; Special identifiers
 ;--------------------
 
-((identifier) @type
- (#match? @type "^[A-Z]"))
+; Uppercase callees are constructors/components: `Person("a")`, `<App />`.
+; Rooted at the callee like the @function call rule above; pattern order
+; (this file) breaks the same-start tie in favor of this later rule.
+((call_expression
+  function: (identifier) @constructor)
+ (#match? @constructor "^[A-Z]"))
+
+; `new Foo()` — the constructor reference is a type/class.
+(new_expression
+  constructor: (identifier) @type)
 
 ([
   (identifier)

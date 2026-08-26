@@ -1,345 +1,233 @@
-;; Kotlin highlights — adapted from tree-sitter-kotlin-sg (nvim-treesitter)
-;; Remapped to the highlight names used by this project's registry.
+;; Kotlin highlights for the tree-sitter-kotlin-ng grammar (v1.1).
 ;;
-;; IMPORTANT: Pattern order matters. This project's highlighter keeps the
-;; FIRST capture name when multiple patterns match the same range. Therefore
-;; specific patterns (function, property, constant…) must appear BEFORE the
-;; generic `(simple_identifier) @variable` catch-all at the end of this file.
+;; IMPORTANT: Same-node captures resolve "later pattern wins" (the
+;; highlighter iterates with `captures()`, which yields in pattern order).
+;; The generic `(identifier) @variable` catch-all therefore comes FIRST and
+;; every specific pattern below overrides it.
 
-;;; Literals (no simple_identifier conflict — safe to place early)
+(identifier) @variable
+
+;; Uppercase identifiers as types/classes; overridden by the specific
+;; function/property rules below.
+((identifier) @type
+ (#match? @type "^[A-Z]"))
+
+;;; Comments
 
 [
 	(line_comment)
-	(multiline_comment)
-	(shebang_line)
+	(block_comment)
 ] @comment
 
-(real_literal) @number
-[
-	(integer_literal)
-	(long_literal)
-	(hex_literal)
-	(bin_literal)
-	(unsigned_literal)
-] @number
+;;; Literals
 
-[
-	(null_literal)
-	(boolean_literal)
-] @boolean
+(number_literal) @number
+(float_literal) @number
 
 (character_literal) @string
 
 (string_literal) @string
+(multiline_string_literal) @string
+(escape_sequence) @string.escape
 
-(character_escape_seq) @string.escape
+(string_literal (interpolation) @embedded)
+(multiline_string_literal (interpolation) @embedded)
 
-; Regex: "pattern".toRegex()
-(call_expression
-	(navigation_expression
-		((string_literal) @string.regex)
-		(navigation_suffix
-			((simple_identifier) @_function
-			(#eq? @_function "toRegex")))))
-
-; Regex: Regex("pattern")
-(call_expression
-	((simple_identifier) @_function
-	(#eq? @_function "Regex"))
-	(call_suffix
-		(value_arguments
-			(value_argument
-				(string_literal) @string.regex))))
-
-; Regex: Regex.fromLiteral("pattern")
-(call_expression
-	(navigation_expression
-		((simple_identifier) @_class
-		(#eq? @_class "Regex"))
-		(navigation_suffix
-			((simple_identifier) @_function
-			(#eq? @_function "fromLiteral"))))
-	(call_suffix
-		(value_arguments
-			(value_argument
-				(string_literal) @string.regex))))
-
-;;; Keywords
-
-(type_alias "typealias" @keyword)
-[
-	(class_modifier)
-	(member_modifier)
-	(function_modifier)
-	(property_modifier)
-	(platform_modifier)
-	(variance_modifier)
-	(parameter_modifier)
-	(visibility_modifier)
-	(reification_modifier)
-	(inheritance_modifier)
-] @keyword
-
-[
-	"val"
-	"var"
-	"enum"
-	"class"
-	"object"
-	"interface"
-	"companion"
-	"where"
-	"by"
-] @keyword
-
-("fun") @keyword
-
-(jump_expression) @keyword
-
-[
-	"if"
-	"else"
-	"when"
-] @keyword
-
-[
-	"for"
-	"do"
-	"while"
-] @keyword
-
-[
-	"try"
-	"catch"
-	"throw"
-	"finally"
-] @keyword
-
-;;; Annotations
-
-(annotation
-	"@" @attribute (use_site_target)? @attribute)
-(annotation
-	(user_type
-		(type_identifier) @attribute))
-(annotation
-	(constructor_invocation
-		(user_type
-			(type_identifier) @attribute)))
-
-(file_annotation
-	"@" @attribute "file" @attribute ":" @attribute)
-(file_annotation
-	(user_type
-		(type_identifier) @attribute))
-(file_annotation
-	(constructor_invocation
-		(user_type
-			(type_identifier) @attribute)))
-
-;;; Operators & Punctuation
-
-[
-	"!"
-	"!="
-	"!=="
-	"="
-	"=="
-	"==="
-	">"
-	">="
-	"<"
-	"<="
-	"||"
-	"&&"
-	"+"
-	"++"
-	"+="
-	"-"
-	"--"
-	"-="
-	"*"
-	"*="
-	"/"
-	"/="
-	"%"
-	"%="
-	"?."
-	"?:"
-	"!!"
-	"is"
-	"!is"
-	"in"
-	"!in"
-	"as"
-	"as?"
-	".."
-	"->"
-] @operator
-
-[
-	"(" ")"
-	"[" "]"
-	"{" "}"
-] @punctuation.bracket
-
-[
-	"."
-	","
-	";"
-	":"
-	"::"
-] @punctuation.delimiter
-
-(string_literal
-	"$" @punctuation.special
-	(interpolated_identifier) @variable)
-(string_literal
-	"${" @punctuation.special
-	(interpolated_expression)
-	"}" @punctuation.special)
+;; true/false/null are parsed as plain identifiers by this grammar
+((identifier) @boolean
+ (#any-of? @boolean "true" "false"))
+((identifier) @constant
+ (#eq? @constant "null"))
 
 ;;; Types
 
-(type_identifier) @type
+(user_type (identifier) @type)
 
-;;; Package & Imports
+((user_type (identifier) @type.builtin)
+ (#any-of? @type.builtin
+   "Int" "Long" "Short" "Byte" "Float" "Double" "Boolean" "Char" "String"
+   "Unit" "Any" "Nothing" "Array" "List" "Map" "Set"))
 
-(package_header
-	"package" @keyword
-	. (identifier) @type)
+;;; Functions
 
-(import_header
-	"import" @keyword)
+;; Function declarations: `fun name(...)`
+(function_declaration (identifier) @function)
 
-;;; Labels
+;; Function calls with a bare callee: `name(...)`
+(call_expression (identifier) @function)
 
-(label) @label
-
-;;; Function definitions
-
-(function_declaration
-	. (simple_identifier) @function)
-
-(getter
-	("get") @function)
-(setter
-	("set") @function)
-
-(primary_constructor) @constructor
-(secondary_constructor
-	("constructor") @constructor)
-
-(constructor_invocation
-	(user_type
-		(type_identifier) @constructor))
-
-(anonymous_initializer
-	("init") @constructor)
-
-;;; Function calls — must appear before the generic @variable catch-all
-
-; function()
+;; Method calls: `obj.name(...)` / `a.b.name(...)`
 (call_expression
-	. (simple_identifier) @function)
-
-; object.function() or object.property.function()
+	(navigation_expression (identifier) "." (identifier) @function))
 (call_expression
-	(navigation_expression
-		(navigation_suffix
-			(simple_identifier) @function) . ))
+	(navigation_expression (navigation_expression) "." (identifier) @function))
 
-(call_expression
-	. (simple_identifier) @function
-    (#any-of? @function
-		"arrayOf"
-		"arrayOfNulls"
-		"byteArrayOf"
-		"shortArrayOf"
-		"intArrayOf"
-		"longArrayOf"
-		"ubyteArrayOf"
-		"ushortArrayOf"
-		"uintArrayOf"
-		"ulongArrayOf"
-		"floatArrayOf"
-		"doubleArrayOf"
-		"booleanArrayOf"
-		"charArrayOf"
-		"emptyArray"
-		"mapOf"
-		"setOf"
-		"listOf"
-		"emptyMap"
-		"emptySet"
-		"emptyList"
-		"mutableMapOf"
-		"mutableSetOf"
-		"mutableListOf"
-		"print"
-		"println"
-		"error"
-		"TODO"
-		"run"
-		"runCatching"
-		"repeat"
-		"lazy"
-		"lazyOf"
-		"enumValues"
-		"enumValueOf"
-		"assert"
-		"check"
-		"checkNotNull"
-		"require"
-		"requireNotNull"
-		"with"
-		"suspend"
-		"synchronized"
-))
+;; Constructor-style calls (uppercase callee): `Person(...)`
+((call_expression (identifier) @constructor)
+ (#match? @constructor "^[A-Z]"))
 
-;;; Identifiers — specific patterns before the catch-all
+;; Built-in top-level functions
+((identifier) @function.builtin
+ (#any-of? @function.builtin "println" "print" "error" "require" "check" "TODO"))
 
-(enum_entry
-	(simple_identifier) @constant)
+;;; Properties / parameters
 
-(class_parameter
-	(simple_identifier) @property)
+;; Property declarations: `val/var name`
+(property_declaration
+	(variable_declaration (identifier) @property))
 
-(class_body
-	(property_declaration
-		(variable_declaration
-			(simple_identifier) @property)))
+;; Class properties (primary constructor): `class Foo(val name: String)`
+(class_parameter (identifier) @property)
 
-(_
-	(navigation_suffix
-		(simple_identifier) @property))
+;; Function parameters
+(parameter (identifier) @variable.parameter)
 
-(parameter
-	(simple_identifier) @variable)
+;; Named call arguments: `f(x = 1)`
+(value_argument (identifier) @property "=")
 
-(parameter_with_optional_type
-	(simple_identifier) @variable)
+;; Field access: `obj.field` (last segment only; the receiver keeps its own style)
+(navigation_expression (identifier) "." (identifier) @property)
 
-(lambda_literal
-	(lambda_parameters
-		(variable_declaration
-			(simple_identifier) @variable)))
+;;; Class-like declarations
 
-; `this` / `super` keywords
+(class_declaration (identifier) @type)
+(object_declaration (identifier) @type)
+(type_alias (identifier) @type)
+(enum_entry (identifier) @variant)
+
+;;; Modifiers & keywords
+
+[
+	"package"
+	"import"
+	"class"
+	"object"
+	"interface"
+	"enum"
+	"fun"
+	"val"
+	"var"
+	"when"
+	"if"
+	"else"
+	"for"
+	"while"
+	"do"
+	"try"
+	"catch"
+	"finally"
+	"throw"
+	"return"
+	"is"
+	"in"
+	"as"
+	"by"
+	"where"
+	"init"
+	"constructor"
+	"companion"
+	"override"
+	"open"
+	"abstract"
+	"final"
+	"private"
+	"protected"
+	"internal"
+	"public"
+	"suspend"
+	"inline"
+	"noinline"
+	"crossinline"
+	"operator"
+	"infix"
+	"external"
+	"lateinit"
+	"const"
+	"vararg"
+	"out"
+	"typealias"
+	"get"
+	"set"
+] @keyword
+
+(visibility_modifier) @keyword
+(inheritance_modifier) @keyword
+(member_modifier) @keyword
+(function_modifier) @keyword
+(property_modifier) @keyword
+(platform_modifier) @keyword
+(variance_modifier) @keyword
+(parameter_modifier) @keyword
+(reification_modifier) @keyword
+(class_modifier) @keyword
+(type_modifiers) @keyword
+
 (this_expression) @variable.special
 (super_expression) @variable.special
 
-; `it` keyword inside lambdas
-((simple_identifier) @variable.special
-(#eq? @variable.special "it"))
+;; `field` inside property accessors and `it` inside lambdas
+((identifier) @variable.special
+ (#eq? @variable.special "field"))
+((identifier) @variable.special
+ (#eq? @variable.special "it"))
 
-; `field` keyword inside property getter/setter
-((simple_identifier) @variable.special
-(#eq? @variable.special "field"))
+(label) @label
 
-; `where` parsed as identifier when grammar doesn't recognise the clause
-((simple_identifier) @keyword
-(#eq? @keyword "where"))
+;;; Annotations
 
-; Generic identifier catch-all — MUST be last so specific patterns win
-(simple_identifier) @variable
+(annotation "@" @punctuation.special)
+(annotation (user_type (identifier) @attribute))
+
+;;; Operators & punctuation
+
+[
+	"+"
+	"-"
+	"*"
+	"/"
+	"%"
+	"="
+	"=="
+	"==="
+	"!="
+	"!=="
+	"<"
+	">"
+	"<="
+	">="
+	"&&"
+	"||"
+	"!"
+	"!!"
+	"++"
+	"--"
+	"+="
+	"-="
+	"*="
+	"/="
+	"%="
+	".."
+	"..<"
+	"?."
+	"?:"
+	"::"
+	"->"
+	"?"
+	"&"
+] @operator
+
+[
+	"("
+	")"
+	"["
+	"]"
+	"{"
+	"}"
+] @punctuation.bracket
+
+[
+	","
+	"."
+	";"
+	":"
+] @punctuation.delimiter

@@ -213,6 +213,24 @@ impl ThemeStyle {
             font_weight: None,
         }
     }
+
+    /// Italic text with the inherited foreground color (markdown emphasis).
+    pub fn italic() -> Self {
+        Self {
+            color: None,
+            font_style: Some(FontStyle::Italic),
+            font_weight: None,
+        }
+    }
+
+    /// Bold text with the inherited foreground color (markdown strong).
+    pub fn bold() -> Self {
+        Self {
+            color: None,
+            font_style: None,
+            font_weight: Some(FontWeightContent::Bold),
+        }
+    }
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -229,20 +247,31 @@ impl From<ThemeStyle> for HighlightStyle {
 impl SyntaxColors {
     /// Map bare capture aliases that appear in language queries but are not
     /// part of the canonical 41-token palette to a supported token name.
+    ///
+    /// Mapping rules follow VSCode/Zed semantics:
+    /// - `variable.parameter` is a plain variable (VSCode shows params in the
+    ///   normal variable color, NOT the `self`/`this` special color).
+    /// - `variable.member` / `field` are properties.
+    /// - Doc comments (`comment.documentation`) are `comment.doc`; docstrings
+    ///   (`string.doc`) are still strings.
     fn normalize_name(name: &str) -> &str {
         match name {
-            "escape" | "string.documentation" | "string.doc" | "comment.documentation" => {
-                "string.escape"
-            }
+            "escape" => "string.escape",
+            "string.documentation" | "string.doc" => "string",
+            "comment.documentation" => "comment.doc",
             "character" | "char" => "string",
             "import" | "cImport" => "keyword",
+            // CSS at-rules (emitted by tree-sitter-css) are keywords in VSCode.
+            "charset" | "keyframes" | "media" | "supports" => "keyword",
             "function.macro" | "function.method" | "function.call" | "function.builtin"
-            | "function.special" => "function",
+            | "function.special" | "method" | "method.call" | "method.definition" => {
+                "function"
+            }
             "constant.builtin" | "constant.macro" => "constant",
             "float" | "number.float" => "number",
-            "variable.builtin" | "variable.parameter" | "variable.member" | "variable.special" => {
-                "variable.special"
-            }
+            "variable.builtin" | "variable.special" => "variable.special",
+            "variable.parameter" | "parameter" | "definition.parameter" => "variable",
+            "variable.member" | "field" | "member" => "property",
             "namespace" | "module" => "type",
             "type.builtin"
             | "type.definition"
@@ -270,8 +299,12 @@ impl SyntaxColors {
             | "exception"
             | "include"
             | "directive" => "keyword",
-            "tag.error" | "tag.attribute" | "tag.delimiter" => "tag",
-            "text.reference" | "text.uri" => "link_text",
+            // Lua emits bare `@delimiter` for `.` and `;`.
+            "delimiter" => "punctuation.delimiter",
+            "tag.error" | "tag.delimiter" => "tag",
+            "tag.attribute" => "attribute",
+            "text.reference" => "link_text",
+            "text.uri" => "link_uri",
             "text.danger" | "text.warning" | "text.note" => "string.special",
             "selector" | "selector.pseudo" => "type",
             "punctuation.markup" => "punctuation",
@@ -581,6 +614,7 @@ impl LanguageRegistry {
 #[cfg(test)]
 mod tests {
     use crate::editor::syntax::LanguageConfig;
+    use super::SyntaxColors;
 
     #[test]
     fn test_registry() {
@@ -597,5 +631,68 @@ mod tests {
         assert!(registry.language("rs").is_some());
         assert!(registry.language("javascript").is_some());
         assert!(registry.language("js").is_some());
+    }
+
+    #[test]
+    fn test_normalize_name_semantics() {
+        use super::SyntaxColors;
+
+        let n = SyntaxColors::normalize_name;
+
+        // Parameters are plain variables (VSCode parity), not self/this.
+        assert_eq!(n("variable.parameter"), "variable");
+        assert_eq!(n("parameter"), "variable");
+        assert_eq!(n("variable.builtin"), "variable.special");
+        // Members/fields are properties.
+        assert_eq!(n("variable.member"), "property");
+        assert_eq!(n("field"), "property");
+        // Lua method definitions and calls are functions.
+        assert_eq!(n("method"), "function");
+        assert_eq!(n("method.call"), "function");
+        // Doc comments map to comment.doc; docstrings remain strings.
+        assert_eq!(n("comment.documentation"), "comment.doc");
+        assert_eq!(n("string.doc"), "string");
+        assert_eq!(n("string.documentation"), "string");
+        assert_eq!(n("escape"), "string.escape");
+        // CSS at-rules are keywords.
+        assert_eq!(n("media"), "keyword");
+        assert_eq!(n("keyframes"), "keyword");
+        assert_eq!(n("supports"), "keyword");
+        assert_eq!(n("charset"), "keyword");
+        // Lua bare delimiter.
+        assert_eq!(n("delimiter"), "punctuation.delimiter");
+        // HTML/markdown link destinations vs link text.
+        assert_eq!(n("text.uri"), "link_uri");
+        assert_eq!(n("text.reference"), "link_text");
+        assert_eq!(n("tag.attribute"), "attribute");
+    }
+
+    /// A syntax palette with distinct colors per token must actually
+    /// differentiate the remapped captures — this exercises the full
+    /// `style()` path (normalize + lookup + prefix fallback).
+    #[test]
+    fn test_style_lookup_for_remapped_captures() {
+        let colors = SyntaxColors {
+            variable: Some(super::ThemeStyle::color(gpui::red())),
+            variable_special: Some(super::ThemeStyle::color(gpui::green())),
+            property: Some(super::ThemeStyle::color(gpui::blue())),
+            function: Some(super::ThemeStyle::color(gpui::black())),
+            keyword: Some(super::ThemeStyle::color(gpui::white())),
+            comment_doc: Some(super::ThemeStyle::color(gpui::rgb(0xff00ff).into())),
+            string: Some(super::ThemeStyle::color(gpui::yellow())),
+            string_escape: Some(super::ThemeStyle::color(gpui::rgb(0x00ffff).into())),
+            attribute: Some(super::ThemeStyle::color(gpui::rgb(0xffa500).into())),
+            punctuation_delimiter: Some(super::ThemeStyle::color(gpui::rgb(0xff00aa).into())),
+            ..Default::default()
+        };
+
+        let color_of = |name: &str| colors.style(name).and_then(|s| s.color);
+        assert_eq!(color_of("variable.parameter"), color_of("variable"));
+        assert_eq!(color_of("method.call"), color_of("function"));
+        assert_eq!(color_of("field"), color_of("property"));
+        assert_eq!(color_of("comment.documentation"), color_of("comment.doc"));
+        assert_eq!(color_of("string.doc"), color_of("string"));
+        assert_eq!(color_of("media"), color_of("keyword"));
+        assert_eq!(color_of("delimiter"), color_of("punctuation.delimiter"));
     }
 }

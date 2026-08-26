@@ -216,8 +216,10 @@ impl TerminalTheme {
                 constant: Some(ThemeStyle::color(rgb(0xdfc184).into())),
                 constructor: Some(ThemeStyle::color(rgb(0x73ade9).into())),
                 embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
-                emphasis: Some(ThemeStyle::color(rgb(0x74ade8).into())),
-                emphasis_strong: Some(ThemeStyle::color(rgb(0xbf956a).into())),
+                // VSCode renders markdown emphasis as italic / strong as bold
+                // with the normal foreground color — not a separate hue.
+                emphasis: Some(ThemeStyle::italic()),
+                emphasis_strong: Some(ThemeStyle::bold()),
                 enum_: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
                 function: Some(ThemeStyle::color(rgb(0x73ade9).into())),
                 hint: Some(ThemeStyle::color(rgb(0x788ca6).into())),
@@ -261,8 +263,10 @@ impl TerminalTheme {
                 constant: Some(ThemeStyle::color(rgb(0xc18401).into())),
                 constructor: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
                 embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
-                emphasis: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
-                emphasis_strong: Some(ThemeStyle::color(rgb(0xad6e25).into())),
+                // VSCode renders markdown emphasis as italic / strong as bold
+                // with the normal foreground color — not a separate hue.
+                emphasis: Some(ThemeStyle::italic()),
+                emphasis_strong: Some(ThemeStyle::bold()),
                 enum_: Some(ThemeStyle::color(rgb(0x3882b7).into())),
                 function: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
                 hint: Some(ThemeStyle::color(rgb(0x7274a7).into())),

@@ -1,3 +1,7 @@
+; Generic identifier catch-all — must come FIRST so the specific patterns
+; below override it (same-node captures resolve "later pattern wins").
+(identifier) @variable
+
 ; Function calls
 
 (call_expression
@@ -29,7 +33,6 @@
 
 (type_identifier) @type
 (field_identifier) @variable.member
-(identifier) @variable
 (package_identifier) @namespace
 
 ; Operators

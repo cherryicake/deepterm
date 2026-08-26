@@ -91,7 +91,7 @@ impl SimpleHighlighter {
             "python" | "py" => Self::setup_language(
                 &mut parser,
                 tree_sitter_python::LANGUAGE.into(),
-                tree_sitter_python::HIGHLIGHTS_QUERY,
+                include_str!("languages/python/highlights.scm"),
             ),
             "json" => Self::setup_language(
                 &mut parser,
@@ -116,7 +116,7 @@ impl SimpleHighlighter {
             "c" => Self::setup_language(
                 &mut parser,
                 tree_sitter_c::LANGUAGE.into(),
-                tree_sitter_c::HIGHLIGHT_QUERY,
+                include_str!("languages/c/highlights.scm"),
             ),
             "cpp" | "c++" => Self::setup_language(
                 &mut parser,
@@ -133,6 +133,11 @@ impl SimpleHighlighter {
                 tree_sitter_md::LANGUAGE.into(),
                 include_str!("languages/markdown/highlights.scm"),
             ),
+            "markdown_inline" | "markdown-inline" => Self::setup_language(
+                &mut parser,
+                tree_sitter_md::INLINE_LANGUAGE.into(),
+                include_str!("languages/markdown_inline/highlights.scm"),
+            ),
             "toml" => Self::setup_language(
                 &mut parser,
                 tree_sitter_toml_ng::LANGUAGE.into(),
@@ -141,12 +146,12 @@ impl SimpleHighlighter {
             "tsx" => Self::setup_language(
                 &mut parser,
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                include_str!("languages/tsx/highlights.scm"),
             ),
             "lua" => Self::setup_language(
                 &mut parser,
                 tree_sitter_lua::LANGUAGE.into(),
-                tree_sitter_lua::HIGHLIGHTS_QUERY,
+                include_str!("languages/lua/highlights.scm"),
             ),
             "kotlin" | "kt" => Self::setup_language(
                 &mut parser,
@@ -161,7 +166,7 @@ impl SimpleHighlighter {
             "zig" => Self::setup_language(
                 &mut parser,
                 tree_sitter_zig::LANGUAGE.into(),
-                tree_sitter_zig::HIGHLIGHTS_QUERY,
+                include_str!("languages/zig/highlights.scm"),
             ),
             _ => None,
         };
@@ -274,21 +279,29 @@ impl SimpleHighlighter {
             cursor.set_timeout_micros(timeout.as_micros() as u64);
         }
         let provider = RopeTextProvider(&self.text);
-        let mut matches = cursor.matches(query, tree.root_node(), provider);
+        // NOTE: iterate with `captures()`, not `matches()`. The captures
+        // iterator yields same-node captures in *query pattern order*, so a
+        // later, more specific pattern overrides an earlier catch-all on the
+        // same node — the convention every official tree-sitter query is
+        // written against (catch-alls first, specific rules after). The
+        // matches() iterator instead emits ancestor-rooted patterns before
+        // identifier-rooted ones, which inverts that priority and makes
+        // generic rules override structural captures (e.g. every function
+        // name painted as a plain variable).
+        let mut captures = cursor.captures(query, tree.root_node(), provider);
 
         let mut styles = Vec::new();
-        while let Some(m) = matches.next() {
-            for capture in m.captures {
-                let name = query.capture_names()[capture.index as usize];
-                let cap_range = capture.node.byte_range();
-                let mut s = cap_range.start.max(range.start).min(range.end);
-                let mut e = cap_range.end.min(range.end).max(s);
-                // Ensure byte offsets are on char boundaries to avoid invalid UTF-8 slices
-                s = clip_offset(&self.text, s, Bias::Right);
-                e = clip_offset(&self.text, e, Bias::Left);
-                if e > s {
-                    styles.push((s..e, theme.style(name).unwrap_or_default()));
-                }
+        while let Some((mat, cap_ix)) = captures.next() {
+            let capture = mat.captures[*cap_ix];
+            let name = query.capture_names()[capture.index as usize];
+            let cap_range = capture.node.byte_range();
+            let mut s = cap_range.start.max(range.start).min(range.end);
+            let mut e = cap_range.end.min(range.end).max(s);
+            // Ensure byte offsets are on char boundaries to avoid invalid UTF-8 slices
+            s = clip_offset(&self.text, s, Bias::Right);
+            e = clip_offset(&self.text, e, Bias::Left);
+            if e > s {
+                styles.push((s..e, theme.style(name).unwrap_or_default()));
             }
         }
         styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
@@ -322,30 +335,31 @@ impl SimpleHighlighter {
 
             let mut cursor = QueryCursor::new();
             let provider = RopeTextProvider(&layer.text);
-            let mut matches = cursor.matches(&sub_query, tree.root_node(), provider);
-            while let Some(m) = matches.next() {
-                for capture in m.captures {
-                    let name = sub_query.capture_names()[capture.index as usize];
-                    let cap_range = capture.node.byte_range();
-                    let mut s = layer.byte_range.start + cap_range.start;
-                    let mut e = layer.byte_range.start + cap_range.end;
-                    // Guard against a stale layer after an edit: the layer's
-                    // byte range may no longer fit the (edited) host text.
-                    if s >= self.text.len() || e > self.text.len() {
-                        continue;
-                    }
-                    // Clip to the host range and char boundaries.
-                    if e <= range.start || s >= range.end {
-                        continue;
-                    }
-                    s = s.max(range.start);
-                    e = e.min(range.end);
-                    s = clip_offset(&self.text, s, Bias::Right);
-                    e = clip_offset(&self.text, e, Bias::Left);
-                    if e > s {
-                        if let Some(style) = theme.style(name) {
-                            styles.push((s..e, style));
-                        }
+            // `captures()` — see the host-loop note above: same-node captures
+            // must resolve by pattern order so specific rules win.
+            let mut captures = cursor.captures(&sub_query, tree.root_node(), provider);
+            while let Some((mat, cap_ix)) = captures.next() {
+                let capture = mat.captures[*cap_ix];
+                let name = sub_query.capture_names()[capture.index as usize];
+                let cap_range = capture.node.byte_range();
+                let mut s = layer.byte_range.start + cap_range.start;
+                let mut e = layer.byte_range.start + cap_range.end;
+                // Guard against a stale layer after an edit: the layer's
+                // byte range may no longer fit the (edited) host text.
+                if s >= self.text.len() || e > self.text.len() {
+                    continue;
+                }
+                // Clip to the host range and char boundaries.
+                if e <= range.start || s >= range.end {
+                    continue;
+                }
+                s = s.max(range.start);
+                e = e.min(range.end);
+                s = clip_offset(&self.text, s, Bias::Right);
+                e = clip_offset(&self.text, e, Bias::Left);
+                if e > s {
+                    if let Some(style) = theme.style(name) {
+                        styles.push((s..e, style));
                     }
                 }
             }
@@ -359,6 +373,22 @@ impl SimpleHighlighter {
     // Additional stubs for gpui-component compatibility
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
+    }
+
+    /// Whether the language's highlight query compiled and loaded. A failed
+    /// `Query::new` silently disables highlighting (returns `None`), so tests
+    /// assert on this to catch broken query files.
+    #[cfg(test)]
+    pub(crate) fn query_loaded(&self) -> bool {
+        self.query.is_some()
+    }
+
+    /// Whether the language's injections query compiled (if it has one).
+    /// Failures are silently swallowed in `new()` and would disable all
+    /// embedded-language highlighting.
+    #[cfg(test)]
+    pub(crate) fn injections_query_loaded(&self) -> bool {
+        self.injections_query.is_some()
     }
 
     pub fn language(&self) -> &str {
@@ -669,6 +699,10 @@ mod tests {
                     property: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
                     constant: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x00bcd4).into())),
                     tag: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
+                    attribute: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xe91e63).into())),
+                    variable: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xffeb3b).into())),
+                    variable_special: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xff9800).into())),
+                    comment_doc: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x607d8b).into())),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -853,6 +887,197 @@ mod tests {
         assert!(
             styled,
             "expected injected CSS styles inside <style> (range {style_start}..{style_end})"
+        );
+    }
+
+    /// Every registered language must have a compiled highlight query. A
+    /// failing `Query::new` silently disables highlighting, which is how two
+    /// regressions went unnoticed before (kotlin query written for a
+    /// different grammar; tsx wired to the TS-additions-only query).
+    #[test]
+    fn test_all_languages_load_queries() {
+        let languages_with_injections = [
+            "rust",
+            "zig",
+            "markdown",
+            "html",
+            "javascript",
+            "typescript",
+        ];
+        for lang in crate::editor::syntax::languages::Language::all() {
+            let name = lang.name();
+            if name == "text" {
+                continue; // Plain text intentionally has no query
+            }
+            let h = SimpleHighlighter::new(name);
+            assert!(
+                h.query_loaded(),
+                "highlight query failed to load for language {name:?}"
+            );
+            if languages_with_injections.contains(&name) {
+                assert!(
+                    h.injections_query_loaded(),
+                    "injections query failed to load for language {name:?}"
+                );
+            }
+        }
+    }
+
+    /// Function parameters must use the plain variable color, not the
+    /// `variable.special` color reserved for `self`/`this` (VSCode parity).
+    #[test]
+    fn test_rust_parameter_uses_variable_color() {
+        let code = "fn add(left: i32) { self }";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+
+        let variable = gpui::rgb(0xffeb3b).into();
+        let variable_special = gpui::rgb(0xff9800).into();
+        let left_pos = code.find("left").expect("param in code");
+        let left_run = styles
+            .iter()
+            .find(|(r, _)| r.start <= left_pos && r.end > left_pos)
+            .expect("style covers `left`");
+        assert_eq!(
+            left_run.1.color,
+            Some(variable),
+            "parameter `left` should use the plain variable color"
+        );
+        assert_ne!(
+            left_run.1.color,
+            Some(variable_special),
+            "parameter must not use variable.special (self/this) color"
+        );
+
+        // `self` keeps the special-variable color.
+        let self_pos = code.find("self").expect("self in code");
+        let self_run = styles
+            .iter()
+            .find(|(r, _)| r.start <= self_pos && r.end > self_pos)
+            .expect("style covers `self`");
+        assert_eq!(
+            self_run.1.color,
+            Some(variable_special),
+            "`self` should keep the variable.special color"
+        );
+    }
+
+    /// TSX must be highlighted with the full combined query: JavaScript base
+    /// rules (strings, comments, functions, keywords) plus JSX rules
+    /// (element names as tags, attributes).
+    #[test]
+    fn test_tsx_highlights_js_base_and_jsx() {
+        let code = r#"const x: number = 1;
+// note
+export function App() { return <div className="a">hi</div>; }
+"#;
+        let mut h = SimpleHighlighter::new("tsx");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+
+        // JS base rules: keyword `const`, comment, string.
+        let colored = |needle: &str| {
+            let pos = code.find(needle).unwrap_or_else(|| panic!("{needle} in code"));
+            styles
+                .iter()
+                .find(|(r, _)| r.start <= pos && r.end > pos)
+                .unwrap_or_else(|| panic!("style covers `{needle}`"))
+                .1
+                .color
+        };
+        assert_eq!(colored("const"), Some(gpui::red()), "`const` is a keyword");
+        assert_eq!(colored("// note"), Some(gpui::red()), "comment is styled");
+        assert_eq!(colored("App"), Some(gpui::green()), "function name");
+        // JSX: element name as tag, attribute name as attribute.
+        assert_eq!(colored("div"), Some(gpui::rgb(0x9b59b6).into()), "JSX tag");
+        assert_eq!(
+            colored("className"),
+            Some(gpui::rgb(0xe91e63).into()),
+            "JSX attribute"
+        );
+    }
+
+    /// Function definitions must win over any identifier-level pattern
+    /// (the reason the `(identifier) @variable` catch-alls were removed from
+    /// the vendored queries).
+    #[test]
+    fn test_python_function_definition_name() {
+        let code = "def add(left):\n    return left\n";
+        let mut h = SimpleHighlighter::new("python");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+        let add_pos = code.find("add").expect("def name");
+        let run = styles
+            .iter()
+            .find(|(r, _)| r.start <= add_pos && r.end > add_pos)
+            .expect("style covers `add`");
+        assert_eq!(
+            run.1.color,
+            Some(gpui::green()),
+            "python def name must be function-colored, not plain variable"
+        );
+    }
+
+    /// Kotlin (kotlin-ng grammar): function declarations, properties, builtin
+    /// types and constructor calls. Also guards the query against the
+    /// kotlin-ng node-type mismatch that previously made it fail to load.
+    #[test]
+    fn test_kotlin_highlights() {
+        let code = "class Person(val name: String) {\n    fun greet(): String = name\n}\nfun main() {\n    val p = Person(\"a\")\n}\n";
+        let mut h = SimpleHighlighter::new("kotlin");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+        let color_at = |needle: &str| {
+            let pos = code.find(needle).unwrap_or_else(|| panic!("{needle} in code"));
+            styles
+                .iter()
+                .find(|(r, _)| r.start <= pos && r.end > pos)
+                .unwrap_or_else(|| panic!("style covers `{needle}`"))
+                .1
+                .color
+        };
+        assert_eq!(color_at("class"), Some(gpui::red()), "keyword");
+        assert_eq!(color_at("Person"), Some(gpui::blue()), "class name as type");
+        assert_eq!(color_at("name"), Some(gpui::rgb(0x9b59b6).into()), "class property");
+        assert_eq!(color_at("String"), Some(gpui::blue()), "builtin type");
+        assert_eq!(color_at("greet"), Some(gpui::green()), "function declaration");
+        assert_eq!(color_at("val p"), Some(gpui::red()), "`val` keyword colored");
+        assert_eq!(color_at("main"), Some(gpui::green()), "top-level fun");
+    }
+
+    /// Go: function declaration names must be function-colored (previously
+    /// overridden by the `(identifier) @variable` catch-all).
+    #[test]
+    fn test_go_function_declaration_name() {
+        let code = "func main() {\n\tprintln(\"hi\")\n}\n";
+        let mut h = SimpleHighlighter::new("go");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+
+        let theme = test_theme();
+        let styles = h.styles(&(0..code.len()), &theme);
+        let main_pos = code.find("main").expect("func name");
+        let run = styles
+            .iter()
+            .find(|(r, _)| r.start <= main_pos && r.end > main_pos)
+            .expect("style covers `main`");
+        assert_eq!(
+            run.1.color,
+            Some(gpui::green()),
+            "go func name must be function-colored"
         );
     }
 }
