@@ -136,9 +136,11 @@ impl RenderOnce for Stepper {
         let size = self.size;
         let on_click = self.on_click.clone();
 
-        div()
-            .id(self.id)
-            .w_full()
+        // 调用方通过 `impl Styled` 设置的 refinement 应用到根元素，
+        // 在此基础上再叠加组件自身的布局默认值。
+        let mut root = div().id(self.id);
+        *root.style() = self.style;
+        root.w_full()
             .when(layout == Axis::Horizontal, |this| this.flex().flex_row())
             .when(layout == Axis::Vertical, |this| this.flex().flex_col())
             .children(self.items.into_iter().enumerate().map(move |(step, item)| {

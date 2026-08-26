@@ -470,7 +470,7 @@ impl Render for HostView {
                         }
                     }),
                 )
-                .context_menu({
+                .context_menu(format!("host-item-menu-{}", host_id), {
                     let entity = cx.entity().clone();
                     use crate::components::button::Icon as MenuIcon;
                     move |menu: PopupMenu, _window, _cx| {

@@ -42,7 +42,16 @@ impl Sizable for ButtonIcon {
 impl RenderOnce for ButtonIcon {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.loading {
+            // 加载指示器与图标同尺寸，避免 loading 时按钮尺寸跳变（此前固定为 24px）。
+            let spinner_size = match self.size {
+                Size::XSmall => gpui::px(12.0),
+                Size::Small => gpui::px(14.0),
+                Size::Medium => gpui::px(16.0),
+                Size::Large => gpui::px(20.0),
+                Size::Size(pixels) => pixels,
+            };
             Spinner::new()
+                .size_px(spinner_size)
                 .color(cx.theme().ui.accent)
                 .into_any_element()
         } else {

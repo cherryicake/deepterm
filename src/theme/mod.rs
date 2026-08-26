@@ -9,7 +9,9 @@ pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
+use crate::editor::syntax::{
+    HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +64,12 @@ pub struct UiTheme {
     pub error_background: Hsla,
     pub error_foreground: Hsla,
     pub notification_background: Hsla,
+    /// 弹出菜单（PopupMenu / MacosSelect 下拉）的浮层背景色。
+    pub menu_background: Hsla,
+    /// 弹出菜单浮层的描边色。
+    pub menu_border: Hsla,
+    /// 弹出菜单内部分隔线的颜色。
+    pub menu_separator: Hsla,
     pub shadow: Hsla,
     // Git status colors
     pub status_modified: Hsla,
@@ -407,6 +415,12 @@ struct UiThemeFile {
     error_background: String,
     error_foreground: String,
     notification_background: String,
+    #[serde(default)]
+    menu_background: Option<String>,
+    #[serde(default)]
+    menu_border: Option<String>,
+    #[serde(default)]
+    menu_separator: Option<String>,
     shadow: String,
     // Git status colors
     #[serde(default = "default_status_modified")]
@@ -608,50 +622,84 @@ fn default_tab_active_border() -> String {
     "#FFFFFF1A".to_string()
 }
 
-impl TryFrom<UiThemeFile> for UiTheme {
-    type Error = anyhow::Error;
-
-    fn try_from(value: UiThemeFile) -> anyhow::Result<Self> {
-        Ok(Self {
-            app_background: parse_color(&value.app_background)?,
-            panel_background: parse_color(&value.panel_background)?,
-            elevated_background: parse_color(&value.elevated_background)?,
-            overlay_background: parse_color(&value.overlay_background)?,
-            title_bar_background: parse_color(&value.title_bar_background)?,
-            title_bar_hover: parse_color(&value.title_bar_hover)?,
-            tab_bar_background: parse_color(&value.tab_bar_background)?,
-            tab_active_background: parse_color(&value.tab_active_background)?,
-            tab_inactive_background: parse_color(&value.tab_inactive_background)?,
-            tab_hover_background: parse_color(&value.tab_hover_background)?,
-            tab_active_border: parse_color(&value.tab_active_border)?,
-            border: parse_color(&value.border)?,
-            border_strong: parse_color(&value.border_strong)?,
-            text: parse_color(&value.text)?,
-            text_muted: parse_color(&value.text_muted)?,
-            text_subtle: parse_color(&value.text_subtle)?,
-            icon: parse_color(&value.icon)?,
-            icon_muted: parse_color(&value.icon_muted)?,
-            accent: parse_color(&value.accent)?,
-            accent_hover: parse_color(&value.accent_hover)?,
-            accent_foreground: parse_color(&value.accent_foreground)?,
-            selection: parse_color(&value.selection)?,
-            drop_target: parse_color(&value.drop_target)?,
-            drop_target_border: parse_color(&value.drop_target_border)?,
-            success: parse_color(&value.success)?,
-            success_background: parse_color(&value.success_background)?,
-            success_foreground: parse_color(&value.success_foreground)?,
-            warning: parse_color(&value.warning)?,
-            warning_background: parse_color(&value.warning_background)?,
-            error: parse_color(&value.error)?,
-            error_background: parse_color(&value.error_background)?,
-            error_foreground: parse_color(&value.error_foreground)?,
-            notification_background: parse_color(&value.notification_background)?,
-            shadow: parse_color(&value.shadow)?,
-            status_modified: parse_color(&value.status_modified)?,
-            status_added: parse_color(&value.status_added)?,
-            status_deleted: parse_color(&value.status_deleted)?,
-            status_conflict: parse_color(&value.status_conflict)?,
+impl UiThemeFile {
+    /// 转换为 [`UiTheme`]，未在主题文件中声明的菜单颜色按外观回退到默认值
+    /// （与历史硬编码行为一致，避免视觉变化）。
+    fn into_ui_theme(self, appearance: ThemeAppearance) -> anyhow::Result<UiTheme> {
+        let parse_opt = |value: Option<String>, default: Hsla| -> anyhow::Result<Hsla> {
+            match value {
+                Some(v) => parse_color(&v),
+                None => Ok(default),
+            }
+        };
+        Ok(UiTheme {
+            app_background: parse_color(&self.app_background)?,
+            panel_background: parse_color(&self.panel_background)?,
+            elevated_background: parse_color(&self.elevated_background)?,
+            overlay_background: parse_color(&self.overlay_background)?,
+            title_bar_background: parse_color(&self.title_bar_background)?,
+            title_bar_hover: parse_color(&self.title_bar_hover)?,
+            tab_bar_background: parse_color(&self.tab_bar_background)?,
+            tab_active_background: parse_color(&self.tab_active_background)?,
+            tab_inactive_background: parse_color(&self.tab_inactive_background)?,
+            tab_hover_background: parse_color(&self.tab_hover_background)?,
+            tab_active_border: parse_color(&self.tab_active_border)?,
+            border: parse_color(&self.border)?,
+            border_strong: parse_color(&self.border_strong)?,
+            text: parse_color(&self.text)?,
+            text_muted: parse_color(&self.text_muted)?,
+            text_subtle: parse_color(&self.text_subtle)?,
+            icon: parse_color(&self.icon)?,
+            icon_muted: parse_color(&self.icon_muted)?,
+            accent: parse_color(&self.accent)?,
+            accent_hover: parse_color(&self.accent_hover)?,
+            accent_foreground: parse_color(&self.accent_foreground)?,
+            selection: parse_color(&self.selection)?,
+            drop_target: parse_color(&self.drop_target)?,
+            drop_target_border: parse_color(&self.drop_target_border)?,
+            success: parse_color(&self.success)?,
+            success_background: parse_color(&self.success_background)?,
+            success_foreground: parse_color(&self.success_foreground)?,
+            warning: parse_color(&self.warning)?,
+            warning_background: parse_color(&self.warning_background)?,
+            error: parse_color(&self.error)?,
+            error_background: parse_color(&self.error_background)?,
+            error_foreground: parse_color(&self.error_foreground)?,
+            notification_background: parse_color(&self.notification_background)?,
+            menu_background: parse_opt(self.menu_background, default_menu_background(appearance))?,
+            menu_border: parse_opt(self.menu_border, default_menu_border(appearance))?,
+            menu_separator: parse_opt(self.menu_separator, default_menu_separator(appearance))?,
+            shadow: parse_color(&self.shadow)?,
+            status_modified: parse_color(&self.status_modified)?,
+            status_added: parse_color(&self.status_added)?,
+            status_deleted: parse_color(&self.status_deleted)?,
+            status_conflict: parse_color(&self.status_conflict)?,
         })
+    }
+}
+
+/// 菜单浮层背景色的默认值：深色取 macOS 系统菜单灰，浅色取纯白。
+fn default_menu_background(appearance: ThemeAppearance) -> Hsla {
+    if appearance.is_dark() {
+        rgb(0x2C2C2E).into()
+    } else {
+        rgb(0xFFFFFF).into()
+    }
+}
+
+/// 菜单浮层描边色的默认值：白色低透明度（深色 10% / 浅色 60%），
+/// 与历史硬编码行为一致。
+fn default_menu_border(appearance: ThemeAppearance) -> Hsla {
+    let white: Hsla = rgb(0xFFFFFF).into();
+    white.opacity(if appearance.is_dark() { 0.1 } else { 0.6 })
+}
+
+/// 菜单分隔线颜色的默认值。
+fn default_menu_separator(appearance: ThemeAppearance) -> Hsla {
+    if appearance.is_dark() {
+        rgb(0x48484A).into()
+    } else {
+        rgb(0xE5E5EA).into()
     }
 }
 
@@ -699,20 +747,21 @@ impl TryFrom<AppThemeFile> for AppTheme {
 
     fn try_from(value: AppThemeFile) -> anyhow::Result<Self> {
         let terminal: TerminalTheme = value.terminal.try_into()?;
+        let appearance = value.appearance;
         let highlight_theme = match value.highlight {
             Some(style) => Arc::new(HighlightTheme {
                 name: value.name.clone(),
-                appearance: value.appearance,
+                appearance,
                 style,
             }),
-            None => terminal.to_highlight_theme(&value.name, value.appearance),
+            None => terminal.to_highlight_theme(&value.name, appearance),
         };
         Ok(Self {
             id: value.id,
             name: value.name,
             description: value.description,
-            appearance: value.appearance,
-            ui: value.ui.try_into()?,
+            appearance,
+            ui: value.ui.into_ui_theme(appearance)?,
             terminal,
             highlight_theme,
         })

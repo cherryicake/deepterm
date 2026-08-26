@@ -15,16 +15,18 @@ pub trait ContextMenuExt: ParentElement + Styled {
     ///
     /// This will changed the element to be `relative` positioned, and add a child `ContextMenu` element.
     /// Because the `ContextMenu` element is positioned `absolute`, it will not affect the layout of the parent element.
+    ///
+    /// `id` 必须跨帧稳定且在同类元素中唯一（例如行 ID / 标签 ID），
+    /// 它作为浮层元素状态的键：不稳定的 ID 会导致菜单状态丢失，
+    /// 而重复的 ID 会让多个元素共享同一份菜单状态。
     fn context_menu(
         self,
+        id: impl Into<ElementId>,
         f: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> ContextMenu<Self>
     where
         Self: Sized,
     {
-        // Generate a unique ID based on the element's memory address to ensure
-        // each context menu has its own state and doesn't share with others
-        let id = format!("context-menu-{:p}", &self as *const _);
         ContextMenu::new(id, self).menu(f)
     }
 }
@@ -38,7 +40,6 @@ pub struct ContextMenu<E: ParentElement + Styled + Sized> {
     menu: Option<Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>>,
     // This is not in use, just for style refinement forwarding.
     _ignore_style: StyleRefinement,
-    anchor: gpui::Anchor,
 }
 
 impl<E: ParentElement + Styled> ContextMenu<E> {
@@ -48,7 +49,6 @@ impl<E: ParentElement + Styled> ContextMenu<E> {
             id: id.into(),
             element: Some(element),
             menu: None,
-            anchor: gpui::Anchor::TopLeft,
             _ignore_style: StyleRefinement::default(),
         }
     }
@@ -152,8 +152,6 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let anchor = self.anchor;
-
         self.with_element_state(
             id.unwrap(),
             window,
@@ -185,7 +183,6 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                             anchored()
                                                 .position(position)
                                                 .snap_to_window_with_margin(px(8.))
-                                                .anchor(anchor)
                                                 .when_some(menu_view, |this, menu| {
                                                     // Focus the menu, so that can be handle the action.
                                                     if !menu

@@ -1,7 +1,6 @@
 use gpui::{
     AnyElement, App, Axis, ClickEvent, InteractiveElement as _, IntoElement, ParentElement,
-    RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    RenderOnce, StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
 use crate::components::spinner::Spinner;
@@ -14,7 +13,6 @@ use crate::theme::ActiveTheme;
 pub(crate) struct StepperTrigger {
     step: usize,
     checked_step: usize,
-    style: StyleRefinement,
     size: StepperSize,
     children: Vec<AnyElement>,
     layout: Axis,
@@ -35,7 +33,6 @@ impl StepperTrigger {
             disabled: false,
             children: Vec::new(),
             text_center: false,
-            style: StyleRefinement::default(),
             show_spinner: false,
             status: StepperStatus::default(),
             on_click: Box::new(|_, _, _| {}),
@@ -88,12 +85,6 @@ impl StepperTrigger {
     {
         self.on_click = Box::new(f);
         self
-    }
-}
-
-impl Styled for StepperTrigger {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
     }
 }
 

@@ -10,6 +10,8 @@ use gpui::{
 #[derive(IntoElement)]
 pub struct Spinner {
     size: SpinnerSize,
+    /// 覆盖 `SpinnerSize` 的自定义像素尺寸（例如需要与图标严格对齐时使用）。
+    size_px: Option<gpui::Pixels>,
     speed: Duration,
     color: Option<Hsla>,
     path: SharedString,
@@ -41,6 +43,7 @@ impl Spinner {
     pub fn new() -> Self {
         Self {
             size: SpinnerSize::Medium,
+            size_px: None,
             speed: Duration::from_millis(800),
             color: None,
             path: Icon::Loader.path(),
@@ -56,6 +59,13 @@ impl Spinner {
     /// Set the spinner size.
     pub fn size(mut self, size: SpinnerSize) -> Self {
         self.size = size;
+        self.size_px = None;
+        self
+    }
+
+    /// Set an exact pixel size, overriding [`Spinner::size`].
+    pub fn size_px(mut self, px: gpui::Pixels) -> Self {
+        self.size_px = Some(px);
         self
     }
 
@@ -80,7 +90,7 @@ impl Default for Spinner {
 
 impl RenderOnce for Spinner {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let size = self.size.px_size();
+        let size = self.size_px.unwrap_or_else(|| self.size.px_size());
 
         div()
             .child(

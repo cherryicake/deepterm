@@ -584,7 +584,7 @@ fn render_keychain_item_row(
                 }
             }),
         )
-        .context_menu({
+        .context_menu(format!("keychain-item-menu-{}", item_id), {
             let entity = cx.entity().clone();
             use crate::components::button::Icon as MenuIcon;
             move |menu: PopupMenu, _window, _cx| {

@@ -360,9 +360,12 @@ impl RenderOnce for Modal {
 
         let backdrop_opacity = theme.overlay_background.opacity(0.5);
         let has_top_padding = self.top_padding.is_some();
+        // 调用方通过 `impl Styled` 设置的 refinement 应用到最外层全屏容器，
+        // 作为基准后再叠加组件的关键布局样式（absolute / inset_0 / flex 等）。
+        let mut container = div().id(self.id);
+        *container.style() = self.style;
         deferred(
-            div()
-                .id(self.id)
+            container
                 .absolute()
                 .inset_0()
                 .size_full()

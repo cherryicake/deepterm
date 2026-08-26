@@ -14,7 +14,10 @@ use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::theme::{ActiveTheme, UiTheme};
 use crate::workspace::panel::DraggedPanel;
 
-actions!(tab_context_menu, [CopyTabAddress, DuplicateTab, ReconnectTab]);
+actions!(
+    tab_context_menu,
+    [CopyTabAddress, DuplicateTab, ReconnectTab]
+);
 
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,11 +622,7 @@ impl TabBar {
 
     /// 就地应用重排：`insert_slot` 为重排前列表中的插入位（before 语义）。
     /// 返回拖拽标签的重排前索引；无实际移动或标签不存在时返回 None。
-    fn apply_tab_reorder(
-        &mut self,
-        dragged_tab: &DraggedTab,
-        insert_slot: usize,
-    ) -> Option<usize> {
+    fn apply_tab_reorder(&mut self, dragged_tab: &DraggedTab, insert_slot: usize) -> Option<usize> {
         apply_reorder(&mut self.tabs, &dragged_tab.tab_id, insert_slot)
     }
 
@@ -734,16 +733,12 @@ impl TabBar {
             .items_center()
             .gap_1()
             .h_full()
-            .on_drag_move::<DraggedPanel>(cx.listener(
-                |this, event, _window, cx| {
-                    this.handle_panel_drag_move(event, cx);
-                },
-            ))
-            .on_drag_move::<DraggedTab>(cx.listener(
-                |this, event, _window, cx| {
-                    this.handle_tab_drag_move(event, cx);
-                },
-            ))
+            .on_drag_move::<DraggedPanel>(cx.listener(|this, event, _window, cx| {
+                this.handle_panel_drag_move(event, cx);
+            }))
+            .on_drag_move::<DraggedTab>(cx.listener(|this, event, _window, cx| {
+                this.handle_tab_drag_move(event, cx);
+            }))
             // 拖拽重排：由 drag_move 维护的中点插入位直接应用
             .on_drop(cx.listener({
                 let on_tab_reorder = on_tab_reorder.clone();
@@ -902,7 +897,7 @@ impl TabBar {
                     .into()
                 }
             })
-            .context_menu({
+            .context_menu(format!("tab-menu-{}", tab_id), {
                 let tab_id = tab_id.clone();
                 let on_context_menu = self.on_context_menu.clone();
                 move |menu: PopupMenu, window, cx| {
@@ -923,10 +918,8 @@ impl TabBar {
                 .flex_shrink_0()
                 .with_animation(
                     animation_id,
-                    Animation::new(Duration::from_millis(
-                        TAB_REORDER_ANIMATION_DURATION_MS,
-                    ))
-                    .with_easing(ease_out_quint()),
+                    Animation::new(Duration::from_millis(TAB_REORDER_ANIMATION_DURATION_MS))
+                        .with_easing(ease_out_quint()),
                     move |this, delta| {
                         let offset = start_offset + (end_offset - start_offset) * delta;
                         let opacity = start_opacity + (end_opacity - start_opacity) * delta;

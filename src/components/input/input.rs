@@ -1,7 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px,
-    relative,
+    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative,
 };
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
@@ -83,17 +82,21 @@ impl EditorInput {
                 }
             })
     }
-
-
 }
 
 impl RenderOnce for EditorInput {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.state.update(cx, |state, _cx| {
+        // 仅在值真正变化时写入并通知：render 每帧都会走到这里，
+        // 无条件写入会让 InputState 每帧都被判定为已更新。
+        self.state.update(cx, |state, cx| {
             if state.disabled != self.disabled {
                 state.disabled = self.disabled;
+                cx.notify();
             }
-            state.size = self.size;
+            if state.size != self.size {
+                state.size = self.size;
+                cx.notify();
+            }
         });
 
         let state = self.state.read(cx);
@@ -170,7 +173,9 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::show_character_palette))
                     .on_action(window.listener_for(&self.state, InputState::copy))
                     .when(is_multi_line, |this| {
-                        this.on_action(window.listener_for(&self.state, InputState::on_action_search))
+                        this.on_action(
+                            window.listener_for(&self.state, InputState::on_action_search),
+                        )
                     })
                     .on_key_down(window.listener_for(&self.state, InputState::on_key_down))
             })
@@ -204,10 +209,7 @@ impl RenderOnce for EditorInput {
                 .h_full()
                 .flex_grow(1.0)
                 .overflow_x_hidden()
-                .child(
-                    TextElement::new(self.state.clone())
-                        .placeholder(state.placeholder.clone()),
-                )
+                .child(TextElement::new(self.state.clone()).placeholder(state.placeholder.clone()))
                 // 搜索面板：VSCode 式悬浮卡片，绝对定位右上角，不占文档流。
                 .when_some(state.search_panel.clone(), |this, panel| {
                     this.child(

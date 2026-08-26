@@ -2,14 +2,13 @@ use crate::components::button::Disableable;
 use crate::theme::ActiveTheme;
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, RenderOnce, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled, Window, prelude::FluentBuilder as _, px,
+    ParentElement, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 
 #[derive(IntoElement)]
 pub struct MenuItemElement {
     id: ElementId,
-    group_name: SharedString,
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
@@ -19,12 +18,10 @@ pub struct MenuItemElement {
 }
 
 impl MenuItemElement {
-    /// Create a new MenuItem with the given ID and group name.
-    pub fn new(id: impl Into<ElementId>, group_name: impl Into<SharedString>) -> Self {
-        let id: ElementId = id.into();
+    /// Create a new MenuItem with the given ID.
+    pub fn new(id: impl Into<ElementId>) -> Self {
         Self {
-            id: id.clone(),
-            group_name: group_name.into(),
+            id: id.into(),
             style: StyleRefinement::default(),
             disabled: false,
             selected: false,
@@ -56,7 +53,6 @@ impl MenuItemElement {
     }
 
     /// Set a handler for when the mouse enters the MenuItem.
-    #[allow(unused)]
     pub fn on_hover(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
         self.on_hover = Some(Box::new(handler));
         self
@@ -84,14 +80,14 @@ impl ParentElement for MenuItemElement {
 
 impl RenderOnce for MenuItemElement {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        use gpui::div;
-
         let theme = cx.theme().ui;
 
-        div()
-            .id(self.id)
-            .group(&self.group_name)
-            .h(px(22.)) // Fixed height like macOS menu items
+        // 调用方通过 `impl Styled` 设置的 refinement 应用到根元素，
+        // 再叠加组件自身的菜单项默认样式（高度 / 内边距 / 布局）。
+        let mut root = div().id(self.id);
+        *root.style() = self.style;
+
+        root.h(px(22.)) // Fixed height like macOS menu items
             .pl(px(8.))
             .pr(px(8.))
             .text_sm()
@@ -106,18 +102,18 @@ impl RenderOnce for MenuItemElement {
                 this.on_hover(move |hovered, window, cx| (on_hover)(hovered, window, cx))
             })
             .when(!self.disabled, |this| {
-                this.group_hover(&self.group_name, |this| {
-                    this.bg(theme.accent).text_color(theme.accent_foreground)
-                })
-                .when(self.selected, |this| {
-                    this.bg(theme.accent).text_color(theme.accent_foreground)
-                })
-                .when_some(self.on_click, |this, on_click| {
-                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
+                // 悬停高亮：直接用 .hover()（此前通过为每一项生成独立
+                // group 实现同等效果，属于无谓的间接层）。
+                this.hover(|this| this.bg(theme.accent).text_color(theme.accent_foreground))
+                    .when(self.selected, |this| {
+                        this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
-                    .on_click(on_click)
-                })
+                    .when_some(self.on_click, |this, on_click| {
+                        this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(on_click)
+                    })
             })
             .when(self.disabled, |this| this.text_color(theme.text_muted))
             .children(self.children)

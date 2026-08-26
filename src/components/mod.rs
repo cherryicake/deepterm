@@ -1,16 +1,13 @@
 use gpui::App;
 pub mod animation;
 pub mod button;
-pub mod drag_drop;
 pub mod input;
 pub mod macos_select;
 pub mod macos_sidebar;
 pub mod menu;
 pub mod modal;
 pub mod notification;
-pub mod resize_handle;
 pub mod spinner;
-pub mod split_view;
 pub mod stepper;
 pub mod tab_bar;
 pub mod title_bar;

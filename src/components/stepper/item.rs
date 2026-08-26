@@ -112,9 +112,10 @@ impl RenderOnce for StepperItem {
         let is_passed = self.step < self.checked_step;
         let icon_size = self.size.icon_size();
 
-        div()
-            .id(("stepper-item", self.step))
-            .relative()
+        // 调用方 refinement 应用到根元素（仅 StepperItem 公开使用，效果同 Stepper）。
+        let mut root = div().id(("stepper-item", self.step));
+        *root.style() = self.style;
+        root.relative()
             .when(self.layout == Axis::Horizontal, |this| {
                 this.flex().flex_row().items_start()
             })
@@ -163,7 +164,6 @@ struct StepperSeparator {
     checked: bool,
     icon_size: gpui::Pixels,
     layout: Axis,
-    style: StyleRefinement,
     text_center: bool,
 }
 
@@ -174,7 +174,6 @@ impl StepperSeparator {
             checked: false,
             icon_size: px(24.),
             layout: Axis::Horizontal,
-            style: StyleRefinement::default(),
             text_center: false,
         }
     }
@@ -202,12 +201,6 @@ impl StepperSeparator {
     fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
         self
-    }
-}
-
-impl Styled for StepperSeparator {
-    fn style(&mut self) -> &mut StyleRefinement {
-        &mut self.style
     }
 }
 

@@ -45,6 +45,7 @@ use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
     AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
 };
+use crate::workspace::transfer_bell::TransferBellPanel;
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::{Workspace, WorkspaceEvent};
 
@@ -69,6 +70,8 @@ struct TabGroupWorkspace {
 
 pub struct AppWindow {
     title_bar: Entity<TitleBar>,
+    /// 传输任务铃铛面板：通过 TitleBar 的 trailing 插槽挂载。
+    transfer_bell: Entity<TransferBellPanel>,
     default_workspace: Entity<Workspace>,
     workspace: Entity<Workspace>,
     tab_group_workspaces: Vec<TabGroupWorkspace>,
@@ -119,10 +122,17 @@ impl AppWindow {
 
         let tab_bar = workspace.read(cx).tab_bar.clone();
         let workspace_weak = workspace.downgrade();
-        let title_bar = cx.new(|cx| {
-            let mut bar = TitleBar::new("title-bar").with_tab_bar(tab_bar);
-            bar.bind_workspace(workspace_weak, cx);
-            bar
+        // 传输铃铛面板：独立的业务组件，通过 TitleBar 的 trailing 插槽挂载，
+        // 自行观察 workspace 的传输任务。
+        let transfer_bell = cx.new(|cx| {
+            let mut bell = TransferBellPanel::new();
+            bell.bind_workspace(workspace_weak, cx);
+            bell
+        });
+        let title_bar = cx.new(|_cx| {
+            TitleBar::new("title-bar")
+                .with_tab_bar(tab_bar)
+                .with_trailing(transfer_bell.clone())
         });
 
         let workspace_for_picker = workspace.clone();
@@ -313,6 +323,7 @@ impl AppWindow {
 
         let mut this = Self {
             title_bar,
+            transfer_bell,
             default_workspace: workspace.clone(),
             workspace: workspace.clone(),
             tab_group_workspaces: Vec::new(),
@@ -574,6 +585,9 @@ impl AppWindow {
         self.workspace = workspace.clone();
         self.title_bar.update(cx, |title_bar, cx| {
             title_bar.set_workspace(workspace.clone(), cx);
+        });
+        self.transfer_bell.update(cx, |bell, cx| {
+            bell.bind_workspace(workspace.downgrade(), cx);
         });
         self.ssh_picker.update(cx, |picker, _cx| {
             picker.set_workspace(workspace.clone());
@@ -1304,10 +1318,7 @@ fn main() {
                 // 任务未触发就会丢失最后一次会话状态。
                 for handle in cx.windows() {
                     let _ = handle.update(cx, |_view, window, cx| {
-                        if let Some(app) = window
-                            .root::<crate::AppWindow>()
-                            .and_then(|e| e)
-                        {
+                        if let Some(app) = window.root::<crate::AppWindow>().and_then(|e| e) {
                             app.update(cx, |app, cx| app.flush_pending_save(cx));
                         }
                     });

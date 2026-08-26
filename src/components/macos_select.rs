@@ -1,6 +1,5 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -22,6 +21,14 @@ const SELECT_EXIT_MS: u64 = 130;
 const SELECT_SLIDE_PX: f32 = 10.0;
 /// 在触发器正下方弹出时，触发器底边到弹窗边框的间距（像素）需要 > 6px 后才是视觉上真实的间距。
 const POPUP_GAP_BELOW_TRIGGER: f32 = 6.0;
+/// 触发器高度（像素）。
+const SELECT_TRIGGER_H: f32 = 24.0;
+/// 下拉项高度（像素）。
+const SELECT_ITEM_H: f32 = 24.0;
+/// 下拉项之间的间距（像素）。
+const SELECT_ITEM_GAP: f32 = 2.0;
+/// 下拉弹窗内容区内边距（像素）。
+const SELECT_POPUP_PAD: f32 = 6.0;
 
 /// 进入动画：返回 (位置进度, 不透明度)。位置全程平滑减速，不透明度提前收尾。
 fn select_enter_progress(t: f32) -> (f32, f32) {
@@ -90,7 +97,7 @@ pub struct MacosSelect {
     selected_item: SharedString,
     highlighted_index: usize,
     scroll_handle: ScrollHandle,
-    on_select: Option<Arc<dyn Fn(SharedString, usize, &mut Window, &mut App) + Send + Sync>>,
+    on_select: Option<Rc<dyn Fn(SharedString, usize, &mut Window, &mut App)>>,
     trigger_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     /// 动画代次，确保每次开/关从 delta=0 重新播放。
     anim_epoch: u32,
@@ -131,9 +138,9 @@ impl MacosSelect {
 
     pub fn on_select<F>(&mut self, callback: F)
     where
-        F: Fn(SharedString, usize, &mut Window, &mut App) + Send + Sync + 'static,
+        F: Fn(SharedString, usize, &mut Window, &mut App) + 'static,
     {
-        self.on_select = Some(Arc::new(callback));
+        self.on_select = Some(Rc::new(callback));
     }
 
     pub fn set_items(&mut self, items: Vec<SharedString>, cx: &mut Context<Self>) {
@@ -258,21 +265,15 @@ impl Render for MacosSelect {
         let anim_epoch = self.anim_epoch;
         let selected = self.selected_item.clone();
         let trigger_bounds = self.trigger_bounds.clone();
-        let _bounds = trigger_bounds.get();
 
         let theme_accent = theme.accent;
         let theme_text = theme.text;
         let theme_text_muted = theme.text_muted;
-        let is_dark = cx.theme().appearance.is_dark();
 
-        // 和 popup_menu 一致的颜色
-        let menu_bg = if is_dark {
-            gpui::Hsla::from(gpui::rgb(0x2C2C2E))
-        } else {
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF))
-        };
-        let menu_border =
-            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(if is_dark { 0.1 } else { 0.6 });
+        // 与 PopupMenu 一致的浮层颜色（来自主题，可在主题文件中通过
+        // menu_background / menu_border 覆盖）。
+        let menu_bg = theme.menu_background;
+        let menu_border = theme.menu_border;
 
         let highlighted = self.highlighted_index;
         let popup_position = self.popup_position;
@@ -282,7 +283,13 @@ impl Render for MacosSelect {
         let trigger_bounds_value = trigger_bounds.get();
         let dropdown_offset_y = match popup_position {
             SelectPopupPosition::BelowTrigger => px(POPUP_GAP_BELOW_TRIGGER),
-            SelectPopupPosition::AlignSelected => -(px(30.0) + px(highlighted as f32 * 26.0)),
+            SelectPopupPosition::AlignSelected => {
+                // 将高亮项对齐到触发器行：基准偏移 = 触发器高度 + 触发器间距，
+                // 再为高亮项之前的每一项上移一行（项高 + 行间距）。
+                let item_stride = SELECT_ITEM_H + SELECT_ITEM_GAP;
+                let base = SELECT_TRIGGER_H + POPUP_GAP_BELOW_TRIGGER;
+                -(px(base) + px(highlighted as f32 * item_stride))
+            }
         };
         let dropdown_width = match popup_position {
             SelectPopupPosition::AlignSelected => None,
@@ -299,7 +306,7 @@ impl Render for MacosSelect {
                 let item_clone = item.clone();
                 div()
                     .id(("macos-select-item", item_idx))
-                    .h(px(24.0))
+                    .h(px(SELECT_ITEM_H))
                     .px(px(8.0))
                     .flex()
                     .items_center()
@@ -380,7 +387,7 @@ impl Render for MacosSelect {
                 div()
                     .id("macos-select-trigger")
                     .relative()
-                    .h(px(24.0))
+                    .h(px(SELECT_TRIGGER_H))
                     .max_w_full()
                     .px(px(6.0))
                     .flex()
@@ -466,14 +473,14 @@ impl Render for MacosSelect {
                                     .shadow_lg()
                                     .when(dropdown_width.is_some(), |d| {
                                         d.w(dropdown_width.unwrap())
-                                            .px(px(6.0))
-                                            .pb(px(6.0))
+                                            .px(px(SELECT_POPUP_PAD))
+                                            .pb(px(SELECT_POPUP_PAD))
                                             .pt(px(1.0))
                                     })
-                                    .when(dropdown_width.is_none(), |d| d.p(px(6.0)))
+                                    .when(dropdown_width.is_none(), |d| d.p(px(SELECT_POPUP_PAD)))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(2.0))
+                                    .gap(px(SELECT_ITEM_GAP))
                                     .key_context("MacosSelect")
                                     .on_key_down(cx.listener(
                                         |this, event: &KeyDownEvent, window, cx| {
@@ -502,7 +509,7 @@ impl Render for MacosSelect {
                                             .track_scroll(&scroll_handle)
                                             .flex()
                                             .flex_col()
-                                            .gap(px(2.0))
+                                            .gap(px(SELECT_ITEM_GAP))
                                             .children(item_elements),
                                     )
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))

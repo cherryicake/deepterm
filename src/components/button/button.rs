@@ -2,9 +2,10 @@ use crate::components::button::button_icon::{ButtonIcon, Disableable, Selectable
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla, InteractiveElement,
-    Interactivity, IntoElement, MouseButton, ParentElement, Pixels, RenderOnce, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, Window, div, px, transparent_black,
+    AnyElement, App, AppContext as _, ClickEvent, Corners, Div, Edges, ElementId, Hsla,
+    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels, Render,
+    RenderOnce, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, px,
+    relative, transparent_black,
 };
 use std::rc::Rc;
 
@@ -187,7 +188,8 @@ pub struct Button {
     custom_height: Option<Pixels>,
     custom_width: Option<Pixels>,
     custom_px: Option<Pixels>,
-    tooltip: Option<(SharedString, Option<Rc<Box<dyn Action>>>)>,
+    /// 悬停提示文本，在 render 时通过 gpui 的 tooltip 机制渲染。
+    tooltip: Option<SharedString>,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     on_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
     loading: bool,
@@ -256,8 +258,19 @@ impl Button {
 
     /// Set the tooltip of the button
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
-        self.tooltip = Some((tooltip.into(), None));
+        self.tooltip = Some(tooltip.into());
         self
+    }
+
+    /// 计算焦点环样式：仅在获得焦点时显示，用外发光而不是边框，避免影响布局。
+    fn focus_ring_style(theme: &crate::theme::UiTheme) -> gpui::BoxShadow {
+        gpui::BoxShadow {
+            color: theme.accent.opacity(0.45),
+            offset: gpui::Point::default(),
+            blur_radius: px(0.),
+            spread_radius: px(2.),
+            inset: false,
+        }
     }
 
     /// Set true to show the loading indicator
@@ -392,7 +405,7 @@ impl RenderOnce for Button {
             .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
             .read(cx)
             .clone();
-        let _is_focused = focus_handle.is_focused(window);
+        let is_focused = focus_handle.is_focused(window);
 
         // Calculate corner radius based on theme
         let radius = match self.rounded {
@@ -466,28 +479,34 @@ impl RenderOnce for Button {
                     .when(self.border_edges.bottom, |this| this.border_b_1())
             })
             .text_color(normal_style.fg)
-            .when(self.selected, |this| {
-                let selected_style = style.selected(self.outline, cx);
-                this.bg(selected_style.bg)
-                    .border_color(selected_style.border)
-                    .text_color(selected_style.fg)
-            })
-            .when(!self.disabled && !self.selected, |this| {
-                this.border_color(normal_style.border)
-                    .bg(normal_style.bg)
-                    .when(normal_style.underline, |this| this.text_decoration_1())
-                    .hover(|this| {
-                        let hover_style = style.hovered(self.outline, cx);
-                        this.bg(hover_style.bg)
-                            .border_color(hover_style.border)
-                            .text_color(hover_style.fg)
-                    })
-                    .active(|this| {
-                        let active_style = style.active(self.outline, cx);
-                        this.bg(active_style.bg)
-                            .border_color(active_style.border)
-                            .text_color(active_style.fg)
-                    })
+            .when(!self.disabled, |this| {
+                if self.selected {
+                    // 选中态：保持选中样式，但悬停/按下时降低背景不透明度，保留可交互反馈
+                    let selected_style = style.selected(self.outline, cx);
+                    this.bg(selected_style.bg)
+                        .border_color(selected_style.border)
+                        .text_color(selected_style.fg)
+                        .when(!self.loading, |this| {
+                            this.hover(|this| this.bg(selected_style.bg.opacity(0.85)))
+                                .active(|this| this.bg(selected_style.bg.opacity(0.7)))
+                        })
+                } else {
+                    this.border_color(normal_style.border)
+                        .bg(normal_style.bg)
+                        .when(normal_style.underline, |this| this.text_decoration_1())
+                        .hover(|this| {
+                            let hover_style = style.hovered(self.outline, cx);
+                            this.bg(hover_style.bg)
+                                .border_color(hover_style.border)
+                                .text_color(hover_style.fg)
+                        })
+                        .active(|this| {
+                            let active_style = style.active(self.outline, cx);
+                            this.bg(active_style.bg)
+                                .border_color(active_style.border)
+                                .text_color(active_style.fg)
+                        })
+                }
             })
             .when(self.disabled, |this| {
                 let disabled_style = style.disabled(self.outline, cx);
@@ -513,6 +532,18 @@ impl RenderOnce for Button {
             .when_some(self.on_hover.filter(|_| hoverable), |this, on_hover| {
                 this.on_hover(move |hovered, window, cx| {
                     on_hover(hovered, window, cx);
+                })
+            })
+            .when(is_focused && !is_disabled, |this| {
+                // 键盘焦点可见性：用 accent 外发光作为焦点环，不影响布局。
+                this.shadow(vec![Self::focus_ring_style(&cx.theme().ui)])
+            })
+            .when_some(self.tooltip.filter(|_| !is_disabled), |this, tooltip| {
+                this.tooltip(move |_window, cx| {
+                    cx.new(|_| ButtonTooltip {
+                        label: tooltip.clone(),
+                    })
+                    .into()
                 })
             })
             .child({
@@ -543,6 +574,37 @@ impl RenderOnce for Button {
                     .border_color(normal_style.border.opacity(0.8))
                     .text_color(normal_style.fg.opacity(0.8))
             })
+    }
+}
+
+/// 按钮悬停提示气泡，与标签栏 Tooltip 的样式保持一致。
+struct ButtonTooltip {
+    label: SharedString,
+}
+
+impl Render for ButtonTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        div()
+            .id("button-tooltip")
+            .max_w(px(320.0))
+            .px_2()
+            .py_1()
+            .rounded(px(6.0))
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .shadow(vec![gpui::BoxShadow {
+                color: theme.shadow,
+                offset: gpui::point(px(0.0), px(4.0)),
+                blur_radius: px(12.0),
+                spread_radius: px(0.0),
+                inset: false,
+            }])
+            .text_size(px(12.0))
+            .text_color(theme.text)
+            .line_height(relative(1.3))
+            .child(self.label.clone())
     }
 }
 
