@@ -24,7 +24,7 @@ pub struct KeychainSidebarView {
     scroll_handle: ScrollHandle,
     selected_ids: HashSet<SharedString>,
     editor: Option<Entity<KeychainEditor>>,
-    modal_state: ModalState,
+    modal_state: Entity<ModalState>,
     on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
     context_menu_item_id: Option<SharedString>,
     search_input: Entity<InputState>,
@@ -61,7 +61,7 @@ impl KeychainSidebarView {
                 scroll_handle,
                 selected_ids: HashSet::new(),
                 editor: None,
-                modal_state: ModalState::new(),
+                modal_state: ModalState::entity(cx),
                 on_select: None,
                 context_menu_item_id: None,
                 search_input,
@@ -89,18 +89,17 @@ impl KeychainSidebarView {
             let entity_clone = entity.clone();
             ed.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.modal_state.close(cx, |this| &mut this.modal_state);
+                    this.modal_state.update(cx, |modal, cx| modal.close(cx));
                 });
             });
             let entity_clone2 = entity.clone();
             ed.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.modal_state.close(cx, |this| &mut this.modal_state);
+                    this.modal_state.update(cx, |modal, cx| modal.close(cx));
                 });
             });
         });
-        self.modal_state.open();
-        cx.notify();
+        self.modal_state.update(cx, |modal, cx| modal.open(cx));
     }
 
     fn open_edit_modal(
@@ -119,22 +118,22 @@ impl KeychainSidebarView {
             let entity_clone = entity.clone();
             ed.on_cancel(move |cx| {
                 entity_clone.update(cx, |this, cx| {
-                    this.modal_state.close(cx, |this| &mut this.modal_state);
+                    this.modal_state.update(cx, |modal, cx| modal.close(cx));
                 });
             });
             let entity_clone2 = entity.clone();
             ed.on_saved(move |cx| {
                 entity_clone2.update(cx, |this, cx| {
-                    this.modal_state.close(cx, |this| &mut this.modal_state);
+                    this.modal_state.update(cx, |modal, cx| modal.close(cx));
                 });
             });
         });
-        self.modal_state.open();
-        cx.notify();
+        self.modal_state.update(cx, |modal, cx| modal.open(cx));
     }
 
     pub fn build_modal(&mut self, cx: &mut Context<Self>) -> Option<Modal> {
-        if !self.modal_state.is_rendered() {
+        let modal_state = self.modal_state.read(cx);
+        if !modal_state.is_rendered() {
             return None;
         }
         let editor = self.editor.as_ref()?.clone();
@@ -144,11 +143,11 @@ impl KeychainSidebarView {
                 .width(px(540.))
                 .max_height(px(700.))
                 .top_padding(px(120.))
-                .closing(self.modal_state.is_closing())
-                .epoch(self.modal_state.epoch())
+                .closing(modal_state.is_closing())
+                .epoch(modal_state.epoch())
                 .on_close(move |_window, cx| {
                     entity.update(cx, |this, cx| {
-                        this.modal_state.close(cx, |this| &mut this.modal_state);
+                        this.modal_state.update(cx, |modal, cx| modal.close(cx));
                     });
                 })
                 .child(editor),

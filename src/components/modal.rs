@@ -2,8 +2,8 @@ use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, BoxShadow, Context, ElementId,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce,
+    Animation, AnimationExt as _, AnyElement, App, AppContext as _, BoxShadow, Context, ElementId,
+    Entity, InteractiveElement, IntoElement, KeyBinding, ParentElement, Pixels, RenderOnce,
     StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, actions, deferred, div,
     linear, point, px,
 };
@@ -26,8 +26,13 @@ pub fn init(cx: &mut App) {
 }
 
 /// 弹窗动画状态。封装「打开 / 关闭中 / 动画代次」与延迟卸载任务，
-/// 供调用方（如 HostView、KeychainView）持有，复用 macOS 风格的
-/// 「关闭时保持挂载直到退出动画结束」逻辑。
+/// 供调用方（如 HostView、KeychainView）以 `Entity<ModalState>` 形式持有，
+/// 复用 macOS 风格的「关闭时保持挂载直到退出动画结束」逻辑。
+///
+/// 作为独立实体，`close` 内部的延迟清理任务通过自身弱引用回到本状态，
+/// 调用方无需提供「从宿主视图导航到本字段」的函数指针，避免误指向
+/// 其他字段导致退出动画状态卡死。宿主视图需
+/// `cx.observe(&modal_state, |_, _, cx| cx.notify())` 订阅刷新。
 #[derive(Default)]
 pub struct ModalState {
     open: bool,
@@ -40,6 +45,14 @@ pub struct ModalState {
 impl ModalState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 创建独立的弹窗状态实体，并在宿主视图上订阅其变化以便重新渲染。
+    /// 宿主视图构造时调用一次即可。
+    pub fn entity<T: 'static>(cx: &mut Context<T>) -> Entity<Self> {
+        let entity = cx.new(|_| Self::new());
+        cx.observe(&entity, |_, _, cx| cx.notify()).detach();
+        entity
     }
 
     /// 弹窗是否需要渲染（打开中或正在播放退出动画）。
@@ -60,17 +73,18 @@ impl ModalState {
         self.epoch
     }
 
-    /// 打开弹窗，触发进入动画。调用方需自行 `cx.notify()`。
-    pub fn open(&mut self) {
+    /// 打开弹窗，触发进入动画。
+    pub fn open(&mut self, cx: &mut Context<Self>) {
         self.closing = false;
         self._hide_task = None;
         self.open = true;
         self.epoch = self.epoch.wrapping_add(1);
+        cx.notify();
     }
 
     /// 开始关闭：进入退出动画阶段并保持渲染，待动画结束后卸载。
-    /// `field` 用于在延迟任务里重新定位到所属实体中的 ModalState 字段。
-    pub fn close<T: 'static>(&mut self, cx: &mut Context<T>, field: fn(&mut T) -> &mut ModalState) {
+    /// 延迟任务通过自身弱引用回到本实体，无需调用方提供字段导航。
+    pub fn close(&mut self, cx: &mut Context<Self>) {
         if !self.open {
             return;
         }
@@ -81,8 +95,7 @@ impl ModalState {
             cx.background_executor()
                 .timer(Duration::from_millis(MODAL_EXIT_MS + 40))
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                let state = field(this);
+            let _ = this.update(cx, |state, cx| {
                 state.closing = false;
                 state._hide_task = None;
                 cx.notify();
