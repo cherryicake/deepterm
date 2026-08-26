@@ -105,6 +105,195 @@ pub enum InputEvent {
 
 pub(crate) const CONTEXT: &str = "Input";
 
+/// Git 行变更类型（行号区色条）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitLineMark {
+    Added,
+    Modified,
+    /// 该行上方有被删除的行（红色小三角/色条画在行顶部）。
+    Deleted,
+}
+
+/// 同词高亮缓存。
+pub(crate) struct OccurrenceCache {
+    pub(crate) text_version: u64,
+    /// 命中条件：光标仍在该词范围内。
+    pub(crate) word: Range<usize>,
+    pub(crate) ranges: std::rc::Rc<Vec<Range<usize>>>,
+}
+
+/// 滚动条几何信息（每次 paint 后写入，供拖拽命中与换算）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollbarGeometry {
+    /// thumb 在窗口坐标下的区域。
+    pub(crate) thumb: Bounds<Pixels>,
+    /// 轨道总高度（= viewport 高度）。
+    pub(crate) track_height: Pixels,
+    /// thumb 高度。
+    pub(crate) thumb_height: Pixels,
+    /// 内容总高度。
+    pub(crate) content_height: Pixels,
+}
+
+/// 括号着色的最大文件长度（字节），超出则跳过（避免每帧全文件扫描）。
+pub(crate) const RAINBOW_BRACKETS_MAX_TEXT_LEN: usize = 2_000_000;
+/// 同词高亮的最大出现次数，超出则放弃高亮（避免噪音与性能问题）。
+const OCCURRENCE_MAX_MATCHES: usize = 2_000;
+/// 同词高亮扫描的最大文件长度（字节）。
+const OCCURRENCE_MAX_TEXT_LEN: usize = 2_000_000;
+
+/// 行首缩进的每级字节边界：第 k 个元素 = 第 k+1 个缩进单位结束处的字节偏移。
+///
+/// Tab 算 1 级，每 4 个空格算 1 级（与 SPACE_OUTDENT_WIDTH 一致）。
+pub(crate) fn indent_level_bounds(line_text: &str) -> Vec<usize> {
+    let mut bounds = Vec::new();
+    let mut spaces = 0;
+    for (i, b) in line_text.bytes().enumerate() {
+        match b {
+            b'\t' => {
+                spaces = 0;
+                bounds.push(i + 1);
+            }
+            b' ' => {
+                spaces += 1;
+                if spaces == 4 {
+                    spaces = 0;
+                    bounds.push(i + 1);
+                }
+            }
+            _ => break,
+        }
+    }
+    bounds
+}
+
+/// Sticky scroll 最多钉住的行数。
+const STICKY_MAX_LINES: usize = 3;
+
+/// 是否是适合 sticky scroll 钉住的“定义类”语法节点 kind。
+/// 语言无关的字符串匹配（Rust/JS/TS/Python/Java/Go/C 家族常见定义节点）。
+fn is_sticky_definition_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Rust
+        "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "impl_item"
+            | "trait_item"
+            | "mod_item"
+            | "macro_definition"
+            // JS / TS
+            | "function_declaration"
+            | "function_definition"
+            | "method_definition"
+            | "method_declaration"
+            | "class_declaration"
+            | "class_definition"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "namespace_definition"
+            // C / C++ / Java / Go
+            | "struct_specifier"
+            | "struct_declaration"
+            | "enum_specifier"
+            | "type_declaration"
+            | "impl_declaration"
+            // Python（function_definition / class_definition 与 JS 重名）
+            // 其他
+            | "module"
+    )
+}
+
+/// ASCII 词字符（同词高亮只用 ASCII 词，避免 CJK 单字噪音）。
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 光标处的词字节范围（要求光标在词内或紧贴词边界）。
+fn word_range_at(text: &Rope, offset: usize) -> Option<Range<usize>> {
+    let len = text.len();
+    let prev_is_word = offset > 0 && text.get_byte(offset - 1).is_some_and(is_ascii_word_byte);
+    let next_is_word = offset < len && text.get_byte(offset).is_some_and(is_ascii_word_byte);
+    if !prev_is_word && !next_is_word {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 && text.get_byte(start - 1).is_some_and(is_ascii_word_byte) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < len && text.get_byte(end).is_some_and(is_ascii_word_byte) {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+/// 全文件找 `word`（字节范围）的所有边界完整出现。超过 `max_matches` 返回 None。
+fn find_word_occurrences(
+    text: &Rope,
+    word: &Range<usize>,
+    max_matches: usize,
+) -> Option<Vec<Range<usize>>> {
+    let wlen = word.len();
+    if wlen == 0 {
+        return None;
+    }
+    let target: Vec<u8> = text.slice(word.clone()).bytes().collect();
+    let len = text.len();
+    let bytes: Vec<u8> = text.bytes().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i + wlen <= len {
+        if bytes[i] == target[0]
+            && &bytes[i..i + wlen] == target.as_slice()
+            && (i == 0 || !is_ascii_word_byte(bytes[i - 1]))
+            && (i + wlen == len || !is_ascii_word_byte(bytes[i + wlen]))
+        {
+            result.push(i..i + wlen);
+            if result.len() > max_matches {
+                return None;
+            }
+            i += wlen;
+        } else {
+            i += 1;
+        }
+    }
+    Some(result)
+}
+
+/// 括号嵌套深度扫描结果：每个括号字节的 (字节范围, 是否开括号, 自身层级)。
+///
+/// 层级取括号自身的嵌套层级（最外层 = 0，闭括号取其配对开括号的层级）。
+/// 只扫到 `scan_end`（用于缓存全文件后按可见范围过滤）。
+pub(crate) fn bracket_depth_spans(text: &Rope, scan_end: usize) -> Vec<(Range<usize>, bool, usize)> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let scan_end = scan_end.min(text.len());
+    if scan_end == 0 {
+        return result;
+    }
+    for (i, b) in text.slice(0..scan_end).bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => {
+                result.push((i..i + 1, true, depth));
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                result.push((i..i + 1, false, depth));
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
 /// 括号匹配的单向扫描上限（字节），防止超大文件下卡顿。
 const BRACKET_MATCH_SCAN_LIMIT: usize = 500_000;
 
@@ -388,6 +577,32 @@ pub struct InputState {
     pub(crate) masked: bool,
     pub(crate) clean_on_escape: bool,
     pub(crate) soft_wrap: bool,
+    /// 同词高亮（光标停在词内时高亮全文件出现）。
+    pub(crate) occurrences: bool,
+    /// 同词高亮缓存：键为 (text_version, 词范围)，避免每帧全文件扫描。
+    pub(crate) occurrence_cache: Option<OccurrenceCache>,
+    /// 括号着色（rainbow brackets，按嵌套深度分色）。
+    pub(crate) rainbow_brackets: bool,
+    /// 括号着色缓存：键为 text_version，值为全文件括号层级扫描结果。
+    pub(crate) rainbow_cache:
+        Option<(u64, std::rc::Rc<Vec<(Range<usize>, bool, usize)>>)>,
+    /// 缩进参考线。
+    pub(crate) indent_guides: bool,
+    /// 悬浮滚动条。
+    pub(crate) scrollbar: bool,
+    /// 滚动条几何（每次 paint 后写入）。
+    pub(crate) scrollbar_geometry: Option<ScrollbarGeometry>,
+    /// 滚动条拖拽状态：(按下时鼠标 y, 按下时滚动位置)。
+    pub(crate) scrollbar_drag: Option<(Pixels, Pixels)>,
+    /// 滚动条拖拽状态：(按下时鼠标 y, 按下时滚动位置)。
+    /// Sticky scroll：顶部固定外围定义行。
+    pub(crate) sticky_scroll: bool,
+    /// Sticky 行点击目标（窗口坐标，由 paint 阶段写入，鼠标点击跳转用）。
+    pub(crate) sticky_click_targets: Vec<(usize, Bounds<Pixels>)>,
+    /// Git 变更标记（行号区色条）。
+    pub(crate) git_gutter: bool,
+    /// Git 变更标记数据：buffer 行号 → 变更类型（由 Editor 侧异步计算写入）。
+    pub(crate) git_line_marks: std::collections::HashMap<u32, GitLineMark>,
     pub(crate) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
@@ -504,6 +719,18 @@ impl InputState {
             masked: false,
             clean_on_escape: false,
             soft_wrap: true,
+            occurrences: true,
+            occurrence_cache: None,
+            rainbow_brackets: true,
+            rainbow_cache: None,
+            indent_guides: true,
+            scrollbar: true,
+            scrollbar_geometry: None,
+            scrollbar_drag: None,
+            sticky_scroll: true,
+            sticky_click_targets: Vec::new(),
+            git_gutter: true,
+            git_line_marks: std::collections::HashMap::new(),
             show_whitespaces: false,
             loading: false,
             pattern: None,
@@ -1070,6 +1297,134 @@ impl InputState {
     pub fn show_whitespaces(mut self, show: bool) -> Self {
         self.show_whitespaces = show;
         self
+    }
+
+    /// 同词高亮（默认开启）。
+    pub fn occurrences(mut self, enable: bool) -> Self {
+        self.occurrences = enable;
+        self
+    }
+
+    /// 括号着色（默认开启）。
+    pub fn rainbow_brackets(mut self, enable: bool) -> Self {
+        self.rainbow_brackets = enable;
+        self
+    }
+
+    /// 缩进参考线（默认开启）。
+    pub fn indent_guides(mut self, enable: bool) -> Self {
+        self.indent_guides = enable;
+        self
+    }
+
+    /// 悬浮滚动条（默认开启）。
+    pub fn scrollbar(mut self, enable: bool) -> Self {
+        self.scrollbar = enable;
+        self
+    }
+
+    /// Sticky scroll（默认开启，仅 code_editor 多行模式生效）。
+    pub fn sticky_scroll(mut self, enable: bool) -> Self {
+        self.sticky_scroll = enable;
+        self
+    }
+
+    /// Git 变更标记（默认开启）。
+    pub fn git_gutter(mut self, enable: bool) -> Self {
+        self.git_gutter = enable;
+        self
+    }
+
+    /// 写入 Git 行变更标记（由 Editor 侧异步计算后调用）。
+    pub fn set_git_line_marks(
+        &mut self,
+        marks: Vec<(u32, GitLineMark)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_line_marks = marks.into_iter().collect();
+        cx.notify();
+    }
+
+    /// 同词高亮：返回光标处词的全文件出现范围（带缓存）。
+    /// None 表示当前无需高亮（非词内/超出限制/未启用）。
+    pub(crate) fn occurrence_ranges(&mut self) -> Option<std::rc::Rc<Vec<Range<usize>>>> {
+        if !self.occurrences || self.mode.is_single_line() || self.masked {
+            return None;
+        }
+        if !self.selected_range.is_empty() {
+            return None;
+        }
+        if self.text.len() > OCCURRENCE_MAX_TEXT_LEN {
+            return None;
+        }
+        let cursor = self.cursor();
+        if let Some(cache) = &self.occurrence_cache
+            && cache.text_version == self.text_version
+            && cache.word.contains(&cursor)
+        {
+            return Some(cache.ranges.clone());
+        }
+        let word = word_range_at(&self.text, cursor)?;
+        let ranges = find_word_occurrences(&self.text, &word, OCCURRENCE_MAX_MATCHES)?;
+        let rc = std::rc::Rc::new(ranges);
+        self.occurrence_cache = Some(OccurrenceCache {
+            text_version: self.text_version,
+            word,
+            ranges: rc.clone(),
+        });
+        Some(rc)
+    }
+
+    /// Sticky scroll：首可见行的外围定义节点所在行，外→内序，最多
+    /// [`STICKY_MAX_LINES`] 行。仅返回完全位于首可见行之上的行；
+    /// 无语法树 / 非代码模式返回空。
+    pub(crate) fn sticky_lines(&self, first_visible_row: usize) -> Vec<usize> {
+        if !self.sticky_scroll || self.mode.is_single_line() || self.masked {
+            return Vec::new();
+        }
+        // diff 视图（外部高亮）与图片等场景不做 sticky
+        if self.external_highlight_runs.is_some() {
+            return Vec::new();
+        }
+        if first_visible_row == 0 {
+            return Vec::new();
+        }
+        let InputMode::CodeEditor { highlighter, .. } = &self.mode else {
+            return Vec::new();
+        };
+        let hl = highlighter.borrow();
+        let Some(hl) = hl.as_ref() else {
+            return Vec::new();
+        };
+        let Some(tree) = hl.tree() else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+
+        // 首可见行起点的字节偏移（防御：越界时取最后一行）
+        let last_line = self.text.len_lines(ropey::LineType::LF).saturating_sub(1);
+        let row = first_visible_row.min(last_line);
+        let start_byte = self.text.line_start_offset(row);
+
+        // 从该字节最深的节点向上收集定义类祖先（内→外序）
+        let mut node = root.descendant_for_byte_range(start_byte, start_byte);
+        let mut rows: Vec<usize> = Vec::new();
+        while let Some(n) = node {
+            let start_row = n.start_position().row;
+            if start_row < first_visible_row
+                && is_sticky_definition_kind(n.kind())
+                && !rows.contains(&start_row)
+            {
+                rows.push(start_row);
+            }
+            node = n.parent();
+        }
+        rows.reverse(); // 外→内
+        if rows.len() > STICKY_MAX_LINES {
+            let keep = rows.len() - STICKY_MAX_LINES;
+            rows.drain(0..keep);
+        }
+        rows
     }
 
     /// Update the soft wrap mode for multi-line input, default is true.
@@ -3563,6 +3918,89 @@ mod tests {
         assert_eq!(InputState::newline_indent_kind("  foo({ key:", None), Inherit);
         assert_eq!(InputState::newline_indent_kind("let x = 1", None), Inherit);
         assert_eq!(InputState::newline_indent_kind("", None), Inherit);
+    }
+
+    #[test]
+    fn word_occurrence_scanning() {
+        let rope = Rope::from_str("let foo = foo + foo2 + foo;");
+        // 光标在词内
+        assert_eq!(word_range_at(&rope, 4), Some(4..7));
+        // 光标紧贴词尾（边界处仍算在词内）
+        assert_eq!(word_range_at(&rope, 7), Some(4..7));
+        // 光标在空格处（两侧都非词字符）
+        assert_eq!(word_range_at(&rope, 8), None);
+        // 词边界匹配：foo 命中 3 处，foo2 不命中
+        let occ = find_word_occurrences(&rope, &(4..7), 100).unwrap();
+        assert_eq!(occ.len(), 3);
+        assert_eq!(occ[0], 4..7);
+        assert_eq!(occ[1], 10..13);
+        assert_eq!(occ[2], 23..26);
+
+        // 下划线词
+        let rope = Rope::from_str("my_var my_var2");
+        assert_eq!(word_range_at(&rope, 2), Some(0..6));
+        let occ = find_word_occurrences(&rope, &(0..6), 100).unwrap();
+        assert_eq!(occ.len(), 1);
+
+        // CJK 不参与同词高亮
+        let rope = Rope::from_str("中文 foo 中文");
+        assert_eq!(word_range_at(&rope, 1), None);
+
+        // 超出次数上限 → None
+        let many = "ab ".repeat(50);
+        let rope = Rope::from_str(&many);
+        assert!(find_word_occurrences(&rope, &(0..2), 10).is_none());
+    }
+
+    #[test]
+    fn indent_level_bounds_scan() {
+        // Tab：每 1 个 = 1 级
+        assert_eq!(indent_level_bounds("\t\tfoo"), vec![1, 2]);
+        // 空格：每 4 个 = 1 级
+        assert_eq!(indent_level_bounds("        bar"), vec![4, 8]);
+        // 混合：tab + 4 空格 = 2 级
+        assert_eq!(indent_level_bounds("\t    baz"), vec![1, 5]);
+        // 不足 4 个空格不算一级
+        assert_eq!(indent_level_bounds("   x"), Vec::<usize>::new());
+        // 空行 / 无缩进
+        assert_eq!(indent_level_bounds(""), Vec::<usize>::new());
+        assert_eq!(indent_level_bounds("no indent"), Vec::<usize>::new());
+        // 只有空白
+        assert_eq!(indent_level_bounds("  \t "), vec![3]);
+    }
+
+    #[test]
+    fn bracket_depth_spans_scan() {
+        let rope = Rope::from_str("(a[b]{c})");
+        let spans = bracket_depth_spans(&rope, rope.len())
+            .into_iter()
+            .map(|(r, is_open, d)| (r.start, is_open, d))
+            .collect::<Vec<_>>();
+        // ( 层级0，[ 层级1，] 层级1，{ 层级1，} 层级1，) 层级0
+        assert_eq!(
+            spans,
+            vec![
+                (0, true, 0),
+                (2, true, 1),
+                (4, false, 1),
+                (5, true, 1),
+                (7, false, 1),
+                (8, false, 0),
+            ]
+        );
+
+        // 多余闭括号深度不归负
+        let rope = Rope::from_str(")((");
+        let spans = bracket_depth_spans(&rope, rope.len());
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].2, 0); // 多余的 ) 归 0 层
+        assert_eq!(spans[1].2, 0);
+        assert_eq!(spans[2].2, 1);
+
+        // 扫描截至 scan_end
+        let rope = Rope::from_str("(()");
+        let spans = bracket_depth_spans(&rope, 2);
+        assert_eq!(spans.len(), 2);
     }
 
     #[test]

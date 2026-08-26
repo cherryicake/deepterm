@@ -2,6 +2,7 @@ pub mod diff_model;
 pub mod diff_view;
 pub mod editor;
 pub mod encoding;
+pub mod git_marks;
 pub mod git_repository;
 pub mod git_status;
 pub mod goto_line;

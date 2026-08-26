@@ -15,6 +15,8 @@ use crate::components::input::{EditorInput, InputState};
 use crate::components::notification::NotificationKind;
 use crate::components::tab_bar::{DraggedTab, TabBar, TabItem};
 use crate::editor::encoding::{self, FileEncoding};
+use crate::editor::git_marks::compute_git_line_marks;
+use crate::editor::git_repository::GitRepository;
 use crate::editor::goto_line;
 use crate::editor::syntax::languages::Language;
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
@@ -1427,6 +1429,8 @@ impl Editor {
                                             loaded.encoding,
                                         );
                                 }
+                                // 后台计算 Git 行变更标记（行号区色条）
+                                this.refresh_git_marks(&tab_id, cx);
                             }
                             let file_path = this
                                 .open_files
@@ -1964,6 +1968,53 @@ impl Editor {
     }
 
     /// 同步标签栏的未保存标记。
+    /// 后台计算 Git 行变更标记（HEAD → 工作区）并写入编辑器状态。
+    ///
+    /// 在文件加载完成与保存成功后调用：标记反映磁盘状态，因此无需
+    /// 随击键重算（未保存的缓冲区修改不属于工作区 diff）。
+    fn refresh_git_marks(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) else {
+            return;
+        };
+        let path = file.path.clone();
+        let ssh_config = file.ssh_config.clone();
+        let weak = cx.entity().downgrade();
+        let tab_id = tab_id.to_string();
+
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let is_local = ssh_config.is_none();
+                    let repo =
+                        GitRepository::find(std::path::Path::new(&path), is_local, ssh_config)
+                            .ok()
+                            .flatten()?;
+                    // 仓库相对路径：git show HEAD:<rel> 在仓库根目录下执行
+                    let rel = path
+                        .strip_prefix(repo.root())?
+                        .trim_start_matches('/');
+                    if rel.is_empty() {
+                        return None;
+                    }
+                    let (old, new) = repo.diff_file_contents(rel).ok()?;
+                    Some(compute_git_line_marks(&old, &new))
+                })
+                .await;
+            let Some(marks) = result else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(file) = this.open_files.iter().find(|f| f.id.as_ref() == tab_id) {
+                    file.editor_state.update(cx, |state, cx| {
+                        state.set_git_line_marks(marks, cx);
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
     fn sync_tab_modified(&self, tab_id: &str, dirty: bool, cx: &mut Context<Self>) {
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.modify_tab(tab_id, |tab| tab.is_modified = dirty, cx);
@@ -2063,6 +2114,8 @@ impl Editor {
                         }
                         let msg = format!("已保存 {label}");
                         this.sync_tab_modified(&tab_id, false, cx);
+                        // 保存后工作区变化：重算 Git 行变更标记
+                        this.refresh_git_marks(&tab_id, cx);
                         this.show_notification(msg, NotificationKind::Success, cx);
                         if close_after_save {
                             this.close_file_direct(&tab_id, cx);
