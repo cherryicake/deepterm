@@ -510,8 +510,8 @@ impl Render for TitleBar {
         let is_macos = cfg!(target_os = "macos");
         let theme = cx.theme().ui;
 
-        // 注意：TabBar 现在使用 ScrollHandle.max_offset() 自动检测溢出
-        // 不需要从外部传入可用宽度
+        // TabBar 自行管理标签溢出滚动（overflow_x_scroll + ScrollHandle），
+        // 外部无需感知可用宽度或溢出状态
 
         // Main title bar container - 与工作空间背景色一致
         div()

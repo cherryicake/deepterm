@@ -475,13 +475,9 @@ impl Workspace {
                     (tab_id.clone(), is_remote)
                 })
                 .collect();
-            workspace.tab_bar.update(cx, |tab_bar, _cx| {
-                for tab in tab_bar.tabs.iter_mut() {
-                    if let Some((_, is_remote)) =
-                        remote_status.iter().find(|(id, _)| id == tab.id.as_ref())
-                    {
-                        tab.is_remote = *is_remote;
-                    }
+            workspace.tab_bar.update(cx, |tab_bar, cx| {
+                for (tab_id, is_remote) in remote_status {
+                    tab_bar.modify_tab(tab_id.as_str(), |tab| tab.is_remote = is_remote, cx);
                 }
             });
 
@@ -641,21 +637,6 @@ impl Workspace {
                                 cx,
                             );
                         });
-                    });
-                }
-            });
-
-            // 设置溢出检测回调 - 当 TabBar 标签过多时触发
-            tab_bar.on_overflow_changed({
-                let workspace = workspace.clone();
-                move |is_overflowing, cx| {
-                    cx.defer({
-                        let workspace = workspace.clone();
-                        move |cx| {
-                            workspace.update(cx, |this, cx| {
-                                this.handle_tab_bar_overflow(is_overflowing, cx);
-                            });
-                        }
                     });
                 }
             });
@@ -1886,7 +1867,6 @@ impl Workspace {
                     tab_bar.tabs.push(new_tab_item);
                 }
             }
-            tab_bar.update_overflow_state(cx);
             cx.notify();
         });
 
@@ -1916,40 +1896,19 @@ impl Workspace {
     }
 
     /// 处理tab重新排序
+    ///
+    /// TabBar 组件在触发回调前已就地应用重排（`to_index` 为重排前列表的
+    /// 插入位语义），此处只需同步派生状态并广播变更。
     fn handle_tab_reorder(
         &mut self,
-        dragged_tab_id: &str,
-        to_index: usize,
+        _dragged_tab_id: &str,
+        _to_index: usize,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = false;
-        self.tab_bar.update(cx, |tab_bar, cx| {
-            if let Some(from_index) = tab_bar.tabs.iter().position(|t| t.id == dragged_tab_id) {
-                if from_index != to_index {
-                    let tab = tab_bar.tabs.remove(from_index);
-                    tab_bar.tabs.insert(to_index, tab);
-                    changed = true;
-                    cx.notify();
-                }
-            }
-        });
-        if changed {
-            // 标签顺序变化：按新的显示顺序重新为Workspace标签编号
-            self.renumber_workspace_tabs(cx);
-            cx.emit(WorkspaceEvent::SessionChanged);
-            cx.emit(WorkspaceEvent::TabBarChanged);
-        }
-    }
-
-    /// 处理 TabBar 溢出事件
-    /// 当标签页数量过多导致需要滚动时触发
-    fn handle_tab_bar_overflow(&mut self, is_overflowing: bool, _cx: &mut Context<Self>) {
-        // TabBar 已经自动处理滚动，仅 debug 级别记录
-        if is_overflowing {
-            log::debug!("[WORKSPACE] TabBar is overflowing");
-        } else {
-            log::debug!("[WORKSPACE] TabBar overflow resolved");
-        }
+        // 标签顺序变化：按新的显示顺序重新为Workspace标签编号
+        self.renumber_workspace_tabs(cx);
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
     }
 
     fn find_panel(&self, panel_id: &str, cx: &App) -> Option<Entity<Panel>> {

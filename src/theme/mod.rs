@@ -37,6 +37,9 @@ pub struct UiTheme {
     pub tab_active_background: Hsla,
     pub tab_inactive_background: Hsla,
     pub tab_hover_background: Hsla,
+    /// 激活标签的描边色。历史行为是白色半透明（暗色主题 10%、亮色主题 60%），
+    /// 现作为主题字段保留该默认值，可被主题文件覆盖。
+    pub tab_active_border: Hsla,
     pub border: Hsla,
     pub border_strong: Hsla,
     pub text: Hsla,
@@ -380,6 +383,8 @@ struct UiThemeFile {
     tab_active_background: String,
     tab_inactive_background: String,
     tab_hover_background: String,
+    #[serde(default = "default_tab_active_border")]
+    tab_active_border: String,
     border: String,
     border_strong: String,
     text: String,
@@ -599,6 +604,10 @@ fn default_status_conflict() -> String {
     "#ff9800".to_string()
 }
 
+fn default_tab_active_border() -> String {
+    "#FFFFFF1A".to_string()
+}
+
 impl TryFrom<UiThemeFile> for UiTheme {
     type Error = anyhow::Error;
 
@@ -614,6 +623,7 @@ impl TryFrom<UiThemeFile> for UiTheme {
             tab_active_background: parse_color(&value.tab_active_background)?,
             tab_inactive_background: parse_color(&value.tab_inactive_background)?,
             tab_hover_background: parse_color(&value.tab_hover_background)?,
+            tab_active_border: parse_color(&value.tab_active_border)?,
             border: parse_color(&value.border)?,
             border_strong: parse_color(&value.border_strong)?,
             text: parse_color(&value.text)?,

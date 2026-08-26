@@ -3,15 +3,15 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, ElementId, Entity, FocusHandle,
-    Focusable, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle, SharedString,
-    TextRun, TextStyle, Transformation, Window, actions, canvas, div, ease_in_out, ease_out_quint,
-    percentage, px, svg,
+    Action, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId, Entity,
+    FocusHandle, Focusable, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle,
+    SharedString, Stateful, TextRun, TextStyle, Transformation, Window, actions, div, ease_in_out,
+    ease_out_quint, percentage, px, svg,
 };
 
 use crate::assets::Icon;
 use crate::components::menu::{ContextMenuExt, PopupMenu};
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveTheme, UiTheme};
 use crate::workspace::panel::DraggedPanel;
 
 actions!(tab_context_menu, [CopyTabAddress, DuplicateTab, ReconnectTab]);
@@ -26,6 +26,8 @@ pub struct DraggedTab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TabReorderPreview {
     dragged_tab: DraggedTab,
+    /// 插入位（before 语义）：拖拽结果为「插入到重排前的第 insert_slot 个位置」，
+    /// 取值范围 [0, tabs.len()]（等于 len 表示追加到末尾）。
     insert_slot: usize,
 }
 
@@ -42,28 +44,13 @@ const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
 const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
 const TAB_MAX_WIDTH_PX: f32 = 180.0;
-
-/// Tab 放置事件
-pub struct TabDropEvent {
-    pub dragged_tab: DraggedTab,
-    pub to_index: usize,
-}
-
-/// 边缘区域
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EdgeZone {
-    Left,
-    Right,
-    Top,
-    Bottom,
-    Center,
-}
-
-/// 拖拽分割事件
-pub struct TabSplitEvent {
-    pub dragged_tab: DraggedTab,
-    pub edge_zone: EdgeZone,
-}
+const TAB_HEIGHT_PX: f32 = 30.0;
+const TAB_PADDING_X_PX: f32 = 12.0;
+const TAB_RADIUS_PX: f32 = 8.0;
+const ICON_SIZE_PX: f32 = 16.0;
+const FILE_ICON_SIZE_PX: f32 = 22.0;
+const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
+const TAB_TOOLTIP_MAX_WIDTH_PX: f32 = 480.0;
 
 /// 拖拽预览视图
 pub struct DragPreview {
@@ -185,15 +172,52 @@ impl TabItem {
     }
 }
 
-/// Tab合并事件
-pub struct TabMergeEvent {
-    pub dragged_tab: DraggedTab,
-    pub target_tab_id: SharedString,
+/// 纯重排核心：把 `dragged_id` 对应标签移动到「重排前列表的第 `insert_slot` 个插入位」。
+/// 返回拖拽标签的重排前索引；无实际移动或标签不存在时返回 None。
+fn apply_reorder(tabs: &mut Vec<TabItem>, dragged_id: &str, insert_slot: usize) -> Option<usize> {
+    let from_index = tabs.iter().position(|t| t.id == dragged_id)?;
+    let final_index = TabBar::final_index_for_slot(from_index, insert_slot);
+
+    if from_index == final_index || final_index >= tabs.len() {
+        return None;
+    }
+
+    let tab = tabs.remove(from_index);
+    tabs.insert(final_index, tab);
+    Some(from_index)
 }
 
-/// 溢出状态变化回调
-/// 当 TabBar 检测到溢出状态变化时触发
-pub type OnOverflowChanged = Rc<dyn Fn(bool, &mut App) + Send + Sync>;
+/// 中点判定（纯函数）：`content_x` 位于哪个 tab 中点左侧，就插入到哪个索引之前。
+fn insert_slot_for_content_x(content_x: Pixels, tab_bounds: &[Bounds<Pixels>]) -> usize {
+    for (index, bounds) in tab_bounds.iter().enumerate() {
+        let midpoint = bounds.left() + bounds.size.width / 2.0;
+        if content_x < midpoint {
+            return index;
+        }
+    }
+
+    tab_bounds.len()
+}
+
+/// 纯函数：重排预览期间第 `index` 个标签的水平位移。
+/// 拖拽标签右移时，[from+1, to] 区间的标签左移让位；左移时 [to, from-1] 区间右移。
+fn reorder_offset(from_index: usize, to_index: usize, index: usize, shift_width: f32) -> f32 {
+    if to_index > from_index {
+        if index > from_index && index <= to_index {
+            -shift_width
+        } else {
+            0.0
+        }
+    } else if to_index < from_index {
+        if index >= to_index && index < from_index {
+            shift_width
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
+}
 
 /// 标签栏组件
 pub struct TabBar {
@@ -203,31 +227,23 @@ pub struct TabBar {
     on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
     on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
+    /// 重排回调：`insert_slot` 为重排前列表中的插入位（before 语义）。
+    /// 回调触发时 TabBar 自身的 tabs 已完成重排，消费方只需同步自己的平行结构
+    /// （如 editor 的 open_files），不要再对 tab_bar.tabs 重复应用。
     on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
-    on_tab_split: Option<Rc<dyn Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync>>,
-    on_tab_merge: Option<Rc<dyn Fn(DraggedTab, SharedString, &mut App) + Send + Sync>>,
     /// Panel 拖拽到 TabBar 的回调
     on_panel_drop:
         Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>>,
-    /// 溢出状态变化回调
-    on_overflow_changed: Option<OnOverflowChanged>,
     focus_handle: FocusHandle,
-    /// 滚动句柄，用于控制水平滚动
+    /// 滚动句柄，用于控制水平滚动；子元素 bounds（内容坐标）与视口
+    /// （窗口坐标）均从此句柄读取
     scroll_handle: ScrollHandle,
-    /// 上一次检测到的溢出状态
-    last_overflow: Option<bool>,
-    /// 测量到的容器宽度（通过 canvas 获取）
-    measured_container_width: f32,
     /// 当前 Tab 重排预览
     reorder_preview: Option<TabReorderPreview>,
     /// 上一次 Tab 重排预览，用于做补间动画
     previous_reorder_preview: Option<TabReorderPreview>,
     /// 重排动画序号
     reorder_animation_epoch: usize,
-    /// 当前渲染周期里每个 tab 的实际边界
-    tab_bounds: Vec<Bounds<Pixels>>,
-    /// Tab 列表容器边界，用于判断拖拽是否仍在列表区域内
-    tab_list_bounds: Option<Bounds<Pixels>>,
     /// 当前 Panel 拖入 TabBar 的插入预览
     panel_drop_preview: Option<PanelDropPreview>,
     /// 当前悬停的标签 ID
@@ -247,37 +263,35 @@ pub struct TabBar {
 }
 
 impl TabBar {
-    pub fn new(id: impl Into<ElementId>, cx: &mut App) -> Entity<Self> {
-        let focus_handle = cx.focus_handle();
-        cx.new(|_cx| Self {
-            id: id.into(),
-            tabs: Vec::new(),
-            active_tab_id: None,
+    fn build(id: ElementId, focus_handle: FocusHandle, tabs: Vec<TabItem>) -> Self {
+        let active_tab_id = tabs.first().map(|tab| tab.id.clone());
+        Self {
+            id,
+            tabs,
+            active_tab_id,
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
             on_tab_reorder: None,
-            on_tab_split: None,
-            on_tab_merge: None,
             on_panel_drop: None,
-            on_overflow_changed: None,
             hovered_tab_id: None,
             focus_handle,
             scroll_handle: ScrollHandle::new(),
-            last_overflow: Some(false),
-            measured_container_width: 0.0,
             reorder_preview: None,
             previous_reorder_preview: None,
             reorder_animation_epoch: 0,
-            tab_bounds: Vec::new(),
-            tab_list_bounds: None,
             panel_drop_preview: None,
             context_menu_tab_id: None,
             on_tab_copy_address: None,
             on_tab_duplicate: None,
             on_tab_reconnect: None,
             on_context_menu: None,
-        })
+        }
+    }
+
+    pub fn new(id: impl Into<ElementId>, cx: &mut App) -> Entity<Self> {
+        let focus_handle = cx.focus_handle();
+        cx.new(|_cx| Self::build(id.into(), focus_handle, Vec::new()))
     }
 
     pub fn new_with_tabs(
@@ -286,46 +300,13 @@ impl TabBar {
         tabs: Vec<TabItem>,
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
-        let active_tab_id = if tabs.is_empty() {
-            None
-        } else {
-            Some(tabs[0].id.clone())
-        };
-
-        cx.new(|_cx| Self {
-            id: id.into(),
-            tabs,
-            active_tab_id,
-            on_tab_click: None,
-            on_tab_close: None,
-            on_new_tab: None,
-            on_tab_reorder: None,
-            on_tab_split: None,
-            on_tab_merge: None,
-            on_panel_drop: None,
-            on_overflow_changed: None,
-            hovered_tab_id: None,
-            focus_handle,
-            scroll_handle: ScrollHandle::new(),
-            last_overflow: Some(false),
-            measured_container_width: 0.0,
-            reorder_preview: None,
-            previous_reorder_preview: None,
-            reorder_animation_epoch: 0,
-            tab_bounds: Vec::new(),
-            tab_list_bounds: None,
-            panel_drop_preview: None,
-            context_menu_tab_id: None,
-            on_tab_copy_address: None,
-            on_tab_duplicate: None,
-            on_tab_reconnect: None,
-            on_context_menu: None,
-        })
+        cx.new(|_cx| Self::build(id.into(), focus_handle, tabs))
     }
 
     pub fn clear_tabs(&mut self, cx: &mut Context<Self>) {
         self.tabs.clear();
         self.active_tab_id = None;
+        self.context_menu_tab_id = None;
         cx.notify();
     }
 
@@ -350,25 +331,13 @@ impl TabBar {
         self.on_new_tab = Some(Rc::new(callback));
     }
 
+    /// 设置重排回调。`insert_slot` 为重排前列表中的插入位（before 语义），
+    /// 取值范围 [0, tabs.len()]；TabBar 自身已同步完成重排。
     pub fn on_tab_reorder<F>(&mut self, callback: F)
     where
         F: Fn(DraggedTab, usize, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_reorder = Some(Rc::new(callback));
-    }
-
-    pub fn on_tab_split<F>(&mut self, callback: F)
-    where
-        F: Fn(DraggedTab, EdgeZone, &mut App) + Send + Sync + 'static,
-    {
-        self.on_tab_split = Some(Rc::new(callback));
-    }
-
-    pub fn on_tab_merge<F>(&mut self, callback: F)
-    where
-        F: Fn(DraggedTab, SharedString, &mut App) + Send + Sync + 'static,
-    {
-        self.on_tab_merge = Some(Rc::new(callback));
     }
 
     /// 设置 Panel 拖拽到 TabBar 的回调
@@ -377,16 +346,6 @@ impl TabBar {
         F: Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_panel_drop = Some(Rc::new(callback));
-    }
-
-    /// 设置溢出状态变化回调
-    /// 当 TabBar 检测到溢出状态变化时触发
-    /// `is_overflowing` 为 true 表示内容已溢出需要滚动
-    pub fn on_overflow_changed<F>(&mut self, callback: F)
-    where
-        F: Fn(bool, &mut App) + Send + Sync + 'static,
-    {
-        self.on_overflow_changed = Some(Rc::new(callback));
     }
 
     /// 拷贝地址回调
@@ -429,8 +388,6 @@ impl TabBar {
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
         let is_first = self.tabs.is_empty();
         self.tabs.push(tab);
-        // 提前检查溢出状态，避免 UI 上出现溢出后再切换
-        self.update_overflow_state(cx);
         cx.notify();
         // 滚动到最新添加的标签（最右边）
         // 首个标签不要调用 scroll_to_item(0)，避免 ScrollHandle 未初始化时触发默认偏移
@@ -454,9 +411,11 @@ impl TabBar {
                     None
                 };
             }
+        }
 
-            // 检查溢出状态是否改变（移除标签后可能不再溢出）
-            self.update_overflow_state(cx);
+        // 右键菜单目标已不存在，避免后续 action 作用到过期 id
+        if self.context_menu_tab_id.as_deref() == Some(id) {
+            self.context_menu_tab_id = None;
         }
         cx.notify();
     }
@@ -466,6 +425,14 @@ impl TabBar {
         let changed = self.active_tab_id.as_ref() != Some(&new_id);
         if changed {
             self.active_tab_id = Some(new_id);
+            // 溢出时把新激活的标签滚动到可见区域（最小滚动策略）
+            if let Some(index) = self
+                .active_tab_id
+                .as_ref()
+                .and_then(|id| self.tabs.iter().position(|t| t.id == *id))
+            {
+                self.scroll_handle.scroll_to_item(index);
+            }
             cx.notify();
         }
     }
@@ -475,7 +442,7 @@ impl TabBar {
         if self.active_tab_id.is_none() && !self.tabs.is_empty() {
             self.active_tab_id = Some(self.tabs[0].id.clone());
         }
-        self.update_overflow_state(cx);
+        self.context_menu_tab_id = None;
         cx.notify();
     }
 
@@ -488,7 +455,6 @@ impl TabBar {
     ) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             f(tab);
-            self.update_overflow_state(cx);
             cx.notify();
         }
     }
@@ -497,65 +463,27 @@ impl TabBar {
         self.active_tab_id.as_ref()
     }
 
-    pub fn tabs_count(&self) -> usize {
-        self.tabs.len()
-    }
-
-    /// 获取滚动句柄
-    pub fn scroll_handle(&self) -> &ScrollHandle {
-        &self.scroll_handle
-    }
-
-    /// 滚动到指定索引的标签
-    pub fn scroll_to_tab(&self, index: usize) {
-        self.scroll_handle.scroll_to_item(index);
-    }
-
-    pub(crate) fn update_overflow_state(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.measured_container_width <= 0.0 || self.tabs.is_empty() {
-            return false;
-        }
-
-        const NEW_TAB_BUTTON_SPACE: f32 = 48.0;
-        let available_width = self.measured_container_width - NEW_TAB_BUTTON_SPACE;
-
-        // 当存在真实 bounds 数据时，直接用真实尺寸判断；否则用估算值
-        let would_overflow =
-            if self.tab_bounds.len() >= self.tabs.len() && self.tab_list_bounds.is_some() {
-                let tab_list_left = self.tab_list_bounds.unwrap().origin.x.as_f32();
-                let last_tab = &self.tab_bounds[self.tabs.len() - 1];
-                let last_tab_right =
-                    tab_list_left + last_tab.origin.x.as_f32() + last_tab.size.width.as_f32();
-                last_tab_right >= available_width
-            } else {
-                // 非滚动模式或无 layout 数据：用估算值
-                self.tabs.len() as f32 * TAB_MAX_WIDTH_PX > available_width
-            };
-
-        if self.last_overflow != Some(would_overflow) {
-            self.last_overflow = Some(would_overflow);
-            if let Some(ref callback) = self.on_overflow_changed {
-                callback(would_overflow, cx);
-            }
-            true
-        } else {
-            false
-        }
-    }
-
     fn handle_tab_drag_move(
         &mut self,
         event: &gpui::DragMoveEvent<DraggedTab>,
         cx: &mut Context<Self>,
     ) {
         let position = event.event.position;
-        let Some(bounds) = self.tab_list_bounds else {
-            return;
-        };
-
-        if !Self::bounds_contains_position(bounds, position) {
+        if !self.tab_list_viewport().contains(&position) {
             self.clear_tab_reorder_preview(cx);
+            return;
         }
+
+        let dragged = event.drag(cx).clone();
+        // 拖拽源可能来自另一个 TabBar（同窗口内终端栏与编辑器栏并存），
+        // 只对本栏存在的标签生成重排预览
+        if !self.tabs.iter().any(|t| t.id == dragged.tab_id) {
+            self.clear_tab_reorder_preview(cx);
+            return;
+        }
+
+        let insert_slot = self.tab_insert_slot_for_position(position);
+        self.set_tab_reorder_preview(&dragged, insert_slot, cx);
     }
 
     fn handle_panel_drag_move(
@@ -564,36 +492,48 @@ impl TabBar {
         cx: &mut Context<Self>,
     ) {
         let position = event.event.position;
-        let dragged: &DraggedPanel = event.drag(cx);
-        let Some(bounds) = self.tab_list_bounds else {
-            return;
-        };
-
-        if !Self::bounds_contains_position(bounds, position) {
+        if !self.tab_list_viewport().contains(&position) {
             self.clear_panel_drop_preview(cx);
             return;
         }
 
+        let dragged: &DraggedPanel = event.drag(cx);
         let insert_index = self.tab_insert_slot_for_position(position);
         self.set_panel_drop_preview(insert_index, dragged.tab_label.clone(), cx);
     }
 
-    fn bounds_contains_position(bounds: Bounds<Pixels>, position: Point<Pixels>) -> bool {
-        position.x >= bounds.left()
-            && position.x <= bounds.right()
-            && position.y >= bounds.top()
-            && position.y <= bounds.bottom()
+    /// 滚动容器视口（窗口坐标），拖拽命中判定用
+    fn tab_list_viewport(&self) -> Bounds<Pixels> {
+        self.scroll_handle.bounds()
+    }
+
+    /// 各 tab 的布局边界（内容坐标，不含滚动偏移），
+    /// 直接读取 ScrollHandle 记录的子元素 bounds。
+    /// 滚动容器的子元素 = 各 tab（+ 可选的 panel 插入预览，需跳过）。
+    fn current_tab_bounds(&self) -> Vec<Bounds<Pixels>> {
+        let preview_index = self.panel_drop_preview.as_ref().map(|p| p.insert_index);
+        let child_count = self.tabs.len() + usize::from(preview_index.is_some());
+        let mut bounds = Vec::with_capacity(self.tabs.len());
+        for child_index in 0..child_count {
+            if Some(child_index) == preview_index {
+                continue;
+            }
+            if let Some(tab_bounds) = self.scroll_handle.bounds_for_item(child_index) {
+                bounds.push(tab_bounds);
+            }
+        }
+        bounds
     }
 
     fn set_tab_reorder_preview(
         &mut self,
         dragged_tab: &DraggedTab,
-        to_index: usize,
+        insert_slot: usize,
         cx: &mut Context<Self>,
     ) {
         let next_preview = TabReorderPreview {
             dragged_tab: dragged_tab.clone(),
-            insert_slot: to_index.min(self.tabs.len().saturating_sub(1)),
+            insert_slot: insert_slot.min(self.tabs.len()),
         };
 
         if self.reorder_preview.as_ref() == Some(&next_preview) {
@@ -667,41 +607,46 @@ impl TabBar {
         cx.notify();
     }
 
-    fn apply_tab_reorder_locally(&mut self, dragged_tab: &DraggedTab, to_index: usize) -> bool {
-        let Some(from_index) = self.tabs.iter().position(|t| t.id == dragged_tab.tab_id) else {
-            return false;
-        };
-
-        if from_index == to_index || to_index >= self.tabs.len() {
-            return false;
+    /// 将「原列表插入位」换算为 remove+insert 后的最终索引。
+    /// insert_slot > from 时插入位在拖拽标签之后，移除后目标元素左移一位。
+    fn final_index_for_slot(from_index: usize, insert_slot: usize) -> usize {
+        if insert_slot > from_index {
+            insert_slot - 1
+        } else {
+            insert_slot
         }
-
-        let tab = self.tabs.remove(from_index);
-        self.tabs.insert(to_index, tab);
-        true
     }
 
-    fn tab_insert_slot_for_position(&self, position: Point<Pixels>) -> usize {
-        for (index, bounds) in self.tab_bounds.iter().enumerate() {
-            let midpoint = bounds.left() + bounds.size.width / 2.0;
-            if position.x < midpoint {
-                return index;
-            }
-        }
+    /// 就地应用重排：`insert_slot` 为重排前列表中的插入位（before 语义）。
+    /// 返回拖拽标签的重排前索引；无实际移动或标签不存在时返回 None。
+    fn apply_tab_reorder(
+        &mut self,
+        dragged_tab: &DraggedTab,
+        insert_slot: usize,
+    ) -> Option<usize> {
+        apply_reorder(&mut self.tabs, &dragged_tab.tab_id, insert_slot)
+    }
 
-        self.tabs.len()
+    /// 中点判定：指针位于哪个 tab 中点左侧，就插入到哪个索引之前。
+    /// 位置为窗口坐标，需换算到内容坐标后与布局 bounds 比较。
+    fn tab_insert_slot_for_position(&self, position: Point<Pixels>) -> usize {
+        let offset = self.scroll_handle.offset();
+        let content_x = position.x - offset.x;
+        insert_slot_for_content_x(content_x, &self.current_tab_bounds())
     }
 
     fn reorder_preview_has_effect(preview: &TabReorderPreview, tab_count: usize) -> bool {
-        if preview.dragged_tab.from_index >= tab_count {
+        let from_index = preview.dragged_tab.from_index;
+        if from_index >= tab_count {
             return false;
         }
 
-        preview.insert_slot < tab_count && preview.insert_slot != preview.dragged_tab.from_index
+        let final_index = Self::final_index_for_slot(from_index, preview.insert_slot);
+        final_index < tab_count && final_index != from_index
     }
 
     fn dragged_tab_shift_width(&self, preview: &TabReorderPreview) -> f32 {
-        self.tab_bounds
+        self.current_tab_bounds()
             .get(preview.dragged_tab.from_index)
             .map(|bounds| {
                 let width: f32 = bounds.size.width.into();
@@ -720,24 +665,9 @@ impl TabBar {
         }
 
         let from_index = preview.dragged_tab.from_index;
-        let to_index = preview.insert_slot.min(self.tabs.len().saturating_sub(1));
+        let to_index = Self::final_index_for_slot(from_index, preview.insert_slot);
         let shift = self.dragged_tab_shift_width(preview);
-
-        if to_index > from_index {
-            if index > from_index && index <= to_index {
-                -shift
-            } else {
-                0.0
-            }
-        } else if to_index < from_index {
-            if index >= to_index && index < from_index {
-                shift
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
+        reorder_offset(from_index, to_index, index, shift)
     }
 
     fn tab_opacity_for_preview(&self, preview: Option<&TabReorderPreview>, index: usize) -> f32 {
@@ -761,16 +691,449 @@ impl Focusable for TabBar {
     }
 }
 
+impl TabBar {
+    /// 右键菜单动作的统一监听器：取用并清除 `context_menu_tab_id`，
+    /// 避免过期 id 被后续 action 误用。
+    fn context_menu_action_listener<A: Action>(
+        cx: &Context<Self>,
+        callback: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, _: &A, window, cx| {
+            let tab_id = this.context_menu_tab_id.take();
+            if let (Some(callback), Some(tab_id)) = (callback.as_ref(), tab_id) {
+                callback(tab_id, window, cx);
+            }
+        })
+    }
+
+    /// 标签列表滚动容器：拖拽/落点处理 + 标签与插入预览子元素
+    fn render_tab_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let on_tab_reorder = self.on_tab_reorder.clone();
+        let on_panel_drop = self.on_panel_drop.clone();
+        let panel_drop_preview = self.panel_drop_preview.clone();
+        let theme = cx.theme().ui;
+
+        let mut children: Vec<AnyElement> =
+            Vec::with_capacity(self.tabs.len() + usize::from(panel_drop_preview.is_some()));
+        for index in 0..=self.tabs.len() {
+            if let Some(preview) = panel_drop_preview
+                .as_ref()
+                .filter(|preview| preview.insert_index == index)
+            {
+                children.push(Self::render_panel_drop_preview(theme, preview));
+            }
+            if let Some(tab) = self.tabs.get(index) {
+                children.push(self.render_tab(tab, index, cx));
+            }
+        }
+
+        div()
+            .id("tab-list-container")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .h_full()
+            .on_drag_move::<DraggedPanel>(cx.listener(
+                |this, event, _window, cx| {
+                    this.handle_panel_drag_move(event, cx);
+                },
+            ))
+            .on_drag_move::<DraggedTab>(cx.listener(
+                |this, event, _window, cx| {
+                    this.handle_tab_drag_move(event, cx);
+                },
+            ))
+            // 拖拽重排：由 drag_move 维护的中点插入位直接应用
+            .on_drop(cx.listener({
+                let on_tab_reorder = on_tab_reorder.clone();
+                move |this, dragged: &DraggedTab, _window, cx| {
+                    cx.stop_propagation();
+
+                    let insert_slot = this
+                        .reorder_preview
+                        .as_ref()
+                        .filter(|preview| preview.dragged_tab.tab_id == dragged.tab_id)
+                        .map(|preview| preview.insert_slot);
+
+                    if let Some(insert_slot) = insert_slot {
+                        let did_reorder = this.apply_tab_reorder(dragged, insert_slot);
+                        this.reset_tab_reorder_preview(cx);
+
+                        if let Some(ref callback) = on_tab_reorder
+                            && did_reorder.is_some()
+                        {
+                            callback(dragged.clone(), insert_slot, cx);
+                        }
+                    } else {
+                        this.clear_tab_reorder_preview(cx);
+                    }
+                }
+            }))
+            .on_drop(cx.listener({
+                let on_panel_drop = on_panel_drop.clone();
+                move |this, dragged: &DraggedPanel, window, cx| {
+                    let insert_index = this
+                        .panel_drop_preview
+                        .as_ref()
+                        .map(|preview| preview.insert_index);
+
+                    this.reset_panel_drop_preview(cx);
+                    cx.stop_propagation();
+
+                    if let Some(ref callback) = on_panel_drop {
+                        callback(dragged.clone(), insert_index, window, cx);
+                    }
+                }
+            }))
+            .flex_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll_handle)
+            .children(children)
+    }
+
+    /// 渲染单个标签（含重排补间动画包装）
+    fn render_tab(&self, tab: &TabItem, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().ui;
+        let tab_id = tab.id.clone();
+        let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
+        let label = tab.label.clone();
+
+        let start_offset =
+            self.tab_offset_for_preview(self.previous_reorder_preview.as_ref(), index);
+        let end_offset = self.tab_offset_for_preview(self.reorder_preview.as_ref(), index);
+        let start_opacity =
+            self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
+        let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
+
+        let tab_inner = div()
+            .id(tab_id.clone())
+            .h(px(TAB_HEIGHT_PX))
+            .px(px(TAB_PADDING_X_PX))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(TAB_RADIUS_PX))
+            .border_1()
+            .border_color(if is_active {
+                theme.tab_active_border
+            } else {
+                theme.transparent()
+            })
+            .bg(if is_active {
+                theme.tab_active_background
+            } else {
+                theme.tab_inactive_background
+            })
+            .hover(move |style| {
+                if !is_active {
+                    style.bg(theme.tab_hover_background)
+                } else {
+                    style
+                }
+            })
+            .on_hover(cx.listener({
+                let tab_id = tab_id.clone();
+                move |this, hovered: &bool, _window, cx| {
+                    this.hovered_tab_id = hovered.then(|| tab_id.clone());
+                    cx.notify();
+                }
+            }))
+            .on_drag(
+                DraggedTab {
+                    tab_id: tab_id.clone(),
+                    from_index: index,
+                },
+                {
+                    let label = label.clone();
+                    move |_drag_data, position, window, cx| {
+                        cx.stop_propagation();
+                        let preview = DragPreview::new(label.clone(), position, window, cx);
+                        cx.new(move |_cx| preview)
+                    }
+                },
+            )
+            .child(self.render_tab_icon_slot(tab, &tab_id, is_active, cx))
+            .child(Self::render_tab_label(tab, is_active, theme))
+            .on_click(cx.listener({
+                let on_tab_click = self.on_tab_click.clone();
+                let tab_id = tab_id.clone();
+                move |_this, _event: &gpui::ClickEvent, window, cx| {
+                    if let Some(ref callback) = on_tab_click {
+                        callback(tab_id.clone(), window, cx);
+                    }
+                }
+            }))
+            // 左键：阻止冒泡到 TitleBar 触发窗口拖拽
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            // 中键关闭标签（浏览器/终端通用习惯）
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener({
+                    let on_tab_close = self.on_tab_close.clone();
+                    let tab_id = tab_id.clone();
+                    move |_this, _event, window, cx| {
+                        if let Some(ref callback) = on_tab_close {
+                            callback(tab_id.clone(), window, cx);
+                        }
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let tab_id = tab_id.clone();
+                    move |this, _, _, cx| {
+                        this.context_menu_tab_id = Some(tab_id.clone());
+                        cx.notify();
+                    }
+                }),
+            )
+            // 完整标题 tooltip（标签宽度受限被截断时尤其有用）
+            .tooltip({
+                let label = label.clone();
+                move |_window, cx| {
+                    cx.new(|_| TabTooltip {
+                        label: label.clone(),
+                    })
+                    .into()
+                }
+            })
+            .context_menu({
+                let tab_id = tab_id.clone();
+                let on_context_menu = self.on_context_menu.clone();
+                move |menu: PopupMenu, window, cx| {
+                    if let Some(ref cb) = on_context_menu {
+                        cb(tab_id.clone(), menu, window, cx)
+                    } else {
+                        menu
+                    }
+                }
+            });
+
+        let needs_animation = start_offset != end_offset || start_opacity != end_opacity;
+        if needs_animation {
+            let animation_id = format!("tab-reorder-{}-{}", tab_id, self.reorder_animation_epoch);
+
+            div()
+                .child(tab_inner)
+                .flex_shrink_0()
+                .with_animation(
+                    animation_id,
+                    Animation::new(Duration::from_millis(
+                        TAB_REORDER_ANIMATION_DURATION_MS,
+                    ))
+                    .with_easing(ease_out_quint()),
+                    move |this, delta| {
+                        let offset = start_offset + (end_offset - start_offset) * delta;
+                        let opacity = start_opacity + (end_opacity - start_opacity) * delta;
+                        this.left(px(offset)).opacity(opacity)
+                    },
+                )
+                .into_any_element()
+        } else {
+            tab_inner.into_any_element()
+        }
+    }
+
+    /// 标签的图标/关闭按钮/loading 槽位。
+    /// 关闭按钮不依赖 icon 存在：hover 时统一显示关闭按钮，
+    /// 其优先于 loading 动画，慢速远程连接也能从标签上直接关闭。
+    fn render_tab_icon_slot(
+        &self,
+        tab: &TabItem,
+        tab_id: &SharedString,
+        is_active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().ui;
+        let icon = tab.icon;
+        let is_hovered = self.hovered_tab_id.as_ref() == Some(tab_id);
+
+        let icon_slot_width = if icon.map_or(false, |i| matches!(i, Icon::FileIcon(_))) {
+            px(FILE_ICON_SIZE_PX)
+        } else {
+            px(ICON_SIZE_PX)
+        };
+
+        let content = if is_hovered {
+            let on_tab_close = self.on_tab_close.clone();
+            let tab_id_close = tab_id.clone();
+            svg()
+                .size(px(ICON_SIZE_PX))
+                .cursor_pointer()
+                .text_color(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .path(Icon::XmarkCircleFill.path())
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |_this, _event, window, cx| {
+                        if let Some(ref callback) = on_tab_close {
+                            callback(tab_id_close.clone(), window, cx);
+                        }
+                    }),
+                )
+                .into_any_element()
+        } else if tab.is_loading {
+            svg()
+                .size(px(ICON_SIZE_PX))
+                .text_color(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .path(Icon::Loader.path())
+                .with_animation(
+                    format!("tab-loading-{}", tab_id),
+                    Animation::new(Duration::from_millis(800))
+                        .repeat()
+                        .with_easing(ease_in_out),
+                    |this, delta| {
+                        this.with_transformation(Transformation::rotate(percentage(delta)))
+                    },
+                )
+                .into_any_element()
+        } else if let Some(icon) = icon {
+            let icon_size = if matches!(icon, Icon::FileIcon(_)) {
+                px(FILE_ICON_SIZE_PX)
+            } else {
+                px(ICON_SIZE_PX)
+            };
+            svg()
+                .size(icon_size)
+                .text_color(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .path(icon.path())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        div()
+            .w(icon_slot_width)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(content)
+            .into_any_element()
+    }
+
+    /// 标签文本（含未保存圆点），非激活时限宽截断
+    fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
+        div()
+            .relative()
+            .overflow_hidden()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .when(!is_active, |this| this.max_w(px(TAB_MAX_WIDTH_PX)))
+            .when(tab.is_modified, |this| {
+                this.child(
+                    div()
+                        .size(px(6.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(if is_active {
+                            theme.text_muted
+                        } else {
+                            theme.text_muted.opacity(0.7)
+                        }),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_weight(if is_active {
+                        gpui::FontWeight::SEMIBOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .text_color(if is_active {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(tab.label.clone()),
+            )
+    }
+
+    /// Panel 拖入时的插入位置预览
+    fn render_panel_drop_preview(theme: UiTheme, preview: &PanelDropPreview) -> AnyElement {
+        div()
+            .id(format!("panel-drop-preview-{}", preview.insert_index))
+            .h(px(TAB_HEIGHT_PX))
+            .px(px(TAB_PADDING_X_PX))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(TAB_RADIUS_PX))
+            .border_1()
+            .border_color(theme.border_strong.opacity(0.55))
+            .bg(theme.tab_hover_background.opacity(0.6))
+            .opacity(0.75)
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.text_muted)
+                    .child(preview.tab_label.clone()),
+            )
+            .into_any_element()
+    }
+
+    /// 新建标签按钮 - 放在滚动区域外面，始终可见
+    fn render_new_tab_button(
+        theme: UiTheme,
+        on_new_tab: Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
+    ) -> Stateful<Div> {
+        div()
+            .id("new-tab-btn")
+            .w(px(NEW_TAB_BUTTON_SIZE_PX))
+            .h(px(NEW_TAB_BUTTON_SIZE_PX))
+            .flex()
+            .flex_shrink_0()
+            .ml_1()
+            .mr_3()
+            .items_center()
+            .justify_center()
+            .rounded(px(999.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.tab_hover_background))
+            .child(
+                svg()
+                    .size(px(ICON_SIZE_PX))
+                    .text_color(theme.icon_muted)
+                    .path(Icon::Plus.path()),
+            )
+            .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                on_new_tab(window, cx);
+            })
+    }
+}
+
 impl Render for TabBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let on_tab_click = self.on_tab_click.clone();
-        let on_tab_close = self.on_tab_close.clone();
-        let on_new_tab = self.on_new_tab.clone();
-        let on_tab_reorder = self.on_tab_reorder.clone();
         let on_panel_drop = self.on_panel_drop.clone();
-        let animation_epoch = self.reorder_animation_epoch;
-        let panel_drop_preview = self.panel_drop_preview.clone();
+
+        let new_tab_button = self
+            .on_new_tab
+            .clone()
+            .map(|on_new_tab| Self::render_new_tab_button(theme, on_new_tab));
 
         div()
             .id(self.id.clone())
@@ -789,7 +1152,7 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }),
             )
-            // TabBar 整体接受 DraggedPanel drop
+            // TabBar 整体接受 DraggedPanel drop（落点在标签列表之外时的兑底）
             .on_drop(cx.listener({
                 let on_panel_drop = on_panel_drop.clone();
                 move |this, dragged: &DraggedPanel, window, cx| {
@@ -803,38 +1166,20 @@ impl Render for TabBar {
                     }
                 }
             }))
-            .on_action(cx.listener({
-                let on_tab_copy_address = self.on_tab_copy_address.clone();
-                move |this, _: &CopyTabAddress, window, cx| {
-                    if let Some(ref cb) = on_tab_copy_address {
-                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
-                            cb(tab_id, window, cx);
-                        }
-                    }
-                }
-            }))
-            .on_action(cx.listener({
-                let on_tab_duplicate = self.on_tab_duplicate.clone();
-                move |this, _: &DuplicateTab, window, cx| {
-                    if let Some(ref cb) = on_tab_duplicate {
-                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
-                            cb(tab_id, window, cx);
-                        }
-                    }
-                }
-            }))
-            .on_action(cx.listener({
-                let on_tab_reconnect = self.on_tab_reconnect.clone();
-                move |this, _: &ReconnectTab, window, cx| {
-                    if let Some(ref cb) = on_tab_reconnect {
-                        if let Some(tab_id) = this.context_menu_tab_id.clone() {
-                            cb(tab_id, window, cx);
-                        }
-                    }
-                }
-            }))
+            .on_action(Self::context_menu_action_listener::<CopyTabAddress>(
+                cx,
+                self.on_tab_copy_address.clone(),
+            ))
+            .on_action(Self::context_menu_action_listener::<DuplicateTab>(
+                cx,
+                self.on_tab_duplicate.clone(),
+            ))
+            .on_action(Self::context_menu_action_listener::<ReconnectTab>(
+                cx,
+                self.on_tab_reconnect.clone(),
+            ))
             .child(
-                // 外层容器，用于测量实际可用宽度
+                // 外层容器：横向布局滚动区 + 新建按钮
                 div()
                     .id("tab-bar-outer")
                     .flex()
@@ -842,589 +1187,157 @@ impl Render for TabBar {
                     .items_center()
                     .h_full()
                     .w_full()
-                    // 使用 canvas 测量容器宽度（只在变化时更新）
-                    .child({
-                        let entity = cx.entity();
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, _, cx| {
-                                let container_width: f32 = bounds.size.width.into();
-                                let entity = entity.clone();
-                                cx.defer(move |cx| {
-                                    entity.update(cx, |this, cx| {
-                                        // 只在宽度变化超过 1px 时更新
-                                        if (this.measured_container_width - container_width).abs()
-                                            > 1.0
-                                        {
-                                            this.measured_container_width = container_width;
-                                            this.update_overflow_state(cx);
-                                        }
-                                    });
-                                });
-                            },
-                        )
-                        .absolute()
-                        .size_full()
-                    })
-                    // 标签列表容器（始终使用 overflow_x_scroll，无论是否溢出）
-                    .child(
-                        div()
-                            .child({
-                                let entity = cx.entity();
-                                canvas(
-                                    |_, _, _| {},
-                                    move |bounds, _, _, cx| {
-                                        entity.update(cx, |this, _cx| {
-                                            this.tab_list_bounds = Some(bounds);
-                                        });
-                                    },
-                                )
-                                .absolute()
-                                .size_full()
-                            })
-                            .on_children_prepainted({
-                                let entity = cx.entity();
-                                move |bounds, _window, cx| {
-                                    entity.update(cx, |this, _cx| {
-                                        // 跳过第一个 bound（canvas 测量元素），只取 tab 和 preview 的 bounds
-                                        let all_bounds: Vec<_> =
-                                            bounds.into_iter().skip(1).collect();
-                                        let expected_bounds = this.tabs.len()
-                                            + usize::from(this.panel_drop_preview.is_some());
-                                        let mut tab_bounds = if expected_bounds == 0 {
-                                            Vec::new()
-                                        } else {
-                                            all_bounds
-                                                .into_iter()
-                                                .rev()
-                                                .take(expected_bounds)
-                                                .collect::<Vec<_>>()
-                                        };
-                                        tab_bounds.reverse();
-
-                                        if let Some(preview) = this.panel_drop_preview.as_ref()
-                                            && preview.insert_index < tab_bounds.len()
-                                        {
-                                            tab_bounds.remove(preview.insert_index);
-                                        }
-
-                                        this.tab_bounds = tab_bounds;
-
-                                        // 收集完 bounds 后，统一由 update_overflow_state 处理溢出检测
-                                        this.update_overflow_state(_cx);
-                                    });
-                                }
-                            })
-                            .id("tab-list-container")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .h_full()
-                            .on_drag_move::<DraggedPanel>(cx.listener(
-                                |this, event, _window, cx| {
-                                    this.handle_panel_drag_move(event, cx);
-                                },
-                            ))
-                            .on_drop(cx.listener({
-                                let on_tab_reorder = on_tab_reorder.clone();
-                                move |this, dragged: &DraggedTab, _window, cx| {
-                                    let target_index = this
-                                        .reorder_preview
-                                        .as_ref()
-                                        .filter(|preview| {
-                                            preview.dragged_tab.tab_id == dragged.tab_id
-                                        })
-                                        .map(|preview| preview.insert_slot);
-
-                                    if let Some(target_index) = target_index {
-                                        let did_reorder =
-                                            this.apply_tab_reorder_locally(dragged, target_index);
-                                        this.reset_tab_reorder_preview(cx);
-
-                                        if let Some(ref callback) = on_tab_reorder
-                                            && did_reorder
-                                        {
-                                            callback(dragged.clone(), target_index, cx);
-                                        }
-                                    } else {
-                                        this.clear_tab_reorder_preview(cx);
-                                    }
-                                }
-                            }))
-                            .on_drop(cx.listener({
-                                let on_panel_drop = on_panel_drop.clone();
-                                move |this, dragged: &DraggedPanel, window, cx| {
-                                    let insert_index = this
-                                        .panel_drop_preview
-                                        .as_ref()
-                                        .map(|preview| preview.insert_index);
-
-                                    this.reset_panel_drop_preview(cx);
-                                    cx.stop_propagation();
-
-                                    if let Some(ref callback) = on_panel_drop {
-                                        callback(dragged.clone(), insert_index, window, cx);
-                                    }
-                                }
-                            }))
-                            .flex_1()
-                            .overflow_x_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .children({
-                                let mut children: Vec<AnyElement> = Vec::with_capacity(
-                                    self.tabs.len() + usize::from(panel_drop_preview.is_some()),
-                                );
-
-                                for index in 0..=self.tabs.len() {
-                                    if let Some(preview) = panel_drop_preview.as_ref()
-                                        && preview.insert_index == index
-                                    {
-                                        children.push(
-                                            div()
-                                                .id(format!("panel-drop-preview-{index}"))
-                                                .h(px(30.0))
-                                                .px(px(12.0))
-                                                .flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap(px(6.0))
-                                                .rounded(px(8.0))
-                                                .border_1()
-                                                .border_color(theme.border_strong.opacity(0.55))
-                                                .bg(theme.tab_hover_background.opacity(0.6))
-                                                .opacity(0.75)
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(theme.text_muted)
-                                                        .child(preview.tab_label.clone()),
-                                                )
-                                                .into_any_element(),
-                                        );
-                                    }
-
-                                    let Some(tab) = self.tabs.get(index) else {
-                                        continue;
-                                    };
-
-                                    let tab_id = tab.id.clone();
-                                    let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
-                                    let label = tab.label.clone();
-                                    let icon = tab.icon;
-                                    let on_panel_drop_for_tab = on_panel_drop.clone();
-                                    let entity = cx.entity();
-                                    let start_offset = self.tab_offset_for_preview(
-                                        self.previous_reorder_preview.as_ref(),
-                                        index,
-                                    );
-                                    let end_offset = self.tab_offset_for_preview(
-                                        self.reorder_preview.as_ref(),
-                                        index,
-                                    );
-                                    let start_opacity = self.tab_opacity_for_preview(
-                                        self.previous_reorder_preview.as_ref(),
-                                        index,
-                                    );
-                                    let end_opacity = self.tab_opacity_for_preview(
-                                        self.reorder_preview.as_ref(),
-                                        index,
-                                    );
-
-                                    let tab_inner = div()
-                                        .id(tab_id.clone())
-                                        .h(px(30.0))
-                                        .px(px(12.0))
-                                        .flex()
-                                        .flex_shrink_0()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .rounded(px(8.0))
-                                        .border_1()
-                                        .border_color(if is_active {
-                                            gpui::Hsla::from(gpui::rgb(0xFFFFFF)).opacity(
-                                                if cx.theme().appearance.is_dark() {
-                                                    0.1
-                                                } else {
-                                                    0.6
-                                                },
-                                            )
-                                        } else {
-                                            theme.transparent()
-                                        })
-                                        .bg(if is_active {
-                                            theme.tab_active_background
-                                        } else {
-                                            theme.tab_inactive_background
-                                        })
-                                        .hover(move |style| {
-                                            if !is_active {
-                                                style.bg(theme.tab_hover_background)
-                                            } else {
-                                                style
-                                            }
-                                        })
-                                        .on_hover(cx.listener({
-                                            let tab_id = tab_id.clone();
-                                            move |this, hovered: &bool, _window, cx| {
-                                                if *hovered {
-                                                    this.hovered_tab_id = Some(tab_id.clone());
-                                                } else {
-                                                    this.hovered_tab_id = None;
-                                                }
-                                                cx.notify();
-                                            }
-                                        }))
-                                        .on_drag(
-                                            DraggedTab {
-                                                tab_id: tab_id.clone(),
-                                                from_index: index,
-                                            },
-                                            {
-                                                let label = label.clone();
-                                                move |_drag_data, position, window, cx| {
-                                                    cx.stop_propagation();
-                                                    let preview = DragPreview::new(
-                                                        label.clone(),
-                                                        position,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                    cx.new(move |_cx| preview)
-                                                }
-                                            },
-                                        )
-                                        .on_drag_move::<DraggedTab>(cx.listener(
-                                            |this, event, _window, cx| {
-                                                this.handle_tab_drag_move(event, cx);
-                                            },
-                                        ))
-                                        .drag_over::<DraggedTab>({
-                                            let entity = entity.clone();
-                                            let tab_id = tab_id.clone();
-                                            move |tab, dragged: &DraggedTab, _window, cx| {
-                                                let dragged = dragged.clone();
-                                                let entity = entity.clone();
-                                                let tab_id = tab_id.clone();
-                                                cx.defer(move |cx| {
-                                                    entity.update(cx, |this, cx| {
-                                                        if dragged.tab_id != tab_id {
-                                                            this.set_tab_reorder_preview(
-                                                                &dragged, index, cx,
-                                                            );
-                                                        } else {
-                                                            this.clear_tab_reorder_preview(cx);
-                                                        }
-                                                    });
-                                                });
-                                                tab
-                                            }
-                                        })
-                                        .drag_over::<DraggedPanel>({
-                                            let entity = entity.clone();
-                                            move |tab, dragged: &DraggedPanel, _window, cx| {
-                                                let entity = entity.clone();
-                                                let tab_label = dragged.tab_label.clone();
-                                                cx.defer(move |cx| {
-                                                    entity.update(cx, |this, cx| {
-                                                        this.set_panel_drop_preview(
-                                                            index, tab_label, cx,
-                                                        );
-                                                    });
-                                                });
-                                                tab
-                                            }
-                                        })
-                                        .on_drop(cx.listener({
-                                            let on_tab_reorder = on_tab_reorder.clone();
-                                            let tab_id = tab_id.clone();
-                                            move |this, dragged: &DraggedTab, _window, cx| {
-                                                cx.stop_propagation();
-
-                                                if dragged.tab_id != tab_id {
-                                                    if let Some(to_index) = this
-                                                        .tabs
-                                                        .iter()
-                                                        .position(|t| t.id == tab_id)
-                                                    {
-                                                        let did_reorder = this
-                                                            .apply_tab_reorder_locally(
-                                                                dragged, to_index,
-                                                            );
-                                                        this.reset_tab_reorder_preview(cx);
-
-                                                        if let Some(ref callback) = on_tab_reorder
-                                                            && did_reorder
-                                                        {
-                                                            callback(dragged.clone(), to_index, cx);
-                                                        }
-                                                    }
-                                                } else {
-                                                    this.clear_tab_reorder_preview(cx);
-                                                }
-                                            }
-                                        }))
-                                        .on_drop(cx.listener({
-                                            let on_panel_drop_for_tab =
-                                                on_panel_drop_for_tab.clone();
-                                            move |this, dragged: &DraggedPanel, window, cx| {
-                                                cx.stop_propagation();
-                                                this.reset_panel_drop_preview(cx);
-                                                if let Some(ref callback) = on_panel_drop_for_tab {
-                                                    callback(
-                                                        dragged.clone(),
-                                                        Some(index),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            }
-                                        }))
-                                        .child({
-                                            let is_hovered =
-                                                self.hovered_tab_id.as_ref() == Some(&tab_id);
-
-                                            let icon_slot_width = if icon
-                                                .map_or(false, |i| matches!(i, Icon::FileIcon(_)))
-                                            {
-                                                px(22.0)
-                                            } else {
-                                                px(16.0)
-                                            };
-
-                                            let has_icon = icon.is_some() || tab.is_loading;
-                                            if !has_icon {
-                                                div().into_any_element()
-                                            } else {
-                                                // Hover close takes priority over loading spinner so
-                                                // slow remote opens can still be dismissed from the tab.
-                                                let content = if is_hovered && icon.is_some() {
-                                                    let on_tab_close = on_tab_close.clone();
-                                                    let tab_id_close = tab_id.clone();
-                                                    svg()
-                                                        .size(px(16.0))
-                                                        .cursor_pointer()
-                                                        .text_color(if is_active {
-                                                            theme.text
-                                                        } else {
-                                                            theme.text_muted
-                                                        })
-                                                        .path(Icon::XmarkCircleFill.path())
-                                                        .on_mouse_down(
-                                                            gpui::MouseButton::Left,
-                                                            cx.listener(
-                                                                move |_this, _event, window, cx| {
-                                                                    if let Some(ref callback) =
-                                                                        on_tab_close
-                                                                    {
-                                                                        callback(
-                                                                            tab_id_close.clone(),
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    }
-                                                                },
-                                                            ),
-                                                        )
-                                                        .into_any_element()
-                                                } else if tab.is_loading {
-                                                    svg()
-                                                        .size(px(16.0))
-                                                        .text_color(if is_active {
-                                                            theme.text
-                                                        } else {
-                                                            theme.text_muted
-                                                        })
-                                                        .path(Icon::Loader.path())
-                                                        .with_animation(
-                                                            format!("tab-loading-{}", tab_id),
-                                                            Animation::new(
-                                                                Duration::from_millis(800),
-                                                            )
-                                                            .repeat()
-                                                            .with_easing(ease_in_out),
-                                                            |this, delta| {
-                                                                this.with_transformation(
-                                                                    Transformation::rotate(
-                                                                        percentage(delta),
-                                                                    ),
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element()
-                                                } else if let Some(icon) = icon {
-                                                    let icon_size = if matches!(icon, Icon::FileIcon(_)) {
-                                                        px(22.0)
-                                                    } else {
-                                                        px(16.0)
-                                                    };
-                                                    svg()
-                                                        .size(icon_size)
-                                                        .text_color(if is_active {
-                                                            theme.text
-                                                        } else {
-                                                            theme.text_muted
-                                                        })
-                                                        .path(icon.path())
-                                                        .into_any_element()
-                                                } else {
-                                                    div().into_any_element()
-                                                };
-
-                                                div()
-                                                    .w(icon_slot_width)
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(content)
-                                                    .into_any_element()
-                                            }
-                                        })
-                                        .child(
-                                            div()
-                                                .relative()
-                                                .overflow_hidden()
-                                                .flex_none()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .when(!is_active, |this| {
-                                                    this.max_w(px(TAB_MAX_WIDTH_PX))
-                                                })
-                                                .when(tab.is_modified, |this| {
-                                                    this.child(
-                                                        div()
-                                                            .size(px(6.0))
-                                                            .flex_none()
-                                                            .rounded_full()
-                                                            .bg(if is_active {
-                                                                theme.text_muted
-                                                            } else {
-                                                                theme.text_muted.opacity(0.7)
-                                                            }),
-                                                    )
-                                                })
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .text_sm()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .font_weight(if is_active {
-                                                            gpui::FontWeight::SEMIBOLD
-                                                        } else {
-                                                            gpui::FontWeight::NORMAL
-                                                        })
-                                                        .text_color(if is_active {
-                                                            theme.text
-                                                        } else {
-                                                            theme.text_muted
-                                                        })
-                                                        .child(label),
-                                                ),
-                                        )
-                                        .on_click(cx.listener({
-                                            let on_tab_click = on_tab_click.clone();
-                                            let tab_id = tab_id.clone();
-                                            move |_this, _event: &gpui::ClickEvent, window, cx| {
-                                                if let Some(ref callback) = on_tab_click {
-                                                    callback(tab_id.clone(), window, cx);
-                                                }
-                                            }
-                                        }))
-                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener({
-                                                let tab_id = tab_id.clone();
-                                                move |this, _, _, cx| {
-                                                    this.context_menu_tab_id = Some(tab_id.clone());
-                                                    cx.notify();
-                                                }
-                                            }),
-                                        )
-                                        .context_menu({
-                                            let tab_id = tab_id.clone();
-                                            let on_context_menu = self.on_context_menu.clone();
-                                            move |menu: PopupMenu, window, cx| {
-                                                if let Some(ref cb) = on_context_menu {
-                                                    cb(tab_id.clone(), menu, window, cx)
-                                                } else {
-                                                    menu
-                                                }
-                                            }
-                                        });
-
-                                    let needs_animation =
-                                        start_offset != end_offset || start_opacity != end_opacity;
-
-                                    let tab_element = if needs_animation {
-                                        let animation_id =
-                                            format!("tab-reorder-{}-{}", tab_id, animation_epoch);
-
-                                        div()
-                                            .child(tab_inner)
-                                            .flex_shrink_0()
-                                            .with_animation(
-                                                animation_id,
-                                                Animation::new(Duration::from_millis(
-                                                    TAB_REORDER_ANIMATION_DURATION_MS,
-                                                ))
-                                                .with_easing(ease_out_quint()),
-                                                move |this, delta| {
-                                                    let offset = start_offset
-                                                        + (end_offset - start_offset) * delta;
-                                                    let opacity = start_opacity
-                                                        + (end_opacity - start_opacity) * delta;
-                                                    this.left(px(offset)).opacity(opacity)
-                                                },
-                                            )
-                                            .into_any_element()
-                                    } else {
-                                        tab_inner.into_any_element()
-                                    };
-
-                                    children.push(tab_element);
-                                }
-
-                                children
-                            }),
-                    )
-                    // 新建标签按钮 - 放在滚动区域外面，始终可见
-                    // 使用 ml_1 保持与 Tab 标签页之间的间距一致（gap_1 = 4px）
-                    .when_some(on_new_tab, |this, on_new_tab| {
-                        this.child(
-                            div()
-                                .id("new-tab-btn")
-                                .w(px(32.0))
-                                .h(px(32.0))
-                                .flex()
-                                .flex_shrink_0()
-                                .ml_1()
-                                .mr_3()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(999.0))
-                                .cursor_pointer()
-                                // .bg(theme.tab_inactive_background)
-                                .hover(move |style| style.bg(theme.tab_hover_background))
-                                .child(
-                                    svg()
-                                        .size(px(16.0))
-                                        .text_color(theme.icon_muted)
-                                        .path(Icon::Plus.path()),
-                                )
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(move |_, _, window, cx| {
-                                        on_new_tab(window, cx);
-                                    }),
-                                ),
-                        )
-                    }),
+                    .child(self.render_tab_list(cx))
+                    .children(new_tab_button),
             )
+    }
+}
+
+/// 标签完整标题的悬停提示
+struct TabTooltip {
+    label: SharedString,
+}
+
+impl Render for TabTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        div()
+            .max_w(px(TAB_TOOLTIP_MAX_WIDTH_PX))
+            .px_2()
+            .py_1()
+            .rounded(px(TAB_RADIUS_PX))
+            .bg(theme.elevated_background)
+            .border_1()
+            .border_color(theme.border)
+            .text_sm()
+            .text_color(theme.text)
+            .child(self.label.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, size};
+
+    fn make_tabs(ids: &[&str]) -> Vec<TabItem> {
+        ids.iter().map(|id| TabItem::new(*id, *id)).collect()
+    }
+
+    fn ids(tabs: &[TabItem]) -> Vec<String> {
+        tabs.iter().map(|t| t.id.to_string()).collect()
+    }
+
+    fn preview(from_index: usize, insert_slot: usize) -> TabReorderPreview {
+        TabReorderPreview {
+            dragged_tab: DraggedTab {
+                tab_id: format!("tab-{from_index}").into(),
+                from_index,
+            },
+            insert_slot,
+        }
+    }
+
+    #[test]
+    fn final_index_for_slot_uses_before_semantics() {
+        // slot == from 或 from+1：插入位仍在自身位置，等价无移动
+        assert_eq!(TabBar::final_index_for_slot(0, 0), 0);
+        assert_eq!(TabBar::final_index_for_slot(0, 1), 0);
+        // slot > from+1：移除自身后目标位左移一位
+        assert_eq!(TabBar::final_index_for_slot(0, 2), 1);
+        assert_eq!(TabBar::final_index_for_slot(0, 3), 2);
+        assert_eq!(TabBar::final_index_for_slot(1, 3), 2);
+        // slot < from：插入位即最终索引
+        assert_eq!(TabBar::final_index_for_slot(2, 0), 0);
+        assert_eq!(TabBar::final_index_for_slot(2, 3), 2);
+    }
+
+    #[test]
+    fn apply_reorder_moves_tabs_to_insert_slot() {
+        // 右移：A 拖到末尾 [A,B,C] -> [B,C,A]
+        let mut tabs = make_tabs(&["a", "b", "c"]);
+        assert_eq!(apply_reorder(&mut tabs, "a", 3), Some(0));
+        assert_eq!(ids(&tabs), ["b", "c", "a"]);
+
+        // 左移：C 拖到开头 [A,B,C] -> [C,A,B]
+        let mut tabs = make_tabs(&["a", "b", "c"]);
+        assert_eq!(apply_reorder(&mut tabs, "c", 0), Some(2));
+        assert_eq!(ids(&tabs), ["c", "a", "b"]);
+
+        // 跨一位右移：B 拖到 C 之后 [A,B,C] -> [A,C,B]
+        let mut tabs = make_tabs(&["a", "b", "c"]);
+        assert_eq!(apply_reorder(&mut tabs, "b", 3), Some(1));
+        assert_eq!(ids(&tabs), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn apply_reorder_no_op_cases() {
+        let mut tabs = make_tabs(&["a", "b", "c"]);
+
+        // slot == from：无移动
+        assert_eq!(apply_reorder(&mut tabs, "b", 1), None);
+        // slot == from + 1：插入位在自身之后，等价无移动
+        assert_eq!(apply_reorder(&mut tabs, "b", 2), None);
+        assert_eq!(apply_reorder(&mut tabs, "a", 1), None);
+        assert_eq!(ids(&tabs), ["a", "b", "c"]);
+
+        // 标签不存在
+        assert_eq!(apply_reorder(&mut tabs, "zzz", 0), None);
+        // 空列表
+        let mut empty: Vec<TabItem> = Vec::new();
+        assert_eq!(apply_reorder(&mut empty, "a", 0), None);
+    }
+
+    #[test]
+    fn reorder_preview_has_effect_matches_final_position_change() {
+        assert!(!TabBar::reorder_preview_has_effect(&preview(1, 1), 3));
+        assert!(!TabBar::reorder_preview_has_effect(&preview(1, 2), 3));
+        assert!(TabBar::reorder_preview_has_effect(&preview(1, 3), 3));
+        assert!(TabBar::reorder_preview_has_effect(&preview(1, 0), 3));
+        // from 越界
+        assert!(!TabBar::reorder_preview_has_effect(&preview(3, 0), 3));
+        // 最终索引越界
+        assert!(!TabBar::reorder_preview_has_effect(&preview(0, 5), 3));
+    }
+
+    #[test]
+    fn insert_slot_uses_tab_midpoints() {
+        let bounds: Vec<Bounds<Pixels>> = (0..3)
+            .map(|i| Bounds {
+                origin: point(px(i as f32 * 100.0), px(0.0)),
+                size: size(px(100.0), px(30.0)),
+            })
+            .collect();
+
+        assert_eq!(insert_slot_for_content_x(px(-10.0), &bounds), 0);
+        assert_eq!(insert_slot_for_content_x(px(49.0), &bounds), 0);
+        // 恰在中点上：视为越过中点，插入到下一个位置
+        assert_eq!(insert_slot_for_content_x(px(50.0), &bounds), 1);
+        assert_eq!(insert_slot_for_content_x(px(149.0), &bounds), 1);
+        assert_eq!(insert_slot_for_content_x(px(150.0), &bounds), 2);
+        assert_eq!(insert_slot_for_content_x(px(249.0), &bounds), 2);
+        // 最后一个中点之后：追加到末尾
+        assert_eq!(insert_slot_for_content_x(px(250.0), &bounds), 3);
+        assert_eq!(insert_slot_for_content_x(px(1000.0), &bounds), 3);
+        // 无标签：只能插入到 0
+        assert_eq!(insert_slot_for_content_x(px(10.0), &[]), 0);
+    }
+
+    #[test]
+    fn reorder_offset_shifts_only_moved_interval() {
+        // 右移 A(0)->2：区间 (0, 2] 左移让位，拖拽标签自身不动
+        assert_eq!(reorder_offset(0, 2, 0, 10.0), 0.0);
+        assert_eq!(reorder_offset(0, 2, 1, 10.0), -10.0);
+        assert_eq!(reorder_offset(0, 2, 2, 10.0), -10.0);
+        assert_eq!(reorder_offset(0, 2, 5, 10.0), 0.0);
+
+        // 左移 C(2)->0：区间 [0, 2) 右移让位
+        assert_eq!(reorder_offset(2, 0, 0, 10.0), 10.0);
+        assert_eq!(reorder_offset(2, 0, 1, 10.0), 10.0);
+        assert_eq!(reorder_offset(2, 0, 2, 10.0), 0.0);
+
+        // 无移动：全部为 0
+        assert_eq!(reorder_offset(1, 1, 0, 10.0), 0.0);
+        assert_eq!(reorder_offset(1, 1, 1, 10.0), 0.0);
     }
 }
