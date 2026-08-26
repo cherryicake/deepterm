@@ -613,6 +613,37 @@ impl TextElement {
         paths
     }
 
+    /// 布局括号匹配高亮：光标紧邻括号时，为开/闭括号各生成一个背景路径。
+    fn layout_bracket_matches(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        window: &Window,
+        cx: &mut App,
+    ) -> Vec<Path<Pixels>> {
+        let state = self.state.read(cx);
+        if state.mode.is_single_line() || state.masked {
+            return Vec::new();
+        }
+        if !state.selected_range.is_empty() {
+            return Vec::new();
+        }
+        if !state.focus_handle.is_focused(window) {
+            return Vec::new();
+        }
+        let cursor = state.cursor();
+        let Some((open, close)) = InputState::matching_bracket(&state.text, cursor) else {
+            return Vec::new();
+        };
+        let mut paths = Vec::with_capacity(2);
+        for off in [open, close] {
+            if let Some(path) = Self::layout_match_range(off..off + 1, last_layout, bounds) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
     /// Calculate the visible range of lines in the viewport.
     ///
     /// Returns
@@ -1161,6 +1192,8 @@ pub(crate) struct PrepaintState {
     /// Search-match highlight paths: (path, is_current_match). Painted below
     /// selections so both remain visible.
     search_match_paths: Vec<(Path<Pixels>, bool)>,
+    /// 括号匹配高亮路径（光标紧邻括号时的开/闭括号背景）。
+    bracket_paths: Vec<Path<Pixels>>,
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
@@ -1547,6 +1580,7 @@ impl Element for TextElement {
 
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
+        let bracket_paths = self.layout_bracket_matches(&last_layout, &bounds, window, cx);
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
@@ -1617,6 +1651,7 @@ impl Element for TextElement {
             current_row,
             selection_path,
             search_match_paths,
+            bracket_paths,
             fold_icon_layout,
         };
 
@@ -1703,6 +1738,12 @@ impl Element for TextElement {
             if *is_active {
                 window.paint_path(path.clone(), cx.theme().selection);
             }
+        }
+
+        // Paint matching brackets：柔和的 accent 底色标记配对括号
+        let bracket_fill = cx.theme().accent.opacity(0.22);
+        for path in prepaint.bracket_paths.drain(..) {
+            window.paint_path(path, bracket_fill);
         }
 
         // Paint text

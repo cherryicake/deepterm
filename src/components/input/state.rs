@@ -11,7 +11,7 @@ use gpui::{
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
@@ -84,6 +84,12 @@ actions!(
         Escape,
         Search,
         SearchPrevious,
+        ToggleComment,
+        MoveLineUp,
+        MoveLineDown,
+        DuplicateLine,
+        DeleteLine,
+        JoinLines,
     ]
 );
 
@@ -98,6 +104,54 @@ pub enum InputEvent {
 }
 
 pub(crate) const CONTEXT: &str = "Input";
+
+/// 括号匹配的单向扫描上限（字节），防止超大文件下卡顿。
+const BRACKET_MATCH_SCAN_LIMIT: usize = 500_000;
+
+/// 从 `start`（一个开/闭括号所在偏移）向配对方向扫描，返回配对括号偏移。
+///
+/// - `backward: true` 表示 `start` 是闭括号，向前找开括号
+/// - `open`/`close` 是这对括号的字节值
+///
+/// 只比较 ASCII 字节，多字节 UTF-8 序列的后续字节 \u{2265} 0x80，不会误命中。
+fn scan_matching_bracket(
+    text: &Rope,
+    start: usize,
+    backward: bool,
+    open: u8,
+    close: u8,
+    limit: usize,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    if backward {
+        let lo = start.saturating_sub(limit);
+        for i in (lo..=start).rev() {
+            let Some(b) = text.get_byte(i) else { continue };
+            if b == close {
+                depth += 1;
+            } else if b == open {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    } else {
+        let hi = text.len().min(start + limit);
+        for i in start..hi {
+            let Some(b) = text.get_byte(i) else { continue };
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -218,6 +272,22 @@ pub fn init(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
         KeyBinding::new("shift-enter", SearchPrevious, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-/", ToggleComment, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
+        KeyBinding::new("alt-up", MoveLineUp, Some(CONTEXT)),
+        KeyBinding::new("alt-down", MoveLineDown, Some(CONTEXT)),
+        KeyBinding::new("alt-shift-up", DuplicateLine, Some(CONTEXT)),
+        KeyBinding::new("alt-shift-down", DuplicateLine, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-k", DeleteLine, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-k", DeleteLine, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-j", JoinLines, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-j", JoinLines, Some(CONTEXT)),
     ]);
 }
 
@@ -374,6 +444,17 @@ pub struct InputState {
 }
 
 impl EventEmitter<InputEvent> for InputState {}
+
+/// 回车缩进决策结果。
+#[derive(Debug, PartialEq, Eq)]
+enum NewlineIndent {
+    /// 继承当前行缩进（保留原有 max(当前, 下一行) 行为）
+    Inherit,
+    /// 深入一级（行尾 `{`/`[`/`(` 或 `:`）
+    Deeper,
+    /// 括号对之间插入空行（`{|}` 中回车）
+    BlankBetween,
+}
 
 impl InputState {
     /// Create a Input state with default [`InputMode::SingleLine`] mode.
@@ -667,6 +748,26 @@ impl InputState {
         cx.notify();
     }
 
+    /// 切换语言并立即全量重新解析/高亮（不产生历史记录）。
+    pub fn set_language(
+        &mut self,
+        new_language: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_highlighter(new_language, cx);
+        // 空编辑 + force 触发新建 highlighter 并全量解析
+        let range = 0..0;
+        let bg = self
+            .mode
+            .update_highlighter(&range, &self.text, "", true, cx);
+        if let Some(bg) = bg {
+            Self::dispatch_background_parse(bg, self.text_version, window, cx);
+        }
+        self.update_fold_candidates();
+        cx.notify();
+    }
+
     fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
         match &mut self.mode {
             InputMode::CodeEditor {
@@ -694,6 +795,62 @@ impl InputState {
     pub fn diagnostics_mut(&mut self) -> Option<&mut DiagnosticSet> {
         self.mode.diagnostics_mut()
     }
+
+    /// 当前编辑器语言名（仅 [`InputMode::CodeEditor`]），如 "rust"、"python"。
+    pub fn language(&self) -> Option<SharedString> {
+        match &self.mode {
+            InputMode::CodeEditor { language, .. } => Some(language.clone()),
+            _ => None,
+        }
+    }
+
+    /// 语言对应的行注释 token（无行注释语法的返回 None，如 JSON/CSS/HTML）。
+    pub(crate) fn line_comment_token(language: Option<&str>) -> Option<&'static str> {
+        // 语言名与 editor::syntax::languages 的 Language::id 对应
+        Some(match language? {
+            "rust" | "javascript" | "typescript" | "tsx" | "go" | "c" | "cpp" | "kotlin"
+            | "swift" | "java" | "zig" => "//",
+            "python" | "bash" | "makefile" | "toml" | "yaml" | "ruby" | "perl" => "#",
+            "lua" | "sql" => "--",
+            _ => return None,
+        })
+    }
+
+    /// 给单行加注释（缩进之后插入 `token + " "`）。返回 (新行, 插入点)。
+    fn add_line_comment(line: &str, token: &str) -> (String, usize) {
+        let indent_len = line.len() - line.trim_start().len();
+        let mut out = String::with_capacity(line.len() + token.len() + 1);
+        out.push_str(&line[..indent_len]);
+        out.push_str(token);
+        out.push(' ');
+        out.push_str(&line[indent_len..]);
+        (out, indent_len)
+    }
+
+    /// 去掉单行注释（连同 token 后的一个空格）。返回 (新行, 原 token 位置)。
+    fn strip_line_comment(line: &str, token: &str) -> (String, usize) {
+        let Some(idx) = line.find(token) else {
+            return (line.to_string(), 0);
+        };
+        let mut rest = &line[idx + token.len()..];
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            rest = stripped;
+        }
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[..idx]);
+        out.push_str(rest);
+        (out, idx)
+    }
+
+    /// 括号/引号自动配对表：`(开, 闭)`。
+    const AUTO_PAIRS: &[(char, char)] = &[
+        ('(', ')'),
+        ('[', ']'),
+        ('{', '}'),
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+    ];
 
     /// Set placeholder
     pub fn set_placeholder(
@@ -1256,7 +1413,520 @@ impl InputState {
         }
     }
 
+    /// 代码编辑器的回车：智能缩进。
+    fn enter_with_smart_indent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cursor = self.cursor();
+        let row = self.text.offset_to_point(cursor).row;
+        let line_start = self.text.line_start_offset(row);
+        let before = self.text.slice(line_start..cursor).to_string();
+        let base = before[..before.len() - before.trim_start().len()].to_string();
+        let next = self.text.slice(cursor..).chars().next();
+        let unit = Self::INDENT_UNIT;
+
+        match Self::newline_indent_kind(&before, next) {
+            NewlineIndent::BlankBetween => {
+                // `{` + 紧跟的配对闭括号 → 在括号对间插入空行，光标停在中间行
+                let text = format!("\n{base}{unit}\n{base}");
+                self.replace_text_in_range_silent(None, &text, window, cx);
+                let new_cursor = cursor + 1 + base.len() + unit.len();
+                self.selected_range = (new_cursor..new_cursor).into();
+                self.update_preferred_column();
+                cx.notify();
+            }
+            NewlineIndent::Deeper => {
+                let text = format!("\n{base}{unit}");
+                self.replace_text_in_range_silent(None, &text, window, cx);
+            }
+            NewlineIndent::Inherit => {
+                let indent = self.indent_of_next_line();
+                let text = format!("\n{indent}");
+                self.replace_text_in_range_silent(None, &text, window, cx);
+            }
+        }
+    }
+
+    /// 括号匹配（纯函数，便于测试）：光标紧邻（前或后）一个括号时，
+    /// 返回 (开括号, 闭括号) 的字节偏移。未命中返回 None。
+    ///
+    /// 仅处理 `()[]{}`；扫描范围限制在前后 [`BRACKET_MATCH_SCAN_LIMIT`] 字节内。
+    pub(crate) fn matching_bracket(text: &Rope, cursor: usize) -> Option<(usize, usize)> {
+        let len = text.len();
+        let mut candidates = Vec::with_capacity(2);
+        if cursor > 0 {
+            candidates.push(cursor - 1);
+        }
+        if cursor < len {
+            candidates.push(cursor);
+        }
+        for off in candidates {
+            let Some(b) = text.get_byte(off) else {
+                continue;
+            };
+            match b {
+                b'(' | b'[' | b'{' => {
+                    let close = match b {
+                        b'(' => b')',
+                        b'[' => b']',
+                        _ => b'}',
+                    };
+                    if let Some(m) =
+                        scan_matching_bracket(text, off, false, b, close, BRACKET_MATCH_SCAN_LIMIT)
+                    {
+                        return Some((off, m));
+                    }
+                }
+                b')' | b']' | b'}' => {
+                    let (open, close) = match b {
+                        b')' => (b'(', b')'),
+                        b']' => (b'[', b']'),
+                        _ => (b'{', b'}'),
+                    };
+                    if let Some(m) =
+                        scan_matching_bracket(text, off, true, open, close, BRACKET_MATCH_SCAN_LIMIT)
+                    {
+                        return Some((m, off));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// 回车缩进决策（纯函数，便于测试）：基于光标前行内容与光标后字符。
+    fn newline_indent_kind(before: &str, next: Option<char>) -> NewlineIndent {
+        let trimmed_end = before.trim_end();
+        let ends_with_open = trimmed_end.ends_with('{')
+            || trimmed_end.ends_with('[')
+            || trimmed_end.ends_with('(');
+        if ends_with_open {
+            let open = trimmed_end.chars().last().unwrap();
+            if let Some(next) = next
+                && Self::AUTO_PAIRS.iter().any(|(o, c)| *o == open && *c == next)
+            {
+                return NewlineIndent::BlankBetween;
+            }
+            return NewlineIndent::Deeper;
+        }
+        // 行尾 `:` 且行内无花括号：Python/YAML/JSON 风格的块并深入
+        let ends_with_colon =
+            trimmed_end.ends_with(':') && !trimmed_end.contains('{') && !trimmed_end.contains('}');
+        if ends_with_colon {
+            NewlineIndent::Deeper
+        } else {
+            NewlineIndent::Inherit
+        }
+    }
+
+    /// 括号/引号自动配对：在 [`InputState::replace_text_in_range`]（键盘输入路径）
+    /// 中拦截单个 ASCII 字符处理。返回 true 表示已消费本次输入。
+    fn handle_auto_pair_input(
+        &mut self,
+        input: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ch) = input.chars().next() else {
+            return false;
+        };
+
+        // 1) 键入闭括号/引号且光标后紧跟同一字符 → 跳过而非重复插入
+        let is_closer = matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`');
+        if self.selected_range.is_empty() && is_closer {
+            let cursor = self.cursor();
+            if self.text.slice(cursor..).chars().next() == Some(ch) {
+                self.selected_range = (cursor + 1..cursor + 1).into();
+                self.update_preferred_column();
+                cx.notify();
+                return true;
+            }
+        }
+
+        // 2) 键入 `}`/`)`/`]` 且当前行只有缩进 → 行首 outdent 一级再插入
+        if matches!(ch, '}' | ')' | ']') && self.selected_range.is_empty() {
+            let cursor = self.cursor();
+            let row = self.text.offset_to_point(cursor).row;
+            let line_start = self.text.line_start_offset(row);
+            let prefix = self.text.slice(line_start..cursor).to_string();
+            if !prefix.is_empty() && prefix.trim().is_empty() {
+                let new_prefix = match prefix.strip_suffix('\t') {
+                    Some(p) => p.to_string(),
+                    None => {
+                        // 空格缩进：去掉一个单位（至多 SPACE_OUTDENT_WIDTH 个空格）
+                        let keep = prefix
+                            .len()
+                            .saturating_sub(Self::SPACE_OUTDENT_WIDTH);
+                        prefix[..keep].to_string()
+                    }
+                };
+                let text = format!("{new_prefix}{ch}");
+                let range_utf16 = self.range_to_utf16(&(line_start..cursor));
+                self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+                return true;
+            }
+        }
+
+        // 3) 键入开括号/引号 → 自动配对；有选区时包裹选区
+        if let Some(&(_, close)) = Self::AUTO_PAIRS.iter().find(|(o, _)| *o == ch) {
+            let sel: Range<usize> = self.selected_range.into();
+            let selected = self.text.slice(sel.clone()).to_string();
+            let quote = ch == close;
+
+            if !selected.is_empty() {
+                // 包裹选区：(|sel|)
+                let text = format!("{ch}{selected}{close}");
+                let range_utf16 = self.range_to_utf16(&sel);
+                self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+                let inner = sel.start + 1..sel.start + 1 + selected.len();
+                self.selected_range = inner.into();
+                self.update_preferred_column();
+                cx.notify();
+                return true;
+            }
+
+            // 空选区：引号只在词边界处配对（避免 don't、a"b 这类场景）
+            if quote {
+                let wordlike = |c: Option<char>| {
+                    c.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false)
+                };
+                let before = self.text.slice(..sel.start).chars().last();
+                let after = self.text.slice(sel.end..).chars().next();
+                if wordlike(before)
+                    || after.map(|c| wordlike(Some(c)) || c == ch).unwrap_or(false)
+                {
+                    return false; // 按普通引号插入
+                }
+            }
+
+            let text = format!("{ch}{close}");
+            let range_utf16 = self.range_to_utf16(&sel);
+            self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+            self.selected_range = (sel.start + 1..sel.start + 1).into();
+            self.update_preferred_column();
+            cx.notify();
+            return true;
+        }
+
+        false
+    }
+
+    /// 光标/选区覆盖的逻辑行范围（选区末尾恰在行首时不包含该行）。
+    fn selected_logical_rows(&self) -> RangeInclusive<usize> {
+        let sel: Range<usize> = self.selected_range.into();
+        let start_row = self.text.offset_to_point(sel.start).row;
+        let mut end_row = self.text.offset_to_point(sel.end).row;
+        if sel.end > sel.start
+            && end_row > start_row
+            && self.text.line_start_offset(end_row) == sel.end
+        {
+            end_row -= 1;
+        }
+        start_row..=end_row
+    }
+
+    /// 行 span：[首行行首, 末行下一行行首或文件尾)（含末行行尾换行）。
+    fn logical_rows_span(&self, rows: &RangeInclusive<usize>) -> Range<usize> {
+        let start = self.text.line_start_offset(*rows.start());
+        let end = if *rows.end() + 1 <= self.text.lines_len().saturating_sub(1) {
+            self.text.line_start_offset(*rows.end() + 1)
+        } else {
+            self.text.len()
+        };
+        start..end
+    }
+
+    /// cmd-/：行注释切换。选区跨行时逐行注释；所有非空行已注释时取消注释。
+    pub(crate) fn toggle_comment(
+        &mut self,
+        _: &ToggleComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_code_editor() {
+            cx.propagate();
+            return;
+        }
+        let Some(token) = Self::line_comment_token(self.language().as_deref()) else {
+            return;
+        };
+
+        let rows = self.selected_logical_rows();
+        let span = self.logical_rows_span(&rows);
+        if span.start >= span.end {
+            return;
+        }
+
+        let span_text = self.text.slice(span.clone()).to_string();
+        let raw_lines: Vec<&str> = span_text.split_inclusive('\n').collect();
+        let multi = raw_lines.len() > 1;
+        let commented = |core: &str| core.trim_start().starts_with(token);
+        let all_commented = raw_lines.iter().any(|l| !l.trim().is_empty())
+            && raw_lines
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .all(|l| commented(l.trim_end_matches(['\n', '\r'])));
+
+        // 逐行重建；记录每行 (orig_start, new_start, delta, insert_point) 以恢复选区
+        let mut new_span = String::new();
+        let mut orig_offset = span.start;
+        let mut line_maps: Vec<(usize, usize, isize, usize)> = Vec::new();
+        for raw in &raw_lines {
+            let new_line_start = new_span.len();
+            let has_nl = raw.ends_with('\n');
+            let no_nl = raw.strip_suffix('\n').unwrap_or(raw);
+            let (line, has_cr) = match no_nl.strip_suffix('\r') {
+                Some(core) => (core, true),
+                None => (no_nl, false),
+            };
+
+            let (new_core, insert_point) =
+                if all_commented && commented(line) {
+                    Self::strip_line_comment(line, token)
+                } else if line.trim().is_empty() && multi {
+                    (line.to_string(), 0)
+                } else {
+                    Self::add_line_comment(line, token)
+                };
+
+            let new_raw_len = new_core.len() + has_cr as usize + has_nl as usize;
+            let delta = new_raw_len as isize - raw.len() as isize;
+            line_maps.push((orig_offset, new_line_start, delta, insert_point));
+            orig_offset += raw.len();
+            new_span.push_str(&new_core);
+            if has_cr {
+                new_span.push('\r');
+            }
+            if has_nl {
+                new_span.push('\n');
+            }
+        }
+
+        // 选区/光标映射：行内 insert_point 之后的偏移叠加本行 delta，
+        // 后续行叠加之前行的累计 delta
+        let remap = |offset: usize| -> usize {
+            let mut result = offset;
+            let mut cumulative: isize = 0;
+            for (i, (orig_start, new_start, delta, insert_point)) in line_maps.iter().enumerate() {
+                let line_len = raw_lines[i].len();
+                if offset < *orig_start {
+                    break;
+                }
+                if offset <= *orig_start + line_len {
+                    let pos = offset - orig_start;
+                    let adjusted = if pos > *insert_point { pos as isize + delta } else { pos as isize };
+                    result = span.start + new_start + adjusted as usize;
+                    return result;
+                }
+                cumulative += delta;
+            }
+            (offset as isize + cumulative).max(0) as usize
+        };
+
+        let sel: Range<usize> = self.selected_range.into();
+        let new_sel = remap(sel.start)..remap(sel.end).max(remap(sel.start));
+        let range_utf16 = self.range_to_utf16(&span);
+        self.replace_text_in_range_silent(Some(range_utf16), &new_span, window, cx);
+        self.selected_range = new_sel.into();
+        self.update_preferred_column();
+        cx.notify();
+    }
+
+    /// alt-up：上移当前行/选区行块。
+    pub(crate) fn move_line_up(
+        &mut self,
+        _: &MoveLineUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let rows = self.selected_logical_rows();
+        if *rows.start() == 0 {
+            return;
+        }
+        let span = self.logical_rows_span(&rows);
+        let prev_start = self.text.line_start_offset(*rows.start() - 1);
+        let block = self.text.slice(span.clone()).to_string();
+        let prev = self.text.slice(prev_start..span.start).to_string();
+
+        // 交换相邻两个行块：新内容 = block + prev
+        let new_text = if block.ends_with('\n') {
+            format!("{block}{prev}")
+        } else {
+            // block 在文件尾无换行：需补分隔换行并去掉 prev 尾部换行
+            format!("{block}\n{}", &prev[..prev.len() - 1])
+        };
+        let range_utf16 = self.range_to_utf16(&(prev_start..span.end));
+        self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
+        let sel: Range<usize> = self.selected_range.into();
+        let shift = prev.len() as isize;
+        let new_sel = ((sel.start as isize - shift).max(0) as usize)
+            ..((sel.end as isize - shift).max(0) as usize);
+        self.selected_range = new_sel.into();
+        self.scroll_to(self.cursor(), None, cx);
+        self.update_preferred_column();
+        cx.notify();
+    }
+
+    /// alt-down：下移当前行/选区行块。
+    pub(crate) fn move_line_down(
+        &mut self,
+        _: &MoveLineDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let rows = self.selected_logical_rows();
+        let span = self.logical_rows_span(&rows);
+        if span.end >= self.text.len() {
+            return; // 已是最后一行
+        }
+        let block = self.text.slice(span.clone()).to_string();
+        let below_end = {
+            let next_row = *rows.end() + 2; // below 行块的下一行
+            if next_row <= self.text.lines_len().saturating_sub(1) {
+                self.text.line_start_offset(next_row)
+            } else {
+                self.text.len()
+            }
+        };
+        let below = self.text.slice(span.end..below_end).to_string();
+
+        // 交换相邻两个行块：新内容 = below + block
+        let new_text = if below.ends_with('\n') {
+            format!("{below}{block}")
+        } else {
+            // below 是文件尾无换行的行：补分隔换行并去掉 block 尾部换行
+            format!("{below}\n{}", &block[..block.len() - 1])
+        };
+        let range_utf16 = self.range_to_utf16(&(span.start..below_end));
+        self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
+        let sel: Range<usize> = self.selected_range.into();
+        let shift = below.len();
+        self.selected_range = ((sel.start + shift)..(sel.end + shift)).into();
+        self.scroll_to(self.cursor(), None, cx);
+        self.update_preferred_column();
+        cx.notify();
+    }
+
+    /// shift-alt-up/down：向下复制当前行/选区行块（保留原选区）。
+    pub(crate) fn duplicate_line(
+        &mut self,
+        _: &DuplicateLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let rows = self.selected_logical_rows();
+        let span = self.logical_rows_span(&rows);
+        if span.start >= span.end {
+            return;
+        }
+        let content = self.text.slice(span.clone()).to_string();
+        let insert = if content.ends_with('\n') {
+            content.clone()
+        } else {
+            format!("\n{content}")
+        };
+        let range_utf16 = self.range_to_utf16(&(span.end..span.end));
+        self.replace_text_in_range_silent(Some(range_utf16), &insert, window, cx);
+        self.scroll_to(self.cursor(), None, cx);
+        cx.notify();
+    }
+
+    /// cmd-shift-k：删除当前行/选区行块。
+    pub(crate) fn delete_line(
+        &mut self,
+        _: &DeleteLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let rows = self.selected_logical_rows();
+        let mut span = self.logical_rows_span(&rows);
+        if span.start >= span.end {
+            return;
+        }
+        // 删除文件最后的行时连同前一个换行一起删，避免留下尾部空行
+        if span.end >= self.text.len() && span.start > 0 {
+            span.start -= 1;
+        }
+        let range_utf16 = self.range_to_utf16(&span);
+        self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
+        let cursor = self.cursor().min(self.text.len());
+        self.selected_range = (cursor..cursor).into();
+        self.scroll_to(cursor, None, cx);
+        self.update_preferred_column();
+        cx.notify();
+    }
+
+    /// cmd-j：合并当前行与下一行（去下一行行首空白，必要时补一个空格）。
+    pub(crate) fn join_lines(
+        &mut self,
+        _: &JoinLines,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let cursor = self.cursor();
+        let row = self.text.offset_to_point(cursor).row;
+        if row + 1 > self.text.lines_len().saturating_sub(1) {
+            return; // 已是最后一行
+        }
+        let line_end = self.text.line_end_offset(row);
+        let next_end = self.text.line_end_offset(row + 1);
+        let next_line = self.text.slice(line_end + 1..next_end).to_string();
+        if next_line.trim().is_empty() && next_end >= self.text.len() {
+            // 下一行是文件尾空行：仅删换行符
+            let range_utf16 = self.range_to_utf16(&(line_end..line_end + 1));
+            self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
+            cx.notify();
+            return;
+        }
+        let cur_line = self.text.slice(self.text.line_start_offset(row)..line_end).to_string();
+        let trimmed = next_line.trim_start();
+        let sep = if cur_line.is_empty() || cur_line.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        let text = format!("{sep}{trimmed}");
+        let range_utf16 = self.range_to_utf16(&(line_end..next_end));
+        self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+        let new_cursor = line_end + sep.len();
+        self.selected_range = (new_cursor..new_cursor).into();
+        self.update_preferred_column();
+        cx.notify();
+    }
+
     pub(crate) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        // 代码编辑器：空选区时光标夹在空括号/引号对中间 → 一并删除
+        if self.selected_range.is_empty()
+            && self.mode.is_code_editor()
+            && self.ime_marked_range.is_none()
+        {
+            let cursor = self.cursor();
+            let prev = self.text.slice(..cursor).chars().last();
+            let next = self.text.slice(cursor..).chars().next();
+            if let (Some(p), Some(n)) = (prev, next)
+                && Self::AUTO_PAIRS.iter().any(|(o, c)| (*o, *c) == (p, n))
+            {
+                let range = cursor - p.len_utf8()..cursor + n.len_utf8();
+                let range_utf16 = self.range_to_utf16(&range);
+                self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
+                self.pause_blink_cursor(cx);
+                return;
+            }
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor()), cx)
         }
@@ -1368,16 +2038,11 @@ impl InputState {
 
     pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_multi_line() {
-            // Get current line indent
-            let indent = if self.mode.is_code_editor() {
-                self.indent_of_next_line()
+            if self.mode.is_code_editor() {
+                self.enter_with_smart_indent(window, cx);
             } else {
-                "".to_string()
-            };
-
-            // Add newline and indent
-            let new_line_text = format!("\n{}", indent);
-            self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+                self.replace_text_in_range_silent(None, "\n", window, cx);
+            }
             self.pause_blink_cursor(cx);
         } else if self.submit_on_enter {
             // Single line input with submit_on_enter: emit the submit event.
@@ -2507,6 +3172,17 @@ impl EntityInputHandler for InputState {
 
         self.pause_blink_cursor(cx);
 
+        // 代码编辑器：括号/引号自动配对、跳过与 outdent。
+        // 仅拦截「单次键入的 ASCII 字符」；IME 组字、粘贴、程序化插入不受影响。
+        if self.mode.is_code_editor()
+            && self.ime_marked_range.is_none()
+            && new_text.len() == 1
+            && new_text.is_ascii()
+            && self.handle_auto_pair_input(new_text, window, cx)
+        {
+            return;
+        }
+
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -2837,5 +3513,94 @@ mod tests {
         let (text, range) = line_text_for_clipboard(&rope, 2);
         assert_eq!(text, "\n");
         assert_eq!(range, 2..3);
+    }
+
+    #[test]
+    fn comment_tokens_by_language() {
+        assert_eq!(InputState::line_comment_token(Some("rust")), Some("//"));
+        assert_eq!(InputState::line_comment_token(Some("python")), Some("#"));
+        assert_eq!(InputState::line_comment_token(Some("lua")), Some("--"));
+        // 无行注释语义/暂不支持的语言
+        assert_eq!(InputState::line_comment_token(Some("json")), None);
+        assert_eq!(InputState::line_comment_token(Some("css")), None);
+        assert_eq!(InputState::line_comment_token(None), None);
+    }
+
+    #[test]
+    fn add_and_strip_line_comment() {
+        let (out, pt) = InputState::add_line_comment("    let x = 1;", "//");
+        assert_eq!(out, "    // let x = 1;");
+        assert_eq!(pt, 4);
+        let (out, pt) = InputState::strip_line_comment(&out, "//");
+        assert_eq!(out, "    let x = 1;");
+        assert_eq!(pt, 4);
+        // 无空格分隔的注释也能取消
+        let (out, _) = InputState::strip_line_comment("  #comment", "#");
+        assert_eq!(out, "  comment");
+        // 无注释 token 时原样返回
+        let (out, _) = InputState::strip_line_comment("let x = 1;", "//");
+        assert_eq!(out, "let x = 1;");
+    }
+
+    #[test]
+    fn newline_indent_decisions() {
+        use NewlineIndent::*;
+        // 行尾开括号 → 深入
+        assert_eq!(InputState::newline_indent_kind("fn main() {", None), Deeper);
+        // 开括号后紧跟配对闭括号 → 空行
+        assert_eq!(
+            InputState::newline_indent_kind("fn main() {", Some('}')),
+            BlankBetween
+        );
+        // 不配对的闭括号不触发空行
+        assert_eq!(
+            InputState::newline_indent_kind("foo(", Some('}')),
+            Deeper
+        );
+        // 冒号（Python/YAML 风格，行内无花括号）→ 深入
+        assert_eq!(InputState::newline_indent_kind("def foo():", None), Deeper);
+        // 行尾冒号但行内含花括号（JS 对象字面量）→ 不深入
+        assert_eq!(InputState::newline_indent_kind("  foo({ key:", None), Inherit);
+        assert_eq!(InputState::newline_indent_kind("let x = 1", None), Inherit);
+        assert_eq!(InputState::newline_indent_kind("", None), Inherit);
+    }
+
+    #[test]
+    fn bracket_matching_offsets() {
+        let rope = Rope::from_str("fn main() {\n    let a = (1 + 2);\n}\n");
+        // 光标在 `{` 后 → 匹配 `{`..`}`
+        assert_eq!(InputState::matching_bracket(&rope, 11), Some((10, 33)));
+        // 光标在 `(` 后 → 前向匹配
+        assert_eq!(InputState::matching_bracket(&rope, 25), Some((24, 30)));
+        // 光标在 `)` 前（同一个闭括号，后向匹配）
+        assert_eq!(InputState::matching_bracket(&rope, 31), Some((24, 30)));
+        // 光标在 `}` 后 → 后向匹配到 `{`
+        assert_eq!(InputState::matching_bracket(&rope, 34), Some((10, 33)));
+        // 非括号处 → None
+        assert_eq!(InputState::matching_bracket(&rope, 0), None);
+
+        // 嵌套：光标在第一个 `(` 后，应跳过内层括号
+        let nested = Rope::from_str("a (b (c)) d");
+        assert_eq!(InputState::matching_bracket(&nested, 3), Some((2, 8)));
+        // 内层
+        assert_eq!(InputState::matching_bracket(&nested, 6), Some((5, 7)));
+
+        // 未闭合括号 → None
+        let unclosed = Rope::from_str("(abc");
+        assert_eq!(InputState::matching_bracket(&unclosed, 1), None);
+        let unopened = Rope::from_str("abc)");
+        assert_eq!(InputState::matching_bracket(&unopened, 4), None);
+
+        // 多字节字符中的括号不会被误判（中文字节 ≥ 0x80，不会与 ASCII 括号混淆）
+        // 布局：中文(0-5) （(6-8) 注(9-11) ）(12-14) ((15) )(16) “(17-19) (20) ”(21-23)
+        let cjk = Rope::from_str("中文（注）()“ ”");
+        assert_eq!(InputState::matching_bracket(&cjk, 16), Some((15, 16)));
+        assert_eq!(InputState::matching_bracket(&cjk, 17), Some((15, 16)));
+        // 中文全角括号（多字节）不参与 ASCII 括号匹配
+        assert_eq!(InputState::matching_bracket(&cjk, 9), None);
+
+        // 空文本/边界
+        let empty = Rope::from_str("");
+        assert_eq!(InputState::matching_bracket(&empty, 0), None);
     }
 }

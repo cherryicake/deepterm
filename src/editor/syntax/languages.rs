@@ -19,6 +19,7 @@ pub enum Language {
     Css,
     Go,
     Html,
+    Java,
     JavaScript,
     Kotlin,
     Lua,
@@ -30,6 +31,8 @@ pub enum Language {
     Toml,
     Tsx,
     TypeScript,
+    Xml,
+    Yaml,
     Zig,
 }
 
@@ -57,6 +60,7 @@ impl Language {
             Self::Css => "css",
             Self::Go => "go",
             Self::Html => "html",
+            Self::Java => "java",
             Self::JavaScript => "javascript",
             Self::Json => "json",
             Self::Kotlin => "kotlin",
@@ -69,7 +73,37 @@ impl Language {
             Self::Toml => "toml",
             Self::Tsx => "tsx",
             Self::TypeScript => "typescript",
+            Self::Xml => "xml",
+            Self::Yaml => "yaml",
             Self::Zig => "zig",
+        }
+    }
+
+    /// 状态栏/语言选择器使用的显示名。
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Plain => "Plain Text",
+            Self::Bash => "Bash",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::Css => "CSS",
+            Self::Go => "Go",
+            Self::Html => "HTML",
+            Self::Java => "Java",
+            Self::JavaScript => "JavaScript",
+            Self::Json => "JSON",
+            Self::Kotlin => "Kotlin",
+            Self::Lua => "Lua",
+            Self::Makefile => "Makefile",
+            Self::Markdown | Self::MarkdownInline => "Markdown",
+            Self::Python => "Python",
+            Self::Rust => "Rust",
+            Self::Toml => "TOML",
+            Self::Tsx => "TSX",
+            Self::TypeScript => "TypeScript",
+            Self::Xml => "XML",
+            Self::Yaml => "YAML",
+            Self::Zig => "Zig",
         }
     }
 
@@ -86,6 +120,7 @@ impl Language {
             "css" | "scss" => Self::Css,
             "go" => Self::Go,
             "html" => Self::Html,
+            "java" => Self::Java,
             "javascript" | "js" => Self::JavaScript,
             "json" | "jsonc" => Self::Json,
             "kotlin" | "kt" | "kts" => Self::Kotlin,
@@ -98,6 +133,8 @@ impl Language {
             "toml" => Self::Toml,
             "tsx" => Self::Tsx,
             "typescript" | "ts" => Self::TypeScript,
+            "xml" => Self::Xml,
+            "yaml" | "yml" => Self::Yaml,
             "zig" => Self::Zig,
             _ => Self::Plain,
         }
@@ -259,6 +296,24 @@ impl Language {
                 include_str!("languages/tsx/highlights.scm"),
                 "",
                 tree_sitter_typescript::LOCALS_QUERY,
+            ),
+            Self::Xml => (
+                tree_sitter_xml::LANGUAGE_XML,
+                tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+                "",
+                "",
+            ),
+            Self::Yaml => (
+                tree_sitter_yaml::LANGUAGE,
+                tree_sitter_yaml::HIGHLIGHTS_QUERY,
+                "",
+                "",
+            ),
+            Self::Java => (
+                tree_sitter_java::LANGUAGE,
+                tree_sitter_java::HIGHLIGHTS_QUERY,
+                "",
+                "",
             ),
             Self::Zig => (
                 tree_sitter_zig::LANGUAGE,

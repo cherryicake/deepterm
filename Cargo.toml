@@ -53,6 +53,9 @@ env_logger = "0.11"
 # Error handling
 anyhow = "1.0"
 
+# File encoding detection / conversion (GBK, GB18030, UTF-16, BOM)
+encoding_rs = "0.8"
+
 # Image / SVG preview
 image = "0.25.1"
 usvg = "0.46.0"
@@ -99,6 +102,9 @@ regex = "1.12.3"
 imara-diff = "0.1.8"
 open = "5"
 mimalloc = "0.1.52"
+tree-sitter-yaml = "0.7"
+tree-sitter-java = "0.23"
+tree-sitter-xml = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

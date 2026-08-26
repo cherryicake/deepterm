@@ -515,6 +515,19 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 将原始字节整体写入远程文件（覆盖已存在的文件）。
+    /// 用于按非 UTF-8 编码（GBK / UTF-16 等）保存编辑器内容。
+    pub fn write_file_bytes(&mut self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let mut file = self.sftp.create(path).await?;
+            file.write_all(bytes).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            file.shutdown().await?;
+            Ok(())
+        })
+    }
+
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
     pub fn execute_command(
@@ -973,6 +986,20 @@ pub fn write_file_string(
     content: &str,
 ) -> anyhow::Result<()> {
     with_cached_session(config, |session| session.write_file_string(path, content))
+}
+
+/// 将原始字节整体写入远程文件（覆盖已存在的文件），用于非 UTF-8 编码保存。
+pub fn write_file_bytes(
+    config: &SshConnectionConfig,
+    path: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    with_cached_session(config, |session| session.write_file_bytes(path, bytes))
+}
+
+/// 查询远程文件权限位（mode），失败或不可用时返回 None。
+pub fn file_permissions(config: &SshConnectionConfig, path: &str) -> anyhow::Result<Option<u32>> {
+    with_cached_session(config, |session| session.permissions(path))
 }
 
 pub fn read_file_bytes(
@@ -1465,6 +1492,11 @@ const PREVIEW_ANALYSIS_BYTES: usize = 1024;
 /// Detect whether a byte sequence is likely binary content.
 /// Based on zed's heuristic in worktree/src/worktree.rs.
 fn is_binary_content(bytes: &[u8]) -> bool {
+    is_binary_bytes(bytes)
+}
+
+/// 判断字节内容是否为二进制（供编辑器打开文件前的拦截）。
+pub fn is_binary_bytes(bytes: &[u8]) -> bool {
     if bytes.len() < 2 {
         return false;
     }

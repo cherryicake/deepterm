@@ -168,6 +168,21 @@ impl SimpleHighlighter {
                 tree_sitter_zig::LANGUAGE.into(),
                 include_str!("languages/zig/highlights.scm"),
             ),
+            "java" => Self::setup_language(
+                &mut parser,
+                tree_sitter_java::LANGUAGE.into(),
+                tree_sitter_java::HIGHLIGHTS_QUERY,
+            ),
+            "xml" => Self::setup_language(
+                &mut parser,
+                tree_sitter_xml::LANGUAGE_XML.into(),
+                tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+            ),
+            "yaml" => Self::setup_language(
+                &mut parser,
+                tree_sitter_yaml::LANGUAGE.into(),
+                tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            ),
             _ => None,
         };
         let injections_query = crate::editor::syntax::LanguageRegistry::singleton()
@@ -1078,6 +1093,65 @@ export function App() { return <div className="a">hi</div>; }
             run.1.color,
             Some(gpui::green()),
             "go func name must be function-colored"
+        );
+    }
+
+    /// Java / XML / YAML：新增语言的高亮冒烟测试（至少能解析并命中若干 capture）。
+    #[test]
+    fn test_java_xml_yaml_highlights_smoke() {
+        let theme = test_theme();
+
+        // Java：class 名应命中 type 色，int 应命中 keyword 色
+        let java_code = "public class Main {\n    int count = 42;\n}\n";
+        let mut h = SimpleHighlighter::new("java");
+        let rope = Rope::from_str(java_code);
+        assert!(h.update(None, &rope, None));
+        let styles = h.styles(&(0..java_code.len()), &theme);
+        let color_at = |code: &str, needle: &str| {
+            let pos = code.find(needle).expect("needle in code");
+            styles
+                .iter()
+                .find(|(r, _)| r.start <= pos && r.end > pos)
+                .map(|(_, s)| s.color)
+        };
+        assert_eq!(
+            color_at(java_code, "Main"),
+            Some(Some(gpui::blue())),
+            "java class name as type"
+        );
+        assert_eq!(
+            color_at(java_code, "int"),
+            Some(Some(gpui::blue())),
+            "java primitive type builtin"
+        );
+        assert_eq!(
+            color_at(java_code, "public"),
+            Some(Some(gpui::red())),
+            "java modifier keyword"
+        );
+
+        // XML：标签名应命中 tag 色，属性名应命中 attribute 色
+        let xml_code = "<note id=\"1\">hi</note>\n";
+        let mut h = SimpleHighlighter::new("xml");
+        let rope = Rope::from_str(xml_code);
+        assert!(h.update(None, &rope, None));
+        let styles = h.styles(&(0..xml_code.len()), &theme);
+        let pos = xml_code.find("note").unwrap();
+        assert!(
+            styles.iter().any(|(r, _)| r.start <= pos && r.end > pos),
+            "xml tag name has a style"
+        );
+
+        // YAML：键应命中 property 色，字符串值命中 string 色
+        let yaml_code = "name: deepterm\nversion: 2\n";
+        let mut h = SimpleHighlighter::new("yaml");
+        let rope = Rope::from_str(yaml_code);
+        assert!(h.update(None, &rope, None));
+        let styles = h.styles(&(0..yaml_code.len()), &theme);
+        let pos = yaml_code.find("name").unwrap();
+        assert!(
+            styles.iter().any(|(r, _)| r.start <= pos && r.end > pos),
+            "yaml key has a style"
         );
     }
 }

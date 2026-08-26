@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::editor::encoding::FileEncoding;
 use crate::file_manager::types::FileEntry;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind};
 use crate::ssh::SshConnectionConfig;
@@ -17,6 +18,8 @@ struct DirNode {
 /// 远程文件内容缓存条目
 struct FileContentEntry {
     content: String,
+    /// 文件磁盘编码（缓存命中时无需重新检测）。
+    encoding: FileEncoding,
     loaded_at: Instant,
 }
 
@@ -150,6 +153,7 @@ impl RemoteFileTreeCache {
         config: &SshConnectionConfig,
         path: &Path,
         content: String,
+        encoding: FileEncoding,
     ) {
         let key = Self::server_key(config);
         let file_cache = self
@@ -165,18 +169,23 @@ impl RemoteFileTreeCache {
             path.to_path_buf(),
             FileContentEntry {
                 content,
+                encoding,
                 loaded_at: Instant::now(),
             },
         );
     }
 
-    /// 获取缓存的远程文件内容
-    pub fn get_file_content(&self, config: &SshConnectionConfig, path: &Path) -> Option<String> {
+    /// 获取缓存的远程文件内容及其磁盘编码
+    pub fn get_file_content(
+        &self,
+        config: &SshConnectionConfig,
+        path: &Path,
+    ) -> Option<(String, FileEncoding)> {
         let key = Self::server_key(config);
         let file_cache = self.file_caches.get(&key)?;
         let entry = file_cache.files.get(path)?;
         log::debug!("FileTreeCache get file content: {}{}", key, path.display());
-        Some(entry.content.clone())
+        Some((entry.content.clone(), entry.encoding))
     }
 
     /// 移除单个文件的内容缓存
