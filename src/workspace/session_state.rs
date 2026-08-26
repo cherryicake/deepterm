@@ -40,7 +40,6 @@ pub struct WorkspaceSessionState {
     pub next_tab_id: usize,
     pub next_panel_id: usize,
     pub local_terminal_count: usize,
-    pub workspace_index: usize,
     pub tabs: Vec<TabSessionState>,
 }
 

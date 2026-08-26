@@ -373,7 +373,6 @@ mod migration_tests {
                 next_tab_id: 1,
                 next_panel_id: 1,
                 local_terminal_count: 1,
-                workspace_index: 0,
                 tabs: vec![],
             }),
         });

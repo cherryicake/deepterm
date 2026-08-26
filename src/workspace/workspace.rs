@@ -99,32 +99,6 @@ impl TabInfo {
             broadcast_enabled: false,
         }
     }
-
-    pub fn new_workspace(
-        id: impl Into<String>,
-        children: Vec<SplitContainer>,
-        direction: SplitDirection,
-        workspace_index: usize,
-    ) -> Self {
-        let sizes = vec![1.0; children.len()];
-        // 第一个是"WorkSpace"，之后是"WorkSpace[1]", "WorkSpace[2]"...
-        let label = if workspace_index == 0 {
-            "WorkSpace".to_string()
-        } else {
-            format!("WorkSpace[{}]", workspace_index)
-        };
-        Self {
-            id: id.into(),
-            label,
-            tab_type: TabType::Workspace,
-            container: SplitContainer::Split {
-                direction,
-                children,
-                sizes,
-            },
-            broadcast_enabled: false,
-        }
-    }
 }
 
 /// 主工作区组件
@@ -141,8 +115,6 @@ pub struct Workspace {
     next_panel_id: usize,
     /// Local Terminal创建计数（用于生成标签名，只增不减）
     local_terminal_count: usize,
-    /// WorkSpace创建计数（用于生成标签名，只增不减）
-    workspace_index: usize,
     focus_handle: FocusHandle,
     /// Panel事件订阅
     panel_subscriptions: HashMap<String, Subscription>,
@@ -209,7 +181,6 @@ impl Workspace {
             next_tab_id: self.next_tab_id,
             next_panel_id: self.next_panel_id,
             local_terminal_count: self.local_terminal_count,
-            workspace_index: self.workspace_index,
             tabs,
         }
     }
@@ -258,21 +229,57 @@ impl Workspace {
         self.sync_tab_broadcast_to_panels(tab_id, cx);
     }
 
-    /// 生成带序号的标签名称
-    /// 第一个是"Base"，之后是"Base[1]", "Base[2]"...
-    fn generate_indexed_name(base: &str, counter: &mut usize) -> String {
-        let current = *counter;
-        *counter += 1;
-        if current == 0 {
-            base.to_string()
+    /// 生成带序号的 Workspace 标签名称。
+    /// 编号从 0 开始递增；编号为 0 时不显示编号（直接返回 "WorkSpace"），
+    /// 其后依次为 "WorkSpace[1]"、"WorkSpace[2]"...
+    fn workspace_label_for_index(index: usize) -> String {
+        if index == 0 {
+            "WorkSpace".to_string()
         } else {
-            format!("{}[{}]", base, current)
+            format!("WorkSpace[{}]", index)
         }
     }
 
-    /// 生成WorkSpace标签名称
-    fn generate_workspace_label(&mut self) -> String {
-        Self::generate_indexed_name("WorkSpace", &mut self.workspace_index)
+    /// 重新为所有 Workspace 类型的 tab 分配编号。
+    ///
+    /// 规则：按标签栏中的显示顺序，从 0 开始递增；编号为 0 时显示 "WorkSpace"
+    /// （不显示编号），其后依次为 "WorkSpace[1]"、"WorkSpace[2]"...
+    /// 在 Workspace 标签新增（分割/合并）、移除、降级为普通标签或重排后调用，
+    /// 保证编号始终从 0 连续递增。
+    fn renumber_workspace_tabs(&mut self, cx: &mut Context<Self>) {
+        let workspace_tab_ids: Vec<String> = self
+            .tab_bar
+            .read(cx)
+            .tabs
+            .iter()
+            .filter(|item| {
+                self.tabs
+                    .get(item.id.as_ref())
+                    .is_some_and(|info| matches!(info.tab_type, TabType::Workspace))
+            })
+            .map(|item| item.id.to_string())
+            .collect();
+
+        for (position, tab_id) in workspace_tab_ids.into_iter().enumerate() {
+            let new_label = Self::workspace_label_for_index(position);
+            let Some(tab_info) = self.tabs.get_mut(&tab_id) else {
+                continue;
+            };
+            if tab_info.label == new_label {
+                continue;
+            }
+            tab_info.label = new_label.clone();
+
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.modify_tab(
+                    &tab_id,
+                    |tab| {
+                        tab.label = new_label.clone().into();
+                    },
+                    cx,
+                );
+            });
+        }
     }
 
     pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
@@ -299,7 +306,6 @@ impl Workspace {
                 next_tab_id: 1,
                 next_panel_id: 1,
                 local_terminal_count: 1, // 初始已有一个本地终端
-                workspace_index: 0,      // 从0开始计数
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
                 workspace_id: workspace_id.clone(),
@@ -359,6 +365,28 @@ impl Workspace {
             state.workspace_id.clone()
         };
 
+        // 修正旧版本会话中可能残留的断档/起始错误编号：按顺序重新为
+        // Workspace 标签编号（从 0 开始，为 0 时不显示编号），与运行时规则保持一致。
+        let workspace_labels: HashMap<String, String> = {
+            let mut next_index = 0usize;
+            state
+                .tabs
+                .iter()
+                .filter(|tab| matches!(tab.tab_type, TabSessionType::Workspace))
+                .map(|tab| {
+                    let label = Self::workspace_label_for_index(next_index);
+                    next_index += 1;
+                    (tab.id.clone(), label)
+                })
+                .collect()
+        };
+        let label_for = |tab: &TabSessionState| -> String {
+            workspace_labels
+                .get(&tab.id)
+                .cloned()
+                .unwrap_or_else(|| tab.label.clone())
+        };
+
         let tab_items = state
             .tabs
             .iter()
@@ -374,7 +402,7 @@ impl Workspace {
                         .filter(|os| *os != RemoteOS::Unknown)
                         .map(|os| os.icon()),
                 };
-                TabItem::new(&tab.id, &tab.label).with_icon(icon)
+                TabItem::new(&tab.id, label_for(tab)).with_icon(icon)
             })
             .collect();
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, tab_items);
@@ -390,16 +418,17 @@ impl Workspace {
             .tabs
             .iter()
             .map(|tab| {
+                let label = label_for(tab);
                 let container = SplitContainer::from_session_state(
                     &tab.container,
                     &workspace_id,
                     &tab.id,
-                    &tab.label,
+                    &label,
                     cx,
                 );
                 let tab_info = TabInfo {
                     id: tab.id.clone(),
-                    label: tab.label.clone(),
+                    label,
                     tab_type: match tab.tab_type {
                         TabSessionType::Normal => TabType::Normal,
                         TabSessionType::Workspace => TabType::Workspace,
@@ -419,7 +448,6 @@ impl Workspace {
                 next_tab_id: state.next_tab_id.max(state.tabs.len()),
                 next_panel_id: state.next_panel_id.max(1),
                 local_terminal_count: state.local_terminal_count.max(1),
-                workspace_index: state.workspace_index,
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
                 workspace_id,
@@ -1447,6 +1475,8 @@ impl Workspace {
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.remove_tab(&target_tab_id, cx);
             });
+            // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
+            self.renumber_workspace_tabs(cx);
 
             if self.active_tab_id == target_tab_id {
                 self.activate_next_tab(cx);
@@ -1470,6 +1500,8 @@ impl Workspace {
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.remove_tab(&target_tab_id, cx);
             });
+            // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
+            self.renumber_workspace_tabs(cx);
             if self.active_tab_id == target_tab_id {
                 self.activate_next_tab(cx);
             }
@@ -1515,6 +1547,8 @@ impl Workspace {
                     cx,
                 );
             });
+            // 该tab降级为普通标签：剩余Workspace标签重新编号
+            self.renumber_workspace_tabs(cx);
         }
 
         // 重新订阅所有panel
@@ -1548,9 +1582,6 @@ impl Workspace {
             return;
         }
 
-        // 预生成workspace标签，避免在借用self.tabs后再次借用self
-        let workspace_label = self.generate_workspace_label();
-
         // 获取被拖拽的tab信息
         let Some(dragged_tab_info) = self.tabs.remove(&dragged_tab_id) else {
             return;
@@ -1573,10 +1604,10 @@ impl Workspace {
                 .container
                 .split_at(target_panel_id, placement, dragged_container, cx);
 
-        // 更新目标tab为Workspace类型
+        // 更新目标tab为Workspace类型（标签编号由 renumber_workspace_tabs 统一分配，
+        // 目标tab已是Workspace时保持原标签不变）
         target_tab_info.container = new_container;
         target_tab_info.tab_type = TabType::Workspace;
-        target_tab_info.label.clone_from(&workspace_label);
 
         // 更新TabBar显示（Workspace使用统一图标）
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1584,12 +1615,14 @@ impl Workspace {
             tab_bar.modify_tab(
                 &target_tab_id,
                 |tab| {
-                    tab.label = workspace_label.clone().into();
                     tab.icon = Some(crate::assets::Icon::Workspace);
                 },
                 cx,
             );
         });
+
+        // 被拖拽的tab已移除、目标tab新成为Workspace：重新为Workspace标签编号
+        self.renumber_workspace_tabs(cx);
 
         // 重新订阅所有panel
         self.subscribe_to_panels(window, cx);
@@ -1687,18 +1720,18 @@ impl Workspace {
         if tab_info.tab_type != TabType::Workspace {
             tab_info.tab_type = TabType::Workspace;
 
-            // 更新TabBar显示（Workspace使用统一图标）
-            let workspace_label = self.generate_workspace_label();
+            // 更新TabBar显示（Workspace使用统一图标）；标签编号由 renumber_workspace_tabs 统一分配
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.modify_tab(
                     &active_tab_id,
                     |tab| {
-                        tab.label = workspace_label.clone().into();
                         tab.icon = Some(crate::assets::Icon::Workspace);
                     },
                     cx,
                 );
             });
+            // 新增了一个Workspace标签：重新从0开始编号
+            self.renumber_workspace_tabs(cx);
         }
 
         // 保存被拖拽panel的ID和广播状态，用于后续设置
@@ -1775,6 +1808,8 @@ impl Workspace {
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.remove_tab(&active_tab_id, cx);
             });
+            // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
+            self.renumber_workspace_tabs(cx);
             if self.active_tab_id == active_tab_id {
                 self.activate_next_tab(cx);
             }
@@ -1818,6 +1853,8 @@ impl Workspace {
                     cx,
                 );
             });
+            // 该tab降级为普通标签：剩余Workspace标签重新编号
+            self.renumber_workspace_tabs(cx);
         }
 
         // 创建新的tab
@@ -1897,6 +1934,8 @@ impl Workspace {
             }
         });
         if changed {
+            // 标签顺序变化：按新的显示顺序重新为Workspace标签编号
+            self.renumber_workspace_tabs(cx);
             cx.emit(WorkspaceEvent::SessionChanged);
             cx.emit(WorkspaceEvent::TabBarChanged);
         }
@@ -2098,6 +2137,8 @@ impl Workspace {
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(tab_id, cx);
         });
+        // 被关闭的可能是Workspace标签：剩余Workspace标签重新编号
+        self.renumber_workspace_tabs(cx);
 
         // 如果关闭的是当前活动tab，切换到相邻 tab（以渲染顺序为准：优先下一个，否则上一个）
         if self.active_tab_id == tab_id {
@@ -2609,5 +2650,19 @@ impl IntoElement for ResizeHandlerElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Workspace 标签编号规则：从 0 开始递增，编号为 0 时不显示编号
+    #[test]
+    fn workspace_label_for_index_hides_zero() {
+        assert_eq!(Workspace::workspace_label_for_index(0), "WorkSpace");
+        assert_eq!(Workspace::workspace_label_for_index(1), "WorkSpace[1]");
+        assert_eq!(Workspace::workspace_label_for_index(2), "WorkSpace[2]");
+        assert_eq!(Workspace::workspace_label_for_index(10), "WorkSpace[10]");
     }
 }
