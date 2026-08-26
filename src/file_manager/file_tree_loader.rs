@@ -12,6 +12,9 @@ use crate::ssh::SshConnectionConfig;
 ///
 /// 负责目录缓存管理、加载状态跟踪、共享缓存交互。
 /// View 层（`SidebarFileTree`）持有此结构体，将文件操作委托给它。
+///
+/// 构造时对共享缓存 `acquire` 一份引用，`Drop` 时归还，
+/// 保证引用计数严格配对（本地树与远程树走同一路径）。
 pub struct FileTreeLoader {
     /// path -> entries，本地工作集缓存
     directory_cache: HashMap<PathBuf, Vec<FileEntry>>,
@@ -21,10 +24,18 @@ pub struct FileTreeLoader {
     pending_refresh: HashSet<PathBuf>,
     /// 后端文件系统
     backend: Arc<dyn FileSystem>,
-    /// SSH 配置（远程时有值）
+    /// SSH 配置（远程时有值；本地树使用 local() 占位配置作为共享缓存 key）
     ssh_config: Option<SshConnectionConfig>,
     /// 是否本地
     is_local: bool,
+    /// 是否仍持有共享缓存引用
+    cache_ref_held: bool,
+}
+
+impl Drop for FileTreeLoader {
+    fn drop(&mut self) {
+        self.release_shared_cache();
+    }
 }
 
 impl FileTreeLoader {
@@ -37,6 +48,10 @@ impl FileTreeLoader {
                 None
             }
         });
+        // 构造即持有共享缓存引用，Drop 时归还
+        if let Some(config) = &ssh_config {
+            RemoteFileTreeCache::global().lock().acquire(config);
+        }
         Self {
             directory_cache: HashMap::new(),
             loading_paths: HashSet::new(),
@@ -44,6 +59,7 @@ impl FileTreeLoader {
             backend,
             ssh_config,
             is_local,
+            cache_ref_held: true,
         }
     }
 
@@ -102,12 +118,16 @@ impl FileTreeLoader {
     }
 
     /// 请求刷新。如果正在加载则标记 pending 并返回 false。
-    /// 如果可以立即刷新返回 true。
+    /// 如果可以立即刷新，则将路径标记为加载中并返回 true。
+    ///
+    /// 返回 true 后调用方必须在完成时调用 `finish_refresh` / `fail_refresh`
+    /// 清除加载标记，否则该路径会卡在加载状态。
     pub fn request_refresh(&mut self, path: &Path) -> bool {
         if self.loading_paths.contains(path) {
             self.pending_refresh.insert(path.to_path_buf());
             false
         } else {
+            self.loading_paths.insert(path.to_path_buf());
             true
         }
     }
@@ -191,7 +211,6 @@ impl FileTreeLoader {
         if let Some(config) = &self.ssh_config {
             RemoteFileTreeCache::global()
                 .lock()
-                .unwrap()
                 .on_fs_event(config, event);
         }
 
@@ -247,10 +266,7 @@ impl FileTreeLoader {
     /// 从共享缓存获取目录条目
     pub fn get_shared_cache(&self, path: &Path) -> Option<Vec<FileEntry>> {
         let config = self.ssh_config.as_ref()?;
-        RemoteFileTreeCache::global()
-            .lock()
-            .unwrap()
-            .get(config, path)
+        RemoteFileTreeCache::global().lock().get(config, path)
     }
 
     /// 写入共享缓存
@@ -258,7 +274,6 @@ impl FileTreeLoader {
         if let Some(config) = &self.ssh_config {
             RemoteFileTreeCache::global()
                 .lock()
-                .unwrap()
                 .insert(config, path, entries);
         }
     }
@@ -268,18 +283,197 @@ impl FileTreeLoader {
         if let Some(config) = &self.ssh_config {
             RemoteFileTreeCache::global()
                 .lock()
-                .unwrap()
                 .remove_dir(config, path);
         }
     }
 
-    /// 释放共享缓存引用
-    pub fn release_shared_cache(&self) {
-        if let Some(config) = &self.ssh_config {
-            RemoteFileTreeCache::global()
-                .lock()
-                .unwrap()
-                .release(config);
+    /// 释放共享缓存引用（幂等；正常情况下由 `Drop` 调用）
+    fn release_shared_cache(&mut self) {
+        if !self.cache_ref_held {
+            return;
         }
+        self.cache_ref_held = false;
+        if let Some(config) = &self.ssh_config {
+            RemoteFileTreeCache::global().lock().release(config);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_manager::filesystem::FileMetadata;
+    use crate::file_manager::types::FileEntryKind;
+    use std::sync::Mutex as StdMutex;
+
+    /// 可注入读取结果的 mock 后端；ssh_config 返回唯一 key 以隔离全局共享缓存
+    struct MockFs {
+        entries: StdMutex<Result<Vec<FileEntry>, String>>,
+        config: SshConnectionConfig,
+    }
+
+    impl FileSystem for MockFs {
+        fn read_dir(&self, _path: &Path) -> Result<Vec<FileEntry>, String> {
+            self.entries.lock().unwrap().clone()
+        }
+        fn metadata(&self, _path: &Path) -> Result<FileMetadata, String> {
+            Ok(FileMetadata {
+                is_dir: true,
+                size: 0,
+                modified_at: None,
+            })
+        }
+        fn read_file_bytes(&self, _path: &Path) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn home_dir(&self) -> Option<PathBuf> {
+            None
+        }
+        fn ssh_config(&self) -> Option<SshConnectionConfig> {
+            Some(self.config.clone())
+        }
+        fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    fn test_config(tag: &str) -> SshConnectionConfig {
+        let mut config = SshConnectionConfig::local();
+        config.host = format!("test-host-{tag}");
+        config.username = format!("test-user-{tag}");
+        config
+    }
+
+    fn entries(names: &[&str]) -> Vec<FileEntry> {
+        names
+            .iter()
+            .map(|n| FileEntry {
+                name: (*n).to_string(),
+                path: PathBuf::from(format!("/root/{n}")),
+                kind: FileEntryKind::File,
+            })
+            .collect()
+    }
+
+    /// 回归守卫（Bug 1）：request_refresh 返回 true 时必须标记 loading，
+    /// 否则完成回调里的 is_loading 守卫会丢弃刷新结果，本地 fs 变更完全不刷新
+    #[test]
+    fn request_refresh_marks_loading_and_finish_writes_cache() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a", "b"]))),
+            config: test_config("refresh-finish"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+
+        assert!(loader.request_refresh(Path::new("/root")));
+        assert!(loader.is_loading(Path::new("/root")));
+
+        // 内容有变化 → 返回 true 且清除 loading
+        assert!(loader.finish_refresh(Path::new("/root"), entries(&["a", "b"])));
+        assert!(!loader.is_loading(Path::new("/root")));
+        assert_eq!(
+            loader.get_cached(Path::new("/root")),
+            Some(&entries(&["a", "b"]))
+        );
+    }
+
+    /// 加载中的 request_refresh → pending 标记，加载完成后补一次刷新
+    #[test]
+    fn request_refresh_during_load_defers_via_pending() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("refresh-pending"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+
+        assert!(loader.begin_load(Path::new("/root")));
+        assert!(!loader.request_refresh(Path::new("/root")));
+        assert!(loader.take_pending_refresh(Path::new("/root")));
+        assert!(!loader.take_pending_refresh(Path::new("/root")));
+    }
+
+    /// 刷新结果与缓存相同 → finish_refresh 返回 false，但 loading 必须被清除
+    #[test]
+    fn finish_refresh_with_unchanged_entries_clears_loading() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("refresh-unchanged"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+        loader.begin_load(Path::new("/root"));
+        loader.finish_load(Path::new("/root"), entries(&["a"]));
+
+        assert!(loader.request_refresh(Path::new("/root")));
+        assert!(!loader.finish_refresh(Path::new("/root"), entries(&["a"])));
+        assert!(!loader.is_loading(Path::new("/root")));
+        assert!(loader.has_cached(Path::new("/root")));
+    }
+
+    /// 刷新失败（目录消失）→ 清除 loading 与缓存
+    #[test]
+    fn fail_refresh_removes_cache_and_loading() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("refresh-fail"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+        loader.begin_load(Path::new("/root"));
+        loader.finish_load(Path::new("/root"), entries(&["a"]));
+
+        assert!(loader.request_refresh(Path::new("/root")));
+        assert!(loader.fail_refresh(Path::new("/root")));
+        assert!(!loader.is_loading(Path::new("/root")));
+        assert!(!loader.has_cached(Path::new("/root")));
+    }
+
+    /// watcher 带 entries 的事件直写缓存并清除 loading，
+    /// 后续完成的 in-flight 读取因 is_loading 为 false 被丢弃（更新数据获胜）
+    #[test]
+    fn watcher_direct_update_wins_over_in_flight_load() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["stale"]))),
+            config: test_config("watcher-wins"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+
+        assert!(loader.begin_load(Path::new("/root")));
+        // watcher 事件带 entries：loader 直写缓存
+        let event = FsChangeEvent {
+            path: PathBuf::from("/root"),
+            kind: FsChangeKind::Modify,
+            entries: Some(entries(&["fresh"])),
+        };
+        loader.handle_fs_event(Path::new("/root"), &event);
+
+        assert!(!loader.is_loading(Path::new("/root")));
+        assert_eq!(
+            loader.get_cached(Path::new("/root")),
+            Some(&entries(&["fresh"]))
+        );
+    }
+
+    /// Remove 事件：删除路径及子路径缓存，返回最近已缓存祖先供刷新
+    #[test]
+    fn remove_event_clears_subtree_and_finds_cached_ancestor() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("remove"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+        loader.begin_load(Path::new("/root"));
+        loader.finish_load(Path::new("/root"), entries(&["sub"]));
+        loader.begin_load(Path::new("/root/sub"));
+        loader.finish_load(Path::new("/root/sub"), entries(&["x"]));
+
+        let event = FsChangeEvent {
+            path: PathBuf::from("/root/sub"),
+            kind: FsChangeKind::Remove,
+            entries: None,
+        };
+        let ancestor = loader.handle_fs_event(Path::new("/root"), &event);
+
+        assert_eq!(ancestor, Some(PathBuf::from("/root")));
+        assert!(!loader.has_cached(Path::new("/root/sub")));
+        assert!(loader.has_cached(Path::new("/root")));
     }
 }

@@ -756,7 +756,6 @@ impl Editor {
                 if let Some(ref ssh_config) = self.open_files[file_ix].ssh_config {
                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                         .lock()
-                        .unwrap()
                         .insert_file_content(
                             ssh_config,
                             std::path::Path::new(path),
@@ -842,7 +841,6 @@ impl Editor {
                         if let Some(ref ssh_config) = this.open_files[file_ix].ssh_config {
                             crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                                 .lock()
-                                .unwrap()
                                 .insert_file_content(
                                     ssh_config,
                                     std::path::Path::new(&prompt_path),
@@ -1421,7 +1419,6 @@ impl Editor {
                                 if let Some(ref ssh_config) = file.ssh_config {
                                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                                         .lock()
-                                        .unwrap()
                                         .insert_file_content(
                                             ssh_config,
                                             std::path::Path::new(&file.path),
@@ -1566,7 +1563,6 @@ impl Editor {
         // 检查是否有缓存的文件内容
         let cached_content = crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
             .lock()
-            .unwrap()
             .get_file_content(&ssh_config, std::path::Path::new(&path));
 
         if let Some((content, encoding)) = cached_content {
@@ -2104,7 +2100,6 @@ impl Editor {
                         if let Some(config) = &file.ssh_config {
                             crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                                 .lock()
-                                .unwrap()
                                 .insert_file_content(
                                     config,
                                     std::path::Path::new(&file.path),
@@ -2220,7 +2215,6 @@ impl Editor {
                 if is_remote {
                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                         .lock()
-                        .unwrap()
                         .remove_file(
                             self.open_files[index].ssh_config.as_ref().unwrap(),
                             std::path::Path::new(&path),

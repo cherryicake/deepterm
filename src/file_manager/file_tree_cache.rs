@@ -1,12 +1,18 @@
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::editor::encoding::FileEncoding;
 use crate::file_manager::types::FileEntry;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind};
 use crate::ssh::SshConnectionConfig;
+
+/// 引用归零后的“保温”时长：释放后保留一段时间，便于切回时复用缓存
+const ORPHAN_TTL: Duration = Duration::from_secs(10 * 60);
+/// 最多保留的无引用服务器数量（超出时按最旧优先逐出）
+const MAX_ORPHAN_SERVERS: usize = 3;
 
 /// 单个目录的缓存条目
 struct DirNode {
@@ -37,6 +43,9 @@ struct ServerTree {
     expanded: HashSet<PathBuf>,
     /// 正在使用这棵树的终端数量（引用计数）
     ref_count: usize,
+    /// 引用归零的时间；`None` 表示仍有活跃引用。
+    /// 归零后不立即清除，保温 `ORPHAN_TTL` 后由 sweep 逐出。
+    orphaned_since: Option<Instant>,
 }
 
 /// 全局远程目录树缓存。
@@ -99,12 +108,14 @@ impl RemoteFileTreeCache {
 
     /// 终端打开时调用：引用计数 +1。如服务器尚无缓存则创建。
     pub fn acquire(&mut self, config: &SshConnectionConfig) {
+        self.sweep_orphans();
         let key = Self::server_key(config);
         let tree = self
             .servers
             .entry(key.clone())
             .or_insert_with(ServerTree::new);
         tree.ref_count += 1;
+        tree.orphaned_since = None;
         log::debug!(
             "FileTreeCache acquire {}: ref_count={}",
             key,
@@ -112,7 +123,8 @@ impl RemoteFileTreeCache {
         );
     }
 
-    /// 终端关闭时调用：引用计数 -1，归零则清理整棵树。
+    /// 终端关闭时调用：引用计数 -1。归零后不立即清除，进入保温期
+    /// （`ORPHAN_TTL` 内切回可直接复用），逾期或超量时由 sweep 逐出。
     pub fn release(&mut self, config: &SshConnectionConfig) {
         let key = Self::server_key(config);
         if let Some(tree) = self.servers.get_mut(&key) {
@@ -123,10 +135,45 @@ impl RemoteFileTreeCache {
                 tree.ref_count
             );
             if tree.ref_count == 0 {
-                self.servers.remove(&key);
-                self.file_caches.remove(&key);
-                log::debug!("FileTreeCache evicted server tree and file cache: {}", key);
+                tree.orphaned_since = Some(Instant::now());
+                log::debug!(
+                    "FileTreeCache orphaned {}: kept for reuse, TTL {:?}",
+                    key,
+                    ORPHAN_TTL
+                );
             }
+        }
+        self.sweep_orphans();
+    }
+
+    /// 清理过期的无引用服务器树；无引用树数量超限时按“最旧优先”逐出。
+    fn sweep_orphans(&mut self) {
+        let now = Instant::now();
+        let mut orphans: Vec<(String, Instant)> = self
+            .servers
+            .iter()
+            .filter_map(|(key, tree)| tree.orphaned_since.map(|at| (key.clone(), at)))
+            .collect();
+
+        // TTL 过期的直接逐出
+        let mut evicted: Vec<String> = orphans
+            .iter()
+            .filter(|(_, at)| now.duration_since(*at) >= ORPHAN_TTL)
+            .map(|(key, _)| key.clone())
+            .collect();
+        orphans.retain(|(_, at)| now.duration_since(*at) < ORPHAN_TTL);
+
+        // 超出数量上限时，按“最旧优先”逐出
+        if orphans.len() > MAX_ORPHAN_SERVERS {
+            orphans.sort_by_key(|(_, at)| *at);
+            let excess = orphans.len() - MAX_ORPHAN_SERVERS;
+            evicted.extend(orphans.into_iter().take(excess).map(|(key, _)| key));
+        }
+
+        for key in evicted {
+            self.servers.remove(&key);
+            self.file_caches.remove(&key);
+            log::debug!("FileTreeCache evicted server tree and file cache: {}", key);
         }
     }
 
@@ -236,6 +283,7 @@ impl ServerTree {
             nodes: HashMap::new(),
             expanded: HashSet::new(),
             ref_count: 0,
+            orphaned_since: None,
         }
     }
 }
@@ -244,6 +292,82 @@ impl ServerFileCache {
     fn new() -> Self {
         Self {
             files: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(tag: &str) -> SshConnectionConfig {
+        let mut config = SshConnectionConfig::local();
+        config.host = format!("cache-test-{tag}");
+        config.username = format!("cache-user-{tag}");
+        config
+    }
+
+    /// 引用归零后进入保温期：数据保留，切回时可复用
+    #[test]
+    fn released_tree_is_retained_for_reuse() {
+        let config = test_config("retain");
+        let mut cache = RemoteFileTreeCache::global().lock();
+        cache.acquire(&config);
+        cache.insert(&config, Path::new("/root"), vec![]);
+        cache.release(&config);
+
+        // 归零后仍在保温期内，数据可读
+        assert!(cache.get(&config, Path::new("/root")).is_some());
+
+        // 再次 acquire 不会重复计数（复用而非重建导致 ref_count 异常）
+        cache.acquire(&config);
+        cache.release(&config);
+    }
+
+    /// 多次 release 不会下溢 panic，也不会影响其他服务器
+    #[test]
+    fn double_release_does_not_panic_or_underflow() {
+        let config = test_config("underflow");
+        let mut cache = RemoteFileTreeCache::global().lock();
+        cache.release(&config);
+        cache.release(&config);
+    }
+
+    /// 展开状态在 release 后仍可恢复（保温期内）
+    #[test]
+    fn load_expanded_survives_release_within_ttl() {
+        let config = test_config("expanded");
+        let mut cache = RemoteFileTreeCache::global().lock();
+        cache.acquire(&config);
+        let mut expanded = HashSet::new();
+        expanded.insert(PathBuf::from("/root/sub"));
+        cache.save_expanded(&config, expanded);
+        cache.release(&config);
+
+        let restored = cache.load_expanded(&config);
+        assert!(restored.contains(Path::new("/root/sub")));
+    }
+
+    /// 超过孤儿数量上限时按最旧优先逐出
+    #[test]
+    fn sweep_evicts_oldest_orphan_beyond_limit() {
+        let mut cache = RemoteFileTreeCache::global().lock();
+        // 制造 MAX_ORPHAN_SERVERS + 1 个孤儿（即时逐出，无需等 TTL）
+        let configs: Vec<SshConnectionConfig> = (0..=MAX_ORPHAN_SERVERS)
+            .map(|i| test_config(&format!("sweep-{i}")))
+            .collect();
+        for config in &configs {
+            cache.acquire(config);
+            cache.insert(config, Path::new("/root"), vec![]);
+        }
+        for config in &configs {
+            cache.release(config);
+        }
+
+        // 逐出最旧的（sweep-0），其余保留
+        assert!(cache.get(&configs[0], Path::new("/root")).is_none());
+        for config in &configs[1..] {
+            assert!(cache.get(config, Path::new("/root")).is_some());
         }
     }
 }

@@ -5,7 +5,6 @@ use gpui::{App, AppContext, Entity, Window};
 
 use crate::components::macos_sidebar::MacosSidebar;
 use crate::editor::Editor;
-use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::ssh::SshConnectionConfig;
@@ -34,16 +33,11 @@ pub fn handle_open_path(
             cx.update_window(window_handle, |_view, window, cx| {
                 if is_dir {
                     let file_tree = cx.new(|cx| {
-                        let mut tree =
-                            SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
+                        let mut tree = SidebarFileTree::new(cx, backend, Some(remote_path.clone()));
                         tree.open_path(Some(remote_path), cx);
                         tree
                     });
-                    // 为新树注册共享缓存引用
-                    RemoteFileTreeCache::global()
-                        .lock()
-                        .unwrap()
-                        .acquire(&ssh_config);
+                    // 共享缓存引用由 SidebarFileTree 构造时 acquire、Drop 时 release
                     sidebar.update(cx, |s, cx| {
                         s.set_file_tree_view(file_tree, "Files".to_string(), None, cx);
                         if !s.is_visible() {

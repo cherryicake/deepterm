@@ -15,7 +15,6 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
-use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::file_tree_event::FileTreeEvent;
 use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::{FileTreePanel, FileTreePanelTabs, SidebarFileTree};
@@ -513,26 +512,18 @@ impl MacosSidebar {
         }
 
         // 不同 → 重建
-        let (backend, requested_path, config_for_cache): (
-            Arc<dyn FileSystem>,
-            Option<PathBuf>,
-            Option<SshConnectionConfig>,
-        ) = if !is_local {
+        let (backend, requested_path): (Arc<dyn FileSystem>, Option<PathBuf>) = if !is_local {
             if let Some(config) = ssh_config.clone() {
                 let p = path
                     .as_ref()
                     .map(|p| PathBuf::from(p.to_string_lossy().to_string()));
-                (
-                    Arc::new(RemoteFileSystem::new(config)),
-                    p,
-                    ssh_config.clone(),
-                )
+                (Arc::new(RemoteFileSystem::new(config)), p)
             } else {
                 log::error!("非本地文件树但缺少 SSH 配置，退化为本地");
-                (Arc::new(LocalFileSystem), path.clone(), None)
+                (Arc::new(LocalFileSystem), path.clone())
             }
         } else {
-            (Arc::new(LocalFileSystem), path.clone(), None)
+            (Arc::new(LocalFileSystem), path.clone())
         };
         let file_tree = cx.new(|cx| {
             let mut tree = SidebarFileTree::new(cx, backend, requested_path);
@@ -540,25 +531,12 @@ impl MacosSidebar {
             tree
         });
 
-        // 为新树注册共享缓存引用
-        if let Some(config) = &config_for_cache {
-            RemoteFileTreeCache::global()
-                .lock()
-                .unwrap()
-                .acquire(config);
-        }
-
+        // 共享缓存引用由 SidebarFileTree 构造时 acquire、Drop 时 release，无需手动管理。
         self.file_tree_subscription.take();
         if let Some(old) = self.file_tree_view.take() {
-            // 旧树是远程且新终端也是远程：释放旧树引用再让新树 acquire，ref_count 保持正确；
-            // 远程 -> 本地：只 detach，保留缓存引用以便切回时复用。
-            let old_is_remote = !old.read(cx).is_local();
-            let new_is_remote = config_for_cache.is_some();
-            old.update(cx, |t, cx| {
-                // 新终端仍是远程时，释放旧树对共享缓存的引用；
-                // 远程 -> 本地时保留引用，以便切回远程时复用缓存。
-                t.detach(cx, old_is_remote && new_is_remote);
-            });
+            // 旧树保存展开状态并释放 watcher/订阅；缓存引用随实体 Drop 归还，
+            // 归零后进入保温期，切回同一服务器时可直接复用。
+            old.update(cx, |t, cx| t.cleanup(cx));
         }
         self.file_tree_terminal_view = Some(terminal_view.clone());
         self.subscribe_file_tree_to_terminal(&terminal_view, file_tree.clone(), cx);
