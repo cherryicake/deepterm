@@ -236,6 +236,10 @@ pub struct TerminalView {
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
+    /// Whether the link-hover modifier (Cmd/Ctrl) was held at the last mouse
+    /// move. Transitions are forwarded to `Terminal::set_link_hover_active`
+    /// so URL detection runs only while links are actually hoverable.
+    link_modifier_held: bool,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
     /// Flattened render data reused across frames when nothing changed.
@@ -515,6 +519,7 @@ impl TerminalView {
                 cached_working_directory: None,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
+                link_modifier_held: false,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -703,6 +708,7 @@ impl TerminalView {
                 cached_working_directory: None,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
+                link_modifier_held: false,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -2705,6 +2711,16 @@ impl Render for TerminalView {
                 #[cfg(not(target_os = "macos"))]
                 let modifiers_pressed = event.modifiers.control;
 
+                // Forward modifier transitions so the terminal only maintains
+                // URL ranges (regex scan per dirty row per frame) while links
+                // are actually hoverable.
+                if this.link_modifier_held != modifiers_pressed {
+                    this.link_modifier_held = modifiers_pressed;
+                    this.terminal.update(cx, |terminal, _cx| {
+                        terminal.set_link_hover_active(modifiers_pressed);
+                    });
+                }
+
                 // URL hover detection (only when modifier is held)
                 let link = if modifiers_pressed {
                     this.terminal.update(cx, |terminal, _cx| {
@@ -2808,6 +2824,20 @@ impl Render for TerminalView {
                 this.animate_scrollbar(target_y);
                 cx.stop_propagation();
                 cx.notify();
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                // Clear the hovered-link highlight when the pointer leaves the
+                // terminal. `on_mouse_move` only fires inside this element, so
+                // without this the underline would stay stuck until the next
+                // in-view mouse move (e.g. after moving to the sidebar while
+                // holding Cmd).
+                if !*hovered && this.hovered_link.take().is_some() {
+                    this.link_modifier_held = false;
+                    this.terminal.update(cx, |terminal, _cx| {
+                        terminal.set_link_hover_active(false);
+                    });
+                    cx.notify();
+                }
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.add_paths_to_terminal(paths.paths(), cx);

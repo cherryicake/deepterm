@@ -139,6 +139,12 @@ pub struct RenderMetricsSignature {
     pub cell_width: Pixels,
     pub viewport_lines: usize,
     pub viewport_cols: usize,
+    /// Resolved font id (family + weight + style). The signature must cover
+    /// this so that changing the terminal font in settings invalidates the
+    /// cached `ShapedLine`s even when the resulting cell metrics (size, line
+    /// height, cell width) happen to be unchanged. `FontState::update` only
+    /// refreshes windows; it does not recreate the view or clear caches.
+    pub font_id: usize,
 }
 
 #[derive(Clone, Default)]
@@ -342,6 +348,52 @@ impl BatchedTextRun {
     }
 }
 
+/// Cheap pre-style key that fully determines every field of the `TextRun`
+/// produced by [`TerminalElement::text_run_for_cell`] for a given cell:
+/// the rendered foreground (after the INVERSE swap) selects `color`, the
+/// BOLD/ITALIC bits select `font`, and the underline kind (none / cell flag /
+/// hovered URL) selects `underline` (the flag variant's color derives from the
+/// raw `fg`, which is also part of the key).
+///
+/// During row layout the hot path is *extending* the current batch, which
+/// only needs an equality check against the batch's key. Constructing the
+/// full `TextRun` (including the theme color conversion) is then done once
+/// per batch start instead of once per cell — for typical output (a whole
+/// row sharing one style) this removes ~cols conversions per row.
+#[derive(PartialEq)]
+struct BatchStyleKey {
+    rendered_fg: alacritty_terminal::vte::ansi::Color,
+    raw_fg: alacritty_terminal::vte::ansi::Color,
+    bold: bool,
+    italic: bool,
+    /// 0 = none, 1 = cell UNDERLINE flag, 2 = hovered URL.
+    underline_kind: u8,
+}
+
+impl BatchStyleKey {
+    #[inline]
+    fn for_cell(cell: &IndexedCell, is_hovered_url: bool) -> Self {
+        let flags = cell.cell.flags;
+        Self {
+            rendered_fg: if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+                cell.cell.bg
+            } else {
+                cell.cell.fg
+            },
+            raw_fg: cell.cell.fg,
+            bold: flags.contains(alacritty_terminal::term::cell::Flags::BOLD),
+            italic: flags.contains(alacritty_terminal::term::cell::Flags::ITALIC),
+            underline_kind: if is_hovered_url {
+                2
+            } else if flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE) {
+                1
+            } else {
+                0
+            },
+        }
+    }
+}
+
 pub struct TerminalElement {
     terminal: Entity<Terminal>,
     focus: FocusHandle,
@@ -521,6 +573,9 @@ impl TerminalElement {
     ) -> RowLayoutEntry {
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
         let mut current_batch: Option<(usize, String, TextRun, usize)> = None;
+        // Style key of the cell that started `current_batch`. Kept in sync so
+        // the per-cell hot path only compares cheap enum/bitfield values.
+        let mut current_key: Option<BatchStyleKey> = None;
 
         for cell in cells {
             let ch = cell.cell.c;
@@ -538,36 +593,36 @@ impl TerminalElement {
                     font_size,
                     cell_width,
                 );
+                current_key = None;
                 continue;
             }
 
-            let cell_style =
-                Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
+            let key = BatchStyleKey::for_cell(cell, is_hovered_url);
+            let batch_extends = current_batch.is_some()
+                && current_key.as_ref() == Some(&key)
+                && {
+                    let (start_col, _, _, cell_count) = current_batch.as_ref().unwrap();
+                    *start_col + *cell_count == cell.point.column.0
+                };
 
-            match current_batch.as_mut() {
-                Some((start_col, text, style, cell_count))
-                    if style.font == cell_style.font
-                        && style.color == cell_style.color
-                        && style.background_color == cell_style.background_color
-                        && style.underline == cell_style.underline
-                        && style.strikethrough == cell_style.strikethrough
-                        && *start_col + *cell_count == cell.point.column.0 =>
-                {
-                    text.push(ch);
-                    *cell_count += 1;
-                    style.len += ch.len_utf8();
-                }
-                _ => {
-                    Self::flush_text_batch(
-                        row_idx,
-                        &mut batched_runs,
-                        &mut current_batch,
-                        window,
-                        font_size,
-                        cell_width,
-                    );
-                    current_batch = Some((cell.point.column.0, ch.to_string(), cell_style, 1));
-                }
+            if batch_extends {
+                let (_, text, style, cell_count) = current_batch.as_mut().unwrap();
+                text.push(ch);
+                *cell_count += 1;
+                style.len += ch.len_utf8();
+            } else {
+                Self::flush_text_batch(
+                    row_idx,
+                    &mut batched_runs,
+                    &mut current_batch,
+                    window,
+                    font_size,
+                    cell_width,
+                );
+                current_key = Some(key);
+                let cell_style =
+                    Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
+                current_batch = Some((cell.point.column.0, ch.to_string(), cell_style, 1));
             }
         }
 
@@ -1173,35 +1228,35 @@ impl Element for TerminalElement {
         };
 
         // Selection changes only invalidate selection slices inside row caches.
+        // This is merged with the row-cache take below into a single
+        // `view.update` to keep per-frame entity-borrow overhead low.
         let selection_range_for_cache = selection_range.clone();
-        let selection_changed = self.view.update(cx, |view, _cx| {
-            let changed = view.cached_selection_mouse_mode != mouse_mode
-                || view.cached_selection_range != selection_range_for_cache;
-            if changed {
-                for row_cache in &mut view.row_render_cache {
-                    row_cache.selection_cols = None;
-                }
-                view.cached_selection_mouse_mode = mouse_mode;
-                view.cached_selection_range = selection_range_for_cache;
-            }
-            changed
-        });
-
-        // Take row render cache out of the view so we can mutate it here
-        // without a borrow conflict, then write it back after processing.
-        let (mut row_caches, theme_changed, cached_flattened) =
+        let (mut row_caches, theme_changed, cached_flattened, selection_changed) =
             self.view.update(cx, |view, _cx| {
+                let selection_changed = view.cached_selection_mouse_mode != mouse_mode
+                    || view.cached_selection_range != selection_range_for_cache;
+                if selection_changed {
+                    for row_cache in &mut view.row_render_cache {
+                        row_cache.selection_cols = None;
+                    }
+                    view.cached_selection_mouse_mode = mouse_mode;
+                    view.cached_selection_range = selection_range_for_cache;
+                }
+
+                // Take row render cache out of the view so we can mutate it here
+                // without a borrow conflict, then write it back after processing.
                 match &view.cached_theme_id {
                     Some(theme_id) if active_theme_id == *theme_id => (
                         std::mem::take(&mut view.row_render_cache),
                         false,
                         view.flattened_render_cache.clone(),
+                        selection_changed,
                     ),
                     _ => {
                         // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
                         view.cached_theme_id = Some(active_theme_id.clone());
                         view.flattened_render_cache = FlattenedRenderCache::default();
-                        (Vec::new(), true, FlattenedRenderCache::default())
+                        (Vec::new(), true, FlattenedRenderCache::default(), selection_changed)
                     }
                 }
             });
@@ -1212,6 +1267,7 @@ impl Element for TerminalElement {
             cell_width,
             viewport_lines,
             viewport_cols: terminal_bounds.num_columns(),
+            font_id: font_id.0,
         };
         let metrics_changed = cached_flattened.metrics != Some(metrics_signature);
 
@@ -1470,24 +1526,24 @@ impl Element for TerminalElement {
                 metrics: Some(metrics_signature),
                 hovered_link,
             };
+            // Single write-back: row caches, flattened cache and the returned
+            // scratch buffers (merged so the frame performs one entity update
+            // instead of two).
             self.view.update(cx, |view, _cx| {
                 view.row_render_cache = row_caches;
                 view.flattened_render_cache = flattened.clone();
+                view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
+                view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
             });
             flattened
         } else {
             self.view.update(cx, |view, _cx| {
                 view.row_render_cache = row_caches;
+                view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
+                view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
             });
             cached_flattened
         };
-
-        // Return the dirty-row scratch buffers to the view so their capacity is
-        // reused on the next frame instead of being reallocated.
-        self.view.update(cx, |view, _cx| {
-            view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
-            view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
-        });
 
         log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
         log::trace!("row run partial updates: {partial_run_update_count}");
@@ -1685,20 +1741,10 @@ impl Element for TerminalElement {
         let origin = terminal_bounds.bounds.origin;
         window.paint_quad(fill(bounds, terminal_theme.background));
 
-        for span in selection_spans.iter() {
-            let span_origin = point(
-                origin.x + *cell_width * span.start_col as f32,
-                origin.y + *line_height * span.row as f32,
-            );
-            window.paint_quad(fill(
-                Bounds::new(
-                    span_origin,
-                    size(*cell_width * span.width as f32, *line_height),
-                ),
-                terminal_theme.selection_background,
-            ));
-        }
-
+        // Cell background spans are painted *under* the selection so that a
+        // non-default cell background (colored prompt segments, vim splits,
+        // syntax highlighting) can never cover the selection highlight. This
+        // mirrors Zed's terminal element ordering: rects -> selection -> text.
         for span in background_spans.iter() {
             let span_origin = point(
                 origin.x + *cell_width * span.start_col as f32,
@@ -1710,6 +1756,20 @@ impl Element for TerminalElement {
                     size(*cell_width * span.width as f32, *line_height),
                 ),
                 span.color,
+            ));
+        }
+
+        for span in selection_spans.iter() {
+            let span_origin = point(
+                origin.x + *cell_width * span.start_col as f32,
+                origin.y + *line_height * span.row as f32,
+            );
+            window.paint_quad(fill(
+                Bounds::new(
+                    span_origin,
+                    size(*cell_width * span.width as f32, *line_height),
+                ),
+                terminal_theme.selection_background,
             ));
         }
 

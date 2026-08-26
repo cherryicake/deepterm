@@ -445,6 +445,12 @@ pub struct Terminal {
     vte_processor: Processor<StdSyncHandler>,
     pub terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
+    /// Whether the link-hover modifier (Cmd on macOS / Ctrl elsewhere) is
+    /// currently held. URL detection for the viewport costs one regex scan
+    /// plus two allocations per dirty row on every frame, but its only
+    /// consumer is hover hit-testing — so it is maintained lazily only while
+    /// this flag is set. See `set_link_hover_active`.
+    link_hover_active: bool,
     last_mouse_position: Option<Point<Pixels>>,
     /// Scroll accumulator for smooth scrolling (trackpad support)
     /// Accumulates partial scroll amounts and applies them when they reach a full line
@@ -557,6 +563,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
@@ -682,6 +689,7 @@ impl Terminal {
             vte_processor: Processor::<StdSyncHandler>::new(),
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
+            link_hover_active: false,
             last_mouse_position: None,
             scroll_px: px(0.0),
             scrollbar_drag_offset: Rc::new(Cell::new(None)),
@@ -759,6 +767,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
@@ -971,6 +980,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
@@ -1632,9 +1642,13 @@ impl Terminal {
         // term lock a second time per frame.
         self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
 
-        let rebuild_all_urls =
-            force_full_damage || self.last_content.url_ranges.len() != row_ranges.len();
-        if rebuild_all_urls {
+        // URL ranges are only consumed by link hover hit-testing. Skip the
+        // per-row regex scans while the hover modifier is not held.
+        let rebuild_all_urls = self.link_hover_active
+            && (force_full_damage || self.last_content.url_ranges.len() != row_ranges.len());
+        if !self.link_hover_active {
+            self.last_content.url_ranges.clear();
+        } else if rebuild_all_urls {
             self.last_content.url_ranges.clear();
             self.last_content.url_ranges.reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
@@ -1757,6 +1771,35 @@ impl Terminal {
         // a full renderer invalidation so stale row caches never survive a wrap
         // or viewport-size change.
         self.update_last_content(true);
+    }
+
+    /// Enable or disable lazy URL-range maintenance.
+    ///
+    /// While enabled (link-hover modifier held), `update_last_content` keeps
+    /// `last_content.url_ranges` fresh for dirty rows. While disabled, all
+    /// URL work is skipped entirely: the ranges are only consumed by hover
+    /// hit-testing (`url_range_at_viewport_position`), so maintaining them on
+    /// every output frame is wasted regex scanning and allocation churn.
+    ///
+    /// Turning the flag on rebuilds all rows immediately from the cached
+    /// content snapshot — no term lock is needed because `last_content` is
+    /// owned by `Self`.
+    pub fn set_link_hover_active(&mut self, active: bool) {
+        if self.link_hover_active == active {
+            return;
+        }
+        self.link_hover_active = active;
+        if active {
+            let TerminalContent { cells, row_ranges, url_ranges, .. } = &mut self.last_content;
+            url_ranges.clear();
+            url_ranges.reserve(row_ranges.len());
+            for (start, end) in row_ranges.iter() {
+                let ranges = crate::terminal::link_detector::detect_urls_in_line(&cells[*start..*end]);
+                url_ranges.push(ranges);
+            }
+        } else {
+            self.last_content.url_ranges.clear();
+        }
     }
 
     pub fn last_content(&self) -> &TerminalContent {
