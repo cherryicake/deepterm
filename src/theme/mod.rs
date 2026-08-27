@@ -106,6 +106,27 @@ pub struct TerminalTheme {
 }
 
 impl TerminalTheme {
+    /// 返回与背景色相同的命名色列表。
+    ///
+    /// 这些颜色作为前景时会完全不可见（例如 ANSI 黑色文字落在同色背景上）。
+    /// 少数上游官方主题本身即如此设计（见测试中的例外表），
+    /// 加载时仅记录警告；其余情况应视为主题数据回归。
+    pub fn visibility_issues(&self) -> Vec<&'static str> {
+        let checks: [(&'static str, Hsla); 6] = [
+            ("foreground", self.foreground),
+            ("normal.black", self.normal[0]),
+            ("normal.white", self.normal[7]),
+            ("bright.black", self.bright[0]),
+            ("cursor", self.cursor),
+            ("selection_background", self.selection_background),
+        ];
+        checks
+            .into_iter()
+            .filter(|(_, color)| *color == self.background)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     pub fn named_color(&self, named: NamedColor) -> Hsla {
         match named {
             NamedColor::Black => self.normal[0],
@@ -578,7 +599,21 @@ fn default_theme_id(appearance: WindowAppearance) -> &'static str {
 fn load_builtin_themes() -> anyhow::Result<Vec<AppTheme>> {
     let bundle: ThemeBundleFile =
         serde_json::from_str(include_str!("../../assets/themes/builtin.json"))?;
-    bundle.themes.into_iter().map(AppTheme::try_from).collect()
+    bundle
+        .themes
+        .into_iter()
+        .map(|theme_file| {
+            let theme = AppTheme::try_from(theme_file)?;
+            for name in theme.terminal.visibility_issues() {
+                log::warn!(
+                    "theme '{}': {name} equals the background color \
+                     and will be invisible when used as a foreground",
+                    theme.id
+                );
+            }
+            Ok(theme)
+        })
+        .collect()
 }
 
 fn parse_color(value: &str) -> anyhow::Result<Hsla> {
@@ -588,6 +623,11 @@ fn parse_color(value: &str) -> anyhow::Result<Hsla> {
         .or_else(|| value.strip_prefix("0x"))
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value);
+    if hex.len() != 6 && hex.len() != 8 {
+        anyhow::bail!(
+            "invalid color literal '{value}': expected #RRGGBB or #RRGGBBAA"
+        );
+    }
     let parsed = u32::from_str_radix(hex, 16)?;
 
     // Support both #RRGGBB and #RRGGBBAA.
@@ -765,5 +805,72 @@ impl TryFrom<AppThemeFile> for AppTheme {
             terminal,
             highlight_theme,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上游官方主题本身即如此的已知例外。
+    ///
+    /// 新增主题若触发警告，应优先核对上游是否确有此设计；
+    /// 若是数据回归，请修复主题数据而不是加入本表。
+    const OFFICIAL_VISIBILITY_EXCEPTIONS: &[(&str, &str)] = &[
+        // 官方 monokai 移植（alacritty/kitty）的 color0 即背景色
+        ("monokai", "normal.black"),
+        // 官方 kitty flexoki_light 的 color7 即纸色背景
+        ("flexoki-light", "normal.white"),
+        // 官方 Solarized Dark 的 bright black（base02）即背景色
+        ("solarized-dark", "bright.black"),
+        // 官方 night-owl 的 alacritty 移植 color0 即背景色
+        ("night-owl", "normal.black"),
+        // 官方 kitty flexoki_dark 的 color0 即墨黑背景
+        ("flexoki-dark", "normal.black"),
+        // 官方 alacritty gruvbox_light 的 color0 即纸色背景
+        ("gruvbox-light", "normal.black"),
+    ];
+
+    #[test]
+    fn builtin_themes_have_no_unexpected_visibility_issues() {
+        let themes = load_builtin_themes().expect("builtin themes must parse");
+        assert!(!themes.is_empty());
+        let mut failures = Vec::new();
+        for theme in &themes {
+            for name in theme.terminal.visibility_issues() {
+                if !OFFICIAL_VISIBILITY_EXCEPTIONS.contains(&(theme.id.as_str(), name)) {
+                    failures.push(format!("{}: {name}", theme.id));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unexpected visibility issues: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn parse_color_rejects_invalid_hex() {
+        // 长度错误必须显式报错，而不是被静默补零（#FFF 曾被解析为 #000FFF）
+        assert!(parse_color("#FFF").is_err());
+        assert!(parse_color("#FFFF").is_err());
+        assert!(parse_color("#12345").is_err());
+        assert!(parse_color("#1234567").is_err());
+        assert!(parse_color("").is_err());
+        assert!(parse_color("ZZZZZZ").is_err());
+        assert!(parse_color("#000000").is_ok());
+        assert!(parse_color("#00000000").is_ok());
+        assert!(parse_color("  #ffaa00  ").is_ok());
+    }
+
+    #[test]
+    fn parse_color_accepts_prefix_variants() {
+        let a = parse_color("#10f0d0").unwrap();
+        let b = parse_color("0x10F0D0").unwrap();
+        let c = parse_color("10f0d0").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        let alpha = parse_color("#10f0d080").unwrap();
+        assert!((alpha.a - 0x80 as f32 / 255.0).abs() < f32::EPSILON);
     }
 }
