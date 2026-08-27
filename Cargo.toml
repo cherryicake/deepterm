@@ -145,6 +145,9 @@ mach2 = "0.4"
 # gpui = { path = "../zed/crates/gpui" }
 # gpui_macos = { path = "../zed/crates/gpui_macos" }
 
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = ["test-support"] }
+
 [package.metadata.bundle]
 name = "DeepTerm"
 identifier = "com.deepterm.app"

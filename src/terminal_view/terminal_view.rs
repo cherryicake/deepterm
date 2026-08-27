@@ -231,8 +231,6 @@ pub struct TerminalView {
     ime_state: Option<ImeState>,
     /// DeepTerm 内置命令管理器
     builtin_command_manager: BuiltinCommandManager,
-    /// 当前输入行是否仍允许由 `/` 启动内置命令
-    can_start_builtin_command: bool,
     /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
     broadcast_callback: Option<BroadcastInputCallback>,
     /// 应用远端同步的内建命令缓冲期间置位，阻止 mutate_builtin_command 再次广播（防回环）。
@@ -527,7 +525,6 @@ impl TerminalView {
                 selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
-                can_start_builtin_command: true,
                 broadcast_callback: None,
                 broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
@@ -718,7 +715,6 @@ impl TerminalView {
                 selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
-                can_start_builtin_command: true,
                 broadcast_callback: None,
                 broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
@@ -1572,13 +1568,15 @@ impl TerminalView {
 
     /// 判断一段新文本是否应该开启内建命令模式。
     ///
-    /// 只有当前行仍允许 `/` 起始命令、当前处于 shell 提示符场景、且输入内容不是换行时才会进入。
-    fn should_start_builtin_command(&self, text: &str, cx: &App) -> bool {
+    /// 只有输入行仍为空（光标停在输入区起点）、shell 处于前台可接管状态、
+    /// 且输入内容以 `/` 开头且不含换行时才会进入。空行判定由
+    /// [`crate::terminal::Terminal::input_line_blank`] 完成（OSC 133;B 锚点 /
+    /// 回显锚点），不再依赖按键历史启发式 flag。
+    fn should_start_builtin_command(&self, text: &str, cx: &mut Context<Self>) -> bool {
         !self.builtin_command_manager.is_active()
-            && self.can_start_builtin_command
-            && self.can_trigger_builtin_command_here(cx)
             && text.starts_with('/')
             && !text.contains(['\n', '\r'])
+            && self.terminal.update(cx, |terminal, _| terminal.input_line_blank())
     }
 
     /// 把文本写入内建命令缓冲，并刷新浮层。
@@ -1818,7 +1816,6 @@ impl TerminalView {
                 manager.dismiss();
             }
         });
-        self.can_start_builtin_command = true;
     }
 
     /// 广播接收方入口：同步清空本地镜像的内建输入。
@@ -2085,7 +2082,6 @@ impl TerminalView {
     fn finish_builtin_command_input(&mut self, cx: &mut Context<Self>) {
         self.clear_marked_text(cx);
         self.clear_builtin_command(cx);
-        self.can_start_builtin_command = true;
     }
 
     /// 判断某个按键在内建命令模式下是否应该被本地吞掉。
@@ -2174,8 +2170,6 @@ impl TerminalView {
                                 cx,
                                 BuiltinCommandManager::delete_word_backward,
                             );
-                            self.can_start_builtin_command =
-                                !self.builtin_command_manager.is_active();
                             return true;
                         }
                         _ => {}
@@ -2213,12 +2207,10 @@ impl TerminalView {
             }
             "backspace" => {
                 self.pop_builtin_command(cx);
-                self.can_start_builtin_command = !self.builtin_command_manager.is_active();
                 true
             }
             "delete" => {
                 self.mutate_builtin_command(cx, BuiltinCommandManager::delete_forward);
-                self.can_start_builtin_command = !self.builtin_command_manager.is_active();
                 true
             }
             "left" => {
@@ -2309,7 +2301,6 @@ impl TerminalView {
     /// This is called when the user confirms the input (e.g., pressing Space to select).
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if !text.is_empty() {
-            self.can_start_builtin_command = false;
             self.write_with_broadcast(text.as_bytes(), cx);
         }
     }
@@ -2521,30 +2512,9 @@ impl TerminalView {
         }
 
         if handled {
-            match event.keystroke.key.as_str() {
-                "enter" | "return" => {
-                    self.can_start_builtin_command = true;
-                }
-                "backspace" => {
-                    if !self.builtin_command_manager.is_active() {
-                        self.can_start_builtin_command = true;
-                    }
-                }
-                _ if input_bytes.is_some() => {
-                    // 输入 '/' 时重置标志，确保内建命令模式能正常启动；
-                    // 输入其他字符时设为 false，避免行中误触发
-                    if let Some(ref bytes) = input_bytes {
-                        if bytes == b"/" {
-                            self.can_start_builtin_command = true;
-                        } else {
-                            self.can_start_builtin_command = false;
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            // Stop propagation only if we handled the key
+            // 空行 / 前台判定已由 Terminal::write 内的输入区锚点统一维护：
+            // 回车写入后锚点自动失效（提示符将重绘），其余输入的回显会推动
+            // 光标离开锚点。这里不再需要按按键历史猜测 shell 行是否为空。
             cx.stop_propagation();
         }
         // Otherwise, let the event propagate to EntityInputHandler

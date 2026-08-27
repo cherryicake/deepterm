@@ -455,6 +455,27 @@ pub struct Terminal {
     driver_task: Option<Task<()>>,
     /// VTE 解析器状态（跨数据块保持，避免转义序列在 chunk 边界处被截断导致乱码）
     vte_processor: Processor<StdSyncHandler>,
+    /// 输入区起点锚点（OSC 133;B 标记处 / 无集成 shell 时的回显锚点）。
+    ///
+    /// shell 回显会把光标留在当前行内容的末尾，因此“光标 == 锚点”即输入行为空。
+    /// 判定逻辑见 [`Terminal::input_line_blank`]。
+    /// - 远程集成 shell：提示符绘制完成时 OSC 133;B 精确设置锚点；
+    /// - 本地 / 无集成 shell：alacritty EventLoop 直接消费 PTY 字节，OSC 133 不可见，
+    ///   退化为 [`Terminal::write`] 时捕获的“首个输入前的光标位置”（即提示符末尾）。
+    ///
+    /// 锚点失效时机：resize / clear（reflow 改变行列）、写入回车（提示符即将重绘）、
+    /// shell 重回前台（旧提示符位置作废，如退出编辑器后）。
+    input_area_start: Option<AlacPoint>,
+    /// 上一次观察到的前台状态，用于检测“程序退出 → shell 回到前台”的转换；
+    /// 转换发生时旧锚点必然过期，交由下一次输入重新捕获。
+    shell_fg_observed: Option<bool>,
+    /// 跨 chunk 未完成的 OSC 序列暂存。
+    ///
+    /// 若 OSC 终止符落在下一个 PTY 读取块中，直接把残尾透传给 vte 会导致
+    /// 应用层（133;A/B/C、OSC 7 等）永远看不到这个序列；这里把残尾缓存
+    /// 起来与下一个 chunk 拼接后再扫描。超过上限则放弃缓存直接透传，防止
+    /// 异常输出（无终止符的 ESC ]）无限占用内存。
+    pending_osc: Vec<u8>,
     pub terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
     /// Whether a mouse press was reported to the terminal application (mouse
@@ -579,6 +600,9 @@ impl Terminal {
                 event_loop_task: Some(event_loop_task),
                 driver_task: None,
                 vte_processor: Processor::<StdSyncHandler>::new(),
+                input_area_start: None,
+                shell_fg_observed: None,
+                pending_osc: Vec::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
@@ -706,6 +730,9 @@ impl Terminal {
             event_loop_task: None,
             driver_task: None,
             vte_processor: Processor::<StdSyncHandler>::new(),
+            input_area_start: None,
+            shell_fg_observed: None,
+            pending_osc: Vec::new(),
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             mouse_report_active: false,
@@ -785,6 +812,9 @@ impl Terminal {
                 event_loop_task: Some(event_loop_task),
                 driver_task: None,
                 vte_processor: Processor::<StdSyncHandler>::new(),
+                input_area_start: None,
+                shell_fg_observed: None,
+                pending_osc: Vec::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
@@ -999,6 +1029,9 @@ impl Terminal {
                 event_loop_task: Some(event_loop_task),
                 driver_task: Some(driver_task),
                 vte_processor: Processor::<StdSyncHandler>::new(),
+                input_area_start: None,
+                shell_fg_observed: None,
+                pending_osc: Vec::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
@@ -1187,13 +1220,11 @@ impl Terminal {
         require_local_osc7_host: bool,
         cx: &mut Context<Self>,
     ) {
-        // 先拦截需要由应用层消费的 OSC 序列（如 cwd 更新），OSC 52 则透传至 VTE 解析器处理。
-        let filtered_data =
-            self.extract_and_handle_osc_sequences(data, require_local_osc7_host, cx);
-
-        let mut term = self.term.lock();
-        self.vte_processor
-            .advance(&mut *term, filtered_data.as_ref());
+        // 分段喂入：处理某个 OSC 时，其前置文本已经过 vte 解析，
+        // 这样 OSC 133;B 捕获的光标位置精确反映提示符末尾，
+        // 不受同 chunk 后续回显的影响。需要由应用层消费的 OSC
+        // 序列（如 133;B、cwd 更新）在此被拦截，OSC 52 等则透传给 vte。
+        self.process_pty_data(data, require_local_osc7_host, cx);
 
         // 标记内容已更新
         self.content_dirty = true;
@@ -1210,52 +1241,79 @@ impl Terminal {
         cx.emit(Event::Wakeup);
     }
 
-    /// 提取需要由应用层处理的 OSC 序列，返回过滤后的数据。
-    /// 使用 Cow 实现零拷贝快速路径 - 当没有 OSC 序列时直接返回借用数据。
-    fn extract_and_handle_osc_sequences<'a>(
+    /// 把一段字节喂给 vte 解析器（作用于 term）。空段直接跳过。
+    fn advance_vte(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut term = self.term.lock();
+        self.vte_processor.advance(&mut *term, bytes);
+    }
+
+    /// 逐段扫描数据块：普通文本段直接喂给 vte，完整 OSC 交由应用层
+    /// 判定（消费则丢弃，否则透传给 vte）。跨 chunk 未完成的 OSC
+    /// 存入 `pending_osc`，与下一个数据块拼接后重新扫描。
+    ///
+    /// 快速路径：不含 OSC 起始符时一次性喂入，避免分段锁开销。
+    fn process_pty_data(
         &mut self,
-        data: &'a [u8],
+        data: &[u8],
         require_local_osc7_host: bool,
         cx: &mut Context<Self>,
-    ) -> Cow<'a, [u8]> {
-        // 快速路径: 检查是否包含 OSC 开始序列 (ESC ])
+    ) {
         const OSC_START: &[u8] = b"\x1b]";
+        // 未完成 OSC 的缓存上限；超过则放弃拼接直接透传，防止异常
+        // 输出（无终止符的 ESC ]）无限占用内存。
+        const MAX_PENDING_OSC: usize = 8 * 1024;
+
+        // 有跨 chunk 残尾时先拼接（拷贝一次，仅在有残尾时发生）。
+        let pending = std::mem::take(&mut self.pending_osc);
+        let joined: Vec<u8>;
+        let data: &[u8] = if pending.is_empty() {
+            data
+        } else {
+            joined = [pending.as_slice(), data].concat();
+            joined.as_slice()
+        };
+
         if memchr::memmem::find(data, OSC_START).is_none() {
-            return Cow::Borrowed(data);
+            self.advance_vte(data);
+            return;
         }
 
-        // 慢速路径: 需要过滤 OSC 序列
-        let mut result = Vec::with_capacity(data.len());
         let mut pos = 0;
-
         while let Some(osc_offset) = memchr::memmem::find(&data[pos..], OSC_START) {
             let osc_pos = pos + osc_offset;
 
-            // 批量拷贝 OSC 之前的普通数据
-            result.extend_from_slice(&data[pos..osc_pos]);
+            // 先喂入 OSC 之前的普通文本，使光标反映这些内容
+            self.advance_vte(&data[pos..osc_pos]);
 
-            // 尝试提取完整 OSC 序列
-            if let Some((osc_end, osc_content)) = Terminal::extract_osc_sequence(&data[osc_pos..]) {
-                if self.try_handle_osc_sequence(cx, osc_content, require_local_osc7_host) {
-                    // 已由应用层处理，跳过这个序列
-                    pos = osc_pos + osc_end;
-                    continue;
+            match Terminal::extract_osc_sequence(&data[osc_pos..]) {
+                Some((osc_end, osc_content)) => {
+                    if self.try_handle_osc_sequence(cx, osc_content, require_local_osc7_host) {
+                        // 已由应用层处理，跳过这个序列
+                        pos = osc_pos + osc_end;
+                    } else {
+                        // 不是应用层关心的 OSC，保留给 vte 自己处理
+                        self.advance_vte(&data[osc_pos..osc_pos + osc_end]);
+                        pos = osc_pos + osc_end;
+                    }
                 }
-                // 不是应用层关心的 OSC，保留给 VTE 自己处理
-                result.extend_from_slice(&data[osc_pos..osc_pos + osc_end]);
-                pos = osc_pos + osc_end;
-                continue;
+                None => {
+                    // 序列不完整：若残尾过大则直接透传，否则暂存等下一个 chunk
+                    if data.len() - osc_pos > MAX_PENDING_OSC {
+                        self.advance_vte(&data[osc_pos..]);
+                    } else {
+                        self.pending_osc = data[osc_pos..].to_vec();
+                    }
+                    pos = data.len();
+                }
             }
-
-            // 不完整的 OSC 序列，保留给 VTE 处理
-            result.extend_from_slice(&data[osc_pos..osc_pos + 2]);
-            pos = osc_pos + 2;
         }
 
-        // 拷贝尾部剩余数据
-        result.extend_from_slice(&data[pos..]);
-
-        Cow::Owned(result)
+        if pos < data.len() {
+            self.advance_vte(&data[pos..]);
+        }
     }
 
     fn try_handle_osc_sequence(
@@ -1266,6 +1324,18 @@ impl Terminal {
     ) -> bool {
         if Self::matches_osc_prefix(osc_content, "133;A") {
             self.remote_shell_ready = true;
+            return true;
+        }
+
+        if Self::matches_osc_prefix(osc_content, "133;B") {
+            // 输入区起点标记：提示符文本已经过 process_pty_data 分段喂入，
+            // 此时光标即输入区起点，作为空行判定的锚点。
+            // （兼容 `133;B;aid=...` 等带后缀的变体。）
+            let point = {
+                let term = self.term.lock();
+                term.grid().cursor.point
+            };
+            self.input_area_start = Some(point);
             return true;
         }
 
@@ -1724,6 +1794,17 @@ impl Terminal {
     }
 
     pub fn write(&mut self, data: &[u8]) {
+        // 用户输入即将进入 PTY：维护输入区锚点（见 input_area_start 文档）。
+        // - shell 前台且尚无锚点 → 以当前光标（提示符末尾）为锚点；
+        // - 写入回车 → 提示符即将重绘，锚点失效，等待重新捕获。
+        //
+        // 本地终端看不到 OSC 133;B（alacritty EventLoop 直接消费 PTY 字节），
+        // 这条回显锚点路径就是本地空行判定的唯一依据。
+        self.observe_input_state();
+        if memchr::memchr2(b'\r', b'\n', data).is_some() {
+            self.input_area_start = None;
+        }
+
         if let Some(ref sender) = self.sender {
             let msg = Msg::Input(Cow::Owned(data.to_vec()));
             let _ = sender.send(msg);
@@ -1733,6 +1814,51 @@ impl Terminal {
         // 远程终端：通过回调发送到 SSH 通道
         if let Some(ref callback) = self.remote_input_callback {
             callback(data);
+        }
+    }
+
+    /// 当前光标在 grid 中的绝对坐标（与 [`Terminal::input_area_start`] 同一坐标系）。
+    pub fn current_cursor_point(&self) -> AlacPoint {
+        let term = self.term.lock();
+        term.grid().cursor.point
+    }
+
+    /// 观察前台状态并维护输入区锚点，返回 shell 是否处于前台。
+    ///
+    /// - 检测到“程序退出 → shell 回到前台”的转换时，旧锚点指向的提示符
+    ///   已经作废（如退出编辑器后的新提示符），需要失效重捕；
+    /// - shell 前台且尚无锚点（刚重置 / 首次输入前）时，以当前光标为锚点。
+    ///   回显发生前捕获，因此锚点即提示符末尾。
+    fn observe_input_state(&mut self) -> bool {
+        let fg = self.is_shell_in_foreground();
+        if self.shell_fg_observed == Some(false) && fg {
+            self.input_area_start = None;
+        }
+        self.shell_fg_observed = Some(fg);
+        if fg && self.input_area_start.is_none() {
+            self.input_area_start = Some(self.current_cursor_point());
+        }
+        fg
+    }
+
+    /// 判断 shell 输入行当前是否为空（用于内建命令 `/` 触发判定）。
+    ///
+    /// 原理：shell 会回显每一次行编辑，回显后光标总停在当前行内容的末尾，
+    /// 因此“光标 == 输入区起点锚点” ⇔ 行内没有已输入的内容。锚点来源：
+    /// - OSC 133;B（远程集成 shell，精确）；
+    /// - 最近一次用户输入前捕获的回显锚点（本地 / 无集成 shell）。
+    ///
+    /// 程序在前台时始终返回 false（`/` 不应被拦截）。
+    pub fn input_line_blank(&mut self) -> bool {
+        let fg = self.observe_input_state();
+        if !fg {
+            return false;
+        }
+        match self.input_area_start {
+            Some(anchor) => self.current_cursor_point() == anchor,
+            // 理论不可达：observe_input_state 在 shell 前台时总会补上锚点。
+            // 保守视为空行（与“新提示符”语义一致）。
+            None => true,
         }
     }
 
@@ -1789,6 +1915,10 @@ impl Terminal {
         term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
 
         drop(term);
+        // reflow 会改变行的折行与坐标，旧锚点必然过期；
+        // shell 收到 SIGWINCH 后重绘提示符时会重新发 133;B，
+        // 本地终端则由下一次输入重新捕获。
+        self.input_area_start = None;
         // Alacritty does not mark resize as full damage. Treat the new grid as
         // a full renderer invalidation so stale row caches never survive a wrap
         // or viewport-size change.
@@ -2301,6 +2431,8 @@ impl Terminal {
     // Clear
     pub fn clear(&mut self) {
         use alacritty_terminal::vte::ansi::ClearMode;
+        // 清屏后光标归位到屏幕左上角，旧锚点坐标必然过期。
+        self.input_area_start = None;
         let mut term = self.term.lock();
         term.clear_screen(ClearMode::All);
     }
@@ -2322,9 +2454,10 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::Terminal;
+    use super::{Terminal, TerminalType};
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
+    use gpui::{AppContext as _, TestAppContext};
 
     #[test]
     fn click_count_normalizes_in_cycles_of_three() {
@@ -2450,5 +2583,133 @@ mod tests {
             Terminal::parse_working_directory_osc(b"633;P;Cwd=/opt/app", false),
             Some("/opt/app".to_string())
         );
+    }
+
+    // ===== 输入区锚点（空行判定）测试 =====
+
+    /// 构造无 PTY 的终端，并伪装成"就绪的远程 shell"，
+    /// 使 `is_shell_in_foreground` 走 `remote_shell_ready` 分支返回 true。
+    fn anchor_test_terminal() -> Terminal {
+        let mut t = Terminal::create_error_terminal();
+        t.terminal_type = TerminalType::Remote {
+            host: "test".into(),
+            username: "user".into(),
+            port: 22,
+        };
+        t.remote_shell_ready = true;
+        t
+    }
+
+    /// 远程集成 shell 的提示符数据在同一 chunk 内：
+    /// 133;A + 提示符文本 + 133;B + 用户输入回显。
+    /// 锚点必须落在提示符文本之后、回显之前（验证分段喂入）。
+    #[gpui::test]
+    fn osc133_b_anchor_reflects_preceding_prompt_text(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\abc", false, cx);
+            let anchor = t.input_area_start.expect("133;B 应捕获锚点");
+            let cursor = t.current_cursor_point();
+            assert_eq!(anchor.column.0, 2, "锚点应在 '$ ' 之后（列 2）");
+            assert_eq!(cursor.column.0, 5, "回显 'abc' 后光标应在列 5");
+            assert_eq!(anchor.line, cursor.line);
+        });
+    }
+
+    /// OSC 终止符落在下一个 chunk 时应被拼接重扫，而不是永久丢失。
+    #[gpui::test]
+    fn osc133_b_split_across_chunks_is_reassembled(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"$ \x1b]133", false, cx);
+            assert!(t.input_area_start.is_none(), "不完整 OSC 不应误判");
+            t.handle_pty_data(b";B\x1b\\", false, cx);
+            let anchor = t.input_area_start.expect("跨 chunk 的 133;B 也应被捕获");
+            assert_eq!(anchor.column.0, 2);
+            assert!(t.pending_osc.is_empty(), "处理后残尾应清空");
+        });
+    }
+
+    /// 无终止符的超长 ESC ] 输出不应无限累积在 pending 缓冲中。
+    #[gpui::test]
+    fn oversized_unterminated_osc_does_not_accumulate(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let mut data = vec![0x1b, b']'];
+        data.extend(std::iter::repeat(b'x').take(9 * 1024));
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(&data, false, cx);
+            assert!(t.pending_osc.is_empty());
+        });
+    }
+
+    /// 空行判定随回显内容变化：空 → 输入后非空 → 退格删空后恢复可触发。
+    /// 对应用户报告的两个症状。
+    #[gpui::test]
+    fn input_line_blank_tracks_echoed_content(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"$ \x1b]133;B\x1b\\", false, cx);
+            assert!(t.input_line_blank(), "新提示符处应为空行");
+
+            t.handle_pty_data(b"abc", false, cx);
+            assert!(!t.input_line_blank(), "行内已有内容时不应触发（症状二）");
+
+            // BS + 空格覆盖 + BS：退格删除一个字符（光标净减一）
+            t.handle_pty_data(b"\x08 \x08\x08 \x08\x08 \x08", false, cx);
+            assert!(t.input_line_blank(), "退格删空后应恢复可触发");
+        });
+    }
+
+    /// Ctrl+C 后 shell 重绘提示符并重新发 133;B：空行判定恢复（症状一）。
+    #[gpui::test]
+    fn input_line_blank_recovered_after_prompt_redraw(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"$ \x1b]133;B\x1b\\abc", false, cx);
+            assert!(!t.input_line_blank());
+
+            // 光标回到提示符末尾并重发 133;B
+            t.handle_pty_data(b"\r  \x1b]133;B\x1b\\", false, cx);
+            assert!(t.input_line_blank());
+        });
+    }
+
+    /// 本地路径（无 133;B）：write 捕获回显锚点，回车写入使锚点失效。
+    #[gpui::test]
+    fn write_captures_and_resets_echo_anchor(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"$ ", false, cx);
+            assert!(t.input_area_start.is_none(), "无 133;B 时锚点待捕获");
+
+            // 首次输入前捕获：锚点 = 提示符末尾（回显尚未发生）
+            t.write(b"ab");
+            assert_eq!(t.input_area_start.unwrap().column.0, 2);
+
+            // 回车写入：提示符将重绘，锚点失效等待重捕
+            t.write(b"\r");
+            assert!(t.input_area_start.is_none());
+        });
+    }
+
+    /// 前台程序退出后（fg 转换），旧锚点失效，首次输入重新捕获。
+    #[gpui::test]
+    fn foreground_return_recaptures_anchor(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_pty_data(b"$ \x1b]133;B\x1b\\", false, cx);
+            assert!(t.input_line_blank());
+
+            // 133;C：程序进入前台 → 不允许触发
+            t.handle_pty_data(b"\x1b]133;C\x1b\\vim running...", false, cx);
+            assert!(!t.input_line_blank());
+
+            // 程序退出后 shell 回到前台（133;A）；
+            // 模拟本地 shell（无 133;B）：首次输入触发 fg 转换重捕
+            t.remote_shell_ready = true;
+            t.write(b"x");
+            let anchor = t.input_area_start.expect("fg 转换后应重新捕获锚点");
+            assert_eq!(anchor, t.current_cursor_point());
+        });
     }
 }
