@@ -311,6 +311,18 @@ pub enum SelectionPhase {
     Started,
 }
 
+/// 构造覆盖整个 grid 的全选选区：从 `topmost_line()`（scrollback 顶部）
+/// 的第 0 列到 `bottommost_line()`（屏幕底行）的最后一列。
+/// 用 `SelectionType::Simple`（而非 `Lines`）：Simple 在两个端点都取
+/// `Side::Left`/`Side::Right` 时不会裁剪行尾空格，能覆盖完整矩形区域。
+fn build_select_all_selection<T: EventListener>(term: &Term<T>) -> Selection {
+    let start = AlacPoint::new(term.topmost_line(), Column(0));
+    let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+    let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+    selection.update(end, Side::Right);
+    selection
+}
+
 /// Terminal content
 #[derive(Clone, Debug)]
 pub struct TerminalContent {
@@ -445,6 +457,12 @@ pub struct Terminal {
     vte_processor: Processor<StdSyncHandler>,
     pub terminal_bounds: TerminalBounds,
     selection_phase: SelectionPhase,
+    /// Whether a mouse press was reported to the terminal application (mouse
+    /// mode active at `mouse_down` time). The release report must be paired
+    /// with the press report even if the shift modifier changes mid-drag,
+    /// otherwise applications receive an unpaired release (or never see the
+    /// button go up and treat all later motion as a drag).
+    mouse_report_active: bool,
     /// Whether the link-hover modifier (Cmd on macOS / Ctrl elsewhere) is
     /// currently held. URL detection for the viewport costs one regex scan
     /// plus two allocations per dirty row on every frame, but its only
@@ -563,6 +581,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
@@ -689,6 +708,7 @@ impl Terminal {
             vte_processor: Processor::<StdSyncHandler>::new(),
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
+            mouse_report_active: false,
             link_hover_active: false,
             last_mouse_position: None,
             scroll_px: px(0.0),
@@ -767,6 +787,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
@@ -980,6 +1001,7 @@ impl Terminal {
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
+                mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
                 scroll_px: px(0.0),
@@ -1852,13 +1874,8 @@ impl Terminal {
         mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::VI)
     }
 
-    fn clear_selection_for_mouse(&mut self) -> bool {
-        let mut term = self.term.lock();
-        let selection = term.selection.take();
-        selection.is_some_and(|selection| !selection.is_empty())
-    }
-
-    fn start_selection(&mut self, ty: SelectionType, point: AlacPoint, side: Side) {
+    /// 清空旧选区并开始新选区（单次持锁，避免连续两次 term 锁）。
+    fn restart_selection(&mut self, ty: SelectionType, point: AlacPoint, side: Side) {
         let mut term = self.term.lock();
         term.selection = Some(Selection::new(ty, point, side));
         self.selection_phase = SelectionPhase::Started;
@@ -1877,15 +1894,27 @@ impl Terminal {
         true
     }
 
+    /// 将 gpui 的 click_count 归一化为 1..=3 的循环：1=字符、2=词、3=行。
+    /// macOS 原生 clickCount 会随连续点击无限递增，第 4 击应回到字符选择
+    /// （与 alacritty 的 1→2→3→1 循环一致），而不是落入未定义分支。
+    fn normalized_click_count(click_count: usize) -> usize {
+        if click_count == 0 {
+            1
+        } else {
+            (click_count - 1) % 3 + 1
+        }
+    }
+
     pub fn mouse_down(&mut self, e: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
         let position = e.position - self.terminal_bounds.bounds.origin;
-        let point = grid_point(
-            position,
-            self.terminal_bounds,
-            self.last_content.display_offset,
-        );
 
         if self.mouse_mode(e.modifiers.shift) {
+            self.mouse_report_active = true;
+            let point = grid_point(
+                position,
+                self.terminal_bounds,
+                self.last_content.display_offset,
+            );
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode)
             {
@@ -1894,52 +1923,50 @@ impl Terminal {
             return;
         }
 
-        if let gpui::MouseButton::Left = e.button {
-            let (point, side) = grid_point_and_side(
-                position,
-                self.terminal_bounds,
-                self.last_content.display_offset,
-            );
+        match e.button {
+            gpui::MouseButton::Left => {
+                let (point, side) = grid_point_and_side(
+                    position,
+                    self.terminal_bounds,
+                    self.last_content.display_offset,
+                );
 
-            match e.click_count {
-                1 => {
-                    let cleared_non_empty_selection = self.clear_selection_for_mouse();
-                    self.start_selection(
-                        if e.modifiers.control {
-                            SelectionType::Block
-                        } else {
-                            SelectionType::Simple
-                        },
-                        point,
-                        side,
-                    );
-                    if cleared_non_empty_selection {
-                        cx.emit(Event::SelectionsChanged);
+                // Ctrl 按住时统一为矩形选区；否则按点击次数循环：
+                // 1=字符 2=词 3=行（归一化后 4 击重新回到字符选择）。
+                let ty = if e.modifiers.control {
+                    SelectionType::Block
+                } else {
+                    match Self::normalized_click_count(e.click_count) {
+                        1 => SelectionType::Simple,
+                        2 => SelectionType::Semantic,
+                        _ => SelectionType::Lines,
                     }
-                }
-                2 if !e.modifiers.control => {
-                    self.start_selection(SelectionType::Semantic, point, side);
-                    cx.emit(Event::SelectionsChanged);
-                }
-                3 if !e.modifiers.control => {
-                    self.start_selection(SelectionType::Lines, point, side);
-                    cx.emit(Event::SelectionsChanged);
-                }
-                _ => return,
+                };
+                self.restart_selection(ty, point, side);
+                cx.emit(Event::SelectionsChanged);
             }
+            // 中键：本地模式下粘贴剪贴板（终端惯例；mouse mode 下已在上方转发给应用）
+            gpui::MouseButton::Middle => {
+                self.paste(cx);
+            }
+            // 右键：本地模式下无默认行为（mouse mode 下已在上方转发给应用）
+            gpui::MouseButton::Right => {}
+            gpui::MouseButton::Navigate(_) => {}
         }
     }
 
     pub fn mouse_up(&mut self, e: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
-        let position = e.position - self.terminal_bounds.bounds.origin;
-
-        if self.mouse_mode(e.modifiers.shift) {
+        // 释放报文必须与按下报文配对：只有 mouse_down 时确实向应用上报了
+        // press（mouse_report_active），才上报 release。若中途按住/松开
+        // shift 导致 mouse_mode 判定翻转，也不会发出幽灵报文或丢失配对。
+        if self.mouse_report_active {
+            self.mouse_report_active = false;
+            let position = e.position - self.terminal_bounds.bounds.origin;
             let point = grid_point(
                 position,
                 self.terminal_bounds,
                 self.last_content.display_offset,
             );
-
             if let Some(bytes) =
                 mouse_button_report(point, e.button, e.modifiers, false, self.last_content.mode)
             {
@@ -1948,7 +1975,9 @@ impl Terminal {
             return;
         }
 
-        if matches!(e.button, gpui::MouseButton::Left | gpui::MouseButton::Right) {
+        // 本地模式：左键释放时若存在非空选区则 copy-on-select。
+        // （右键不再复制：避免与未来的上下文菜单冲突，且原实现从未被触发过。）
+        if e.button == gpui::MouseButton::Left {
             self.copy(cx);
         }
 
@@ -1960,20 +1989,63 @@ impl Terminal {
             return;
         }
 
+        // 若左键已不再按下，说明拖拽在终端视图外结束（GPUI 元素级
+        // `on_mouse_up` 仅在指针位于元素内时触发，视图外的释放不会送达）。
+        // 此时收尾选择而不是继续延伸，否则后续悬停移动会无按键地
+        // 继续扩展选区（幽灵拖拽）。
+        if e.pressed_button != Some(gpui::MouseButton::Left) {
+            self.selection_phase = SelectionPhase::Ended;
+            return;
+        }
+
         if self.mouse_mode(e.modifiers.shift) {
             return;
         }
 
         self.selection_phase = SelectionPhase::Selecting;
         let position = e.position - self.terminal_bounds.bounds.origin;
-        let (point, side) = grid_point_and_side(
-            position,
-            self.terminal_bounds,
-            self.last_content.display_offset,
-        );
+        self.last_mouse_position = Some(position);
+        self.update_selection_at_position(position, cx);
+    }
 
+    /// 用相对于终端内容区域的像素坐标更新选区头部。
+    /// display_offset 从 term 实时读取（拖拽期间自动滚动会改变它，
+    /// `last_content.display_offset` 快照会滞后）。
+    fn update_selection_at_position(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let display_offset = {
+            let term = self.term.lock();
+            term.grid().display_offset()
+        };
+        let (point, side) = grid_point_and_side(position, self.terminal_bounds, display_offset);
         if self.update_selection(point, side) {
             cx.emit(Event::SelectionsChanged);
+        }
+    }
+
+    /// 拖拽选择时的边缘自动滚动：每次滚动 `lines` 行（正=向上进入
+    /// scrollback，负=向下回到最新内容），然后用最后已知的鼠标位置
+    /// 延伸选区头部到当前视口边缘。
+    /// 由视图层的周期任务驱动（见 `TerminalView` 的 auto-scroll task）。
+    pub fn autoscroll_selection(&mut self, lines: i32, cx: &mut Context<Self>) {
+        if self.selection_phase == SelectionPhase::Ended {
+            return;
+        }
+
+        let display_offset_changed = {
+            let mut term = self.term.lock();
+            let before = term.grid().display_offset();
+            term.scroll_display(AlacScroll::Delta(lines));
+            let after = term.grid().display_offset();
+            before != after
+        };
+
+        if display_offset_changed {
+            self.content_dirty = true;
+            self.last_scroll_time.set(Instant::now());
+        }
+
+        if let Some(position) = self.last_mouse_position {
+            self.update_selection_at_position(position, cx);
         }
     }
 
@@ -2102,27 +2174,39 @@ impl Terminal {
         self.last_content.selection_range = None;
     }
 
-    pub fn select_all(&mut self) {
+    /// 全选：从 scrollback 顶行到屏幕底行（含最后一列）。
+    /// 此前实现用 `Selection::new(Lines, Line(0)..Line(0))`，两个锚点相同，
+    /// `to_range` 只会把范围扩展到首个逻辑行的边界——实际只选中了第一行。
+    /// 正确范围应从 `topmost_line()`（scrollback 最顶部，负值）到
+    /// `bottommost_line()`（屏幕底行）。
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
         let mut term = self.term.lock();
-        let start = AlacPoint::new(Line(0), Column(0));
-        let selection = Selection::new(SelectionType::Lines, start, Side::Left);
-        term.selection = Some(selection);
+        term.selection = Some(build_select_all_selection(&term));
         // Resolve the new selection immediately so the first frame after a
         // "select all" action shows the highlight without waiting for a
         // content-dirty cycle.
         self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
+        self.selection_phase = SelectionPhase::Ended;
+        cx.emit(Event::SelectionsChanged);
     }
 
     // Scrolling
+    // 注意：scroll_display 只更新 term 内部的 display_offset，视口快照
+    // （last_content）依赖 sync() 的 content_dirty 分支刷新。这里统一置位
+    // content_dirty，否则键盘滚动后视口/选区高亮会停留在旧数据。
     pub fn scroll_line_up(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Delta(1));
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_line_down(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Delta(-1));
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
@@ -2130,6 +2214,8 @@ impl Terminal {
         let mut term = self.term.lock();
         let lines = term.screen_lines() as i32;
         term.scroll_display(AlacScroll::Delta(lines));
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
@@ -2137,18 +2223,24 @@ impl Terminal {
         let mut term = self.term.lock();
         let lines = term.screen_lines() as i32;
         term.scroll_display(AlacScroll::Delta(-lines));
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_to_top(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Top);
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
     pub fn scroll_to_bottom(&mut self) {
         let mut term = self.term.lock();
         term.scroll_display(AlacScroll::Bottom);
+        drop(term);
+        self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
     }
 
@@ -2231,6 +2323,62 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::Terminal;
+    use alacritty_terminal::term::test::mock_term;
+    use alacritty_terminal::vte::ansi::Handler;
+
+    #[test]
+    fn click_count_normalizes_in_cycles_of_three() {
+        // macOS 的 clickCount 随连续点击无限递增：1/2/3 击后第 4 击
+        // 应回到字符选择，而不是落入未定义分支。
+        assert_eq!(Terminal::normalized_click_count(1), 1);
+        assert_eq!(Terminal::normalized_click_count(2), 2);
+        assert_eq!(Terminal::normalized_click_count(3), 3);
+        assert_eq!(Terminal::normalized_click_count(4), 1);
+        assert_eq!(Terminal::normalized_click_count(5), 2);
+        assert_eq!(Terminal::normalized_click_count(6), 3);
+        assert_eq!(Terminal::normalized_click_count(7), 1);
+        // 异常输入退化到单击。
+        assert_eq!(Terminal::normalized_click_count(0), 1);
+    }
+
+    #[test]
+    fn select_all_covers_scrollback_to_bottom() {
+        // 2 行屏幕，写入额外换行制造 scrollback 历史。
+        let mut term = mock_term("one\ntwo");
+        for _ in 0..3 {
+            term.input('\n');
+        }
+
+        let selection = super::build_select_all_selection(&term);
+        let range = selection
+            .to_range(&term)
+            .expect("select-all selection should not be empty");
+
+        use alacritty_terminal::grid::Dimensions;
+        assert_eq!(
+            range.start.line,
+            term.topmost_line(),
+            "应从 scrollback 顶部开始"
+        );
+        assert_eq!(range.start.column, alacritty_terminal::index::Column(0));
+        assert_eq!(
+            range.end.line,
+            term.bottommost_line(),
+            "应覆盖到屏幕底行（而不仅是第一行）"
+        );
+        assert_eq!(range.end.column, term.last_column());
+    }
+
+    #[test]
+    fn select_all_without_scrollback_covers_screen() {
+        let term = mock_term("abc\ndef");
+        let selection = super::build_select_all_selection(&term);
+        let range = selection.to_range(&term).expect("range should exist");
+
+        use alacritty_terminal::grid::Dimensions;
+        assert_eq!(range.start.line, term.topmost_line());
+        assert_eq!(range.end.line, term.bottommost_line());
+    }
 
     #[test]
     fn parses_file_scheme_osc7_cwd() {

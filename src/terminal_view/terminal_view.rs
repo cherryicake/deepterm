@@ -94,6 +94,11 @@ pub enum TerminalBlink {
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
 const TAB_LABEL_DEBOUNCE_DELAY: Duration = Duration::from_millis(100);
 
+/// 拖拽选择边缘自动滚动：指针距视口上下边缘小于此行数时激活。
+const SELECTION_AUTOSCROLL_EDGE_LINES: f32 = 1.5;
+/// 边缘自动滚动周期。过快会在高频终端上产生过多重绘，过慢则滚动不连贯。
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
 // Scroll velocity tracking constants
 const SCROLL_VELOCITY_WINDOW_SIZE: usize = 3;
 const SCROLL_MULTIPLIER_BASE: f32 = 3.0;
@@ -107,6 +112,12 @@ pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell
+        // 的行首快捷键，不能占用）。
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
         #[cfg(target_os = "windows")]
         KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
         #[cfg(not(target_os = "windows"))]
@@ -209,6 +220,13 @@ pub struct TerminalView {
     was_focused: bool,
     title: SharedString,
     selecting: bool,
+    /// 拖拽选择时的边缘自动滚动方向：+1 = 向上滚入 scrollback，
+    /// -1 = 向下滚回最新内容，None = 未激活。
+    /// 由鼠标移动事件更新，由 `selection_autoscroll_task` 周期性消费。
+    selection_autoscroll_direction: Option<i32>,
+    /// 边缘自动滚动周期任务（约 50ms/次）。拖拽结束或鼠标离开
+    /// 边缘区域时置 None 取消。
+    selection_autoscroll_task: Option<Task<()>>,
     /// IME composition state for CJK input methods
     ime_state: Option<ImeState>,
     /// DeepTerm 内置命令管理器
@@ -505,6 +523,8 @@ impl TerminalView {
                 was_focused: false,
                 title: initial_title,
                 selecting: false,
+                selection_autoscroll_direction: None,
+                selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
                 can_start_builtin_command: true,
@@ -694,6 +714,8 @@ impl TerminalView {
                 was_focused: false,
                 title: ssh_config_clone.host_label().into(),
                 selecting: false,
+                selection_autoscroll_direction: None,
+                selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
                 can_start_builtin_command: true,
@@ -1098,6 +1120,101 @@ impl TerminalView {
         self.scrollbar_target_y = target_y;
         self.scrollbar_anim_start = Instant::now();
         self.scrollbar_animating = true;
+    }
+
+    /// 停止拖拽选择的边缘自动滚动（取消周期任务并清除方向）。
+    fn stop_selection_autoscroll(&mut self) {
+        self.selection_autoscroll_task = None;
+        self.selection_autoscroll_direction = None;
+    }
+
+    /// 结束左键拖拽选择（若正在进行）：清除拖拽状态、停止边缘自动滚动，
+    /// 并把释放事件转发给终端（copy-on-select / mouse mode release 报文）。
+    /// 返回是否确有进行中的拖拽被结束。
+    ///
+    /// 供两个释放路径共用：视图元素级 `on_mouse_up`（指针在视图内）与
+    /// `TerminalElement::paint` 注册的窗口级监听器（指针在视图外时元素
+    /// 级 handler 不会触发）。后者先触发并清除 `selecting`，前者随后
+    /// 因守卫早退，不会重复调用 `mouse_up`。
+    pub(crate) fn finish_mouse_selection(
+        &mut self,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.selecting {
+            return false;
+        }
+        self.selecting = false;
+        self.stop_selection_autoscroll();
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.mouse_up(event, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    /// 拖拽选择期间由鼠标移动事件调用：根据指针 `position_y` 是否位于
+    /// 视口上下边缘区域（约 1.5 行内），启动/停止边缘自动滚动任务。
+    /// 鼠标静止在边缘时 mouse_move 不再触发，因此需要一个周期任务
+    /// （而非仅在事件中滚动）才能持续滚动并延伸选区。
+    fn update_selection_autoscroll(
+        &mut self,
+        position_y: Pixels,
+        line_height: Pixels,
+        viewport_height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        // +1 = 向上滚入 scrollback，-1 = 向下滚回最新内容，None = 不滚动。
+        // （边界裁剪由 `Terminal::autoscroll_selection` 内部处理，滚到顶/底
+        // 后 display_offset 不再变化。）
+        let edge = line_height * SELECTION_AUTOSCROLL_EDGE_LINES;
+        let direction = if position_y < edge {
+            Some(1)
+        } else if position_y > viewport_height - edge {
+            Some(-1)
+        } else {
+            None
+        };
+
+        if direction == self.selection_autoscroll_direction {
+            return;
+        }
+        self.selection_autoscroll_direction = direction;
+        match direction {
+            Some(_) => self.start_selection_autoscroll(cx),
+            None => self.selection_autoscroll_task = None,
+        }
+    }
+
+    /// 启动边缘自动滚动周期任务（先取消旧任务）。
+    /// 方向由 `selection_autoscroll_direction` 字段提供，方向变化时
+    /// `update_selection_autoscroll` 会重启本任务。
+    fn start_selection_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.selection_autoscroll_task = None;
+        self.selection_autoscroll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                // 返回值表示任务是否应继续运行：拖拽结束或方向被清除时停。
+                match this.update(cx, |view, cx| {
+                    let Some(direction) = view.selection_autoscroll_direction else {
+                        return false;
+                    };
+                    if !view.selecting {
+                        return false;
+                    }
+                    view.terminal.update(cx, |terminal, cx| {
+                        terminal.autoscroll_selection(direction, cx);
+                    });
+                    cx.notify();
+                    true
+                }) {
+                    Ok(true) => continue,
+                    _ => break,
+                }
+            }
+        }));
     }
 
     // IME handling methods for CJK input methods
@@ -2305,8 +2422,8 @@ impl TerminalView {
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.terminal.update(cx, |terminal, _cx| {
-            terminal.select_all();
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.select_all(cx);
         });
         cx.notify();
     }
@@ -2661,6 +2778,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &Paste, _window, cx| {
                 this.paste(cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
+                this.select_all(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
@@ -2682,20 +2802,57 @@ impl Render for TerminalView {
                     }
 
                     this.selecting = true;
+                    // 新一次按下：重置上一次拖拽残留的自动滚动状态，
+                    // 避免旧任务在新选区开始时继续滚动。
+                    this.stop_selection_autoscroll();
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_down(event, cx);
                     });
                     cx.notify();
                 }),
             )
+            // 中键/右键：转发给终端（mouse mode 下应用程序需要收到这些事件，
+            // 例如 vim/tmux 的中键粘贴、less 的右键菜单）。本地模式下中键
+            // 粘贴剪贴板、右键无默认行为。不参与文本选择，不动 `selecting`。
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_down(event, cx);
+                    });
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_down(event, cx);
+                    });
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
-                    this.selecting = false;
+                    // 视图内释放时，TerminalElement::paint 注册的全局释放
+                    // 监听器（bubble 阶段先于本 handler 触发）通常已处理过
+                    // 并清掉了 `selecting`；这里退化为兑底路径。
+                    this.finish_mouse_selection(event, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     this.terminal.update(cx, |terminal, cx| {
                         terminal.mouse_up(event, cx);
                     });
-                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.terminal.update(cx, |terminal, cx| {
+                        terminal.mouse_up(event, cx);
+                    });
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
@@ -2756,6 +2913,15 @@ impl Render for TerminalView {
                     cx.notify();
                 }
 
+                // 元素级 `on_mouse_up` 仅在指针位于本元素内时触发：若左键
+                // 在视图外释放（例如拖到侧边栏/标签栏后松开），释放事件不会
+                // 送达，拖拽状态会泄漏——后续悬停移动会无按键地继续扩展
+                // 选区（幽灵拖拽）。此处用 `pressed_button` 检测并就地收尾。
+                if this.selecting && event.pressed_button != Some(MouseButton::Left) {
+                    this.selecting = false;
+                    this.stop_selection_autoscroll();
+                }
+
                 this.terminal.update(cx, |terminal, cx| {
                     // Always send mouse move events in mouse mode (e.g., neovim)
                     // so the application can handle selection in real-time
@@ -2767,6 +2933,17 @@ impl Render for TerminalView {
                         terminal.mouse_drag(event, cx);
                     }
                 });
+                // 拖拽时检测指针是否在视口上下边缘区域，启动/停止边缘
+                // 自动滚动任务（鼠标静止在边缘时也能持续滚动并延伸选区）。
+                if this.selecting {
+                    let (position_y, line_height, viewport_height) = {
+                        let term = this.terminal.read(cx);
+                        let bounds = term.terminal_bounds;
+                        let position = event.position - bounds.bounds.origin;
+                        (position.y, bounds.line_height, bounds.bounds.size.height)
+                    };
+                    this.update_selection_autoscroll(position_y, line_height, viewport_height, cx);
+                }
                 // Only request a repaint when something visible changes.
                 // - Link hover changes are already notified above (`link_changed`).
                 // - Mouse-mode moves forward bytes to the PTY; the application's own

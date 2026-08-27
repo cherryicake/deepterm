@@ -279,3 +279,85 @@ fn sgr_mouse_report(point: AlacPoint, button: u8, pressed: bool) -> String {
         c
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Bounds, point, px, size};
+
+    fn test_bounds(cols: usize, lines: usize) -> TerminalBounds {
+        // 10x20 px cells, origin at (100, 50) in window coordinates.
+        TerminalBounds {
+            cell_width: px(10.0),
+            line_height: px(20.0),
+            bounds: Bounds::new(
+                point(px(100.0), px(50.0)),
+                size(px(cols as f32 * 10.0), px(lines as f32 * 20.0)),
+            ),
+        }
+    }
+
+    /// 坐标是相对终端内容区域原点的，但 grid_point_and_side 直接用
+    /// `pos.x / cell_width` 计算——传入相对坐标。
+    fn relative(pos_x: f32, pos_y: f32) -> Point<Pixels> {
+        point(px(pos_x), px(pos_y))
+    }
+
+    #[test]
+    fn grid_point_maps_center_of_first_cell() {
+        let bounds = test_bounds(80, 24);
+        let (point, side) = grid_point_and_side(relative(4.0, 10.0), bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(0), GridCol(0)));
+        assert_eq!(side, Side::Left);
+    }
+
+    #[test]
+    fn grid_point_second_half_of_cell_is_right_side() {
+        let bounds = test_bounds(80, 24);
+        // x=6 处于第 0 列（0..10）的右半格。
+        let (point, side) = grid_point_and_side(relative(6.0, 10.0), bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(0), GridCol(0)));
+        assert_eq!(side, Side::Right);
+    }
+
+    #[test]
+    fn grid_point_clamps_to_last_column() {
+        let bounds = test_bounds(80, 24);
+        // 超出最后一列的横向位置钳制到 79 列右侧。
+        let (point, side) = grid_point_and_side(relative(2000.0, 10.0), bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(0), GridCol(79)));
+        assert_eq!(side, Side::Right);
+    }
+
+    #[test]
+    fn grid_point_clamps_above_viewport() {
+        let bounds = test_bounds(80, 24);
+        // 视口上方（负 y）钳制到第 0 行左侧——拖拽越过上边缘时选区头部
+        // 停在顶行行首。
+        let (point, side) = grid_point_and_side(relative(400.0, -30.0), bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(0), GridCol(40)));
+        assert_eq!(side, Side::Left);
+    }
+
+    #[test]
+    fn grid_point_clamps_below_viewport() {
+        let bounds = test_bounds(80, 24);
+        // 视口下方钳制到最后一行右侧——拖拽越过下边缘时选区头部停在
+        // 底行行尾。
+        let (point, side) = grid_point_and_side(relative(400.0, 1000.0), bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(23), GridCol(40)));
+        assert_eq!(side, Side::Right);
+    }
+
+    #[test]
+    fn grid_point_applies_display_offset() {
+        let bounds = test_bounds(80, 24);
+        // 向上滚 5 行（display_offset=5）：视口第 0 行对应 grid 第 -5 行。
+        let (point, _) = grid_point_and_side(relative(4.0, 10.0), bounds, 5);
+        assert_eq!(point, AlacPoint::new(GridLine(-5), GridCol(0)));
+
+        // 视口第 7 行对应 grid 第 2 行。
+        let (point, _) = grid_point_and_side(relative(4.0, 150.0), bounds, 5);
+        assert_eq!(point, AlacPoint::new(GridLine(2), GridCol(0)));
+    }
+}

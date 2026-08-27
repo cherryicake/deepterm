@@ -218,31 +218,62 @@ impl gpui::Element for ScrollbarElement {
 
         // Clone for event handlers
         let terminal = self.terminal.clone();
+        let terminal_for_down = terminal.clone();
         let thumb_bounds_for_down = thumb_bounds;
         let track_bounds_for_move = track_bounds;
         let thumb_size_for_move = thumb_size;
 
-        // Mouse down handler - start dragging
+        // Mouse down handler - start dragging (thumb) or page-scroll (track).
+        //
+        // These are window-level listeners: they are invoked once per dispatch
+        // phase (capture and bubble). Guard on `phase.bubble()` so each event
+        // is handled exactly once, and use `stop_propagation()` for any click
+        // inside the track so the underlying terminal element does not start
+        // a text selection (the scrollbar paints after the terminal element,
+        // so in the bubble phase this handler runs first).
         window.on_mouse_event({
             let thumb_offset = thumb_offset.clone();
-            move |event: &MouseDownEvent, _phase, _window, cx| {
-                if event.button != MouseButton::Left {
+            let track_bounds_for_down = track_bounds;
+            move |event: &MouseDownEvent, phase, _window, cx| {
+                if !phase.bubble() || event.button != MouseButton::Left {
+                    return;
+                }
+
+                if !track_bounds_for_down.contains(&event.position) {
                     return;
                 }
 
                 if thumb_bounds_for_down.contains(&event.position) {
-                    // Calculate offset from top of thumb to click position
+                    // Thumb: start dragging at the clicked offset.
                     let offset = event.position.y - thumb_bounds_for_down.origin.y;
                     thumb_offset.set(Some(offset));
-                    cx.stop_propagation();
+                } else if event.position.y < thumb_bounds_for_down.origin.y {
+                    // Track above the thumb: page up (towards older scrollback).
+                    let target = display_offset
+                        .saturating_add(viewport_lines)
+                        .min(max_scroll_lines);
+                    terminal_for_down.update(cx, |t, cx| {
+                        t.set_display_offset(target, cx);
+                    });
+                } else {
+                    // Track below the thumb: page down (towards newest content).
+                    let target = display_offset.saturating_sub(viewport_lines);
+                    terminal_for_down.update(cx, |t, cx| {
+                        t.set_display_offset(target, cx);
+                    });
                 }
+                cx.stop_propagation();
             }
         });
 
         // Mouse move handler - dragging in progress
         window.on_mouse_event({
             let thumb_offset = thumb_offset.clone();
-            move |event: &MouseMoveEvent, _phase, _window, cx| {
+            move |event: &MouseMoveEvent, phase, _window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+
                 // Check if we're dragging the scrollbar
                 let Some(offset) = thumb_offset.get() else {
                     return;
@@ -282,7 +313,10 @@ impl gpui::Element for ScrollbarElement {
         // Mouse up handler - end dragging
         window.on_mouse_event({
             let thumb_offset = thumb_offset;
-            move |_event: &MouseUpEvent, _phase, _window, _cx| {
+            move |_event: &MouseUpEvent, phase, _window, _cx| {
+                if !phase.bubble() {
+                    return;
+                }
                 thumb_offset.set(None);
             }
         });

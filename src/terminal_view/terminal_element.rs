@@ -11,8 +11,8 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
 use gpui::{
     Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle,
-    FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, Pixels, Point, Style, TextRun,
-    TextStyle, WhiteSpace, Window, fill, point, px, size,
+    FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, MouseButton, MouseUpEvent, Pixels,
+    Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
 use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
@@ -1932,6 +1932,29 @@ impl Element for TerminalElement {
                     ));
                 }
             }
+        }
+
+        // 全局左键释放监听器：修复“视图外释放”泄漏。
+        //
+        // 元素级 `on_mouse_up` 仅在指针位于元素内时触发——若用户把选区
+        // 拖到终端视图外（侧边栏、标签栏、另一个面板）再松开左键，释放
+        // 事件不会送达：拖拽状态泄漏，之后的悬停移动会继续扩展选区
+        // （幽灵拖拽）；mouse mode 应用的 release 报文也会丢失。
+        //
+        // 此处用窗口级监听器补上：仅在视图正在选择（`selecting`）时处理。
+        // 本元素在外层 div 之后 paint，注册顺序在后，bubble 阶段先于
+        // 元素级 handler 触发；处理完置 `selecting = false`，元素级
+        // handler 随后因守卫早退，两者不会重复调用 `mouse_up`。
+        {
+            let view = self.view.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if !phase.bubble() || event.button != MouseButton::Left {
+                    return;
+                }
+                view.update(cx, |view, cx| {
+                    view.finish_mouse_selection(event, cx);
+                });
+            });
         }
 
         window.handle_input(
