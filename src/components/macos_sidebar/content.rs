@@ -143,7 +143,15 @@ impl MacosSidebar {
         let select_width = (right_edge - left_edge).max(36.0);
         let offset_from_toggle = toggle_left_open - left_edge;
 
-        let wrapper = div().w(px(select_width)).h(px(24.)).child(select_element);
+        // 外层定位容器占据可用区域（不可见），内部选择器宽度随选中的
+        // 标签组名自适应并右对齐，贴近侧边栏开关按钮；仅以可用区域
+        // 作为宽度上限，避免随侧边栏宽度整体拉伸。
+        let wrapper = div()
+            .w(px(select_width))
+            .h(px(24.))
+            .flex()
+            .justify_end()
+            .child(select_element);
         self.render_top_element(
             is_fullscreen,
             offset_from_toggle,

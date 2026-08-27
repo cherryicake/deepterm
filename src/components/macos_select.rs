@@ -370,7 +370,11 @@ impl Render for MacosSelect {
                                         theme_text_muted
                                     })
                                     .child(item.to_string()),
-                            ),
+                            )
+                            // 尾部占位与左侧勾选框列（16px + gap）镜像对称：
+                            // 弹窗宽度由最宽选项的自然宽度决定时，最长标签
+                            // 名两侧的空白区域保持一致。
+                            .child(div().w(px(16.0)).h(px(16.0))),
                     )
                     .into_any_element()
             })
@@ -413,6 +417,8 @@ impl Render for MacosSelect {
                     .child(
                         div()
                             .id("title")
+                            // 标签名左侧留白稍大于触发器内边距（6+8=14px），
+                            // 与右侧 chevron 图标中心（6+16/2=14px）对称，视觉更平衡。
                             .ml_2()
                             .overflow_hidden()
                             .whitespace_nowrap()
@@ -471,13 +477,14 @@ impl Render for MacosSelect {
                                     .border_color(menu_border)
                                     .rounded(px(10.0))
                                     .shadow_lg()
+                                    // 四周内边距统一：首个选项到弹窗顶部与末个选项
+                                    // 到弹窗底部的间距保持一致。
+                                    .p(px(SELECT_POPUP_PAD))
                                     .when(dropdown_width.is_some(), |d| {
-                                        d.w(dropdown_width.unwrap())
-                                            .px(px(SELECT_POPUP_PAD))
-                                            .pb(px(SELECT_POPUP_PAD))
-                                            .pt(px(1.0))
+                                        // 以触发器宽度为下限，弹窗可随最宽选项自然变宽，
+                                        // 避免触发器收紧后长选项文字被裁剪。
+                                        d.min_w(dropdown_width.unwrap())
                                     })
-                                    .when(dropdown_width.is_none(), |d| d.p(px(SELECT_POPUP_PAD)))
                                     .flex()
                                     .flex_col()
                                     .gap(px(SELECT_ITEM_GAP))
