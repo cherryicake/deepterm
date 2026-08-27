@@ -37,6 +37,10 @@ pub struct Enter {
     pub secondary: bool,
 }
 
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = editor, no_json)]
+pub struct FoldLevel(pub usize);
+
 actions!(
     editor,
     [
@@ -90,6 +94,11 @@ actions!(
         DuplicateLine,
         DeleteLine,
         JoinLines,
+        ToggleFold,
+        Fold,
+        Unfold,
+        FoldAll,
+        UnfoldAll,
     ]
 );
 
@@ -559,6 +568,54 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-j", JoinLines, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-j", JoinLines, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-[", Fold, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-[", Fold, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-]", Unfold, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-]", Unfold, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-l", ToggleFold, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-l", ToggleFold, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-0", FoldAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-0", FoldAll, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-j", UnfoldAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-j", UnfoldAll, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-1", FoldLevel(1), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-1", FoldLevel(1), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-2", FoldLevel(2), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-2", FoldLevel(2), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-3", FoldLevel(3), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-3", FoldLevel(3), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-4", FoldLevel(4), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-4", FoldLevel(4), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-5", FoldLevel(5), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-5", FoldLevel(5), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-6", FoldLevel(6), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-6", FoldLevel(6), Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("alt-cmd-7", FoldLevel(7), Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-7", FoldLevel(7), Some(CONTEXT)),
     ]);
 }
 
@@ -685,6 +742,8 @@ pub struct InputState {
     pub(crate) sticky_scroll: bool,
     /// Sticky 行点击目标（窗口坐标，由 paint 阶段写入，鼠标点击跳转用）。
     pub(crate) sticky_click_targets: Vec<(usize, Bounds<Pixels>)>,
+    /// 折叠 gutter / ··· 点击目标：(buffer start_line, 窗口坐标 bounds)。
+    pub(crate) fold_click_targets: Vec<(usize, Bounds<Pixels>)>,
     /// Git 变更标记（行号区色条）。
     pub(crate) git_gutter: bool,
     /// Git 变更标记数据：buffer 行号 → 变更类型（由 Editor 侧异步计算写入）。
@@ -815,6 +874,7 @@ impl InputState {
             scrollbar_drag: None,
             sticky_scroll: true,
             sticky_click_targets: Vec::new(),
+            fold_click_targets: Vec::new(),
             git_gutter: true,
             git_line_marks: std::collections::HashMap::new(),
             show_whitespaces: false,
@@ -2347,6 +2407,80 @@ impl InputState {
         cx.notify();
     }
 
+    fn cursor_buffer_line(&self) -> usize {
+        self.text.offset_to_point(self.cursor()).row
+    }
+
+    pub(crate) fn after_fold_change(&mut self, cx: &mut Context<Self>) {
+        let cursor = self.cursor();
+        let clamped = self.clamp_offset_to_visible_backward(cursor);
+        if clamped != cursor {
+            self.move_to(clamped, None, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_fold(
+        &mut self,
+        _: &ToggleFold,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let line = self.cursor_buffer_line();
+        self.display_map.toggle_fold_at_line(line);
+        self.after_fold_change(cx);
+    }
+
+    pub(crate) fn fold(&mut self, _: &Fold, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let line = self.cursor_buffer_line();
+        self.display_map.fold_at_line(line);
+        self.after_fold_change(cx);
+    }
+
+    pub(crate) fn unfold(&mut self, _: &Unfold, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let line = self.cursor_buffer_line();
+        self.display_map.unfold_at_line(line);
+        self.after_fold_change(cx);
+    }
+
+    pub(crate) fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        self.display_map.fold_all();
+        self.after_fold_change(cx);
+    }
+
+    pub(crate) fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        self.display_map.clear_folds();
+        cx.notify();
+    }
+
+    pub(crate) fn fold_level(
+        &mut self,
+        action: &FoldLevel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        self.display_map.fold_level(action.0);
+        self.after_fold_change(cx);
+    }
+
     pub(crate) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         // 代码编辑器：空选区时光标夹在空括号/引号对中间 → 一并删除
         if self.selected_range.is_empty()
@@ -2680,6 +2814,21 @@ impl InputState {
         if let Some(ime_marked_range) = &self.ime_marked_range {
             if ime_marked_range.len() == 0 {
                 self.ime_marked_range = None;
+            }
+        }
+
+        if event.button == MouseButton::Left {
+            if let Some((start_line, _)) = self
+                .fold_click_targets
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&event.position))
+            {
+                let start_line = *start_line;
+                if self.mode.is_folding() {
+                    self.display_map.toggle_fold(start_line);
+                    self.after_fold_change(cx);
+                }
+                return;
             }
         }
 
@@ -3197,28 +3346,30 @@ impl InputState {
     /// the fold header line (last visible position before the fold).
     fn clamp_offset_to_visible_backward(&self, offset: usize) -> usize {
         let line = self.text.offset_to_point(offset).row;
-        if self.display_map.is_buffer_line_hidden(line) {
-            for fold in self.display_map.folded_ranges() {
-                if line > fold.start_line && line <= fold.end_line {
-                    return self.text.line_end_offset(fold.start_line);
-                }
-            }
-        }
-        offset
+        let Some(header) = crate::components::input::display_map::hidden_line_fold_header(
+            line,
+            self.display_map.folded_ranges(),
+        ) else {
+            return offset;
+        };
+        self.text.line_end_offset(header)
     }
 
-    /// If offset falls on a hidden (folded) line, clamp forward to the start of
-    /// the fold end line (first visible position after the fold).
+    /// If offset falls on a hidden (folded) line, clamp forward to the first
+    /// visible line after the outermost fold.
     fn clamp_offset_to_visible_forward(&self, offset: usize) -> usize {
         let line = self.text.offset_to_point(offset).row;
-        if self.display_map.is_buffer_line_hidden(line) {
-            for fold in self.display_map.folded_ranges() {
-                if line > fold.start_line && line <= fold.end_line {
-                    return self.text.line_start_offset(fold.end_line);
-                }
-            }
+        let Some(after) = crate::components::input::display_map::hidden_line_after_fold(
+            line,
+            self.display_map.folded_ranges(),
+        ) else {
+            return offset;
+        };
+        if after >= self.text.lines_len() {
+            self.text.len()
+        } else {
+            self.text.line_start_offset(after)
         }
-        offset
     }
 
     pub(crate) fn previous_boundary(&self, offset: usize) -> usize {
@@ -3392,57 +3543,66 @@ impl InputState {
         self.replace_text_in_range(range_utf16, new_text, window, cx);
     }
 
-    /// Update fold candidates from tree-sitter syntax tree (full extraction).
-    /// Used only on initial load or language changes.
+    fn syntax_fold_ranges(&self) -> Vec<crate::components::input::FoldRange> {
+        let Some(highlighter_rc) = self.mode.highlighter() else {
+            return Vec::new();
+        };
+        let highlighter = highlighter_rc.borrow();
+        let Some(highlighter) = highlighter.as_ref() else {
+            return Vec::new();
+        };
+        let Some(tree) = highlighter.tree() else {
+            return Vec::new();
+        };
+        crate::components::input::display_map::extract_fold_ranges(tree)
+    }
+
+    fn apply_merged_fold_candidates(
+        &mut self,
+        syntax: Vec<crate::components::input::FoldRange>,
+    ) {
+        let indent = crate::components::input::display_map::extract_indent_fold_ranges(
+            &self.text,
+            crate::components::input::TabSize::default(),
+        );
+        self.display_map.set_fold_candidates(
+            crate::components::input::display_map::merge_fold_ranges(syntax, indent),
+        );
+    }
+
+    /// Update fold candidates from tree-sitter syntax tree + indent ranges.
+    /// Used on initial load or language changes.
     pub(crate) fn update_fold_candidates(&mut self) {
         if !self.mode.is_folding() {
             return;
         }
-
-        let Some(highlighter_rc) = self.mode.highlighter() else {
-            return;
-        };
-
-        let highlighter = highlighter_rc.borrow();
-        let Some(highlighter) = highlighter.as_ref() else {
-            return;
-        };
-
-        let Some(tree) = highlighter.tree() else {
-            return;
-        };
-
-        let fold_ranges = crate::components::input::display_map::extract_fold_ranges(tree);
-        self.display_map.set_fold_candidates(fold_ranges);
+        let syntax = self.syntax_fold_ranges();
+        self.apply_merged_fold_candidates(syntax);
     }
 
-    /// Incrementally update fold candidates after a text edit.
-    /// Only traverses the edited region of the syntax tree instead of the full tree.
+    /// Incrementally update syntax fold candidates after a text edit, then
+    /// re-merge with a full indent pass.
     fn update_fold_candidates_incremental(&mut self, edit_range: &Range<usize>, new_text: &str) {
         if !self.mode.is_folding() {
             return;
         }
 
-        let Some(highlighter_rc) = self.mode.highlighter() else {
-            return;
-        };
-
-        let highlighter = highlighter_rc.borrow();
-        let Some(highlighter) = highlighter.as_ref() else {
-            return;
-        };
-
-        let Some(tree) = highlighter.tree() else {
-            return;
-        };
-
-        // The new byte range in the updated text after the edit
         let new_end = edit_range.start + new_text.len();
-        self.display_map.update_fold_candidates_for_edit(
-            tree,
-            edit_range.start..new_end,
-            &self.text,
-        );
+        if let Some(highlighter_rc) = self.mode.highlighter() {
+            let highlighter = highlighter_rc.borrow();
+            if let Some(highlighter) = highlighter.as_ref() {
+                if let Some(tree) = highlighter.tree() {
+                    self.display_map.update_fold_candidates_for_edit(
+                        tree,
+                        edit_range.start..new_end,
+                        &self.text,
+                    );
+                }
+            }
+        }
+
+        let syntax = self.display_map.fold_candidates().to_vec();
+        self.apply_merged_fold_candidates(syntax);
     }
 
     /// Spawn a background parse after the synchronous parse timed out.

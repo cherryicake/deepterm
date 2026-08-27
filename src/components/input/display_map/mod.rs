@@ -21,7 +21,10 @@ pub use self::display_map::DisplayMap;
 pub(crate) use self::text_wrapper::LineLayout;
 
 // Re-export FoldRange and extract_fold_ranges
-pub use folding::{FoldRange, extract_fold_ranges};
+pub use folding::{
+    FoldRange, extract_fold_ranges, extract_indent_fold_ranges, hidden_line_after_fold,
+    hidden_line_fold_header, merge_fold_ranges,
+};
 
 /// Position in the buffer (logical text).
 ///

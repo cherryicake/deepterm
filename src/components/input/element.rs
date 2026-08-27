@@ -1,7 +1,7 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    App, Bounds, Corners, Element, ElementId, ElementInputHandler, Entity,
+    App, Bounds, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
     MouseDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ShapedLine,
     SharedString,
@@ -44,11 +44,20 @@ fn masked_display_offset(text: &Rope, original_offset: usize) -> usize {
 }
 
 /// Layout information for fold icons.
+struct FoldGutterIcon {
+    start_line: usize,
+    is_folded: bool,
+    bounds: Bounds<Pixels>,
+    hitbox: Hitbox,
+}
+
 struct FoldIconLayout {
     /// Hitbox for the line number area (used for hover detection)
     line_number_hitbox: Hitbox,
-    /// List of (display_row, is_folded, icon_element) pairs for each fold candidate
-    icons: Vec<(usize, bool, gpui::AnyElement)>,
+    chevron_down: ShapedLine,
+    chevron_right: ShapedLine,
+    ellipsis: ShapedLine,
+    icons: Vec<FoldGutterIcon>,
 }
 
 pub(crate) struct TextElement {
@@ -1164,7 +1173,6 @@ impl TextElement {
     /// Layout fold icon hitboxes during prepaint phase.
     ///
     /// This creates hitboxes for the fold icon area, positioned to the right of line numbers.
-    /// Icons are created and prepainted here to avoid panics.
     fn layout_fold_icons(
         &self,
         bounds: &Bounds<Pixels>,
@@ -1180,40 +1188,118 @@ impl TextElement {
             HitboxBehavior::Normal,
         );
 
-        let icon_layout = FoldIconLayout {
+        let style = window.text_style();
+        let muted = cx.theme().text_muted;
+        let chevron_size = last_layout.line_height * 0.7;
+        let run = |text: &str| TextRun {
+            len: text.len(),
+            font: style.font(),
+            color: muted,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let chevron_down = window.text_system().shape_line(
+            SharedString::new_static("▾"),
+            chevron_size,
+            &[run("▾")],
+            None,
+        );
+        let chevron_right = window.text_system().shape_line(
+            SharedString::new_static("▸"),
+            chevron_size,
+            &[run("▸")],
+            None,
+        );
+        let ellipsis = window.text_system().shape_line(
+            SharedString::new_static("···"),
+            last_layout.line_height * 0.85,
+            &[run("···")],
+            None,
+        );
+
+        let mut icon_layout = FoldIconLayout {
             line_number_hitbox,
+            chevron_down,
+            chevron_right,
+            ellipsis,
             icons: vec![],
         };
 
-        // Fold icons disabled in deepterm (missing Button/Icon integration)
-        let _ = (last_layout, bounds, window, cx);
+        let state = self.state.read(cx);
+        if !state.mode.is_folding() {
+            return icon_layout;
+        }
+
+        let line_height = last_layout.line_height;
+        let mut offset_y = last_layout.visible_top;
+        for (i, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
+            let height = last_layout
+                .lines
+                .get(i)
+                .map(|line| line.size(line_height).height)
+                .unwrap_or(line_height);
+            if state.display_map.is_fold_candidate(buffer_line) {
+                let icon_bounds = Bounds::new(
+                    point(
+                        bounds.origin.x + last_layout.line_number_width - FOLD_ICON_HITBOX_WIDTH,
+                        bounds.origin.y + offset_y,
+                    ),
+                    size(FOLD_ICON_HITBOX_WIDTH, line_height),
+                );
+                let hitbox = window.insert_hitbox(icon_bounds, HitboxBehavior::Normal);
+                icon_layout.icons.push(FoldGutterIcon {
+                    start_line: buffer_line,
+                    is_folded: state.display_map.is_folded_at(buffer_line),
+                    bounds: icon_bounds,
+                    hitbox,
+                });
+            }
+            offset_y += height;
+        }
+
         icon_layout
     }
 
     /// Paint fold icons using prepaint hitboxes.
     ///
-    /// This handles:
-    /// - Rendering fold icons (chevron-right for folded, chevron-down for expanded)
-    /// - Mouse click handling to toggle fold state
-    /// - Cursor style changes on hover
-    /// - Only show icon on hover or for current line
+    /// Chevrons: right when folded (always visible), down when expanded
+    /// (gutter hover or current line only).
     fn paint_fold_icons(
         &mut self,
         fold_icon_layout: &mut FoldIconLayout,
         current_row: Option<usize>,
+        line_height: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Vec<(usize, Bounds<Pixels>)> {
         let is_hovered = fold_icon_layout.line_number_hitbox.is_hovered(window);
-        for (display_row, is_folded, icon) in fold_icon_layout.icons.iter_mut() {
-            let is_current_line = current_row == Some(*display_row);
-
-            if !is_hovered && !is_current_line && !*is_folded {
+        let mut click_targets = Vec::new();
+        for icon in &fold_icon_layout.icons {
+            click_targets.push((icon.start_line, icon.bounds));
+            let is_current_line = current_row == Some(icon.start_line);
+            if !is_hovered && !is_current_line && !icon.is_folded {
                 continue;
             }
 
-            icon.paint(window, cx);
+            let glyph = if icon.is_folded {
+                &fold_icon_layout.chevron_right
+            } else {
+                &fold_icon_layout.chevron_down
+            };
+            let x = icon.bounds.origin.x
+                + (icon.bounds.size.width - glyph.width).half().max(px(0.));
+            _ = glyph.paint(
+                point(x, icon.bounds.origin.y),
+                line_height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            window.set_cursor_style(CursorStyle::PointingHand, &icon.hitbox);
         }
+        click_targets
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2089,9 +2175,14 @@ impl Element for TextElement {
 
             let diff_line_colors = &self.state.read(cx).diff_line_colors;
             // Git 变更标记（行号区右缘窄色条）
-            let (git_gutter_enabled, git_line_marks) = {
+            let (git_gutter_enabled, git_line_marks, fold_gutter_width) = {
                 let state = self.state.read(cx);
-                (state.git_gutter, &state.git_line_marks)
+                let fold_w = if state.mode.is_folding() {
+                    FOLD_ICON_HITBOX_WIDTH
+                } else {
+                    px(0.)
+                };
+                (state.git_gutter, &state.git_line_marks, fold_w)
             };
 
             // Each item is the normal lines.
@@ -2121,8 +2212,9 @@ impl Element for TextElement {
                 // Paint git gutter marks：新增绿 / 修改蓝 / 删除红（顶部小短条）
                 if git_gutter_enabled {
                     if let Some(mark) = git_line_marks.get(&(buffer_line as u32)) {
-                        let bar_x =
-                            input_bounds.origin.x + prepaint.last_layout.line_number_width - px(8.);
+                        let bar_x = input_bounds.origin.x + prepaint.last_layout.line_number_width
+                            - fold_gutter_width
+                            - px(8.);
                         match mark {
                             GitLineMark::Added => {
                                 window.paint_quad(fill(
@@ -2262,7 +2354,17 @@ impl Element for TextElement {
             px(0.)
         };
 
-        for (line, &_buffer_line) in prepaint
+        let folded_starts: std::collections::HashSet<usize> = self
+            .state
+            .read(cx)
+            .display_map
+            .folded_ranges()
+            .iter()
+            .map(|f| f.start_line)
+            .collect();
+        let mut fold_click_targets: Vec<(usize, Bounds<Pixels>)> = Vec::new();
+
+        for (line, &buffer_line) in prepaint
             .last_layout
             .lines
             .iter()
@@ -2283,6 +2385,29 @@ impl Element for TextElement {
                 window,
                 cx,
             );
+            if folded_starts.contains(&buffer_line) {
+                let wrap_count = line.wrapped_lines.len().max(1);
+                let last_y = line_y + line_height * (wrap_count.saturating_sub(1) as f32);
+                let last_width = line
+                    .wrapped_lines
+                    .last()
+                    .map(|l| l.width)
+                    .unwrap_or(line.longest_width);
+                let ellipsis = &prepaint.fold_icon_layout.ellipsis;
+                let ellipsis_origin = point(p.x + last_width + px(6.), last_y);
+                _ = ellipsis.paint(
+                    ellipsis_origin,
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+                fold_click_targets.push((
+                    buffer_line,
+                    Bounds::new(ellipsis_origin, size(ellipsis.width, line_height)),
+                ));
+            }
             offset_y += line.size(line_height).height;
         }
 
@@ -2336,12 +2461,13 @@ impl Element for TextElement {
         }
 
         // Paint fold icons (only visible on hover or for current line)
-        self.paint_fold_icons(
+        fold_click_targets.extend(self.paint_fold_icons(
             &mut prepaint.fold_icon_layout,
             prepaint.current_row,
+            line_height,
             window,
             cx,
-        );
+        ));
 
         // Paint sticky scroll：顶部钉住外围定义行（半透明底 + 底边框，点击跳转）
         let mut sticky_click_targets: Vec<(usize, Bounds<Pixels>)> = Vec::new();
@@ -2423,6 +2549,7 @@ impl Element for TextElement {
         self.state.update(cx, |state, cx| {
             state.scrollbar_geometry = scrollbar_geometry;
             state.sticky_click_targets = sticky_click_targets;
+            state.fold_click_targets = fold_click_targets;
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());

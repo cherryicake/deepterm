@@ -108,8 +108,8 @@ impl FoldMap {
     /// Set fold candidates (from tree-sitter), full replacement.
     pub fn set_candidates(&mut self, mut candidates: Vec<FoldRange>) {
         // Sort and deduplicate by start_line
-        candidates.sort_by_key(|r| r.start_line);
-        candidates.dedup_by_key(|r| r.start_line);
+        candidates.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+        candidates.dedup_by(|a, b| a.start_line == b.start_line);
         self.candidates = candidates;
 
         // Remove any folded ranges that are no longer in candidates
@@ -137,8 +137,9 @@ impl FoldMap {
 
         // Add new candidates
         self.candidates.extend(new_candidates);
-        self.candidates.sort_by_key(|r| r.start_line);
-        self.candidates.dedup_by_key(|r| r.start_line);
+        self.candidates
+            .sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+        self.candidates.dedup_by(|a, b| a.start_line == b.start_line);
     }
 
     /// Set a fold at the given start_line (must be in candidates)
@@ -206,9 +207,95 @@ impl FoldMap {
     }
 
     /// Clear all folds
-    #[inline]
     pub fn clear_folds(&mut self) {
+        if !self.folded.is_empty() {
+            self.folded.clear();
+            self.needs_rebuild = true;
+        }
+    }
+
+    /// Fold every candidate range.
+    pub fn fold_all(&mut self) {
+        if self.folded.len() != self.candidates.len() {
+            self.folded = self.candidates.clone();
+            self.needs_rebuild = true;
+        }
+    }
+
+    /// Fold all candidates whose nesting depth is >= `level` (1 = outermost).
+    /// Unfolds shallower regions first so only the requested level stays collapsed.
+    pub fn fold_level(&mut self, level: usize) {
+        if level == 0 {
+            self.clear_folds();
+            return;
+        }
+        let candidates = self.candidates.clone();
         self.folded.clear();
+        for candidate in &candidates {
+            if Self::nesting_depth(&candidates, candidate) >= level {
+                self.folded.push(*candidate);
+            }
+        }
+        self.needs_rebuild = true;
+    }
+
+    /// Nesting depth of a range: 1 if not contained in any other candidate.
+    pub fn nesting_depth(candidates: &[FoldRange], range: &FoldRange) -> usize {
+        let mut depth = 1;
+        for other in candidates {
+            if other.start_line == range.start_line && other.end_line == range.end_line {
+                continue;
+            }
+            let contains = other.start_line <= range.start_line
+                && other.end_line >= range.end_line
+                && (other.start_line < range.start_line || other.end_line > range.end_line);
+            if contains {
+                depth += 1;
+            }
+        }
+        depth
+    }
+
+    fn containing_sorted<'a>(ranges: &'a [FoldRange], line: usize) -> Vec<FoldRange> {
+        let mut containing: Vec<FoldRange> = ranges
+            .iter()
+            .copied()
+            .filter(|c| c.start_line <= line && line <= c.end_line)
+            .collect();
+        containing.sort_by_key(|c| {
+            (
+                c.end_line.saturating_sub(c.start_line),
+                std::cmp::Reverse(c.start_line),
+            )
+        });
+        containing
+    }
+
+    /// Fold the innermost unfolded candidate that contains `line`.
+    pub fn fold_at_line(&mut self, line: usize) -> bool {
+        for range in Self::containing_sorted(&self.candidates, line) {
+            if !self.is_folded_at(range.start_line) {
+                self.set_folded(range.start_line, true);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Unfold the innermost folded range that contains `line`.
+    pub fn unfold_at_line(&mut self, line: usize) -> bool {
+        if let Some(range) = Self::containing_sorted(&self.folded, line).first().copied() {
+            self.set_folded(range.start_line, false);
+            return true;
+        }
+        false
+    }
+
+    /// Toggle the innermost region at `line`: unfold if folded, otherwise fold.
+    pub fn toggle_fold_at_line(&mut self, line: usize) {
+        if !self.unfold_at_line(line) {
+            self.fold_at_line(line);
+        }
     }
 
     /// Adjust folds and candidates after a text edit.
@@ -287,13 +374,13 @@ impl FoldMap {
         // Build set of hidden wrap_row ranges from folded buffer lines
         let mut hidden_ranges = Vec::new();
         for fold in &self.folded {
-            // Hide wrap rows from (start_line + 1) to (end_line - 1) (inclusive)
-            // Both the first line and last line of the fold remain visible
+            // VSCode-style: keep the start line visible, hide start+1..=end
+            // (including the closing brace / last line of the region).
             let hide_start_line = fold.start_line + 1;
-            let hide_end_line = fold.end_line.saturating_sub(1);
+            let hide_end_line = fold.end_line;
 
             if hide_start_line > hide_end_line {
-                continue; // No middle lines to hide (0 or 1 lines between start and end)
+                continue;
             }
 
             // Get wrap_row ranges for the hidden buffer lines
@@ -357,5 +444,118 @@ impl FoldMap {
         }
 
         self.needs_rebuild = false;
+    }
+
+    /// Test helper: rebuild assuming one wrap row per buffer line.
+    #[cfg(test)]
+    fn rebuild_identity(&mut self, line_count: usize) {
+        self.needs_rebuild = true;
+        self.cached_wrap_row_count = line_count;
+        self.visible_wrap_rows.clear();
+        self.wrap_row_to_display_row.clear();
+        self.wrap_row_to_display_row.resize(line_count, None);
+
+        let mut hidden = vec![false; line_count];
+        for fold in &self.folded {
+            let start = fold.start_line.saturating_add(1);
+            if start >= line_count || start > fold.end_line {
+                continue;
+            }
+            let end = fold.end_line.min(line_count.saturating_sub(1));
+            for line in start..=end {
+                hidden[line] = true;
+            }
+        }
+
+        let mut display_row = 0;
+        for wrap_row in 0..line_count {
+            if !hidden[wrap_row] {
+                self.visible_wrap_rows.push(wrap_row);
+                self.wrap_row_to_display_row[wrap_row] = Some(display_row);
+                display_row += 1;
+            }
+        }
+        self.needs_rebuild = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hides_start_plus_one_through_end() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 3)]);
+        map.set_folded(0, true);
+        map.rebuild_identity(5);
+
+        assert_eq!(map.wrap_row_to_display_row(0), Some(0));
+        assert_eq!(map.wrap_row_to_display_row(1), None);
+        assert_eq!(map.wrap_row_to_display_row(2), None);
+        assert_eq!(map.wrap_row_to_display_row(3), None);
+        assert_eq!(map.wrap_row_to_display_row(4), Some(1));
+        assert_eq!(map.display_row_count(), 2);
+    }
+
+    #[test]
+    fn nested_folds_hide_inner_and_outer() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 8), FoldRange::new(2, 5)]);
+        map.set_folded(2, true);
+        map.rebuild_identity(10);
+
+        assert!(map.wrap_row_to_display_row(2).is_some());
+        assert_eq!(map.wrap_row_to_display_row(3), None);
+        assert_eq!(map.wrap_row_to_display_row(5), None);
+        assert!(map.wrap_row_to_display_row(6).is_some());
+
+        map.set_folded(0, true);
+        map.rebuild_identity(10);
+        assert!(map.wrap_row_to_display_row(0).is_some());
+        for line in 1..=8 {
+            assert_eq!(map.wrap_row_to_display_row(line), None, "line {line}");
+        }
+        assert!(map.wrap_row_to_display_row(9).is_some());
+    }
+
+    #[test]
+    fn fold_level_collapses_nested_depths() {
+        let mut map = FoldMap::new();
+        let outer = FoldRange::new(0, 10);
+        let inner = FoldRange::new(2, 6);
+        let inner2 = FoldRange::new(3, 5);
+        map.set_candidates(vec![outer, inner, inner2]);
+
+        assert_eq!(FoldMap::nesting_depth(map.fold_candidates(), &outer), 1);
+        assert_eq!(FoldMap::nesting_depth(map.fold_candidates(), &inner), 2);
+        assert_eq!(FoldMap::nesting_depth(map.fold_candidates(), &inner2), 3);
+
+        map.fold_level(2);
+        assert!(!map.is_folded_at(0));
+        assert!(map.is_folded_at(2));
+        assert!(map.is_folded_at(3));
+
+        map.fold_all();
+        assert!(map.is_folded_at(0));
+        map.clear_folds();
+        assert!(!map.is_folded_at(0));
+        assert!(map.folded_ranges().is_empty());
+    }
+
+    #[test]
+    fn fold_at_line_picks_innermost_unfolded() {
+        let mut map = FoldMap::new();
+        map.set_candidates(vec![FoldRange::new(0, 10), FoldRange::new(2, 6)]);
+        assert!(map.fold_at_line(4));
+        assert!(map.is_folded_at(2));
+        assert!(!map.is_folded_at(0));
+
+        assert!(map.fold_at_line(4));
+        assert!(map.is_folded_at(0));
+
+        map.toggle_fold_at_line(4);
+        assert!(!map.is_folded_at(2));
+        assert!(map.is_folded_at(0));
     }
 }

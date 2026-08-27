@@ -1,17 +1,17 @@
 use std::ops::Range;
 
+use ropey::Rope;
+
 #[cfg(not(target_family = "wasm"))]
 use tree_sitter::Node;
 #[cfg(not(target_family = "wasm"))]
 pub use tree_sitter::Tree;
 
+use crate::components::input::{RopeExt as _, TabSize};
+
 #[cfg(target_family = "wasm")]
 /// Stub type for tree-sitter Tree on WASM (tree-sitter not available).
 pub struct Tree;
-
-#[cfg(not(target_family = "wasm"))]
-/// Minimum line span for a node to be considered foldable.
-const MIN_FOLD_LINES: usize = 2;
 
 /// A fold range representing a foldable code region.
 ///
@@ -54,7 +54,7 @@ fn is_foldable_node(node: &Node) -> bool {
 
     let start = node.start_position().row;
     let end = node.end_position().row;
-    end.saturating_sub(start) >= MIN_FOLD_LINES
+    end > start
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -136,6 +136,88 @@ pub fn extract_fold_ranges_in_range(_tree: &Tree, _byte_range: Range<usize>) -> 
     Vec::new()
 }
 
+/// Merge syntax and indent fold ranges.
+///
+/// Ranges are unique by `start_line`; when both sources share a start line,
+/// the range with the larger `end_line` is kept.
+pub fn merge_fold_ranges(syntax: Vec<FoldRange>, indent: Vec<FoldRange>) -> Vec<FoldRange> {
+    let mut ranges = syntax;
+    ranges.extend(indent);
+    ranges.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+    ranges.dedup_by(|a, b| a.start_line == b.start_line);
+    ranges
+}
+
+/// Indent-based fold ranges (VSCode-style).
+///
+/// A line is foldable when a later non-empty line has strictly greater indent.
+/// The fold ends at the last consecutive deeper line (empty lines in between
+/// are included in the hidden span). Trailing empty lines after the last
+/// deeper line are left visible so neighbouring blocks stay separated.
+pub fn extract_indent_fold_ranges(text: &Rope, tab_size: TabSize) -> Vec<FoldRange> {
+    let line_count = text.lines_len();
+    if line_count < 2 {
+        return Vec::new();
+    }
+
+    let mut indents: Vec<Option<usize>> = Vec::with_capacity(line_count);
+    for row in 0..line_count {
+        let slice = text.slice_line(row);
+        if slice.chars().all(|c| c.is_whitespace()) {
+            indents.push(None);
+        } else {
+            indents.push(Some(tab_size.indent_count(&slice)));
+        }
+    }
+
+    let mut ranges = Vec::new();
+    for i in 0..line_count {
+        let Some(indent) = indents[i] else {
+            continue;
+        };
+        let mut end = None;
+        let mut j = i + 1;
+        while j < line_count {
+            match indents[j] {
+                None => j += 1,
+                Some(next) if next > indent => {
+                    end = Some(j);
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        if let Some(end_line) = end {
+            if end_line > i {
+                ranges.push(FoldRange::new(i, end_line));
+            }
+        }
+    }
+
+    ranges.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+    ranges.dedup_by(|a, b| a.start_line == b.start_line);
+    ranges
+}
+
+/// Outermost fold header for a hidden line, if `line` is inside any folded range.
+pub fn hidden_line_fold_header(line: usize, folded: &[FoldRange]) -> Option<usize> {
+    folded
+        .iter()
+        .filter(|f| line > f.start_line && line <= f.end_line)
+        .map(|f| f.start_line)
+        .min()
+}
+
+/// First line after the outermost fold that hides `line`.
+pub fn hidden_line_after_fold(line: usize, folded: &[FoldRange]) -> Option<usize> {
+    folded
+        .iter()
+        .filter(|f| line > f.start_line && line <= f.end_line)
+        .map(|f| f.end_line)
+        .max()
+        .map(|end| end + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +250,61 @@ mod tests {
         assert_eq!(ranges[0].start_line, 1);
         assert_eq!(ranges[1].start_line, 5);
         assert_eq!(ranges[2].start_line, 10);
+    }
+
+    #[test]
+    fn indent_folds_function_body_and_skips_blank_separator() {
+        let text = Rope::from("def foo():\n    a = 1\n    b = 2\n\ndef bar():\n    c = 3\n");
+        let ranges = extract_indent_fold_ranges(&text, TabSize::default());
+        assert!(
+            ranges.contains(&FoldRange::new(0, 2)),
+            "foo body should fold, got {ranges:?}"
+        );
+        assert!(
+            ranges.contains(&FoldRange::new(4, 5)),
+            "bar body should fold, got {ranges:?}"
+        );
+    }
+
+    #[test]
+    fn indent_folds_include_blank_lines_inside_block() {
+        let text = Rope::from("def foo():\n    a = 1\n\n    b = 2\n");
+        let ranges = extract_indent_fold_ranges(&text, TabSize::default());
+        assert_eq!(ranges, vec![FoldRange::new(0, 3)]);
+    }
+
+    #[test]
+    fn merge_prefers_larger_end_on_same_start() {
+        let syntax = vec![FoldRange::new(0, 20), FoldRange::new(2, 5)];
+        let indent = vec![FoldRange::new(0, 18), FoldRange::new(8, 12)];
+        let merged = merge_fold_ranges(syntax, indent);
+        assert_eq!(
+            merged,
+            vec![
+                FoldRange::new(0, 20),
+                FoldRange::new(2, 5),
+                FoldRange::new(8, 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_line_clamp_uses_outermost_fold() {
+        let folded = vec![FoldRange::new(0, 10), FoldRange::new(2, 6)];
+        assert_eq!(hidden_line_fold_header(4, &folded), Some(0));
+        assert_eq!(hidden_line_after_fold(4, &folded), Some(11));
+        assert_eq!(hidden_line_fold_header(0, &folded), None);
+        assert_eq!(hidden_line_fold_header(11, &folded), None);
+    }
+
+    #[test]
+    fn clamp_forward_skips_hidden_closing_line() {
+        let text = Rope::from("fn foo() {\n    a();\n}\nnext\n");
+        let folded = vec![FoldRange::new(0, 2)];
+        let after = hidden_line_after_fold(2, &folded).expect("line 2 is hidden");
+        assert_eq!(after, 3);
+        assert_eq!(text.slice_line(after).to_string(), "next");
+        assert_eq!(hidden_line_fold_header(2, &folded), Some(0));
+        assert_eq!(text.slice_line(0).to_string(), "fn foo() {");
     }
 }

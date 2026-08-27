@@ -145,6 +145,12 @@ impl DisplayMap {
         self.fold_map.is_fold_candidate(start_line)
     }
 
+    /// Get all fold candidates
+    #[inline]
+    pub fn fold_candidates(&self) -> &[FoldRange] {
+        self.fold_map.fold_candidates()
+    }
+
     /// Get all currently folded ranges
     #[inline]
     pub fn folded_ranges(&self) -> &[FoldRange] {
@@ -154,6 +160,36 @@ impl DisplayMap {
     /// Clear all folds
     pub fn clear_folds(&mut self) {
         self.fold_map.clear_folds();
+        self.rebuild_fold_projection();
+    }
+
+    /// Fold every candidate.
+    pub fn fold_all(&mut self) {
+        self.fold_map.fold_all();
+        self.rebuild_fold_projection();
+    }
+
+    /// Fold all candidates at nesting depth >= `level`.
+    pub fn fold_level(&mut self, level: usize) {
+        self.fold_map.fold_level(level);
+        self.rebuild_fold_projection();
+    }
+
+    /// Fold the innermost unfolded region containing `line`.
+    pub fn fold_at_line(&mut self, line: usize) {
+        self.fold_map.fold_at_line(line);
+        self.rebuild_fold_projection();
+    }
+
+    /// Unfold the innermost folded region containing `line`.
+    pub fn unfold_at_line(&mut self, line: usize) {
+        self.fold_map.unfold_at_line(line);
+        self.rebuild_fold_projection();
+    }
+
+    /// Toggle the innermost region containing `line`.
+    pub fn toggle_fold_at_line(&mut self, line: usize) {
+        self.fold_map.toggle_fold_at_line(line);
         self.rebuild_fold_projection();
     }
 
