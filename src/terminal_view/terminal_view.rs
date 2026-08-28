@@ -249,6 +249,12 @@ pub struct TerminalView {
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
     cached_working_directory: Option<String>,
+    /// 本地 shell 进程 cwd 缓存：lsof//proc 查询在后台线程执行，
+    /// 按键（内建命令补全）/标签刷新/拖拽等 UI 路径只读缓存。
+    process_cwd_cache: Option<PathBuf>,
+    /// 上次后台查询时间（含查询失败，避免反复 spawn）
+    process_cwd_checked_at: Option<Instant>,
+    process_cwd_refresh_in_flight: bool,
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
@@ -534,6 +540,9 @@ impl TerminalView {
                 ssh_connect_hide_task: None,
                 remote_os: None,
                 cached_working_directory: None,
+                process_cwd_cache: None,
+                process_cwd_checked_at: None,
+                process_cwd_refresh_in_flight: false,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 link_modifier_held: false,
@@ -724,6 +733,9 @@ impl TerminalView {
                 ssh_connect_hide_task: None,
                 remote_os: None,
                 cached_working_directory: None,
+                process_cwd_cache: None,
+                process_cwd_checked_at: None,
+                process_cwd_refresh_in_flight: false,
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 link_modifier_held: false,
@@ -914,12 +926,50 @@ impl TerminalView {
         terminal
             .reported_working_directory()
             .map(PathBuf::from)
-            .or_else(|| {
-                terminal.child_process_id.and_then(
-                    crate::builtin_commands::PathResolver::query_process_working_directory,
-                )
-            })
+            // 进程 cwd 只读缓存（由 local_process_cwd 后台刷新），
+            // 不在 UI 线程同步起 lsof 子进程
+            .or_else(|| self.process_cwd_cache.clone())
             .or_else(|| self.working_directory.clone())
+    }
+
+    /// 读取并按需后台刷新本地 shell 进程的实时 cwd（lsof / /proc）。
+    ///
+    /// 查询移到后台线程：此前按键、标签刷新、拖拽等高频路径在 UI 线程
+    /// 同步起 lsof 子进程，单次可达几十到几百毫秒，造成明显卡顿。
+    /// 缓存 2 秒内直接复用；过期且有 pid 时后台刷新一次（in-flight 防抖），
+    /// 期间返回旧值。无 pid（远程终端/尚未启动）也记录时间戳，避免重复进入。
+    fn local_process_cwd(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
+        const TTL: Duration = Duration::from_secs(2);
+        if let Some(at) = self.process_cwd_checked_at {
+            if at.elapsed() < TTL {
+                return self.process_cwd_cache.clone();
+            }
+        }
+        if self.process_cwd_refresh_in_flight {
+            return self.process_cwd_cache.clone();
+        }
+        let Some(pid) = self.terminal.read(cx).child_process_id else {
+            self.process_cwd_checked_at = Some(Instant::now());
+            return self.process_cwd_cache.clone();
+        };
+        self.process_cwd_refresh_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let cwd = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::builtin_commands::PathResolver::query_process_working_directory(pid)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.process_cwd_refresh_in_flight = false;
+                this.process_cwd_checked_at = Some(Instant::now());
+                this.process_cwd_cache = cwd;
+                // cwd 变化会影响 tab 标签与会话保存
+                cx.notify();
+            });
+        })
+        .detach();
+        self.process_cwd_cache.clone()
     }
 
     fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
@@ -988,17 +1038,14 @@ impl TerminalView {
             .foreground_process_name()
             .or_else(|| term.shell_name().map(|s| s.to_string()));
 
-        // 优先使用缓存的 cwd（OSC 7 / 远程上报），fallback 到进程实时查询
+        // 优先使用缓存的 cwd（OSC 7 / 远程上报），fallback 到后台刷新的进程 cwd 缓存。
+        // 不在标签/拖拽路径同步起 lsof（由 do_check_tab_label_changed 后台预热）。
         let cwd = self
             .cached_working_directory
             .as_deref()
             .map(PathBuf::from)
             .or_else(|| term.reported_working_directory().map(PathBuf::from))
-            .or_else(|| {
-                term.child_process_id.and_then(
-                    crate::builtin_commands::PathResolver::query_process_working_directory,
-                )
-            })
+            .or_else(|| self.process_cwd_cache.clone())
             .or_else(|| self.working_directory.clone());
 
         let cwd_display = cwd.as_ref().and_then(|p| {
@@ -1042,6 +1089,8 @@ impl TerminalView {
     }
 
     fn do_check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
+        // 先后台刷新进程 cwd 缓存（防抖后低频），标签计算只读缓存
+        self.local_process_cwd(cx);
         let current = self.tab_label(cx);
         if self.last_tab_label.as_deref() != Some(&current) {
             self.last_tab_label = Some(current);
@@ -1662,6 +1711,7 @@ impl TerminalView {
             // 本地终端：优先使用 OSC 7 上报的 cwd。OSC 7 来自 shell prompt hook，
             // 能实时反映 shell 内建 `cd` 后的目录；进程 cwd 查询只作为兼容兜底，
             // 因为某些平台/场景下拿到的可能是启动 shell 或前台程序的旧目录。
+            self.local_process_cwd(cx); // 顺带后台刷新缓存
             let process_cwd = self.current_local_working_directory(cx);
             (process_cwd, None)
         };
@@ -1853,14 +1903,13 @@ impl TerminalView {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut BuiltinCommandManager),
     ) {
-        // 同步"本机端 cwd"：本地终端用 shell 进程实时 cwd（lsof / /proc），
-        // 远程终端用 DeepTerm 进程的初始工作目录。补全引擎拿到的 cwd 必须是
-        // 当前终端 shell 的实际位置，而不是 DeepTerm 启动时所在的项目目录。
+        // 同步"本机端 cwd"：本地终端用 shell 进程实时 cwd（后台刷新的缓存，
+        // 不在按键路径同步起 lsof），远程终端用 DeepTerm 进程的初始工作目录。
+        // 补全引擎拿到的 cwd 必须是当前终端 shell 的实际位置。
         let local_cwd = if self.ssh_config.is_some() {
             self.working_directory.clone()
         } else {
-            let pid = self.terminal.read(cx).child_process_id;
-            pid.and_then(crate::builtin_commands::PathResolver::query_process_working_directory)
+            self.local_process_cwd(cx)
                 .or_else(|| self.working_directory.clone())
         };
         self.builtin_command_manager.set_local_cwd(local_cwd);
