@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs;
@@ -14,15 +15,16 @@ const REMOTE_GIT_TIMEOUT: u64 = 60;
 const HEAD_TTL: Duration = Duration::from_secs(10);
 const STATUS_TTL: Duration = Duration::from_secs(5);
 
-static HEAD_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>)>>> = OnceLock::new();
-fn head_cache() -> &'static Mutex<HashMap<String, (Instant, Option<String>)>> {
-    HEAD_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+type HeadCache = HashMap<String, (Instant, Option<String>)>;
+type StatusCache = HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>)>;
+
+static HEAD_CACHE: OnceLock<Mutex<HeadCache>> = OnceLock::new();
+fn head_cache() -> &'static Mutex<HeadCache> {
+    HEAD_CACHE.get_or_init(|| Mutex::default())
 }
-static STATUS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>)>>> =
-    OnceLock::new();
-fn status_cache(
-) -> &'static Mutex<HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>)>> {
-    STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+static STATUS_CACHE: OnceLock<Mutex<StatusCache>> = OnceLock::new();
+fn status_cache() -> &'static Mutex<StatusCache> {
+    STATUS_CACHE.get_or_init(|| Mutex::default())
 }
 
 /// 远程 diff 内容缓存条目：以 (HEAD commit, 文件 size, mtime) 为有效性指纹。
@@ -189,59 +191,54 @@ impl GitRepository {
             "--",
             ".",
         ])?;
-        let git_status = GitStatus::parse(&stdout);
-        Ok(git_status.entries.iter().cloned().collect())
+        Ok(GitStatus::parse(&stdout).entries.iter().cloned().collect())
     }
 
     fn diff_stat_uncached(&self) -> Result<Vec<(String, DiffStat)>, String> {
-        match self.run_git(&["diff", "--numstat", "--no-renames", "HEAD"]) {
-            Ok(stdout) => Ok(parse_numstat(&stdout)),
-            Err(_) => Ok(Vec::new()),
-        }
+        self.run_git(&["diff", "--numstat", "--no-renames", "HEAD"])
+            .map(|s| parse_numstat(&s))
+            .or(Ok(Vec::new()))
     }
 
     fn invalidate_status_cache(&self) {
         status_cache().lock().remove(&self.root);
-        // Also clear head cache so next diff sees new commit after commit/amend
         head_cache().lock().remove(&self.root);
     }
 
     /// Get all file statuses using `git status --porcelain=v1` (remote has 5s cache).
     pub fn status(&self) -> Result<Vec<StatusEntry>, String> {
-        if let GitBackend::Remote { .. } = &self.backend {
-            let key = self.root.clone();
-            if let Some((at, cached, _)) = status_cache().lock().get(&key).cloned() {
-                if at.elapsed() < STATUS_TTL {
-                    return Ok(cached);
-                }
-            }
-            let result = self.status_uncached()?;
-            let mut cache = status_cache().lock();
-            let entry = cache.entry(key).or_insert((Instant::now(), Vec::new(), Vec::new()));
-            entry.0 = Instant::now();
-            entry.1 = result.clone();
-            return Ok(result);
+        if !matches!(&self.backend, GitBackend::Remote { .. }) {
+            return self.status_uncached();
         }
-        self.status_uncached()
+        let key = self.root.clone();
+        if let Some((at, cached, _)) = status_cache().lock().get(&key).cloned() {
+            if at.elapsed() < STATUS_TTL {
+                return Ok(cached);
+            }
+        }
+        let result = self.status_uncached()?;
+        let mut cache = status_cache().lock();
+        let diff_stat = cache.get(&key).map(|(_, _, d)| d.clone()).unwrap_or_default();
+        cache.insert(key, (Instant::now(), result.clone(), diff_stat));
+        Ok(result)
     }
 
     /// Get diff stat for all files using `git diff --numstat` (remote has 5s cache).
     pub fn diff_stat(&self) -> Result<Vec<(String, DiffStat)>, String> {
-        if let GitBackend::Remote { .. } = &self.backend {
-            let key = self.root.clone();
-            if let Some((at, _, cached)) = status_cache().lock().get(&key).cloned() {
-                if at.elapsed() < STATUS_TTL && !cached.is_empty() {
-                    return Ok(cached);
-                }
-            }
-            let result = self.diff_stat_uncached()?;
-            let mut cache = status_cache().lock();
-            let entry = cache.entry(key).or_insert((Instant::now(), Vec::new(), Vec::new()));
-            entry.0 = Instant::now();
-            entry.2 = result.clone();
-            return Ok(result);
+        if !matches!(&self.backend, GitBackend::Remote { .. }) {
+            return self.diff_stat_uncached();
         }
-        self.diff_stat_uncached()
+        let key = self.root.clone();
+        if let Some((at, _, cached)) = status_cache().lock().get(&key).cloned() {
+            if at.elapsed() < STATUS_TTL && !cached.is_empty() {
+                return Ok(cached);
+            }
+        }
+        let result = self.diff_stat_uncached()?;
+        let mut cache = status_cache().lock();
+        let status = cache.get(&key).map(|(_, s, _)| s.clone()).unwrap_or_default();
+        cache.insert(key, (Instant::now(), status, result.clone()));
+        Ok(result)
     }
 
     /// Get the diff output for a specific file
@@ -310,14 +307,9 @@ impl GitRepository {
                     return Ok(cached);
                 }
                 let head_ref = format!("HEAD:{path}");
-                // 并行拉取 HEAD 内容与工作区文件，掩盖 RTT
                 let (old, new) = std::thread::scope(|s| {
-                    let repo_old = self.clone();
-                    let repo_new = self.clone();
-                    let head_ref_old = head_ref.clone();
-                    let path_owned = path.to_string();
-                    let h_old = s.spawn(move || repo_old.run_git(&["show", &head_ref_old]).unwrap_or_default());
-                    let h_new = s.spawn(move || repo_new.read_file(&path_owned).unwrap_or_default());
+                    let h_old = s.spawn(|| self.run_git(&["show", &head_ref]).unwrap_or_default());
+                    let h_new = s.spawn(|| self.read_file(path).unwrap_or_default());
                     (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
                 });
                 remote_diff_cache_insert(
@@ -332,35 +324,30 @@ impl GitRepository {
         }
     }
 
-    /// 当前 HEAD 提交 id；无提交历史时返回 None（远程带 10s 缓存）。
+    /// Current HEAD commit id (remote is cached for 10s).
     fn head_commit(&self) -> Option<String> {
-        match &self.backend {
-            GitBackend::Local => self
+        let GitBackend::Remote { config } = &self.backend else {
+            return self
                 .run_git(&["rev-parse", "HEAD"])
                 .ok()
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            GitBackend::Remote { config } => {
-                let cache_key = self.root.clone();
-                if let Some((at, cached)) = head_cache().lock().get(&cache_key).cloned() {
-                    if at.elapsed() < HEAD_TTL {
-                        return cached;
-                    }
-                }
-                let command = format!("cd {} && git rev-parse HEAD", shell_quote(&self.root));
-                let result = crate::ssh::sftp_fs::with_cached_session(config, |session| {
-                    session.execute_command(&command, REMOTE_GIT_TIMEOUT)
-                })
-                .ok()
-                .filter(|r| r.success())
-                .map(|r| r.stdout.trim().to_string())
                 .filter(|s| !s.is_empty());
-                head_cache()
-                    .lock()
-                    .insert(cache_key, (Instant::now(), result.clone()));
-                result
+        };
+        if let Some((at, cached)) = head_cache().lock().get(self.root.as_str()).cloned() {
+            if at.elapsed() < HEAD_TTL {
+                return cached;
             }
         }
+        let command = format!("cd {} && git rev-parse HEAD", shell_quote(&self.root));
+        let result = crate::ssh::sftp_fs::with_cached_session(config, |session| {
+            session.execute_command(&command, REMOTE_GIT_TIMEOUT)
+        })
+        .ok()
+        .filter(|r| r.success())
+        .map(|r| r.stdout.trim().to_string())
+        .filter(|s| !s.is_empty());
+        head_cache().lock().insert(self.root.clone(), (Instant::now(), result.clone()));
+        result
     }
 
     /// Write content to a working-tree file (local fs or remote via SFTP).

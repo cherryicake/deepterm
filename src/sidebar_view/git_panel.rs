@@ -122,6 +122,7 @@ pub struct GitPanel {
     status_poll_task: Option<Task<()>>,
     refresh_pending: bool,
     workspace_generation: u64,
+    /// Extra remote watches for `.git/index` and `.git/HEAD` to notice stage/commit quickly.
     remote_git_watched: Vec<std::path::PathBuf>,
 }
 
