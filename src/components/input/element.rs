@@ -21,8 +21,7 @@ use super::{
     GitLineMark, InputState, LastLayout, ScrollbarGeometry, WhitespaceIndicators,
     mode::InputMode,
     state::{
-        RAINBOW_BRACKETS_MAX_TEXT_LEN, indent_level_bounds, scan_bracket_spans_text,
-        scan_bracket_spans_tree,
+        RAINBOW_BRACKETS_MAX_TEXT_LEN, scan_bracket_spans_text, scan_bracket_spans_tree,
     },
 };
 
@@ -76,6 +75,9 @@ fn combine_highlights_stable(
     }
     out
 }
+
+/// VS Code 风格缩进参考线网格：每 N 列一个 guide，空白行按上下文插值，活跃块高亮
+const INDENT_GUIDE_SIZE: usize = 4;
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
@@ -2330,64 +2332,150 @@ impl Element for TextElement {
             window.paint_path(path, occurrence_fill);
         }
 
-        // Paint indent guides：缩进参考线（相邻同级行合并为长竖线，光标所在层加深）
-        if state.indent_guides && state.mode.is_multi_line() && !state.masked
-                && state.text.len() > 0
-            {
-            let cursor_buffer_line = state.cursor_position().line as usize;
-            // 打开的段落：索引 = 层级，(x, y, height, end_y)
-            let mut open: Vec<(Pixels, Pixels, Pixels, Pixels)> = Vec::new();
-            let mut closed: Vec<(usize, Pixels, Pixels, Pixels)> = Vec::new();
-            // 光标所在行的 y 与层级（若可见）
-            let mut active_y: Option<(Pixels, usize)> = None;
-            let mut gy = invisible_top_padding;
-            for (line, &buffer_line) in prepaint
-                .last_layout
-                .lines
-                .iter()
-                .zip(prepaint.last_layout.visible_buffer_lines.iter())
-            {
-                let line_abs_y = origin.y + gy;
-                let line_h = line.size(line_height).height;
-                let line_text: String = state.text.slice_line(buffer_line).into();
-                let bounds_for_line = indent_level_bounds(&line_text);
-                if buffer_line == cursor_buffer_line {
-                    active_y = Some((line_abs_y, bounds_for_line.len().saturating_sub(1)));
-                }
-                for (k, &bound) in bounds_for_line.iter().enumerate() {
-                    if let Some(pos) =
-                        line.position_for_index(bound, &prepaint.last_layout, false)
-                    {
-                        let x = origin.x + prepaint.last_layout.line_number_width + pos.x;
-                        if k < open.len() {
-                            let seg = &mut open[k];
-                            if (seg.0 - x).abs() < px(0.5) && seg.3 == line_abs_y {
-                                seg.2 += line_h;
-                                seg.3 += line_h;
-                            } else {
-                                closed.push((k, seg.0, seg.1, seg.2));
-                                *seg = (x, line_abs_y, line_h, line_abs_y + line_h);
+        // Paint indent guides — VS Code style: grid-aligned, whitespace-interpolated, active-block highlighted
+        if state.indent_guides && state.mode.is_multi_line() && !state.masked && state.text.len() > 0 {
+            let indent_size = INDENT_GUIDE_SIZE;
+            let style = window.text_style();
+            let font_size = state
+                .font_size
+                .unwrap_or_else(|| style.font_size.to_pixels(window.rem_size()));
+            let space_width = window
+                .text_system()
+                .shape_line(
+                    SharedString::from(" "),
+                    font_size,
+                    &[TextRun {
+                        len: 1,
+                        font: style.font(),
+                        color: style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width;
+            if space_width > px(0.) {
+                let total_lines = state.text.lines_len();
+                // Indent columns: -1 for blank lines, else leading columns (space=1, tab=indent_size)
+                let mut indents = Vec::with_capacity(total_lines);
+                for idx in 0..total_lines {
+                    let line: String = state.text.slice_line(idx).into();
+                    if line.trim().is_empty() {
+                        indents.push(-1);
+                    } else {
+                        let mut cols = 0;
+                        for ch in line.chars() {
+                            match ch {
+                                ' ' => cols += 1,
+                                '\t' => cols = cols - cols % indent_size as i32 + indent_size as i32,
+                                _ => break,
                             }
-                        } else {
-                            open.push((x, line_abs_y, line_h, line_abs_y + line_h));
                         }
+                        indents.push(cols);
                     }
                 }
-                gy += line_h;
-            }
-            for (k, seg) in open.into_iter().enumerate() {
-                closed.push((k, seg.0, seg.1, seg.2));
-            }
-            let base_color = cx.theme().border.opacity(0.45);
-            let active_color = cx.theme().border;
-            for (level, x, y, h) in closed {
-                let is_active = active_y.is_some_and(|(cy, lvl)| {
-                    level + 1 == lvl && y <= cy && cy < y + h
-                });
-                window.paint_quad(fill(
-                    Bounds::new(point(x, y), size(px(1.), h)),
-                    if is_active { active_color } else { base_color },
-                ));
+                // Guides per line with VS Code whitespace interpolation
+                let off_side = matches!(state.language().as_deref(), Some("python") | Some("yaml"));
+                let guides_counts = {
+                    let mut prev = vec![-1; total_lines];
+                    let mut last = -1;
+                    for i in 0..total_lines {
+                        if indents[i] >= 0 {
+                            last = indents[i];
+                        }
+                        prev[i] = last;
+                    }
+                    let mut next = vec![-1; total_lines];
+                    let mut nxt = -1;
+                    for i in (0..total_lines).rev() {
+                        if indents[i] >= 0 {
+                            nxt = indents[i];
+                        }
+                        next[i] = nxt;
+                    }
+                    let mut counts = vec![0; total_lines];
+                    for i in 0..total_lines {
+                        let cur = indents[i];
+                        if cur >= 0 {
+                            counts[i] = (cur as usize + indent_size - 1) / indent_size;
+                        } else {
+                            let above = prev[i];
+                            let below = next[i];
+                            counts[i] = match (above, below) {
+                                (-1, _) | (_, -1) => 0,
+                                (a, b) if a < b => (a as usize / indent_size) + 1,
+                                (a, b) if a == b => (b as usize + indent_size - 1) / indent_size,
+                                (_, b) if off_side => (b as usize + indent_size - 1) / indent_size,
+                                (_, b) => (b as usize / indent_size) + 1,
+                            };
+                        }
+                    }
+                    counts
+                };
+                // Active indent block for the cursor line
+                let (active_start, active_end, active_level) = {
+                    let cursor_line = state.cursor_position().line as usize;
+                    if cursor_line >= total_lines {
+                        (0, 0, 0)
+                    } else {
+                        let mut level = guides_counts[cursor_line];
+                        let mut start = cursor_line + 1;
+                        let mut end = cursor_line + 1;
+                        if level == 0
+                            && cursor_line + 1 < total_lines
+                            && guides_counts[cursor_line + 1] == 1
+                        {
+                            level = 1;
+                            start = cursor_line + 2;
+                            end = start;
+                        }
+                        if level == 0 {
+                            (0, 0, 0)
+                        } else {
+                            let mut s = start;
+                            while s > 1 && guides_counts[s - 2] >= level {
+                                s -= 1;
+                            }
+                            let mut e = end;
+                            while e < total_lines && guides_counts[e] >= level {
+                                e += 1;
+                            }
+                            (s, e, level)
+                        }
+                    }
+                };
+                let base_color = cx.theme().border.opacity(0.28);
+                let active_color = cx.theme().border.opacity(0.85);
+                let gutter_width = prepaint.last_layout.line_number_width;
+                let mut gy = invisible_top_padding;
+                for (vi, &buffer_line) in prepaint
+                    .last_layout
+                    .visible_buffer_lines
+                    .iter()
+                    .enumerate()
+                {
+                    let line = &prepaint.last_layout.lines[vi];
+                    let line_h = line.size(line_height).height;
+                    let line_y = origin.y + gy;
+                    let count = guides_counts.get(buffer_line).copied().unwrap_or(0);
+                    for level in 1..=count {
+                        let visible_column = (level - 1) * indent_size + 1;
+                        let x = origin.x + gutter_width + space_width * (visible_column - 1) as f32;
+                        if x >= input_bounds.right() {
+                            break;
+                        }
+                        let is_active = level == active_level
+                            && active_level != 0
+                            && (active_start <= buffer_line + 1 && buffer_line + 1 <= active_end);
+                        let color = if is_active { active_color } else { base_color };
+                        window.paint_quad(fill(
+                            Bounds::new(point(x, line_y), size(px(1.), line_h)),
+                            color,
+                        ));
+                    }
+                    gy += line_h;
+                }
             }
         }
 

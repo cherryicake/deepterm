@@ -154,6 +154,7 @@ const OCCURRENCE_MAX_TEXT_LEN: usize = 2_000_000;
 /// 行首缩进的每级字节边界：第 k 个元素 = 第 k+1 个缩进单位结束处的字节偏移。
 ///
 /// Tab 算 1 级，每 4 个空格算 1 级（与 SPACE_OUTDENT_WIDTH 一致）。
+#[allow(dead_code)] // legacy: kept for tests; guides now use indent columns
 pub(crate) fn indent_level_bounds(line_text: &str) -> Vec<usize> {
     let mut bounds = Vec::new();
     let mut spaces = 0;
