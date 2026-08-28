@@ -18,11 +18,10 @@ use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 
 const LIST_ROW_HEIGHT: f32 = 28.0;
-const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
-/// 无文件事件时的兑底轮询间隔（主要面向远程仓库：
-/// 远程 watcher 只轮询工作区根目录的元数据/条目，git commit 只改
-/// .git 内部，不会产生任何事件，必须靠定时器发现状态变化）。
-const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(20);
+const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
+/// Fallback poll for remote git status (now also watches .git/index directly,
+/// so interval can be longer than file watcher but still catch missed events).
+const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Git panel events
 pub enum GitPanelEvent {
@@ -123,6 +122,7 @@ pub struct GitPanel {
     status_poll_task: Option<Task<()>>,
     refresh_pending: bool,
     workspace_generation: u64,
+    remote_git_watched: Vec<std::path::PathBuf>,
 }
 
 impl GitPanel {
@@ -145,6 +145,7 @@ impl GitPanel {
             status_poll_task: None,
             refresh_pending: false,
             workspace_generation: 0,
+            remote_git_watched: Vec::new(),
         }
     }
 
@@ -175,6 +176,9 @@ impl GitPanel {
                 cx.unwatch_recursive_path(old_path);
             } else {
                 cx.unwatch_remote_path(old_path);
+                for p in self.remote_git_watched.drain(..) {
+                    cx.unwatch_remote_path(&p);
+                }
             }
         }
 
@@ -197,6 +201,12 @@ impl GitPanel {
             cx.watch_recursive_path(&path);
         } else if let Some(ref fs) = filesystem {
             cx.watch_remote_path(&path, fs.clone());
+            // Watch git index/HEAD directly so stage/commit is noticed without 20s poll.
+            self.remote_git_watched.clear();
+            for git_path in [path.join(".git/index"), path.join(".git/HEAD")] {
+                cx.watch_remote_path(&git_path, fs.clone());
+                self.remote_git_watched.push(git_path);
+            }
         }
 
         // Set up file watching for auto-refresh
@@ -315,21 +325,15 @@ impl GitPanel {
         let generation = self.workspace_generation;
 
         cx.spawn(async move |_, cx| {
-            let status_result = cx
-                .background_executor()
-                .spawn({
-                    let repo = repo.clone();
-                    async move { repo.status() }
-                })
-                .await;
-
-            let diff_stat_result = cx
-                .background_executor()
-                .spawn({
-                    let repo = repo.clone();
-                    async move { repo.diff_stat() }
-                })
-                .await;
+            let status_task = cx.background_executor().spawn({
+                let repo = repo.clone();
+                async move { repo.status() }
+            });
+            let diff_task = cx.background_executor().spawn({
+                let repo = repo.clone();
+                async move { repo.diff_stat() }
+            });
+            let (status_result, diff_stat_result) = futures::join!(status_task, diff_task);
 
             let _ = weak.update(cx, |this, cx| {
                 this.loading = false;

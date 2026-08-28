@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
@@ -10,6 +11,19 @@ use crate::ssh::sftp_fs;
 use super::git_status::{DiffStat, GitStatus, StatusEntry, parse_numstat};
 
 const REMOTE_GIT_TIMEOUT: u64 = 60;
+const HEAD_TTL: Duration = Duration::from_secs(10);
+const STATUS_TTL: Duration = Duration::from_secs(5);
+
+static HEAD_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>)>>> = OnceLock::new();
+fn head_cache() -> &'static Mutex<HashMap<String, (Instant, Option<String>)>> {
+    HEAD_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+static STATUS_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>)>>> =
+    OnceLock::new();
+fn status_cache(
+) -> &'static Mutex<HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>)>> {
+    STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// 远程 diff 内容缓存条目：以 (HEAD commit, 文件 size, mtime) 为有效性指纹。
 struct CachedRemoteDiff {
@@ -165,8 +179,7 @@ impl GitRepository {
         self.backend.execute(args, &self.root)
     }
 
-    /// Get all file statuses using `git status --porcelain=v1`
-    pub fn status(&self) -> Result<Vec<StatusEntry>, String> {
+    fn status_uncached(&self) -> Result<Vec<StatusEntry>, String> {
         let stdout = self.run_git(&[
             "status",
             "--porcelain=v1",
@@ -180,12 +193,55 @@ impl GitRepository {
         Ok(git_status.entries.iter().cloned().collect())
     }
 
-    /// Get diff stat for all files using `git diff --numstat`
-    pub fn diff_stat(&self) -> Result<Vec<(String, DiffStat)>, String> {
+    fn diff_stat_uncached(&self) -> Result<Vec<(String, DiffStat)>, String> {
         match self.run_git(&["diff", "--numstat", "--no-renames", "HEAD"]) {
             Ok(stdout) => Ok(parse_numstat(&stdout)),
-            Err(_) => Ok(Vec::new()), // Might be initial commit with no HEAD
+            Err(_) => Ok(Vec::new()),
         }
+    }
+
+    fn invalidate_status_cache(&self) {
+        status_cache().lock().remove(&self.root);
+        // Also clear head cache so next diff sees new commit after commit/amend
+        head_cache().lock().remove(&self.root);
+    }
+
+    /// Get all file statuses using `git status --porcelain=v1` (remote has 5s cache).
+    pub fn status(&self) -> Result<Vec<StatusEntry>, String> {
+        if let GitBackend::Remote { .. } = &self.backend {
+            let key = self.root.clone();
+            if let Some((at, cached, _)) = status_cache().lock().get(&key).cloned() {
+                if at.elapsed() < STATUS_TTL {
+                    return Ok(cached);
+                }
+            }
+            let result = self.status_uncached()?;
+            let mut cache = status_cache().lock();
+            let entry = cache.entry(key).or_insert((Instant::now(), Vec::new(), Vec::new()));
+            entry.0 = Instant::now();
+            entry.1 = result.clone();
+            return Ok(result);
+        }
+        self.status_uncached()
+    }
+
+    /// Get diff stat for all files using `git diff --numstat` (remote has 5s cache).
+    pub fn diff_stat(&self) -> Result<Vec<(String, DiffStat)>, String> {
+        if let GitBackend::Remote { .. } = &self.backend {
+            let key = self.root.clone();
+            if let Some((at, _, cached)) = status_cache().lock().get(&key).cloned() {
+                if at.elapsed() < STATUS_TTL && !cached.is_empty() {
+                    return Ok(cached);
+                }
+            }
+            let result = self.diff_stat_uncached()?;
+            let mut cache = status_cache().lock();
+            let entry = cache.entry(key).or_insert((Instant::now(), Vec::new(), Vec::new()));
+            entry.0 = Instant::now();
+            entry.2 = result.clone();
+            return Ok(result);
+        }
+        self.diff_stat_uncached()
     }
 
     /// Get the diff output for a specific file
@@ -254,8 +310,16 @@ impl GitRepository {
                     return Ok(cached);
                 }
                 let head_ref = format!("HEAD:{path}");
-                let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
-                let new = self.read_file(path).unwrap_or_default();
+                // 并行拉取 HEAD 内容与工作区文件，掩盖 RTT
+                let (old, new) = std::thread::scope(|s| {
+                    let repo_old = self.clone();
+                    let repo_new = self.clone();
+                    let head_ref_old = head_ref.clone();
+                    let path_owned = path.to_string();
+                    let h_old = s.spawn(move || repo_old.run_git(&["show", &head_ref_old]).unwrap_or_default());
+                    let h_new = s.spawn(move || repo_new.read_file(&path_owned).unwrap_or_default());
+                    (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
+                });
                 remote_diff_cache_insert(
                     format!("{}\u{0}{}", self.root, path),
                     head_commit,
@@ -268,7 +332,7 @@ impl GitRepository {
         }
     }
 
-    /// 当前 HEAD 提交 id；无提交历史时返回 None。
+    /// 当前 HEAD 提交 id；无提交历史时返回 None（远程带 10s 缓存）。
     fn head_commit(&self) -> Option<String> {
         match &self.backend {
             GitBackend::Local => self
@@ -277,17 +341,24 @@ impl GitRepository {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             GitBackend::Remote { config } => {
-                let command = format!(
-                    "cd {} && git rev-parse HEAD",
-                    shell_quote(&self.root)
-                );
-                crate::ssh::sftp_fs::with_cached_session(config, |session| {
+                let cache_key = self.root.clone();
+                if let Some((at, cached)) = head_cache().lock().get(&cache_key).cloned() {
+                    if at.elapsed() < HEAD_TTL {
+                        return cached;
+                    }
+                }
+                let command = format!("cd {} && git rev-parse HEAD", shell_quote(&self.root));
+                let result = crate::ssh::sftp_fs::with_cached_session(config, |session| {
                     session.execute_command(&command, REMOTE_GIT_TIMEOUT)
                 })
                 .ok()
                 .filter(|r| r.success())
                 .map(|r| r.stdout.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty());
+                head_cache()
+                    .lock()
+                    .insert(cache_key, (Instant::now(), result.clone()));
+                result
             }
         }
     }
@@ -305,9 +376,8 @@ impl GitRepository {
                 sftp_fs::write_file_string(config, &remote_path, content)
                     .map_err(|e| format!("Failed to write remote file: {e}"))
                     .inspect(|_| {
-                        // SFTP mtime 精度可能秒级：同秒内写完后 stat 指纹不变，
-                        // 必须显式失效，否则 diff 会读到旧内容
                         invalidate_remote_diff_cache(&self.root, path);
+                        self.invalidate_status_cache();
                     })
             }
         }
@@ -354,6 +424,10 @@ impl GitRepository {
         args.push("add");
         args.extend(paths.iter().copied());
         self.run_git(&args)?;
+        self.invalidate_status_cache();
+        for p in paths {
+            invalidate_remote_diff_cache(&self.root, p);
+        }
         Ok(())
     }
 
@@ -365,6 +439,10 @@ impl GitRepository {
         args.push("--");
         args.extend(paths.iter().copied());
         self.run_git(&args)?;
+        self.invalidate_status_cache();
+        for p in paths {
+            invalidate_remote_diff_cache(&self.root, p);
+        }
         Ok(())
     }
 }
