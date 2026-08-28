@@ -74,6 +74,8 @@ pub struct SidebarFileTree {
     scroll_handle: UniformListScrollHandle,
     /// 防抖中的目录刷新任务（按路径去重）
     refresh_debounce: HashMap<PathBuf, Task<()>>,
+    /// P1 预取任务（hover 预取，去重）
+    prefetch_tasks: HashMap<PathBuf, Task<()>>,
     resolving_home: bool,
 }
 
@@ -125,6 +127,7 @@ impl SidebarFileTree {
             watched_paths: HashSet::new(),
             scroll_handle: UniformListScrollHandle::new(),
             refresh_debounce: HashMap::new(),
+            prefetch_tasks: HashMap::new(),
             resolving_home,
         };
 
@@ -217,6 +220,7 @@ impl SidebarFileTree {
         self.hovered_path = None;
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
+        self.prefetch_tasks.clear();
         self.scroll_handle = UniformListScrollHandle::new();
         let root = self.root_path.clone();
         self.load_directory(root, cx);
@@ -336,6 +340,7 @@ impl SidebarFileTree {
         self.watcher_subscription.take();
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
+        self.prefetch_tasks.clear();
     }
 
     /// 保存展开状态到共享缓存
@@ -399,12 +404,15 @@ impl SidebarFileTree {
             return;
         }
 
-        // 先查共享缓存，命中则立即显示 + 后台刷新
+        // 先查共享缓存，命中则立即显示 + 按 TTL 决定是否后台刷新
         if let Some(entries) = self.loader.get_shared_cache(&path) {
+            let is_fresh = self.loader.is_shared_cache_fresh(&path);
             self.loader.finish_load(&path, entries);
             self.invalidate_flat_cache();
             cx.notify();
-            self.spawn_background_refresh(path, cx);
+            if !is_fresh {
+                self.spawn_background_refresh(path, cx);
+            }
             return;
         }
 
@@ -426,6 +434,8 @@ impl SidebarFileTree {
                             this.loader.finish_load(&path_for_loading, entries);
                             this.invalidate_flat_cache();
                             cx.notify();
+                            // P1: 目录加载完成后预取前3个小文件
+                            this.prefetch_dir_first_files(&path_for_loading, cx);
                         }
                         Err(e) => {
                             log::warn!(
@@ -593,14 +603,18 @@ impl SidebarFileTree {
             }
         } else {
             self.expanded_folders.insert(path.clone());
-            // 重新展开时强制刷新缓存，确保能看到外部变化；取消尚未触发的防抖刷新
-            self.loader.invalidate_path(&path);
             self.refresh_debounce.remove(&path);
-            self.load_directory(path.clone(), cx);
-            if !self.loader.is_local() {
-                cx.watch_remote_path(&path, self.loader.backend().clone());
-                self.watched_paths.insert(path);
+            if self.loader.has_cached(&path) {
+                if !self.loader.is_shared_cache_fresh(&path) {
+                    self.spawn_background_refresh(path.clone(), cx);
+                }
+            } else {
+                self.load_directory(path.clone(), cx);
             }
+            if !self.loader.is_local() && self.watched_paths.insert(path.clone()) {
+                cx.watch_remote_path(&path, self.loader.backend().clone());
+            }
+            self.prefetch_dir_first_files(&path, cx);
         }
         self.invalidate_flat_cache();
         cx.notify();
@@ -613,11 +627,120 @@ impl SidebarFileTree {
 
     fn set_hovered_path(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
-            self.hovered_path = Some(path);
+            self.hovered_path = Some(path.clone());
+            // P1 预取：悬停文件 80ms 后后台拉取 <128K 文本，二次点击秒开
+            self.schedule_prefetch(path, cx);
         } else if self.hovered_path.as_ref() == Some(&path) {
             self.hovered_path = None;
         }
         cx.notify();
+    }
+
+    /// Prefetch a hovered file if it is a small remote file not yet cached.
+    fn schedule_prefetch(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.loader.is_local() || self.prefetch_tasks.contains_key(&path) {
+            return;
+        }
+        let Some(ssh_cfg) = self.loader.ssh_config().cloned() else {
+            return;
+        };
+        if RemoteFileTreeCache::global().lock().is_file_fresh(&ssh_cfg, &path) {
+            return;
+        }
+        if self.is_large_or_non_file(&path) {
+            return;
+        }
+        self.spawn_prefetch_task(path, ssh_cfg, Duration::from_millis(80), true, cx);
+    }
+
+    /// Prefetch the first few small files in a newly loaded directory.
+    fn prefetch_dir_first_files(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        if self.loader.is_local() {
+            return;
+        }
+        let Some(entries) = self.loader.get_cached(dir).cloned() else {
+            return;
+        };
+        let Some(ssh_cfg) = self.loader.ssh_config().cloned() else {
+            return;
+        };
+        let mut spawned = 0;
+        for entry in entries.iter().filter(|e| e.kind == FileEntryKind::File) {
+            if spawned >= 3 {
+                break;
+            }
+            if entry.size > 128 * 1024 {
+                continue;
+            }
+            let path = &entry.path;
+            if self.prefetch_tasks.contains_key(path) {
+                continue;
+            }
+            let cache = RemoteFileTreeCache::global().lock();
+            if cache.is_file_fresh(&ssh_cfg, path) || cache.get_file_content(&ssh_cfg, path).is_some() {
+                continue;
+            }
+            drop(cache);
+            self.spawn_prefetch_task(path.clone(), ssh_cfg.clone(), Duration::from_millis(150), false, cx);
+            spawned += 1;
+        }
+    }
+
+    fn is_large_or_non_file(&self, path: &Path) -> bool {
+        let Some(parent) = path.parent() else { return false; };
+        let Some(entries) = self.loader.get_cached(parent) else { return false; };
+        entries
+            .iter()
+            .find(|e| e.path == path)
+            .is_some_and(|e| e.kind != FileEntryKind::File || e.size > 128 * 1024)
+    }
+
+    fn spawn_prefetch_task(
+        &mut self,
+        path: PathBuf,
+        ssh_cfg: SshConnectionConfig,
+        delay: Duration,
+        check_hover: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = self.loader.backend().clone();
+        let weak = cx.weak_entity();
+        let task_path = path.clone();
+        let task_cfg = ssh_cfg.clone();
+        let task = cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(delay).await;
+            if check_hover {
+                let still_hovered = weak
+                    .update(cx, |this, _| this.hovered_path.as_ref() == Some(&task_path))
+                    .unwrap_or(false);
+                if !still_hovered {
+                    let _ = weak.update(cx, |this, _| {
+                        this.prefetch_tasks.remove(&task_path);
+                    });
+                    return;
+                }
+            }
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let backend = backend.clone();
+                    let path = task_path.clone();
+                    async move { backend.read_file_bytes(&path) }
+                })
+                .await;
+            if let Ok(Some(bytes)) = result {
+                if bytes.len() <= 128 * 1024 && !crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
+                    let decoded = crate::editor::encoding::decode_bytes(&bytes);
+                    RemoteFileTreeCache::global().lock().insert_file_content(
+                        &task_cfg, &task_path, decoded.text, decoded.encoding,
+                    );
+                }
+            }
+            let _ = weak.update(cx, |this, _| {
+                this.prefetch_tasks.remove(&task_path);
+            });
+        });
+        self.prefetch_tasks.insert(path, task);
     }
 
     fn render_root_row(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {

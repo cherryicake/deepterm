@@ -100,6 +100,7 @@ impl FileSystem for RemoteFileSystem {
                     RemoteFileKind::Symlink => FileEntryKind::Symlink,
                     RemoteFileKind::Other => FileEntryKind::Other,
                 },
+                size: e.size,
             })
             .collect();
         result.sort_by_key(|a| a.sort_key());

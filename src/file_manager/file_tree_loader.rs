@@ -287,6 +287,15 @@ impl FileTreeLoader {
         }
     }
 
+    /// Returns true if the shared directory cache is still fresh (within TTL).
+    pub fn is_shared_cache_fresh(&self, path: &Path) -> bool {
+        self.ssh_config.as_ref().is_some_and(|config| {
+            RemoteFileTreeCache::global()
+                .lock()
+                .is_dir_fresh(config, path)
+        })
+    }
+
     /// 释放共享缓存引用（幂等；正常情况下由 `Drop` 调用）
     fn release_shared_cache(&mut self) {
         if !self.cache_ref_held {
@@ -351,6 +360,7 @@ mod tests {
                 name: (*n).to_string(),
                 path: PathBuf::from(format!("/root/{n}")),
                 kind: FileEntryKind::File,
+                size: 0,
             })
             .collect()
     }

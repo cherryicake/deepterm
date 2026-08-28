@@ -9,6 +9,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::file_manager::filesystem::{FileMetadata, FileSystem};
 use crate::file_manager::types::FileEntry;
+use futures::StreamExt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FsChangeKind {
@@ -339,7 +340,8 @@ impl FsWatcher {
     }
 }
 
-const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Remote polling interval (reduced from 2s to lower SFTP load).
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -459,31 +461,38 @@ impl RemoteFsWatcher {
                         .collect()
                 };
 
-                for (path, fs) in to_check {
-                    let (meta, entries, content_hash) = cx
-                        .background_executor()
-                        .spawn({
-                            let path = path.clone();
-                            let fs = fs.clone();
-                            async move {
+                if to_check.is_empty() {
+                    continue;
+                }
+
+                let bg = cx.background_executor().clone();
+                let all_results = futures::stream::iter(to_check)
+                    .map(|(path, fs)| {
+                        let bg = bg.clone();
+                        async move {
+                            bg.spawn(async move {
                                 let meta = fs.metadata(&path);
-                                let mut entries = None;
-                                let mut content_hash = None;
-                                if let Ok(ref m) = meta {
-                                    if m.is_dir {
-                                        entries = fs.read_dir(&path).ok();
-                                    } else {
-                                        content_hash = fs
-                                            .read_file_bytes(&path)
+                                let (entries, content_hash) = match &meta {
+                                    Ok(m) if m.is_dir => (fs.read_dir(&path).ok(), None),
+                                    Ok(_) => (
+                                        None,
+                                        fs.read_file_bytes(&path)
                                             .ok()
                                             .flatten()
-                                            .map(|bytes| hash_bytes(&bytes));
-                                    }
-                                }
-                                (meta, entries, content_hash)
-                            }
-                        })
-                        .await;
+                                            .map(|bytes| hash_bytes(&bytes)),
+                                    ),
+                                    Err(_) => (None, None),
+                                };
+                                (path, meta, entries, content_hash)
+                            })
+                            .await
+                        }
+                    })
+                    .buffer_unordered(8)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                for (path, meta, entries, content_hash) in all_results {
 
                     let meta = match meta {
                         Ok(m) => m,
@@ -701,6 +710,7 @@ mod tests {
             name: name.to_string(),
             path: PathBuf::from(name),
             kind,
+            size: 0,
         }
     }
 

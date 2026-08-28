@@ -15,6 +15,7 @@ use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::file_manager::TRANSFER_CANCELLED_MSG;
+use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::ssh::auth::{try_agent_auth, try_default_keys};
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
@@ -493,14 +494,30 @@ impl BlockingSftpSession {
         })
     }
 
-    /// 读取完整远程文件原始字节。
+    /// 读取完整远程文件原始字节（小文件快路径）。
     pub fn read_file_bytes(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_file_bytes_simple(path)
+    }
+
+    pub fn read_file_bytes_simple(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
             let mut file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
             Ok(Some(bytes))
         })
+    }
+
+    /// 大文件流水线读取（通过 bulk RawSftpSession 并行 16×248K）
+    pub fn read_file_bytes_pipelined(&mut self, path: &str, size: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        if size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let raw = self.bulk_session()?;
+        let config = ParallelTransferConfig::from_env();
+        let bytes = crate::ssh::shared_runtime::shared_ssh_runtime()
+            .block_on(pipelined_read_to_vec(raw, path, size, config))?;
+        Ok(Some(bytes))
     }
 
     /// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
@@ -733,7 +750,8 @@ struct CacheEntry {
 
 /// 每个主机最多保留的空闲会话数。并行传输期间会临时创建更多连接，用完即弃，
 /// 避免池无限增长；UI 的读目录 / 统计等高频小操作始终能复用池中会话。
-const MAX_IDLE_SESSIONS_PER_HOST: usize = 2;
+/// P0 优化：2 -> 8，允许目录并行展开 / 轮询 / 文件读取并发执行，避免单会话排队。
+const MAX_IDLE_SESSIONS_PER_HOST: usize = 8;
 
 /// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理
 const SFTP_SESSION_IDLE_TIMEOUT: u64 = 1800; // 30 分钟（原 5 分钟，通过心跳减少断连）
@@ -1002,11 +1020,33 @@ pub fn file_permissions(config: &SshConnectionConfig, path: &str) -> anyhow::Res
     with_cached_session(config, |session| session.permissions(path))
 }
 
+const LARGE_FILE_THRESHOLD: u64 = 512 * 1024;
+
+fn cached_file_size(config: &SshConnectionConfig, path: &str) -> Option<u64> {
+    let parent = Path::new(path).parent()?;
+    let entries = RemoteFileTreeCache::global().lock().get(config, parent)?;
+    let file_name = Path::new(path).file_name()?.to_string_lossy();
+    entries.into_iter().find(|e| e.name == file_name).map(|e| e.size)
+}
+
 pub fn read_file_bytes(
     config: &SshConnectionConfig,
     path: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(size) = cached_file_size(config, path).filter(|s| *s > LARGE_FILE_THRESHOLD) {
+        return with_cached_session(config, |session| session.read_file_bytes_pipelined(path, size));
+    }
     with_cached_session(config, |session| session.read_file_bytes(path))
+}
+
+/// 供编辑器等调用的显式流水线入口（已知 size 时）
+#[allow(dead_code)]
+pub fn read_file_bytes_pipelined(
+    config: &SshConnectionConfig,
+    path: &str,
+    size: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    with_cached_session(config, |session| session.read_file_bytes_pipelined(path, size))
 }
 
 async fn connect_sftp(
@@ -1485,6 +1525,62 @@ async fn pipelined_writer(
     }
 
     Ok(bytes_written)
+}
+
+async fn pipelined_read_to_vec(
+    raw: Arc<RawSftpSession>,
+    path: &str,
+    size: u64,
+    config: ParallelTransferConfig,
+) -> anyhow::Result<Vec<u8>> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let handle = open_handle(&raw, path, OpenFlags::READ).await?;
+    let mut buffer = vec![0u8; size as usize];
+    let chunk = config.chunk.max(1024) as u32;
+    let parallel = config.parallel.max(1);
+    use futures::future::FutureExt;
+    use futures::stream::{FuturesOrdered, StreamExt};
+
+    let mut reads: FuturesOrdered<futures::future::BoxFuture<'_, anyhow::Result<(u64, Vec<u8>)>>> =
+        FuturesOrdered::new();
+    let mut next_offset = 0u64;
+
+    let make_read = |raw: Arc<RawSftpSession>, handle: String, offset: u64, len: u32| {
+        async move {
+            raw.read(handle, offset, len)
+                .await
+                .map(|d| (offset, d.data))
+                .map_err(|e| anyhow!("SFTP read({offset}) 失败: {e}"))
+        }
+        .boxed()
+    };
+
+    while reads.len() < parallel && next_offset < size {
+        let len = (size - next_offset).min(chunk as u64) as u32;
+        reads.push_back(make_read(raw.clone(), handle.clone(), next_offset, len));
+        next_offset += len as u64;
+    }
+
+    while let Some((offset, data)) = reads.next().await.transpose()? {
+        if data.is_empty() && (offset as usize) < buffer.len() {
+            return Err(anyhow!("远程文件在 offset={offset} 提前结束 (预期大小 {size})"));
+        }
+        let end = offset as usize + data.len();
+        if end > buffer.len() {
+            buffer.resize(end, 0);
+        }
+        buffer[offset as usize..end].copy_from_slice(&data);
+        if next_offset < size {
+            let len = (size - next_offset).min(chunk as u64) as u32;
+            reads.push_back(make_read(raw.clone(), handle.clone(), next_offset, len));
+            next_offset += len as u64;
+        }
+    }
+
+    let _ = raw.close(handle).await;
+    Ok(buffer)
 }
 
 const PREVIEW_ANALYSIS_BYTES: usize = 1024;

@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FileEntryKind {
     Directory,
     File,
@@ -8,11 +9,13 @@ pub enum FileEntryKind {
     Other,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,
     pub kind: FileEntryKind,
+    /// Size in bytes; used to choose pipelined reads for large files.
+    pub size: u64,
 }
 
 impl FileEntry {
@@ -29,7 +32,8 @@ impl FileEntry {
         } else {
             FileEntryKind::Other
         };
-        Some(Self { name, path, kind })
+        let size = entry.metadata().map_or(0, |m| m.len());
+        Some(Self { name, path, kind, size })
     }
 
     pub fn sort_key(&self) -> (u8, String) {

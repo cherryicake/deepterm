@@ -134,7 +134,7 @@ pub(crate) fn load_local_text(path: &Path) -> Result<LoadedText, String> {
     })
 }
 
-/// 读取并解码远程文件字节（后台线程调用）。
+/// Reads and decodes a remote file (permission check is deferred to avoid extra RTT).
 pub(crate) fn load_remote_text(
     config: &SshConnectionConfig,
     path: &str,
@@ -146,17 +146,25 @@ pub(crate) fn load_remote_text(
         return Err("二进制文件，无法作为文本编辑".to_string());
     }
     let decoded = encoding::decode_bytes(&bytes);
-    // 任意写位（owner/group/other）都不存在 → 判定只读。
-    let read_only = crate::ssh::sftp_fs::file_permissions(config, path)
-        .ok()
-        .flatten()
-        .map(|mode| mode & 0o222 == 0)
-        .unwrap_or(false);
     Ok(LoadedText {
         text: decoded.text,
         encoding: decoded.encoding,
-        read_only,
+        read_only: false,
     })
+}
+
+/// Variant that also fetches the read-only flag (costs an extra RTT).
+#[allow(dead_code)]
+pub(crate) fn load_remote_text_with_perm(
+    config: &SshConnectionConfig,
+    path: &str,
+) -> Result<LoadedText, String> {
+    let mut loaded = load_remote_text(config, path)?;
+    loaded.read_only = crate::ssh::sftp_fs::file_permissions(config, path)
+        .ok()
+        .flatten()
+        .is_some_and(|mode| mode & 0o222 == 0);
+    Ok(loaded)
 }
 
 /// 文件树标识符，用于区分不同的文件树（终端会话）
@@ -1560,19 +1568,23 @@ impl Editor {
             return;
         }
 
-        // 检查是否有缓存的文件内容
-        let cached_content = crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
-            .lock()
-            .get_file_content(&ssh_config, std::path::Path::new(&path));
+        // 检查是否有缓存的文件内容（P1: 带 TTL 的 stale-while-revalidate）
+        let (cached_content, is_fresh) = {
+            let cache = crate::file_manager::file_tree_cache::RemoteFileTreeCache::global().lock();
+            let c = cache.get_file_content(&ssh_config, std::path::Path::new(&path));
+            let f = cache.is_file_fresh(&ssh_config, std::path::Path::new(&path));
+            (c, f)
+        };
 
         if let Some((content, encoding)) = cached_content {
-            // 有缓存，直接使用缓存内容打开文件（编码一并恢复，避免保存时写错编码）
+            // 有缓存，直接使用缓存内容秒开
+            let tab_id_for_bg = tab_id.clone();
             self.open_file_with_content(
-                tab_id,
+                tab_id.clone(),
                 path.clone(),
                 content,
                 PathBuf::from(&path),
-                Some(ssh_config),
+                Some(ssh_config.clone()),
                 encoding,
                 false,
                 window,
@@ -1581,6 +1593,56 @@ impl Editor {
                 false, // is_loading = false，因为有缓存内容
                 edit_mode,
             );
+            if !is_fresh {
+                let ssh_config = ssh_config.clone();
+                let path = path.clone();
+                let tab_id = tab_id_for_bg;
+                let weak = cx.entity().downgrade();
+                cx.spawn(async move |_, cx| {
+                    let fetched = cx
+                        .background_executor()
+                        .spawn({
+                            let ssh_config = ssh_config.clone();
+                            let path = path.clone();
+                            async move {
+                                let bytes = crate::ssh::sftp_fs::read_file_bytes(&ssh_config, &path)
+                                    .ok()
+                                    .flatten()?;
+                                if crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
+                                    return None;
+                                }
+                                let decoded = crate::editor::encoding::decode_bytes(&bytes);
+                                Some((decoded.text, decoded.encoding))
+                            }
+                        })
+                        .await;
+                    let Some((fresh_text, fresh_enc)) = fetched else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |this, cx| {
+                        let Some(file) = this.open_files.iter_mut().find(|f| f.id.as_str() == tab_id) else {
+                            return;
+                        };
+                        let should_update = !file.is_loading
+                            && !file.dirty
+                            && file.original_content != fresh_text
+                            && file.editor_state.read(cx).value().to_string() == file.original_content;
+                        if should_update {
+                            file.original_content = fresh_text.clone();
+                            file.encoding = fresh_enc;
+                            file.editor_state.update(cx, |st, cx| st.set_text(fresh_text.clone(), cx));
+                            if let Some(md) = &file.markdown {
+                                md.update(cx, |r, cx| r.set_text(fresh_text.clone(), cx));
+                            }
+                            cx.notify();
+                        }
+                        crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                            .lock()
+                            .insert_file_content(&ssh_config, Path::new(&path), fresh_text, fresh_enc);
+                    });
+                })
+                .detach();
+            }
             return;
         }
 

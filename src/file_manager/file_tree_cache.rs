@@ -8,11 +8,49 @@ use crate::editor::encoding::FileEncoding;
 use crate::file_manager::types::FileEntry;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind};
 use crate::ssh::SshConnectionConfig;
+use serde::{Deserialize, Serialize};
+
+/// Disk persistence types (Instant is reset to now on load).
+#[derive(Serialize, Deserialize)]
+struct PersistedCache {
+    version: u32,
+    servers: HashMap<String, PersistedServer>,
+    file_caches: HashMap<String, HashMap<String, PersistedFileContent>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedServer {
+    nodes: HashMap<String, Vec<FileEntry>>,
+    expanded: HashSet<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedFileContent {
+    content: String,
+    encoding: FileEncoding,
+}
+
+const PERSISTED_VERSION: u32 = 1;
+const MAX_PERSISTED_FILES_PER_HOST: usize = 200;
+const MAX_PERSISTED_DIRS_PER_HOST: usize = 500;
+const MAX_CACHED_FILE_SIZE: usize = 512 * 1024;
+
+fn cache_file_path() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("deepterm/sftp_cache.json")
+}
 
 /// 引用归零后的“保温”时长：释放后保留一段时间，便于切回时复用缓存
 const ORPHAN_TTL: Duration = Duration::from_secs(10 * 60);
 /// 最多保留的无引用服务器数量（超出时按最旧优先逐出）
 const MAX_ORPHAN_SERVERS: usize = 3;
+
+/// P1 优化：目录与文件缓存的 TTL，用于减少不必要的后台刷新
+/// 目录 10s 内视为新鲜，命中后不触发后台 readdir
+const DIR_TTL: Duration = Duration::from_secs(10);
+/// 文件内容 30s 内新鲜，超时后仍秒开但后台会重新校验
+const FILE_TTL: Duration = Duration::from_secs(30);
 
 /// 单个目录的缓存条目
 struct DirNode {
@@ -68,9 +106,107 @@ impl RemoteFileTreeCache {
         }
     }
 
-    /// 获取全局单例
+    /// 获取全局单例（首次初始化时尝试从磁盘恢复）
     pub fn global() -> &'static Mutex<RemoteFileTreeCache> {
-        GLOBAL_CACHE.get_or_init(|| Mutex::new(RemoteFileTreeCache::new()))
+        GLOBAL_CACHE.get_or_init(|| {
+            let mut cache = RemoteFileTreeCache::new();
+            cache.load_from_disk();
+            Mutex::new(cache)
+        })
+    }
+
+    /// Loads persisted cache from disk; failures are ignored.
+    fn load_from_disk(&mut self) {
+        let path = cache_file_path();
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(persisted): Result<PersistedCache, _> = serde_json::from_str(&data) else {
+            return;
+        };
+        if persisted.version != PERSISTED_VERSION {
+            return;
+        }
+        for (key, persisted_server) in persisted.servers {
+            let mut tree = ServerTree::new();
+            for (p_str, entries) in persisted_server.nodes.into_iter().take(MAX_PERSISTED_DIRS_PER_HOST) {
+                tree.nodes.insert(PathBuf::from(p_str), DirNode { entries, loaded_at: Instant::now() });
+            }
+            for p_str in persisted_server.expanded {
+                tree.expanded.insert(PathBuf::from(p_str));
+            }
+            tree.orphaned_since = Some(Instant::now());
+            self.servers.insert(key, tree);
+        }
+        for (key, files) in persisted.file_caches {
+            let mut fc = ServerFileCache::new();
+            for (p_str, persisted_file) in files.into_iter().take(MAX_PERSISTED_FILES_PER_HOST) {
+                if persisted_file.content.len() > MAX_CACHED_FILE_SIZE {
+                    continue;
+                }
+                fc.files.insert(
+                    PathBuf::from(p_str),
+                    FileContentEntry {
+                        content: persisted_file.content,
+                        encoding: persisted_file.encoding,
+                        loaded_at: Instant::now(),
+                    },
+                );
+            }
+            self.file_caches.insert(key, fc);
+        }
+        log::debug!("FileTreeCache loaded from disk: {} servers", self.servers.len());
+    }
+
+    fn to_persisted(&self) -> PersistedCache {
+        let servers = self
+            .servers
+            .iter()
+            .map(|(key, tree)| {
+                let nodes = tree
+                    .nodes
+                    .iter()
+                    .take(MAX_PERSISTED_DIRS_PER_HOST)
+                    .map(|(path, node)| (path.to_string_lossy().to_string(), node.entries.clone()))
+                    .collect();
+                let expanded = tree.expanded.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                (key.clone(), PersistedServer { nodes, expanded })
+            })
+            .collect();
+        let file_caches = self
+            .file_caches
+            .iter()
+            .filter_map(|(key, fc)| {
+                let files = fc
+                    .files
+                    .iter()
+                    .take(MAX_PERSISTED_FILES_PER_HOST)
+                    .filter(|(_, entry)| entry.content.len() <= MAX_CACHED_FILE_SIZE)
+                    .map(|(path, entry)| {
+                        (
+                            path.to_string_lossy().to_string(),
+                            PersistedFileContent { content: entry.content.clone(), encoding: entry.encoding },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                if files.is_empty() { None } else { Some((key.clone(), files)) }
+            })
+            .collect();
+        PersistedCache { version: PERSISTED_VERSION, servers, file_caches }
+    }
+
+    /// P2: 异步落盘（后台线程，不阻塞 UI）
+    fn schedule_save(&self) {
+        let persisted = self.to_persisted();
+        std::thread::spawn(move || {
+            let path = cache_file_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(&persisted) {
+                let _ = std::fs::write(path, json);
+            }
+        });
     }
 
     /// 生成服务器唯一标识（基于用户名、主机、端口）
@@ -97,6 +233,7 @@ impl RemoteFileTreeCache {
                 loaded_at: Instant::now(),
             },
         );
+        self.schedule_save();
     }
 
     /// 移除单个目录及其所有子目录缓存
@@ -104,6 +241,7 @@ impl RemoteFileTreeCache {
         if let Some(tree) = self.servers.get_mut(&Self::server_key(config)) {
             tree.nodes.retain(|p, _| !p.starts_with(path));
         }
+        self.schedule_save();
     }
 
     /// 终端打开时调用：引用计数 +1。如服务器尚无缓存则创建。
@@ -183,6 +321,7 @@ impl RemoteFileTreeCache {
         if let Some(tree) = self.servers.get_mut(&key) {
             tree.expanded = expanded;
         }
+        self.schedule_save();
     }
 
     /// 从共享缓存加载展开状态
@@ -220,6 +359,7 @@ impl RemoteFileTreeCache {
                 loaded_at: Instant::now(),
             },
         );
+        self.schedule_save();
     }
 
     /// 获取缓存的远程文件内容及其磁盘编码
@@ -235,12 +375,35 @@ impl RemoteFileTreeCache {
         Some((entry.content.clone(), entry.encoding))
     }
 
+    /// 判断目录缓存是否新鲜（在 TTL 内）
+    pub fn is_dir_fresh(&self, config: &SshConnectionConfig, path: &Path) -> bool {
+        let key = Self::server_key(config);
+        if let Some(tree) = self.servers.get(&key) {
+            if let Some(node) = tree.nodes.get(path) {
+                return node.loaded_at.elapsed() < DIR_TTL;
+            }
+        }
+        false
+    }
+
+    /// 判断文件内容缓存是否新鲜
+    pub fn is_file_fresh(&self, config: &SshConnectionConfig, path: &Path) -> bool {
+        let key = Self::server_key(config);
+        if let Some(fc) = self.file_caches.get(&key) {
+            if let Some(entry) = fc.files.get(path) {
+                return entry.loaded_at.elapsed() < FILE_TTL;
+            }
+        }
+        false
+    }
+
     /// 移除单个文件的内容缓存
     pub fn remove_file(&mut self, config: &SshConnectionConfig, path: &Path) {
         let key = Self::server_key(config);
         if let Some(file_cache) = self.file_caches.get_mut(&key) {
             if file_cache.files.remove(path).is_some() {
                 log::debug!("FileTreeCache remove file: {}{}", key, path.display());
+                self.schedule_save();
             }
         }
     }
@@ -274,6 +437,7 @@ impl RemoteFileTreeCache {
                 file_cache.files.remove(&event.path);
             }
         }
+        self.schedule_save();
     }
 }
 

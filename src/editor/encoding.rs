@@ -6,9 +6,10 @@
 //! 破坏文件内容）。
 
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE};
+use serde::{Deserialize, Serialize};
 
 /// 文件文本编码。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FileEncoding {
     #[default]
     Utf8,
