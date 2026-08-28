@@ -328,7 +328,7 @@ impl RopeExt for Rope {
     }
 
     fn iter_lines(&self) -> RopeLines<'_> {
-        RopeLines::new(&self)
+        RopeLines::new(self)
     }
 
     fn line_byte_len(&self, row: usize) -> usize {

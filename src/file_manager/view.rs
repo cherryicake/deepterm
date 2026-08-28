@@ -608,7 +608,6 @@ fn remote_total_size(ssh_config: &crate::ssh::SshConnectionConfig, path: &str) -
     match session.execute_command(&cmd, 30) {
         Ok(result) if result.success() => result
             .stdout
-            .trim()
             .split_whitespace()
             .next()
             .and_then(|s| s.parse::<u64>().ok())

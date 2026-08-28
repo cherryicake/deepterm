@@ -16,7 +16,7 @@ const MAX_NEW_LINES: usize = 200_000;
 /// - hunk 只有旧行（删除）→ 在新文本中紧随其后的行（或末行）标 `Deleted`，
 ///   渲染层画一个红色小三角/短条表示“此处上方有删除”。
 pub fn compute_git_line_marks(old_text: &str, new_text: &str) -> Vec<(u32, GitLineMark)> {
-    let new_line_count = new_text.lines().count().max(if new_text.is_empty() { 0 } else { 0 });
+    let new_line_count = new_text.lines().count();
     if new_line_count > MAX_NEW_LINES {
         return Vec::new();
     }

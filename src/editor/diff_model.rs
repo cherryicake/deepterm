@@ -333,7 +333,6 @@ pub(crate) fn build_unified_collapsed(
 ) -> CollapsedUnified {
     let old_starts = line_starts(old_text);
     let new_starts = line_starts(new_text);
-    let old_line_count = line_count(old_text, &old_starts);
     let new_line_count = line_count(new_text, &new_starts);
 
     let mut text = String::new();
@@ -403,7 +402,8 @@ pub(crate) fn build_unified_collapsed(
         new_from: u32,
         new_to: u32,
         old_from: u32,
-        leading: bool,
+        // `true` for the gap after the last hunk (tail of file).
+        trailing: bool,
         expanded: &std::collections::HashSet<u32>,
     ) {
         let gap_len = new_to.saturating_sub(new_from);
@@ -414,45 +414,42 @@ pub(crate) fn build_unified_collapsed(
             push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
             return;
         }
-        if leading {
-            // Head/tail-of-file or post-hunk strip: visible C rows sit at the
-            // START of the gap when it precedes a hunk...
-            let visible = CONTEXT_LINES.min(gap_len);
-            let hidden = gap_len - visible;
-            let hidden_id = new_from; // hidden region starts at gap head
-            if expanded.contains(&hidden_id) {
-                push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
-                return;
-            }
-            push_context(
-                text,
-                lines,
-                new_text,
-                new_starts,
-                new_from + hidden,
-                new_to,
-                old_from + hidden,
-            );
-            push_separator(text, lines, separators, hidden_id, hidden);
+
+        // Keep `visible` context rows and replace the other `hidden` rows with a
+        // single placeholder. Which end the visible rows sit at follows whatever
+        // the gap is adjacent to:
+        //   - before the next hunk: they must lead into it, so they are the LAST
+        //     rows of the gap and the placeholder goes in front of them.
+        //   - after the last hunk (trailing): they are the context of that hunk,
+        //     so they are the FIRST rows of the gap and the placeholder follows.
+        let visible = CONTEXT_LINES.min(gap_len);
+        let hidden = gap_len - visible;
+        let (vis_from, vis_to, hidden_start) = if trailing {
+            (new_from, new_from + visible, new_from + visible)
         } else {
-            // ...or at the END of the gap when it follows a hunk.
-            let visible = CONTEXT_LINES.min(gap_len);
-            let hidden = gap_len - visible;
-            let hidden_id = new_from; // hidden region starts at gap head
-            if expanded.contains(&hidden_id) {
-                push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
-                return;
-            }
-            push_separator(text, lines, separators, hidden_id, hidden);
-            push_context(
-                text,
-                lines,
-                new_text,
-                new_starts,
-                new_from + hidden,
-                new_to,
-                old_from + hidden,
-            );
+            (new_from + hidden, new_to, new_from)
+        };
+
+        // id = new-side start line of the hidden region: stable across
+        // recomputes, so it doubles as the expansion key.
+        if expanded.contains(&hidden_start) {
+            push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+            return;
+        }
+        if !trailing {
+            push_separator(text, lines, separators, hidden_start, hidden);
+        }
+        push_context(
+            text,
+            lines,
+            new_text,
+            new_starts,
+            vis_from,
+            vis_to,
+            old_from + (vis_from - new_from),
+        );
+        if trailing {
+            push_separator(text, lines, separators, hidden_start, hidden);
         }
     }
 
@@ -489,7 +486,7 @@ pub(crate) fn build_unified_collapsed(
                 );
             }
         } else if gap_new > 0 {
-            // Between hunks: C trailing + separator + C leading.
+            // Between hunks: separator, then context leading into the next hunk.
             push_gap(
                 &mut text,
                 &mut lines,
@@ -499,7 +496,7 @@ pub(crate) fn build_unified_collapsed(
                 new_cursor,
                 hunk.new_rows.start,
                 old_cursor,
-                false,
+                false, // not trailing: the next hunk follows this gap
                 expanded,
             );
         }
@@ -535,7 +532,7 @@ pub(crate) fn build_unified_collapsed(
         new_cursor = hunk.new_rows.end;
     }
 
-    // Tail gap after the last hunk: keep only leading C rows.
+    // Tail gap after the last hunk: context first, then the placeholder.
     if new_cursor < new_line_count {
         push_gap(
             &mut text,
@@ -546,7 +543,7 @@ pub(crate) fn build_unified_collapsed(
             new_cursor,
             new_line_count,
             old_cursor,
-            true,
+            true, // trailing: no hunk follows, so the file tail is collapsed
             expanded,
         );
     }
@@ -785,8 +782,8 @@ fn should_word_diff(
         && !new_byte_range.is_empty()
         && old_byte_range.len() <= MAX_WORD_DIFF_LEN
         && new_byte_range.len() <= MAX_WORD_DIFF_LEN
-        && old_rows.len() <= MAX_WORD_DIFF_LINE_COUNT as usize
-        && new_rows.len() <= MAX_WORD_DIFF_LINE_COUNT as usize
+        && old_rows.len() <= MAX_WORD_DIFF_LINE_COUNT
+        && new_rows.len() <= MAX_WORD_DIFF_LINE_COUNT
 }
 
 fn diff_internal(
@@ -1106,7 +1103,37 @@ mod collapsed_tests {
         expanded.insert(0u32); // 展开头部分隔区
         let out = build_unified_collapsed(&old, &new, &hunks, &expanded);
         assert_eq!(out.separators.len(), 1); // 只剩尾部
-        assert_eq!(out.separators[0].id, 22); // 尾部隐藏区从 new 第 23 行(索引22，即 hunk 结束处)开始
+        // 尾部：new 22..42 是尾部 gap，前 CONTEXT_LINES 行作为上下文保留，
+        // 隐藏区从 22 + CONTEXT_LINES 开始。
+        assert_eq!(out.separators[0].id, 22 + CONTEXT_LINES);
+    }
+
+    #[test]
+    fn tail_gap_keeps_context_adjacent_to_last_hunk() {
+        // 回归：尾部折叠必须保留紧贴最后一个 hunk 的上下文行，
+        // 占位行应排在它们之后，而不是跑到文件末尾下方。
+        let (old, new) = sample_texts();
+        let hunks = compute_hunks(&old, &new);
+        let out = build_unified_collapsed(&old, &new, &hunks, &HashSet::new());
+
+        let seps: Vec<u32> = out.separators.iter().map(|s| s.merged_row).collect();
+        let last_sep = *seps.last().unwrap() as usize;
+
+        // 占位行之前的那几行必须是 hunk 结束后紧接着的 tail20..tail23，
+        // 而不是文件末尾的 tail36..tail39。
+        let ctx: Vec<&str> = (last_sep - CONTEXT_LINES as usize..last_sep)
+            .map(|i| &out.source.text[out.source.lines[i].merged_range.clone()])
+            .collect();
+        assert_eq!(ctx, vec!["tail20", "tail21", "tail22", "tail23"]);
+
+        // 占位行之后不应再有任何内容行。
+        assert_eq!(last_sep, out.source.lines.len() - 1);
+
+        // 且它们必须是 new 侧的 22..26（hunk 结束后的前 4 行），
+        // 而不是文件末尾的 38..41。
+        for (offset, i) in (last_sep - CONTEXT_LINES as usize..last_sep).enumerate() {
+            assert_eq!(out.source.lines[i].new_lineno, Some(22 + offset as u32));
+        }
     }
 
     #[test]

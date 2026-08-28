@@ -13,6 +13,9 @@ use crate::assets::Icon;
 use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 
+/// 选项选中回调，参数为选中的文本与其索引。
+type SelectCallback = Rc<dyn Fn(SharedString, usize, &mut Window, &mut App)>;
+
 /// 下拉进入动画时长（毫秒）。
 const SELECT_ENTER_MS: u64 = 200;
 /// 下拉退出动画时长（毫秒）。
@@ -97,7 +100,7 @@ pub struct MacosSelect {
     selected_item: SharedString,
     highlighted_index: usize,
     scroll_handle: ScrollHandle,
-    on_select: Option<Rc<dyn Fn(SharedString, usize, &mut Window, &mut App)>>,
+    on_select: Option<SelectCallback>,
     trigger_bounds: Rc<Cell<gpui::Bounds<Pixels>>>,
     /// 动画代次，确保每次开/关从 delta=0 重新播放。
     anim_epoch: u32,

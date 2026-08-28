@@ -148,12 +148,12 @@ impl SplitContainer {
     }
 
     /// 收集所有面板
-    pub fn collect_panels(&self, cx: &App, panels: &mut Vec<Entity<Panel>>) {
+    pub fn collect_panels(&self, panels: &mut Vec<Entity<Panel>>) {
         match self {
             SplitContainer::Panel(panel) => panels.push(panel.clone()),
             SplitContainer::Split { children, .. } => {
                 for child in children {
-                    child.collect_panels(cx, panels);
+                    child.collect_panels(panels);
                 }
             }
         }
@@ -498,9 +498,9 @@ impl SplitManager {
     }
 
     /// 收集所有面板
-    pub fn collect_panels(&self, cx: &App) -> Vec<Entity<Panel>> {
+    pub fn collect_panels(&self) -> Vec<Entity<Panel>> {
         let mut panels = Vec::new();
-        self.root.collect_panels(cx, &mut panels);
+        self.root.collect_panels(&mut panels);
         panels
     }
 }

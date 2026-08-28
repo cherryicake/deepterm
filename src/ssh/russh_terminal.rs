@@ -43,43 +43,7 @@ impl client::Handler for SshClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        match russh::keys::known_hosts::check_known_hosts(&self.host, self.port, server_public_key)
-        {
-            Ok(true) => {
-                log::debug!("russh: 主机密钥已知且匹配: {}:{}", self.host, self.port);
-                Ok(true)
-            }
-            Ok(false) => {
-                // 主机未知，自动添加到 known_hosts（accept-new 行为）
-                log::info!(
-                    "russh: 新主机 {}:{}，自动添加密钥到 known_hosts",
-                    self.host,
-                    self.port
-                );
-                if let Err(e) = russh::keys::known_hosts::learn_known_hosts(
-                    &self.host,
-                    self.port,
-                    server_public_key,
-                ) {
-                    log::warn!("russh: 写入 known_hosts 失败: {}", e);
-                }
-                Ok(true)
-            }
-            Err(russh::keys::Error::KeyChanged { line }) => {
-                log::error!(
-                    "russh: 主机密钥已变更！{}:{} known_hosts 第 {} 行不匹配",
-                    self.host,
-                    self.port,
-                    line
-                );
-                Err(russh::Error::Inconsistent)
-            }
-            Err(e) => {
-                log::warn!("russh: known_hosts 检查出错: {}", e);
-                // 检查出错时接受密钥（兼容性）
-                Ok(true)
-            }
-        }
+        crate::ssh::host_key::check_and_trust_host_key(&self.host, self.port, server_public_key)
     }
 }
 

@@ -25,6 +25,12 @@ pub struct NotificationManager {
     current: Option<NotificationItem>,
 }
 
+impl Default for NotificationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NotificationManager {
     pub fn new() -> Self {
         Self { current: None }

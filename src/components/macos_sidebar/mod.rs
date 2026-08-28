@@ -29,6 +29,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
 use crate::file_manager::file_tree_event::FileTreeEvent;
@@ -131,17 +132,17 @@ pub enum SidebarEvent {
     TabGroupsChanged,
     OpenFile {
         path: PathBuf,
-        ssh_config: Option<SshConnectionConfig>,
-    },
-    OpenDiff {
-        path: String,
-        diff: crate::editor::diff_model::DiffFile,
-        repo: crate::editor::git_repository::GitRepository,
+        ssh_config: Option<Box<SshConnectionConfig>>,
     },
     /// Instant open; content loads asynchronously in DiffView.
     OpenDiffLoading {
         path: String,
         repo: crate::editor::git_repository::GitRepository,
+    },
+    /// A file's staging state changed (staged or unstaged by the Git panel).
+    /// The HEAD → worktree diff for that path must be recomputed.
+    GitIndexChanged {
+        path: String,
     },
 }
 
@@ -150,8 +151,8 @@ impl std::fmt::Debug for SidebarEvent {
         match self {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
-            Self::OpenDiff { path, .. } => f.debug_struct("OpenDiff").field("path", path).finish(),
             Self::OpenDiffLoading { path, .. } => f.debug_struct("OpenDiffLoading").field("path", path).finish(),
+            Self::GitIndexChanged { path } => f.debug_struct("GitIndexChanged").field("path", path).finish(),
         }
     }
 }
@@ -166,6 +167,9 @@ pub enum SidebarView {
     Keychain,
     FileTree,
 }
+
+/// Tab 点击回调：`(group_id, tab_id, tab_title, sidebar, window, cx)`。
+type TabClickCallback = Rc<dyn Fn(&str, &str, &str, &mut MacosSidebar, &mut Window, &mut App)>;
 
 pub struct MacosSidebar {
     visible: bool,
@@ -202,9 +206,9 @@ pub struct MacosSidebar {
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
     app_window: Option<WeakEntity<crate::AppWindow>>,
-    on_tab_group_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
-    on_tab_double_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
-    on_tab_single_click: Option<Rc<dyn Fn(&str, &str, &str, &mut Self, &mut Window, &mut App)>>,
+    on_tab_group_select: OptionalStrCallback,
+    on_tab_double_click: Option<TabClickCallback>,
+    on_tab_single_click: Option<TabClickCallback>,
 
     tab_group_menu_open: bool,
     tab_group_menu_group_id: Option<String>,
@@ -381,7 +385,7 @@ impl MacosSidebar {
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
         self.file_tree_subscription.take();
         if let Some(tree) = self.file_tree_view.take() {
-            let _ = tree.update(cx, |tree, cx| tree.cleanup(cx));
+            tree.update(cx, |tree, cx| tree.cleanup(cx));
         }
         self.file_tree_terminal_view = None;
         self.file_tree_target_label = None;
@@ -456,6 +460,9 @@ impl Default for MacosSidebar {
 
 impl EventEmitter<SidebarEvent> for MacosSidebar {}
 
+/// 侧边栏显隐动画参数：`(动画元素 id, 动画键, 时长(ms), 宽度缓动函数)`。
+type SidebarAnimSpec<'a> = (&'a str, &'a str, u64, Box<dyn Fn(f32) -> f32>);
+
 impl Render for MacosSidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.visible && !self.animating_out {
@@ -466,7 +473,7 @@ impl Render for MacosSidebar {
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
 
-        let (anim_id, anim_key, duration_ms, width_fn): (&str, &str, u64, Box<dyn Fn(f32) -> f32>) =
+        let (anim_id, anim_key, duration_ms, width_fn): SidebarAnimSpec<'_> =
             if self.visible {
                 (
                     "macos-sidebar-enter",

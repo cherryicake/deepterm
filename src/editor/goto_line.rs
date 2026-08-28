@@ -46,12 +46,11 @@ impl GotoLinePanel {
             cx.subscribe(&input, |this: &mut Self, _, event, cx| {
                 match event {
                     InputEvent::Submit => this.confirm(cx),
-                    InputEvent::Change => {
-                        if this.error.is_some() {
+                    InputEvent::Change
+                        if this.error.is_some() => {
                             this.error = None;
                             cx.notify();
                         }
-                    }
                     _ => {}
                 }
             })

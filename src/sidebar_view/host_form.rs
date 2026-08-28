@@ -6,6 +6,7 @@ use gpui::{
     px,
 };
 
+use crate::callbacks::OptionalAppCallback;
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
@@ -59,8 +60,8 @@ pub struct NewHostForm {
 
     error_message: Option<String>,
     success_message: Option<String>,
-    on_cancel: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
-    on_saved: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
+    on_cancel: OptionalAppCallback,
+    on_saved: OptionalAppCallback,
 }
 
 impl NewHostForm {
@@ -232,7 +233,7 @@ impl NewHostForm {
         self.port_input
             .update(cx, |input, cx| input.set_text("22", cx));
         self.username_input.update(cx, |input, cx| {
-            input.set_text(&get_current_username().unwrap_or_default(), cx);
+            input.set_text(get_current_username().unwrap_or_default(), cx);
         });
         self.password_input.update(cx, |input, cx| input.clear(cx));
         self.key_path_input.update(cx, |input, cx| input.clear(cx));
@@ -271,7 +272,7 @@ impl NewHostForm {
         self.hostname_input
             .update(cx, |input, cx| input.set_text(&config.host, cx));
         self.port_input
-            .update(cx, |input, cx| input.set_text(&config.port.to_string(), cx));
+            .update(cx, |input, cx| input.set_text(config.port.to_string(), cx));
         self.username_input
             .update(cx, |input, cx| input.set_text(&config.username, cx));
 
@@ -567,9 +568,7 @@ impl NewHostForm {
                     .child(div().text_sm().text_color(theme.error).child(err.clone()))
                     .into_any_element(),
             )
-        } else if let Some(ref succ) = self.success_message {
-            Some(
-                div()
+        } else { self.success_message.as_ref().map(|succ| div()
                     .w_full()
                     .child(
                         div()
@@ -577,11 +576,7 @@ impl NewHostForm {
                             .text_color(theme.success)
                             .child(succ.clone()),
                     )
-                    .into_any_element(),
-            )
-        } else {
-            None
-        }
+                    .into_any_element()) }
     }
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -634,7 +629,7 @@ impl Render for NewHostForm {
             .flex_col()
             .gap(px(10.))
             .child(self.render_header(cx))
-            .children(self.render_message(cx).into_iter())
+            .children(self.render_message(cx))
             // ── Basic Info ──
             .child(self.render_section_title("基本信息", cx))
             .child(self.render_row("昵称", false, EditorInput::new(&self.nickname_input), cx))

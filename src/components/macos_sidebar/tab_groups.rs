@@ -304,7 +304,7 @@ impl MacosSidebar {
                 .timer(Duration::from_millis(MENU_COLLAPSE_ANIMATION_MS))
                 .await;
 
-            let _ = sidebar.update(cx, |this, cx| {
+            sidebar.update(cx, |this, cx| {
                 let reset = match target {
                     CollapseEpochTarget::DefaultTabGroup => {
                         if this.default_tab_group_epoch == epoch {
@@ -679,7 +679,7 @@ impl MacosSidebar {
                 if let Some(menu) = self.tab_group_popup_menu.clone() {
                     let position = self
                         .tab_group_menu_position
-                        .unwrap_or(gpui::Point::default());
+                        .unwrap_or_default();
                     this.child(
                         deferred(
                             anchored()

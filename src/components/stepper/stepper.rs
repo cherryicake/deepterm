@@ -7,6 +7,9 @@ use gpui::{
 
 use crate::components::stepper::{StepperSize, item::StepperItem};
 
+/// 步骤点击回调，参数为被点击的步序号。
+type StepClickCallback = Rc<dyn Fn(&usize, &mut Window, &mut App)>;
+
 /// Stepper 整体状态
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StepperStatus {
@@ -31,7 +34,7 @@ pub struct Stepper {
     text_center: bool,
     status: StepperStatus,
     size: StepperSize,
-    on_click: Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>,
+    on_click: StepClickCallback,
 }
 
 impl Stepper {
@@ -153,7 +156,7 @@ impl RenderOnce for Stepper {
                     .status(status)
                     .size(size)
                     .when(disabled, |this| this.disabled(true))
-                    .is_last(is_last)
+                    .last(is_last)
                     .on_click(move |_, window, cx| {
                         on_click(&step, window, cx);
                     })

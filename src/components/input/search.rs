@@ -20,11 +20,11 @@ use crate::components::button::{
 use crate::theme::ActiveTheme;
 
 use super::{
-    EditorInput, Enter, Escape, IndentInline, InputEvent, InputState, Search, SearchPrevious,
+    EditorInput, Enter, Escape, IndentInline, InputEvent, InputState, Search,
     movement::MoveDirection,
 };
 
-const CONTEXT: &'static str = "SearchPanel";
+const CONTEXT: &str = "SearchPanel";
 
 actions!(input, [Tab]);
 
@@ -93,13 +93,19 @@ enum SearchQuery {
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
-    pub query: Option<SearchQuery>,
+    query: Option<SearchQuery>,
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
     /// Is in replacing mode, if true, the next update will update the current
     /// match index based on matched ranges.
     replacing: bool,
+}
+
+impl Default for SearchMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SearchMatcher {
@@ -142,9 +148,7 @@ impl SearchMatcher {
             }
         }
         self.matched_ranges = Rc::new(new_ranges);
-        if !self.replacing {
-            self.current_match_ix = 0;
-        } else if self.matched_ranges.is_empty() {
+        if !self.replacing || self.matched_ranges.is_empty() {
             self.current_match_ix = 0;
         } else {
             self.current_match_ix = self.current_match_ix.min(self.matched_ranges.len() - 1);
@@ -326,19 +330,8 @@ impl InputState {
         cx.notify();
     }
 
-    pub(super) fn on_action_search_previous(
-        &mut self,
-        _: &SearchPrevious,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.searchable {
-            return;
-        }
-        if let Some(panel) = self.search_panel.as_ref() {
-            panel.update(cx, |this, cx| this.jump(-1, window, cx));
-        }
-    }
+    // NOTE: `SearchPrevious` 由 `SearchPanel::on_action_search_previous` 处理
+    // （焦点在搜索面板内时派发）。这里不需要重复实现。
 }
 
 impl SearchPanel {
@@ -353,16 +346,7 @@ impl SearchPanel {
         }
     }
 
-    fn prev_scroll_direction(
-        previous_match_ix: usize,
-        current_match_ix: usize,
-    ) -> Option<MoveDirection> {
-        if current_match_ix >= previous_match_ix {
-            None
-        } else {
-            Some(MoveDirection::Up)
-        }
-    }
+    // 没有「替换并跳到上一个」的入口，`prev_scroll_direction` 因此没有调用点。
 
     pub fn new(editor: Entity<InputState>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));

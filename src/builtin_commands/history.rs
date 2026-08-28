@@ -129,7 +129,7 @@ impl CommandHistory {
             })
             .collect();
 
-        hits.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+        hits.sort_by_key(|b| std::cmp::Reverse(b.last_used));
         hits.into_iter().take(MAX_MATCHES).cloned().collect()
     }
 

@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    GitLineMark, InputState, LastLayout, ScrollbarGeometry, WhitespaceIndicators,
+    GitLineMark, InputState, LastLayout, RainbowCache, ScrollbarGeometry, WhitespaceIndicators,
     mode::InputMode,
     state::{
         RAINBOW_BRACKETS_MAX_TEXT_LEN, scan_bracket_spans_text, scan_bracket_spans_tree,
@@ -298,9 +298,9 @@ impl TextElement {
         let mut cursor_bounds = None;
 
         // If the input has a fixed height (Otherwise is auto-grow), we need to add a bottom margin to the input.
-        let top_bottom_margin = if state.mode.is_auto_grow() {
-            line_height
-        } else if visible_range.len() < BOTTOM_MARGIN_ROWS * 8 {
+        let top_bottom_margin = if state.mode.is_auto_grow()
+            || visible_range.len() < BOTTOM_MARGIN_ROWS * 8
+        {
             line_height
         } else {
             BOTTOM_MARGIN_ROWS * line_height
@@ -463,7 +463,7 @@ impl TextElement {
             scroll_offset = deferred_scroll_offset;
         }
 
-        bounds.origin = bounds.origin + scroll_offset;
+        bounds.origin += scroll_offset;
 
         (cursor_bounds, scroll_offset, current_row)
     }
@@ -736,7 +736,7 @@ impl TextElement {
         let range = start_ix.max(last_layout.visible_range_offset.start)
             ..end_ix.min(last_layout.visible_range_offset.end);
 
-        Self::layout_match_range(range, &last_layout, bounds)
+        Self::layout_match_range(range, last_layout, bounds)
     }
 
     /// Layout highlight paths for every search match in the visible range.
@@ -825,7 +825,7 @@ impl TextElement {
 
         // 高度限制：至少留出一行内容可见
         let available = bounds.size.height - line_height;
-        let fit_rows = (f32::from(available / line_height).floor().max(0.)) as usize;
+        let fit_rows = ((available / line_height).floor().max(0.)) as usize;
         let sticky_rows = if sticky_rows.len() > fit_rows {
             // 保留最内侧（最靠近可见区）的行
             let keep = sticky_rows.len() - fit_rows;
@@ -951,7 +951,11 @@ impl TextElement {
         let cached = {
             let state = self.state.read(cx);
             match &state.rainbow_cache {
-                Some((v, k, spans)) if *v == version && *k == tree_key => Some(spans.clone()),
+                Some(cache)
+                    if cache.text_version == version && cache.tree_fingerprint == tree_key =>
+                {
+                    Some(cache.spans.clone())
+                }
                 _ => None,
             }
         };
@@ -967,7 +971,11 @@ impl TextElement {
                 };
                 let computed = std::rc::Rc::new(computed);
                 self.state.update(cx, |state, _| {
-                    state.rainbow_cache = Some((version, tree_key, computed.clone()));
+                    state.rainbow_cache = Some(RainbowCache {
+                        text_version: version,
+                        tree_fingerprint: tree_key,
+                        spans: computed.clone(),
+                    });
                 });
                 computed
             }
@@ -1373,7 +1381,7 @@ impl TextElement {
             let shaped_line = window.text_system().shape_line(
                 display_text.to_string().into(),
                 font_size,
-                &runs,
+                runs,
                 None,
             );
 
@@ -1392,7 +1400,7 @@ impl TextElement {
                     let shaped_line = window.text_system().shape_line(
                         SharedString::from(line.to_string()),
                         font_size,
-                        &runs,
+                        runs,
                         None,
                     );
                     LineLayout::new()
@@ -1413,7 +1421,7 @@ impl TextElement {
         let first_line_start = display_text
             .line_start_offset(*last_layout.visible_buffer_lines.first().unwrap_or(&0));
 
-        for (_vi, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
+        for &buffer_line in last_layout.visible_buffer_lines.iter() {
             let line_text: String = display_text.slice_line(buffer_line).into();
             let line_item = buffer_lines
                 .get(buffer_line)
@@ -1425,7 +1433,7 @@ impl TextElement {
             let mut wrapped_lines = SmallVec::with_capacity(1);
 
             for range in &line_item.wrapped_lines {
-                let line_runs = runs_for_range(runs, run_offset, &range);
+                let line_runs = runs_for_range(runs, run_offset, range);
 
                 // Defensive checks to avoid panics from out-of-sync display map
                 if range.start > line_text.len()
@@ -1525,7 +1533,7 @@ impl TextElement {
                 if start > cursor {
                     styles.push((cursor..start, HighlightStyle::default()));
                 }
-                styles.push((start..end, style.clone()));
+                styles.push((start..end, *style));
                 cursor = end.max(cursor);
             }
             if cursor < byte_end {
@@ -1552,7 +1560,16 @@ impl TextElement {
                         highlighter.styles(&(byte_start..byte_end), &highlight_theme)
                     };
 
-                    *styles = combine_highlights_stable(styles.clone(), range_styles);
+                    // 各可见段严格递增且互不重叠（超长行与折叠会切段），
+                    // 所以无需把已累积的样式一起重排 —— 只需归并本段内部
+                    // （tree-sitter 的 captures 天然嵌套重叠），再追加到尾部。
+                    // 此前写的是 `combine(styles.clone(), range_styles)`，
+                    // 每段都对全部累积样式排序一次，段数一多就退化成
+                    // O(K · N log N)。
+                    styles.extend(combine_highlights_stable(
+                        Vec::<(Range<usize>, HighlightStyle)>::new(),
+                        range_styles,
+                    ));
                 };
 
             // Group contiguous visible lines into ranges and call styles() once per range
@@ -1726,8 +1743,8 @@ impl IntoElement for TextElement {
 /// A debug function to print points as SVG path.
 #[allow(unused)]
 fn print_points_as_svg_path(
-    line_corners: &Vec<Corners<Point<Pixels>>>,
-    points: &Vec<Point<Pixels>>,
+    line_corners: &[Corners<Point<Pixels>>],
+    points: &[Point<Pixels>],
 ) {
     for corners in line_corners {
         println!(
@@ -1743,7 +1760,7 @@ fn print_points_as_svg_path(
         );
     }
 
-    if points.len() > 0 {
+    if !points.is_empty() {
         println!(
             "M{},{}",
             points[0].x.as_f32() as i32,
@@ -1814,7 +1831,7 @@ impl Element for TextElement {
         let line_height = window.line_height();
 
         let (visible_range, visible_buffer_lines, visible_top) =
-            self.calculate_visible_range(&state, line_height, bounds.size.height);
+            self.calculate_visible_range(state, line_height, bounds.size.height);
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text
@@ -1839,12 +1856,10 @@ impl Element for TextElement {
         let is_empty = text.len() == 0;
         let placeholder = self.placeholder.clone();
 
-        let text_size = if is_empty && state.placeholder_font_size.is_some() {
-            state.placeholder_font_size.unwrap()
-        } else if let Some(font_size) = state.font_size {
-            font_size
-        } else {
-            style.font_size.to_pixels(window.rem_size())
+        let text_size = match (is_empty, state.placeholder_font_size, state.font_size) {
+            (true, Some(placeholder_font_size), _) => placeholder_font_size,
+            (_, _, Some(font_size)) => font_size,
+            _ => style.font_size.to_pixels(window.rem_size()),
         };
 
         let mut text_style = window.text_style();
@@ -1868,7 +1883,7 @@ impl Element for TextElement {
 
         // Calculate the width of the line numbers
         let (line_number_width, line_number_len) =
-            Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
+            Self::layout_line_numbers(state, &text, text_size, &text_style, window);
 
         let input_bounds = bounds; // 未滚动的元素 bounds（sticky scroll 锚定用）
         let mut bounds = bounds;
@@ -1985,11 +2000,11 @@ impl Element for TextElement {
 
         // Create shaped lines for whitespace indicators before layout
         let whitespace_indicators =
-            Self::layout_whitespace_indicators(&state, text_size, &text_style, window, cx);
+            Self::layout_whitespace_indicators(state, text_size, &text_style, window, cx);
 
         let lines = Self::layout_lines(
-            &state,
-            &display_text,
+            state,
+            display_text,
             &last_layout,
             text_size,
             &runs,
@@ -2092,7 +2107,7 @@ impl Element for TextElement {
         last_layout.cursor_bounds = cursor_bounds;
 
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
-        let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
+        let search_match_paths = self.layout_search_matches(&last_layout, &bounds, cx);
         let bracket_paths = self.layout_bracket_matches(&last_layout, &bounds, window, cx);
         let occurrence_paths = self.layout_occurrences(&last_layout, &bounds, window, cx);
 
@@ -2141,7 +2156,7 @@ impl Element for TextElement {
                 sub_lines.push(
                     window
                         .text_system()
-                        .shape_line(line_no, text_size, &runs, None),
+                        .shape_line(line_no, text_size, runs, None),
                 );
                 for _ in 0..line.wrapped_lines.len().saturating_sub(1) {
                     sub_lines.push(ShapedLine::default());
@@ -2167,7 +2182,9 @@ impl Element for TextElement {
             cx,
         );
 
-        let prepaint_state = PrepaintState {
+        
+
+        PrepaintState {
             bounds,
             last_layout,
             scroll_size,
@@ -2181,9 +2198,7 @@ impl Element for TextElement {
             occurrence_paths,
             sticky_lines,
             fold_icon_layout,
-        };
-
-        prepaint_state
+        }
     }
 
     fn paint(
@@ -2398,15 +2413,15 @@ impl Element for TextElement {
                     for i in 0..total_lines {
                         let cur = indents[i];
                         if cur >= 0 {
-                            counts[i] = (cur as usize + indent_size - 1) / indent_size;
+                            counts[i] = (cur as usize).div_ceil(indent_size);
                         } else {
                             let above = prev[i];
                             let below = next[i];
                             counts[i] = match (above, below) {
                                 (-1, _) | (_, -1) => 0,
                                 (a, b) if a < b => (a as usize / indent_size) + 1,
-                                (a, b) if a == b => (b as usize + indent_size - 1) / indent_size,
-                                (_, b) if off_side => (b as usize + indent_size - 1) / indent_size,
+                                (a, b) if a == b => (b as usize).div_ceil(indent_size),
+                                (_, b) if off_side => (b as usize).div_ceil(indent_size),
                                 (_, b) => (b as usize / indent_size) + 1,
                             };
                         }
@@ -2467,7 +2482,7 @@ impl Element for TextElement {
                         }
                         let is_active = level == active_level
                             && active_level != 0
-                            && (active_start <= buffer_line + 1 && buffer_line + 1 <= active_end);
+                            && (active_start <= buffer_line + 1 && buffer_line < active_end);
                         let color = if is_active { active_color } else { base_color };
                         window.paint_quad(fill(
                             Bounds::new(point(x, line_y), size(px(1.), line_h)),
@@ -2516,7 +2531,7 @@ impl Element for TextElement {
             );
 
             // Paint the actual line
-            _ = line.paint(
+            line.paint(
                 p,
                 line_height,
                 text_align,

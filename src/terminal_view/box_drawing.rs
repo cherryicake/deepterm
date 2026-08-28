@@ -166,10 +166,10 @@ pub fn paint_box_drawing(
         0x2500..=0x257F => {
             let segs = BOX_SEGS[(code - 0x2500) as usize];
             if segs != 0 {
-                let left = (segs & 0x03) as u8;
-                let right = ((segs >> 2) & 0x03) as u8;
-                let up = ((segs >> 4) & 0x03) as u8;
-                let down = ((segs >> 6) & 0x03) as u8;
+                let left = segs & 0x03;
+                let right = (segs >> 2) & 0x03;
+                let up = (segs >> 4) & 0x03;
+                let down = (segs >> 6) & 0x03;
                 paint_segments(origin, cell_w, cell_h, left, right, up, down, &mut paint);
             }
         }

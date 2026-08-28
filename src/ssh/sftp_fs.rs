@@ -22,6 +22,11 @@ use crate::ssh::keychain::{
     ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
 };
 
+/// 命令输出的实时进度回调：每收到一块 stderr 数据调用一次。
+type ProgressCallback<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+/// 分片读取任务：成功时返回 `(分片起始偏移, 数据)`。
+type ChunkReadFuture<'a> = futures::future::BoxFuture<'a, anyhow::Result<(u64, Vec<u8>)>>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteFileKind {
     Directory,
@@ -47,16 +52,23 @@ pub struct RemoteFileMetadata {
     pub permissions: Option<u32>,
 }
 
-struct SftpClientHandler;
+/// SFTP 通道的 russh handler。
+///
+/// 必须做主机密钥校验：SFTP 承载全部远端文件读写，若像早期版本那样无条件
+/// 接受任何密钥，这条通道对中间人攻击就是完全敞开的。
+struct SftpClientHandler {
+    host: String,
+    port: u16,
+}
 
 impl client::Handler for SftpClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        crate::ssh::host_key::check_and_trust_host_key(&self.host, self.port, server_public_key)
     }
 }
 
@@ -621,7 +633,7 @@ impl BlockingSftpSession {
         command: &str,
         timeout_secs: u64,
         cancelled: Option<&AtomicBool>,
-        mut progress_cb: Option<&mut dyn FnMut(&[u8])>,
+        mut progress_cb: ProgressCallback<'_>,
         agent_forward: bool,
     ) -> anyhow::Result<RemoteCommandResult> {
         crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
@@ -675,7 +687,8 @@ impl BlockingSftpSession {
                         Some(russh::ChannelMsg::Data { data }) => {
                             stdout.extend_from_slice(&data);
                         }
-                        Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
+                        // `ext == 1` 即 stderr，直接写成字面量模式，无需 guard。
+                        Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
                             if let Some(cb) = progress_cb.as_mut() {
                                 cb(&data);
                             }
@@ -904,15 +917,30 @@ fn get_or_connect_session(
 }
 
 /// 归还使用完毕的会话：池未满则放回复用，否则直接丢弃（`Drop` 时干净断开）。
+///
+/// 条目不存在时（首次归还、或此前被过期清理过）必须先建立条目，否则会话永远
+/// 无法入池 —— 每次操作都会退化成新建一条 SSH 连接。
 fn checkin_session(key: &str, session: SharedBlockingSftpSession) {
     let mut cache = session_cache().lock();
-    if let Some(entry) = cache.get_mut(key) {
-        entry.last_access = std::time::Instant::now();
-        if entry.idle.len() < MAX_IDLE_SESSIONS_PER_HOST {
-            entry.idle.push(session);
+    let now = std::time::Instant::now();
+    match cache.get_mut(key) {
+        Some(entry) => {
+            entry.last_access = now;
+            if entry.idle.len() < MAX_IDLE_SESSIONS_PER_HOST {
+                entry.idle.push(session);
+            }
+            // 池已满：session 在此 drop 并干净断开。
+        }
+        None => {
+            cache.insert(
+                key.to_string(),
+                CacheEntry {
+                    idle: vec![session],
+                    last_access: now,
+                },
+            );
         }
     }
-    // 条目已被过期清理：什么都不做，session 在此 drop 并干净断开。
 }
 
 /// 移除指定会话：用于传输失败后剔除疑似损坏的连接（`Drop` 时干净断开）。
@@ -932,14 +960,17 @@ pub fn with_cached_session<T>(
     mut f: impl FnMut(&mut BlockingSftpSession) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let key = cache_key(config);
-    let session = get_or_connect_session(config, &key)?;
+    let mut session = get_or_connect_session(config, &key)?;
 
-    let result = match f(&mut session.lock()) {
+    let first = f(&mut session.lock());
+    let result = match first {
         Ok(result) => Ok(result),
         Err(_) => {
             // 失败一次：剔除该会话并重连一次（连接可能在传输中被服务端关闭）。
+            // 注意必须复用同一个绑定，最终归还的是重连后的会话，
+            // 而不是这个已被剔除的坏会话。
             evict_session(&key, &session);
-            let session = get_or_connect_session(config, &key)?;
+            session = get_or_connect_session(config, &key)?;
             f(&mut session.lock())
         }
     };
@@ -1062,7 +1093,10 @@ async fn connect_sftp(
     let mut handle = client::connect(
         russh_config,
         (config.host.as_str(), config.port),
-        SftpClientHandler,
+        SftpClientHandler {
+            host: config.host.clone(),
+            port: config.port,
+        },
     )
     .await
     .map_err(|e| anyhow!("TCP/SSH 握手失败: {}", e))?;
@@ -1543,8 +1577,7 @@ async fn pipelined_read_to_vec(
     use futures::future::FutureExt;
     use futures::stream::{FuturesOrdered, StreamExt};
 
-    let mut reads: FuturesOrdered<futures::future::BoxFuture<'_, anyhow::Result<(u64, Vec<u8>)>>> =
-        FuturesOrdered::new();
+    let mut reads: FuturesOrdered<ChunkReadFuture<'_>> = FuturesOrdered::new();
     let mut next_offset = 0u64;
 
     let make_read = |raw: Arc<RawSftpSession>, handle: String, offset: u64, len: u32| {

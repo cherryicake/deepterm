@@ -1,3 +1,4 @@
+use crate::callbacks::{OptionalClickCallback, OptionalHoverCallback};
 use crate::components::button::button_icon::{ButtonIcon, Disableable, Selectable, Sizable, Size};
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder;
@@ -190,8 +191,8 @@ pub struct Button {
     custom_px: Option<Pixels>,
     /// 悬停提示文本，在 render 时通过 gpui 的 tooltip 机制渲染。
     tooltip: Option<SharedString>,
-    on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
-    on_hover: Option<Rc<dyn Fn(&bool, &mut Window, &mut App)>>,
+    on_click: OptionalClickCallback,
+    on_hover: OptionalHoverCallback,
     loading: bool,
     tab_index: isize,
     tab_stop: bool,
@@ -517,7 +518,6 @@ impl RenderOnce for Button {
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                 if is_disabled {
                     cx.stop_propagation();
-                    return;
                 }
             })
             .when_some(self.on_click, |this, on_click| {

@@ -29,6 +29,10 @@ use crate::theme::ActiveTheme;
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
 
+/// 图片解码任务：从本地磁盘或远端 SFTP 读取字节并解码，返回 `(图片, 像素尺寸)`。
+/// 用 `Arc` 包装以便在后台执行器与 UI 线程之间共享。
+type ImageLoader = Arc<dyn Fn() -> Result<(Arc<gpui::Image>, (u32, u32)), String> + Send + Sync>;
+
 /// 编辑器展开/收起动画时长（与侧边栏展开动画一致，ease_in_out）。
 const EDITOR_OPEN_ANIMATION_MS: u64 = 120;
 
@@ -1079,7 +1083,7 @@ impl Editor {
             .language()
             .map(|l| {
                 let id = l.to_string();
-                Language::from_str(&id).display_name().to_string()
+                Language::from_id(&id).display_name().to_string()
             })
             .unwrap_or_else(|| "纯文本".to_string());
 
@@ -1139,7 +1143,7 @@ impl Editor {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
-                    .child(chip(format!("缩进: Tab")))
+                    .child(chip("缩进: Tab".to_string()))
                     .child(chip(encoding_label.to_string()))
                     // 语言 chip：点击弹出语言菜单
                     .child(
@@ -1218,37 +1222,6 @@ impl Editor {
         self.open_local_file(path, window, cx, false);
     }
 
-    /// Opens a diff tab with pre-fetched content.
-    pub fn open_diff_file(
-        &mut self,
-        path: String,
-        diff: crate::editor::diff_model::DiffFile,
-        repo: crate::editor::git_repository::GitRepository,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let tab_id = format!("diff-{}", path);
-
-        // If already open, just switch to it
-        if self.open_files.iter().any(|f| f.id == tab_id) {
-            self.switch_to_file(&tab_id, cx);
-            return;
-        }
-
-        let label = format!("Diff: {}", path);
-        // Placeholder editor state; the diff tab renders `diff` instead.
-        let editor_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).multi_line(true);
-            state.disabled = true;
-            state
-        });
-        let editor_weak = cx.entity().downgrade();
-        let diff_view = cx.new(|cx| {
-            crate::editor::diff_view::DiffView::new(diff, repo, editor_weak, window, cx)
-        });
-        self.push_diff_tab(tab_id, path, label, editor_state, diff_view, cx);
-    }
-
     /// Opens the diff tab instantly; content loads in the background.
     pub fn open_diff_file_loading(
         &mut self,
@@ -1317,7 +1290,7 @@ impl Editor {
 
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
-                TabItem::new(&tab_id, &format!("Diff: {}", path)).with_icon(Some(Icon::Git)),
+                TabItem::new(&tab_id, format!("Diff: {}", path)).with_icon(Some(Icon::Git)),
                 cx,
             );
         });
@@ -1670,7 +1643,7 @@ impl Editor {
                         let should_update = !file.is_loading
                             && !file.dirty
                             && file.original_content != fresh_text
-                            && file.editor_state.read(cx).value().to_string() == file.original_content;
+                            && file.editor_state.read(cx).value() == file.original_content;
                         if should_update {
                             file.original_content = fresh_text.clone();
                             file.encoding = fresh_enc;
@@ -1760,9 +1733,7 @@ impl Editor {
             false, // 图片没有编辑模式
         );
 
-        let load_image: Arc<
-            dyn Fn() -> Result<(Arc<gpui::Image>, (u32, u32)), String> + Send + Sync,
-        > = if let Some(config) = ssh_config {
+        let load_image: ImageLoader = if let Some(config) = ssh_config {
             Arc::new(move || {
                 let bytes = crate::ssh::sftp_fs::read_file_bytes(&config, &path_str)
                     .map_err(|e| e.to_string())?
@@ -1787,7 +1758,7 @@ impl Editor {
         &mut self,
         tab_id: String,
         load_generation: u64,
-        load_image: Arc<dyn Fn() -> Result<(Arc<gpui::Image>, (u32, u32)), String> + Send + Sync>,
+        load_image: ImageLoader,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2117,6 +2088,22 @@ impl Editor {
         .detach();
     }
 
+    /// 按文件路径刷新 Git 行标记（可能对应多个标签页）。
+    ///
+    /// 供外部通知使用：Git 面板 stage / unstage 会改变暂存区，从而使
+    /// HEAD → 工作区的 diff 结果变化，已打开文件的行标记需要重算。
+    pub fn refresh_git_marks_for_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let ids: Vec<gpui::SharedString> = self
+            .open_files
+            .iter()
+            .filter(|f| f.path == path)
+            .map(|f| f.id.clone())
+            .collect();
+        for id in ids {
+            self.refresh_git_marks(&id, cx);
+        }
+    }
+
     fn sync_tab_modified(&self, tab_id: &str, dirty: bool, cx: &mut Context<Self>) {
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.modify_tab(tab_id, |tab| tab.is_modified = dirty, cx);
@@ -2312,9 +2299,7 @@ impl Editor {
             // 仅当这是最后一个引用该路径的 tab 时才取消文件监听并清理内容缓存。
             let has_other_tab = self
                 .open_files
-                .iter()
-                .filter(|f| f.path == path && f.id.as_ref() != id)
-                .next()
+                .iter().find(|f| f.path == path && f.id.as_ref() != id)
                 .is_some();
             if !has_other_tab {
                 // 文件关闭后同步清理 RemoteFileTreeCache 中的内容缓存，避免重新打开时看到旧内容

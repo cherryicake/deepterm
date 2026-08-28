@@ -20,6 +20,11 @@ use crate::theme::{ActiveTheme, AppTheme};
 use super::markdown_element::MarkdownElementBuilder;
 use super::markdown_parser::{MarkdownEvent, parse_markdown};
 
+/// 代码块高亮缓存：`(代码块源码, 源码在整篇文档中的字节范围) → TextRun 列表`。
+///
+/// 同一篇 Markdown 里的重复代码块可直接复用，避免每次渲染都重跑语法高亮。
+pub(crate) type HighlightCache = Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>;
+
 #[derive(Clone)]
 pub struct MarkdownStyle {
     pub base_text_style: gpui::TextStyle,
@@ -159,7 +164,7 @@ pub struct Markdown {
     focus_handle: FocusHandle,
     wrapped_code_blocks: std::collections::HashSet<usize>,
     copied_code_blocks: std::collections::HashSet<usize>,
-    highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
+    highlight_cache: HighlightCache,
     list_state: ListState,
 }
 
@@ -311,11 +316,10 @@ fn compute_item_ranges(events: &[(Range<usize>, MarkdownEvent)]) -> Vec<Range<us
                     ranges.push(start..i + 1);
                 }
             }
-            MarkdownEvent::Rule => {
-                if depth == 0 {
+            MarkdownEvent::Rule
+                if depth == 0 => {
                     ranges.push(i..i + 1);
                 }
-            }
             _ => {}
         }
     }

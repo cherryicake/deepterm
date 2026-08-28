@@ -587,15 +587,11 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
 
 pub fn preferred_ssh_transport(auth_method: &AuthMethod) -> anyhow::Result<PreferredSshTransport> {
     match resolve_auth_method(auth_method)? {
-        ResolvedAuthMethod::PrivateKey {
-            key_flavor,
-            certificate_path,
-            ..
-        } => {
+        ResolvedAuthMethod::PrivateKey { key_flavor, .. } => {
+            // 只有 russh 处理不了的密钥类型才回退到系统 ssh（PTY）；
+            // 普通密钥与带证书的密钥都走 russh。
             if key_flavor.requires_pty() {
                 Ok(PreferredSshTransport::Pty)
-            } else if certificate_path.is_some() {
-                Ok(PreferredSshTransport::Russh)
             } else {
                 Ok(PreferredSshTransport::Russh)
             }

@@ -56,33 +56,18 @@ impl LocalTerminalOption {
     }
 }
 
-/// 解码 WSL 的 UTF-16LE 输出
-fn decode_wsl_output(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes.len() % 2 == 0 {
-        let utf16: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        String::from_utf16_lossy(&utf16)
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
-    }
-}
-
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// 检测命令是否可用
+/// 检测命令是否可用（仅 Windows 的终端扫描使用）
+#[cfg(windows)]
 fn is_command_available(cmd: &str, args: &[&str]) -> bool {
     let mut command = std::process::Command::new(cmd);
     command.args(args);
-    #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    command.creation_flags(CREATE_NO_WINDOW);
     command
         .output()
         .map(|o| o.status.success())

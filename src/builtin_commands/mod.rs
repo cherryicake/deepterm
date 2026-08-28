@@ -643,7 +643,7 @@ impl BuiltinCommandManager {
             self.update(" ");
         } else {
             // 目录选中后保持浮层展开，让用户继续选择子目录
-            let is_dir_expanding = self.query().map_or(false, |b| b.ends_with('/'));
+            let is_dir_expanding = self.query().is_some_and(|b| b.ends_with('/'));
             if !is_dir_expanding {
                 self.hide_overlay();
             }
@@ -670,7 +670,7 @@ impl BuiltinCommandManager {
             return false;
         }
         // 末尾空白意味着此前已经处于"下一参数空位"阶段，不需要再加
-        if buffer.chars().last().map_or(false, char::is_whitespace) {
+        if buffer.chars().last().is_some_and(char::is_whitespace) {
             return false;
         }
         // 用户选中目录后 path 末尾会是 `/` —— 留在当前 token 继续展开
@@ -687,9 +687,7 @@ impl BuiltinCommandManager {
         // /scp 至少 2 个参数（多源时可在最后一个 token 前手动继续追加源），
         // 因此参数 token ≥ 2 后不再自动前移。
         let total_tokens = scp_completion::shell_split_tokens(
-            buffer
-                .splitn(2, |c: char| c.is_whitespace())
-                .nth(1)
+            buffer.split_once(|c: char| c.is_whitespace()).map(|x| x.1)
                 .unwrap_or(""),
             0,
         )
@@ -816,9 +814,7 @@ impl BuiltinCommandManager {
         };
 
         let current_input = state.buffer().to_string();
-        let args = current_input
-            .splitn(2, |c: char| c.is_whitespace())
-            .nth(1)
+        let args = current_input.split_once(|c: char| c.is_whitespace()).map(|x| x.1)
             .unwrap_or("");
 
         let new_input = if args.is_empty() {

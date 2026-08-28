@@ -58,6 +58,12 @@ pub struct TransferBellPanel {
     _hide_task: Option<gpui::Task<()>>,
 }
 
+impl Default for TransferBellPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransferBellPanel {
     pub fn new() -> Self {
         Self {
@@ -163,14 +169,13 @@ impl TransferBellPanel {
         // 点击铃铛时若 popover 刚被 on_mouse_down_out 关掉（几十毫秒内），
         // 说明这是同一次鼠标下压事件：此时不要再打开，让“点击铃铛关闭”
         // 生效，而不是“关→开”抖动。
-        if !self.panel_open {
-            if let Some(dismissed_at) = self.panel_dismissed_at
+        if !self.panel_open
+            && let Some(dismissed_at) = self.panel_dismissed_at
                 && dismissed_at.elapsed() < Duration::from_millis(300)
             {
                 self.panel_dismissed_at = None;
                 return;
             }
-        }
         if self.panel_open {
             self.close_panel(cx);
         } else {
@@ -193,7 +198,7 @@ impl TransferBellPanel {
             cx.background_executor()
                 .timer(Duration::from_millis(BELL_PANEL_EXIT_MS + 40))
                 .await;
-            let _ = entity.update(cx, |this, cx| {
+            entity.update(cx, |this, cx| {
                 this.panel_animating_out = false;
                 cx.notify();
             });

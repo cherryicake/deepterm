@@ -319,7 +319,7 @@ impl SimpleHighlighter {
                 styles.push((s..e, theme.style(name).unwrap_or_default()));
             }
         }
-        styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
+        styles.sort_by_key(|a| a.0.start);
 
         // Empty range (e.g. cursor on an empty document): a single default
         // segment, like the pre-injection behavior.
@@ -381,7 +381,7 @@ impl SimpleHighlighter {
         }
         self.injection_layers = layers;
 
-        styles.sort_by(|a, b| a.0.start.cmp(&b.0.start));
+        styles.sort_by_key(|a| a.0.start);
         unique_styles(range, styles)
     }
 
@@ -562,11 +562,10 @@ impl<'a> Iterator for RopeByteChunks<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.at_first {
-            if !self.cursor.next() {
+        if !self.at_first
+            && !self.cursor.next() {
                 return None;
             }
-        }
         self.at_first = false;
 
         let chunk_byte_start = self.cursor.byte_offset();

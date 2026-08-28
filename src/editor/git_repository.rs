@@ -20,11 +20,11 @@ type StatusCache = HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, Diff
 
 static HEAD_CACHE: OnceLock<Mutex<HeadCache>> = OnceLock::new();
 fn head_cache() -> &'static Mutex<HeadCache> {
-    HEAD_CACHE.get_or_init(|| Mutex::default())
+    HEAD_CACHE.get_or_init(Mutex::default)
 }
 static STATUS_CACHE: OnceLock<Mutex<StatusCache>> = OnceLock::new();
 fn status_cache() -> &'static Mutex<StatusCache> {
-    STATUS_CACHE.get_or_init(|| Mutex::default())
+    STATUS_CACHE.get_or_init(Mutex::default)
 }
 
 /// 远程 diff 内容缓存条目：以 (HEAD commit, 文件 size, mtime) 为有效性指纹。
@@ -88,7 +88,10 @@ pub fn invalidate_remote_diff_cache(repo_root: &str, path: &str) {
 #[derive(Clone)]
 pub enum GitBackend {
     Local,
-    Remote { config: SshConnectionConfig },
+    /// `SshConnectionConfig` 有 184 字节。内嵌它会让 `GitBackend` 膨胀到 184 字节，
+    /// 连带把 `GitRepository`（208 字节）和所有携带它的事件枚举一起撑大。
+    /// 装箱后 `GitBackend` 降到 8 字节，`GitRepository` 降到 32 字节。
+    Remote { config: Box<SshConnectionConfig> },
 }
 
 impl GitBackend {
@@ -166,7 +169,7 @@ impl GitRepository {
         Ok(Some(Self {
             root,
             backend: GitBackend::Remote {
-                config: config.clone(),
+                config: Box::new(config.clone()),
             },
         }))
     }
@@ -247,7 +250,7 @@ impl GitRepository {
         let staged = self.run_git(&["diff", "--staged", "--", path]).unwrap_or_default();
         if !staged.is_empty() {
             if !diff.is_empty() {
-                diff.push_str("\n");
+                diff.push('\n');
             }
             diff.push_str(&staged);
         }
@@ -404,7 +407,7 @@ impl GitRepository {
     pub fn ssh_config(&self) -> Option<SshConnectionConfig> {
         match &self.backend {
             GitBackend::Local => None,
-            GitBackend::Remote { config } => Some(config.clone()),
+            GitBackend::Remote { config } => Some((**config).clone()),
         }
     }
 

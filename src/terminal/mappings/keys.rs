@@ -30,7 +30,7 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, _vi_mode: bool) -> Opt
     // Handle function keys F1-F12
     if let Some(f_num) = key.strip_prefix('f') {
         if let Ok(n) = f_num.parse::<u8>() {
-            if n >= 1 && n <= 12 {
+            if (1..=12).contains(&n) {
                 // Pre-computed lookup to avoid format! allocation per keystroke
                 // Values match original: F5-F8 = n+10~, F9-F12 = n+11~
                 const F_SUFFIXES: [&str; 12] = [

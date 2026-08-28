@@ -151,15 +151,12 @@ impl FoldMap {
                 .binary_search_by_key(&start_line, |c| c.start_line)
             {
                 // Add to folded if not already present, maintaining sorted order
-                match self
+                if let Err(insert_pos) = self
                     .folded
                     .binary_search_by_key(&start_line, |f| f.start_line)
                 {
-                    Err(insert_pos) => {
-                        self.folded.insert(insert_pos, self.candidates[idx]);
-                        self.needs_rebuild = true;
-                    }
-                    Ok(_) => {} // Already folded
+                    self.folded.insert(insert_pos, self.candidates[idx]);
+                    self.needs_rebuild = true;
                 }
             }
         } else {
@@ -256,7 +253,7 @@ impl FoldMap {
         depth
     }
 
-    fn containing_sorted<'a>(ranges: &'a [FoldRange], line: usize) -> Vec<FoldRange> {
+    fn containing_sorted(ranges: &[FoldRange], line: usize) -> Vec<FoldRange> {
         let mut containing: Vec<FoldRange> = ranges
             .iter()
             .copied()

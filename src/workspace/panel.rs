@@ -219,6 +219,7 @@ impl Panel {
     /// * `active_tab_id` - ID of the currently active tab
     /// * `active_tab_label` - Label shown in the title bar
     /// * `cx` - The context for entity creation
+    ///
     /// Subscribes to TerminalView close events and emits PanelEvent::Close when the terminal exits.
     fn subscribe_terminal_events(
         panel_id: &str,

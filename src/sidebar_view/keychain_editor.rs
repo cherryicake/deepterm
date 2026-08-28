@@ -10,6 +10,7 @@ use gpui::{
     MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, px,
 };
 
+use crate::callbacks::{OptionalAppCallback, OptionalStrAppCallback};
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::ssh::keychain::{
@@ -24,7 +25,7 @@ pub struct MultilineTextArea {
     placeholder: String,
     height: f32,
     scroll_handle: ScrollHandle,
-    on_change: Option<Box<dyn Fn(&str, &mut App) + Send + Sync>>,
+    on_change: OptionalStrAppCallback,
 }
 
 impl MultilineTextArea {
@@ -206,8 +207,8 @@ pub struct KeychainEditor {
     editing_certificate_path: Option<PathBuf>,
     error_message: Option<String>,
     success_message: Option<String>,
-    on_cancel: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
-    on_saved: Option<Box<dyn Fn(&mut App) + Send + Sync>>,
+    on_cancel: OptionalAppCallback,
+    on_saved: OptionalAppCallback,
 }
 
 impl KeychainEditor {
@@ -398,7 +399,6 @@ impl KeychainEditor {
                 }
             }
             let _ = window;
-            return;
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -601,9 +601,7 @@ impl KeychainEditor {
                     )
                     .into_any_element(),
             )
-        } else if let Some(success) = &self.success_message {
-            Some(
-                div()
+        } else { self.success_message.as_ref().map(|success| div()
                     .w_full()
                     .px(px(12.0))
                     .py(px(8.0))
@@ -617,11 +615,7 @@ impl KeychainEditor {
                             .text_color(theme.success_foreground)
                             .child(success.clone()),
                     )
-                    .into_any_element(),
-            )
-        } else {
-            None
-        }
+                    .into_any_element()) }
     }
 }
 
@@ -721,7 +715,7 @@ impl Render for KeychainEditor {
             .flex_col()
             .gap(px(16.0))
             .child(header)
-            .children(self.render_message(cx).into_iter())
+            .children(self.render_message(cx))
             .child(self.render_labeled_input("标签", &self.label_input, false, cx))
             .when(self.draft_kind == KeychainItemKind::Identity, |this| {
                 this.child(self.render_labeled_input("用户名", &self.username_input, false, cx))

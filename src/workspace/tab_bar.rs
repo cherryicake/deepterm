@@ -19,6 +19,21 @@ actions!(
     [CopyTabAddress, DuplicateTab, ReconnectTab]
 );
 
+/// 以 tab id 为参数的回调（点击、关闭、复制地址、复制标签页、重连等）。
+type TabCallback = Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>;
+/// 可选 [`TabCallback`]。
+type OptionalTabCallback = Option<TabCallback>;
+/// 无参数回调（如新建标签页）。
+type NewTabCallback = Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
+/// Tab 重排回调：参数为被拖拽的 tab 与插入位（before 语义）。
+type TabReorderCallback = Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>;
+/// Panel 拖放到 TabBar 的回调：参数为被拖放的 panel 与可选的插入位。
+type PanelDropCallback =
+    Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>;
+/// 右键菜单构建回调：接收一个空 `PopupMenu`，返回填充好菜单项的 `PopupMenu`。
+type ContextMenuCallback =
+    Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+
 /// 拖拽的 Tab 数据
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraggedTab {
@@ -227,16 +242,15 @@ pub struct TabBar {
     id: ElementId,
     pub tabs: Vec<TabItem>,
     pub active_tab_id: Option<SharedString>,
-    on_tab_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
-    on_tab_close: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
-    on_new_tab: Option<Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>>,
+    on_tab_click: OptionalTabCallback,
+    on_tab_close: OptionalTabCallback,
+    on_new_tab: Option<NewTabCallback>,
     /// 重排回调：`insert_slot` 为重排前列表中的插入位（before 语义）。
     /// 回调触发时 TabBar 自身的 tabs 已完成重排，消费方只需同步自己的平行结构
     /// （如 editor 的 open_files），不要再对 tab_bar.tabs 重复应用。
-    on_tab_reorder: Option<Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>>,
+    on_tab_reorder: Option<TabReorderCallback>,
     /// Panel 拖拽到 TabBar 的回调
-    on_panel_drop:
-        Option<Rc<dyn Fn(DraggedPanel, Option<usize>, &mut Window, &mut App) + Send + Sync>>,
+    on_panel_drop: Option<PanelDropCallback>,
     focus_handle: FocusHandle,
     /// 滚动句柄，用于控制水平滚动；子元素 bounds（内容坐标）与视口
     /// （窗口坐标）均从此句柄读取
@@ -254,15 +268,13 @@ pub struct TabBar {
     /// 右键菜单的目标标签 ID
     context_menu_tab_id: Option<SharedString>,
     /// 拷贝地址回调
-    on_tab_copy_address: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_copy_address: OptionalTabCallback,
     /// 复制标签页回调
-    on_tab_duplicate: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_duplicate: OptionalTabCallback,
     /// 重新连接回调
-    on_tab_reconnect: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+    on_tab_reconnect: OptionalTabCallback,
     /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
-    on_context_menu: Option<
-        Rc<dyn Fn(SharedString, PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
-    >,
+    on_context_menu: Option<ContextMenuCallback>,
 }
 
 impl TabBar {
@@ -695,7 +707,7 @@ impl TabBar {
     /// 避免过期 id 被后续 action 误用。
     fn context_menu_action_listener<A: Action>(
         cx: &Context<Self>,
-        callback: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>>,
+        callback: OptionalTabCallback,
     ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
         cx.listener(move |this, _: &A, window, cx| {
             let tab_id = this.context_menu_tab_id.take();
@@ -946,7 +958,7 @@ impl TabBar {
         let icon = tab.icon;
         let is_hovered = self.hovered_tab_id.as_ref() == Some(tab_id);
 
-        let icon_slot_width = if icon.map_or(false, |i| matches!(i, Icon::FileIcon(_))) {
+        let icon_slot_width = if icon.is_some_and(|i| matches!(i, Icon::FileIcon(_))) {
             px(FILE_ICON_SIZE_PX)
         } else {
             px(ICON_SIZE_PX)
@@ -1091,7 +1103,7 @@ impl TabBar {
     /// 新建标签按钮 - 放在滚动区域外面，始终可见
     fn render_new_tab_button(
         theme: UiTheme,
-        on_new_tab: Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
+        on_new_tab: NewTabCallback,
     ) -> Stateful<Div> {
         div()
             .id("new-tab-btn")

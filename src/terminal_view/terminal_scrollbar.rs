@@ -141,7 +141,7 @@ impl gpui::Element for ScrollbarElement {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        ()
+        
     }
 
     fn paint(
@@ -312,7 +312,7 @@ impl gpui::Element for ScrollbarElement {
 
         // Mouse up handler - end dragging
         window.on_mouse_event({
-            let thumb_offset = thumb_offset;
+            // `move` 闭包会直接按值捕获 `thumb_offset`（此处是它的最后一处使用）。
             move |_event: &MouseUpEvent, phase, _window, _cx| {
                 if !phase.bubble() {
                     return;

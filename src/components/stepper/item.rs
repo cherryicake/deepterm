@@ -3,6 +3,7 @@ use gpui::{
     RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
 };
 
+use crate::callbacks::BoxedClickCallback;
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
 use crate::components::stepper::trigger::StepperTrigger;
@@ -21,7 +22,13 @@ pub struct StepperItem {
     text_center: bool,
     status: StepperStatus,
     size: StepperSize,
-    on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+    on_click: BoxedClickCallback,
+}
+
+impl Default for StepperItem {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StepperItem {
@@ -71,7 +78,11 @@ impl StepperItem {
         self
     }
 
-    pub(crate) fn is_last(mut self, is_last: bool) -> Self {
+    /// 是否为最后一步（最后一步不画连接线、不占满剩余宽度）。
+    ///
+    /// 名字不带 `is_` 前缀：这是 builder setter（`self` 按值传递并回传），
+    /// 与同组的 `layout` / `status` / `size` 等保持一致。
+    pub(crate) fn last(mut self, is_last: bool) -> Self {
         self.is_last = is_last;
         self
     }

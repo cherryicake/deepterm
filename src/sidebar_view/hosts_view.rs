@@ -102,7 +102,7 @@ pub enum HostIconColor {
 }
 
 impl HostIconColor {
-    pub fn to_hsla(&self, cx: &App) -> gpui::Hsla {
+    pub fn to_hsla(self, cx: &App) -> gpui::Hsla {
         let theme = cx.theme().ui;
         match self {
             HostIconColor::Orange => theme.warning,

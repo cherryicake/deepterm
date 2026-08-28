@@ -426,13 +426,13 @@ pub struct StatusColors {
 impl StatusColors {
     #[inline]
     pub fn error(&self, _cx: &App) -> Hsla {
-        self.error.unwrap_or(gpui::red().into())
+        self.error.unwrap_or(gpui::red())
     }
 
     #[inline]
     pub fn error_background(&self, _cx: &App) -> Hsla {
         self.error_background
-            .unwrap_or(gpui::red().alpha(0.2).into())
+            .unwrap_or(gpui::red().alpha(0.2))
     }
 
     #[inline]
@@ -442,13 +442,13 @@ impl StatusColors {
 
     #[inline]
     pub fn warning(&self, _cx: &App) -> Hsla {
-        self.warning.unwrap_or(gpui::yellow().into())
+        self.warning.unwrap_or(gpui::yellow())
     }
 
     #[inline]
     pub fn warning_background(&self, _cx: &App) -> Hsla {
         self.warning_background
-            .unwrap_or(gpui::yellow().alpha(0.2).into())
+            .unwrap_or(gpui::yellow().alpha(0.2))
     }
 
     #[inline]
@@ -458,13 +458,13 @@ impl StatusColors {
 
     #[inline]
     pub fn info(&self, _cx: &App) -> Hsla {
-        self.info.unwrap_or(gpui::blue().into())
+        self.info.unwrap_or(gpui::blue())
     }
 
     #[inline]
     pub fn info_background(&self, _cx: &App) -> Hsla {
         self.info_background
-            .unwrap_or(gpui::blue().alpha(0.2).into())
+            .unwrap_or(gpui::blue().alpha(0.2))
     }
 
     #[inline]
@@ -474,13 +474,13 @@ impl StatusColors {
 
     #[inline]
     pub fn success(&self, _cx: &App) -> Hsla {
-        self.success.unwrap_or(gpui::green().into())
+        self.success.unwrap_or(gpui::green())
     }
 
     #[inline]
     pub fn success_background(&self, _cx: &App) -> Hsla {
         self.success_background
-            .unwrap_or(gpui::green().alpha(0.2).into())
+            .unwrap_or(gpui::green().alpha(0.2))
     }
 
     #[inline]
@@ -606,7 +606,7 @@ impl LanguageRegistry {
         let languages = self.languages.lock().unwrap();
         languages
             .get(name)
-            .or_else(|| languages.get(languages::Language::from_str(name).name()))
+            .or_else(|| languages.get(languages::Language::from_id(name).name()))
             .cloned()
     }
 }

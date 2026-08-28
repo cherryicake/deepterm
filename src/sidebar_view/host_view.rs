@@ -8,6 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
@@ -19,6 +20,9 @@ use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{SshConnectionConfig, SshGlobalConfig};
 use crate::theme::ActiveTheme;
 
+/// SSH 主机回调（连接 / 编辑主机时触发），参数为该主机的连接配置。
+type HostConfigCallback = Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App)>;
+
 /// Host 侧边栏视图组件，管理 Host 列表和 New Host Modal。
 pub struct HostView {
     focus_handle: FocusHandle,
@@ -26,9 +30,9 @@ pub struct HostView {
     selected_ids: HashSet<SharedString>,
     host_form: Option<Entity<NewHostForm>>,
     modal_state: Entity<ModalState>,
-    on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
-    on_connect: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
-    on_edit_host: Option<Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App) + 'static>>,
+    on_select: OptionalStrCallback,
+    on_connect: Option<HostConfigCallback>,
+    on_edit_host: Option<HostConfigCallback>,
     context_menu_host_id: Option<SharedString>,
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
@@ -614,7 +618,7 @@ impl Render for HostView {
                 cx.spawn(async move |_, cx| {
                     if let Ok(0) = answer.await {
                         if let Some(entity) = weak.upgrade() {
-                            let _ = entity.update(cx, |this, cx| {
+                            entity.update(cx, |this, cx| {
                                 if let Ok(mut global) = SshGlobalConfig::load_or_create() {
                                     for id in &ids_to_delete {
                                         global.remove_connection(id);

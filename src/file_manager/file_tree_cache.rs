@@ -37,7 +37,7 @@ const MAX_CACHED_FILE_SIZE: usize = 512 * 1024;
 
 fn cache_file_path() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
         .join("deepterm/sftp_cache.json")
 }
 

@@ -1,3 +1,4 @@
+use crate::callbacks::OptionalWindowCallback;
 use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
@@ -168,7 +169,7 @@ pub struct Modal {
     children: Vec<AnyElement>,
     close_on_backdrop: bool,
     close_on_escape: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_close: OptionalWindowCallback,
     /// 是否正在播放退出动画。
     closing: bool,
     /// 动画代次，确保每次开/关从 delta=0 重新播放。

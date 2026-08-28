@@ -2,7 +2,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Context, FocusHandle, Focusable, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ParentElement,
-    Pixels, Point, Render, Size, Stateful, Styled, Subscription, Task, UniformListDecoration,
+    Pixels, Point, Render, Stateful, Styled, Subscription, Task, UniformListDecoration,
     UniformListScrollHandle, Window, div, point, px, size, svg, uniform_list,
 };
 use smallvec::SmallVec;
@@ -1021,7 +1021,7 @@ impl SidebarFileTree {
                             ssh_config: if this.loader.is_local() {
                                 None
                             } else {
-                                this.loader.ssh_config().cloned()
+                                this.loader.ssh_config().map(|c| Box::new(c.clone()))
                             },
                         });
                     }

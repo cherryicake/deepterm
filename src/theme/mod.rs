@@ -223,131 +223,163 @@ impl TerminalTheme {
         name: &str,
         appearance: ThemeAppearance,
     ) -> Arc<HighlightTheme> {
-        let (editor_bg, editor_fg, active_line, line_number, active_line_number, invisible) = (
-            Some(self.background),
-            Some(self.foreground),
-            Some(gpui::Hsla::from(gpui::Rgba::from(self.background).blend(
-                if appearance.is_dark() {
-                    gpui::rgba(0xFFFFFF10)
-                } else {
-                    gpui::rgba(0x0000000C)
-                },
-            ))),
-            Some(self.dim_foreground),
-            Some(self.foreground),
-            Some(self.dim_foreground),
-        );
-
-        let syntax: SyntaxColors = if appearance.is_dark() {
-            // Default Dark: approximate One Dark / gpui-component Default Dark
-            SyntaxColors {
-                attribute: Some(ThemeStyle::color(rgb(0x74ade8).into())),
-                boolean: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                comment: Some(ThemeStyle::color(rgb(0x5d636f).into())),
-                comment_doc: Some(ThemeStyle::color(rgb(0x878e98).into())),
-                constant: Some(ThemeStyle::color(rgb(0xdfc184).into())),
-                constructor: Some(ThemeStyle::color(rgb(0x73ade9).into())),
-                embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
-                // VSCode renders markdown emphasis as italic / strong as bold
-                // with the normal foreground color — not a separate hue.
-                emphasis: Some(ThemeStyle::italic()),
-                emphasis_strong: Some(ThemeStyle::bold()),
-                enum_: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
-                function: Some(ThemeStyle::color(rgb(0x73ade9).into())),
-                hint: Some(ThemeStyle::color(rgb(0x788ca6).into())),
-                keyword: Some(ThemeStyle::color(rgb(0xb477cf).into())),
-                label: Some(ThemeStyle::color(rgb(0x74ade8).into())),
-                link_text: Some(ThemeStyle::color(rgb(0x73ade9).into())),
-                link_uri: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
-                number: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                operator: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
-                predictive: Some(ThemeStyle::color(rgb(0x5a6a87).into())),
-                preproc: Some(ThemeStyle::color(rgb(0xb477cf).into())),
-                primary: Some(ThemeStyle::color(editor_fg.unwrap())),
-                property: Some(ThemeStyle::color(rgb(0xd07277).into())),
-                punctuation: Some(ThemeStyle::color(editor_fg.unwrap())),
-                punctuation_bracket: Some(ThemeStyle::color(rgb(0xb2b9c6).into())),
-                punctuation_delimiter: Some(ThemeStyle::color(rgb(0xb2b9c6).into())),
-                punctuation_list_marker: Some(ThemeStyle::color(rgb(0xd07277).into())),
-                punctuation_special: Some(ThemeStyle::color(rgb(0xb1574b).into())),
-                string: Some(ThemeStyle::color(rgb(0xa1c181).into())),
-                string_escape: Some(ThemeStyle::color(rgb(0x878e98).into())),
-                string_regex: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                string_special: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                string_special_symbol: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                tag: Some(ThemeStyle::color(rgb(0x74ade8).into())),
-                tag_doctype: Some(ThemeStyle::color(rgb(0xb477cf).into())),
-                text_code_span: Some(ThemeStyle::color(rgb(0xe1d797).into())),
-                text_literal: Some(ThemeStyle::color(rgb(0xa1c181).into())),
-                title: Some(ThemeStyle::color(rgb(0xd07277).into())),
-                type_: Some(ThemeStyle::color(rgb(0x6eb4bf).into())),
-                variable: Some(ThemeStyle::color(editor_fg.unwrap())),
-                variable_special: Some(ThemeStyle::color(rgb(0xbf956a).into())),
-                variant: Some(ThemeStyle::color(rgb(0x73ade9).into())),
-            }
+        let palette = if appearance.is_dark() {
+            SyntaxPalette::DARK
         } else {
-            // Default Light: approximate One Light / gpui-component Default Light
-            SyntaxColors {
-                attribute: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
-                boolean: Some(ThemeStyle::color(rgb(0xad6e25).into())),
-                comment: Some(ThemeStyle::color(rgb(0xa2a3a7).into())),
-                comment_doc: Some(ThemeStyle::color(rgb(0x7c7e86).into())),
-                constant: Some(ThemeStyle::color(rgb(0xc18401).into())),
-                constructor: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
-                embedded: Some(ThemeStyle::color(editor_fg.unwrap())),
-                // VSCode renders markdown emphasis as italic / strong as bold
-                // with the normal foreground color — not a separate hue.
-                emphasis: Some(ThemeStyle::italic()),
-                emphasis_strong: Some(ThemeStyle::bold()),
-                enum_: Some(ThemeStyle::color(rgb(0x3882b7).into())),
-                function: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
-                hint: Some(ThemeStyle::color(rgb(0x7274a7).into())),
-                keyword: Some(ThemeStyle::color(rgb(0xa449ab).into())),
-                label: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
-                link_text: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
-                link_uri: Some(ThemeStyle::color(rgb(0x3882b7).into())),
-                number: Some(ThemeStyle::color(rgb(0xad6e25).into())),
-                operator: Some(ThemeStyle::color(rgb(0x3882b7).into())),
-                predictive: Some(ThemeStyle::color(rgb(0x9b9ec6).into())),
-                preproc: Some(ThemeStyle::color(rgb(0xa449ab).into())),
-                primary: Some(ThemeStyle::color(editor_fg.unwrap())),
-                property: Some(ThemeStyle::color(rgb(0xd3604f).into())),
-                punctuation: Some(ThemeStyle::color(editor_fg.unwrap())),
-                punctuation_bracket: Some(ThemeStyle::color(rgb(0x4d4f52).into())),
-                punctuation_delimiter: Some(ThemeStyle::color(rgb(0x4d4f52).into())),
-                punctuation_list_marker: Some(ThemeStyle::color(rgb(0xd3604f).into())),
-                punctuation_special: Some(ThemeStyle::color(rgb(0xb92b46).into())),
-                string: Some(ThemeStyle::color(rgb(0x649f57).into())),
-                string_escape: Some(ThemeStyle::color(rgb(0x7c7e86).into())),
-                string_regex: Some(ThemeStyle::color(rgb(0xad6e26).into())),
-                string_special: Some(ThemeStyle::color(rgb(0xad6e26).into())),
-                string_special_symbol: Some(ThemeStyle::color(rgb(0xad6e26).into())),
-                tag: Some(ThemeStyle::color(rgb(0x5c78e2).into())),
-                tag_doctype: Some(ThemeStyle::color(rgb(0xa449ab).into())),
-                text_code_span: Some(ThemeStyle::color(rgb(0x6f42c1).into())),
-                text_literal: Some(ThemeStyle::color(rgb(0x649f57).into())),
-                title: Some(ThemeStyle::color(rgb(0xd3604f).into())),
-                type_: Some(ThemeStyle::color(rgb(0x3882b7).into())),
-                variable: Some(ThemeStyle::color(editor_fg.unwrap())),
-                variable_special: Some(ThemeStyle::color(rgb(0xad6e25).into())),
-                variant: Some(ThemeStyle::color(rgb(0x5b79e3).into())),
-            }
+            SyntaxPalette::LIGHT
         };
+
+        let editor_bg = self.background;
+        let editor_fg = self.foreground;
+        let active_line = gpui::Hsla::from(gpui::Rgba::from(self.background).blend(
+            if appearance.is_dark() {
+                gpui::rgba(0xFFFFFF10)
+            } else {
+                gpui::rgba(0x0000000C)
+            },
+        ));
 
         Arc::new(HighlightTheme {
             name: name.to_string(),
             appearance,
             style: HighlightThemeStyle {
-                editor_background: editor_bg,
-                editor_foreground: editor_fg,
-                editor_active_line: active_line,
-                editor_line_number: line_number,
-                editor_active_line_number: active_line_number,
-                editor_invisible: invisible,
+                editor_background: Some(editor_bg),
+                editor_foreground: Some(editor_fg),
+                editor_active_line: Some(active_line),
+                editor_line_number: Some(self.dim_foreground),
+                editor_active_line_number: Some(self.foreground),
+                editor_invisible: Some(self.dim_foreground),
                 status: StatusColors::default(),
-                syntax,
+                syntax: palette.to_syntax_colors(editor_fg),
             },
         })
+    }
+}
+
+/// 一版语法配色所需的独立语义色（0xRRGGBB）。
+///
+/// 多个 tree-sitter capture 共用同一个语义色（例如 `keyword` / `preproc` /
+/// `tag_doctype` 同色），所以这里只列独立色值，再由
+/// [`SyntaxPalette::to_syntax_colors`] 展开成完整的 `SyntaxColors` ——
+/// 避免 dark / light 两版各写一遍几十个字段。
+struct SyntaxPalette {
+    attribute: u32,
+    boolean: u32,
+    comment: u32,
+    comment_doc: u32,
+    constant: u32,
+    constructor: u32,
+    function: u32,
+    hint: u32,
+    keyword: u32,
+    number: u32,
+    /// Light 版的 `string_regex` / `string_special` 比 `number` 大 1
+    /// （0xad6e26 vs 0xad6e25），疑似历史笔误；此处原样保留，以免引入视觉回归。
+    regex: u32,
+    operator: u32,
+    predictive: u32,
+    property: u32,
+    bracket: u32,
+    punctuation_special: u32,
+    string: u32,
+    text_code_span: u32,
+}
+
+impl SyntaxPalette {
+    /// 近似 One Dark / gpui-component Default Dark。
+    const DARK: Self = Self {
+        attribute: 0x74ade8,
+        boolean: 0xbf956a,
+        comment: 0x5d636f,
+        comment_doc: 0x878e98,
+        constant: 0xdfc184,
+        constructor: 0x73ade9,
+        function: 0x73ade9,
+        hint: 0x788ca6,
+        keyword: 0xb477cf,
+        number: 0xbf956a,
+        regex: 0xbf956a,
+        operator: 0x6eb4bf,
+        predictive: 0x5a6a87,
+        property: 0xd07277,
+        bracket: 0xb2b9c6,
+        punctuation_special: 0xb1574b,
+        string: 0xa1c181,
+        text_code_span: 0xe1d797,
+    };
+
+    /// 近似 One Light / gpui-component Default Light。
+    const LIGHT: Self = Self {
+        attribute: 0x5c78e2,
+        boolean: 0xad6e25,
+        comment: 0xa2a3a7,
+        comment_doc: 0x7c7e86,
+        constant: 0xc18401,
+        constructor: 0x5c78e2,
+        function: 0x5b79e3,
+        hint: 0x7274a7,
+        keyword: 0xa449ab,
+        number: 0xad6e25,
+        regex: 0xad6e26,
+        operator: 0x3882b7,
+        predictive: 0x9b9ec6,
+        property: 0xd3604f,
+        bracket: 0x4d4f52,
+        punctuation_special: 0xb92b46,
+        string: 0x649f57,
+        text_code_span: 0x6f42c1,
+    };
+
+    /// 展开成完整的 `SyntaxColors`；`fg` 用于那几个「沿用前景色」的 capture。
+    fn to_syntax_colors(&self, fg: Hsla) -> SyntaxColors {
+        let c = |hex: u32| Some(ThemeStyle::color(rgb(hex).into()));
+        let fg = || Some(ThemeStyle::color(fg));
+
+        SyntaxColors {
+            attribute: c(self.attribute),
+            boolean: c(self.boolean),
+            comment: c(self.comment),
+            comment_doc: c(self.comment_doc),
+            constant: c(self.constant),
+            constructor: c(self.constructor),
+            embedded: fg(),
+            // VSCode renders markdown emphasis as italic / strong as bold
+            // with the normal foreground color — not a separate hue.
+            emphasis: Some(ThemeStyle::italic()),
+            emphasis_strong: Some(ThemeStyle::bold()),
+            enum_: c(self.operator),
+            function: c(self.function),
+            hint: c(self.hint),
+            keyword: c(self.keyword),
+            label: c(self.attribute),
+            link_text: c(self.function),
+            link_uri: c(self.operator),
+            number: c(self.number),
+            operator: c(self.operator),
+            predictive: c(self.predictive),
+            preproc: c(self.keyword),
+            primary: fg(),
+            property: c(self.property),
+            punctuation: fg(),
+            punctuation_bracket: c(self.bracket),
+            punctuation_delimiter: c(self.bracket),
+            punctuation_list_marker: c(self.property),
+            punctuation_special: c(self.punctuation_special),
+            string: c(self.string),
+            string_escape: c(self.comment_doc),
+            string_regex: c(self.regex),
+            string_special: c(self.regex),
+            string_special_symbol: c(self.regex),
+            tag: c(self.attribute),
+            tag_doctype: c(self.keyword),
+            text_code_span: c(self.text_code_span),
+            text_literal: c(self.string),
+            title: c(self.property),
+            type_: c(self.operator),
+            variable: fg(),
+            variable_special: c(self.boolean),
+            variant: c(self.function),
+        }
     }
 }
 

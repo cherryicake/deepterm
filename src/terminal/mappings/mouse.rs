@@ -1,6 +1,5 @@
 //! Mouse input mappings for terminal
 
-use std::iter::repeat;
 
 use alacritty_terminal::index::{Column as GridCol, Line as GridLine, Point as AlacPoint, Side};
 use alacritty_terminal::term::TermMode;
@@ -93,7 +92,7 @@ pub fn scroll_report(
             e.modifiers,
             MouseFormat::from_mode(mode),
         )
-        .map(|report| repeat(report).take(scroll_lines.unsigned_abs() as usize))
+        .map(|report| std::iter::repeat_n(report, scroll_lines.unsigned_abs() as usize))
     } else {
         None
     }

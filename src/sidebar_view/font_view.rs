@@ -147,7 +147,7 @@ impl FontSettingsView {
             |this: &mut Self, _, event: &InputEvent, cx| {
                 let text = this.font_size_input.read(cx).value().to_string();
                 let (valid, size) = match text.parse::<f32>() {
-                    Ok(size) if size >= 6.0 && size <= 72.0 => (true, Some(size)),
+                    Ok(size) if (6.0..=72.0).contains(&size) => (true, Some(size)),
                     _ => (false, None),
                 };
                 match event {
@@ -179,7 +179,7 @@ impl FontSettingsView {
             |this: &mut Self, _, event: &InputEvent, cx| {
                 let text = this.line_height_input.read(cx).value().to_string();
                 let (valid, lh) = match text.parse::<f32>() {
-                    Ok(lh) if lh >= 0.8 && lh <= 3.0 => (true, Some(lh)),
+                    Ok(lh) if (0.8..=3.0).contains(&lh) => (true, Some(lh)),
                     _ => (false, None),
                 };
                 match event {

@@ -429,8 +429,8 @@ pub struct Terminal {
     /// 这里同时服务本地 PTY 与 SSH 终端：
     /// - 本地 PTY 走 vendored vte/alacritty 的 OSC 7 事件，由 `PwdChanged` 写入。
     /// - SSH 数据流先在 DeepTerm 侧截获 OSC，再复用同一套解析和保存逻辑。
-    /// 统一保存“终端自己声明的 cwd”，可以避免再用 `lsof`/进程 cwd 猜测 shell
-    /// 状态；后者无法稳定追踪 shell 内建 `cd` 后的实时目录。
+    ///   统一保存“终端自己声明的 cwd”，可以避免再用 `lsof`/进程 cwd 猜测 shell
+    ///   状态；后者无法稳定追踪 shell 内建 `cd` 后的实时目录。
     reported_working_directory: Option<String>,
     /// 检测到的远程操作系统
     pub remote_os: Option<RemoteOS>,
@@ -513,14 +513,15 @@ pub struct Terminal {
 
 impl Terminal {
     fn default_terminal_config() -> Config {
-        let mut config = Config::default();
-        config.scrolling_history = 10000.min(MAX_SCROLLBACK_LINES);
-        config.default_cursor_style = AlacCursorStyle {
-            shape: AlacCursorShape::Block,
-            blinking: false,
-        };
-        config.osc52 = alacritty_terminal::term::Osc52::CopyPaste;
-        config
+        Config {
+            scrolling_history: 10000.min(MAX_SCROLLBACK_LINES),
+            default_cursor_style: AlacCursorStyle {
+                shape: AlacCursorShape::Block,
+                blinking: false,
+            },
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            ..Config::default()
+        }
     }
 
     fn build_local_terminal(
@@ -1192,7 +1193,7 @@ impl Terminal {
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
     pub fn is_ssh_connected(&self) -> bool {
-        self.russh_handle.as_ref().map_or(false, |h| h.is_ready())
+        self.russh_handle.as_ref().is_some_and(|h| h.is_ready())
     }
 
     /// 检查 SSH 连接是否已失败
@@ -1608,9 +1609,11 @@ impl Terminal {
             AlacTermEvent::ColorRequest(index, format) => {
                 // 响应颜色查询请求
                 let term = self.term.lock();
-                let color = term.colors()[index]
-                    .map(|rgb| rgb)
-                    .unwrap_or_else(|| alacritty_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 });
+                let color = term.colors()[index].unwrap_or(alacritty_terminal::vte::ansi::Rgb {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                });
                 drop(term);
                 let response = format(color);
                 self.write(response.as_bytes());

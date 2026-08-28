@@ -202,6 +202,7 @@ impl SshConnectionConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "auth_type", content = "auth_data")]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AuthMethod {
     /// 密码认证（引用 Keychain 项）
     PasswordRef { keychain_id: String },
@@ -220,6 +221,7 @@ pub enum AuthMethod {
     Agent,
     /// 尝试多种方法
     #[serde(skip)]
+    #[default]
     Auto,
 }
 
@@ -303,11 +305,6 @@ impl AuthMethod {
     }
 }
 
-impl Default for AuthMethod {
-    fn default() -> Self {
-        AuthMethod::Auto
-    }
-}
 
 /// SSH 已知主机配置
 #[derive(Clone, Debug, Serialize, Deserialize)]

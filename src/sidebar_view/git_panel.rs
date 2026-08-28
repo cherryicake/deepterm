@@ -4,12 +4,11 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
-    Pixels, Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
-    svg, uniform_list,
+    Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px, svg,
+    uniform_list,
 };
 
 use crate::assets::Icon;
-use crate::editor::diff_model::DiffFile;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::git_status::{DiffStat, FileStatus, Section, StatusCode, TrackedStatus};
 use crate::file_manager::filesystem::FileSystem;
@@ -25,17 +24,14 @@ const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Git panel events
 pub enum GitPanelEvent {
-    OpenDiff {
-        path: String,
-        diff: DiffFile,
-        repo: GitRepository,
-    },
     /// Instant open: content loads asynchronously in DiffView.
     OpenDiffLoading {
         path: String,
         repo: GitRepository,
     },
+    /// Emitted after `git add` succeeds; the HEAD → worktree diff must be recomputed.
     StageFile { path: String },
+    /// Emitted after `git reset` succeeds; same effect as [`Self::StageFile`].
     UnstageFile { path: String },
 }
 
@@ -76,18 +72,6 @@ impl GitFileEntry {
             theme.status_deleted
         } else {
             theme.status_modified
-        }
-    }
-
-    pub fn status_label(&self) -> &'static str {
-        if self.status.is_conflicted() {
-            "!"
-        } else if self.status.is_created() {
-            "+"
-        } else if self.status.is_deleted() {
-            "-"
-        } else {
-            "M"
         }
     }
 
@@ -528,7 +512,6 @@ impl GitPanel {
 
     fn render_header(&self, section: Section, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance.is_dark();
 
         let (title, color) = match section {
             Section::Conflict => ("Conflicts", theme.status_conflict),
@@ -692,7 +675,6 @@ impl Focusable for GitPanel {
 impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance.is_dark();
 
         if self.loading && self.entries.is_empty() {
             return div()

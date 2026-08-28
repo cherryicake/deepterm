@@ -9,6 +9,9 @@ use gpui::{
 
 use crate::components::menu::PopupMenu;
 
+/// 菜单构建回调：接收一个空的 `PopupMenu`，返回填充好菜单项的 `PopupMenu`。
+type MenuBuilder = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+
 /// A extension trait for adding a context menu to an element.
 pub trait ContextMenuExt: ParentElement + Styled {
     /// Add a context menu to the element.
@@ -37,7 +40,7 @@ impl<E: ParentElement + Styled> ContextMenuExt for E {}
 pub struct ContextMenu<E: ParentElement + Styled + Sized> {
     id: ElementId,
     element: Option<E>,
-    menu: Option<Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>>,
+    menu: Option<MenuBuilder>,
     // This is not in use, just for style refinement forwarding.
     _ignore_style: StyleRefinement,
 }

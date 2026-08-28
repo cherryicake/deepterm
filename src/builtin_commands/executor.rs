@@ -387,7 +387,7 @@ fn candidate_host_path_splits(token: &str) -> Vec<(&str, &str)> {
         splits.push((&token[..i], &token[i + 1..]));
     }
     // 长度长的优先（带端口的 host 在前）
-    splits.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    splits.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
     splits
 }
 

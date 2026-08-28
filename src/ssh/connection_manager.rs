@@ -17,8 +17,10 @@ use crate::ssh::{
 
 /// 连接状态
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ConnectionState {
     /// 空闲（尚未连接）
+    #[default]
     Idle,
     /// 正在连接
     Connecting,
@@ -70,11 +72,6 @@ impl ConnectionState {
     }
 }
 
-impl Default for ConnectionState {
-    fn default() -> Self {
-        ConnectionState::Idle
-    }
-}
 
 /// 连接信息
 #[derive(Clone, Debug)]
@@ -155,11 +152,14 @@ struct ActiveConnection {
 }
 
 /// SSH 连接管理器
+/// 连接状态变更监听器。
+type ConnectionEventHandler = Box<dyn Fn(ConnectionEvent) + Send + Sync>;
+
 pub struct SshConnectionManager {
     /// 所有连接
     connections: Mutex<HashMap<String, ActiveConnection>>,
     /// 连接状态变更回调
-    event_handlers: Mutex<Vec<Box<dyn Fn(ConnectionEvent) + Send + Sync>>>,
+    event_handlers: Mutex<Vec<ConnectionEventHandler>>,
 }
 
 impl SshConnectionManager {
@@ -238,7 +238,7 @@ impl SshConnectionManager {
             }
             Err(e) => {
                 let mut info = info;
-                info.set_error(&e.to_string());
+                info.set_error(e.to_string());
 
                 let active_conn = ActiveConnection { info: info.clone() };
 

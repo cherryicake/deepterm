@@ -1,3 +1,4 @@
+use crate::callbacks::{OptionalBoxedClickCallback, OptionalBoxedHoverCallback};
 use crate::components::button::Disableable;
 use crate::theme::ActiveTheme;
 use gpui::{
@@ -12,8 +13,8 @@ pub struct MenuItemElement {
     style: StyleRefinement,
     disabled: bool,
     selected: bool,
-    on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
-    on_hover: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
+    on_click: OptionalBoxedClickCallback,
+    on_hover: OptionalBoxedHoverCallback,
     children: Vec<AnyElement>,
 }
 

@@ -1,3 +1,4 @@
+use crate::callbacks::OptionalClickCallback;
 use crate::components::button::button_icon::Sizable;
 use crate::components::button::{Icon, Size};
 use crate::components::menu::menu_item::MenuItemElement;
@@ -39,7 +40,7 @@ pub enum PopupMenuItem {
         /// 勾选状态：渲染时在左侧图标槽显示 check 图标（替换原图标，与 macOS 菜单一致）。
         checked: bool,
         action: Option<Box<dyn Action>>,
-        handler: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+        handler: OptionalClickCallback,
     },
 }
 
@@ -74,11 +75,8 @@ impl PopupMenuItem {
     ///
     /// Only works for [`PopupMenuItem::Item`].
     pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
-        match &mut self {
-            PopupMenuItem::Item { icon: i, .. } => {
-                *i = Some(icon.into());
-            }
-            _ => {}
+        if let PopupMenuItem::Item { icon: i, .. } = &mut self {
+            *i = Some(icon.into());
         }
         self
     }
@@ -87,11 +85,8 @@ impl PopupMenuItem {
     ///
     /// Only works for [`PopupMenuItem::Item`].
     pub fn disabled(mut self, disabled: bool) -> Self {
-        match &mut self {
-            PopupMenuItem::Item { disabled: d, .. } => {
-                *d = disabled;
-            }
-            _ => {}
+        if let PopupMenuItem::Item { disabled: d, .. } = &mut self {
+            *d = disabled;
         }
         self
     }
@@ -100,11 +95,8 @@ impl PopupMenuItem {
     ///
     /// Only works for [`PopupMenuItem::Item`].
     pub fn action(mut self, action: Box<dyn Action>) -> Self {
-        match &mut self {
-            PopupMenuItem::Item { action: a, .. } => {
-                *a = Some(action);
-            }
-            _ => {}
+        if let PopupMenuItem::Item { action: a, .. } = &mut self {
+            *a = Some(action);
         }
         self
     }
@@ -114,11 +106,8 @@ impl PopupMenuItem {
     /// 勾选的菜单项在左侧图标槽位显示 check 图标；若菜单中存在勾选项或图标项，
     /// 所有条目会统一保留图标槽位以对齐标签文本。
     pub fn checked(mut self, checked: bool) -> Self {
-        match &mut self {
-            PopupMenuItem::Item { checked: c, .. } => {
-                *c = checked;
-            }
-            _ => {}
+        if let PopupMenuItem::Item { checked: c, .. } = &mut self {
+            *c = checked;
         }
         self
     }
@@ -130,11 +119,8 @@ impl PopupMenuItem {
     where
         F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     {
-        match &mut self {
-            PopupMenuItem::Item { handler: h, .. } => {
-                *h = Some(Rc::new(handler));
-            }
-            _ => {}
+        if let PopupMenuItem::Item { handler: h, .. } = &mut self {
+            *h = Some(Rc::new(handler));
         }
         self
     }

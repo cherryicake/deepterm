@@ -1236,7 +1236,7 @@ impl TerminalView {
     pub fn has_ime_composition(&self) -> bool {
         self.ime_state
             .as_ref()
-            .map_or(false, |s| !s.marked_text.is_empty())
+            .is_some_and(|s| !s.marked_text.is_empty())
     }
 
     /// 是否存在本地覆盖输入。
@@ -1649,9 +1649,7 @@ impl TerminalView {
         let argument = ArgumentParser::extract_argument(command_line, command_name);
 
         // 在注册表中查找命令
-        let Some(command) = global_registry().find(command_name) else {
-            return None;
-        };
+        let command = global_registry().find(command_name)?;
 
         log::info!("builtin command {}: {}", command.name, command.description);
 
@@ -2603,9 +2601,7 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         // Only return bounds during active IME composition
-        if self.ime_state.is_none() {
-            return None;
-        }
+        self.ime_state.as_ref()?;
         self.terminal.update(cx, |terminal, _cx| {
             let content = terminal.last_content();
             let bounds = terminal.terminal_bounds;
@@ -2866,7 +2862,7 @@ impl Render for TerminalView {
                         }
                         terminal.url_range_at_viewport_position(row, col).map(
                             |(url, start_col, end_col)| HoveredLink {
-                                url: url.into(),
+                                url,
                                 row,
                                 start_col,
                                 end_col,

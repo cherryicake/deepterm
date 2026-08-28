@@ -501,9 +501,9 @@ impl TerminalElement {
     }
 
     #[cfg(debug_assertions)]
-    fn assert_row_consistency<'a>(
+    fn assert_row_consistency(
         row_idx: usize,
-        row_cells: &'a [IndexedCell],
+        row_cells: &[IndexedCell],
         row_runs: &[BatchedTextRun],
         row_boxes: &[BoxDrawingCell],
         row_backgrounds: &[BackgroundSpan],
@@ -912,10 +912,10 @@ impl TerminalElement {
         box_cells
     }
 
-    fn try_update_runs_in_range<'a>(
+    fn try_update_runs_in_range(
         row_idx: usize,
         cached_runs: &[BatchedTextRun],
-        cells: &'a [IndexedCell],
+        cells: &[IndexedCell],
         range: (usize, usize),
         hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
@@ -1230,7 +1230,7 @@ impl Element for TerminalElement {
         // Selection changes only invalidate selection slices inside row caches.
         // This is merged with the row-cache take below into a single
         // `view.update` to keep per-frame entity-borrow overhead low.
-        let selection_range_for_cache = selection_range.clone();
+        let selection_range_for_cache = selection_range;
         let (mut row_caches, theme_changed, cached_flattened, selection_changed) =
             self.view.update(cx, |view, _cx| {
                 let selection_changed = view.cached_selection_mouse_mode != mouse_mode
@@ -1307,7 +1307,8 @@ impl Element for TerminalElement {
             #[cfg(debug_assertions)]
             let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
 
-            for row_idx in 0..viewport_lines {
+            // `row_caches` 在上面已 resize 到 `viewport_lines`，逐行迭代等价于按下标遍历。
+            for (row_idx, row_cache) in row_caches.iter_mut().enumerate() {
                 let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
                 let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx)
                 {
@@ -1322,8 +1323,6 @@ impl Element for TerminalElement {
                         None
                     }
                 });
-
-                let row_cache = &mut row_caches[row_idx];
 
                 // Invalidate cached layout when the hovered URL range on this row changes,
                 // so that underline styles are recomputed even if terminal content is clean.
@@ -1384,9 +1383,10 @@ impl Element for TerminalElement {
                     row_cache.layout = Some(entry);
                 } else {
                     cache_hit_count += 1;
-                    if rebuild_flattened_cache {
-                        let cached_entry = row_cache.layout.as_ref().unwrap();
-                        batched_runs.extend_from_slice(&cached_entry.runs);
+                    if let Some(cached_entry) = row_cache.layout.as_ref() {
+                        if rebuild_flattened_cache {
+                            batched_runs.extend_from_slice(&cached_entry.runs);
+                        }
                     }
                 }
 
@@ -1679,7 +1679,7 @@ impl Element for TerminalElement {
                 &builtin_text,
                 &ime_text,
                 builtin_cursor,
-                cursor_display_col as usize,
+                cursor_display_col,
                 cursor_line_in_viewport,
                 terminal_bounds,
                 cell_width,

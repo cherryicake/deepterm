@@ -29,7 +29,7 @@ impl MacosSidebar {
                     return;
                 }
                 this.file_tree_target_label = Some(target_label);
-                let _ = file_tree.update(cx, |tree, cx| {
+                file_tree.update(cx, |tree, cx| {
                     tree.open_path(cwd, cx);
                 });
                 cx.notify();
@@ -71,7 +71,7 @@ impl MacosSidebar {
     ) {
         self.file_tree_subscription.take();
         if let Some(old_tree) = self.file_tree_view.take() {
-            let _ = old_tree.update(cx, |tree, cx| tree.cleanup(cx));
+            old_tree.update(cx, |tree, cx| tree.cleanup(cx));
         }
         self.file_tree_terminal_view = terminal_view.clone();
 
@@ -100,7 +100,7 @@ impl MacosSidebar {
     /// 路径相同时保持现有订阅不动。
     fn ensure_git_panel(&mut self, cx: &mut Context<Self>) {
         if self.git_panel.is_none() {
-            let git_panel = cx.new(|cx| crate::sidebar_view::git_panel::GitPanel::new(cx));
+            let git_panel = cx.new(crate::sidebar_view::git_panel::GitPanel::new);
             self.git_panel = Some(git_panel);
         }
 
@@ -132,14 +132,7 @@ impl MacosSidebar {
         self.git_panel_subscription.take();
         let sub = cx.subscribe(
             git_panel,
-            |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
-                crate::sidebar_view::git_panel::GitPanelEvent::OpenDiff { path, diff, repo } => {
-                    cx.emit(SidebarEvent::OpenDiff {
-                        path: path.clone(),
-                        diff: diff.clone(),
-                        repo: repo.clone(),
-                    });
-                }
+            |_this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
                 crate::sidebar_view::git_panel::GitPanelEvent::OpenDiffLoading { path, repo } => {
                     // Forward instantly; DiffView fetches content in background.
                     cx.emit(SidebarEvent::OpenDiffLoading {
@@ -147,7 +140,12 @@ impl MacosSidebar {
                         repo: repo.clone(),
                     });
                 }
-                _ => {}
+                crate::sidebar_view::git_panel::GitPanelEvent::StageFile { path }
+                | crate::sidebar_view::git_panel::GitPanelEvent::UnstageFile { path } => {
+                    // 暂存区变了：该文件的 HEAD → 工作区 diff 需要重算，
+                    // 正在编辑该文件的标签页要刷新行标记。
+                    cx.emit(SidebarEvent::GitIndexChanged { path: path.clone() });
+                }
             },
         );
         self.git_panel_subscription = Some(sub);

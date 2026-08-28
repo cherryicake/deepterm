@@ -8,6 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
@@ -25,7 +26,7 @@ pub struct KeychainSidebarView {
     selected_ids: HashSet<SharedString>,
     editor: Option<Entity<KeychainEditor>>,
     modal_state: Entity<ModalState>,
-    on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
+    on_select: OptionalStrCallback,
     context_menu_item_id: Option<SharedString>,
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
@@ -418,7 +419,7 @@ impl Render for KeychainSidebarView {
                 cx.spawn(async move |_, cx| {
                     if let Ok(0) = answer.await {
                         if let Some(entity) = weak.upgrade() {
-                            let _ = entity.update(cx, |this, cx| {
+                            entity.update(cx, |this, cx| {
                                 let mut store = KeychainStore::load_or_default();
                                 for id in &ids_to_delete {
                                     let _ = store.delete_item(id);
@@ -456,7 +457,7 @@ fn render_keychain_item_row(
     is_dark: bool,
     theme: crate::theme::UiTheme,
     selected_ids: &HashSet<SharedString>,
-    on_select: Option<Rc<dyn Fn(&str, &mut Window, &mut App) + 'static>>,
+    on_select: OptionalStrCallback,
     cx: &mut Context<KeychainSidebarView>,
 ) -> impl IntoElement {
     let item_id = item.id.clone();

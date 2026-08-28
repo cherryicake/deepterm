@@ -107,8 +107,12 @@ impl Language {
         }
     }
 
+    /// 从语言 id / 扩展名解析语言，未识别时返回 [`Self::Plain`]。
+    ///
+    /// 刻意不叫 `from_str`：它不会失败、也不实现 [`std::str::FromStr`]，
+    /// 与标准 trait 同名容易误读。
     #[allow(unused)]
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_id(s: &str) -> Self {
         #[cfg(not(feature = "tree-sitter-languages"))]
         return Self::Json;
 
@@ -356,8 +360,8 @@ mod tests {
         assert_eq!(Language::TypeScript.name(), "typescript");
         assert_eq!(Language::Tsx.name(), "tsx");
         assert_eq!(Language::Makefile.name(), "make");
-        assert_eq!(Language::from_str("make"), Language::Makefile);
-        assert_eq!(Language::from_str("mk"), Language::Makefile);
-        assert_eq!(Language::from_str("makefile"), Language::Makefile);
+        assert_eq!(Language::from_id("make"), Language::Makefile);
+        assert_eq!(Language::from_id("mk"), Language::Makefile);
+        assert_eq!(Language::from_id("makefile"), Language::Makefile);
     }
 }

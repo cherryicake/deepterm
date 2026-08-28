@@ -212,9 +212,7 @@ impl InputMode {
                     highlighter_ref.replace(new_highlighter);
                 }
 
-                let Some(h) = highlighter_ref.as_mut() else {
-                    return None;
-                };
+                let h = highlighter_ref.as_mut()?;
 
                 // When full text changed, the selected_range may be out of bound (The before version).
                 let mut selected_range = selected_range.clone();

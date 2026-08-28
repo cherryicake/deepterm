@@ -3,6 +3,7 @@ use gpui::{
     RenderOnce, StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
+use crate::callbacks::BoxedClickCallback;
 use crate::components::spinner::Spinner;
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
@@ -20,7 +21,7 @@ pub(crate) struct StepperTrigger {
     text_center: bool,
     show_spinner: bool,
     status: StepperStatus,
-    on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+    on_click: BoxedClickCallback,
 }
 
 impl StepperTrigger {

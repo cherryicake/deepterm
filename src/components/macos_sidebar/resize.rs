@@ -35,8 +35,8 @@ impl Element for SidebarResizeElement {
         _request_layout: &mut (),
         _window: &mut Window,
         _cx: &mut App,
-    ) -> () {
-        ()
+    ) {
+        
     }
 
     fn paint(

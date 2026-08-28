@@ -7,6 +7,7 @@ use std::time::Duration;
 
 pub mod assets;
 pub mod builtin_commands;
+pub mod callbacks;
 pub mod components;
 pub mod editor;
 pub mod file_icons;
@@ -209,7 +210,7 @@ impl AppWindow {
                 ) {
                     this.show_file_tree_page();
                     window.defer(cx, move |window, cx| {
-                        let _ = workspace.update(cx, |ws, cx| {
+                        workspace.update(cx, |ws, cx| {
                             ws.handle_sidebar_tab_double_click(&tab_id, sidebar, window, cx);
                         });
                     });
@@ -223,8 +224,8 @@ impl AppWindow {
             sidebar.on_tab_single_click(move |group_id, tab_id, _tab_label, this, window, cx| {
                 Self::activate_sidebar_tab(
                     app_window_for_single.clone(),
-                    &group_id,
-                    &tab_id,
+                    group_id,
+                    tab_id,
                     this,
                     window,
                     cx,
@@ -279,7 +280,7 @@ impl AppWindow {
                 SidebarEvent::TabGroupsChanged => {
                     let app_window = cx.entity().clone();
                     window.defer(cx, move |_window, cx| {
-                        let _ = app_window.update(cx, |this, cx| {
+                        app_window.update(cx, |this, cx| {
                             this.sync_sidebar_tab_groups(cx);
                         });
                     });
@@ -294,26 +295,13 @@ impl AppWindow {
                                 if let Some(config) = config {
                                     e.open_remote_file(
                                         path.to_string_lossy().to_string(),
-                                        config,
+                                        *config,
                                         window,
                                         cx,
                                     );
                                 } else {
                                     e.open_file(path, window, cx);
                                 }
-                            });
-                        }
-                    });
-                }
-                SidebarEvent::OpenDiff { path, diff, repo } => {
-                    let editor = editor_for_open.clone();
-                    let path = path.clone();
-                    let diff = diff.clone();
-                    let repo = repo.clone();
-                    window.defer(cx, move |window, cx| {
-                        if let Some(editor) = editor.upgrade() {
-                            editor.update(cx, |e, cx| {
-                                e.open_diff_file(path, diff, repo, window, cx);
                             });
                         }
                     });
@@ -325,6 +313,18 @@ impl AppWindow {
                         if let Some(editor) = editor.upgrade() {
                             editor.update(cx, |e, cx| {
                                 e.open_diff_file_loading(path, repo, window, cx)
+                            });
+                        }
+                    });
+                }
+                SidebarEvent::GitIndexChanged { path } => {
+                    // Git 面板已经自行刷新列表，这里只需让编辑器重算行标记。
+                    let editor = editor_for_open.clone();
+                    let path = path.clone();
+                    window.defer(cx, move |_, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                e.refresh_git_marks_for_path(&path, cx);
                             });
                         }
                     });
@@ -431,7 +431,7 @@ impl AppWindow {
                             return;
                         }
                         let active_tab_id = workspace.read(cx).active_tab_id().to_string();
-                        let _ = workspace.update(cx, |ws, cx| {
+                        workspace.update(cx, |ws, cx| {
                             ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, window, cx);
                         });
                     });
@@ -439,7 +439,7 @@ impl AppWindow {
                 WorkspaceEvent::TabBarChanged => {
                     let app_window = cx.entity();
                     window.defer(cx, move |_window, cx| {
-                        let _ = app_window.update(cx, |this, cx| {
+                        app_window.update(cx, |this, cx| {
                             this.sync_sidebar_tab_groups(cx);
                         });
                     });
@@ -449,7 +449,7 @@ impl AppWindow {
                         this.editor.clone(),
                         this.sidebar.clone(),
                         path.clone(),
-                        ssh_config.clone(),
+                        ssh_config.as_deref().cloned(),
                         window,
                         cx,
                     );
@@ -852,7 +852,7 @@ impl AppWindow {
                 return;
             }
             let active_tab_id = workspace.read(cx).active_tab_id().to_string();
-            let _ = workspace.update(cx, |ws, cx| {
+            workspace.update(cx, |ws, cx| {
                 ws.handle_sidebar_tab_double_click(&active_tab_id, sidebar, window, cx);
             });
         });
@@ -872,7 +872,7 @@ impl AppWindow {
                     s.finish_animation();
                     cx.notify();
                 });
-                let _ = app_window.update(cx, |_, cx| cx.notify());
+                app_window.update(cx, |_, cx| cx.notify());
             }));
         } else {
             self._sidebar_hide_task = None;

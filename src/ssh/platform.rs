@@ -168,7 +168,7 @@ impl RemoteOS {
 pub fn detect_local_os() -> RemoteOS {
     #[cfg(target_os = "macos")]
     {
-        return RemoteOS::Macos;
+        RemoteOS::Macos
     }
     #[cfg(target_os = "windows")]
     {

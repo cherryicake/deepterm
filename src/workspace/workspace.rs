@@ -42,13 +42,21 @@ use crate::workspace::split_manager::{SplitContainer, SplitDirection};
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
 
+/// 最后一个 tab 关闭时的回调（不需要跨线程，故无 `Send + Sync`）。
+type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App)>;
+/// 可选 [`LastTabCloseCallback`]。
+type OptionalLastTabCloseCallback = Option<LastTabCloseCallback>;
+
+/// `SshConnectionConfig` 有 184 字节，直接内嵌会让整个枚举膨胀到 208 字节，
+/// 而 `SessionChanged` / `TabBarChanged` 这类高频小事件也要跟着付这份拷贝代价。
+/// 装箱后枚举降到 32 字节。
 #[derive(Clone, Debug)]
 pub enum WorkspaceEvent {
     SessionChanged,
     TabBarChanged,
     OpenPath {
         path: String,
-        ssh_config: Option<SshConnectionConfig>,
+        ssh_config: Option<Box<SshConnectionConfig>>,
     },
 }
 
@@ -126,7 +134,7 @@ pub struct Workspace {
     ssh_picker: Option<Entity<SshPicker>>,
     /// 最后一个 tab 关闭、窗口即将移除前的回调（由 AppWindow 注入，
     /// 用于同步落盘会话——防抖任务会随窗口销毁而丢失）。
-    on_last_tab_close: Option<Box<dyn Fn(&mut gpui::App)>>,
+    on_last_tab_close: OptionalLastTabCloseCallback,
     /// 下一个传输任务序号
     next_transfer_id: usize,
     /// 文件传输任务状态
@@ -407,12 +415,10 @@ impl Workspace {
             .collect();
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, tab_items);
 
-        let active_tab_id = state
+        let active_tab_id = if state
             .tabs
             .iter()
-            .any(|tab| tab.id == state.active_tab_id)
-            .then(|| state.active_tab_id.clone())
-            .unwrap_or_else(|| state.tabs[0].id.clone());
+            .any(|tab| tab.id == state.active_tab_id) { state.active_tab_id.clone() } else { state.tabs[0].id.clone() };
 
         let tabs = state
             .tabs
@@ -838,7 +844,7 @@ impl Workspace {
                 // 判断路径是文件还是目录
                 cx.emit(WorkspaceEvent::OpenPath {
                     path: path.clone(),
-                    ssh_config: ssh_config.clone(),
+                    ssh_config: ssh_config.as_ref().map(|c| Box::new(c.clone())),
                 });
                 // 聚焦原 panel
                 if let Some(panel) = self.find_panel(panel_id, cx) {
@@ -950,7 +956,7 @@ impl Workspace {
                 .spawn(async move { quick_total_size(&request_for_size) })
                 .await;
             if let Some(entity) = weak_for_size.upgrade() {
-                let _ = entity.update(cx, |this, cx| {
+                entity.update(cx, |this, cx| {
                     if let Some(task) = this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
                     {
                         let transferred = task.bytes_transferred.load(Ordering::Relaxed);
@@ -1099,7 +1105,7 @@ impl Workspace {
         cx.spawn(async move |_, cx| {
             let result = task.await;
             if let Some(entity) = weak2.upgrade() {
-                let _ = entity.update(cx, |this, cx| {
+                entity.update(cx, |this, cx| {
                     this.finish_transfer_task(transfer_id, result, cx);
                 });
             }
@@ -1116,7 +1122,7 @@ impl Workspace {
                 }
                 if let Some(entity) = weak.upgrade() {
                     let tb = total_bytes_for_reporter.load(Ordering::Relaxed);
-                    let _ = entity.update(cx, |this, cx| {
+                    entity.update(cx, |this, cx| {
                         if let Some(task) =
                             this.transfer_tasks.iter_mut().find(|t| t.id == transfer_id)
                         {
@@ -1507,8 +1513,7 @@ impl Workspace {
             let remaining_icon = tab_info
                 .container
                 .get_first_panel()
-                .map(|p| p.read(cx).remote_os)
-                .flatten()
+                .and_then(|p| p.read(cx).remote_os)
                 .map(|os| os.icon());
 
             // 更新TabBar显示
@@ -2144,7 +2149,7 @@ impl Workspace {
             return;
         };
 
-        let _ = sidebar.update(cx, |s, cx| {
+        sidebar.update(cx, |s, cx| {
             s.set_terminal_file_tree(terminal_view, window, cx)
         });
     }
@@ -2285,7 +2290,7 @@ impl Workspace {
                         path.iter().copied().chain(std::iter::once(i)).collect();
 
                     let child_element = div()
-                        .flex_basis(gpui::DefiniteLength::Fraction(size.into()))
+                        .flex_basis(gpui::DefiniteLength::Fraction(size))
                         .flex_shrink(1.0)
                         .overflow_hidden()
                         .min_w(px(0.0))
@@ -2522,8 +2527,8 @@ impl Element for ResizeHandlerElement {
         _request_layout: &mut (),
         _window: &mut Window,
         _cx: &mut App,
-    ) -> () {
-        ()
+    ) {
+        
     }
 
     fn paint(

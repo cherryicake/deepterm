@@ -31,6 +31,7 @@ pub mod auth;
 pub mod config;
 pub mod connection_manager;
 pub mod error;
+pub mod host_key;
 pub mod keychain;
 pub mod platform;
 pub mod russh_terminal;

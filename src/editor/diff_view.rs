@@ -46,6 +46,11 @@ use super::diff_model::{
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 use super::git_repository::GitRepository;
 
+/// 行级背景着色：`(0 基行号, 背景色)`，按行号升序。
+type LineColors = Vec<(u32, Hsla)>;
+/// 词级背景着色：`(字节范围, 背景色)`。
+type WordColors = Vec<(Range<usize>, Hsla)>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiffMode {
     Unified,
@@ -725,10 +730,10 @@ impl DiffView {
             let mut j = i + 1;
             while j < unified.lines.len() && members.len() < MAX_GROUP_LINES {
                 let line = &unified.lines[j];
-                let same_kind = match (is_old, line.kind) {
-                    (true, LineKind::Del) | (false, LineKind::Context | LineKind::Add) => true,
-                    _ => false,
-                };
+                let same_kind = matches!(
+                    (is_old, line.kind),
+                    (true, LineKind::Del) | (false, LineKind::Context | LineKind::Add)
+                );
                 if !same_kind {
                     break;
                 }
@@ -762,7 +767,7 @@ impl DiffView {
                         let e = range.end.min(src.end);
                         if e > s {
                             let offset = merged.start - src.start;
-                            runs.push((s + offset..e + offset, style.clone()));
+                            runs.push((s + offset..e + offset, style));
                         }
                     }
                 }
@@ -1430,11 +1435,7 @@ fn unified_decorations(
     deleted_line: Hsla,
     added_word: Hsla,
     deleted_word: Hsla,
-) -> (
-    Vec<(u32, Hsla)>,
-    Vec<(Range<usize>, Hsla)>,
-    Vec<Option<u32>>,
-) {
+) -> (LineColors, WordColors, Vec<Option<u32>>) {
     let mut line_colors = Vec::new();
     let mut word_colors = Vec::new();
     let mut labels = Vec::with_capacity(unified.lines.len());
@@ -1468,12 +1469,7 @@ fn hunk_decorations(
     deleted_line: Hsla,
     added_word: Hsla,
     deleted_word: Hsla,
-) -> (
-    Vec<(u32, Hsla)>,
-    Vec<(Range<usize>, Hsla)>,
-    Vec<(u32, Hsla)>,
-    Vec<(Range<usize>, Hsla)>,
-) {
+) -> (LineColors, WordColors, LineColors, WordColors) {
     let mut new_line_colors = Vec::new();
     let mut new_word_colors = Vec::new();
     let mut old_line_colors = Vec::new();

@@ -63,12 +63,12 @@ impl PersistenceManager {
             return;
         }
         // 新目录不存在但旧目录存在，尝试迁移
-        match fs::rename(&legacy, new_dir) {
+        match fs::rename(legacy, new_dir) {
             Ok(_) => log::info!("Migrated legacy config {} -> {}", legacy.display(), new_dir.display()),
             Err(e) => {
                 // 跨文件系统 rename 失败则拷贝
                 log::warn!("Failed to rename legacy config ({}), trying copy: {e}", legacy.display());
-                if let Err(copy_err) = Self::copy_dir_all(&legacy, new_dir) {
+                if let Err(copy_err) = Self::copy_dir_all(legacy, new_dir) {
                     log::error!("Failed to migrate legacy config: {copy_err}");
                 } else {
                     log::info!("Copied legacy config {} -> {}", legacy.display(), new_dir.display());

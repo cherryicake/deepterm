@@ -456,7 +456,7 @@ fn detect_transfer_strategies(
                 return forced_strategies;
             }
             "pipeline" | "stream" => return vec![RemoteToRemoteStrategy::StreamViaLocal],
-            "auto" | _ => {}
+            _ => {}
         }
     }
 

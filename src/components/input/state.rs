@@ -131,6 +131,20 @@ pub(crate) struct OccurrenceCache {
     pub(crate) ranges: std::rc::Rc<Vec<Range<usize>>>,
 }
 
+/// 单个括号的着色信息：`(字节范围, 嵌套层级, 是否开括号, 是否配对)`。
+pub(crate) type BracketSpan = (Range<usize>, usize, bool, bool);
+
+/// 括号着色缓存。
+pub(crate) struct RainbowCache {
+    pub(crate) text_version: u64,
+    /// 语法树根指纹；没有语法树时为 `None`。
+    pub(crate) tree_fingerprint: Option<usize>,
+    pub(crate) spans: std::rc::Rc<Vec<BracketSpan>>,
+}
+
+/// 输入校验回调：返回 `false` 表示校验不通过。
+pub(crate) type ValidateFn = Box<dyn Fn(&str, &mut Context<InputState>) -> bool + 'static>;
+
 /// 滚动条几何信息（每次 paint 后写入，供拖拽命中与换算）。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScrollbarGeometry {
@@ -723,13 +737,8 @@ pub struct InputState {
     pub(crate) occurrence_cache: Option<OccurrenceCache>,
     /// 括号着色（rainbow brackets，按嵌套深度分色）。
     pub(crate) rainbow_brackets: bool,
-    /// 括号着色缓存：(text_version, 语法树根指纹（无树时 None）, 全文件括号着色结果)。
-    /// 着色结果元素为 (范围, 层级, 是否开括号, 是否配对)。
-    pub(crate) rainbow_cache: Option<(
-        u64,
-        Option<usize>,
-        std::rc::Rc<Vec<(Range<usize>, usize, bool, bool)>>,
-    )>,
+    /// 括号着色缓存；元素含义见 [`RainbowCache`] 与 [`BracketSpan`]。
+    pub(crate) rainbow_cache: Option<RainbowCache>,
     /// 缩进参考线。
     pub(crate) indent_guides: bool,
     /// 悬浮滚动条。
@@ -753,7 +762,7 @@ pub struct InputState {
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
     pub(crate) pattern: Option<regex::Regex>,
-    pub(crate) validate: Option<Box<dyn Fn(&str, &mut Context<Self>) -> bool + 'static>>,
+    pub(crate) validate: Option<ValidateFn>,
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
@@ -1106,18 +1115,15 @@ impl InputState {
         new_language: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        match &mut self.mode {
-            InputMode::CodeEditor {
+        if let InputMode::CodeEditor {
                 language,
                 highlighter,
                 parse_task,
                 ..
-            } => {
-                *language = new_language.into();
-                *highlighter.borrow_mut() = None;
-                parse_task.borrow_mut().take();
-            }
-            _ => {}
+            } = &mut self.mode {
+            *language = new_language.into();
+            *highlighter.borrow_mut() = None;
+            parse_task.borrow_mut().take();
         }
         cx.notify();
     }
@@ -1143,16 +1149,13 @@ impl InputState {
     }
 
     fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
-        match &mut self.mode {
-            InputMode::CodeEditor {
+        if let InputMode::CodeEditor {
                 highlighter,
                 parse_task,
                 ..
-            } => {
-                *highlighter.borrow_mut() = None;
-                parse_task.borrow_mut().take();
-            }
-            _ => {}
+            } = &mut self.mode {
+            *highlighter.borrow_mut() = None;
+            parse_task.borrow_mut().take();
         }
         cx.notify();
     }
@@ -1909,9 +1912,9 @@ impl InputState {
         }
 
         if next_indent.len() > current_indent.len() {
-            return next_indent;
+            next_indent
         } else {
-            return current_indent;
+            current_indent
         }
     }
 
@@ -2129,7 +2132,7 @@ impl InputState {
     /// 行 span：[首行行首, 末行下一行行首或文件尾)（含末行行尾换行）。
     fn logical_rows_span(&self, rows: &RangeInclusive<usize>) -> Range<usize> {
         let start = self.text.line_start_offset(*rows.start());
-        let end = if *rows.end() + 1 <= self.text.lines_len().saturating_sub(1) {
+        let end = if *rows.end() < self.text.lines_len().saturating_sub(1) {
             self.text.line_start_offset(*rows.end() + 1)
         } else {
             self.text.len()
@@ -2793,7 +2796,7 @@ impl InputState {
     }
 
     pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clean_on_escape {}
+        
 
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
@@ -2813,7 +2816,7 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         if let Some(ime_marked_range) = &self.ime_marked_range {
-            if ime_marked_range.len() == 0 {
+            if ime_marked_range.is_empty() {
                 self.ime_marked_range = None;
             }
         }
@@ -3171,7 +3174,7 @@ impl InputState {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
             for change in changes {
-                let range_utf16 = self.range_to_utf16(&change.new_range.into());
+                let range_utf16 = self.range_to_utf16(&change.new_range);
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
         }
@@ -3182,7 +3185,7 @@ impl InputState {
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
             for change in changes {
-                let range_utf16 = self.range_to_utf16(&change.old_range.into());
+                let range_utf16 = self.range_to_utf16(&change.old_range);
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
         }
@@ -3509,23 +3512,14 @@ impl InputState {
     ///
     /// Returns `None` when the requested range is not currently laid out or visible.
     pub fn range_to_bounds(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
-        let Some(last_layout) = self.last_layout.as_ref() else {
-            return None;
-        };
-
-        let Some(last_bounds) = self.last_bounds else {
-            return None;
-        };
+        let last_layout = self.last_layout.as_ref()?;
+        let last_bounds = self.last_bounds?;
 
         let (_, _, start_pos) = self.line_and_position_for_offset(range.start);
         let (_, _, end_pos) = self.line_and_position_for_offset(range.end);
 
-        let Some(start_pos) = start_pos else {
-            return None;
-        };
-        let Some(end_pos) = end_pos else {
-            return None;
-        };
+        let start_pos = start_pos?;
+        let end_pos = end_pos?;
 
         Some(Bounds::from_corners(
             last_bounds.origin + start_pos,
@@ -3646,9 +3640,7 @@ impl InputState {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let Some(config) = LanguageRegistry::singleton().language(&language) else {
-                        return None;
-                    };
+                    let config = LanguageRegistry::singleton().language(&language)?;
 
                     let mut parser = tree_sitter::Parser::new();
                     if parser.set_language(&config.language).is_err() {
@@ -3806,7 +3798,7 @@ impl EntityInputHandler for InputState {
             }
         }
 
-        self.push_history(&old_text, &range, &new_text);
+        self.push_history(&old_text, &range, new_text);
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -3819,7 +3811,7 @@ impl EntityInputHandler for InputState {
 
         let bg = self
             .mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+            .update_highlighter(&range, &self.text, new_text, true, cx);
         if let Some(bg) = bg {
             Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
@@ -3879,7 +3871,7 @@ impl EntityInputHandler for InputState {
 
         let bg = self
             .mode
-            .update_highlighter(&range, &self.text, &new_text, true, cx);
+            .update_highlighter(&range, &self.text, new_text, true, cx);
         if let Some(bg) = bg {
             Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }

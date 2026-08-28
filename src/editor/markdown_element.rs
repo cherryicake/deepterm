@@ -1,7 +1,4 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Range;
-use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -13,7 +10,7 @@ use gpui::{
 use crate::assets::Icon;
 use crate::theme::ActiveTheme;
 
-use super::markdown::{Markdown, MarkdownStyle, highlight_code_runs};
+use super::markdown::{HighlightCache, Markdown, MarkdownStyle, highlight_code_runs};
 use super::markdown_parser::{ColumnAlign, MarkdownEvent, MarkdownTag, MarkdownTagEnd};
 
 pub enum AnyDiv {
@@ -114,7 +111,7 @@ pub struct MarkdownElementBuilder {
     wrapped_code_blocks: std::collections::HashSet<usize>,
     copied_code_blocks: std::collections::HashSet<usize>,
     markdown: Entity<Markdown>,
-    highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
+    highlight_cache: HighlightCache,
 }
 
 impl MarkdownElementBuilder {
@@ -123,7 +120,7 @@ impl MarkdownElementBuilder {
         wrapped_code_blocks: std::collections::HashSet<usize>,
         copied_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
-        highlight_cache: Rc<RefCell<HashMap<(String, Range<usize>), Vec<TextRun>>>>,
+        highlight_cache: HighlightCache,
     ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
