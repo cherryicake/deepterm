@@ -5,32 +5,13 @@
 //! # 主要组件
 //!
 //! - [`config`]: SSH 连接配置（主机、端口、认证方式等）
-//! - [`connection_manager`]: 管理所有 SSH 连接的生命周期
 //! - [`ssh_pty`]: PTY + ssh 命令方式实现 SSH 终端
-//!
-//! # 使用示例
-//!
-//! ```rust,ignore
-//! use ssh::{SshConnectionConfig, AuthMethod, SshConnectionManager};
-//!
-//! let config = SshConnectionConfig {
-//!     id: "server-1".to_string(),
-//!     host: "192.168.1.100".to_string(),
-//!     port: 22,
-//!     username: "admin".to_string(),
-//!     auth_method: AuthMethod::Password { password: "secret".to_string() },
-//!     nickname: Some("My Server".to_string()),
-//! };
-//!
-//! let manager = SshConnectionManager::new();
-//! manager.connect(config).await?;
-//! ```
+//! - [`russh_terminal`]: russh 实现的 SSH 终端（默认传输路径）
+//! - [`sftp_fs`]: SFTP 文件系统
 
 pub mod agent;
 pub mod auth;
 pub mod config;
-pub mod connection_manager;
-pub mod error;
 pub mod host_key;
 pub mod keychain;
 pub mod platform;
@@ -40,14 +21,10 @@ pub mod shared_runtime;
 pub mod ssh_pty;
 
 pub use config::{AuthMethod, SshConnectionConfig};
-pub use connection_manager::{ConnectionState, SshConnectionManager};
-pub use error::{SshError, SshResult};
 pub use keychain::{KeychainItem, KeychainItemKind, KeychainStore};
 pub use russh_terminal::RusshTerminal;
 pub use ssh_pty::SshPtyTerminal;
 
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 const REMOTE_BASH_INTEGRATION: &str =
     include_str!("../../assets/shell-integration/bash/deepterm.bash");
@@ -176,103 +153,6 @@ esac
     );
 
     script
-}
-
-/// SSH 客户端配置
-#[derive(Clone, Debug)]
-pub struct SshClientConfig {
-    /// 连接超时时间（秒）
-    pub connection_timeout: u64,
-    /// 是否启用严格主机密钥检查
-    pub strict_host_key_checking: bool,
-    /// 密钥交换算法偏好
-    pub kex_algorithms: Option<Vec<String>>,
-    /// 加密算法偏好
-    pub cipher_algorithms: Option<Vec<String>>,
-}
-
-impl Default for SshClientConfig {
-    fn default() -> Self {
-        Self {
-            connection_timeout: 30,
-            strict_host_key_checking: true,
-            kex_algorithms: None,
-            cipher_algorithms: None,
-        }
-    }
-}
-
-/// 全局 SSH 状态管理
-///
-/// 用于在应用级别共享 SSH 连接管理器
-#[derive(Clone)]
-pub struct SshGlobalState {
-    /// 连接管理器
-    manager: Arc<Mutex<SshConnectionManager>>,
-    /// 客户端配置
-    client_config: Arc<SshClientConfig>,
-}
-
-impl SshGlobalState {
-    /// 创建新的 SSH 全局状态
-    pub fn new() -> Self {
-        Self {
-            manager: Arc::new(Mutex::new(SshConnectionManager::new())),
-            client_config: Arc::new(SshClientConfig::default()),
-        }
-    }
-
-    /// 获取连接管理器的锁
-    pub fn manager_lock(&self) -> parking_lot::MutexGuard<'_, SshConnectionManager> {
-        self.manager.lock()
-    }
-
-    /// 获取客户端配置
-    pub fn client_config(&self) -> &SshClientConfig {
-        &self.client_config
-    }
-
-    /// 更新客户端配置
-    pub fn set_client_config(&mut self, config: SshClientConfig) {
-        self.client_config = Arc::new(config);
-    }
-}
-
-impl Default for SshGlobalState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 连接状态变更事件
-#[derive(Clone, Debug)]
-pub enum ConnectionEvent {
-    /// 连接已建立
-    Connected { connection_id: String },
-    /// 连接已断开
-    Disconnected {
-        connection_id: String,
-        reason: Option<String>,
-    },
-    /// 连接失败
-    ConnectionFailed {
-        connection_id: String,
-        error: String,
-    },
-    /// 正在连接
-    Connecting { connection_id: String },
-    /// 正在重连
-    Reconnecting { connection_id: String, attempt: u32 },
-}
-
-/// 生成唯一的连接 ID
-pub fn generate_connection_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("ssh-{}-{}", timestamp, rand::random::<u16>())
 }
 
 /// 支持的 SSH 密钥类型

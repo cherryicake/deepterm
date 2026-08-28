@@ -21,64 +21,6 @@ const MAX_WORD_DIFF_LINE_COUNT: usize = 8;
 /// unchanged regions.
 pub const CONTEXT_LINES: u32 = 4;
 
-/// A fully computed diff between the HEAD (old) and working-tree (new)
-/// version of one file.
-#[derive(Clone, Debug)]
-pub struct DiffFile {
-    /// Repository-relative path.
-    pub path: String,
-    /// Language id used for syntax highlighting (see `guess_language_from_extension`).
-    pub language: String,
-    /// File content at HEAD. Empty for untracked / newly added files.
-    pub old_text: String,
-    /// Current working-tree content. Empty for deleted files.
-    pub new_text: String,
-    /// Unified render rows (with long unchanged regions collapsed).
-    pub rows: Vec<DiffRow>,
-    pub additions: usize,
-    pub deletions: usize,
-}
-
-/// One row in the unified diff rendering.
-#[derive(Clone, Debug)]
-pub enum DiffRow {
-    /// Unchanged line. Byte range refers to `new_text` (identical in old).
-    Context {
-        old_lineno: u32,
-        new_lineno: u32,
-        new_range: Range<usize>,
-    },
-    /// Added line. Byte range refers to `new_text`.
-    Add {
-        new_lineno: u32,
-        new_range: Range<usize>,
-        /// Word-level changed ranges, absolute in `new_text`.
-        word_ranges: Vec<Range<usize>>,
-    },
-    /// Deleted line. Byte range refers to `old_text`.
-    Del {
-        old_lineno: u32,
-        old_range: Range<usize>,
-        /// Word-level changed ranges, absolute in `old_text`.
-        word_ranges: Vec<Range<usize>>,
-    },
-    /// Collapsed run of unchanged lines between two hunks.
-    Separator {
-        hidden_lines: u32,
-        /// Region start line in the new text (0-based); also the id used
-        /// to expand this separator via `expanded_separators`.
-        new_start: u32,
-        /// Region start line in the old text (0-based).
-        old_start: u32,
-    },
-}
-
-impl DiffRow {
-    pub fn is_separator(&self) -> bool {
-        matches!(self, DiffRow::Separator { .. })
-    }
-}
-
 /// One changed hunk between old and new text, with word-level detail.
 #[derive(Clone, Debug)]
 pub struct DiffHunk {
@@ -185,18 +127,12 @@ pub struct UnifiedSource {
 
 /// Build the merged unified display: context lines interleaved with deleted
 /// (old) and added (new) lines, hunks in file order, nothing collapsed.
+///
+/// 仅测试使用：生产路径走 [`build_unified_collapsed`]，这里保留未折叠
+/// 版本供测试断言“全量展开”时的行为。
+#[cfg(test)]
 pub fn build_unified(old_text: &str, new_text: &str) -> UnifiedSource {
     let hunks = compute_hunks(old_text, new_text);
-    build_unified_with_hunks(old_text, new_text, &hunks)
-}
-
-/// Like [`build_unified`], but reuses already-computed hunks so the
-/// (potentially expensive) line diff runs only once per recompute.
-pub(crate) fn build_unified_with_hunks(
-    old_text: &str,
-    new_text: &str,
-    hunks: &[DiffHunk],
-) -> UnifiedSource {
     let old_starts = line_starts(old_text);
     let new_starts = line_starts(new_text);
     let new_line_count = line_count(new_text, &new_starts);
@@ -588,140 +524,6 @@ pub(crate) fn line_range(text: &str, starts: &[usize], row: u32) -> Range<usize>
     start..end
 }
 
-impl DiffFile {
-    /// Build the diff model from old/new file contents.
-    ///
-    /// `expanded_separators` contains `new_start` values of separator rows
-    /// that the user expanded; those regions are rendered in full.
-    pub fn build(
-        path: String,
-        language: String,
-        old_text: String,
-        new_text: String,
-        expanded_separators: &[u32],
-    ) -> Self {
-        let hunks = compute_hunks(&old_text, &new_text);
-        let new_starts = line_starts(&new_text);
-        let old_starts = line_starts(&old_text);
-        let old_line_count = line_count(&old_text, &old_starts);
-        let new_line_count = line_count(&new_text, &new_starts);
-
-        let mut rows = Vec::new();
-        let mut additions = 0usize;
-        let mut deletions = 0usize;
-
-        let mut old_cursor = 0u32;
-        let mut new_cursor = 0u32;
-
-        let push_context = |old_from: u32,
-                                old_to: u32,
-                                new_from: u32,
-                                new_to: u32,
-                                rows: &mut Vec<DiffRow>| {
-            let len = new_to - new_from;
-            debug_assert_eq!(len, old_to - old_from);
-            // Collapse long unchanged runs, keeping CONTEXT_LINES on each side.
-            if len > CONTEXT_LINES * 2 + 1 && !expanded_separators.contains(&new_from) {
-                for i in 0..CONTEXT_LINES {
-                    rows.push(DiffRow::Context {
-                        old_lineno: old_from + i,
-                        new_lineno: new_from + i,
-                        new_range: line_range(&new_text, &new_starts, new_from + i),
-                    });
-                }
-                rows.push(DiffRow::Separator {
-                    hidden_lines: len - CONTEXT_LINES * 2,
-                    new_start: new_from,
-                    old_start: old_from,
-                });
-                for i in len - CONTEXT_LINES..len {
-                    rows.push(DiffRow::Context {
-                        old_lineno: old_from + i,
-                        new_lineno: new_from + i,
-                        new_range: line_range(&new_text, &new_starts, new_from + i),
-                    });
-                }
-            } else {
-                for i in 0..len {
-                    rows.push(DiffRow::Context {
-                        old_lineno: old_from + i,
-                        new_lineno: new_from + i,
-                        new_range: line_range(&new_text, &new_starts, new_from + i),
-                    });
-                }
-            }
-        };
-
-        for hunk in &hunks {
-            let old_rows = &hunk.old_rows;
-            let new_rows = &hunk.new_rows;
-            // Context before this hunk.
-            push_context(
-                old_cursor,
-                old_rows.start,
-                new_cursor,
-                new_rows.start,
-                &mut rows,
-            );
-
-            let old_word_ranges = &hunk.old_word_ranges;
-            let new_word_ranges = &hunk.new_word_ranges;
-
-            deletions += hunk.deletions();
-            additions += hunk.additions();
-
-            for row in old_rows.start..old_rows.end {
-                let range = line_range(&old_text, &old_starts, row);
-                let word_ranges = old_word_ranges
-                    .iter()
-                    .filter(|r| r.start < range.end && r.end > range.start)
-                    .map(|r| r.start.max(range.start)..r.end.min(range.end))
-                    .collect();
-                rows.push(DiffRow::Del {
-                    old_lineno: row,
-                    old_range: range,
-                    word_ranges,
-                });
-            }
-            for row in new_rows.start..new_rows.end {
-                let range = line_range(&new_text, &new_starts, row);
-                let word_ranges = new_word_ranges
-                    .iter()
-                    .filter(|r| r.start < range.end && r.end > range.start)
-                    .map(|r| r.start.max(range.start)..r.end.min(range.end))
-                    .collect();
-                rows.push(DiffRow::Add {
-                    new_lineno: row,
-                    new_range: range,
-                    word_ranges,
-                });
-            }
-
-            old_cursor = old_rows.end;
-            new_cursor = new_rows.end;
-        }
-
-        // Trailing context after the last hunk.
-        push_context(
-            old_cursor,
-            old_line_count,
-            new_cursor,
-            new_line_count,
-            &mut rows,
-        );
-
-        DiffFile {
-            path,
-            language,
-            old_text,
-            new_text,
-            rows,
-            additions,
-            deletions,
-        }
-    }
-}
-
 /// Computes a line-based diff, returning `(old_row_range, new_row_range)`
 /// for each changed hunk. Ported from zed `text_diff.rs::line_diff`.
 pub fn line_diff(old_text: &str, new_text: &str) -> Vec<(Range<u32>, Range<u32>)> {
@@ -921,84 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_modified_file() {
-        let old = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n".to_string();
-        let new = "fn main() {\n    let x = 2;\n    println!(\"{x}\");\n}\n".to_string();
-        let diff = DiffFile::build("a.rs".into(), "rust".into(), old, new, &[]);
-        assert_eq!(diff.additions, 1);
-        assert_eq!(diff.deletions, 1);
-        // 3 context rows (lines are short, no separator) + 1 del + 1 add
-        assert_eq!(diff.rows.len(), 5);
-        let add = diff
-            .rows
-            .iter()
-            .find_map(|r| match r {
-                DiffRow::Add {
-                    new_range,
-                    word_ranges,
-                    ..
-                } => Some((new_range, word_ranges)),
-                _ => None,
-            })
-            .expect("should have an Add row");
-        assert_eq!(&diff.new_text[add.0.clone()], "    let x = 2;");
-        assert!(!add.1.is_empty(), "word ranges should highlight `2`");
-    }
-
-    #[test]
-    fn test_build_new_file_all_added() {
-        let diff = DiffFile::build(
-            "new.rs".into(),
-            "rust".into(),
-            String::new(),
-            "a\nb\nc\n".to_string(),
-            &[],
-        );
-        assert_eq!(diff.additions, 3);
-        assert_eq!(diff.deletions, 0);
-        assert!(diff.rows.iter().all(|r| matches!(r, DiffRow::Add { .. })));
-    }
-
-    #[test]
-    fn test_build_collapses_long_context() {
-        let mut old = String::new();
-        let mut new = String::new();
-        for i in 0..40 {
-            if i == 20 {
-                old.push_str("old_line\n");
-                new.push_str("new_line\n");
-            } else {
-                let line = format!("line{i}\n");
-                old.push_str(&line);
-                new.push_str(&line);
-            }
-        }
-        let diff = DiffFile::build("f.txt".into(), "text".into(), old, new, &[]);
-        let separators = diff.rows.iter().filter(|r| r.is_separator()).count();
-        assert_eq!(separators, 2, "context before and after should collapse");
-
-        // Expanded separators render everything.
-        let sep_starts: Vec<u32> = diff
-            .rows
-            .iter()
-            .filter_map(|r| match r {
-                DiffRow::Separator { new_start, .. } => Some(*new_start),
-                _ => None,
-            })
-            .collect();
-        let diff2 = DiffFile::build(
-            "f.txt".into(),
-            "text".into(),
-            diff.old_text.clone(),
-            diff.new_text.clone(),
-            &sep_starts,
-        );
-        assert!(!diff2.rows.iter().any(|r| r.is_separator()));
-        // 39 context lines + 1 del + 1 add
-        assert_eq!(diff2.rows.len(), 41);
-    }
-
-    #[test]
     fn test_build_unified() {
         let old = "fn main() {\n    let x = 1;\n}\n".to_string();
         let new = "fn main() {\n    let x = 2;\n    dbg!(x);\n}\n".to_string();
@@ -1088,7 +812,7 @@ mod collapsed_tests {
             assert!(line.old_lineno.is_none() && line.new_lineno.is_none());
         }
         // 总行数 = 全量行数 - 两个隐藏区 + 2 个占位行
-        let full = build_unified_with_hunks(&old, &new, &hunks);
+        let full = build_unified(&old, &new);
         assert_eq!(
             out.source.lines.len(),
             full.lines.len() - 2 * (20 - CONTEXT_LINES as usize) + 2

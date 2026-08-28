@@ -529,7 +529,7 @@ mod tests {
         let cursor = "/scp a.txt ".len() + 3; // 光标在 "bob" 中间
         let q = analyse_at(buffer, cursor).unwrap();
         match &q.phase {
-            ScpCompletionPhase::RemotePath { host_token, prefix } => {
+            ScpCompletionPhase::RemotePath { host_token, .. } => {
                 assert_eq!(host_token, "bob");
             }
             _ => panic!("expected RemotePath"),

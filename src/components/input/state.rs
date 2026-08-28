@@ -4399,7 +4399,7 @@ mod tests {
         fn build_code_input(
             cx: &mut gpui::TestAppContext,
         ) -> (gpui::Entity<InputState>, &mut gpui::VisualTestContext) {
-            struct Host(gpui::Entity<InputState>);
+            struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
             impl gpui::Render for Host {
                 fn render(
                     &mut self,

@@ -37,7 +37,7 @@ use crate::theme::ActiveTheme;
 use ropey::Rope;
 
 use super::diff_model::{
-    DiffFile, DiffHunk, LineKind, UnifiedSource, compute_hunks, line_count, line_range,
+    DiffHunk, LineKind, UnifiedSource, compute_hunks, line_count, line_range,
     line_starts,
 };
 
@@ -162,77 +162,6 @@ pub struct DiffView {
 }
 
 impl DiffView {
-    pub fn new(
-        diff: DiffFile,
-        repo: GitRepository,
-        editor: WeakEntity<Editor>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let old_text: Arc<str> = diff.old_text.clone().into();
-        let saved_text = diff.new_text.clone();
-        let saved_text_fingerprint = TextFingerprint::of(&saved_text);
-
-        let left = Self::new_editor(&diff.language, &diff.old_text, true, window, cx);
-        let right = Self::new_editor(&diff.language, &diff.new_text, false, window, cx);
-        let unified = Self::new_editor(&diff.language, "", true, window, cx);
-
-        let mut this = Self {
-            path: diff.path,
-            repo,
-            editor,
-            old_text,
-            saved_text,
-            left,
-            right,
-            unified,
-            hunks: Vec::new(),
-            hunks_source: saved_text_fingerprint,
-            additions: 0,
-            deletions: 0,
-            preference: LayoutPreference::Auto,
-            available_width: 0.0,
-            old_highlighter: SimpleHighlighter::new(&diff.language),
-            new_highlighter: SimpleHighlighter::new(&diff.language),
-            old_parsed: None,
-            new_parsed: None,
-            dirty: false,
-            saving: false,
-            refreshing: false,
-            loading: false,
-            load_error: None,
-            recompute_gen: 0,
-            scroll_syncing: false,
-            expanded_separators: std::collections::HashSet::new(),
-            unified_hunk_rows: Vec::new(),
-            unified_separators: Vec::new(),
-            initial_jump_done: false,
-            pending_jump: false,
-            _subscriptions: Vec::new(),
-        };
-
-        this.recompute(cx);
-
-        // Live updates while editing the new side.
-        let right = this.right.clone();
-        this._subscriptions.push(cx.subscribe(
-            &right,
-            |this, _, event: &crate::components::input::InputEvent, cx| {
-                if matches!(event, crate::components::input::InputEvent::Change) {
-                    this.on_right_changed(cx);
-                }
-            },
-        ));
-        // Scroll sync both ways.
-        this._subscriptions.push(cx.observe(&this.left.clone(), |this, _, cx| {
-            this.sync_scroll(Side::Left, cx);
-        }));
-        this._subscriptions.push(cx.observe(&this.right.clone(), |this, _, cx| {
-            this.sync_scroll(Side::Right, cx);
-        }));
-
-        this
-    }
 
     /// Creates the view with empty editors and fetches content in the background.
     /// The tab appears instantly; batched remote fetch makes it feel local.
