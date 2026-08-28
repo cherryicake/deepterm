@@ -628,6 +628,25 @@ fn default_theme_id(appearance: WindowAppearance) -> &'static str {
     }
 }
 
+/// 上游官方主题本身即如此的已知例外。
+///
+/// 新增主题若触发警告，应优先核对上游是否确有此设计；
+/// 若是数据回归，请修复主题数据而不是加入本表。
+const OFFICIAL_VISIBILITY_EXCEPTIONS: &[(&str, &str)] = &[
+    // 官方 monokai 移植（alacritty/kitty）的 color0 即背景色
+    ("monokai", "normal.black"),
+    // 官方 kitty flexoki_light 的 color7 即纸色背景
+    ("flexoki-light", "normal.white"),
+    // 官方 Solarized Dark 的 bright black（base02）即背景色
+    ("solarized-dark", "bright.black"),
+    // 官方 night-owl 的 alacritty 移植 color0 即背景色
+    ("night-owl", "normal.black"),
+    // 官方 kitty flexoki_dark 的 color0 即墨黑背景
+    ("flexoki-dark", "normal.black"),
+    // 官方 alacritty gruvbox_light 的 color0 即纸色背景
+    ("gruvbox-light", "normal.black"),
+];
+
 fn load_builtin_themes() -> anyhow::Result<Vec<AppTheme>> {
     let bundle: ThemeBundleFile =
         serde_json::from_str(include_str!("../../assets/themes/builtin.json"))?;
@@ -637,11 +656,20 @@ fn load_builtin_themes() -> anyhow::Result<Vec<AppTheme>> {
         .map(|theme_file| {
             let theme = AppTheme::try_from(theme_file)?;
             for name in theme.terminal.visibility_issues() {
-                log::warn!(
-                    "theme '{}': {name} equals the background color \
-                     and will be invisible when used as a foreground",
-                    theme.id
-                );
+                if OFFICIAL_VISIBILITY_EXCEPTIONS.contains(&(theme.id.as_str(), name)) {
+                    // 上游官方主题本就如此设计，降级为 debug，避免每次启动都刷 WARN。
+                    log::debug!(
+                        "theme '{}' (official upstream design): {name} \
+                         equals the background color",
+                        theme.id
+                    );
+                } else {
+                    log::warn!(
+                        "theme '{}': {name} equals the background color \
+                         and will be invisible when used as a foreground",
+                        theme.id
+                    );
+                }
             }
             Ok(theme)
         })
@@ -843,25 +871,6 @@ impl TryFrom<AppThemeFile> for AppTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 上游官方主题本身即如此的已知例外。
-    ///
-    /// 新增主题若触发警告，应优先核对上游是否确有此设计；
-    /// 若是数据回归，请修复主题数据而不是加入本表。
-    const OFFICIAL_VISIBILITY_EXCEPTIONS: &[(&str, &str)] = &[
-        // 官方 monokai 移植（alacritty/kitty）的 color0 即背景色
-        ("monokai", "normal.black"),
-        // 官方 kitty flexoki_light 的 color7 即纸色背景
-        ("flexoki-light", "normal.white"),
-        // 官方 Solarized Dark 的 bright black（base02）即背景色
-        ("solarized-dark", "bright.black"),
-        // 官方 night-owl 的 alacritty 移植 color0 即背景色
-        ("night-owl", "normal.black"),
-        // 官方 kitty flexoki_dark 的 color0 即墨黑背景
-        ("flexoki-dark", "normal.black"),
-        // 官方 alacritty gruvbox_light 的 color0 即纸色背景
-        ("gruvbox-light", "normal.black"),
-    ];
 
     #[test]
     fn builtin_themes_have_no_unexpected_visibility_issues() {

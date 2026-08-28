@@ -1297,6 +1297,10 @@ fn main() {
     env_logger::Builder::from_default_env()
         .filter_level(default_level)
         .filter_module("russh", log::LevelFilter::Warn)
+        // macOS 的 .AppleSystemUIFont 存在重复注册的字体条目，gpui 的文本系统
+        // 每次启动都会为此打 WARN（上游已知噪音，gpui 为固定 rev 的 git 依赖），
+        // 静音到 Error 级别。
+        .filter_module("gpui_macos", log::LevelFilter::Error)
         .init();
 
     log::info!("=== DeepTerm 启动 ===");
