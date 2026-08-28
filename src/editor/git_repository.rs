@@ -110,6 +110,29 @@ pub struct GitRepository {
     backend: GitBackend,
 }
 
+/// 工作区侧内容的读取结果。
+pub enum DiffSideContent {
+    /// 可用的文本内容
+    Text(String),
+    /// 文件已删除或不存在（diff 中应显示为空）
+    Missing,
+    /// 二进制或无法解码：给出原因，由调用方决定如何展示
+    Unsupported(String),
+}
+
+/// 把文件字节分为"文本 / 二进制 / 空文件"三类。
+fn classify_bytes(bytes: &[u8]) -> DiffSideContent {
+    if bytes.is_empty() {
+        return DiffSideContent::Text(String::new());
+    }
+    // 与 SSH 侧一致：二进制文件不参与文本 diff
+    if sftp_fs::is_binary_bytes(bytes) {
+        return DiffSideContent::Unsupported("二进制文件".to_string());
+    }
+    // GBK/GB18030/UTF-16/BOM 等由统一解码层处理
+    DiffSideContent::Text(crate::editor::encoding::decode_bytes(bytes).text)
+}
+
 impl GitRepository {
     /// Find the git repository root starting from the given path.
     /// Returns `Ok(Some(repo))` if a git repository was found, `Ok(None)` if the path
@@ -293,7 +316,15 @@ impl GitRepository {
             GitBackend::Local => {
                 let head_ref = format!("HEAD:{path}");
                 let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
-                let new = self.read_file(path).unwrap_or_default();
+                let new = match self.read_file_content(path)? {
+                    DiffSideContent::Text(text) => text,
+                    DiffSideContent::Missing => String::new(),
+                    // 二进制/无法解码：给占位文本，避免被当成"整个文件被删除"
+                    DiffSideContent::Unsupported(reason) => {
+                        log::debug!("git diff: {path} 无法按文本展示: {reason}");
+                        format!("<{reason}，无法显示文本差异>")
+                    }
+                };
                 Ok((old, new))
             }
             GitBackend::Remote { config } => {
@@ -334,14 +365,24 @@ impl GitRepository {
                         let h_old = s.spawn(|| self.run_git(&["show", &head_ref]).unwrap_or_default());
                         let h_new = s.spawn(|| {
                             let is_large = size != u64::MAX && size > 512 * 1024;
-                            if is_large {
+                            let content = if is_large {
                                 sftp_fs::read_file_bytes(config, &remote_path)
                                     .ok()
                                     .flatten()
-                                    .map(|bytes| crate::editor::encoding::decode_bytes(&bytes).text)
-                                    .unwrap_or_else(|| self.read_file(path).unwrap_or_default())
+                                    .map(|bytes| classify_bytes(&bytes))
+                                    .unwrap_or_else(|| self
+                                        .read_file_content(path)
+                                        .unwrap_or(DiffSideContent::Missing))
                             } else {
-                                self.read_file(path).unwrap_or_default()
+                                self.read_file_content(path)
+                                    .unwrap_or(DiffSideContent::Missing)
+                            };
+                            match content {
+                                DiffSideContent::Text(text) => text,
+                                DiffSideContent::Missing => String::new(),
+                                DiffSideContent::Unsupported(reason) => {
+                                    format!("<{reason}，无法显示文本差异>")
+                                }
                             }
                         });
                         (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
@@ -423,25 +464,40 @@ impl GitRepository {
     }
 
     fn read_file(&self, path: &str) -> Result<String, String> {
+        match self.read_file_content(path)? {
+            DiffSideContent::Text(text) => Ok(text),
+            DiffSideContent::Missing => Err("文件不存在".to_string()),
+            DiffSideContent::Unsupported(reason) => Err(reason),
+        }
+    }
+
+    /// 读取工作区侧内容，并区分"文件不存在"与"无法作为文本展示"。
+    ///
+    /// 过去 `read_file` 对 GBK/GB18030 等编码与二进制文件统一返回 Err，
+    /// 调用方 `diff_file_contents` 再 `unwrap_or_default()` 变成空串，
+    /// 于是 diff 视图把这类文件显示成"整个文件被删除"。
+    fn read_file_content(&self, path: &str) -> Result<DiffSideContent, String> {
         match &self.backend {
             GitBackend::Local => {
                 let file_path = Path::new(&self.root).join(path);
-                std::fs::read_to_string(&file_path)
-                    .map_err(|e| format!("Failed to read file: {e}"))
+                let bytes = match std::fs::read(&file_path) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(DiffSideContent::Missing)
+                    }
+                    Err(e) => return Err(format!("Failed to read file: {e}")),
+                };
+                Ok(classify_bytes(&bytes))
             }
             GitBackend::Remote { config } => {
                 let remote_path = join_remote_path(&self.root, path);
                 // Handles encoding and pipelined read for large files.
                 let bytes_opt = sftp_fs::read_file_bytes(config, &remote_path)
                     .map_err(|e| format!("Failed to read remote file: {e}"))?;
-                let bytes = bytes_opt.unwrap_or_default();
-                if bytes.is_empty() {
-                    return Ok(String::new());
-                }
-                if sftp_fs::is_binary_bytes(&bytes) {
-                    return Err("二进制文件".to_string());
-                }
-                Ok(crate::editor::encoding::decode_bytes(&bytes).text)
+                let Some(bytes) = bytes_opt else {
+                    return Ok(DiffSideContent::Missing);
+                };
+                Ok(classify_bytes(&bytes))
             }
         }
     }

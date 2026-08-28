@@ -2058,10 +2058,11 @@ impl InputState {
                     Some(p) => p.to_string(),
                     None => {
                         // 空格缩进：去掉一个单位（至多 SPACE_OUTDENT_WIDTH 个空格）
-                        let keep = prefix
-                            .len()
-                            .saturating_sub(Self::SPACE_OUTDENT_WIDTH);
-                        prefix[..keep].to_string()
+                        // 按**字符**裁剪：行首空白可能是全角空格（U+3000）等
+                        // 多字节字符，按字节切片会落在字符中间导致 panic。
+                        let chars: Vec<char> = prefix.chars().collect();
+                        let keep = chars.len().saturating_sub(Self::SPACE_OUTDENT_WIDTH);
+                        chars[..keep].iter().collect()
                     }
                 };
                 let text = format!("{new_prefix}{ch}");
@@ -3535,7 +3536,92 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        // 程序化插入（undo/redo、粘贴、缩进、行操作等）不触发自动配对：
+        // 否则 redo 回放单字符 "(" 会再次配对成 "()"，与原始键入结果不一致。
+        self.replace_text_in_range_inner(range_utf16, new_text, false, window, cx);
+    }
+
+    /// `replace_text_in_range` 的实现体。
+    ///
+    /// `allow_auto_pair` 区分「用户键入」与「程序化插入」：
+    /// 只有真实键入单个 ASCII 字符时才走括号/引号自动配对，undo/redo、
+    /// 粘贴、缩进与行操作一律绕过，保证回放结果与原始编辑一致。
+    fn replace_text_in_range_inner(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        allow_auto_pair: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled {
+            return;
+        }
+
+        self.pause_blink_cursor(cx);
+
+        // 代码编辑器：括号/引号自动配对、跳过与 outdent。
+        // 仅拦截「单次键入的 ASCII 字符」；IME 组字、粘贴、程序化插入不受影响。
+        if allow_auto_pair
+            && self.mode.is_code_editor()
+            && self.ime_marked_range.is_none()
+            && new_text.len() == 1
+            && new_text.is_ascii()
+            && self.handle_auto_pair_input(new_text, window, cx)
+        {
+            return;
+        }
+
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .or(self.ime_marked_range.map(|range| {
+                let range = self.range_to_utf16(&(range.start..range.end));
+                self.range_from_utf16(&range)
+            }))
+            .unwrap_or(self.selected_range.into());
+
+        let old_text = self.text.clone();
+        self.text.replace(range.clone(), new_text);
+
+        let new_offset = (range.start + new_text.len()).min(self.text.len());
+
+        if self.mode.is_single_line() {
+            let pending_text = self.text.to_string();
+            // Check if the new text is valid
+            if !self.is_valid_input(&pending_text, cx) {
+                self.text = old_text;
+                return;
+            }
+        }
+
+        self.push_history(&old_text, &range, new_text);
+        self.history.end_grouping();
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        // Adjust folds before updating wrap map: remove overlapping folds and shift others
+        self.display_map
+            .adjust_folds_for_edit(&old_text, &range, new_text);
+        self.display_map
+            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
+
+        let bg = self
+            .mode
+            .update_highlighter(&range, &self.text, new_text, true, cx);
+        if let Some(bg) = bg {
+            Self::dispatch_background_parse(bg, self.text_version, window, cx);
+        }
+
+        self.update_fold_candidates_incremental(&range, new_text);
+        self.selected_range = (new_offset..new_offset).into();
+        self.ime_marked_range.take();
+        self.update_preferred_column();
+        self.mode.update_auto_grow(&self.display_map);
+        self.text_version = self.text_version.wrapping_add(1);
+        self.update_search(cx);
+        cx.emit(InputEvent::Change);
+        cx.notify();
     }
 
     fn syntax_fold_ranges(&self) -> Vec<crate::components::input::FoldRange> {
@@ -3758,73 +3844,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
-            return;
-        }
-
-        self.pause_blink_cursor(cx);
-
-        // 代码编辑器：括号/引号自动配对、跳过与 outdent。
-        // 仅拦截「单次键入的 ASCII 字符」；IME 组字、粘贴、程序化插入不受影响。
-        if self.mode.is_code_editor()
-            && self.ime_marked_range.is_none()
-            && new_text.len() == 1
-            && new_text.is_ascii()
-            && self.handle_auto_pair_input(new_text, window, cx)
-        {
-            return;
-        }
-
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.ime_marked_range.map(|range| {
-                let range = self.range_to_utf16(&(range.start..range.end));
-                self.range_from_utf16(&range)
-            }))
-            .unwrap_or(self.selected_range.into());
-
-        let old_text = self.text.clone();
-        self.text.replace(range.clone(), new_text);
-
-        let new_offset = (range.start + new_text.len()).min(self.text.len());
-
-        if self.mode.is_single_line() {
-            let pending_text = self.text.to_string();
-            // Check if the new text is valid
-            if !self.is_valid_input(&pending_text, cx) {
-                self.text = old_text;
-                return;
-            }
-        }
-
-        self.push_history(&old_text, &range, new_text);
-        self.history.end_grouping();
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
-        self.display_map
-            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
-
-        let bg = self
-            .mode
-            .update_highlighter(&range, &self.text, new_text, true, cx);
-        if let Some(bg) = bg {
-            Self::dispatch_background_parse(bg, self.text_version, window, cx);
-        }
-
-        self.update_fold_candidates_incremental(&range, new_text);
-        self.selected_range = (new_offset..new_offset).into();
-        self.ime_marked_range.take();
-        self.update_preferred_column();
-        self.mode.update_auto_grow(&self.display_map);
-        self.text_version = self.text_version.wrapping_add(1);
-        self.update_search(cx);
-        cx.emit(InputEvent::Change);
-        cx.notify();
+        self.replace_text_in_range_inner(range_utf16, new_text, true, window, cx);
     }
 
     /// Mark text is the IME temporary insert on typing.
@@ -3883,10 +3903,13 @@ impl EntityInputHandler for InputState {
             self.ime_marked_range = None;
         } else {
             self.ime_marked_range = Some((range.start..range.start + new_text.len()).into());
+            // `new_selected_range_utf16` 是相对「刚插入的组字文本」的偏移，
+            // 基准是 range.start 而非 range.end —— 第二帧起组字区间非空，
+            // 用 range.end 平移会让选区终点持续右移。
             self.selected_range = new_selected_range_utf16
                 .as_ref()
                 .map(|range_utf16| self.range_from_utf16(range_utf16))
-                .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+                .map(|new_range| new_range.start + range.start..new_range.end + range.start)
                 .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
                 .into();
         }
@@ -4366,5 +4389,57 @@ mod tests {
                 (10, 0, false, true),
             ]
         );
+    }
+
+    /// H3 回归：程序化插入（undo/redo 回放等）不走括号自动配对，
+    /// 否则 redo 回放单字符 "(" 会再次配对成 "()"，与原始键入结果不一致；
+    /// 而真实键入路径（EntityInputHandler）仍应配对。
+    #[gpui::test]
+    fn programmatic_insert_bypasses_auto_pair(cx: &mut gpui::TestAppContext) {
+        fn build_code_input(
+            cx: &mut gpui::TestAppContext,
+        ) -> (gpui::Entity<InputState>, &mut gpui::VisualTestContext) {
+            struct Host(gpui::Entity<InputState>);
+            impl gpui::Render for Host {
+                fn render(
+                    &mut self,
+                    _: &mut Window,
+                    _: &mut Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div()
+                }
+            }
+            let cell = std::cell::RefCell::new(None);
+            let (_host, cx) = cx.add_window_view(|window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+                *cell.borrow_mut() = Some(input.clone());
+                Host(input)
+            });
+            (cell.into_inner().unwrap(), cx)
+        }
+
+        // 程序化插入：不配对
+        let (input, cx) = build_code_input(cx);
+        input
+            .downgrade()
+            .update_in(cx, |state, window, cx| {
+                state.replace_text_in_range_silent(None, "(", window, cx);
+                assert_eq!(state.value().as_ref(), "(");
+            })
+            .unwrap();
+
+        // 键入路径（EntityInputHandler）：仍应自动配对成 "()"
+        let (input, cx) = build_code_input(cx);
+        input
+            .downgrade()
+            .update_in(cx, |state, window, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state, None, "(", window, cx,
+                );
+                assert_eq!(state.value().as_ref(), "()");
+                // 光标应停在配对括号中间
+                assert_eq!(state.cursor(), 1);
+            })
+            .unwrap();
     }
 }

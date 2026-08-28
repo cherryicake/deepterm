@@ -623,6 +623,14 @@ fn copy_via_agent_forward_scp(
         "{}@{}",
         destination_config.username, destination_config.host
     );
+    // dst 参数经两层 shell：源服务器 shell（执行整条 scp 命令行）与
+    // 目标服务器 shell（scp 把 path 段交给远端 shell）。两层都要转义，
+    // 否则用户名/主机名/路径中的元字符可在任一端注入命令。
+    let dst_arg = shell_single_quote(&format!(
+        "{}:{}",
+        dest_host,
+        shell_single_quote(destination_path)
+    ));
 
     let recurse = if is_directory { " -r" } else { "" };
     let port_arg = if destination_config.port == 22 {
@@ -637,12 +645,11 @@ fn copy_via_agent_forward_scp(
          -o UserKnownHostsFile=/dev/null \
          -o LogLevel=ERROR \
          -o ConnectTimeout=10 \
-         '{src}' '{dst_host}:{dst_path}'",
+         '{src}' '{dst}'",
         recurse = recurse,
         port_arg = port_arg,
         src = shell_single_quote(remote_path),
-        dst_host = dest_host,
-        dst_path = shell_single_quote(destination_path),
+        dst = dst_arg,
     );
 
     log::info!(
@@ -917,19 +924,25 @@ fn copy_via_remote_scp(
         format!("-P {} ", destination_config.port)
     };
 
+    // dst 参数经两层 shell（源机 shell + 目标机 shell），两层都要转义
+    let dst_arg = shell_single_quote(&format!(
+        "{}:{}",
+        dest_host,
+        shell_single_quote(destination_path)
+    ));
+
     let scp_cmd = format!(
         "scp {recurse}{port_flag}-p -B \
          -o StrictHostKeyChecking=accept-new \
          -o UserKnownHostsFile=/dev/null \
          -o LogLevel=ERROR \
          -o ConnectTimeout=10 \
-         -i '{key}' '{src}' '{dst_host}:{dst_path}'",
+         -i '{key}' '{src}' '{dst}'",
         recurse = recurse,
         port_flag = port_flag,
         key = shell_single_quote(&remote_key_path),
         src = shell_single_quote(remote_path),
-        dst_host = dest_host,
-        dst_path = shell_single_quote(destination_path),
+        dst = dst_arg,
     );
 
     log::info!(

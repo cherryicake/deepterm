@@ -204,7 +204,9 @@ impl RemoteFileTreeCache {
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Ok(json) = serde_json::to_string(&persisted) {
-                let _ = std::fs::write(path, json);
+                // 缓存里含远端文件的实际内容（可能是 .env、凭据类文件），
+                // 必须 0600，与 ssh.json / keychain.json 的口径一致
+                let _ = crate::ssh::keychain::write_secret_file(&path, json.as_bytes());
             }
         });
     }

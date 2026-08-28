@@ -2,7 +2,10 @@
 //!
 //! Manages all open DeepTerm windows and provides operations to open new windows.
 
-use gpui::{App, AppContext, Global, WindowBackgroundAppearance, WindowDecorations, WindowOptions};
+use gpui::{
+    App, AppContext, BorrowAppContext, Entity, Global, WeakEntity, WindowBackgroundAppearance,
+    WindowDecorations, WindowOptions,
+};
 
 use crate::AppWindow;
 use crate::components::title_bar::TitleBar;
@@ -10,19 +13,58 @@ use crate::components::title_bar::TitleBar;
 /// Manages all open DeepTerm windows.
 ///
 /// Stored as a GPUI global so it can be accessed from anywhere in the app.
-pub struct WindowManager;
+pub struct WindowManager {
+    /// 会话持久化的责任窗口（"主窗口"）。
+    ///
+    /// 会话状态写入单一的 `session_state.json`：每个窗口各自持有
+    /// `PersistenceManager` 时，后落盘的窗口会整体覆盖先落盘的窗口，
+    /// 导致其他窗口的标签页与 SSH 会话全部丢失。因此只有主窗口写盘。
+    main_window: Option<WeakEntity<AppWindow>>,
+}
 
 impl Global for WindowManager {}
 
 impl WindowManager {
     pub fn init(cx: &mut App) {
-        cx.set_global(Self);
+        cx.set_global(Self { main_window: None });
 
         // Quit the application when the last window is closed.
         cx.set_quit_mode(gpui::QuitMode::LastWindowClosed);
     }
 
-    /// Open a new DeepTerm window with the default size and options.
+    /// 窗口创建时调用：首个窗口成为主窗口。
+    /// 全局不存在时（如非窗口路径的单测）视为唯一窗口，返回 true。
+    pub fn claim_main_window(cx: &mut App, window: &Entity<AppWindow>) -> bool {
+        if !cx.has_global::<Self>() {
+            return true;
+        }
+        cx.update_global::<Self, _>(|this, _| this.claim(window))
+    }
+
+    /// 主窗口已关闭时，由存活的窗口接管落盘职责，
+    /// 避免"主窗口关掉后，剩下的窗口再也无法持久化"。
+    pub fn take_over_main_window(cx: &mut App, window: &Entity<AppWindow>) -> bool {
+        if !cx.has_global::<Self>() {
+            return true;
+        }
+        cx.update_global::<Self, _>(|this, _| this.claim(window))
+    }
+
+    /// 主窗口槽位为空（尚未分配，或原主窗口已析构）时认领之。
+    fn claim(&mut self, window: &Entity<AppWindow>) -> bool {
+        let slot_free = self
+            .main_window
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .is_none();
+        if slot_free {
+            self.main_window = Some(window.downgrade());
+            true
+        } else {
+            false
+        }
+    }
+
     /// Open a new DeepTerm window with the default size and options.
     ///
     /// `open_paths`, when given, are opened in the editor once the window is

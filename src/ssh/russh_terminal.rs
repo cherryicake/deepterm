@@ -34,6 +34,7 @@ enum InputMsg {
 struct SshClientHandler {
     host: String,
     port: u16,
+    host_key_policy: crate::ssh::host_key::HostKeyPolicy,
 }
 
 impl client::Handler for SshClientHandler {
@@ -43,7 +44,12 @@ impl client::Handler for SshClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        crate::ssh::host_key::check_and_trust_host_key(&self.host, self.port, server_public_key)
+        crate::ssh::host_key::check_and_trust_host_key(
+            &self.host,
+            self.port,
+            server_public_key,
+            self.host_key_policy,
+        )
     }
 }
 
@@ -261,6 +267,7 @@ impl RusshTerminal {
             SshClientHandler {
                 host: config.host.clone(),
                 port: config.port,
+                host_key_policy: crate::ssh::host_key::policy_from_global_config(),
             },
         )
         .await

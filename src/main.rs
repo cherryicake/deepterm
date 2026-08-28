@@ -89,6 +89,8 @@ pub struct AppWindow {
     host_view: Entity<HostView>,
     keychain_view: Entity<KeychainSidebarView>,
     persistence: PersistenceManager,
+    /// 本窗口是否负责写盘（多窗口共用 session_state.json，只能有一个写者）
+    is_main_window: bool,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_save_task: Option<gpui::Task<()>>,
     _sidebar_subscription: Option<Subscription>,
@@ -151,6 +153,9 @@ impl AppWindow {
 
         // 创建 Sidebar Entity
         let app_window = cx.entity();
+        // 多窗口共用同一个 session_state.json，必须指定唯一窗口负责写盘，
+        // 否则后落盘的窗口会覆盖其他窗口的全部标签页与 SSH 会话。
+        let is_main_window = WindowManager::claim_main_window(cx, &app_window);
         let sidebar = cx.new(|_cx| {
             let mut sidebar = MacosSidebar::new();
             sidebar.set_font_view(font_settings_view);
@@ -349,6 +354,7 @@ impl AppWindow {
             host_view,
             keychain_view,
             persistence,
+            is_main_window,
             workspace_subscriptions: HashMap::new(),
             pending_save_task: None,
             _sidebar_subscription: Some(sidebar_subscription),
@@ -573,11 +579,31 @@ impl AppWindow {
         }
     }
 
-    fn save_session(&self, cx: &mut Context<Self>) {
+    fn save_session(&mut self, cx: &mut Context<Self>) {
+        // 只有主窗口写盘：多窗口共用 session_state.json，
+        // 若各窗口都写，后写者会整体覆盖其他窗口的标签页与 SSH 会话。
+        if !self.ensure_session_ownership(cx) {
+            log::debug!("跳过会话落盘：本窗口不是主窗口");
+            return;
+        }
         let session = self.session_state(cx);
         if let Err(error) = self.persistence.save_session(&session) {
             log::warn!("Failed to save session state: {error}");
         }
+    }
+
+    /// 主窗口关闭后，由存活的窗口接管落盘职责，
+    /// 避免"主窗口一关，剩下的窗口再也无法持久化"。
+    fn ensure_session_ownership(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.is_main_window {
+            return true;
+        }
+        let entity = cx.entity();
+        if WindowManager::take_over_main_window(cx, &entity) {
+            log::info!("主窗口已关闭，本窗口接管会话持久化");
+            self.is_main_window = true;
+        }
+        self.is_main_window
     }
 
     /// 设置初始焦点到工作区的第一个终端

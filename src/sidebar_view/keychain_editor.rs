@@ -529,7 +529,8 @@ impl KeychainEditor {
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&file_path, text)?;
+        // 私钥必须 0600：同机其他用户不可读，ssh 也不再因权限过宽拒绝使用
+        crate::ssh::keychain::write_secret_file(&file_path, text.as_bytes())?;
         Ok(file_path)
     }
 

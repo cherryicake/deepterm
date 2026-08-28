@@ -90,6 +90,26 @@ struct UnifiedPayload {
     separators: Vec<super::diff_model::SeparatorRow>,
 }
 
+/// 文本指纹：判断 hunks 是否基于当前文本计算。
+/// 只存长度与哈希，避免为校验再保留一份完整文本副本。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextFingerprint {
+    len: usize,
+    hash: u64,
+}
+
+impl TextFingerprint {
+    fn of(text: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        Self {
+            len: text.len(),
+            hash: hasher.finish(),
+        }
+    }
+}
+
 pub struct DiffView {
     path: String,
     repo: GitRepository,
@@ -102,6 +122,10 @@ pub struct DiffView {
     right: Entity<InputState>,
     unified: Entity<InputState>,
     hunks: Vec<DiffHunk>,
+    /// `hunks` 计算时所依据的右栏文本指纹（长度 + 哈希）。
+    /// 用于判断行号是否已过期：hunks 由 200ms 防抖的后台任务产出，
+    /// 用户编辑后立刻点"还原此块"会拿到基于旧文本的 `new_rows`。
+    hunks_source: TextFingerprint,
     additions: usize,
     deletions: usize,
     preference: LayoutPreference,
@@ -147,6 +171,7 @@ impl DiffView {
     ) -> Self {
         let old_text: Arc<str> = diff.old_text.clone().into();
         let saved_text = diff.new_text.clone();
+        let saved_text_fingerprint = TextFingerprint::of(&saved_text);
 
         let left = Self::new_editor(&diff.language, &diff.old_text, true, window, cx);
         let right = Self::new_editor(&diff.language, &diff.new_text, false, window, cx);
@@ -162,6 +187,7 @@ impl DiffView {
             right,
             unified,
             hunks: Vec::new(),
+            hunks_source: saved_text_fingerprint,
             additions: 0,
             deletions: 0,
             preference: LayoutPreference::Auto,
@@ -232,6 +258,7 @@ impl DiffView {
             right,
             unified,
             hunks: Vec::new(),
+            hunks_source: TextFingerprint::default(),
             additions: 0,
             deletions: 0,
             preference: LayoutPreference::Auto,
@@ -497,6 +524,7 @@ impl DiffView {
                         view.old_parsed = Some(old_text.clone());
                         view.new_parsed = Some(new_text.clone());
                         view.hunks = hunks;
+                        view.hunks_source = TextFingerprint::of(&new_text);
                         view.additions = additions;
                         view.deletions = deletions;
                         view.unified_hunk_rows = payload.hunk_rows.clone();
@@ -863,12 +891,62 @@ impl DiffView {
         cx.notify();
     }
 
+    /// 把点击的 hunk 下标解析为**与当前右栏文本一致**的 hunk。
+    ///
+    /// `self.hunks` 由 200ms 防抖的后台任务产出。用户连续编辑后立刻点
+    /// "还原此块"时，hunks 仍基于旧文本，其 `new_rows` 已失效 —— 直接按
+    /// 字节切片会删掉错误的行、吞掉刚输入的内容。
+    ///
+    /// 处理方式：指纹不匹配时同步重算 hunks，再用**HEAD 侧行号**重新定位
+    /// 目标块（HEAD 文本不随右栏编辑变化，是稳定的锚点）；定位不到就放弃
+    /// 本次还原，总好过改错内容。
+    fn resolve_hunk_for_revert(&mut self, hunk_ix: usize, current: &str) -> Option<DiffHunk> {
+        let stale = self.hunks.get(hunk_ix)?.clone();
+        if self.hunks_source == TextFingerprint::of(current) {
+            return Some(stale);
+        }
+
+        let fresh = super::diff_model::compute_hunks(&self.old_text, current);
+        // 优先按 HEAD 侧行号区间相交匹配
+        let mut matched = fresh.iter().find(|h| {
+            h.old_rows.start < stale.old_rows.end.max(stale.old_rows.start + 1)
+                && stale.old_rows.start < h.old_rows.end.max(h.old_rows.start + 1)
+        });
+        // 纯新增块（HEAD 侧为空区间）：退化为按 new_rows 起点最接近者
+        if matched.is_none() && stale.old_rows.start == stale.old_rows.end {
+            matched = fresh.iter().min_by_key(|h| {
+                h.new_rows
+                    .start
+                    .abs_diff(stale.new_rows.start)
+                    .saturating_add(h.old_rows.start.abs_diff(stale.old_rows.start))
+            });
+        }
+
+        match matched.cloned() {
+            Some(hunk) => {
+                // 用重算结果刷新视图状态，避免后续操作重复重算
+                self.hunks = fresh;
+                self.hunks_source = TextFingerprint::of(current);
+                Some(hunk)
+            }
+            None => {
+                log::warn!(
+                    "diff revert: 无法定位已变更的 hunk #{}，放弃还原（old_rows={:?}）",
+                    hunk_ix,
+                    stale.old_rows
+                );
+                None
+            }
+        }
+    }
+
     /// Revert one hunk: replace the new-side lines with the HEAD lines.
     fn revert_hunk(&mut self, hunk_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hunk) = self.hunks.get(hunk_ix).cloned() else {
+        let current = self.right.read(cx).value().to_string();
+        let Some(hunk) = self.resolve_hunk_for_revert(hunk_ix, &current) else {
+            cx.notify();
             return;
         };
-        let current = self.right.read(cx).value().to_string();
         let starts = line_starts(&current);
         let count = line_count(&current, &starts);
 

@@ -490,6 +490,33 @@ impl KeychainStore {
     }
 }
 
+/// 以 0600 权限写入敏感文件（私钥、凭据缓存等）。
+/// - unix 上创建时即带 0600（避免"先写后 chmod"窗口期内其他用户可读）；
+/// - 若文件已存在且权限更宽松，写后收紧为 0600；
+/// - 非 unix 平台退化为普通写入。
+pub(crate) fn write_secret_file(path: &std::path::Path, content: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content)?;
+        // 文件已存在时 mode 不生效，显式收紧
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
 pub fn migrate_auth_method(
     connection: &mut SshConnectionConfig,
     store: &mut KeychainStore,

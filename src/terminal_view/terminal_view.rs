@@ -2328,20 +2328,23 @@ impl TerminalView {
             })
             .join("");
 
-        // 过滤掉 \x1b 和 \x03，防止恶意输入破坏终端转义序列
-        let filtered = text.replace(['\x1b', '\x03'], "");
-
         self.terminal.update(cx, |terminal, _| {
             let bracketed = terminal
                 .last_content()
                 .mode
                 .contains(TermMode::BRACKETED_PASTE);
 
+            // 统一走粘贴清洗：过滤 ESC 等控制字符，防止拖拽文件名/恶意
+            // 文本中的转义序列被终端当作输入执行
+            let filtered = crate::terminal::terminal::sanitize_pasted_text(&text, bracketed);
+
             if bracketed {
-                // 使用 bracketed paste 模式
-                terminal.write(b"\x1b[200~");
-                terminal.write(filtered.as_bytes());
-                terminal.write(b"\x1b[201~");
+                // 使用 bracketed paste 模式（单次写入，避免定界符与内容被拆开）
+                let mut data = Vec::with_capacity(filtered.len() + 12);
+                data.extend_from_slice(b"\x1b[200~");
+                data.extend_from_slice(filtered.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                terminal.write(&data);
             } else {
                 // 普通模式
                 terminal.write(filtered.as_bytes());
@@ -2384,16 +2387,20 @@ impl TerminalView {
                     .contains(TermMode::BRACKETED_PASTE)
             });
 
+            // 粘贴前清洗：非 bracketed 模式剔除 ESC/控制字符，
+            // bracketed 模式剔除粘贴定界符（防止提前结束粘贴模式而执行后续文本）
+            let sanitized = crate::terminal::terminal::sanitize_pasted_text(&text, bracketed);
+
             if bracketed {
                 // Use bracketed paste mode to preserve whitespace
-                let mut data = Vec::new();
+                let mut data = Vec::with_capacity(sanitized.len() + 12);
                 data.extend_from_slice(b"\x1b[200~");
-                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(sanitized.as_bytes());
                 data.extend_from_slice(b"\x1b[201~");
                 self.write_with_broadcast(&data, cx);
             } else {
                 // Normal mode
-                self.write_with_broadcast(text.as_bytes(), cx);
+                self.write_with_broadcast(sanitized.as_bytes(), cx);
             }
         }
     }

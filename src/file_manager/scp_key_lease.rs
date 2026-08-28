@@ -339,9 +339,13 @@ fn create_lease(
 
     super::utils::check_cancelled(cancelled)?;
 
-    if let Err(e) = source_session.upload_file_from_local_with_cancel(
+    // 关键：创建时就带 0600，避免"按远端 umask 创建 → 稍后 chmod"的
+    // 窗口期内其他用户可读私钥；下面的 chmod 仅作兼容兜底（部分服务端
+    // 会忽略 open 携带的初始属性）。
+    if let Err(e) = source_session.upload_file_from_local_with_permissions(
         &local_temp_path,
         &remote_key_path,
+        0o600,
         cancelled,
     ) {
         let _ = std::fs::write(&local_temp_path, vec![0u8; key_bytes.len()]);

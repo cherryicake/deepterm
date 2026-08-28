@@ -6,6 +6,29 @@ use gpui::{
 use crate::workspace::panel::{Panel, PanelPlacement};
 use crate::workspace::session_state::{SplitSessionDirection, SplitSessionState};
 
+/// 修正分割比例数组。
+///
+/// `sizes` 由会话 JSON 反序列化得到，长度可能与 `children` 不一致（文件损坏、
+/// 旧版本格式），直接索引会在拖动分割条时 panic。这里保证输出的 `sizes`
+/// 满足：长度 == count、每项有限且为正、总和归一到 1。
+fn normalize_sizes(sizes: &[f32], count: usize) -> Vec<f32> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let shape_valid = sizes.len() == count && sizes.iter().all(|s| s.is_finite() && *s > 0.0);
+    if !shape_valid {
+        return vec![1.0 / count as f32; count];
+    }
+
+    let sum: f32 = sizes.iter().sum();
+    if sum.is_finite() && sum > 0.0 && (sum - 1.0).abs() > 1e-6 {
+        sizes.iter().map(|s| s / sum).collect()
+    } else {
+        sizes.to_vec()
+    }
+}
+
 /// 分割方向
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SplitDirection {
@@ -105,16 +128,22 @@ impl SplitContainer {
                 direction,
                 children,
                 sizes,
-            } => SplitContainer::Split {
-                direction: (*direction).into(),
-                children: children
+            } => {
+                let children: Vec<SplitContainer> = children
                     .iter()
                     .map(|child| {
                         Self::from_session_state(child, workspace_id, tab_id, tab_label, cx)
                     })
-                    .collect(),
-                sizes: sizes.clone(),
-            },
+                    .collect();
+                // sizes 来自会话 JSON，长度可能与 children 不一致（损坏/旧版本
+                // 文件），拖动分割条时会越界 panic。恢复时统一修正。
+                let sizes = normalize_sizes(sizes, children.len());
+                SplitContainer::Split {
+                    direction: (*direction).into(),
+                    children,
+                    sizes,
+                }
+            }
         }
     }
 
@@ -382,8 +411,13 @@ impl SplitContainer {
             SplitContainer::Split {
                 sizes, children, ..
             } => {
-                if children.len() < 2 || child_index >= children.len() - 1 {
+                if children.len() < 2 || child_index + 1 >= children.len() {
                     return false;
+                }
+                // 兜底：sizes 与 children 不一致时先修正，避免索引越界 panic
+                // （正常路径下 from_session_state 已归一化）
+                if sizes.len() != children.len() {
+                    *sizes = normalize_sizes(sizes, children.len());
                 }
 
                 let current_left = sizes.get(child_index).copied().unwrap_or(1.0);
@@ -515,5 +549,39 @@ impl Render for SplitManager {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // SplitManager 本身不渲染，由 Workspace 来渲染
         div().size_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sizes;
+
+    #[test]
+    fn keeps_valid_sizes() {
+        assert_eq!(normalize_sizes(&[0.5, 0.5], 2), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn rescales_unnormalized_but_valid_sizes() {
+        let out = normalize_sizes(&[2.0, 2.0], 2);
+        assert_eq!(out, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn repairs_length_mismatch() {
+        // 会话文件损坏时的典型形态：children 有 2 个，sizes 只有 1 个
+        assert_eq!(normalize_sizes(&[1.0], 2), vec![0.5, 0.5]);
+        assert_eq!(normalize_sizes(&[], 3), vec![1.0 / 3.0; 3]);
+    }
+
+    #[test]
+    fn repairs_invalid_values() {
+        assert_eq!(normalize_sizes(&[f32::NAN, 0.5], 2), vec![0.5, 0.5]);
+        assert_eq!(normalize_sizes(&[0.0, 0.0], 2), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn empty_children_yields_empty_sizes() {
+        assert!(normalize_sizes(&[0.5], 0).is_empty());
     }
 }

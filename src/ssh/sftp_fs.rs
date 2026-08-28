@@ -59,6 +59,7 @@ pub struct RemoteFileMetadata {
 struct SftpClientHandler {
     host: String,
     port: u16,
+    host_key_policy: crate::ssh::host_key::HostKeyPolicy,
 }
 
 impl client::Handler for SftpClientHandler {
@@ -68,7 +69,12 @@ impl client::Handler for SftpClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        crate::ssh::host_key::check_and_trust_host_key(&self.host, self.port, server_public_key)
+        crate::ssh::host_key::check_and_trust_host_key(
+            &self.host,
+            self.port,
+            server_public_key,
+            self.host_key_policy,
+        )
     }
 }
 
@@ -270,6 +276,60 @@ impl BlockingSftpSession {
                 if let Some(p) = progress {
                     p.fetch_add(read as u64, Ordering::Relaxed);
                 }
+            }
+
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+            }
+
+            remote_file.flush().await?;
+            remote_file.sync_all().await?;
+            remote_file.shutdown().await?;
+            Ok(transferred)
+        })
+    }
+
+    /// 上传文件并在**创建时**即设定远程权限（mode）。
+    ///
+    /// 默认上传路径是 "create → 写内容 → chmod"，中间存在一个按远端 umask
+    /// 创建的窗口期，私钥等敏感文件在该窗口内可能对同机其他用户可读。
+    /// SFTP 的 SSH_FXP_OPEN 支持携带初始属性，直接给出 0600 即可消除窗口。
+    pub fn upload_file_from_local_with_permissions(
+        &mut self,
+        local_path: &Path,
+        remote_path: &str,
+        mode: u32,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<u64> {
+        let mut local_file = File::open(local_path)?;
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let attrs = FileAttributes {
+                permissions: Some(mode),
+                ..FileAttributes::empty()
+            };
+            let mut remote_file = self
+                .sftp
+                .open_with_flags_and_attributes(
+                    remote_path,
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    attrs,
+                )
+                .await?;
+            let mut transferred = 0;
+            let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+                }
+
+                let read = local_file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+
+                remote_file.write_all(&buffer[..read]).await?;
+                transferred += read as u64;
             }
 
             if cancelled.load(Ordering::Relaxed) {
@@ -1096,6 +1156,7 @@ async fn connect_sftp(
         SftpClientHandler {
             host: config.host.clone(),
             port: config.port,
+            host_key_policy: crate::ssh::host_key::policy_from_global_config(),
         },
     )
     .await

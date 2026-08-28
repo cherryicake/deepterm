@@ -7,6 +7,7 @@ use std::{
     cell::Cell,
     collections::HashMap,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -187,36 +188,92 @@ fn configure_local_shell_integration(
     tty::Shell::new(program, args)
 }
 
+/// shell integration 脚本目录：按 uid 隔离，避免多用户共享固定路径。
+/// 共享固定路径存在两类风险：多实例写竞态；同机其他用户可预建目录/
+/// 替换脚本，让本应用以当前用户身份执行任意 shell 代码。
+fn shell_integration_root() -> PathBuf {
+    #[cfg(unix)]
+    {
+        // temp_dir 本身在 macOS/Linux 上就是按用户隔离的，再叠加 uid
+        // 兜底（如 TMPDIR 被指向共享目录时）
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("deepterm-shell-integration-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("deepterm-shell-integration")
+    }
+}
+
+/// 校验 integration 根目录可信：必须存在、是目录、属主为当前用户、
+/// 且对 group/other 不可写（防符号链接/替换攻击）。
+#[cfg(unix)]
+fn integration_dir_is_trusted(root: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match fs::metadata(root) {
+        Ok(md) => {
+            md.is_dir()
+                && md.uid() == unsafe { libc::getuid() }
+                && md.permissions().mode() & 0o022 == 0
+        }
+        Err(_) => false,
+    }
+}
+
+/// 创建目录并把权限收紧为 0700（unix）。
+fn ensure_secure_dir(path: &std::path::Path) -> Option<()> {
+    fs::create_dir_all(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    Some(())
+}
+
 fn write_local_shell_integration_files() -> Option<PathBuf> {
-    let root = std::env::temp_dir().join("deepterm-shell-integration");
+    let root = shell_integration_root();
+
+    // 已存在的根目录若不可信（非本人所有 / group·other 可写），整个清除重建
+    #[cfg(unix)]
+    if root.exists() && !integration_dir_is_trusted(&root) {
+        fs::remove_dir_all(&root).ok()?;
+    }
+
     let bash_dir = root.join("shell-integration/bash");
     let zsh_dir = root.join("shell-integration/zsh");
-    fs::create_dir_all(&bash_dir).ok()?;
-    fs::create_dir_all(&zsh_dir).ok()?;
+    ensure_secure_dir(&root)?;
+    ensure_secure_dir(&bash_dir)?;
+    ensure_secure_dir(&zsh_dir)?;
 
     // 关键点：这些文件直接来自 Ghostty 的 shell integration 资源结构，
     // 只做 DeepTerm 命名适配。运行时复制资源文件，而不是手写/拼接 shell
     // wrapper，避免 zsh/bash 启动语义和 Ghostty 分叉。
-    fs::write(
-        bash_dir.join("deepterm.bash"),
-        include_str!("../../assets/shell-integration/bash/deepterm.bash"),
-    )
-    .ok()?;
-    fs::write(
-        bash_dir.join("bash-preexec.sh"),
-        include_str!("../../assets/shell-integration/bash/bash-preexec.sh"),
-    )
-    .ok()?;
-    fs::write(
-        zsh_dir.join(".zshenv"),
-        include_str!("../../assets/shell-integration/zsh/.zshenv"),
-    )
-    .ok()?;
-    fs::write(
-        zsh_dir.join("deepterm-integration"),
-        include_str!("../../assets/shell-integration/zsh/deepterm-integration"),
-    )
-    .ok()?;
+    let integration_files = [
+        (bash_dir.join("deepterm.bash"), include_str!("../../assets/shell-integration/bash/deepterm.bash")),
+        (bash_dir.join("bash-preexec.sh"), include_str!("../../assets/shell-integration/bash/bash-preexec.sh")),
+        (zsh_dir.join(".zshenv"), include_str!("../../assets/shell-integration/zsh/.zshenv")),
+        (zsh_dir.join("deepterm-integration"), include_str!("../../assets/shell-integration/zsh/deepterm-integration")),
+    ];
+
+    for (path, content) in integration_files {
+        // 脚本只允许属主读写（0600），防止被同机其他用户篡改
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .ok()?
+                .write_all(content.as_bytes())
+                .ok()?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&path, content).ok()?;
+    }
 
     Some(root)
 }
@@ -2419,14 +2476,19 @@ impl Terminal {
             let bracketed = term.mode().contains(TermMode::BRACKETED_PASTE);
             drop(term);
 
+            let sanitized = sanitize_pasted_text(&text, bracketed);
+
             if bracketed {
-                // Use bracketed paste mode to preserve whitespace
-                self.write(b"\x1b[200~");
-                self.write(text.as_bytes());
-                self.write(b"\x1b[201~");
+                // bracketed paste：单次写入，避免 start/payload/end 被拆成
+                // 多个 PTY 写入块（中间可能被其他输出插入、破坏粘贴语义）
+                let mut data = Vec::with_capacity(sanitized.len() + 12);
+                data.extend_from_slice(b"\x1b[200~");
+                data.extend_from_slice(sanitized.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                self.write(&data);
             } else {
                 // Normal mode
-                self.write(text.as_bytes());
+                self.write(sanitized.as_bytes());
             }
         }
     }
@@ -2439,6 +2501,38 @@ impl Terminal {
         let mut term = self.term.lock();
         term.clear_screen(ClearMode::All);
     }
+}
+
+/// 粘贴内容清洗，防止"复制网页上的恶意文本 → 粘贴即执行"类攻击。
+///
+/// - 非 bracketed 模式：剪贴板内容会被 shell/编辑器当成键盘输入处理，
+///   ESC 与控制字符可注入转义序列、Ctrl-C 等，因此除 `\n` `\t` 外的
+///   C0/C1/DEL 全部剔除，并把 CR 归一为 LF（避免多行文本被逐行立即执行）。
+/// - bracketed 模式：应用已知这是粘贴内容，保留其余控制字符；
+///   但仍要剔除粘贴定界符 `ESC[200~` / `ESC[201~`，否则内容里的
+///   `ESC[201~` 会提前结束粘贴模式，后续文本重新变回键盘输入被执行。
+pub fn sanitize_pasted_text(text: &str, bracketed: bool) -> String {
+    if bracketed {
+        // 只剔除定界符序列，其余内容原样保留
+        return text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // CRLF 只保留一个 LF，否则每行之间会多出一个空行
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => out.push('\n'),
+            '\n' | '\t' => out.push(ch),
+            // C0 控制字符（含 ESC）与 DEL 全部丢弃
+            c if c < ' ' || c == '\u{7f}' => {}
+            // C1 控制字符丢弃
+            c if ('\u{80}'..='\u{9f}').contains(&c) => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl EventEmitter<Event> for Terminal {}
@@ -2714,5 +2808,51 @@ mod tests {
             let anchor = t.input_area_start.expect("fg 转换后应重新捕获锚点");
             assert_eq!(anchor, t.current_cursor_point());
         });
+    }
+}
+
+#[cfg(test)]
+mod paste_sanitize_tests {
+    use super::sanitize_pasted_text;
+
+    #[test]
+    fn strips_escape_and_control_chars_in_normal_mode() {
+        // 经典粘贴攻击：ESC 序列 + 换行执行。
+        // ESC 剔除后残留的 "[2J" 只是普通文本，不再构成转义序列
+        let malicious = "echo hi\n\u{1b}[2Jrm -rf /\u{7}";
+        let out = sanitize_pasted_text(malicious, false);
+        assert_eq!(out, "echo hi\n[2Jrm -rf /");
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\u{7}'));
+    }
+
+    #[test]
+    fn normalizes_cr_and_crlf_to_lf_in_normal_mode() {
+        // CRLF 不能变成两个 LF（否则每行之间多一个空行）
+        assert_eq!(sanitize_pasted_text("a\r\nb\rc", false), "a\nb\nc");
+        assert_eq!(sanitize_pasted_text("a\r\n\r\nb", false), "a\n\nb");
+    }
+
+    #[test]
+    fn keeps_tabs_and_multiline_in_normal_mode() {
+        assert_eq!(sanitize_pasted_text("a\tb\nc", false), "a\tb\nc");
+    }
+
+    #[test]
+    fn strips_c1_controls_in_normal_mode() {
+        assert_eq!(sanitize_pasted_text("a\u{9b}b", false), "ab");
+    }
+
+    #[test]
+    fn bracketed_mode_preserves_content_but_strips_delimiters() {
+        // 内容中的 ESC[201~ 会提前结束粘贴模式，必须剔除
+        let text = "ls\u{1b}[201~; rm -rf /\u{1b}[200~";
+        let out = sanitize_pasted_text(text, true);
+        assert_eq!(out, "ls; rm -rf /");
+    }
+
+    #[test]
+    fn non_ascii_text_is_preserved() {
+        assert_eq!(sanitize_pasted_text("中文 ok ✅", false), "中文 ok ✅");
     }
 }
