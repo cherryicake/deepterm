@@ -26,6 +26,57 @@ use super::{
     },
 };
 
+/// Deterministic replacement for `gpui::combine_highlights`.
+/// The original uses `FxHashSet` iteration, which is non-deterministic and
+/// caused paired brackets (`{}`, `()`) to get different colors. `overlay`
+/// is applied after `base` and wins on overlap.
+fn combine_highlights_stable(
+    base: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+    overlay: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut highlights = Vec::new();
+    let mut endpoints = Vec::new(); // (position, is_start, id)
+    for (range, style) in base.into_iter().chain(overlay) {
+        if range.is_empty() {
+            continue;
+        }
+        let id = highlights.len();
+        endpoints.push((range.start, true, id));
+        endpoints.push((range.end, false, id));
+        highlights.push(style);
+    }
+    if endpoints.is_empty() {
+        return Vec::new();
+    }
+    // Ends (false) before starts (true) at the same position.
+    endpoints.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+    let mut active = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut i = 0;
+    while i < endpoints.len() {
+        let pos = endpoints[i].0;
+        if pos > cursor && !active.is_empty() {
+            let style = active
+                .iter()
+                .fold(HighlightStyle::default(), |acc, &id| acc.highlight(highlights[id]));
+            out.push((cursor..pos, style));
+        }
+        while i < endpoints.len() && endpoints[i].0 == pos {
+            let (_, is_start, id) = endpoints[i];
+            if is_start {
+                active.insert(id);
+            } else {
+                active.remove(&id);
+            }
+            i += 1;
+        }
+        cursor = pos;
+    }
+    out
+}
+
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
@@ -944,7 +995,7 @@ impl TextElement {
         if rainbow.is_empty() {
             return Some(styles);
         }
-        styles = gpui::combine_highlights(styles, rainbow).collect();
+        styles = combine_highlights_stable(styles, rainbow);
         Some(styles)
     }
 
@@ -1499,7 +1550,7 @@ impl TextElement {
                         highlighter.styles(&(byte_start..byte_end), &highlight_theme)
                     };
 
-                    *styles = gpui::combine_highlights(styles.clone(), range_styles).collect();
+                    *styles = combine_highlights_stable(styles.clone(), range_styles);
                 };
 
             // Group contiguous visible lines into ranges and call styles() once per range
@@ -1536,7 +1587,7 @@ impl TextElement {
             }
 
             let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
-            styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
+            styles = combine_highlights_stable(diagnostic_styles, styles);
         }
         drop(highlighter_ref);
 
@@ -1552,7 +1603,7 @@ impl TextElement {
                     },
                 )
             });
-            styles = gpui::combine_highlights(styles, diff_styles).collect();
+            styles = combine_highlights_stable(styles, diff_styles);
         }
 
         // The internal tree-sitter branch flushes one gap-free range per
@@ -2665,5 +2716,32 @@ mod tests {
         assert_runs(runs_for_range(&runs, 3, &(0..3)), &[1, 2]);
         assert_runs(runs_for_range(&runs, 3, &(2..10)), &[4, 1, 3]);
         assert_runs(runs_for_range(&runs, 9, &(0..8)), &[1, 7]);
+    }
+
+    #[test]
+    fn combine_highlights_stable_rainbow_overrides_syntax() {
+        // Nested "((  ))" - overlay (rainbow) must win and paired brackets share the same color.
+        let gray = HighlightStyle { color: Some(gpui::rgb(0xb2b9c6).into()), ..Default::default() };
+        let gold = HighlightStyle { color: Some(gpui::rgb(0xE2B93D).into()), ..Default::default() };
+        let blue = HighlightStyle { color: Some(gpui::rgb(0x4FC1FF).into()), ..Default::default() };
+        let syntax = vec![(0..1, gray.clone()), (1..2, gray.clone()), (2..3, gray.clone()), (3..4, gray)];
+        let rainbow = vec![(0..1, gold.clone()), (1..2, blue.clone()), (2..3, blue.clone()), (3..4, gold.clone())];
+        let merged = combine_highlights_stable(syntax, rainbow);
+        assert_eq!(merged, vec![(0..1, gold.clone()), (1..2, blue.clone()), (2..3, blue.clone()), (3..4, gold.clone())]);
+        assert_eq!(merged[0].1.color, merged[3].1.color);
+        assert_eq!(merged[1].1.color, merged[2].1.color);
+    }
+
+    #[test]
+    fn combine_highlights_stable_deterministic_for_nested() {
+        let base = HighlightStyle { color: Some(gpui::red()), ..Default::default() };
+        let overlay = HighlightStyle { color: Some(gpui::blue()), ..Default::default() };
+        let a = vec![(0..5, base.clone()), (4..10, base.clone())];
+        let b = vec![(2..6, overlay.clone())];
+        let r1 = combine_highlights_stable(a.clone(), b.clone());
+        let r2 = combine_highlights_stable(a, b);
+        assert_eq!(r1, r2);
+        let seg = r1.iter().find(|(r, _)| r.contains(&3)).unwrap();
+        assert_eq!(seg.1.color, Some(gpui::blue()));
     }
 }

@@ -319,8 +319,8 @@ pub(crate) fn pair_bracket_tokens(
             if let Some(&(ix, _)) = stack.last() {
                 stack.pop();
                 spans[ix].3 = true;
-                let depth = stack.len();
-                spans.push((offset..offset + 1, depth, false, true));
+                let open_depth = spans[ix].1; // paired brackets share depth
+                spans.push((offset..offset + 1, open_depth, false, true));
             } else {
                 // 游离闭括号
                 spans.push((offset..offset + 1, stack.len(), false, false));
@@ -4335,5 +4335,43 @@ mod tests {
         // 空文本/边界
         let empty = Rope::from_str("");
         assert_eq!(InputState::matching_bracket(&empty, 0), None);
+    }
+
+    #[test]
+    fn rainbow_pair_depth_stable_for_nested_mixed() {
+        let cases = [
+            ("((()))", vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)]),
+            ("({[]})", vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)]),
+            ("a(b[c]{d}e)f", vec![(1, 0), (3, 1), (5, 1), (6, 1), (8, 1), (10, 0)]),
+        ];
+        for (text, expected) in cases {
+            let rope = Rope::from_str(text);
+            let spans = scan_bracket_spans_text(&rope);
+            let depths: Vec<(usize, usize)> = spans.iter().map(|(r, d, _, _)| (r.start, *d)).collect();
+            assert_eq!(depths, expected, "text={text}");
+        }
+    }
+
+    #[test]
+    fn rainbow_pair_all_brackets_paired_same_color_depth() {
+        let rope = Rope::from_str("((a){b}[c])");
+        let spans = scan_bracket_spans_text(&rope);
+        let got: Vec<(usize, usize, bool, bool)> = spans
+            .into_iter()
+            .map(|(r, d, o, m)| (r.start, d, o, m))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 0, true, true),
+                (1, 1, true, true),
+                (3, 1, false, true),
+                (4, 1, true, true),
+                (6, 1, false, true),
+                (7, 1, true, true),
+                (9, 1, false, true),
+                (10, 0, false, true),
+            ]
+        );
     }
 }
