@@ -44,32 +44,39 @@ impl MarkdownStyle {
     pub fn themed(window: &Window, cx: &gpui::App) -> Self {
         let theme = cx.theme();
         let ui = &theme.ui;
+        let is_dark = theme.appearance.is_dark();
 
+        // Typora / Notion 阅读体验：正文使用系统无衬线栈（非等宽），
+        // 15px / 1.75 行高，段间距靠容器 margin 统一控制，
+        // 参考 github-markdown-css + Notion 的柔和留白。
         let mut base_text_style = window.text_style();
         base_text_style.refine(&TextStyleRefinement {
             color: Some(ui.text),
+            font_size: Some(px(15.).into()),
             line_height: Some(rems(1.75).into()),
             white_space: Some(WhiteSpace::Normal),
             ..Default::default()
         });
 
+        // 代码块卡片：editor_background 背景，淡边框，圆角 8px
+        let code_border = ui.border.opacity(if is_dark { 0.28 } else { 0.20 });
         let code_block = StyleRefinement {
             padding: gpui::EdgesRefinement {
                 top: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
+                    gpui::AbsoluteLength::Pixels(px(14.)),
                 )),
                 left: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
+                    gpui::AbsoluteLength::Pixels(px(16.)),
                 )),
                 right: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
+                    gpui::AbsoluteLength::Pixels(px(16.)),
                 )),
                 bottom: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
+                    gpui::AbsoluteLength::Pixels(px(14.)),
                 )),
             },
             margin: gpui::EdgesRefinement {
-                top: Some(gpui::Length::Definite(px(8.).into())),
+                top: Some(gpui::Length::Definite(px(16.).into())),
                 left: Some(gpui::Length::Definite(px(0.).into())),
                 right: Some(gpui::Length::Definite(px(0.).into())),
                 bottom: Some(gpui::Length::Definite(px(20.).into())),
@@ -81,78 +88,75 @@ impl MarkdownStyle {
                 right: Some(gpui::AbsoluteLength::Pixels(px(1.))),
                 bottom: Some(gpui::AbsoluteLength::Pixels(px(1.))),
             },
-            border_color: Some(ui.border),
+            border_color: Some(code_border),
             background: Some(theme.editor_background().into()),
             text: TextStyleRefinement {
                 font_family: Some(platform_default_font_family()),
                 font_fallbacks: Some(platform_default_fallbacks()),
+                font_size: Some(px(13.5).into()),
+                line_height: Some(rems(1.6).into()),
                 ..Default::default()
             },
             ..Default::default()
         };
 
+        // 行内代码：淡底胶囊，亮 6% / 暗 12%
         let inline_code = TextStyleRefinement {
             font_family: Some(platform_default_font_family()),
             font_fallbacks: Some(platform_default_fallbacks()),
             font_size: Some(px(13.).into()),
-            background_color: Some(ui.text.opacity(0.08)),
+            background_color: Some(ui.text.opacity(if is_dark { 0.12 } else { 0.06 })),
             ..Default::default()
         };
 
         let link = TextStyleRefinement {
             color: Some(ui.accent),
             underline: Some(gpui::UnderlineStyle {
-                color: Some(ui.accent.opacity(0.5)),
+                color: Some(ui.accent.opacity(0.35)),
                 thickness: px(1.),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
+        // 标题层级：逐级缩小，H1-H4 加粗，H5-H6 600，H1/H2 带分割线（行高 > 字号，避免重叠）
+        let heading = |size: f32, weight: gpui::FontWeight, height: f32| TextStyleRefinement {
+            font_size: Some(rems(size).into()),
+            font_weight: Some(weight),
+            line_height: Some(rems(height).into()),
+            ..Default::default()
+        };
+        let mut h6 = heading(0.85, gpui::FontWeight(600.), 1.55);
+        h6.color = Some(ui.text_muted);
         let heading_level_styles = [
-            Some(TextStyleRefinement {
-                font_size: Some(rems(1.45).into()),
-                ..Default::default()
-            }),
-            Some(TextStyleRefinement {
-                font_size: Some(rems(1.3).into()),
-                ..Default::default()
-            }),
-            Some(TextStyleRefinement {
-                font_size: Some(rems(1.1).into()),
-                ..Default::default()
-            }),
-            Some(TextStyleRefinement {
-                font_size: Some(rems(1.01).into()),
-                ..Default::default()
-            }),
-            Some(TextStyleRefinement {
-                font_size: Some(rems(0.95).into()),
-                ..Default::default()
-            }),
-            Some(TextStyleRefinement {
-                font_size: Some(rems(0.85).into()),
-                ..Default::default()
-            }),
+            Some(heading(1.875, gpui::FontWeight::BOLD, 2.35)),
+            Some(heading(1.5, gpui::FontWeight::BOLD, 1.95)),
+            Some(heading(1.25, gpui::FontWeight::BOLD, 1.75)),
+            Some(heading(1.08, gpui::FontWeight::BOLD, 1.55)),
+            Some(heading(0.95, gpui::FontWeight(600.), 1.5)),
+            Some(h6),
         ];
 
+        // 引用边框：左重边框
+        let block_quote_border_color = ui.border.opacity(if is_dark { 0.9 } else { 0.65 });
         Self {
             base_text_style,
             container_style: StyleRefinement::default(),
             code_block,
             inline_code,
             block_quote: TextStyleRefinement {
-                color: Some(ui.text_muted),
+                color: Some(ui.text.opacity(0.78)),
+                font_style: Some(gpui::FontStyle::Italic),
                 ..Default::default()
             },
             link,
-            rule_color: ui.border,
-            block_quote_border_color: ui.border,
+            rule_color: ui.border.opacity(if is_dark { 0.5 } else { 0.45 }),
+            block_quote_border_color,
             heading: StyleRefinement {
                 ..Default::default()
             },
             heading_level_styles,
-            heading_border_color: Some(ui.border),
+            heading_border_color: Some(ui.border.opacity(if is_dark { 0.35 } else { 0.22 })),
         }
     }
 }
@@ -251,23 +255,35 @@ impl Render for Markdown {
         let list_state = self.list_state.clone();
         let style = MarkdownStyle::themed(_window, cx);
 
+        // Notion/Typora 版式：居中窄栏，最大 780px (≈72ch)，
+        // 外层负责背景与居中，内层窄栏承载 list，实现优雅的阅读宽度。
         div()
             .id("markdown")
             .key_context("Markdown")
             .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
+            .items_center()
             .size_full()
             .overflow_hidden()
             .bg(theme.app_background)
             .child(
-                div().flex().flex_col().px_8().py_6().size_full().child(
-                    list(list_state, move |ix, window, cx| {
-                        Self::render_item(markdown.clone(), ix, window, cx, style.clone())
-                    })
+                div()
+                    .flex()
+                    .flex_col()
                     .w_full()
-                    .h_full(),
-                ),
+                    .max_w(px(780.))
+                    .px_8()
+                    .py_8()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(
+                        list(list_state, move |ix, window, cx| {
+                            Self::render_item(markdown.clone(), ix, window, cx, style.clone())
+                        })
+                        .w_full()
+                        .h_full(),
+                    ),
             )
     }
 }
