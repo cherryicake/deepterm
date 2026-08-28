@@ -195,6 +195,21 @@ pub struct HoveredLink {
     pub end_col: usize,
 }
 
+/// 本地 shell 进程 cwd 的后台刷新缓存。
+///
+/// 查询走 lsof / /proc 子进程（单次几十至几百毫秒），不能在 UI 线程执行：
+/// 按键（内建命令补全）、标签刷新、拖拽等路径只读缓存，由
+/// [`TerminalView::local_process_cwd`] 在后台线程刷新。
+#[derive(Default)]
+struct ProcessCwdCache {
+    /// 最近一次后台查询结果
+    cwd: Option<PathBuf>,
+    /// 最近一次查询时间（含无 pid / 失败，避免重复 spawn）
+    checked_at: Option<Instant>,
+    /// 后台查询进行中（同时只允许一个）
+    refresh_in_flight: bool,
+}
+
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     terminal_subscription: Option<Subscription>,
@@ -249,12 +264,8 @@ pub struct TerminalView {
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
     cached_working_directory: Option<String>,
-    /// 本地 shell 进程 cwd 缓存：lsof//proc 查询在后台线程执行，
-    /// 按键（内建命令补全）/标签刷新/拖拽等 UI 路径只读缓存。
-    process_cwd_cache: Option<PathBuf>,
-    /// 上次后台查询时间（含查询失败，避免反复 spawn）
-    process_cwd_checked_at: Option<Instant>,
-    process_cwd_refresh_in_flight: bool,
+    /// 本地 shell 进程 cwd（后台线程刷新，UI 路径只读）
+    process_cwd: ProcessCwdCache,
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
@@ -540,9 +551,7 @@ impl TerminalView {
                 ssh_connect_hide_task: None,
                 remote_os: None,
                 cached_working_directory: None,
-                process_cwd_cache: None,
-                process_cwd_checked_at: None,
-                process_cwd_refresh_in_flight: false,
+                process_cwd: ProcessCwdCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 link_modifier_held: false,
@@ -733,9 +742,7 @@ impl TerminalView {
                 ssh_connect_hide_task: None,
                 remote_os: None,
                 cached_working_directory: None,
-                process_cwd_cache: None,
-                process_cwd_checked_at: None,
-                process_cwd_refresh_in_flight: false,
+                process_cwd: ProcessCwdCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 link_modifier_held: false,
@@ -926,9 +933,8 @@ impl TerminalView {
         terminal
             .reported_working_directory()
             .map(PathBuf::from)
-            // 进程 cwd 只读缓存（由 local_process_cwd 后台刷新），
-            // 不在 UI 线程同步起 lsof 子进程
-            .or_else(|| self.process_cwd_cache.clone())
+            // 进程 cwd 只读后台缓存（local_process_cwd 刷新），不在 UI 线程起 lsof
+            .or_else(|| self.process_cwd.cwd.clone())
             .or_else(|| self.working_directory.clone())
     }
 
@@ -940,19 +946,22 @@ impl TerminalView {
     /// 期间返回旧值。无 pid（远程终端/尚未启动）也记录时间戳，避免重复进入。
     fn local_process_cwd(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
         const TTL: Duration = Duration::from_secs(2);
-        if let Some(at) = self.process_cwd_checked_at {
-            if at.elapsed() < TTL {
-                return self.process_cwd_cache.clone();
-            }
+
+        let cache_fresh = self
+            .process_cwd
+            .checked_at
+            .is_some_and(|at| at.elapsed() < TTL);
+        if cache_fresh || self.process_cwd.refresh_in_flight {
+            return self.process_cwd.cwd.clone();
         }
-        if self.process_cwd_refresh_in_flight {
-            return self.process_cwd_cache.clone();
-        }
+
         let Some(pid) = self.terminal.read(cx).child_process_id else {
-            self.process_cwd_checked_at = Some(Instant::now());
-            return self.process_cwd_cache.clone();
+            // 无 pid：记录检查时间，避免每次调用都重走到这里
+            self.process_cwd.checked_at = Some(Instant::now());
+            return self.process_cwd.cwd.clone();
         };
-        self.process_cwd_refresh_in_flight = true;
+
+        self.process_cwd.refresh_in_flight = true;
         cx.spawn(async move |this, cx| {
             let cwd = cx
                 .background_executor()
@@ -961,15 +970,17 @@ impl TerminalView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.process_cwd_refresh_in_flight = false;
-                this.process_cwd_checked_at = Some(Instant::now());
-                this.process_cwd_cache = cwd;
+                this.process_cwd = ProcessCwdCache {
+                    cwd,
+                    checked_at: Some(Instant::now()),
+                    refresh_in_flight: false,
+                };
                 // cwd 变化会影响 tab 标签与会话保存
                 cx.notify();
             });
         })
         .detach();
-        self.process_cwd_cache.clone()
+        self.process_cwd.cwd.clone()
     }
 
     fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
@@ -1045,7 +1056,7 @@ impl TerminalView {
             .as_deref()
             .map(PathBuf::from)
             .or_else(|| term.reported_working_directory().map(PathBuf::from))
-            .or_else(|| self.process_cwd_cache.clone())
+            .or_else(|| self.process_cwd.cwd.clone())
             .or_else(|| self.working_directory.clone());
 
         let cwd_display = cwd.as_ref().and_then(|p| {
