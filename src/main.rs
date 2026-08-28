@@ -318,6 +318,17 @@ impl AppWindow {
                         }
                     });
                 }
+                SidebarEvent::OpenDiffLoading { path, repo } => {
+                    let editor = editor_for_open.clone();
+                    let (path, repo) = (path.clone(), repo.clone());
+                    window.defer(cx, move |window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                e.open_diff_file_loading(path, repo, window, cx)
+                            });
+                        }
+                    });
+                }
             },
         );
 

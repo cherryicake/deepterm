@@ -140,6 +140,13 @@ impl MacosSidebar {
                         repo: repo.clone(),
                     });
                 }
+                crate::sidebar_view::git_panel::GitPanelEvent::OpenDiffLoading { path, repo } => {
+                    // Forward instantly; DiffView fetches content in background.
+                    cx.emit(SidebarEvent::OpenDiffLoading {
+                        path: path.clone(),
+                        repo: repo.clone(),
+                    });
+                }
                 _ => {}
             },
         );

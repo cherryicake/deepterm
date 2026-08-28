@@ -30,6 +30,11 @@ pub enum GitPanelEvent {
         diff: DiffFile,
         repo: GitRepository,
     },
+    /// Instant open: content loads asynchronously in DiffView.
+    OpenDiffLoading {
+        path: String,
+        repo: GitRepository,
+    },
     StageFile { path: String },
     UnstageFile { path: String },
 }
@@ -394,6 +399,17 @@ impl GitPanel {
                     }
                 }
 
+                // Prefetch first few files so the initial click is instant.
+                if let Some(repo) = this.repo.clone().filter(|r| r.ssh_config().is_some()) {
+                    for entry in this.file_entries.iter().take(3) {
+                        let repo = repo.clone();
+                        let path = entry.path.clone();
+                        cx.background_executor()
+                            .spawn(async move { let _ = repo.diff_file_contents(&path); })
+                            .detach();
+                    }
+                }
+
                 // If a refresh was requested while we were loading, schedule another one
                 if this.refresh_pending && this.repo.is_some() {
                     this.refresh_pending = false;
@@ -432,40 +448,28 @@ impl GitPanel {
         }));
     }
 
-    /// Open diff for a file
+    /// Opens the diff tab instantly; content loads in the background.
     fn open_diff(&self, entry: &GitFileEntry, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_ref() else {
             return;
         };
+        // Instant emit — no await.
+        cx.emit(GitPanelEvent::OpenDiffLoading {
+            path: entry.path.clone(),
+            repo: repo.clone(),
+        });
+    }
 
-        let path = entry.path.clone();
-        let path_for_spawn = path.clone();
+    /// Warms the diff cache in the background for faster open on click.
+    fn prefetch_diff(&self, path: &str, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_ref().filter(|r| r.ssh_config().is_some()) else {
+            return;
+        };
         let repo = repo.clone();
-        let repo_for_spawn = repo.clone();
-        let weak = cx.entity().downgrade();
-
-        cx.spawn(async move |_, cx| {
-            let diff_result = cx
-                .background_executor()
-                .spawn(async move {
-                    repo_for_spawn
-                        .diff_file_contents(&path_for_spawn)
-                        .map(|(old, new)| {
-                            let language = crate::editor::guess_language_from_extension(
-                                std::path::Path::new(&path_for_spawn),
-                            );
-                            DiffFile::build(path_for_spawn.clone(), language, old, new, &[])
-                        })
-                })
-                .await;
-
-            if let Ok(diff) = diff_result {
-                let _ = weak.update(cx, |_, cx| {
-                    cx.emit(GitPanelEvent::OpenDiff { path, diff, repo });
-                });
-            }
-        })
-        .detach();
+        let path = path.to_owned();
+        cx.background_executor()
+            .spawn(async move { let _ = repo.diff_file_contents(&path); })
+            .detach();
     }
 
     /// Stage a file
@@ -571,6 +575,7 @@ impl GitPanel {
             theme.elevated_background.opacity(0.0)
         };
 
+        let hover_path = path.clone();
         div()
             .id(format!("git-entry-{index}"))
             .w_full()
@@ -580,6 +585,8 @@ impl GitPanel {
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 if *hovered {
                     this.hovered_index = Some(index);
+                    // Warm cache on hover.
+                    this.prefetch_diff(&hover_path, cx);
                 } else if this.hovered_index == Some(index) {
                     this.hovered_index = None;
                 }

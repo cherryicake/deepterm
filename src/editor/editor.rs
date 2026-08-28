@@ -1218,7 +1218,7 @@ impl Editor {
         self.open_local_file(path, window, cx, false);
     }
 
-    /// Open a diff view for a file
+    /// Opens a diff tab with pre-fetched content.
     pub fn open_diff_file(
         &mut self,
         path: String,
@@ -1246,7 +1246,51 @@ impl Editor {
         let diff_view = cx.new(|cx| {
             crate::editor::diff_view::DiffView::new(diff, repo, editor_weak, window, cx)
         });
+        self.push_diff_tab(tab_id, path, label, editor_state, diff_view, cx);
+    }
 
+    /// Opens the diff tab instantly; content loads in the background.
+    pub fn open_diff_file_loading(
+        &mut self,
+        path: String,
+        repo: crate::editor::git_repository::GitRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = format!("diff-{path}");
+        if self.open_files.iter().any(|file| file.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            return;
+        }
+
+        let label = format!("Diff: {path}");
+        let editor_state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).multi_line(true);
+            state.disabled = true;
+            state
+        });
+        let editor_weak = cx.entity().downgrade();
+        let diff_view = cx.new(|cx| {
+            crate::editor::diff_view::DiffView::new_loading(
+                path.clone(),
+                repo,
+                editor_weak,
+                window,
+                cx,
+            )
+        });
+        self.push_diff_tab(tab_id, path, label, editor_state, diff_view, cx);
+    }
+
+    fn push_diff_tab(
+        &mut self,
+        tab_id: String,
+        path: String,
+        label: String,
+        editor_state: Entity<InputState>,
+        diff_view: Entity<crate::editor::diff_view::DiffView>,
+        cx: &mut Context<Self>,
+    ) {
         if self.open_files.is_empty() {
             self.begin_open_animation();
         }

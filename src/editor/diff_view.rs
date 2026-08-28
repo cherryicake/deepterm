@@ -112,6 +112,11 @@ pub struct DiffView {
     dirty: bool,
     saving: bool,
     refreshing: bool,
+    /// True while the initial content fetch is pending; editors are empty
+    /// with a spinner and recompute is deferred.
+    loading: bool,
+    /// Error from the last fetch, if any.
+    load_error: Option<String>,
     recompute_gen: u32,
     scroll_syncing: bool,
     /// 已展开的折叠区 id（= 隐藏区 new 侧起始行）。
@@ -163,6 +168,8 @@ impl DiffView {
             dirty: false,
             saving: false,
             refreshing: false,
+            loading: false,
+            load_error: None,
             recompute_gen: 0,
             scroll_syncing: false,
             expanded_separators: std::collections::HashSet::new(),
@@ -194,6 +201,116 @@ impl DiffView {
         }));
 
         this
+    }
+
+    /// Creates the view with empty editors and fetches content in the background.
+    /// The tab appears instantly; batched remote fetch makes it feel local.
+    pub fn new_loading(
+        path: String,
+        repo: GitRepository,
+        editor: WeakEntity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let language = crate::editor::guess_language_from_extension(std::path::Path::new(&path));
+        let left = Self::new_editor(&language, "", true, window, cx);
+        let right = Self::new_editor(&language, "", false, window, cx);
+        let unified = Self::new_editor(&language, "", true, window, cx);
+
+        let mut this = Self {
+            path,
+            repo,
+            editor,
+            old_text: "".into(),
+            saved_text: String::new(),
+            left,
+            right,
+            unified,
+            hunks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            preference: LayoutPreference::Auto,
+            available_width: 0.0,
+            old_highlighter: SimpleHighlighter::new(&language),
+            new_highlighter: SimpleHighlighter::new(&language),
+            old_parsed: None,
+            new_parsed: None,
+            dirty: false,
+            saving: false,
+            refreshing: false,
+            loading: true,
+            load_error: None,
+            recompute_gen: 0,
+            scroll_syncing: false,
+            expanded_separators: std::collections::HashSet::new(),
+            unified_hunk_rows: Vec::new(),
+            unified_separators: Vec::new(),
+            initial_jump_done: false,
+            pending_jump: false,
+            _subscriptions: Vec::new(),
+        };
+
+        // Same subscriptions as `new`: live edits and scroll sync.
+        let right = this.right.clone();
+        this._subscriptions.push(cx.subscribe(
+            &right,
+            |this, _, event: &crate::components::input::InputEvent, cx| {
+                if matches!(event, crate::components::input::InputEvent::Change) {
+                    this.on_right_changed(cx);
+                }
+            },
+        ));
+        this._subscriptions.push(cx.observe(&this.left.clone(), |this, _, cx| {
+            this.sync_scroll(Side::Left, cx);
+        }));
+        this._subscriptions.push(cx.observe(&this.right.clone(), |this, _, cx| {
+            this.sync_scroll(Side::Right, cx);
+        }));
+
+        this.fetch_contents(cx);
+        this
+    }
+
+    fn fetch_contents(&mut self, cx: &mut Context<Self>) {
+        self.loading = true;
+        self.load_error = None;
+        cx.notify();
+
+        let repo = self.repo.clone();
+        let path = self.path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.diff_file_contents(&path) })
+                .await;
+
+            this.update(cx, |view, cx| {
+                match result {
+                    Ok((old_text, new_text)) => {
+                        view.loading = false;
+                        view.load_error = None;
+                        let language =
+                            crate::editor::guess_language_from_extension(std::path::Path::new(&view.path));
+                        view.old_highlighter = SimpleHighlighter::new(&language);
+                        view.new_highlighter = SimpleHighlighter::new(&language);
+                        view.old_text = old_text.clone().into();
+                        view.saved_text = new_text.clone();
+                        view.old_parsed = None;
+                        view.new_parsed = None;
+                        view.left.update(cx, |state, cx| state.set_text(old_text, cx));
+                        view.right.update(cx, |state, cx| state.set_text(new_text, cx));
+                        view.recompute(cx);
+                    }
+                    Err(error) => {
+                        view.loading = false;
+                        view.load_error = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn new_editor(
@@ -300,32 +417,40 @@ impl DiffView {
                     let additions = hunks.iter().map(|h| h.additions()).sum();
                     let deletions = hunks.iter().map(|h| h.deletions()).sum();
 
-                    // Re-parse only the changed source side(s). Parses run on
-                    // the background executor, so no timeout is applied: a
-                    // wall-clock timeout here would drop the tree for large
-                    // files (the parse returns `None` on expiry) and with it
-                    // all syntax highlighting.
-                    if old_parsed.as_deref() != Some(task_old.as_ref()) {
-                        let rope = Rope::from_str(&task_old);
-                        old_hl.update(None, &rope, None);
-                    }
-                    if new_parsed.as_deref() != Some(task_new.as_str()) {
-                        let rope = Rope::from_str(&task_new);
-                        new_hl.update(None, &rope, None);
+                    // Skip syntax highlighting for large files to keep the task fast.
+                    let should_highlight = task_old.len() + task_new.len() <= 600 * 1024;
+                    if should_highlight {
+                        if old_parsed.as_deref() != Some(task_old.as_ref()) {
+                            let rope = Rope::from_str(&task_old);
+                            old_hl.update(None, &rope, None);
+                        }
+                        if new_parsed.as_deref() != Some(task_new.as_str()) {
+                            let rope = Rope::from_str(&task_new);
+                            new_hl.update(None, &rope, None);
+                        }
                     }
 
                     let unified =
                         super::diff_model::build_unified_collapsed(&task_old, &task_new, &hunks, &expanded);
                     let hunk_rows = unified.hunk_rows.clone();
                     let separators = unified.separators.clone();
-                    let runs = DiffView::merged_highlight_runs(
-                        &unified.source,
-                        &task_old,
-                        &task_new,
-                        &mut old_hl,
-                        &mut new_hl,
-                        &theme,
-                    );
+                    let runs = if should_highlight {
+                        DiffView::merged_highlight_runs(
+                            &unified.source,
+                            &task_old,
+                            &task_new,
+                            &mut old_hl,
+                            &mut new_hl,
+                            &theme,
+                        )
+                    } else {
+                        let len = unified.source.text.len();
+                        if len > 0 {
+                            vec![(0..len, HighlightStyle::default())]
+                        } else {
+                            Vec::new()
+                        }
+                    };
                     let (line_colors, word_colors, labels) = unified_decorations(
                         &unified.source,
                         added_line,
@@ -1212,11 +1337,54 @@ impl DiffView {
 
 impl Render for DiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let editor_bg = theme.editor_background();
+        let editor_bg = cx.theme().editor_background();
+        let text_muted = cx.theme().text_muted;
+        let status_deleted = cx.theme().status_deleted;
+        let accent = cx.theme().accent;
+        let accent_fg = cx.theme().accent_foreground;
 
-        // 初始定位：等编辑器首次布局完成后滚动到第一个变更处。
         self.flush_pending_jump(cx);
+
+        let content: gpui::AnyElement = if self.loading {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(text_muted)
+                .child("加载中…")
+                .into_any_element()
+        } else if let Some(error) = self.load_error.as_ref() {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.0))
+                .text_sm()
+                .text_color(status_deleted)
+                .child(format!("加载失败: {error}"))
+                .child(
+                    div()
+                        .id("diff-retry")
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(6.0))
+                        .bg(accent)
+                        .text_color(accent_fg)
+                        .cursor_pointer()
+                        .child("重试")
+                        .on_click(cx.listener(|this, _, _, cx| this.fetch_contents(cx))),
+                )
+                .into_any_element()
+        } else {
+            match self.effective_mode() {
+                DiffMode::Split => self.render_split(cx).into_any_element(),
+                DiffMode::Unified => self.render_unified(cx).into_any_element(),
+            }
+        };
 
         div()
             .flex()
@@ -1224,10 +1392,8 @@ impl Render for DiffView {
             .size_full()
             .bg(editor_bg)
             .child(self.render_toolbar(cx))
-            .child(match self.effective_mode() {
-                DiffMode::Split => self.render_split(cx).into_any_element(),
-                DiffMode::Unified => self.render_unified(cx).into_any_element(),
-            })
+            .child(content)
+            .into_any_element()
     }
 }
 

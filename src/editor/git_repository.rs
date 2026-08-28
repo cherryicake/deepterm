@@ -36,7 +36,6 @@ struct CachedRemoteDiff {
 }
 
 /// 键 = "repo_root\u{0}path"。进程级缓存，容量上限防膨胀。
-static REMOTE_DIFF_CACHE: OnceLock<Mutex<HashMap<String, CachedRemoteDiff>>> = OnceLock::new();
 const REMOTE_DIFF_CACHE_CAP: usize = 64;
 
 fn remote_diff_cache() -> &'static Mutex<HashMap<String, CachedRemoteDiff>> {
@@ -278,10 +277,14 @@ impl GitRepository {
     /// Diffing the working tree against HEAD matches the previous behavior of
     /// `diff_file` (staged + unstaged changes combined).
     ///
-    /// 远程仓库启用 stat 缓存：先用 `rev-parse HEAD` + SFTP stat（两次轻量
-    /// 往返）判断内容是否变化，未变化则直接复用上次全文，避免每次刷新
-    /// 都全量拉取两端内容（大文件经 SFTP 明显慢）。本地仓库文件读取廉价，
-    /// 不走缓存。
+    /// Remote fetch optimized to feel local (mirrors VSCode `git` model).
+    ///
+    /// 1. `HEAD` (10s) + `stat` in parallel — saves one RTT.
+    /// 2. Cache hit (`head` + `size/mtime`) → 0 RTT.
+    /// 3. Miss → reuse editor file cache if fresh (30s) — saves one RTT.
+    /// 4. Otherwise fetch `HEAD` and worktree in parallel; pipelined read for >512KB.
+    ///
+    /// With `DiffView::new_loading` the tab opens instantly and resolves in ~1 RTT.
     pub fn diff_file_contents(&self, path: &str) -> Result<(String, String), String> {
         match &self.backend {
             GitBackend::Local => {
@@ -291,34 +294,57 @@ impl GitRepository {
                 Ok((old, new))
             }
             GitBackend::Remote { config } => {
-                let head_commit = self.head_commit().unwrap_or_else(|| "no-head".to_string());
+                // Fetch HEAD and stat in parallel.
                 let remote_path = join_remote_path(&self.root, path);
-                // 工作区文件可能已被删除：stat 失败视为删除态，用哨兵值入键
-                let (size, mtime) = match sftp_fs::metadata(config, &remote_path) {
-                    Ok(meta) => (meta.size, meta.modified_at),
-                    Err(_) => (u64::MAX, None),
-                };
-                if let Some(cached) = remote_diff_cache_get(
-                    &format!("{}\u{0}{}", self.root, path),
-                    &head_commit,
-                    size,
-                    mtime,
-                ) {
+                let (head_commit, meta_res) = std::thread::scope(|scope| {
+                    let head = scope.spawn(|| self.head_commit().unwrap_or_else(|| "no-head".into()));
+                    let stat = scope.spawn(|| sftp_fs::metadata(config, &remote_path));
+                    (head.join().unwrap(), stat.join().unwrap())
+                });
+                let (size, mtime) = meta_res
+                    .map(|meta| (meta.size, meta.modified_at))
+                    .unwrap_or((u64::MAX, None));
+                let cache_key = format!("{}\u{0}{}", self.root, path);
+                if let Some(cached) = remote_diff_cache_get(&cache_key, &head_commit, size, mtime) {
                     return Ok(cached);
                 }
+                // Reuse editor cache only if fresh to avoid stale content.
+                let file_cache_hit = {
+                    let cache =
+                        crate::file_manager::file_tree_cache::RemoteFileTreeCache::global().lock();
+                    let path_ref = std::path::Path::new(&remote_path);
+                    if cache.is_file_fresh(config, path_ref) {
+                        cache.get_file_content(config, path_ref).map(|(content, _)| content)
+                    } else {
+                        None
+                    }
+                };
                 let head_ref = format!("HEAD:{path}");
-                let (old, new) = std::thread::scope(|s| {
-                    let h_old = s.spawn(|| self.run_git(&["show", &head_ref]).unwrap_or_default());
-                    let h_new = s.spawn(|| self.read_file(path).unwrap_or_default());
-                    (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
-                });
-                remote_diff_cache_insert(
-                    format!("{}\u{0}{}", self.root, path),
-                    head_commit,
-                    size,
-                    mtime,
-                    (old.clone(), new.clone()),
-                );
+                let (old, new) = if let Some(cached_new) = file_cache_hit {
+                    // Only need HEAD via git — saves one RTT + SFTP read.
+                    let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+                    (old, cached_new)
+                } else {
+                    // 3. Parallel fetch of both sides; SFTP read picks pipelined
+                    // path for large files based on the stat size already known.
+                    std::thread::scope(|s| {
+                        let h_old = s.spawn(|| self.run_git(&["show", &head_ref]).unwrap_or_default());
+                        let h_new = s.spawn(|| {
+                            let is_large = size != u64::MAX && size > 512 * 1024;
+                            if is_large {
+                                sftp_fs::read_file_bytes(config, &remote_path)
+                                    .ok()
+                                    .flatten()
+                                    .map(|bytes| crate::editor::encoding::decode_bytes(&bytes).text)
+                                    .unwrap_or_else(|| self.read_file(path).unwrap_or_default())
+                            } else {
+                                self.read_file(path).unwrap_or_default()
+                            }
+                        });
+                        (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
+                    })
+                };
+                remote_diff_cache_insert(cache_key, head_commit, size, mtime, (old.clone(), new.clone()));
                 Ok((old, new))
             }
         }
@@ -365,6 +391,10 @@ impl GitRepository {
                     .inspect(|_| {
                         invalidate_remote_diff_cache(&self.root, path);
                         self.invalidate_status_cache();
+                        // Remove stale file cache; next open uses fresh size/mtime.
+                        crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
+                            .lock()
+                            .remove_file(config, Path::new(&remote_path));
                     })
             }
         }
@@ -398,9 +428,17 @@ impl GitRepository {
             }
             GitBackend::Remote { config } => {
                 let remote_path = join_remote_path(&self.root, path);
-                sftp_fs::read_file_to_string(config, &remote_path)
-                    .map_err(|e| format!("Failed to read remote file: {e}"))
-                    .map(|opt| opt.unwrap_or_default())
+                // Handles encoding and pipelined read for large files.
+                let bytes_opt = sftp_fs::read_file_bytes(config, &remote_path)
+                    .map_err(|e| format!("Failed to read remote file: {e}"))?;
+                let bytes = bytes_opt.unwrap_or_default();
+                if bytes.is_empty() {
+                    return Ok(String::new());
+                }
+                if sftp_fs::is_binary_bytes(&bytes) {
+                    return Err("二进制文件".to_string());
+                }
+                Ok(crate::editor::encoding::decode_bytes(&bytes).text)
             }
         }
     }

@@ -126,20 +126,6 @@ impl SidebarMenuSection {
 }
 
 /// 侧边栏当前显示的视图
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SidebarView {
-    Menu,
-    Theme,
-    Font,
-    Host,
-    Keychain,
-    FileTree,
-}
-
-/// macOS 风格侧边栏组件
-///
-/// 封装了侧边栏的显隐状态、入场/退出动画、宽度拖拽调整、切换按钮和 TitleBar 补偿动画。
-/// 内部包含多组菜单结构，支持选中高亮和点击回调。
 #[derive(Clone)]
 pub enum SidebarEvent {
     TabGroupsChanged,
@@ -152,6 +138,11 @@ pub enum SidebarEvent {
         diff: crate::editor::diff_model::DiffFile,
         repo: crate::editor::git_repository::GitRepository,
     },
+    /// Instant open; content loads asynchronously in DiffView.
+    OpenDiffLoading {
+        path: String,
+        repo: crate::editor::git_repository::GitRepository,
+    },
 }
 
 impl std::fmt::Debug for SidebarEvent {
@@ -160,8 +151,20 @@ impl std::fmt::Debug for SidebarEvent {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
             Self::OpenDiff { path, .. } => f.debug_struct("OpenDiff").field("path", path).finish(),
+            Self::OpenDiffLoading { path, .. } => f.debug_struct("OpenDiffLoading").field("path", path).finish(),
         }
     }
+}
+
+/// 侧边栏当前显示的视图
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarView {
+    Menu,
+    Theme,
+    Font,
+    Host,
+    Keychain,
+    FileTree,
 }
 
 pub struct MacosSidebar {
