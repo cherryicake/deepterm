@@ -8,10 +8,11 @@ use russh::keys::PublicKey;
 
 /// 主机密钥策略，由 `SshGlobalConfig::strict_host_key_checking` 决定。
 ///
-/// - `AcceptNew`（默认关闭严格模式）：未知主机按 accept-new 语义写入
+/// - `AcceptNew`（**默认**）：未知主机按 accept-new 语义写入
 ///   known_hosts 后接受（trust-on-first-use，与 OpenSSH 默认一致）。
-/// - `Strict`：只接受 known_hosts 中已记录的密钥，未知主机直接拒绝，
-///   不静默学习。需要先用系统 ssh 连接一次、或人工导入 known_hosts。
+/// - `Strict`（需在 ssh.json 中显式开启 strict_host_key_checking=true）：
+///   只接受 known_hosts 中已记录的密钥，未知主机直接拒绝，不静默学习。
+///   需要先用系统 ssh 连接一次、或人工导入 known_hosts。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostKeyPolicy {
     AcceptNew,
@@ -26,9 +27,20 @@ impl HostKeyPolicy {
             HostKeyPolicy::AcceptNew
         }
     }
+
+    /// 对应 OpenSSH CLI 的 StrictHostKeyChecking 选项值，
+    /// 供 ssh_pty（系统 ssh 回退路径）与 russh 路径保持同一策略。
+    pub fn openssh_str(self) -> &'static str {
+        match self {
+            HostKeyPolicy::AcceptNew => "accept-new",
+            HostKeyPolicy::Strict => "yes",
+        }
+    }
 }
 
-/// 读取全局配置中的主机密钥策略。读不到配置时退回 Strict（安全优先）。
+/// 读取全局配置中的主机密钥策略。
+/// `SshGlobalConfig::load()` 读不到配置时返回 new()（AcceptNew），
+/// 与默认行为一致。
 pub fn policy_from_global_config() -> HostKeyPolicy {
     HostKeyPolicy::from_strict_flag(crate::ssh::config::SshGlobalConfig::load().strict_host_key_checking)
 }
@@ -66,9 +78,13 @@ pub fn check_and_trust_host_key(
                 Ok(true)
             }
             HostKeyPolicy::Strict => {
+                let hint = match crate::ssh::config::SshGlobalConfig::config_path() {
+                    Some(path) => format!("（配置文件：{} 中 strict_host_key_checking）", path.display()),
+                    None => String::new(),
+                };
                 log::error!(
                     "ssh: {host}:{port} 不在 known_hosts 中，严格模式下拒绝连接。\
-                    请先用系统 ssh 连接一次该主机并确认指纹，或关闭“严格主机密钥检查”"
+                    请先用系统 ssh 连接一次该主机并确认指纹，或改用 accept-new 策略{hint}"
                 );
                 Err(russh::Error::Inconsistent)
             }
@@ -100,5 +116,11 @@ mod tests {
             HostKeyPolicy::from_strict_flag(false),
             HostKeyPolicy::AcceptNew
         );
+    }
+
+    #[test]
+    fn policy_maps_openssh_option() {
+        assert_eq!(HostKeyPolicy::AcceptNew.openssh_str(), "accept-new");
+        assert_eq!(HostKeyPolicy::Strict.openssh_str(), "yes");
     }
 }

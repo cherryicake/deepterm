@@ -37,11 +37,13 @@ impl SshPtyTerminal {
 
         let resolved_auth = resolve_auth_method(&config.auth_method)?;
 
-        // 构建 SSH 命令
+        // 构建 SSH 命令。StrictHostKeyChecking 与 russh 路径共用同一策略，
+        // 避免同一开关在两条传输路径上行为不一致。
+        let host_key_policy = crate::ssh::host_key::policy_from_global_config();
         let mut ssh_program = "ssh";
         let mut ssh_args = vec![
             "-o".to_string(),
-            "StrictHostKeyChecking=accept-new".to_string(),
+            format!("StrictHostKeyChecking={}", host_key_policy.openssh_str()),
             "-o".to_string(),
             "ServerAliveInterval=60".to_string(),
             "-o".to_string(),

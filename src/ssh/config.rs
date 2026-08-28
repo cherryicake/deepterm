@@ -357,7 +357,11 @@ pub struct SshGlobalConfig {
     #[serde(default = "default_timeout")]
     pub default_timeout: u64,
     /// 是否启用严格主机密钥检查
-    #[serde(default = "default_true")]
+    ///
+    /// 默认 false（accept-new，与 OpenSSH 默认及本应用历史行为一致）：
+    /// 未知主机首次连接时自动学习密钥（trust-on-first-use）。
+    /// 设为 true 后只接受 known_hosts 中已记录的主机，未知主机直接拒绝。
+    #[serde(default)]
     pub strict_host_key_checking: bool,
     /// 默认私钥路径列表
     #[serde(default = "default_identity_files")]
@@ -371,6 +375,12 @@ pub struct SshGlobalConfig {
     /// 是否启用 SSH Agent
     #[serde(default = "default_true")]
     pub use_agent: bool,
+    /// 一次性迁移标记：旧版本的 new() 默认写入 strict_host_key_checking=true，
+    /// 且该设置从未有任何 UI、也从未被执行——旧配置文件里的 true 是序列化
+    /// 默认值而非用户选择。首次加载时把它归位为 false（accept-new）。
+    /// 此后用户显式设置的 true 会被尊重，不会再被改写。
+    #[serde(default)]
+    host_key_strict_migrated: bool,
 }
 
 fn default_true() -> bool {
@@ -395,11 +405,13 @@ impl SshGlobalConfig {
     pub fn new() -> Self {
         Self {
             default_timeout: default_timeout(),
-            strict_host_key_checking: true,
+            strict_host_key_checking: false,
             default_identity_files: default_identity_files(),
             saved_connections: Vec::new(),
             known_hosts: Vec::new(),
             use_agent: true,
+            // 新建配置本身就是新默认值，无需迁移
+            host_key_strict_migrated: true,
         }
     }
 
@@ -463,6 +475,7 @@ impl SshGlobalConfig {
                                 if let Err(err) = cfg.migrate_keychain_refs() {
                                     log::warn!("SSH 凭据迁移失败: {}", err);
                                 }
+                                let _ = cfg.migrate_legacy_host_key_strict();
                                 if let Err(e) = cfg.save() {
                                     log::warn!("Failed to migrate SSH config to new location: {e}");
                                 }
@@ -493,7 +506,32 @@ impl SshGlobalConfig {
         if let Err(err) = config.migrate_keychain_refs() {
             log::warn!("SSH 凭据迁移失败: {}", err);
         }
+        if config.migrate_legacy_host_key_strict() {
+            // 一次性回写，避免每次启动重复迁移
+            if let Err(e) = config.save() {
+                log::warn!("SSH: 回写 strict_host_key_checking 迁移结果失败: {e}");
+            }
+        }
         config
+    }
+
+    /// 一次性迁移：把旧版本机器写入的 strict_host_key_checking=true 归位为 false。
+    /// 返回 true 表示配置发生变化，调用方应当保存。
+    /// 迁移标记落盘后，用户显式设置的 true 不再受影响。
+    fn migrate_legacy_host_key_strict(&mut self) -> bool {
+        if self.host_key_strict_migrated {
+            return false;
+        }
+        self.host_key_strict_migrated = true;
+        if self.strict_host_key_checking {
+            self.strict_host_key_checking = false;
+            log::info!(
+                "SSH: 迁移旧默认值 strict_host_key_checking=true → false \
+                （旧值由旧版默认写入，从未可被用户设置也从未被执行；如需严格模式请显式设为 true）"
+            );
+            return true;
+        }
+        false
     }
 
     /// 加载配置，如果不存在则创建默认配置文件（兼容旧路径迁移）
@@ -526,6 +564,9 @@ impl SshGlobalConfig {
         config
             .migrate_keychain_refs()
             .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+        if config.migrate_legacy_host_key_strict() {
+            let _ = config.save();
+        }
         Ok(config)
     }
 
@@ -569,7 +610,7 @@ impl SshGlobalConfig {
     }
 
     /// 获取配置文件路径：优先 dirs::config_dir，回退 ~/.config
-    fn config_path() -> Option<std::path::PathBuf> {
+    pub(crate) fn config_path() -> Option<std::path::PathBuf> {
         if let Some(dir) = dirs::config_dir() {
             return Some(dir.join("deepterm").join("ssh.json"));
         }
@@ -658,5 +699,27 @@ mod tests {
 
         config.remove_connection(&conn.id());
         assert_eq!(config.saved_connections_count(), 0);
+    }
+
+    #[test]
+    fn legacy_strict_host_key_default_is_migrated_once() {
+        // 旧版配置：字段由旧 new() 默认写入 true，且无迁移标记
+        let json = r#"{"strict_host_key_checking": true, "saved_connections": []}"#;
+        let mut cfg: SshGlobalConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.migrate_legacy_host_key_strict());
+        assert!(!cfg.strict_host_key_checking, "旧默认 true 应回位为 false");
+
+        // 二次迁移不再触发，且用户此后显式设置的 true 会被尊重
+        assert!(!cfg.migrate_legacy_host_key_strict());
+        cfg.strict_host_key_checking = true;
+        assert!(!cfg.migrate_legacy_host_key_strict());
+        assert!(cfg.strict_host_key_checking, "迁移后的显式 true 不得被改写");
+    }
+
+    #[test]
+    fn new_config_uses_accept_new_default() {
+        let mut cfg = SshGlobalConfig::new();
+        assert!(!cfg.strict_host_key_checking);
+        assert!(!cfg.migrate_legacy_host_key_strict(), "新建配置无需迁移");
     }
 }
