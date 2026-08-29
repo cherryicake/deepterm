@@ -241,7 +241,7 @@ impl GitPanel {
         let weak = cx.entity().downgrade();
 
         // 远程仓库：文件事件不可靠（commit 只改 .git 内部，远程轮询看不到），
-        // 用低频定时器兑底刷新状态。本地仓库依赖 inotify 事件即可，不轮询。
+        // 用低频定时器兜底刷新状态。本地仓库依赖 inotify 事件即可，不轮询。
         if !is_local {
             let poll_weak = weak.clone();
             self.status_poll_task = Some(cx.spawn(async move |_, cx| {

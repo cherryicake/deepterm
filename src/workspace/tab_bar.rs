@@ -1159,7 +1159,7 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }),
             )
-            // TabBar 整体接受 DraggedPanel drop（落点在标签列表之外时的兑底）
+            // TabBar 整体接受 DraggedPanel drop（落点在标签列表之外时的兜底）
             .on_drop(cx.listener({
                 let on_panel_drop = on_panel_drop.clone();
                 move |this, dragged: &DraggedPanel, window, cx| {
