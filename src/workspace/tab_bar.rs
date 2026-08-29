@@ -1146,7 +1146,9 @@ impl Render for TabBar {
             .w_full()
             .flex()
             .items_center()
-            .bg(theme.tab_bar_background)
+            // 标签栏背景强制与 app 背景保持一致，避免部分主题中 tab_bar_background
+            // 与 app_background 不一致导致的「脱节」感。
+            .bg(theme.app_background)
             .overflow_hidden()
             .pt_1()
             .pb(px(2.))
