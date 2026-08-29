@@ -15,7 +15,7 @@ pub mod search;
 pub mod selection;
 pub mod state;
 
-pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange};
+pub use display_map::{BufferPoint, Crease, DisplayMap, DisplayPoint, Fold};
 pub use indent::TabSize;
 pub use input::EditorInput;
 pub use rope_ext::{InputEdit, Point, Position, RopeExt, RopeLines};

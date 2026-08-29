@@ -2,15 +2,15 @@
 ///
 /// This combines WrapMap and FoldMap to provide a unified API:
 /// - BufferPoint ↔ DisplayPoint conversion
-/// - Fold management (candidates, toggle, query)
+/// - Fold management (fold/unfold/query) with Zed's offset-based fold model
 /// - Automatic projection updates on text/layout changes
 use std::ops::Range;
 
 use gpui::{App, Font, Pixels};
 use ropey::Rope;
 
-use super::fold_map::FoldMap;
-use super::folding::FoldRange;
+use super::fold_map::{Fold, FoldMap};
+use super::folding::Crease;
 use super::text_wrapper::{LineItem, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
@@ -112,127 +112,133 @@ impl DisplayMap {
     /// Check if a buffer line is completely hidden
     #[inline]
     pub fn is_buffer_line_hidden(&self, line: usize) -> bool {
-        self.buffer_line_to_display_row_range(line).is_none()
+        self.fold_map.is_row_hidden(line)
     }
 
-    /// Set fold candidates (from tree-sitter)
-    pub fn set_fold_candidates(&mut self, candidates: Vec<FoldRange>) {
-        self.fold_map.set_candidates(candidates);
-        self.rebuild_fold_projection();
+    // ==================== Fold management (zed semantics) ====================
+
+    /// Creates folds for the given creases (see [`Self::fold_ranges`]).
+    pub fn fold_creases(&mut self, text: &Rope, creases: &[Crease]) -> bool {
+        self.fold_ranges(
+            text,
+            creases.iter().map(|c| c.range(text)).collect::<Vec<_>>(),
+        )
     }
 
-    /// Set a fold at the given start_line (must be in candidates)
-    pub fn set_folded(&mut self, start_line: usize, folded: bool) {
-        self.fold_map.set_folded(start_line, folded);
-        self.rebuild_fold_projection();
+    /// Creates folds for the given byte ranges.
+    ///
+    /// Port of Zed's `Editor::fold_ranges` / `DisplayMap::fold`: empty ranges
+    /// are ignored and folds may nest.
+    pub fn fold_ranges(&mut self, text: &Rope, ranges: Vec<Range<usize>>) -> bool {
+        let folds = ranges
+            .into_iter()
+            .map(|range| Fold::from_points(text.offset_to_point(range.start), text.offset_to_point(range.end), text))
+            .collect::<Vec<_>>();
+        let changed = self.fold_map.fold(folds);
+        if changed {
+            self.rebuild_fold_projection();
+        }
+        changed
     }
 
-    /// Toggle fold at the given start_line
-    pub fn toggle_fold(&mut self, start_line: usize) {
-        self.fold_map.toggle_fold(start_line);
-        self.rebuild_fold_projection();
+    /// Folds the crease starting on the given buffer row, if any
+    /// (port of Zed's `Editor::fold_at`).
+    pub fn fold_at(&mut self, text: &Rope, buffer_row: usize) -> bool {
+        let Some(crease) = self.crease_for_buffer_row(text, buffer_row) else {
+            return false;
+        };
+        self.fold_creases(text, &[crease])
     }
 
-    /// Check if a line is currently folded
+    /// Removes any folds whose ranges intersect any of the given ranges
+    /// (port of Zed's `Editor::unfold_ranges`).
+    pub fn unfold_ranges(&mut self, ranges: &[Range<usize>], inclusive: bool) -> bool {
+        let changed = self.fold_map.unfold_intersecting(ranges, inclusive);
+        if changed {
+            self.rebuild_fold_projection();
+        }
+        changed
+    }
+
+    /// All folds, sorted by start offset.
     #[inline]
-    pub fn is_folded_at(&self, start_line: usize) -> bool {
-        self.fold_map.is_folded_at(start_line)
+    pub fn folds(&self) -> &[Fold] {
+        self.fold_map.folds()
     }
 
-    /// Check if a line is a fold candidate
+    /// Whether a fold starts on the given buffer row
+    /// (port of Zed's `DisplaySnapshot::is_line_folded`).
     #[inline]
-    pub fn is_fold_candidate(&self, start_line: usize) -> bool {
-        self.fold_map.is_fold_candidate(start_line)
+    pub fn is_line_folded(&self, buffer_row: usize) -> bool {
+        self.fold_map.is_line_folded(buffer_row)
     }
 
-    /// Get all fold candidates
+    /// The outermost fold starting on the given buffer row, if any.
     #[inline]
-    pub fn fold_candidates(&self) -> &[FoldRange] {
-        self.fold_map.fold_candidates()
+    pub fn fold_for_row(&self, buffer_row: usize) -> Option<&Fold> {
+        self.fold_map.fold_for_row(buffer_row)
     }
 
-    /// Get all currently folded ranges
+    /// Folds intersecting the given byte range
+    /// (port of Zed's `DisplaySnapshot::folds_in_range`).
+    pub fn folds_in_range(&self, range: Range<usize>) -> impl Iterator<Item = &Fold> {
+        self.fold_map.folds_in_range(range)
+    }
+
+    /// Whether the byte offset lies inside a fold's hidden range.
     #[inline]
-    pub fn folded_ranges(&self) -> &[FoldRange] {
-        self.fold_map.folded_ranges()
+    pub fn intersects_fold(&self, offset: usize) -> bool {
+        self.fold_map.intersects_fold(offset)
     }
 
-    /// Clear all folds
+    /// The fold containing `offset` in its hidden range, if any.
+    #[inline]
+    pub fn fold_containing(&self, offset: usize) -> Option<&Fold> {
+        self.fold_map.fold_containing(offset)
+    }
+
+    /// The fold whose hidden range ends exactly at `offset`, if any.
+    #[inline]
+    pub fn fold_ending_at(&self, offset: usize) -> Option<&Fold> {
+        self.fold_map.fold_ending_at(offset)
+    }
+
+    /// The header row of the outermost fold hiding `row`, if the row is hidden.
+    #[inline]
+    pub fn fold_header_for_row(&self, row: usize) -> Option<usize> {
+        self.fold_map.fold_header_for_row(row)
+    }
+
+    /// Clear all folds (port of Zed's `Editor::unfold_all` on the display map).
     pub fn clear_folds(&mut self) {
         self.fold_map.clear_folds();
         self.rebuild_fold_projection();
     }
 
-    /// Fold every candidate.
-    pub fn fold_all(&mut self) {
-        self.fold_map.fold_all();
-        self.rebuild_fold_projection();
+    // ==================== Creases (zed semantics) ====================
+
+    /// Whether the given buffer row "starts an indent"
+    /// (port of Zed's `DisplaySnapshot::starts_indent`).
+    pub fn starts_indent(&self, text: &Rope, buffer_row: usize) -> bool {
+        super::folding::starts_indent(text, buffer_row)
     }
 
-    /// Fold all candidates at nesting depth >= `level`.
-    pub fn fold_level(&mut self, level: usize) {
-        self.fold_map.fold_level(level);
-        self.rebuild_fold_projection();
-    }
-
-    /// Fold the innermost unfolded region containing `line`.
-    pub fn fold_at_line(&mut self, line: usize) {
-        self.fold_map.fold_at_line(line);
-        self.rebuild_fold_projection();
-    }
-
-    /// Unfold the innermost folded region containing `line`.
-    pub fn unfold_at_line(&mut self, line: usize) {
-        self.fold_map.unfold_at_line(line);
-        self.rebuild_fold_projection();
-    }
-
-    /// Toggle the innermost region containing `line`.
-    pub fn toggle_fold_at_line(&mut self, line: usize) {
-        self.fold_map.toggle_fold_at_line(line);
-        self.rebuild_fold_projection();
+    /// Computes the foldable region that starts on `buffer_row`
+    /// (port of Zed's `DisplaySnapshot::crease_for_buffer_row`).
+    pub fn crease_for_buffer_row(&self, text: &Rope, buffer_row: usize) -> Option<Crease> {
+        let is_line_folded =
+            |row: usize| self.fold_map.is_line_folded(row);
+        super::folding::crease_for_buffer_row(text, buffer_row, is_line_folded)
     }
 
     // ==================== Text and Layout Updates ====================
 
-    /// Adjust folds and candidates for a text edit before updating the wrap map.
+    /// Adjust folds for a text edit before updating the wrap map.
     ///
-    /// Must be called with the OLD text (before replacement) and the edit range/new_text
-    /// so we can compute which old lines were affected.
-    pub fn adjust_folds_for_edit(&mut self, old_text: &Rope, range: &Range<usize>, new_text: &str) {
-        if self.fold_map.folded_ranges().is_empty() && self.fold_map.fold_candidates().is_empty() {
-            return;
-        }
-
-        let edit_start_line = old_text.offset_to_point(range.start).row;
-        let edit_end_line = old_text.offset_to_point(range.end.min(old_text.len())).row;
-
-        let old_lines_in_range = edit_end_line.saturating_sub(edit_start_line);
-        let new_lines_in_range = new_text.chars().filter(|c| *c == '\n').count();
-        let line_delta = new_lines_in_range as isize - old_lines_in_range as isize;
-
-        self.fold_map
-            .adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
-    }
-
-    /// Incrementally update fold candidates after a text edit.
-    ///
-    /// Extracts new fold candidates only within the edited byte range
-    /// and merges them with existing (already adjusted) candidates.
-    pub fn update_fold_candidates_for_edit(
-        &mut self,
-        tree: &super::folding::Tree,
-        edit_byte_range: Range<usize>,
-        new_text: &Rope,
-    ) {
-        let new_start_line = new_text.offset_to_point(edit_byte_range.start).row;
-        let new_end_line = new_text
-            .offset_to_point(edit_byte_range.end.min(new_text.len()))
-            .row;
-
-        let new_candidates = super::folding::extract_fold_ranges_in_range(tree, edit_byte_range);
-        self.fold_map
-            .merge_candidates_for_edit(new_start_line, new_end_line, new_candidates);
+    /// Must be called with the edit range in the OLD text and the
+    /// replacement length (see [`FoldMap::adjust_folds_for_edit`]).
+    pub fn adjust_folds_for_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        self.fold_map.adjust_folds_for_edit(range.clone(), new_text.len());
     }
 
     /// Update text (incremental or full)
@@ -245,6 +251,9 @@ impl DisplayMap {
     ) {
         self.wrap_map
             .on_text_changed(changed_text, range, new_text, cx);
+        // Folds are byte-offset based; recompute their row/column points
+        // against the new text.
+        self.fold_map.refresh_points(self.wrap_map.text());
         self.rebuild_fold_projection();
     }
 
@@ -276,14 +285,12 @@ impl DisplayMap {
 
     // ==================== Internal Helpers ====================
 
-    /// Rebuild fold projection after wrap_map or fold state changes
-    /// Only rebuilds if there are actually folded ranges
+    /// Rebuild fold projection after wrap_map or fold state changes.
     fn rebuild_fold_projection(&mut self) {
-        if !self.fold_map.folded_ranges().is_empty() {
+        if !self.fold_map.folds().is_empty() {
             self.fold_map.rebuild(&self.wrap_map);
         } else {
             // No active folds: identity mapping (wrap_row == display_row).
-            // Just update cached count so query methods work without Vec allocation.
             self.fold_map
                 .mark_dirty_with_wrap_count(self.wrap_map.wrap_row_count());
         }

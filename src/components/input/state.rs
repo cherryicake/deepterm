@@ -16,7 +16,7 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
-use super::{DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
+use super::{Crease, DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -95,10 +95,12 @@ actions!(
         DeleteLine,
         JoinLines,
         ToggleFold,
+        ToggleFoldAll,
         Fold,
         Unfold,
         FoldAll,
         UnfoldAll,
+        FoldSelectedRanges,
     ]
 );
 
@@ -1144,7 +1146,6 @@ impl InputState {
         if let Some(bg) = bg {
             Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
-        self.update_fold_candidates();
         cx.notify();
     }
 
@@ -2412,10 +2413,9 @@ impl InputState {
         cx.notify();
     }
 
-    fn cursor_buffer_line(&self) -> usize {
-        self.text.offset_to_point(self.cursor()).row
-    }
+    // ==================== Code Folding (ported from zed's fold.rs) ====================
 
+    /// Clamps the cursor out of any folded region, then re-scrolls.
     pub(crate) fn after_fold_change(&mut self, cx: &mut Context<Self>) {
         let cursor = self.cursor();
         let clamped = self.clamp_offset_to_visible_backward(cursor);
@@ -2425,6 +2425,16 @@ impl InputState {
         cx.notify();
     }
 
+    /// The cursor's buffer row, clamped out of folded regions.
+    fn clamped_cursor_row(&self) -> usize {
+        let cursor = self
+            .clamp_offset_to_visible_backward(self.cursor())
+            .min(self.text.len());
+        self.text.offset_to_point(cursor).row
+    }
+
+    /// Port of Zed's `Editor::toggle_fold`: if any fold intersects the current
+    /// selection, unfold it; otherwise fold the enclosing crease.
     pub(crate) fn toggle_fold(
         &mut self,
         _: &ToggleFold,
@@ -2434,45 +2444,236 @@ impl InputState {
         if !self.mode.is_folding() {
             return;
         }
-        let line = self.cursor_buffer_line();
-        self.display_map.toggle_fold_at_line(line);
-        self.after_fold_change(cx);
+
+        let selection = self.selected_range;
+        let range = if selection.is_empty() {
+            let row = self.clamped_cursor_row();
+            let mut end = self
+                .text
+                .point_to_offset(crate::components::input::Point::new(
+                    row,
+                    self.text.slice_line(row).len(),
+                ));
+            // A folded row's display row spans the whole fold (zed converts
+            // the selection's display range through the fold map), so a
+            // toggle on the fold header must see the fold as intersecting.
+            if let Some(fold) = self.display_map.fold_for_row(row) {
+                end = end.max(fold.end_offset);
+            }
+            self.text
+                .point_to_offset(crate::components::input::Point::new(row, 0))
+                ..end
+        } else {
+            selection.start..selection.end
+        };
+
+        if self.display_map.folds_in_range(range.clone()).next().is_some() {
+            self.unfold_lines(cx);
+        } else {
+            self.fold_selection(cx);
+        }
     }
 
+    /// Port of Zed's `Editor::toggle_fold_all`.
+    pub(crate) fn toggle_fold_all(
+        &mut self,
+        _: &ToggleFoldAll,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let has_folds = self
+            .display_map
+            .folds_in_range(0..self.text.len())
+            .next()
+            .is_some();
+        if has_folds {
+            self.unfold_all(&UnfoldAll, window, cx);
+        } else {
+            self.fold_all(&FoldAll, window, cx);
+        }
+    }
+
+    /// Port of Zed's `Editor::fold`: fold the creases touched by the selection.
+    ///
+    /// When the selection spans multiple rows, every crease intersecting the
+    /// selected rows is folded; otherwise the innermost crease enclosing the
+    /// cursor row is folded.
     pub(crate) fn fold(&mut self, _: &Fold, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_folding() {
             return;
         }
-        let line = self.cursor_buffer_line();
-        self.display_map.fold_at_line(line);
+        self.fold_selection(cx);
+    }
+
+    fn fold_selection(&mut self, cx: &mut Context<Self>) {
+        let selection = self.selected_range;
+        let (range_start, range_end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let buffer_start_row = self.text.offset_to_point(range_start).row;
+        let range_end_row = self.text.offset_to_point(range_end.min(self.text.len())).row;
+
+        let mut to_fold = Vec::new();
+
+        if range_start != range_end && buffer_start_row != range_end_row {
+            let mut found = false;
+            let mut row = buffer_start_row;
+            while row <= range_end_row {
+                if let Some(crease) = self.display_map.crease_for_buffer_row(&self.text, row) {
+                    found = true;
+                    row = crease.end.row + 1;
+                    to_fold.push(crease);
+                } else {
+                    row += 1;
+                }
+            }
+            if found {
+                self.fold_creases(to_fold, cx);
+                return;
+            }
+        }
+
+        for row in (0..=buffer_start_row).rev() {
+            if let Some(crease) = self.display_map.crease_for_buffer_row(&self.text, row) {
+                if crease.end.row >= buffer_start_row {
+                    to_fold.push(crease);
+                    if row <= buffer_start_row {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.fold_creases(to_fold, cx);
+    }
+
+    /// Port of Zed's `Editor::fold_creases`.
+    fn fold_creases(&mut self, creases: Vec<Crease>, cx: &mut Context<Self>) {
+        if creases.is_empty() {
+            return;
+        }
+        self.display_map.fold_creases(&self.text, &creases);
         self.after_fold_change(cx);
     }
 
+    /// Port of Zed's `Editor::fold_at`: fold the crease starting on `buffer_row`.
+    pub(crate) fn fold_at(&mut self, buffer_row: usize, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        if self.display_map.fold_at(&self.text, buffer_row) {
+            self.after_fold_change(cx);
+        }
+    }
+
+    /// Port of Zed's `Editor::unfold_at`: unfold every fold intersecting
+    /// `buffer_row`'s line.
+    pub(crate) fn unfold_at(&mut self, buffer_row: usize, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let intersection_range =
+            self.text.point_to_offset(crate::components::input::Point::new(buffer_row, 0))
+                ..self.text.point_to_offset(crate::components::input::Point::new(
+                    buffer_row,
+                    self.text.slice_line(buffer_row).len(),
+                ));
+        if self
+            .display_map
+            .unfold_ranges(&[intersection_range], true)
+        {
+            self.after_fold_change(cx);
+        }
+    }
+
+    /// Port of Zed's `Editor::unfold_lines`: unfold every fold intersecting
+    /// the selected rows.
     pub(crate) fn unfold(&mut self, _: &Unfold, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_folding() {
             return;
         }
-        let line = self.cursor_buffer_line();
-        self.display_map.unfold_at_line(line);
-        self.after_fold_change(cx);
+        self.unfold_lines(cx);
     }
 
+    fn unfold_lines(&mut self, cx: &mut Context<Self>) {
+        let selection = self.selected_range;
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let start_row = self.text.offset_to_point(start).row;
+        let end_row = self.text.offset_to_point(end.min(self.text.len())).row;
+        let range = self
+            .text
+            .point_to_offset(crate::components::input::Point::new(start_row, 0))
+            ..self.text.point_to_offset(crate::components::input::Point::new(
+                end_row,
+                self.text.slice_line(end_row).len(),
+            ));
+        if self.display_map.unfold_ranges(&[range], true) {
+            self.after_fold_change(cx);
+        }
+    }
+
+    /// Port of Zed's `Editor::fold_all`: fold every crease in the buffer.
     pub(crate) fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_folding() {
             return;
         }
-        self.display_map.fold_all();
-        self.after_fold_change(cx);
+
+        let mut fold_creases = Vec::new();
+        for row in 0..self.text.lines_len() {
+            if let Some(foldable_range) = self.display_map.crease_for_buffer_row(&self.text, row)
+            {
+                fold_creases.push(foldable_range);
+            }
+        }
+
+        self.fold_creases(fold_creases, cx);
     }
 
+    /// Port of Zed's `Editor::unfold_all`.
     pub(crate) fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_folding() {
             return;
         }
-        self.display_map.clear_folds();
+        #[allow(clippy::single_range_in_vec_init)]
+        self.display_map.unfold_ranges(&[0..self.text.len()], true);
         cx.notify();
     }
 
+    /// Port of Zed's `Editor::fold_selected_ranges`: fold the selection itself.
+    pub(crate) fn fold_selected_ranges(
+        &mut self,
+        _: &FoldSelectedRanges,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let selection = self.selected_range;
+        if selection.is_empty() {
+            return;
+        }
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        #[allow(clippy::single_range_in_vec_init)]
+        self.display_map.fold_ranges(&self.text, vec![start..end]);
+        self.after_fold_change(cx);
+    }
+
+    /// Port of Zed's `Editor::fold_at_level`: fold every crease whose nesting
+    /// depth is `level` (1 = outermost), skipping folds that contain a selection.
     pub(crate) fn fold_level(
         &mut self,
         action: &FoldLevel,
@@ -2482,8 +2683,62 @@ impl InputState {
         if !self.mode.is_folding() {
             return;
         }
-        self.display_map.fold_level(action.0);
-        self.after_fold_change(cx);
+        let fold_at_level = action.0;
+        if fold_at_level == 0 {
+            self.display_map.clear_folds();
+            cx.notify();
+            return;
+        }
+
+        let max_row = self.text.lines_len().saturating_sub(1);
+        let mut to_fold = Vec::new();
+        let mut stack = vec![(0usize, max_row, 1usize)];
+
+        // Rows covered by the current selection are kept visible
+        // (Zed: "Fold iff there is no selection completely contained within
+        // the fold region").
+        let selection = self.selected_range;
+        let (sel_start, sel_end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let sel_start_row = self.text.offset_to_point(sel_start).row;
+        let sel_end_row = self.text.offset_to_point(sel_end.min(self.text.len())).row;
+        #[allow(clippy::single_range_in_vec_init)]
+        let row_ranges_to_keep: Vec<Range<usize>> = vec![sel_start_row..sel_end_row];
+
+        while let Some((mut start_row, end_row, current_level)) = stack.pop() {
+            while start_row < end_row {
+                match self
+                    .display_map
+                    .crease_for_buffer_row(&self.text, start_row)
+                {
+                    Some(crease) => {
+                        let nested_start_row = crease.start.row + 1;
+                        let nested_end_row = crease.end.row;
+
+                        if current_level < fold_at_level {
+                            stack.push((nested_start_row, nested_end_row, current_level + 1));
+                        } else if current_level == fold_at_level {
+                            // Fold iff there is no selection completely contained
+                            // within the fold region
+                            if !row_ranges_to_keep.iter().any(|selection| {
+                                selection.end >= nested_start_row
+                                    && selection.start <= nested_end_row
+                            }) {
+                                to_fold.push(crease);
+                            }
+                        }
+
+                        start_row = nested_end_row + 1;
+                    }
+                    None => start_row += 1,
+                }
+            }
+        }
+
+        self.fold_creases(to_fold, cx);
     }
 
     pub(crate) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -2830,8 +3085,14 @@ impl InputState {
             {
                 let start_line = *start_line;
                 if self.mode.is_folding() {
-                    self.display_map.toggle_fold(start_line);
-                    self.after_fold_change(cx);
+                    // Zed's gutter Disclosure / fold placeholder behavior:
+                    // clicking a folded row unfolds it; clicking an unfolded
+                    // foldable row folds it.
+                    if self.display_map.is_line_folded(start_line) {
+                        self.unfold_at(start_line, cx);
+                    } else {
+                        self.fold_at(start_line, cx);
+                    }
                 }
                 return;
             }
@@ -3347,33 +3608,22 @@ impl InputState {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
     }
 
-    /// If offset falls on a hidden (folded) line, clamp backward to the end of
-    /// the fold header line (last visible position before the fold).
+    /// If the offset falls inside a fold's hidden range, clamp backward to the
+    /// fold's start (the end of the fold header line — the last visible
+    /// position before the `⋯` placeholder).
     fn clamp_offset_to_visible_backward(&self, offset: usize) -> usize {
-        let line = self.text.offset_to_point(offset).row;
-        let Some(header) = crate::components::input::display_map::hidden_line_fold_header(
-            line,
-            self.display_map.folded_ranges(),
-        ) else {
-            return offset;
-        };
-        self.text.line_end_offset(header)
+        match self.display_map.fold_containing(offset) {
+            Some(fold) => fold.start_offset,
+            None => offset,
+        }
     }
 
-    /// If offset falls on a hidden (folded) line, clamp forward to the first
-    /// visible line after the outermost fold.
+    /// If the offset falls inside a fold's hidden range, clamp forward to the
+    /// fold's end (the start of the visible trailing text, e.g. the `}`).
     fn clamp_offset_to_visible_forward(&self, offset: usize) -> usize {
-        let line = self.text.offset_to_point(offset).row;
-        let Some(after) = crate::components::input::display_map::hidden_line_after_fold(
-            line,
-            self.display_map.folded_ranges(),
-        ) else {
-            return offset;
-        };
-        if after >= self.text.lines_len() {
-            self.text.len()
-        } else {
-            self.text.line_start_offset(after)
+        match self.display_map.fold_containing(offset) {
+            Some(fold) => fold.end_offset,
+            None => offset,
         }
     }
 
@@ -3600,9 +3850,9 @@ impl InputState {
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
+        // Adjust folds before updating wrap map (zed's offset-based model:
+        // edits inside a fold keep it; boundary-overlapping edits drop it).
+        self.display_map.adjust_folds_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
@@ -3613,7 +3863,6 @@ impl InputState {
             Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
 
-        self.update_fold_candidates_incremental(&range, new_text);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         self.update_preferred_column();
@@ -3622,68 +3871,6 @@ impl InputState {
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
-    }
-
-    fn syntax_fold_ranges(&self) -> Vec<crate::components::input::FoldRange> {
-        let Some(highlighter_rc) = self.mode.highlighter() else {
-            return Vec::new();
-        };
-        let highlighter = highlighter_rc.borrow();
-        let Some(highlighter) = highlighter.as_ref() else {
-            return Vec::new();
-        };
-        let Some(tree) = highlighter.tree() else {
-            return Vec::new();
-        };
-        crate::components::input::display_map::extract_fold_ranges(tree)
-    }
-
-    fn apply_merged_fold_candidates(
-        &mut self,
-        syntax: Vec<crate::components::input::FoldRange>,
-    ) {
-        let indent = crate::components::input::display_map::extract_indent_fold_ranges(
-            &self.text,
-            crate::components::input::TabSize::default(),
-        );
-        self.display_map.set_fold_candidates(
-            crate::components::input::display_map::merge_fold_ranges(syntax, indent),
-        );
-    }
-
-    /// Update fold candidates from tree-sitter syntax tree + indent ranges.
-    /// Used on initial load or language changes.
-    pub(crate) fn update_fold_candidates(&mut self) {
-        if !self.mode.is_folding() {
-            return;
-        }
-        let syntax = self.syntax_fold_ranges();
-        self.apply_merged_fold_candidates(syntax);
-    }
-
-    /// Incrementally update syntax fold candidates after a text edit, then
-    /// re-merge with a full indent pass.
-    fn update_fold_candidates_incremental(&mut self, edit_range: &Range<usize>, new_text: &str) {
-        if !self.mode.is_folding() {
-            return;
-        }
-
-        let new_end = edit_range.start + new_text.len();
-        if let Some(highlighter_rc) = self.mode.highlighter() {
-            let highlighter = highlighter_rc.borrow();
-            if let Some(highlighter) = highlighter.as_ref() {
-                if let Some(tree) = highlighter.tree() {
-                    self.display_map.update_fold_candidates_for_edit(
-                        tree,
-                        edit_range.start..new_end,
-                        &self.text,
-                    );
-                }
-            }
-        }
-
-        let syntax = self.display_map.fold_candidates().to_vec();
-        self.apply_merged_fold_candidates(syntax);
     }
 
     /// Spawn a background parse after the synchronous parse timed out.
@@ -3883,9 +4070,9 @@ impl EntityInputHandler for InputState {
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
+        // Adjust folds before updating wrap map (zed's offset-based model:
+        // edits inside a fold keep it; boundary-overlapping edits drop it).
+        self.display_map.adjust_folds_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
@@ -3896,7 +4083,6 @@ impl EntityInputHandler for InputState {
             Self::dispatch_background_parse(bg, self.text_version, window, cx);
         }
 
-        self.update_fold_candidates_incremental(&range, new_text);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.selected_range = (range.start..range.start).into();
@@ -4441,5 +4627,122 @@ mod tests {
                 assert_eq!(state.cursor(), 1);
             })
             .unwrap();
+    }
+
+    // ==================== Code folding (zed semantics) ====================
+
+    const FOLD_TEST_TEXT: &str =
+        "fn main() {\n    let a = 1;\n    if true {\n        a();\n    }\n}\n\nfn other() {\n    let b = 2;\n}\n";
+
+    fn build_fold_input(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<InputState>, &mut gpui::VisualTestContext) {
+        struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let cell = std::cell::RefCell::new(None);
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut state =
+                    InputState::new(window, cx).code_editor("rust").multi_line(true);
+                state.set_value(FOLD_TEST_TEXT, window, cx);
+                state
+            });
+            *cell.borrow_mut() = Some(input.clone());
+            Host(input)
+        });
+        (cell.into_inner().unwrap(), cx)
+    }
+
+    #[gpui::test]
+    fn fold_at_hides_rows_and_keeps_closing_bracket(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input.update(cx, |state, cx| {
+            // Rows: 0 `fn main() {`, 1 `let a`, 2 `if true {`, 3 `a();`, 4 `}` (inner),
+            // 5 `}` (outer), 6 blank, 7 `fn other() {`, 8 `let b`, 9 `}`
+            state.fold_at(0, cx);
+            assert!(state.display_map.is_line_folded(0));
+            assert!(!state.display_map.is_line_folded(7));
+            // Rows 1-5 hidden (row 5's `}` tail is painted on row 0).
+            for row in 1..=5 {
+                assert!(state.display_map.is_buffer_line_hidden(row), "row {row}");
+            }
+            assert!(!state.display_map.is_buffer_line_hidden(6));
+            assert!(!state.display_map.is_buffer_line_hidden(7));
+
+            // Unfolding at the header row restores everything.
+            state.unfold_at(0, cx);
+            assert!(!state.display_map.is_line_folded(0));
+            assert!(!state.display_map.is_buffer_line_hidden(1));
+        });
+    }
+
+    #[gpui::test]
+    fn nested_folds_survive_folding_the_outer(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input.update(cx, |state, cx| {
+            // Fold the inner `if true {` block first.
+            state.fold_at(2, cx);
+            assert!(state.display_map.is_line_folded(2));
+            assert!(!state.display_map.is_line_folded(0));
+
+            // Fold the outer function; the inner fold stays in storage.
+            state.fold_at(0, cx);
+            assert!(state.display_map.is_line_folded(0));
+            assert!(state.display_map.is_line_folded(2));
+
+            // Unfolding the outer reveals the still-folded inner
+            // (zed's unfold_at only removes folds intersecting the row).
+            state.unfold_at(0, cx);
+            assert!(!state.display_map.is_line_folded(0));
+            assert!(state.display_map.is_line_folded(2));
+            assert!(state.display_map.is_buffer_line_hidden(3));
+            assert!(state.display_map.is_buffer_line_hidden(4));
+            assert!(!state.display_map.is_buffer_line_hidden(5));
+        });
+    }
+
+    #[gpui::test]
+    fn cursor_is_clamped_out_of_folds(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input.update(cx, |state, cx| {
+            state.fold_at(0, cx);
+
+            // Put the cursor inside the fold, then move by boundaries — the
+            // clamps keep the cursor out of the hidden range.
+            state.selected_range = (30..30).into(); // row 3 (`a();`) inside the fold
+            let backward = state.previous_boundary(30);
+            assert_eq!(backward, 11, "should clamp back to the fold start (end of row 0)");
+            let forward = state.next_boundary(30);
+            assert_eq!(forward, 60, "should clamp forward to the fold end (row 5 closing brace start)");
+        });
+    }
+
+    #[gpui::test]
+    fn fold_all_and_unfold_all(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input.update(cx, |state, cx| {
+            state.display_map.clear_folds();
+            state.fold_at(0, cx);
+            state.fold_at(2, cx);
+            state.fold_at(7, cx);
+            assert!(state.display_map.is_line_folded(0));
+            assert!(state.display_map.is_line_folded(2));
+            assert!(state.display_map.is_line_folded(7));
+
+            // Unfold everything via the whole-buffer range (zed's unfold_all).
+            state
+                .display_map
+                .unfold_ranges(&[0..state.text.len()], true);
+            assert!(state.display_map.folds().is_empty());
+            assert!(!state.display_map.is_buffer_line_hidden(1));
+        });
     }
 }

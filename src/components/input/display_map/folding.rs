@@ -1,310 +1,274 @@
-use std::ops::Range;
+//! Foldable-region ("crease") computation, ported from Zed.
+//!
+//! This mirrors `EditorSnapshot::crease_for_buffer_row` /
+//! `EditorSnapshot::starts_indent` / `EditorSnapshot::closing_bracket_indent_len`
+//! in `zed/crates/editor/src/display_map.rs`: creases are computed **on demand**
+//! from line indentation (no precomputed candidate list), and a fold range
+//! always starts at the end of the header line and ends at the indentation of
+//! the closing bracket line (so the closing delimiter stays visible on the
+//! same display line as the fold placeholder), or at the last non-blank row.
 
 use ropey::Rope;
 
-#[cfg(not(target_family = "wasm"))]
-use tree_sitter::Node;
-#[cfg(not(target_family = "wasm"))]
-pub use tree_sitter::Tree;
+use crate::components::input::{Point, RopeExt as _};
 
-use crate::components::input::{RopeExt as _, TabSize};
-
-#[cfg(target_family = "wasm")]
-/// Stub type for tree-sitter Tree on WASM (tree-sitter not available).
-pub struct Tree;
-
-/// A fold range representing a foldable code region.
+/// Closing bracket pairs used by `closing_bracket_indent_len`.
 ///
-/// The fold range spans from start_line to end_line (inclusive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FoldRange {
-    /// Start line (inclusive)
-    pub start_line: usize,
-    /// End line (inclusive)
-    pub end_line: usize,
+/// Zed resolves the bracket list from the language scope at the row; DeepTerm
+/// has no per-language bracket table, so we use the common closing delimiters.
+const CLOSING_BRACKETS: [&str; 3] = ["}", "]", ")"];
+
+/// A foldable region, equivalent to Zed's inline `Crease`.
+///
+/// - `start` is at the **end of the header line** (row, line_len).
+/// - `end` is at the closing bracket's indentation (`(closing_row, indent_len)`),
+///   or at the end of the last non-blank row when there is no closing row.
+///
+/// The text between `start` and `end` is what gets hidden and replaced by the
+/// `⋯` placeholder; the text after `end` (e.g. the `}` of a function) remains
+/// visible on the same display line as the placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crease {
+    pub start: Point,
+    pub end: Point,
 }
 
-impl FoldRange {
-    pub fn new(start_line: usize, end_line: usize) -> Self {
-        assert!(
-            start_line <= end_line,
-            "fold start_line must be <= end_line"
-        );
-        Self {
-            start_line,
-            end_line,
-        }
+impl Crease {
+    pub fn range(&self, text: &Rope) -> std::ops::Range<usize> {
+        text.point_to_offset(self.start)..text.point_to_offset(self.end)
     }
 }
 
-// ==================== Native Implementation (with tree-sitter) ====================
+/// Byte length of a line's leading whitespace ("indent"), and whether the
+/// whole line is blank. Equivalent to Zed's `LineIndent { raw_len, is_line_blank }`.
+fn line_indent(text: &Rope, row: usize) -> (usize, bool) {
+    let line = text.slice_line(row);
+    let mut raw_len = 0;
+    let mut is_blank = true;
+    for ch in line.chars() {
+        if ch == ' ' || ch == '\t' {
+            raw_len += ch.len_utf8();
+        } else {
+            is_blank = false;
+            break;
+        }
+    }
+    // A `\r` remainder after the whitespace still counts as blank.
+    if is_blank && raw_len == 0 && !line.chars().any(|c| c != '\r') {
+        is_blank = true;
+    }
+    (raw_len, is_blank)
+}
 
-#[cfg(not(target_family = "wasm"))]
-/// Check if a named node qualifies as a fold candidate.
+/// Returns true if the given row "starts an indent", i.e. the line is not
+/// blank and the next non-blank line is indented further.
 ///
-/// Uses a structural heuristic: any **named** node spanning ≥ MIN_FOLD_LINES
-/// is foldable. tree-sitter already parses code into semantic units (functions,
-/// classes, blocks, etc.), so named nodes naturally correspond to meaningful
-/// foldable regions across all languages without a per-language node-type list.
-fn is_foldable_node(node: &Node) -> bool {
-    // Skip root node (e.g. `source_file`) and unnamed tokens
-    if !node.is_named() || node.parent().is_none() {
+/// Verbatim port of Zed's `EditorSnapshot::starts_indent`.
+pub fn starts_indent(text: &Rope, buffer_row: usize) -> bool {
+    let max_row = text.lines_len().saturating_sub(1);
+    if buffer_row >= max_row {
         return false;
     }
 
-    let start = node.start_position().row;
-    let end = node.end_position().row;
-    end > start
+    let (indent_len, is_blank) = line_indent(text, buffer_row);
+    if is_blank {
+        return false;
+    }
+
+    (buffer_row + 1..=max_row)
+        .find_map(|next_row| {
+            let (next_indent_len, next_is_blank) = line_indent(text, next_row);
+            if next_indent_len > indent_len {
+                Some(true)
+            } else if !next_is_blank {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
 }
 
-#[cfg(not(target_family = "wasm"))]
-/// Extract fold ranges from a tree-sitter syntax tree (full traversal).
-pub fn extract_fold_ranges(tree: &Tree) -> Vec<FoldRange> {
-    let mut ranges = Vec::new();
-    collect_foldable_nodes(tree.root_node(), &mut ranges);
-
-    ranges.sort_by_key(|r| r.start_line);
-    ranges.dedup_by_key(|r| r.start_line);
-    ranges
-}
-
-#[cfg(not(target_family = "wasm"))]
-/// Extract fold ranges only within a byte range (for incremental updates after edits).
+/// Returns the indent length of `row` if the row starts with a closing
+/// bracket, so the fold can end before the closing delimiter and keep it
+/// visible.
 ///
-/// Skips subtrees entirely outside the range, making it O(nodes in range)
-/// instead of O(all nodes in tree).
-pub fn extract_fold_ranges_in_range(tree: &Tree, byte_range: Range<usize>) -> Vec<FoldRange> {
-    let mut ranges = Vec::new();
-    collect_foldable_nodes_in_range(tree.root_node(), &byte_range, &mut ranges);
-
-    ranges.sort_by_key(|r| r.start_line);
-    ranges.dedup_by_key(|r| r.start_line);
-    ranges
-}
-
-#[cfg(not(target_family = "wasm"))]
-/// Recursively collect foldable nodes, skipping subtrees outside byte_range.
-fn collect_foldable_nodes_in_range(
-    node: Node,
-    byte_range: &Range<usize>,
-    ranges: &mut Vec<FoldRange>,
-) {
-    if node.end_byte() <= byte_range.start || node.start_byte() >= byte_range.end {
-        return;
-    }
-
-    if is_foldable_node(&node) {
-        ranges.push(FoldRange {
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_foldable_nodes_in_range(child, byte_range, ranges);
+/// Port of Zed's `DisplaySnapshot::closing_bracket_indent_len` (with a static
+/// bracket list instead of language scopes).
+fn closing_bracket_indent_len(text: &Rope, row: usize) -> Option<usize> {
+    let (indent_len, _) = line_indent(text, row);
+    let line: String = text
+        .slice_line(row)
+        .chars()
+        .skip_while(|ch| *ch == ' ' || *ch == '\t')
+        .collect();
+    let line = line.trim_end_matches('\r');
+    if CLOSING_BRACKETS.iter().any(|br| line.starts_with(br)) {
+        Some(indent_len)
+    } else {
+        None
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-/// Recursively collect foldable nodes from the syntax tree (full traversal).
-fn collect_foldable_nodes(node: Node, ranges: &mut Vec<FoldRange>) {
-    if is_foldable_node(&node) {
-        ranges.push(FoldRange {
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_foldable_nodes(child, ranges);
-    }
-}
-
-// ==================== WASM Stub Implementation ====================
-
-#[cfg(target_family = "wasm")]
-/// Extract fold ranges - WASM stub (returns empty, no tree-sitter).
-pub fn extract_fold_ranges(_tree: &Tree) -> Vec<FoldRange> {
-    Vec::new()
-}
-
-#[cfg(target_family = "wasm")]
-/// Extract fold ranges in range - WASM stub (returns empty, no tree-sitter).
-pub fn extract_fold_ranges_in_range(_tree: &Tree, _byte_range: Range<usize>) -> Vec<FoldRange> {
-    Vec::new()
-}
-
-/// Merge syntax and indent fold ranges.
+/// Computes the foldable region ("crease") that starts on `buffer_row`.
 ///
-/// Ranges are unique by `start_line`; when both sources share a start line,
-/// the range with the larger `end_line` is kept.
-pub fn merge_fold_ranges(syntax: Vec<FoldRange>, indent: Vec<FoldRange>) -> Vec<FoldRange> {
-    let mut ranges = syntax;
-    ranges.extend(indent);
-    ranges.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
-    ranges.dedup_by(|a, b| a.start_line == b.start_line);
-    ranges
-}
-
-/// Indent-based fold ranges (VSCode-style).
+/// Port of the indent-based branch of Zed's
+/// `DisplaySnapshot::crease_for_buffer_row`:
 ///
-/// A line is foldable when a later non-empty line has strictly greater indent.
-/// The fold ends at the last consecutive deeper line (empty lines in between
-/// are included in the hidden span). Trailing empty lines after the last
-/// deeper line are left visible so neighbouring blocks stay separated.
-pub fn extract_indent_fold_ranges(text: &Rope, tab_size: TabSize) -> Vec<FoldRange> {
-    let line_count = text.lines_len();
-    if line_count < 2 {
-        return Vec::new();
+/// 1. The row must start an indent (see [`starts_indent`]).
+/// 2. Scan forward for the first non-blank row whose indent is not greater —
+///    the "closing row".
+/// 3. If the closing row starts with a closing bracket, the fold ends at that
+///    bracket's indentation (the bracket stays visible next to the `⋯`).
+/// 4. Otherwise the fold ends at the end of the last non-blank row before the
+///    closing row (or before the end of the buffer).
+///
+/// Pass `is_line_folded` so a row that already has an active fold does not
+/// produce a new crease (matching Zed's `!self.is_line_folded(start.row)`).
+pub fn crease_for_buffer_row(
+    text: &Rope,
+    buffer_row: usize,
+    is_line_folded: impl Fn(usize) -> bool,
+) -> Option<Crease> {
+    let start = Point::new(buffer_row, text.slice_line(buffer_row).len());
+    if !starts_indent(text, buffer_row) || is_line_folded(start.row) {
+        return None;
     }
 
-    let mut indents: Vec<Option<usize>> = Vec::with_capacity(line_count);
-    for row in 0..line_count {
-        let slice = text.slice_line(row);
-        if slice.chars().all(|c| c.is_whitespace()) {
-            indents.push(None);
+    let max_row = text.lines_len().saturating_sub(1);
+    let (start_indent_len, _) = line_indent(text, buffer_row);
+
+    let mut closing_row = None;
+    for row in (buffer_row + 1)..=max_row {
+        let (indent_len, is_blank) = line_indent(text, row);
+        if !is_blank && indent_len <= start_indent_len {
+            closing_row = Some(row);
+            break;
+        }
+    }
+
+    let last_non_blank_row = |from_row: usize| -> Point {
+        let mut row = from_row;
+        while row > start.row {
+            let (_, is_blank) = line_indent(text, row);
+            if !is_blank {
+                break;
+            }
+            row -= 1;
+        }
+        Point::new(row, text.slice_line(row).len())
+    };
+
+    let end = if let Some(row) = closing_row {
+        if let Some(indent_len) = closing_bracket_indent_len(text, row) {
+            // Include newline and whitespace before the closing delimiter,
+            // so it appears on the same display line as the fold placeholder.
+            Point::new(row, indent_len)
         } else {
-            indents.push(Some(tab_size.indent_count(&slice)));
+            last_non_blank_row(row - 1)
         }
+    } else {
+        last_non_blank_row(max_row)
+    };
+
+    if end <= start {
+        return None;
     }
 
-    let mut ranges = Vec::new();
-    for i in 0..line_count {
-        let Some(indent) = indents[i] else {
-            continue;
-        };
-        let mut end = None;
-        let mut j = i + 1;
-        while j < line_count {
-            match indents[j] {
-                None => j += 1,
-                Some(next) if next > indent => {
-                    end = Some(j);
-                    j += 1;
-                }
-                _ => break,
-            }
-        }
-        if let Some(end_line) = end {
-            if end_line > i {
-                ranges.push(FoldRange::new(i, end_line));
-            }
-        }
-    }
-
-    ranges.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
-    ranges.dedup_by(|a, b| a.start_line == b.start_line);
-    ranges
-}
-
-/// Outermost fold header for a hidden line, if `line` is inside any folded range.
-pub fn hidden_line_fold_header(line: usize, folded: &[FoldRange]) -> Option<usize> {
-    folded
-        .iter()
-        .filter(|f| line > f.start_line && line <= f.end_line)
-        .map(|f| f.start_line)
-        .min()
-}
-
-/// First line after the outermost fold that hides `line`.
-pub fn hidden_line_after_fold(line: usize, folded: &[FoldRange]) -> Option<usize> {
-    folded
-        .iter()
-        .filter(|f| line > f.start_line && line <= f.end_line)
-        .map(|f| f.end_line)
-        .max()
-        .map(|end| end + 1)
+    Some(Crease { start, end })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fold_range_ordering() {
-        let mut ranges = vec![
-            FoldRange {
-                start_line: 10,
-                end_line: 20,
-            },
-            FoldRange {
-                start_line: 5,
-                end_line: 15,
-            },
-            FoldRange {
-                start_line: 5,
-                end_line: 15,
-            },
-            FoldRange {
-                start_line: 1,
-                end_line: 30,
-            },
-        ];
-
-        ranges.sort_by_key(|r| r.start_line);
-        ranges.dedup_by_key(|r| r.start_line);
-
-        assert_eq!(ranges.len(), 3);
-        assert_eq!(ranges[0].start_line, 1);
-        assert_eq!(ranges[1].start_line, 5);
-        assert_eq!(ranges[2].start_line, 10);
+    fn crease(text: &str, row: usize) -> Option<Crease> {
+        crease_for_buffer_row(&Rope::from(text), row, |_| false)
     }
 
     #[test]
-    fn indent_folds_function_body_and_skips_blank_separator() {
-        let text = Rope::from("def foo():\n    a = 1\n    b = 2\n\ndef bar():\n    c = 3\n");
-        let ranges = extract_indent_fold_ranges(&text, TabSize::default());
-        assert!(
-            ranges.contains(&FoldRange::new(0, 2)),
-            "foo body should fold, got {ranges:?}"
-        );
-        assert!(
-            ranges.contains(&FoldRange::new(4, 5)),
-            "bar body should fold, got {ranges:?}"
-        );
-    }
-
-    #[test]
-    fn indent_folds_include_blank_lines_inside_block() {
-        let text = Rope::from("def foo():\n    a = 1\n\n    b = 2\n");
-        let ranges = extract_indent_fold_ranges(&text, TabSize::default());
-        assert_eq!(ranges, vec![FoldRange::new(0, 3)]);
-    }
-
-    #[test]
-    fn merge_prefers_larger_end_on_same_start() {
-        let syntax = vec![FoldRange::new(0, 20), FoldRange::new(2, 5)];
-        let indent = vec![FoldRange::new(0, 18), FoldRange::new(8, 12)];
-        let merged = merge_fold_ranges(syntax, indent);
+    fn crease_for_rust_function() {
+        let text = "fn main() {\n    let a = 1;\n    let b = 2;\n}\nnext\n";
+        // Fold starts at end of line 0, ends at start of `}` on line 3.
         assert_eq!(
-            merged,
-            vec![
-                FoldRange::new(0, 20),
-                FoldRange::new(2, 5),
-                FoldRange::new(8, 12),
-            ]
+            crease(text, 0),
+            Some(Crease {
+                start: Point::new(0, 11),
+                end: Point::new(3, 0),
+            })
         );
     }
 
     #[test]
-    fn hidden_line_clamp_uses_outermost_fold() {
-        let folded = vec![FoldRange::new(0, 10), FoldRange::new(2, 6)];
-        assert_eq!(hidden_line_fold_header(4, &folded), Some(0));
-        assert_eq!(hidden_line_after_fold(4, &folded), Some(11));
-        assert_eq!(hidden_line_fold_header(0, &folded), None);
-        assert_eq!(hidden_line_fold_header(11, &folded), None);
+    fn crease_keeps_indented_closing_bracket_visible() {
+        // The closing row (`    }`, indent 4) is the first row whose indent is
+        // not greater than the header row 1's indent (4), so the fold ends at
+        // (4, 4) — the `}` itself stays visible after the placeholder.
+        let text = "mod m {\n    fn main() {\n        let a = 1;\n        }\n    }\n";
+        assert_eq!(
+            crease(text, 1),
+            Some(Crease {
+                start: Point::new(1, 15),
+                end: Point::new(4, 4),
+            })
+        );
     }
 
     #[test]
-    fn clamp_forward_skips_hidden_closing_line() {
-        let text = Rope::from("fn foo() {\n    a();\n}\nnext\n");
-        let folded = vec![FoldRange::new(0, 2)];
-        let after = hidden_line_after_fold(2, &folded).expect("line 2 is hidden");
-        assert_eq!(after, 3);
-        assert_eq!(text.slice_line(after).to_string(), "next");
-        assert_eq!(hidden_line_fold_header(2, &folded), Some(0));
-        assert_eq!(text.slice_line(0).to_string(), "fn foo() {");
+    fn crease_without_closing_row_ends_at_last_non_blank() {
+        let text = "def foo():\n    a = 1\n    b = 2\n\n\n";
+        // No subsequent line with indent <= 0, so the fold ends at the last
+        // non-blank row (line 2, end).
+        assert_eq!(
+            crease(text, 0),
+            Some(Crease {
+                start: Point::new(0, 10),
+                end: Point::new(2, 9),
+            })
+        );
+    }
+
+    #[test]
+    fn crease_skips_blank_lines_before_closing_row() {
+        let text = "fn main() {\n    let a = 1;\n\n}\nnext\n";
+        // Blank line 2 is inside the fold; closing row is 3.
+        assert_eq!(
+            crease(text, 0),
+            Some(Crease {
+                start: Point::new(0, 11),
+                end: Point::new(3, 0),
+            })
+        );
+    }
+
+    #[test]
+    fn starts_indent_requires_deeper_next_line() {
+        let text = "fn main() {\n    let a = 1;\n}\n";
+        assert!(starts_indent(&Rope::from(text), 0));
+        assert!(!starts_indent(&Rope::from(text), 1));
+        assert!(!starts_indent(&Rope::from(text), 2));
+        // Blank line never starts an indent.
+        assert!(!starts_indent(&Rope::from("\n  a\n"), 0));
+        // Last row can never start an indent.
+        assert!(!starts_indent(&Rope::from("a:\n"), 1));
+    }
+
+    #[test]
+    fn nested_indent_creases() {
+        let text = "fn main() {\n    if true {\n        a();\n    }\n}\n";
+        assert_eq!(
+            crease(text, 0),
+            Some(Crease {
+                start: Point::new(0, 11),
+                end: Point::new(4, 0),
+            })
+        );
+        assert_eq!(
+            crease(text, 1),
+            Some(Crease {
+                start: Point::new(1, 13),
+                end: Point::new(3, 4),
+            })
+        );
     }
 }

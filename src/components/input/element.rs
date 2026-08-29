@@ -96,20 +96,65 @@ fn masked_display_offset(text: &Rope, original_offset: usize) -> usize {
     text.offset_to_char_index(original_offset) * MASK_CHAR.len_utf8()
 }
 
-/// Layout information for fold icons.
+/// Zed's fold disclosure icons (`assets/icons/chevron_down.svg` /
+/// `chevron_right.svg` in the zed repo, copied verbatim into DeepTerm's
+/// assets). Rendered via `window.paint_svg` with the muted text color,
+/// matching zed's `ui::Disclosure` (IconButton + `IconName::ChevronDown` /
+/// `ChevronRight`, `IconSize::Small`, `Color::Muted`).
+const FOLD_ICON_OPEN: &str = "icons/chevron_down.svg";
+const FOLD_ICON_CLOSED: &str = "icons/chevron_right.svg";
+
+/// Size of the fold disclosure icon, matching zed's `IconSize::Small`
+/// (14px) constrained by the crease-toggle available height
+/// (`line_height * 0.55`, see zed's `prepaint_crease_toggles`).
+fn fold_icon_size(line_height: Pixels) -> Pixels {
+    px(14.).min(line_height * 0.55)
+}
+
+/// Horizontal padding inside the `⋯` placeholder pill, approximating zed's
+/// `FoldPlaceholder::fold_element` (`size_full` rounded background around
+/// the ellipsis).
+const FOLD_PLACEHOLDER_PADDING: Pixels = px(2.);
+
+/// Layout information for a gutter fold disclosure icon (zed's crease toggle).
 struct FoldGutterIcon {
-    start_line: usize,
+    /// The buffer row the icon toggles.
+    row: usize,
     is_folded: bool,
     bounds: Bounds<Pixels>,
     hitbox: Hitbox,
 }
 
-struct FoldIconLayout {
-    /// Hitbox for the line number area (used for hover detection)
-    line_number_hitbox: Hitbox,
-    chevron_down: ShapedLine,
-    chevron_right: ShapedLine,
+/// A shaped `⋯` placeholder plus the fold's trailing text (e.g. `}`),
+/// painted inline at the end of the fold's header line (zed's fold
+/// placeholder + the text after the fold range on the same display row).
+struct FoldPlaceholder {
+    /// The buffer row of the fold header.
+    row: usize,
+    /// Bounds of the `⋯` pill (window space), flush with the end of the
+    /// header line's last wrapped row; computed after the cursor layout.
+    pill_bounds: Option<Bounds<Pixels>>,
+    /// Hitbox of the pill (pointing-hand cursor + click to unfold).
+    hitbox: Option<Hitbox>,
+    /// Shaped `⋯` (U+22EF).
     ellipsis: ShapedLine,
+    /// The text after the fold end on the closing row (e.g. `}`), with syntax
+    /// highlighting; empty when the fold has no closing row tail.
+    tail: Option<ShapedLine>,
+}
+
+impl FoldPlaceholder {
+    /// Total width of the placeholder pill (background + `⋯`).
+    fn pill_width(&self) -> Pixels {
+        self.ellipsis.width + FOLD_PLACEHOLDER_PADDING * 2.
+    }
+}
+
+/// Fold-related layout data for one frame (gutter icons + inline placeholders).
+struct FoldIconLayout {
+    /// Hitbox for the gutter area (used for hover detection, zed's `gutter_hovered`).
+    line_number_hitbox: Hitbox,
+    /// Fold disclosure icons for every visible foldable row.
     icons: Vec<FoldGutterIcon>,
 }
 
@@ -244,7 +289,6 @@ impl TextElement {
                 if let Some(bg) = bg {
                     InputState::dispatch_background_parse(bg, state.text_version, window, cx);
                 }
-                state.update_fold_candidates();
                 state._pending_update = false;
             }
             state.display_map.set_font(
@@ -268,6 +312,7 @@ impl TextElement {
     fn layout_cursor(
         &self,
         last_layout: &LastLayout,
+        fold_placeholders: &[FoldPlaceholder],
         bounds: &mut Bounds<Pixels>,
         _: &mut Window,
         cx: &mut App,
@@ -365,7 +410,41 @@ impl TextElement {
                 // Just increase the offset_y and prev_lines_offset for scroll tracking.
                 if prev_lines_offset >= cursor && cursor_pos.is_none() {
                     current_row = Some(row);
-                    cursor_pos = Some(line_origin);
+                    // A cursor inside a fold — or at its end (the visible tail,
+                    // e.g. `}`) — is drawn on the fold header's display row:
+                    // at the `⋯` placeholder, or right after the placeholder
+                    // and tail when at the fold end (zed maps positions inside
+                    // a fold to the placeholder).
+                    let display_fold = state
+                        .display_map
+                        .fold_containing(cursor)
+                        .or_else(|| state.display_map.fold_ending_at(cursor));
+                    cursor_pos = display_fold.and_then(|fold| {
+                        let line = last_layout.line(fold.start.row)?;
+                        let placeholder =
+                            fold_placeholders.iter().find(|p| p.row == fold.start.row)?;
+                        let last_y = offset_y - line_height;
+                        let last_width = line
+                            .wrapped_lines
+                            .last()
+                            .map(|l| l.width)
+                            .unwrap_or(px(0.));
+                        let x = if cursor >= fold.end_offset {
+                            let mut x = last_width
+                                + placeholder.ellipsis.width
+                                + FOLD_PLACEHOLDER_PADDING * 2.;
+                            if let Some(tail) = placeholder.tail.as_ref() {
+                                x += tail.width;
+                            }
+                            x
+                        } else {
+                            last_width
+                        };
+                        Some(point(x, last_y))
+                    });
+                    if cursor_pos.is_none() {
+                        cursor_pos = Some(line_origin);
+                    }
                 }
                 if prev_lines_offset >= selected_range.start && cursor_start.is_none() {
                     cursor_start = Some(line_origin);
@@ -462,6 +541,17 @@ impl TextElement {
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
             scroll_offset = deferred_scroll_offset;
         }
+
+        // zed tracks the "active row" in display space: when the cursor sits
+        // on a row hidden by a fold (e.g. at the fold end, on the closing
+        // bracket row), the fold's header row is the active one — it receives
+        // the active-line highlight and shows the fold disclosure icon.
+        let current_row = current_row.map(|row| {
+            state
+                .display_map
+                .fold_header_for_row(row)
+                .unwrap_or(row)
+        });
 
         bounds.origin += scroll_offset;
 
@@ -1230,10 +1320,13 @@ impl TextElement {
         Some(WhitespaceIndicators { space, tab })
     }
 
-    /// Return (line_number_width, line_number_len)
-    /// Layout fold icon hitboxes during prepaint phase.
+    /// Layout the gutter fold disclosure icons (zed's crease toggles).
     ///
-    /// This creates hitboxes for the fold icon area, positioned to the right of line numbers.
+    /// Mirrors zed's `EditorElement::layout_crease_toggles`: every visible
+    /// row that is folded or starts an indent gets an icon hitbox in the
+    /// fold area at the right of the line numbers; whether the icon is
+    /// painted is decided in `paint_fold_icons` following zed's
+    /// `render_crease_toggle` visibility rule.
     fn layout_fold_icons(
         &self,
         bounds: &Bounds<Pixels>,
@@ -1249,41 +1342,8 @@ impl TextElement {
             HitboxBehavior::Normal,
         );
 
-        let style = window.text_style();
-        let muted = cx.theme().text_muted;
-        let chevron_size = last_layout.line_height * 0.7;
-        let run = |text: &str| TextRun {
-            len: text.len(),
-            font: style.font(),
-            color: muted,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let chevron_down = window.text_system().shape_line(
-            SharedString::new_static("▾"),
-            chevron_size,
-            &[run("▾")],
-            None,
-        );
-        let chevron_right = window.text_system().shape_line(
-            SharedString::new_static("▸"),
-            chevron_size,
-            &[run("▸")],
-            None,
-        );
-        let ellipsis = window.text_system().shape_line(
-            SharedString::new_static("···"),
-            last_layout.line_height * 0.85,
-            &[run("···")],
-            None,
-        );
-
         let mut icon_layout = FoldIconLayout {
             line_number_hitbox,
-            chevron_down,
-            chevron_right,
-            ellipsis,
             icons: vec![],
         };
 
@@ -1293,6 +1353,7 @@ impl TextElement {
         }
 
         let line_height = last_layout.line_height;
+        let icon_size = fold_icon_size(line_height);
         let mut offset_y = last_layout.visible_top;
         for (i, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
             let height = last_layout
@@ -1300,18 +1361,39 @@ impl TextElement {
                 .get(i)
                 .map(|line| line.size(line_height).height)
                 .unwrap_or(line_height);
-            if state.display_map.is_fold_candidate(buffer_line) {
+
+            // zed: `is_foldable |= !use_lsp_folding_ranges && starts_indent(row)`.
+            let folded = state.display_map.is_line_folded(buffer_line);
+            let is_foldable =
+                folded || state.display_map.starts_indent(&state.text, buffer_line);
+            if is_foldable {
+                // Center the icon in the fold area (zed centers the crease
+                // toggle within `gutter_dimensions.fold_area_width()`), on the
+                // row's first display line (zed's `prepaint_crease_toggles`
+                // positions toggles at `line_height * display_row`).
+                let icon_x = bounds.origin.x + last_layout.line_number_width
+                    - FOLD_ICON_HITBOX_WIDTH
+                    + (FOLD_ICON_HITBOX_WIDTH - icon_size).half();
+                let icon_y =
+                    bounds.origin.y + offset_y + (line_height - icon_size).half();
                 let icon_bounds = Bounds::new(
-                    point(
-                        bounds.origin.x + last_layout.line_number_width - FOLD_ICON_HITBOX_WIDTH,
-                        bounds.origin.y + offset_y,
-                    ),
-                    size(FOLD_ICON_HITBOX_WIDTH, line_height),
+                    point(icon_x, icon_y),
+                    size(icon_size, icon_size),
                 );
-                let hitbox = window.insert_hitbox(icon_bounds, HitboxBehavior::Normal);
+                let hitbox = window.insert_hitbox(
+                    Bounds::new(
+                        point(
+                            bounds.origin.x + last_layout.line_number_width
+                                - FOLD_ICON_HITBOX_WIDTH,
+                            bounds.origin.y + offset_y,
+                        ),
+                        size(FOLD_ICON_HITBOX_WIDTH, line_height),
+                    ),
+                    HitboxBehavior::Normal,
+                );
                 icon_layout.icons.push(FoldGutterIcon {
-                    start_line: buffer_line,
-                    is_folded: state.display_map.is_folded_at(buffer_line),
+                    row: buffer_line,
+                    is_folded: folded,
                     bounds: icon_bounds,
                     hitbox,
                 });
@@ -1322,40 +1404,204 @@ impl TextElement {
         icon_layout
     }
 
-    /// Paint fold icons using prepaint hitboxes.
+    /// Shape the `⋯` placeholders and trailing texts for every visible folded
+    /// row (zed's fold placeholder is rendered inline where the folded range
+    /// was, and the text after the fold end — e.g. the closing `}` — stays
+    /// visible on the same display line).
+    fn layout_fold_placeholders(
+        &self,
+        last_layout: &LastLayout,
+        text_style: &TextStyle,
+        font_size: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<FoldPlaceholder> {
+        let state = self.state.read(cx);
+        if !state.mode.is_folding() || state.text.len() == 0 {
+            return Vec::new();
+        }
+
+        let text = state.text.clone();
+        let mut placeholders = Vec::new();
+
+        let placeholder_color = cx.theme().text_muted;
+        let ellipsis_text: SharedString = "⋯".into();
+        let ellipsis = window.text_system().shape_line(
+            ellipsis_text.clone(),
+            font_size,
+            &[TextRun {
+                len: ellipsis_text.len(),
+                font: text_style.font(),
+                color: placeholder_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+
+        let mut highlighter = state.mode.highlighter().map(|h| h.borrow_mut());
+        let highlight_theme = cx.theme().highlight_theme.clone();
+
+        for &buffer_line in last_layout.visible_buffer_lines.iter() {
+            let Some(fold) = state.display_map.fold_for_row(buffer_line) else {
+                continue;
+            };
+
+            // The text after the fold end on the closing row (usually a `}`).
+            let tail_start = fold.end_offset;
+            let tail_end = {
+                let line = text.slice_line(fold.end.row);
+                let line_len = line.len();
+                let end_col = fold.end.column.min(line_len);
+                text.line_start_offset(fold.end.row) + end_col
+            };
+            let tail = if tail_end > tail_start {
+                let tail_text: SharedString =
+                    text.slice(tail_start..tail_end).to_string().into();
+                let tail_runs: Vec<TextRun> = if let Some(highlighter) =
+                    highlighter.as_deref_mut().and_then(|h| h.as_mut())
+                {
+                    highlighter
+                        .styles(&(tail_start..tail_end), &highlight_theme)
+                        .into_iter()
+                        .map(|(range, style)| {
+                            let len = range.len().min(tail_text.len());
+                            text_style.clone().highlight(style).to_run(len)
+                        })
+                        .filter(|run| run.len > 0)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let runs = if tail_runs.is_empty() {
+                    vec![TextRun {
+                        len: tail_text.len(),
+                        font: text_style.font(),
+                        color: text_style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }]
+                } else {
+                    tail_runs
+                };
+                Some(
+                    window
+                        .text_system()
+                        .shape_line(tail_text, font_size, &runs, None),
+                )
+            } else {
+                None
+            };
+
+            placeholders.push(FoldPlaceholder {
+                row: buffer_line,
+                pill_bounds: None,
+                hitbox: None,
+                ellipsis: ellipsis.clone(),
+                tail,
+            });
+        }
+
+        placeholders
+    }
+
+    /// Compute each placeholder pill's bounds and hitbox. Must run after the
+    /// cursor layout (which scrolls `bounds`) so the pills land where the
+    /// header line is painted. The pill sits at the end of the header line's
+    /// last wrapped row, flush with the line's text (zed renders the
+    /// placeholder inline exactly where the folded range was).
+    fn layout_fold_placeholder_bounds(
+        &self,
+        bounds: &Bounds<Pixels>,
+        last_layout: &LastLayout,
+        placeholders: &mut [FoldPlaceholder],
+        window: &mut Window,
+        cx: &App,
+    ) {
+        let state = self.state.read(cx);
+        if !state.mode.is_folding() {
+            return;
+        }
+
+        let line_height = last_layout.line_height;
+        let mut offset_y = last_layout.visible_top;
+        for (i, &buffer_line) in last_layout.visible_buffer_lines.iter().enumerate() {
+            let height = last_layout
+                .lines
+                .get(i)
+                .map(|line| line.size(line_height).height)
+                .unwrap_or(line_height);
+
+            if state.display_map.is_line_folded(buffer_line) {
+                if let Some(placeholder) =
+                    placeholders.iter_mut().find(|p| p.row == buffer_line)
+                {
+                    let line = last_layout.lines.get(i);
+                    let wrap_count =
+                        line.map(|l| l.wrapped_lines.len()).unwrap_or(1).max(1);
+                    let last_width = line
+                        .and_then(|l| l.wrapped_lines.last())
+                        .map(|l| l.width)
+                        .unwrap_or(px(0.));
+                    let pill_bounds = Bounds::new(
+                        point(
+                            bounds.origin.x + last_layout.line_number_width + last_width,
+                            bounds.origin.y
+                                + offset_y
+                                + line_height * (wrap_count as f32 - 1.),
+                        ),
+                        size(placeholder.pill_width(), line_height),
+                    );
+                    let hitbox =
+                        window.insert_hitbox(pill_bounds, HitboxBehavior::Normal);
+                    placeholder.pill_bounds = Some(pill_bounds);
+                    placeholder.hitbox = Some(hitbox);
+                }
+            }
+
+            offset_y += height;
+        }
+    }
+
+    /// Paint the gutter fold disclosure icons (zed's crease toggles).
     ///
-    /// Chevrons: right when folded (always visible), down when expanded
-    /// (gutter hover or current line only).
+    /// Follows zed's `EditorSnapshot::render_crease_toggle` visibility rule:
+    /// the icon is shown when the row is folded, or when it is foldable and
+    /// either contains the cursor or the gutter is hovered. The icon is a
+    /// chevron (right when folded, down when expanded) in the muted text
+    /// color with a pointing-hand cursor, exactly like zed's `ui::Disclosure`.
     fn paint_fold_icons(
         &mut self,
         fold_icon_layout: &mut FoldIconLayout,
         current_row: Option<usize>,
-        line_height: Pixels,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<(usize, Bounds<Pixels>)> {
         let is_hovered = fold_icon_layout.line_number_hitbox.is_hovered(window);
+        let icon_color = cx.theme().text_muted;
         let mut click_targets = Vec::new();
         for icon in &fold_icon_layout.icons {
-            click_targets.push((icon.start_line, icon.bounds));
-            let is_current_line = current_row == Some(icon.start_line);
-            if !is_hovered && !is_current_line && !icon.is_folded {
+            let is_current_line = current_row == Some(icon.row);
+            if !icon.is_folded && !is_hovered && !is_current_line {
+                // zed: `if folded || (is_foldable && (row_contains_cursor ||
+                // gutter_hovered))` — otherwise no icon is rendered.
                 continue;
             }
 
-            let glyph = if icon.is_folded {
-                &fold_icon_layout.chevron_right
+            click_targets.push((icon.row, icon.hitbox.bounds));
+            let path = if icon.is_folded {
+                FOLD_ICON_CLOSED
             } else {
-                &fold_icon_layout.chevron_down
+                FOLD_ICON_OPEN
             };
-            let x = icon.bounds.origin.x
-                + (icon.bounds.size.width - glyph.width).half().max(px(0.));
-            _ = glyph.paint(
-                point(x, icon.bounds.origin.y),
-                line_height,
-                TextAlign::Left,
+            let _ = window.paint_svg(
+                icon.bounds,
+                SharedString::new_static(path),
                 None,
-                window,
+                gpui::TransformationMatrix::default(),
+                icon_color,
                 cx,
             );
             window.set_cursor_style(CursorStyle::PointingHand, &icon.hitbox);
@@ -1715,11 +1961,13 @@ pub(crate) struct PrepaintState {
     bracket_paths: Vec<Path<Pixels>>,
     /// 同词高亮路径（光标处词的全文件出现）。
     occurrence_paths: Vec<Path<Pixels>>,
-    /// Sticky scroll 行：(buffer 行号, 文本布局, 点击区域)。
+    /// Sticky scroll 行：(buffer 行号， 文本布局， 点击区域)。
     sticky_lines: Vec<StickyLine>,
     bounds: Bounds<Pixels>,
-    /// Fold icon layout data
+    /// Fold icon layout data (gutter icons + inline placeholders).
     fold_icon_layout: FoldIconLayout,
+    /// Shaped `⋯` placeholders + trailing texts for visible folded rows.
+    fold_placeholders: Vec<FoldPlaceholder>,
 }
 
 impl PrepaintState {
@@ -2038,7 +2286,9 @@ impl Element for TextElement {
         }
         last_layout.lines = Rc::new(lines);
 
-        let total_wrapped_lines = state.display_map.wrap_row_count();
+        // The scrollable height counts *display* rows (folded rows hidden),
+        // matching what is actually painted.
+        let total_display_lines = state.display_map.display_row_count();
         let empty_bottom_height = if state.mode.is_code_editor() {
             let base = bounds
                 .size
@@ -2061,7 +2311,7 @@ impl Element for TextElement {
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height + empty_bottom_height)
+            (total_display_lines as f32 * line_height + empty_bottom_height)
                 .max(bounds.size.height),
         );
 
@@ -2100,11 +2350,20 @@ impl Element for TextElement {
         // | 114   | (429.85938 px, 20.0)  | 1    |
         // | 115   | (11.3125 px, 40.0)    | 2    |
 
-        // Calculate the scroll offset to keep the cursor in view
+        // Calculate the scroll offset to keep the cursor in view.
+        // The fold placeholders are shaped first so the cursor can be placed
+        // after the `⋯` when it sits at a fold boundary (zed maps positions
+        // inside a fold to the placeholder).
+        let mut fold_placeholders =
+            self.layout_fold_placeholders(&last_layout, &text_style, text_size, window, cx);
 
         let (cursor_bounds, cursor_scroll_offset, current_row) =
-            self.layout_cursor(&last_layout, &mut bounds, window, cx);
+            self.layout_cursor(&last_layout, &fold_placeholders, &mut bounds, window, cx);
         last_layout.cursor_bounds = cursor_bounds;
+
+        // Pills are positioned where the header lines are painted, so this
+        // must run after the cursor layout has scrolled `bounds`.
+        self.layout_fold_placeholder_bounds(&bounds, &last_layout, &mut fold_placeholders, window, cx);
 
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
         let search_match_paths = self.layout_search_matches(&last_layout, &bounds, cx);
@@ -2198,6 +2457,7 @@ impl Element for TextElement {
             occurrence_paths,
             sticky_lines,
             fold_icon_layout,
+            fold_placeholders,
         }
     }
 
@@ -2508,17 +2768,11 @@ impl Element for TextElement {
             px(0.)
         };
 
-        let folded_starts: std::collections::HashSet<usize> = self
-            .state
-            .read(cx)
-            .display_map
-            .folded_ranges()
-            .iter()
-            .map(|f| f.start_line)
-            .collect();
+        // Fold-related click targets (placeholder pills + gutter icons).
         let mut fold_click_targets: Vec<(usize, Bounds<Pixels>)> = Vec::new();
+        let fold_placeholder_bg = cx.theme().text.opacity(0.055);
 
-        for (line, &buffer_line) in prepaint
+        for (line, _buffer_line) in prepaint
             .last_layout
             .lines
             .iter()
@@ -2539,30 +2793,46 @@ impl Element for TextElement {
                 window,
                 cx,
             );
-            if folded_starts.contains(&buffer_line) {
-                let wrap_count = line.wrapped_lines.len().max(1);
-                let last_y = line_y + line_height * (wrap_count.saturating_sub(1) as f32);
-                let last_width = line
-                    .wrapped_lines
-                    .last()
-                    .map(|l| l.width)
-                    .unwrap_or(line.longest_width);
-                let ellipsis = &prepaint.fold_icon_layout.ellipsis;
-                let ellipsis_origin = point(p.x + last_width + px(6.), last_y);
-                _ = ellipsis.paint(
-                    ellipsis_origin,
+            offset_y += line.size(line_height).height;
+        }
+
+        // Paint the `⋯` pills and their trailing texts (e.g. `}`) inline at the
+        // end of each folded header line — zed's fold placeholder replaces the
+        // folded range, keeping the closing delimiter visible on the same
+        // display row (`fn main() {⋯}`).
+        for placeholder in &prepaint.fold_placeholders {
+            let Some(pill_bounds) = placeholder.pill_bounds else {
+                continue;
+            };
+            window.paint_quad(fill(pill_bounds, fold_placeholder_bg).corner_radii(px(2.)));
+            _ = placeholder.ellipsis.paint(
+                point(
+                    pill_bounds.origin.x + FOLD_PLACEHOLDER_PADDING,
+                    pill_bounds.origin.y,
+                ),
+                line_height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            // Clicking the placeholder unfolds this fold (zed's
+            // `FoldPlaceholder::fold_element` on_click → unfold_ranges).
+            fold_click_targets.push((placeholder.row, pill_bounds));
+            if let Some(hitbox) = placeholder.hitbox.as_ref() {
+                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            }
+
+            if let Some(tail) = placeholder.tail.as_ref() {
+                _ = tail.paint(
+                    point(pill_bounds.right(), pill_bounds.origin.y),
                     line_height,
                     TextAlign::Left,
                     None,
                     window,
                     cx,
                 );
-                fold_click_targets.push((
-                    buffer_line,
-                    Bounds::new(ellipsis_origin, size(ellipsis.width, line_height)),
-                ));
             }
-            offset_y += line.size(line_height).height;
         }
 
         // Paint blinking cursor
@@ -2618,7 +2888,6 @@ impl Element for TextElement {
         fold_click_targets.extend(self.paint_fold_icons(
             &mut prepaint.fold_icon_layout,
             prepaint.current_row,
-            line_height,
             window,
             cx,
         ));

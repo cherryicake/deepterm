@@ -9,10 +9,7 @@
 /// about `BufferPoint ↔ DisplayPoint` mapping, without worrying about internal wrap/fold complexity.
 mod display_map;
 mod fold_map;
-#[cfg(not(target_family = "wasm"))]
 mod folding;
-#[cfg(target_family = "wasm")]
-pub mod folding;
 mod text_wrapper;
 mod wrap_map;
 
@@ -20,11 +17,9 @@ mod wrap_map;
 pub use self::display_map::DisplayMap;
 pub(crate) use self::text_wrapper::LineLayout;
 
-// Re-export FoldRange and extract_fold_ranges
-pub use folding::{
-    FoldRange, extract_fold_ranges, extract_indent_fold_ranges, hidden_line_after_fold,
-    hidden_line_fold_header, merge_fold_ranges,
-};
+// Re-export fold model (zed-style)
+pub use fold_map::Fold;
+pub use folding::{Crease, crease_for_buffer_row, starts_indent};
 
 /// Position in the buffer (logical text).
 ///
