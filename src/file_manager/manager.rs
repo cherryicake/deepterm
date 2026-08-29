@@ -112,6 +112,14 @@ impl TransferManager {
             None
         };
 
+        // scp CLI 语义：`/scp src dst`（dst 无尾斜杠）在 dst 是**已存在目录**时
+        // 表示“拷入该目录”，仅当 dst 不存在/是文件名时才是重命名。
+        // `/scp` 处理器只做字符串拆分（dir + 期望文件名），这里在实际传输前
+        // 做一次存在性判定，把“dir+名 已存在且为目录”的目的地收敛回目录语义。
+        // 例子：`/scp a.txt ~` / `/scp a.txt /tmp` / `/scp a.txt bob:/tmp`。
+        let (destination, rename_to) =
+            Self::resolve_existing_dir_destination(destination, rename_to);
+
         if sources.len() <= 1 {
             // 单源（或空）：保持原串行路径。
             let mut summary = TransferSummary::default();
@@ -242,6 +250,58 @@ impl TransferManager {
                 summary.skipped
             );
             Ok(())
+        }
+    }
+
+    /// 把“无尾斜杠目的 token”拆出的 `(目录, 期望文件名)` 按 scp CLI 语义收敛：
+    /// 若 `目录/文件名` 实际指向一个已存在的目录，则该名字不是重命名目标，
+    /// 而是目的地目录本身（拷入其中）。本地用 `is_dir` 同步判定；远端走
+    /// SFTP 会话池的 `metadata`（会话有缓存，代价一次往返）。
+    /// 判定失败（网络错误 / 不存在 / 是文件）时保持原语义不变，交由后续
+    /// 冲突解决流程处理。
+    fn resolve_existing_dir_destination(
+        destination: FileEndpoint,
+        rename_to: Option<String>,
+    ) -> (FileEndpoint, Option<String>) {
+        let Some(name) = rename_to else {
+            return (destination, None);
+        };
+        match &destination {
+            FileEndpoint::Local { path } => {
+                let full = path.join(&name);
+                if full.is_dir() {
+                    log::info!(
+                        "/scp 目的地 {} 是已存在目录，改为拷入其中",
+                        full.display()
+                    );
+                    return (FileEndpoint::Local { path: full }, None);
+                }
+                (destination, Some(name))
+            }
+            FileEndpoint::Remote { ssh_config, path } => {
+                let full = crate::ssh::sftp_fs::join_remote_path(path, &name);
+                let is_dir = crate::ssh::sftp_fs::with_cached_session(ssh_config, |session| {
+                    Ok(session.metadata(&full).is_ok_and(|m| {
+                        m.kind == crate::ssh::sftp_fs::RemoteFileKind::Directory
+                    }))
+                })
+                .unwrap_or(false);
+                if is_dir {
+                    log::info!(
+                        "/scp 目的地 {}:{} 是已存在目录，改为拷入其中",
+                        ssh_config.host_label(),
+                        full
+                    );
+                    return (
+                        FileEndpoint::Remote {
+                            ssh_config: ssh_config.clone(),
+                            path: full,
+                        },
+                        None,
+                    );
+                }
+                (destination, Some(name))
+            }
         }
     }
 
@@ -427,6 +487,67 @@ mod tests {
 
     fn local(path: PathBuf) -> FileEndpoint {
         FileEndpoint::Local { path }
+    }
+
+    #[test]
+    fn scp_semantics_existing_dir_destination_copies_into_it() {
+        // /scp a.txt <已存在目录>（无尾斜杠）⇒ 拷入该目录，而不是重命名成目录名
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm_scpdir_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("existing_dir")).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+
+        let request = TransferRequest {
+            sources: vec![local(dir.join("a.txt"))],
+            // 模拟 /scp 处理器对 `.../existing_dir`（无尾斜杠）的拆分结果
+            destination: local(dir.clone()),
+            operation: TransferOperation::Copy,
+            conflict_policy: ConflictPolicy::Ask,
+            rename_to: Some("existing_dir".to_string()),
+        };
+        let summary = TransferManager::execute_blocking(request).unwrap();
+        assert_eq!(summary.files_transferred, 1);
+        assert!(
+            dir.join("existing_dir/a.txt").exists(),
+            "应拷入已存在目录，而不是试图把文件写成目录本身"
+        );
+        assert!(!dir.join("existing_dir/existing_dir").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scp_semantics_nonexistent_name_still_renames() {
+        // /scp a.txt newname.txt（不存在）⇒ 保持重命名语义
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm_scpren_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+
+        let request = TransferRequest {
+            sources: vec![local(dir.join("a.txt"))],
+            destination: local(dir.clone()),
+            operation: TransferOperation::Copy,
+            conflict_policy: ConflictPolicy::Ask,
+            rename_to: Some("newname.txt".to_string()),
+        };
+        let summary = TransferManager::execute_blocking(request).unwrap();
+        assert_eq!(summary.files_transferred, 1);
+        assert!(dir.join("newname.txt").exists(), "不存在的名字应保持重命名");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

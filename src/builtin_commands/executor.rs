@@ -192,7 +192,10 @@ impl CommandHandler for LogOnlyHandler {
 /// 每个 token 形式：
 /// - `<host>:/abs/path` / `<host>:~/rel` / `<host>:rel` / `<host>:/dir/`
 /// - 不带 `:` → 本地路径（支持 `~`、相对路径）
-/// - 尾部 `/` 表示目标是目录；否则视为具体文件名（触发重命名）
+/// - 尾部 `/` 表示目标是目录；否则视为具体文件名（触发重命名）。
+///   若无尾斜杠的目的实际是已存在目录（如 `~`、`/tmp`），传输层会在起传前
+///   把它收敛回“拷入该目录”的语义（与 scp CLI 一致，见
+///   `TransferManager::resolve_existing_dir_destination`）。
 ///
 /// `<host>` 按优先级匹配 `SshGlobalConfig::saved_connections`：
 /// 1. `nickname`（大小写不敏感，精确）
@@ -216,6 +219,13 @@ impl ScpHandler {
         if raw.is_empty() {
             return CommandResult::Error {
                 message: "用法: /scp <src> [<src> ...] <dst>（至少两个参数）".to_string(),
+            };
+        }
+
+        // 与 shell 一致：未闭合的引号是语法错误，而不是把 `"a b` 静默当成路径 `a b`
+        if crate::builtin_commands::scp_completion::has_unclosed_quote(raw) {
+            return CommandResult::Error {
+                message: "命令行存在未闭合的引号".to_string(),
             };
         }
 
@@ -328,8 +338,12 @@ fn parse_scp_token(
             })
         }
         Some(0) => {
-            // `:...` 当作裸路径（跟随当前终端）
-            let path = unquote_raw(raw);
+            // `:path` 当作裸路径（跟随当前终端），去掉多余的前导冒号；
+            // 保留它只会得到 `:tmp/x` 这种几乎肯定非预期的本地路径
+            let path = unquote_raw(&raw[1..]);
+            if path.is_empty() {
+                return Err("路径不能为空".to_string());
+            }
             Ok(ScpEndpointSpec {
                 endpoint: resolve_bare_path(&path, ctx),
                 trailing_slash,
@@ -340,6 +354,44 @@ fn parse_scp_token(
             let path_raw = &raw[pos + 1..];
             let host = unquote_raw(host_raw);
             let path = unquote_raw(path_raw);
+
+            // 端口语法 `user@host:port:path`（手写、未加引号时第一个冒号切在端口前）。
+            // path 以 `<数字>:` 开头时，把 `host:port` 合并后作为完整主机名匹配，
+            // 优先于常规 `host:path` 解释。
+            if let Some((port, rest)) =
+                crate::builtin_commands::scp_completion::split_port_prefix(&path)
+            {
+                let host_with_port = format!("{}:{}", host, port);
+                match match_host(&host_with_port, saved_configs) {
+                    HostMatch::One(config) => {
+                        return Ok(ScpEndpointSpec {
+                            endpoint: resolve_remote_path_with_cwd(rest, config.clone(), None),
+                            trailing_slash,
+                        });
+                    }
+                    HostMatch::Ambiguous(names) => {
+                        return Err(format!(
+                            "主机 \"{}\" 匹配多个保存的连接：{}，请使用 nickname 区分",
+                            host_with_port,
+                            names.join(", ")
+                        ));
+                    }
+                    HostMatch::None => {
+                        if is_local_keyword_str(&host) {
+                            // `user@localhost:2222:...`：带端口的 localhost 不是"本机"
+                            // 关键字（本机没有端口概念）。若静默按本机解析，会得到
+                            // `2222:/...` 这样的乱路径 —— 明确报错。
+                            return Err(format!(
+                                "未找到主机 \"{}\"。带端口的 localhost 连接需先在 DeepTerm 中保存；\
+                                 引用本机请使用 Local: 或不带端口的 user@localhost:",
+                                host_with_port
+                            ));
+                        }
+                        // 端口形式无匹配：继续按常规 host:path 解析，
+                        // `数字:` 视为字面路径（远端文件名恰好含 `123:abc` 的场景）。
+                    }
+                }
+            }
 
             // 关键字 `Local` 始终指向运行 DeepTerm 的本机
             if is_local_keyword_str(&host) {
@@ -412,6 +464,12 @@ fn resolve_host_token(
     saved_configs: &[SshConnectionConfig],
 ) -> Option<FileEndpoint> {
     if is_local_keyword_str(host_part) {
+        // 端口形态（如整段引号包裹的 `user@localhost:2222:...`）：
+        // 带端口的 localhost 不是"本机"，不能把 `2222:...` 当本机路径。
+        // 跳过本解释，交给后续切分 / 裸路径兜底。
+        if crate::builtin_commands::scp_completion::split_port_prefix(path_part).is_some() {
+            return None;
+        }
         return Some(resolve_local_endpoint(path_part, ctx));
     }
     if let HostMatch::One(config) = match_host(host_part, saved_configs) {
@@ -436,6 +494,10 @@ fn resolve_local_endpoint(raw: &str, ctx: &CommandContext) -> FileEndpoint {
 
 /// 远端路径解析的统一实现。`base_cwd` 提供"当前所在目录"用于解析裸的相对路径
 /// （例如远程终端里直接写 `xx/yy.tar`），`None` 则按登录家目录处理（与 scp CLI 一致）。
+///
+/// 注意：`~user`（其他用户家目录）不被支持——SFTP 无法在客户端展开它，
+/// 这里按字面相对路径处理（等价于家目录下一个名为 `~user` 的条目）。
+/// 如需引用其他用户目录请写绝对路径。
 fn resolve_remote_path_with_cwd(
     path_part: &str,
     ssh_config: SshConnectionConfig,
@@ -818,7 +880,8 @@ mod tests {
         let req = unwrap_transfer(result);
         match &req.sources[0] {
             FileEndpoint::Local { path } => {
-                assert_eq!(path, &PathBuf::from("/home/user/project/./Cargo.toml"));
+                // `./` 组件被词法规范化去除（避免同一文件的不同写法落到不同并发锁条）
+                assert_eq!(path.to_str(), Some("/home/user/project/Cargo.toml"));
             }
             _ => panic!("expected local source"),
         }
@@ -1249,8 +1312,149 @@ mod tests {
         }
     }
 
-    // ── split_destination tests ───────────────────────────────────────────────
+    #[test]
+    fn scp_handler_user_at_host_with_port_unquoted() {
+        // 手写（未加引号）`deploy@1.2.3.4:2222:/tmp/x.txt`：第一个冒号切在端口前，
+        // 旧实现会报「未找到主机 deploy@1.2.3.4。可用: deploy@1.2.3.4:2222」
+        // 这样自相矛盾的错。现在应把 host:port 合并后匹配成功。
+        use crate::ssh::config::AuthMethod;
+        let mut cfg = SshConnectionConfig::new(
+            "1.2.3.4".to_string(),
+            "deploy".to_string(),
+            AuthMethod::Agent,
+        );
+        cfg.port = 2222;
+        let saved = vec![cfg];
+        let result = ScpHandler.execute_with_configs(
+            Some("deploy@1.2.3.4:2222:/tmp/x.txt /tmp/"),
+            scp_ctx(),
+            &saved,
+        );
+        let req = unwrap_transfer(result);
+        match &req.sources[0] {
+            FileEndpoint::Remote { ssh_config, path } => {
+                assert_eq!(ssh_config.host, "1.2.3.4");
+                assert_eq!(ssh_config.port, 2222);
+                assert_eq!(path, "/tmp/x.txt");
+            }
+            _ => panic!("expected remote with port"),
+        }
+    }
 
+    #[test]
+    fn scp_handler_localhost_with_port_errors_clearly() {
+        // `root@localhost:2222:/tmp/x`：带端口的 localhost 不是"本机"关键字，
+        // 旧实现会静默解析成本地路径 `.../2222:/tmp/x`。现在应明确报错。
+        let saved: Vec<SshConnectionConfig> = vec![];
+        let result = ScpHandler.execute_with_configs(
+            Some("root@localhost:2222:/tmp/x /tmp/"),
+            scp_ctx(),
+            &saved,
+        );
+        match result {
+            CommandResult::Error { message } => {
+                assert!(
+                    message.contains("root@localhost:2222"),
+                    "应指出完整 host:port: {}",
+                    message
+                );
+                assert!(message.contains("Local"), "应提示改用 Local: {}", message);
+            }
+            _ => panic!("expected error, got silent local-path misparse"),
+        }
+    }
+
+    #[test]
+    fn scp_handler_quoted_localhost_with_port_not_local() {
+        // 整段引号包裹的 `user@localhost:2222:...` 同样不能兜底成本机路径 `2222:...`
+        let cur = host(Some("webNX"), "root", "1.2.3.4");
+        let saved = vec![cur.clone()];
+        let result = ScpHandler.execute_with_configs(
+            Some("\"root@localhost:2222:/tmp/x\" Local:/tmp/"),
+            remote_ctx(&cur, Some("/root")),
+            &saved,
+        );
+        match result {
+            CommandResult::Error { message } => {
+                assert!(message.contains("localhost:2222"), "msg: {}", message);
+            }
+            CommandResult::StartTransfer { request } => {
+                // 若解析为远端（用户恰好保存了 localhost:2222）也接受；
+                // 但绝不能把 `2222:/tmp/x` 当本机路径
+                match &request.sources[0] {
+                    FileEndpoint::Local { path } => panic!(
+                        "BUG: quoted localhost:port parsed as local path {:?}",
+                        path
+                    ),
+                    _ => {}
+                }
+            }
+            _ => panic!("unexpected"),
+        }
+    }
+
+    #[test]
+    fn scp_handler_remote_filename_with_digits_colon() {
+        // 远端文件名恰含 `123:abc`：不应被端口语法劫持（host 匹配失败后回落常规解析）
+        let saved = vec![host(Some("alice"), "root", "1.2.3.4")];
+        let result = ScpHandler.execute_with_configs(
+            Some("alice:123:abc /tmp/"),
+            scp_ctx(),
+            &saved,
+        );
+        let req = unwrap_transfer(result);
+        match &req.sources[0] {
+            FileEndpoint::Remote { path, .. } => {
+                assert_eq!(path, "./123:abc");
+            }
+            _ => panic!("expected remote"),
+        }
+    }
+
+    #[test]
+    fn scp_handler_local_keyword_without_port_still_local() {
+        // 无端口的 `user@localhost:/path` 仍应视为本机
+        let saved: Vec<SshConnectionConfig> = vec![];
+        let result = ScpHandler.execute_with_configs(
+            Some("Local:/tmp/a.txt someone@localhost:/tmp/b/"),
+            scp_ctx(),
+            &saved,
+        );
+        let req = unwrap_transfer(result);
+        match &req.destination {
+            FileEndpoint::Local { path } => assert_eq!(path, &PathBuf::from("/tmp/b")),
+            _ => panic!("expected local destination"),
+        }
+    }
+
+    #[test]
+    fn scp_handler_unclosed_quote_errors() {
+        // 与 shell 一致：未闭合引号应报错，而不是把 `"a b` 静默当成路径 `a b`
+        let saved: Vec<SshConnectionConfig> = vec![];
+        let result = ScpHandler.execute_with_configs(Some("\"a.txt /tmp/"), scp_ctx(), &saved);
+        match result {
+            CommandResult::Error { message } => {
+                assert!(message.contains("引号"), "msg: {}", message);
+            }
+            _ => panic!("expected unclosed-quote error"),
+        }
+    }
+
+    #[test]
+    fn scp_handler_leading_colon_stripped() {
+        // `:path` 当作裸路径且去掉前导冒号（此前会得到 `:tmp/x` 这种乱路径）
+        let saved: Vec<SshConnectionConfig> = vec![];
+        let result = ScpHandler.execute_with_configs(Some(":/tmp/a.txt /tmp/"), scp_ctx(), &saved);
+        let req = unwrap_transfer(result);
+        match &req.sources[0] {
+            FileEndpoint::Local { path } => {
+                assert_eq!(path, &PathBuf::from("/tmp/a.txt"));
+            }
+            _ => panic!("expected local"),
+        }
+    }
+
+    // ── split_destination tests ───────────────────────────────────────────────
     #[test]
     fn split_destination_local_dot_is_directory() {
         // `Local:.` 应当把 `.` 视为目录目的地，不做 rename。

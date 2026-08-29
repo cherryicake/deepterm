@@ -109,8 +109,10 @@ pub struct BuiltinCommandManager {
     remote_dir_cache: HashMap<(String, String), RemoteDirCacheEntry>,
     /// 远端目录缓存的访问顺序（LRU），用于限制缓存大小
     remote_dir_cache_lru: Vec<(String, String)>,
-    /// 已经向外部发起、等待结果的远端目录请求集合
-    pending_remote_keys: HashMap<(String, String), bool>,
+    /// 已经向外部发起、等待结果的远端目录请求集合。
+    /// key 为 `(host id, 绝对目录路径)`；value 携带连接配置快照与派发标记。
+    /// BTreeMap：派发顺序确定（避免 HashMap 哈希序的不确定性）。
+    pending_remote_keys: std::collections::BTreeMap<(String, String), PendingRemoteLoad>,
     /// 上次读取失败、尚未向用户展示过错误的远端目录 key → 错误信息。
     /// cache-miss 分支会消费该标记显示一次错误占位（且不重新注册请求，避免
     /// 失败→刷新→重新请求→再失败的无限循环）；下一次用户输入触发的刷新由于
@@ -158,10 +160,21 @@ pub struct RemoteEntrySnapshot {
 }
 
 /// 外部需要加载的远端目录请求
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoteCompletionRequest {
-    pub config_id: String,
+    /// 完整连接配置快照：请求携带配置本身，加载方无需再读磁盘配置文件。
+    /// （当前终端的 SSH 连接可能未保存，或已校验后被改名/删除；只传 id 的话
+    /// 这些场景下补全会永远失败。）
+    pub config: crate::ssh::SshConnectionConfig,
     pub absolute_dir: String,
+}
+
+/// 一个已注册、等待外部加载的远端目录条目。
+#[derive(Clone, Debug)]
+struct PendingRemoteLoad {
+    config: crate::ssh::SshConnectionConfig,
+    /// 是否已向外部发起（避免同一请求重复派发）
+    started: bool,
 }
 
 impl BuiltinCommandManager {
@@ -182,7 +195,7 @@ impl BuiltinCommandManager {
             terminal_remote_cwd: None,
             remote_dir_cache: HashMap::new(),
             remote_dir_cache_lru: Vec::new(),
-            pending_remote_keys: HashMap::new(),
+            pending_remote_keys: std::collections::BTreeMap::new(),
             failed_remote_keys: HashMap::new(),
             is_loading_remote: false,
             path_scroll_handle: ScrollHandle::new(),
@@ -278,12 +291,13 @@ impl BuiltinCommandManager {
                 if changed {
                     self.remote_dir_cache
                         .insert(key.clone(), RemoteDirCacheEntry { items: new_items });
-                    // LRU 淘汰
+                    // LRU 淘汰（同步清理对应失败标记，避免孤儿条目无限堆积）
                     self.remote_dir_cache_lru.retain(|k| k != &key);
                     self.remote_dir_cache_lru.push(key.clone());
                     while self.remote_dir_cache_lru.len() > 128 {
                         let oldest = self.remote_dir_cache_lru.remove(0);
                         self.remote_dir_cache.remove(&oldest);
+                        self.failed_remote_keys.remove(&oldest);
                     }
                 }
                 changed
@@ -294,6 +308,11 @@ impl BuiltinCommandManager {
                 // 仅当之前没有可用缓存时才清空已有缓存——避免一次后台刷新失败
                 // 就把先前成功列出的内容也抹掉。
                 if !self.remote_dir_cache.contains_key(&key) {
+                    // 失败标记有上限：超出时整体清空（这些标记只影响 UX 提示，
+                    // 且正常会话远达不到此规模；防长会话无限增长）
+                    if self.failed_remote_keys.len() >= 128 {
+                        self.failed_remote_keys.clear();
+                    }
                     self.failed_remote_keys.insert(key.clone(), err);
                 }
                 self.pending_remote_keys.remove(&key);
@@ -309,17 +328,34 @@ impl BuiltinCommandManager {
 
     /// 如果 `/scp` 当前 token 有未完成的远端目录请求，返回需要加载的请求。
     /// 调用方负责在后台线程读取 SFTP，完成后回传到 `apply_remote_dir_result`。
+    /// 请求携带完整连接配置快照，调用方不再依赖磁盘上的保存配置。
+    /// 用 BTreeMap 保证多个挂起请求时派发顺序确定（按 key 字典序）。
     pub fn pending_remote_request(&mut self) -> Option<RemoteCompletionRequest> {
-        for ((cfg, dir), pending) in self.pending_remote_keys.iter_mut() {
-            if !*pending {
-                *pending = true;
-                return Some(RemoteCompletionRequest {
-                    config_id: cfg.clone(),
-                    absolute_dir: dir.clone(),
-                });
+        for ((_cfg_id, dir), entry) in self.pending_remote_keys.iter_mut() {
+            if entry.started {
+                continue;
             }
+            entry.started = true;
+            return Some(RemoteCompletionRequest {
+                config: entry.config.clone(),
+                absolute_dir: dir.clone(),
+            });
         }
         None
+    }
+
+    /// 注册一次远端目录后台加载（key 已存在时保持原样，不重复派发）。
+    fn register_remote_dir_load(
+        &mut self,
+        key: (String, String),
+        config: crate::ssh::SshConnectionConfig,
+    ) {
+        self.pending_remote_keys.entry(key).or_insert_with(|| {
+            PendingRemoteLoad {
+                config,
+                started: false,
+            }
+        });
     }
 
     /// 获取当前缓冲区内容
@@ -840,6 +876,11 @@ impl BuiltinCommandManager {
         let Some(selected) = self.selected_path_completion().cloned() else {
             return;
         };
+        // 占位项（读取中 / 读取失败）不可应用：既无替换文本也无真实路径，
+        // 落到通用分支会把占位文案写进命令行（如 `/scp /srv/读取远端目录中…`）。
+        if selected.is_placeholder() {
+            return;
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -1094,7 +1135,20 @@ impl BuiltinCommandManager {
                 }
             }
             ScpCompletionPhase::RemotePath { host_token, prefix } => {
+                // 端口语法 `user@host:port:path`：analyse_at 按第一个冒号切分，
+                // host_token 丢失端口、prefix 以端口开头。若 prefix 以 `<数字>:` 开头，
+                // 先把端口并回 host 再匹配；匹配不上则不展示候选
+                // （避免按裸 host 误补全，也避免 `user@localhost:2222:...` 被当成
+                // 本机路径补全）。
+                let (host_token, prefix) = match scp_completion::split_port_prefix(prefix) {
+                    Some((port, rest)) => (format!("{}:{}", host_token, port), rest.to_string()),
+                    None => (host_token.to_string(), prefix.to_string()),
+                };
+                let host_token = host_token.as_str();
+                let prefix = prefix.as_str();
+
                 // 关键字 `Local` —— 始终指向"运行 DeepTerm 的本机"
+                // （端口重映射之后才检查：`user@localhost:2222` 不是本机）
                 if scp_completion::is_local_keyword_str(host_token) {
                     self.path_completions =
                         build_local_path_completions(prefix, host_token, self.cwd.as_deref());
@@ -1149,7 +1203,7 @@ impl BuiltinCommandManager {
                             prefix,
                         );
                         // 注册后台刷新（不设置 is_loading_remote，避免 UI 显示加载中）
-                        self.pending_remote_keys.entry(key).or_insert(false);
+                        self.register_remote_dir_load(key, host_cfg.clone());
                     }
                     None => {
                         if let Some(err) = self.failed_remote_keys.remove(&key) {
@@ -1159,7 +1213,7 @@ impl BuiltinCommandManager {
                         } else {
                             // 无缓存：显示加载中，注册请求
                             self.is_loading_remote = true;
-                            self.pending_remote_keys.entry(key).or_insert(false);
+                            self.register_remote_dir_load(key, host_cfg.clone());
                             self.path_completions = vec![remote_dir_loading_item(absolute_dir)];
                         }
                     }
@@ -1202,7 +1256,7 @@ impl BuiltinCommandManager {
                 self.remote_dir_cache_lru.retain(|k| k != &key);
                 self.remote_dir_cache_lru.push(key.clone());
                 // 注册后台刷新
-                self.pending_remote_keys.entry(key).or_insert(false);
+                self.register_remote_dir_load(key, terminal_cfg);
                 build_remote_completions(&cached.items, &file_prefix, extra_host_quoted, prefix)
             }
             None => {
@@ -1212,7 +1266,7 @@ impl BuiltinCommandManager {
                 } else {
                     // 无缓存：显示加载中
                     self.is_loading_remote = true;
-                    self.pending_remote_keys.entry(key).or_insert(false);
+                    self.register_remote_dir_load(key, terminal_cfg);
                     vec![remote_dir_loading_item(absolute_dir)]
                 }
             }
@@ -1328,12 +1382,16 @@ fn estimate_overlay_width(items: &[PathCompletionItem]) -> f32 {
     const NAME_CHAR: f32 = 8.5;
     const DESC_CHAR: f32 = 7.0;
 
+    // 用 unicode-width 计算显示宽度：CJK 等双宽字符占 2 列，
+    // 简单 chars().count() 会低估导致浮窗过窄、长条目被裁剪
+    let text_cells = |s: &str| unicode_width::UnicodeWidthStr::width(s) as f32;
+
     let needed = items
         .iter()
         .map(|item| {
-            let name_w = item.name.chars().count() as f32 * NAME_CHAR;
+            let name_w = text_cells(&item.name) * NAME_CHAR;
             let desc_w = host_description(item)
-                .map(|d| 10.0 + d.chars().count() as f32 * DESC_CHAR)
+                .map(|d| 10.0 + text_cells(&d) * DESC_CHAR)
                 .unwrap_or(0.0);
             FIXED_CHROME + name_w + desc_w
         })
@@ -1379,8 +1437,13 @@ fn build_host_only_completions(
 ) -> Vec<PathCompletionItem> {
     let mut items: Vec<PathCompletionItem> = Vec::new();
 
-    // 主机：按 prefix 匹配；prefix 以 `/` 或 `~` 开头则跳过主机匹配（明显是路径）
-    if !prefix.starts_with('/') && !prefix.starts_with('~') && !prefix.starts_with('.') {
+    // 主机候选：prefix 呈路径形态（以 `/`、`~`、`.` 开头或包含 `/`）时跳过
+    // —— 主机名 / label 里不可能出现这些字符
+    let looks_like_path = prefix.starts_with('/')
+        || prefix.starts_with('~')
+        || prefix.starts_with('.')
+        || prefix.contains('/');
+    if !looks_like_path {
         for suggestion in scp_completion::match_hosts_by_prefix(prefix, saved) {
             // description：保留 nickname 等可读名让用户区分；Local 标注 "This machine"
             let description = match suggestion.kind {
@@ -2267,6 +2330,8 @@ where
                         .map(move |(index, item)| {
                             let on_pick = on_pick.clone();
                             let is_selected = Some(index) == selected_index;
+                            // 占位项（读取中 / 读取失败）不可点击、不悬停高亮
+                            let interactive = !item.is_placeholder();
                             let icon_path =
                                 item.icon
                                     .map(|i| i.path())
@@ -2285,13 +2350,13 @@ where
                                 .items_center()
                                 .gap(px(10.0))
                                 .rounded(px(6.0))
-                                .cursor_pointer()
+                                .when(interactive, |this| this.cursor_pointer())
                                 .bg(if is_selected {
                                     theme.accent.opacity(if is_dark { 0.18 } else { 0.12 })
                                 } else {
                                     gpui::transparent_black()
                                 })
-                                .when(!is_selected, |this| {
+                                .when(!is_selected && interactive, |this| {
                                     this.hover(move |style| {
                                         style.bg(theme.accent.opacity(if is_dark {
                                             0.10
@@ -2300,9 +2365,14 @@ where
                                         }))
                                     })
                                 })
-                                .on_mouse_up(MouseButton::Left, move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    on_pick(index, window, cx);
+                                .when(interactive, |this| {
+                                    this.on_mouse_up(
+                                        MouseButton::Left,
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            on_pick(index, window, cx);
+                                        },
+                                    )
                                 })
                                 .child({
                                     let svg_element = svg()
@@ -2606,7 +2676,7 @@ mod tests {
         let req = manager
             .pending_remote_request()
             .expect("pending remote request must be issued");
-        assert_eq!(req.config_id, cfg_id);
+        assert_eq!(req.config, cfg);
         assert_eq!(req.absolute_dir, "/srv/app");
 
         // 模拟 SFTP 加载完成
@@ -3008,5 +3078,126 @@ mod tests {
         assert!(manager.is_argument_input());
         // 整行子串匹配：输入 /scp ali 召回含 alice 的历史
         assert_eq!(manager.history_matches().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scp_placeholder_tests {
+    use super::*;
+
+    fn remote_terminal_manager() -> (BuiltinCommandManager, String) {
+        use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+        let cfg = SshConnectionConfig::new(
+            "1.2.3.4".to_string(),
+            "root".to_string(),
+            AuthMethod::Agent,
+        );
+        let cfg_id = cfg.id();
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_terminal_context(Some(cfg), Some("/srv/app".to_string()));
+        (manager, cfg_id)
+    }
+
+    #[test]
+    fn clicking_loading_placeholder_does_not_touch_buffer() {
+        let (mut manager, _cfg_id) = remote_terminal_manager();
+        manager.update("/scp /srv/ap");
+        assert!(manager.is_loading_remote);
+        // 模拟鼠标点击 loading 占位项（此前会把「读取远端目录中…」写进命令行）
+        manager.pick_path(0);
+        assert_eq!(manager.query(), Some("/scp /srv/ap"));
+    }
+
+    #[test]
+    fn clicking_failed_placeholder_does_not_touch_buffer() {
+        let (mut manager, cfg_id) = remote_terminal_manager();
+        manager.update("/scp /srv/ap");
+        let _ = manager.pending_remote_request().expect("request issued");
+        manager.apply_remote_dir_result(cfg_id, "/srv".to_string(), Err("权限不足".into()));
+        let idx = manager
+            .path_completions
+            .iter()
+            .position(|i| i.name == "无法读取远端目录")
+            .expect("failure placeholder present");
+        // 模拟鼠标点击失败占位项（此前会把「无法读取远端目录」写进命令行）
+        manager.pick_path(idx);
+        assert_eq!(manager.query(), Some("/scp /srv/ap"));
+    }
+
+    #[test]
+    fn placeholder_items_are_marked_non_interactive() {
+        let (mut manager, cfg_id) = remote_terminal_manager();
+        manager.update("/scp /srv/ap");
+        let _ = manager.pending_remote_request().expect("request issued");
+        manager.apply_remote_dir_result(cfg_id, "/srv".to_string(), Err("权限不足".into()));
+        let failed = manager
+            .path_completions
+            .iter()
+            .find(|i| i.name == "无法读取远端目录")
+            .unwrap();
+        assert!(failed.is_placeholder());
+    }
+}
+
+#[cfg(test)]
+mod scp_port_completion_tests {
+    use super::*;
+    use crate::ssh::config::{AuthMethod, SshConnectionConfig};
+
+    fn port_config() -> SshConnectionConfig {
+        let mut cfg = SshConnectionConfig::new(
+            "1.2.3.4".to_string(),
+            "deploy".to_string(),
+            AuthMethod::Agent,
+        );
+        cfg.port = 2222;
+        cfg
+    }
+
+    #[test]
+    fn port_syntax_completion_resolves_host_with_port() {
+        // 输入 `deploy@1.2.3.4:2222:/tm`（未加引号的手写端口形式）：
+        // host 匹配应把端口并回 host，按 /tm 列远端目录
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_ssh_configs(vec![port_config()]);
+        manager.update("/scp deploy@1.2.3.4:2222:/var/lo");
+
+        let req = manager
+            .pending_remote_request()
+            .expect("should request remote dir for host:port");
+        // `/var/lo` ⇒ 列 /var 目录、按 "lo" 过滤（端口已并回 host，不是路径一部分）
+        assert_eq!(req.absolute_dir, "/var");
+        // 请求应携带端口配置的完整快照
+        assert_eq!(req.config, port_config());
+    }
+
+    #[test]
+    fn port_syntax_localhost_not_completed_as_local() {
+        // `user@localhost:2222:/tm` 不应走本机路径补全（否则会把 `2222:/tm`
+        // 当本机路径，列出本机文件误导用户）
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_ssh_configs(vec![]);
+        manager.update("/scp someone@localhost:2222:/tm");
+        // 无保存连接 ⇒ 无 host 匹配 ⇒ 不应有本机文件候选，也不应有远端请求
+        assert!(manager.pending_remote_request().is_none());
+        let has_local_files = manager
+            .path_completions
+            .iter()
+            .any(|i| i.kind == CompletionKind::File || i.kind == CompletionKind::Directory);
+        assert!(
+            !has_local_files,
+            "user@localhost:2222: 前缀不应触发本机文件补全"
+        );
+    }
+
+    #[test]
+    fn plain_local_keyword_completion_still_works() {
+        // `Local:/tm`（无端口）仍走本机补全
+        let mut manager = BuiltinCommandManager::new();
+        manager.set_ssh_configs(vec![]);
+        manager.update("/scp Local:/tm");
+        assert!(manager.pending_remote_request().is_none());
+        // 本机补全由 cwd 决定，可能有或没有条目，但绝不应出现远端 loading
+        assert!(!manager.is_loading_remote);
     }
 }

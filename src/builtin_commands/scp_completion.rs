@@ -89,7 +89,17 @@ pub fn shell_split_tokens(area: &str, base_offset: usize) -> Vec<ShellToken> {
                         mode = QuoteMode::None;
                         idx += 1;
                     }
-                    '\\' if idx + 1 < total => {
+                    // POSIX：双引号内反斜杠仅在 `$ ` " \\ 换行` 前保留转义含义；
+                    // 其余情况（如 `\n`、`\:`）反斜杠是字面字符。
+                    // 旧实现把任意 `\x` 都当转义，会静默丢掉路径里的字面反斜杠
+                    // （如 `"C:\\new"` 变成 `C:new`）。
+                    '\\'
+                        if idx + 1 < total
+                            && matches!(
+                                chars[idx + 1].1,
+                                '$' | '`' | '"' | '\\' | '\n'
+                            ) =>
+                    {
                         value.push(chars[idx + 1].1);
                         idx += 2;
                     }
@@ -174,6 +184,42 @@ pub fn first_unquoted_colon(raw_token: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// 判断字符串中是否存在未闭合的引号（提交时校验用）。
+///
+/// 补全阶段可以容忍未闭合引号（用户还在输入），但提交 `/scp` 时应像 shell
+/// 一样报错，而不是把 `"a b` 静默当成路径 `a b`。
+pub fn has_unclosed_quote(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    let mut mode = QuoteMode::None;
+    while let Some(c) = chars.next() {
+        match mode {
+            QuoteMode::None => match c {
+                '"' => mode = QuoteMode::Double,
+                '\'' => mode = QuoteMode::Single,
+                // 转义：跳过下一个字符
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            QuoteMode::Double => match c {
+                '"' => mode = QuoteMode::None,
+                // POSIX 双引号转义集合（与 shell_split_tokens 保持一致）
+                '\\' if matches!(chars.peek(), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            QuoteMode::Single => {
+                if c == '\'' {
+                    mode = QuoteMode::None;
+                }
+            }
+        }
+    }
+    mode != QuoteMode::None
 }
 
 /// 把纯文本按 shell 安全规则转义为一个 token。
@@ -299,6 +345,47 @@ pub fn analyse_at(buffer: &str, cursor: usize) -> Option<ScpCompletionQuery> {
     })
 }
 
+/// 计算补全浮窗在 `/scp` 参数 token 内的锚点（字节偏移）：
+/// “用户看到的最后一个 `/` 之后”（目录前缀的末尾），补全从这里开始替换文件名部分。
+///
+/// **必须基于原始（含引号/转义）token 的字节计算**：若用去引号后 prefix 的长度
+/// 去切原始缓冲，引号/反斜杠造成的字节差不仅让锚点错位，还可能落到 UTF-8
+/// 多字节字符中间，令调用方 `&buffer[..anchor]` 直接 panic。
+///
+/// 返回的偏移保证：≤ buffer.len() 且落在字符边界上。
+/// 光标不在可补全位置时返回 `None`（调用方可退回通用锚点）。
+pub fn path_anchor_byte(buffer: &str, cursor: usize) -> Option<usize> {
+    let query = analyse_at(buffer, cursor)?;
+    let raw_token = &buffer[query.token_start..query.token_end];
+    match query.phase {
+        ScpCompletionPhase::HostOrLocal { prefix } => {
+            if prefix.starts_with('/')
+                || prefix.starts_with('.')
+                || prefix.starts_with('~')
+                || prefix.contains('/')
+            {
+                // 锚到 token 内最后一个 `/` 之后（目录前缀末尾）。
+                // prefix 不含 `/`（如 `.hidden`）时 raw_token 也没有 `/`，
+                // 返回 None 交给调用方退回通用锚点。
+                let last_slash = raw_token.rfind('/')?;
+                Some((query.token_start + last_slash + 1).min(buffer.len()))
+            } else {
+                Some(query.token_start)
+            }
+        }
+        ScpCompletionPhase::RemotePath { .. } => {
+            let colon = first_unquoted_colon(raw_token)?;
+            let path_start = query.token_start + colon + 1;
+            let path_raw = &raw_token[colon + 1..];
+            let anchor = match path_raw.rfind('/') {
+                Some(pos) => path_start + pos + 1,
+                None => path_start,
+            };
+            Some(anchor.min(buffer.len()))
+        }
+    }
+}
+
 /// 把 raw token 做一次 shell 展开（丢掉引号/反斜杠修饰）。
 pub fn unquote_raw(raw: &str) -> String {
     // 用相同的分词器处理单个 token
@@ -309,8 +396,26 @@ pub fn unquote_raw(raw: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 若 path 以 `<数字>:` 开头，返回 `(端口数字, 其余路径)`。
+///
+/// 用于识别手写、未加引号的 `user@host:port:path` 端口语法：
+/// `first_unquoted_colon` 在端口前的冒号处切分，host 丢失端口、path 以端口开头。
+/// 判定必须是「纯数字 + 冒号」，避免把 `2024/notes.txt` 这类正常相对路径误判。
+pub fn split_port_prefix(path: &str) -> Option<(&str, &str)> {
+    let colon = path.find(':')?;
+    let digits = &path[..colon];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits, &path[colon + 1..]))
+}
+
 /// 判断 host token 是否是保留关键字 `Local`（不区分大小写），
 /// 或者补全后的标准形态 `xxx@localhost` / `xxx@127.0.0.1`。
+///
+/// 注意：这会**优先于**已保存的同名连接（如保存了 `root@localhost` 的 SSH 配置，
+/// `root@localhost:/path` 仍指向本机而非经 SSH 访问）。带端口的
+/// `user@localhost:port:` 形态不算本机关键字（见 parse_scp_token 的端口处理）。
 pub fn is_local_keyword_str(token: &str) -> bool {
     if token.eq_ignore_ascii_case("local") {
         return true;
@@ -657,5 +762,127 @@ mod tests {
         assert_eq!(&raw[pos..pos + 1], ":");
         assert_eq!(&raw[..pos], "中文Host");
         assert_eq!(&raw[pos + 1..], "/tmp/file.txt");
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    fn assert_safe(buffer: &str, cursor: usize) {
+        if let Some(anchor) = path_anchor_byte(buffer, cursor) {
+            assert!(anchor <= buffer.len(), "anchor {anchor} > len {}", buffer.len());
+            assert!(
+                buffer.is_char_boundary(anchor),
+                "anchor {anchor} not a char boundary in {buffer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_never_lands_inside_multibyte_char() {
+        // 旧实现的 panic 复现用例：token 中间有引号 + 多字节字符，
+        // 去引号 prefix 的字节长度切原始缓冲落在「中」的中间字节上。
+        let buffer = "/scp a\"b\"中/x";
+        let anchor = path_anchor_byte(buffer, buffer.len()).expect("anchor exists");
+        assert!(buffer.is_char_boundary(anchor), "anchor {anchor} mid-char");
+        // 锚点应落在最后一个 '/' 之后（文件名「x」的起点）
+        let last_slash = buffer.rfind('/').unwrap();
+        assert_eq!(anchor, last_slash + 1);
+    }
+
+    #[test]
+    fn anchor_after_last_slash_for_plain_local_path() {
+        let buffer = "/scp Downloads/app.tar.gz";
+        let anchor = path_anchor_byte(buffer, buffer.len()).unwrap();
+        assert_eq!(anchor, "/scp Downloads/".len());
+    }
+
+    #[test]
+    fn anchor_for_remote_path_after_colon_slash() {
+        let buffer = "/scp alice:/var/lo";
+        let anchor = path_anchor_byte(buffer, buffer.len()).unwrap();
+        assert_eq!(anchor, "/scp alice:/var/".len());
+    }
+
+    #[test]
+    fn anchor_for_quoted_remote_path_uses_raw_bytes() {
+        // 带引号 path：锚点必须基于原始字节（引号算在内），不能再靠 unquote 长度
+        let buffer = "/scp \"my host\":/var/lo";
+        let anchor = path_anchor_byte(buffer, buffer.len()).unwrap();
+        assert_eq!(anchor, "/scp \"my host\":/var/".len());
+    }
+
+    #[test]
+    fn anchor_for_host_only_token_is_token_start() {
+        // 还在打 host 前缀（无 '/'）⇒ 锚点在 token 起点
+        let buffer = "/scp ali";
+        let anchor = path_anchor_byte(buffer, buffer.len()).unwrap();
+        assert_eq!(anchor, "/scp ".len());
+    }
+
+    #[test]
+    fn anchor_fuzz_various_buffers_stays_on_boundary() {
+        // 各类病态输入一律不得 panic 且必须落在字符边界
+        for buffer in [
+            "/scp 中/文",
+            "/scp \"a b\"/中/x",
+            "/scp a\\ b/中",
+            "/scp alice:~/中文/",
+            "/scp root@1.2.3.4:",
+            "/scp :",
+            "/scp /中",
+            "/scp ./中/x",
+        ] {
+            for cursor in 0..=buffer.len() {
+                assert_safe(buffer, cursor);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod posix_quote_tests {
+    use super::*;
+
+    #[test]
+    fn double_quote_backslash_posix_semantics() {
+        // POSIX：双引号内 `\n` 是字面反斜杠 + n（不是转义）
+        let tokens = shell_split_tokens(r#""C:\new folder\x""#, 0);
+        assert_eq!(tokens[0].value, "C:\\new folder\\x");
+        // 双引号内 `\"` 与 `\\` 仍是转义
+        let tokens = shell_split_tokens(r#""a\"b\\c""#, 0);
+        assert_eq!(tokens[0].value, "a\"b\\c");
+        // 单引号内反斜杠永远是字面
+        let tokens = shell_split_tokens(r"'C:\new'", 0);
+        assert_eq!(tokens[0].value, "C:\\new");
+        // 未加引号时 `\<any>` 仍是转义
+        let tokens = shell_split_tokens("a\\ b", 0);
+        assert_eq!(tokens[0].value, "a b");
+    }
+
+    #[test]
+    fn detects_unclosed_quotes() {
+        assert!(has_unclosed_quote("/scp \"a b"));
+        assert!(has_unclosed_quote("/scp 'abc"));
+        assert!(!has_unclosed_quote("/scp \"a b\""));
+        assert!(!has_unclosed_quote("/scp 'a' \"b\""));
+        // 未加引号的反斜杠不开启引号模式
+        assert!(!has_unclosed_quote("a\\ b"));
+        // 引号内的反斜杠转义不误判闭合
+        assert!(!has_unclosed_quote(r#""a\"b""#));
+        assert!(has_unclosed_quote(r#""a\"b"#));
+        assert!(has_unclosed_quote("a'b"));
+    }
+
+    #[test]
+    fn port_split_prefix_detects_digits_colon() {
+        assert_eq!(split_port_prefix("2222:/tmp/x"), Some(("2222", "/tmp/x")));
+        assert_eq!(split_port_prefix("22:"), Some(("22", "")));
+        // 非纯数字、无冒号、空串都不是端口形态
+        assert_eq!(split_port_prefix("2024/notes.txt"), None);
+        assert_eq!(split_port_prefix("a2:/x"), None);
+        assert_eq!(split_port_prefix(""), None);
+        assert_eq!(split_port_prefix(":/x"), None);
     }
 }

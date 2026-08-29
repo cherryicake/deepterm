@@ -140,7 +140,7 @@ pub fn init_global_registry() -> CommandRegistry {
         icon: Icon::Server,
         availability: Availability::Always,
         argument: ArgumentType::Required {
-            hint: "src dst",
+            hint: "src... dst_dir",
         },
         handler_id: CommandHandlerId("scp_transfer"),
     });

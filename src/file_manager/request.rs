@@ -20,8 +20,11 @@ pub struct TransferRequest {
     pub destination: FileEndpoint,
     pub operation: TransferOperation,
     pub conflict_policy: ConflictPolicy,
-    /// 单源文件场景下的目标文件名。`Some` 时将 `destination` 视为目录，
-    /// 并用该名称覆盖源文件名；多源或源为目录时忽略。
+    /// 单源文件场景下的目标文件名（`/scp` 无尾斜杠的目的 token 拆出）。
+    /// `Some` 时将 `destination` 视为目录，并用该名称覆盖源文件名；
+    /// 若 `destination + 该名称` 实际是已存在的目录，传输层会退化为
+    /// “拷入该目录”（与 scp CLI 一致，见 `TransferManager::resolve_existing_dir_destination`）。
+    /// 多源时忽略。
     pub rename_to: Option<String>,
 }
 

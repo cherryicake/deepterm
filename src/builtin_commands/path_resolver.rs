@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ssh::SshConnectionConfig;
 
@@ -19,8 +19,34 @@ pub struct RemotePathContext {
 /// 将用户输入的原始路径解析为绝对路径或远程路径。
 pub struct PathResolver;
 
+/// 词法规范化：去掉 `.` 组件、重复分隔符与尾部斜杠，保留 `..`。
+/// 输入为空（如路径仅剩 `./`）时退化为 `.`，避免产出空路径。
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                // push 绝对组件会重置路径；根目录只可能是第一个组件，行为正确
+                out.push(comp);
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 impl PathResolver {
     /// 解析本地路径
+    ///
+    /// 结果会做词法规范化：去掉 `.` 组件与重复分隔符（`/a/./b` → `/a/b`），
+    /// 并去掉尾部斜杠。这样下游的相等性判断（如 `TransferRequest::is_noop`）
+    /// 不会被同一目录的多种写法骗过。
+    /// `..` 不做词法折叠：遇到符号链接时词法折叠会指向错误位置，
+    /// 交给文件系统在打开时解析。
     pub fn resolve_local(raw_path: &str, ctx: &LocalPathContext) -> PathBuf {
         let trimmed = raw_path.trim().trim_matches(|c| matches!(c, '"' | '\''));
         let expanded = if trimmed == "~" {
@@ -33,7 +59,7 @@ impl PathResolver {
             PathBuf::from(trimmed)
         };
 
-        if expanded.is_absolute() {
+        let resolved = if expanded.is_absolute() {
             expanded
         } else {
             ctx.process_cwd
@@ -42,7 +68,8 @@ impl PathResolver {
                 .or_else(dirs::home_dir)
                 .map(|cwd| cwd.join(&expanded))
                 .unwrap_or(expanded)
-        }
+        };
+        normalize_lexical(&resolved)
     }
 
     /// 解析远程路径
@@ -213,6 +240,55 @@ mod tests {
         assert_eq!(
             PathResolver::parse_remote_working_directory_from_title("user@host: /home/user"),
             Some("/home/user".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    fn ctx(cwd: &str) -> LocalPathContext {
+        LocalPathContext {
+            working_directory: Some(PathBuf::from(cwd)),
+            process_cwd: None,
+        }
+    }
+
+    #[test]
+    fn resolves_and_normalizes_dot_components() {
+        assert_eq!(
+            PathResolver::resolve_local("./Cargo.toml", &ctx("/home/user/project")),
+            PathBuf::from("/home/user/project/Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn normalizes_trailing_slash_and_double_slashes() {
+        assert_eq!(
+            PathResolver::resolve_local("/tmp//a.txt", &ctx("/cwd")),
+            PathBuf::from("/tmp/a.txt")
+        );
+        assert_eq!(
+            PathResolver::resolve_local("/tmp/dir/", &ctx("/cwd")),
+            PathBuf::from("/tmp/dir")
+        );
+    }
+
+    #[test]
+    fn keeps_parent_dir_components() {
+        // `..` 不做词法折叠（符号链接语义下折叠会指错位置）
+        assert_eq!(
+            PathResolver::resolve_local("../a.txt", &ctx("/home/user/project")),
+            PathBuf::from("/home/user/project/../a.txt")
+        );
+    }
+
+    #[test]
+    fn lone_dot_falls_back_to_cwd() {
+        assert_eq!(
+            PathResolver::resolve_local(".", &ctx("/home/user/project")),
+            PathBuf::from("/home/user/project")
         );
     }
 }

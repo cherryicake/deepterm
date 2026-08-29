@@ -35,6 +35,16 @@ pub struct PathCompletionItem {
     pub replacement: Option<String>,
 }
 
+impl PathCompletionItem {
+    /// 是否为非交互占位项（"读取远端目录中…" / "无法读取远端目录"）。
+    ///
+    /// 占位项既没有可替换文本也没有真实路径，绝不能被选中应用——
+    /// 否则会把占位文案写进命令行。
+    pub fn is_placeholder(&self) -> bool {
+        self.replacement.is_none() && self.path.as_os_str().is_empty()
+    }
+}
+
 /// 文件系统路径补全引擎
 ///
 /// 根据用户输入的路径前缀，提供文件和目录的补全建议。

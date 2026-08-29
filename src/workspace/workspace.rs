@@ -1309,7 +1309,8 @@ impl Workspace {
                         if let PanelContent::Terminal(terminal_view) = panel_ref.content() {
                             terminal_view.update(_cx, |tv, cx| {
                                 // 各目标面板用自己的 cwd / ssh 上下文静默执行，
-                                // 不弹 Toast / 冲突对话框（UI 副作用仅发生在源面板）
+                                // 不弹 Toast / 冲突对话框（UI 副作用仅发生在源面板）；
+                                // /scp 等全局副作用在接收面板会被抑制，只由源面板执行一次
                                 tv.execute_broadcast_command(&command_line, cx);
                             });
                         }

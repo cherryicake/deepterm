@@ -246,6 +246,10 @@ pub struct TerminalView {
     ime_state: Option<ImeState>,
     /// DeepTerm 内置命令管理器
     builtin_command_manager: BuiltinCommandManager,
+    /// `/scp` 主机候选的磁盘配置缓存（加载时刻 + 快照）。
+    /// 避免在 `/scp` 输入期间每个按键都读盘解析 ssh.json；短 TTL 兼顾
+    /// 「新建/修改连接后尽快可见」。
+    scp_hosts_cache: Option<(std::time::Instant, Vec<crate::ssh::SshConnectionConfig>)>,
     /// 广播输入回调 - 当终端输入需要广播给其他终端时使用
     broadcast_callback: Option<BroadcastInputCallback>,
     /// 应用远端同步的内建命令缓冲期间置位，阻止 mutate_builtin_command 再次广播（防回环）。
@@ -542,6 +546,7 @@ impl TerminalView {
                 selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
+                scp_hosts_cache: None,
                 broadcast_callback: None,
                 broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
@@ -733,6 +738,7 @@ impl TerminalView {
                 selection_autoscroll_task: None,
                 ime_state: None,
                 builtin_command_manager: BuiltinCommandManager::new(),
+                scp_hosts_cache: None,
                 broadcast_callback: None,
                 broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
@@ -1453,7 +1459,13 @@ impl TerminalView {
             .scp_path_anchor_byte(buffer, cursor)
             .or_else(|| self.generic_path_anchor_byte(buffer, cursor))
             .unwrap_or(0);
-        UnicodeWidthStr::width(&buffer[..anchor_byte.min(buffer.len())]) as f32
+        // 防御：锚点必须落在字符边界上，否则切片 panic（应用崩溃）。
+        // 正常路径下各 anchor 计算已保证边界，这里兜底避免未来回归。
+        let mut anchor = anchor_byte.min(buffer.len());
+        while anchor > 0 && !buffer.is_char_boundary(anchor) {
+            anchor -= 1;
+        }
+        UnicodeWidthStr::width(&buffer[..anchor]) as f32
     }
 
     fn generic_path_anchor_byte(&self, buffer: &str, cursor: usize) -> Option<usize> {
@@ -1469,32 +1481,7 @@ impl TerminalView {
         if buffer.split_whitespace().next()? != "/scp" {
             return None;
         }
-
-        let query = crate::builtin_commands::scp_completion::analyse_at(buffer, cursor)?;
-        let raw_token = &buffer[query.token_start..query.token_end];
-        match query.phase {
-            crate::builtin_commands::ScpCompletionPhase::HostOrLocal { prefix } => {
-                if prefix.starts_with('/')
-                    || prefix.starts_with('.')
-                    || prefix.starts_with('~')
-                    || prefix.contains('/')
-                {
-                    let (dir_part, _) =
-                        crate::builtin_commands::PathCompletionEngine::split_path_prefix(&prefix);
-                    Some(query.token_start + dir_part.len().min(raw_token.len()))
-                } else {
-                    Some(query.token_start)
-                }
-            }
-            crate::builtin_commands::ScpCompletionPhase::RemotePath { prefix, .. } => {
-                let colon =
-                    crate::builtin_commands::scp_completion::first_unquoted_colon(raw_token)?;
-                let path_start = query.token_start + colon + 1;
-                let (dir_part, _) =
-                    crate::builtin_commands::PathCompletionEngine::split_path_prefix(&prefix);
-                Some(path_start + dir_part.len().min(buffer.len().saturating_sub(path_start)))
-            }
-        }
+        crate::builtin_commands::scp_completion::path_anchor_byte(buffer, cursor)
     }
 
     /// 渲染内建命令建议浮层，并把鼠标选择转成一次显式补全。
@@ -1757,12 +1744,13 @@ impl TerminalView {
                         request: request.clone(),
                     });
                 } else {
-                    // 静默模式：冲突策略降级为 Skip，避免在目标面板弹冲突对话框
-                    let mut silent_request = request.clone();
-                    silent_request.conflict_policy = crate::file_manager::ConflictPolicy::Skip;
-                    cx.emit(Event::StartTransfer {
-                        request: silent_request,
-                    });
+                    // 静默（广播接收）模式：文件传输是**全局副作用**（工作区级任务），
+                    // 而不是面板局部行为。若每个接收面板都各自启动一次，同一份文件
+                    // 会被并发传 N 次；并发写同一目标路径还可能损坏文件。
+                    // 因此传输只由发起面板执行一次，接收面板不重复执行。
+                    log::info!(
+                        "Broadcast /scp suppressed on receiving panel (transfer executes once on the origin panel)"
+                    );
                 }
             }
             Some(CommandResult::Log { .. }) => {
@@ -1805,12 +1793,15 @@ impl TerminalView {
     fn submit_resolved_builtin_command(&mut self, command_line: String, cx: &mut Context<Self>) {
         self.finish_builtin_command_input(cx);
 
+        let result = self.execute_builtin_command(&command_line, cx, BuiltinExecMode::Interactive);
+
         // 记录到命令历史（仅首 token 命中注册表的内建命令），供下次召回整行。
-        if crate::builtin_commands::find_builtin_command(&command_line).is_some() {
+        // 只在执行成功时记录：失败的命令（如未知主机）召回出来只会再次失败。
+        if crate::builtin_commands::find_builtin_command(&command_line).is_some()
+            && !matches!(result, Some(crate::builtin_commands::CommandResult::Error { .. }))
+        {
             crate::builtin_commands::history::record_command(&command_line);
         }
-
-        let result = self.execute_builtin_command(&command_line, cx, BuiltinExecMode::Interactive);
 
         match result {
             // 未命中注册表：整行回落到 shell（内部经 write_with_broadcast 广播原始输入）
@@ -1819,8 +1810,10 @@ impl TerminalView {
             }
             // FallThrough 已在 execute_builtin_command 内部回落到 shell 并完成原始广播
             Some(CommandResult::FallThrough { .. }) => {}
-            // 应用层命令已接管：把整行命令广播给组内其他面板，让它们在各自上下文静默执行。
-            // 注意不能走 Raw 广播 —— 内建命令文本从未进入 PTY，其他 shell 拿到它毫无意义。
+            // 应用层命令已接管：把整行命令广播给组内其他面板，让面板局部命令（如 /open）
+            // 在各自上下文静默执行。注意：全局副作用命令（如 /scp 的文件传输）在接收面板
+            // 会被抑制（见 execute_builtin_command 的 StartTransfer 分支），只由本面板执行一次。
+            // 另外不能走 Raw 广播 —— 内建命令文本从未进入 PTY，其他 shell 拿到它毫无意义。
             Some(_) => {
                 if let Some(ref callback) = self.broadcast_callback {
                     callback(BroadcastMsg::BuiltinCommand(command_line));
@@ -1841,7 +1834,8 @@ impl TerminalView {
     /// 广播接收方入口：以静默模式执行一条内建命令。
     ///
     /// 各面板用自己的 cwd / ssh 上下文解析并执行（命令历史、Toast、冲突弹窗等
-    /// UI 副作用只在发起面板发生）。若本面板正处于内建命令输入中，先清空其缓冲。
+    /// UI 副作用只在发起面板发生）；**全局副作用（/scp 的文件传输）会被抑制**，
+    /// 只由发起面板执行一次。若本面板正处于内建命令输入中，先清空其缓冲。
     pub fn execute_broadcast_command(&mut self, command_line: &str, cx: &mut Context<Self>) {
         // 接收方执行不产生任何广播：清缓冲的 BuiltinEnd 已由发起面板发出，
         // 这里再发会造成冗余消息甚至回环。用守卫确保即使在 panic 时也复位标志。
@@ -1939,15 +1933,26 @@ impl TerminalView {
             .set_terminal_context(self.ssh_config.clone(), terminal_remote_cwd);
 
         // 进入 /scp 之前先把保存的 SSH 连接注入管理器，供 host / 远端目录补全使用。
-        // 调用点可能很多（每次输入字符），所以仅在当前缓冲以 `/scp` 开头时才加载。
+        // 调用点可能很多（每次输入字符），读盘解析 ssh.json 的开销不可接受；
+        // 用短 TTL 缓存：连续输入期间不重复读盘，新建/修改的连接至多 5 秒后可见。
         let should_refresh_hosts = self
             .builtin_command_manager
             .query()
             .map(|q| q.trim_start().starts_with("/scp"))
             .unwrap_or(false);
         if should_refresh_hosts {
-            let configs = crate::ssh::config::SshGlobalConfig::load().saved_connections;
-            self.builtin_command_manager.set_ssh_configs(configs);
+            const SCP_HOSTS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+            // 需要重读：从未加载过，或缓存已过 TTL
+            let needs_reload = self
+                .scp_hosts_cache
+                .as_ref()
+                .map(|(loaded_at, _)| loaded_at.elapsed() >= SCP_HOSTS_CACHE_TTL)
+                .unwrap_or(true);
+            if needs_reload {
+                let configs = crate::ssh::config::SshGlobalConfig::load().saved_connections;
+                self.builtin_command_manager.set_ssh_configs(configs.clone());
+                self.scp_hosts_cache = Some((std::time::Instant::now(), configs));
+            }
         }
 
         // 注入命令历史快照（内存克隆，不读盘），供补全弹窗召回历史整行。
@@ -1979,32 +1984,17 @@ impl TerminalView {
     }
 
     /// 后台读取远端目录并把结果回写到 `BuiltinCommandManager`。
+    ///
+    /// 请求自带连接配置快照（见 `RemoteCompletionRequest`），不再回读磁盘上的
+    /// 保存配置：当前终端的连接可能未保存/已被改名，只靠 id 查表会永远查不到。
     fn spawn_remote_dir_load(
         &self,
         request: crate::builtin_commands::RemoteCompletionRequest,
         cx: &mut Context<Self>,
     ) {
-        let saved = crate::ssh::config::SshGlobalConfig::load().saved_connections;
-        let Some(config) = saved.iter().find(|c| c.id() == request.config_id).cloned() else {
-            // 配置已删：直接回传空列表避免死等，并提示用户刷新配置
-            let config_id = request.config_id.clone();
-            let dir = request.absolute_dir.clone();
-            cx.spawn(async move |this, cx| {
-                this.update(cx, |this, cx| {
-                    this.builtin_command_manager.apply_remote_dir_result(
-                        config_id,
-                        dir,
-                        Err("SSH 配置已被删除或修改，请刷新连接列表后重试".into()),
-                    );
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-            return;
-        };
-        let abs_dir = request.absolute_dir.clone();
-        let cfg_id = request.config_id.clone();
+        let config = request.config;
+        let abs_dir = request.absolute_dir;
+        let cfg_id = config.id();
 
         cx.spawn(async move |this, cx| {
             let abs_dir_task = abs_dir.clone();
@@ -2868,7 +2858,7 @@ impl Render for TerminalView {
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
                     // 视图内释放时，TerminalElement::paint 注册的全局释放
                     // 监听器（bubble 阶段先于本 handler 触发）通常已处理过
-                    // 并清掉了 `selecting`；这里退化为兑底路径。
+                    // 并清掉了 `selecting`；这里退化为兜底路径。
                     this.finish_mouse_selection(event, cx);
                 }),
             )
