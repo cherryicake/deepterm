@@ -72,19 +72,45 @@ where
         self.grouping = false;
     }
 
+    /// 强制开启一个新分组，下一次 `push` 必定落在新的版本号上。
+    ///
+    /// 用于语义边界：切换光标位置、换行、执行 undo/redo 等场景下，即便两次
+    /// 编辑相隔很近也不应被合并成同一步撤销。
+    pub fn break_group(&mut self) {
+        self.version = self.version.wrapping_add(1);
+        self.last_changed_at = std::time::Instant::now();
+    }
+
     /// 递增版本号
+    ///
+    /// `last_changed_at` 记录的是**当前这一组开始的时间**，而不是上一次
+    /// `push` 的时间。两者差别很大：
+    ///
+    /// - 若每次 `push` 都刷新锚点，判定基准就退化成「距上次按键的间隔」。
+    ///   以 0.9s 的节奏持续输入、`group_interval` 为 1s 时，`elapsed()` 恒为
+    ///   0.9s < 1s，版本号永不递增 —— 一整段输入会被折叠成一个 undo 组，
+    ///   一次 Cmd+Z 全没了。
+    /// - 锚点只在**开新组**时刷新，则累积间隔超过 `group_interval` 就会切组，
+    ///   连续输入会被切成若干步，符合预期。
     fn inc_version(&mut self) -> usize {
         let now = std::time::Instant::now();
         if !self.grouping {
             if let Some(interval) = self.group_interval {
                 if self.last_changed_at.elapsed() > interval {
+                    // 上一组到此为止，新组从现在开始计时。
                     self.version += 1;
+                    self.last_changed_at = now;
                 }
+                // 仍在间隔内：沿用旧锚点，让本组有确定的寿命上限。
             } else {
                 self.version += 1;
+                self.last_changed_at = now;
             }
+        } else {
+            // 显式分组期间版本号不动，但要持续刷新锚点，这样 `end_grouping`
+            // 之后的下一次编辑是从「分组结束」开始计时，而不是从建组开始。
+            self.last_changed_at = now;
         }
-        self.last_changed_at = now;
         self.version
     }
 
@@ -253,6 +279,70 @@ mod tests {
         // undo 应该一次性撤销同一版本的所有变更
         let changes = history.undo().unwrap();
         assert_eq!(changes.len(), 3);
+    }
+
+    /// 回归测试：连续等速输入必须被切成多个 undo 组。
+    ///
+    /// 曾经的 bug：`inc_version` 每次 `push` 都刷新计时锚点，于是判定基准是
+    /// 「距上次按键」而非「距本组开始」。按键间隔恒小于 `group_interval` 时
+    /// 版本号永不递增，整段输入被折叠成一个 undo 组。
+    #[test]
+    fn test_group_interval_measures_from_group_start() {
+        let mut history = History::new().group_interval(std::time::Duration::from_millis(100));
+        // 每 60ms 敲一次，节奏稳定且小于 100ms 的分组间隔。
+        for (i, ch) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            history.push(Change::new(i..i, "", i..i + 1, ch));
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+
+        // 累积间隔跨过 100ms 就应该切组：a b | c d | e，共 3 组。
+        let versions: Vec<usize> = history.undos().iter().map(|c| c.version()).collect();
+        assert_eq!(versions.len(), 5);
+        assert_eq!(versions[0], versions[1], "a and b belong to one group");
+        assert_eq!(versions[2], versions[3], "c and d belong to one group");
+        assert_ne!(versions[1], versions[2], "a second group must have started");
+        assert_ne!(versions[3], versions[4], "a third group must have started");
+
+        // 一次 undo 只撤销最后一组（单个 "e"），而不是整段输入。
+        let changes = history.undo().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_text, "e");
+        assert_eq!(history.undos().len(), 4);
+    }
+
+    #[test]
+    fn test_break_group_starts_a_new_undo_step() {
+        let mut history = History::new().group_interval(std::time::Duration::from_secs(60));
+        history.push(Change::new(0..0, "", 0..1, "a"));
+        history.push(Change::new(1..1, "", 1..2, "b"));
+
+        history.break_group();
+        history.push(Change::new(2..2, "", 2..3, "c"));
+
+        // 虽然间隔远未超过 group_interval，"c" 也必须独立成组。
+        let changes = history.undo().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].new_text, "c");
+    }
+
+    /// 回归测试：`unique()` 曾完全是空操作 —— 去重的 `retain` 执行在
+    /// `set_version` 之前，而 `Change` 的 `PartialEq` 把 `version` 也算进
+    /// 相等性，于是新记录（version == 0）与栈内记录（真实版本号）永远不等。
+    #[test]
+    fn test_unique_deduplicates_changes() {
+        let mut history: History<Change> = History::new().max_undos(100).unique();
+
+        history.push(Change::new(0..0, "", 0..1, "a"));
+        history.push(Change::new(1..1, "", 1..2, "b"));
+        // 与第一条内容完全相同的重复记录必须被去重。
+        history.push(Change::new(0..0, "", 0..1, "a"));
+
+        assert_eq!(
+            history.undos().len(),
+            2,
+            "duplicate change should replace the older one, not stack up"
+        );
+        assert_eq!(history.undos().back().unwrap().new_text, "a");
     }
 
     #[test]

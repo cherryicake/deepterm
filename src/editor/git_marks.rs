@@ -44,10 +44,26 @@ pub fn compute_git_line_marks(old_text: &str, new_text: &str) -> Vec<(u32, GitLi
         }
     }
 
-    // 同行多个标记去重（保留优先级：Added/Modified > Deleted 三角只是提示）
-    marks.sort_by_key(|(line, _)| *line);
+    // 同一行可能拿到多个标记：纯删除 hunk 的锚点挂在「其后第一行」，当它后面
+    // 紧跟着一个修改 hunk 时，两者会落在同一个新行号上。
+    // 按 (行号, 优先级) 排序，让 Added/Modified 排在同组最前 —— `dedup_by` 只
+    // 保留每组第一个，优先级高的才会胜出。
+    // （此前仅按行号做稳定排序，而 Deleted 是先 push 的，反而把 Added/Modified
+    // 挤掉了，与注释声明的优先级相反。）
+    marks.sort_by_key(|(line, mark)| (*line, mark_priority(*mark)));
     marks.dedup_by(|a, b| a.0 == b.0);
     marks
+}
+
+/// 去重优先级，数值越小越优先保留。
+///
+/// `Deleted` 的三角只是「此处上方有删除」的提示，应让位于 `Added` / `Modified`
+/// 这类描述当前行自身状态的标记。
+fn mark_priority(mark: GitLineMark) -> u8 {
+    match mark {
+        GitLineMark::Deleted => 1,
+        GitLineMark::Added | GitLineMark::Modified => 0,
+    }
 }
 
 #[cfg(test)]

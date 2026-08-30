@@ -70,6 +70,13 @@ enum LayoutPreference {
 /// editor columns with gutters).
 const SPLIT_MIN_WIDTH: f32 = 960.0;
 
+/// 陈旧 hunk 与重算 hunk 之间允许的最大行号偏移。
+///
+/// 用户在块附近连续编辑会让目标块的行号有些许漂移，这个容差足以覆盖；
+/// 但相距过远就意味着误匹配，此时宁可放弃还原，也不能把 HEAD 内容写到
+/// 无关的位置上。
+const REVERT_MATCH_TOLERANCE: u32 = 20;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     Left,
@@ -146,6 +153,8 @@ pub struct DiffView {
     loading: bool,
     /// Error from the last fetch, if any.
     load_error: Option<String>,
+    /// Error from the last save, if any.
+    save_error: Option<String>,
     recompute_gen: u32,
     scroll_syncing: bool,
     /// 已展开的折叠区 id（= 隐藏区 new 侧起始行）。
@@ -201,6 +210,7 @@ impl DiffView {
             refreshing: false,
             loading: true,
             load_error: None,
+            save_error: None,
             recompute_gen: 0,
             scroll_syncing: false,
             expanded_separators: std::collections::HashSet::new(),
@@ -534,6 +544,11 @@ impl DiffView {
         if !self.pending_jump {
             return;
         }
+        // 唯一的重试理由是「编辑器还没完成首次布局、拿不到 line_height」。
+        //
+        // 不能用「滚动偏移有没有变化」当重试条件：目标行在文件开头几行时偏移
+        // 量本来就是 0，`scroll_editor_to_row` 写了也没变化，条件恒为真，于是
+        // 每一帧都重复设置滚动并 notify —— 一个永久的重绘死循环。
         match self.effective_mode() {
             DiffMode::Unified => {
                 let Some(row) = self.unified_hunk_rows.first().copied() else {
@@ -541,26 +556,38 @@ impl DiffView {
                     return;
                 };
                 let editor = self.unified.clone();
-                let before = editor.read(cx).scroll_handle.offset().y;
+                if Self::editor_line_height(&editor, cx) <= px(0.) {
+                    return;
+                }
                 Self::scroll_editor_to_row(&editor, row, 3, cx);
-                self.pending_jump = editor.read(cx).scroll_handle.offset().y == before && row > 0;
+                self.pending_jump = false;
             }
             DiffMode::Split => {
-                let Some(hunk) = self.hunks.first() else {
+                let Some(hunk) = self.hunks.first().cloned() else {
                     self.pending_jump = false;
                     return;
                 };
                 let right = self.right.clone();
-                let before = right.read(cx).scroll_handle.offset().y;
+                if Self::editor_line_height(&right, cx) <= px(0.) {
+                    return;
+                }
                 Self::scroll_editor_to_row(&right, hunk.new_rows.start, 3, cx);
-                let jumped = right.read(cx).scroll_handle.offset().y != before || hunk.new_rows.start <= 3;
                 // 左侧经映射同步（显式设置，不依赖 observe 时序）
                 let left_row = map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
                 let left = self.left.clone();
                 Self::scroll_editor_to_row(&left, left_row, 0, cx);
-                self.pending_jump = !jumped;
+                self.pending_jump = false;
             }
         }
+    }
+
+    fn editor_line_height(editor: &Entity<InputState>, cx: &App) -> gpui::Pixels {
+        editor
+            .read(cx)
+            .last_layout
+            .as_ref()
+            .map(|l| l.line_height)
+            .unwrap_or(px(0.))
     }
 
     /// 当前视口顶部所在的 hunk 序号（导航基准）。
@@ -769,7 +796,17 @@ impl DiffView {
             dst.update(cx, |state, cx| {
                 state.update_scroll_offset(Some(point(offset.x, desired_y)), cx);
             });
-            self.scroll_syncing = false;
+            // `update_scroll_offset` notifies the destination entity, but GPUI
+            // observers run at *effect flush* time, i.e. after this method
+            // returns. Resetting the flag synchronously here would clear it
+            // before the mirrored `sync_scroll` ever saw it, leaving both panes
+            // free to correct each other forever. `defer` pushes onto the same
+            // FIFO effect queue, so it runs strictly after the pending
+            // `Effect::Notify` for the destination.
+            let this = cx.weak_entity();
+            cx.defer(move |cx| {
+                this.update(cx, |this, _cx| this.scroll_syncing = false).ok();
+            });
         }
     }
 
@@ -836,22 +873,35 @@ impl DiffView {
         }
 
         let fresh = super::diff_model::compute_hunks(&self.old_text, current);
-        // 优先按 HEAD 侧行号区间相交匹配
-        let mut matched = fresh.iter().find(|h| {
-            h.old_rows.start < stale.old_rows.end.max(stale.old_rows.start + 1)
-                && stale.old_rows.start < h.old_rows.end.max(h.old_rows.start + 1)
-        });
-        // 纯新增块（HEAD 侧为空区间）：退化为按 new_rows 起点最接近者
-        if matched.is_none() && stale.old_rows.start == stale.old_rows.end {
-            matched = fresh.iter().min_by_key(|h| {
-                h.new_rows
-                    .start
-                    .abs_diff(stale.new_rows.start)
-                    .saturating_add(h.old_rows.start.abs_diff(stale.old_rows.start))
-            });
-        }
 
-        match matched.cloned() {
+        // HEAD 侧行号是稳定锚点（右栏怎么编辑都不会改变它），所以评分以
+        // `old_rows` 的距离为主、`new_rows` 的距离为辅。
+        //
+        // 这里不能用 `find` 取「文件序第一个相交的块」：若用户在上方编辑使
+        // 某个更大的块吞并到目标区间，`find` 会返回那个更大的块，还原时就
+        // 把用户刚输入的内容一起覆盖掉了。改成取距离最近者，并用
+        // `REVERT_MATCH_TOLERANCE` 封顶——相距太远说明是误匹配，宁可放弃。
+        let key = |h: &DiffHunk| -> (u32, u32) {
+            let intersects = h.old_rows.start < stale.old_rows.end.max(stale.old_rows.start + 1)
+                && stale.old_rows.start < h.old_rows.end.max(h.old_rows.start + 1);
+            let old_distance = if intersects {
+                0
+            } else {
+                h.old_rows
+                    .start
+                    .abs_diff(stale.old_rows.start)
+                    .min(h.old_rows.start.abs_diff(stale.old_rows.end))
+            };
+            (old_distance, h.new_rows.start.abs_diff(stale.new_rows.start))
+        };
+
+        let matched = fresh
+            .iter()
+            .filter(|h| key(h).0 <= REVERT_MATCH_TOLERANCE)
+            .min_by_key(|h| key(h))
+            .cloned();
+
+        match matched {
             Some(hunk) => {
                 // 用重算结果刷新视图状态，避免后续操作重复重算
                 self.hunks = fresh;
@@ -912,7 +962,10 @@ impl DiffView {
         updated.push_str(&current[byte_end..]);
 
         self.right.update(cx, |state, cx| {
-            state.set_value(updated, window, cx);
+            // Undoable on purpose: `set_value` wipes the undo stack and jumps
+            // to the top of the file, which made a mis-clicked revert both
+            // unrecoverable and disorienting.
+            state.set_value_undoable(updated, window, cx);
         });
         let current = self.right.read(cx).value().to_string();
         self.dirty = current != self.saved_text;
@@ -920,31 +973,65 @@ impl DiffView {
     }
 
     /// Save the working-tree file through the repository backend.
+    ///
+    /// 走与普通编辑器一致的 `save_text_to_file`：按磁盘原编码写回并保留行尾
+    /// 风格。此前直接 `repo.write_file` 写的是解码后的 UTF-8 字符串，等于
+    /// 悄悄删掉 BOM、把 GBK / UTF-16 文件整体改写成 UTF-8。
     pub fn save(&mut self, cx: &mut Context<Self>) {
         if self.saving || !self.dirty {
             return;
         }
         self.saving = true;
+        self.save_error = None;
         cx.notify();
 
         let text = self.right.read(cx).value().to_string();
         let repo = self.repo.clone();
         let path = self.path.clone();
+        let full_path = self.repo.resolve_path(&self.path);
+        let ssh_config = self.repo.ssh_config();
+        // 磁盘基线：供 `save_text_to_file` 推断文件原本的行尾风格。
+        let baseline = self.saved_text.clone();
+
         cx.spawn(async move |this, cx| {
             let write_text = text.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { repo.write_file(&path, &write_text) })
+                .spawn(async move {
+                    let encoding = repo.detect_encoding(&path);
+                    crate::editor::editor::save_text_to_file(
+                        &full_path,
+                        ssh_config.as_ref(),
+                        &baseline,
+                        &write_text,
+                        encoding,
+                    )
+                })
                 .await;
             this.update(cx, |view, cx| {
                 view.saving = false;
                 match result {
-                    Ok(()) => {
-                        view.saved_text = text.clone();
-                        view.dirty = view.right.read(cx).value().as_ref() != text.as_str();
+                    Ok(written) => {
+                        // `written` 是行尾归一化后的实际落盘内容，用它做新的
+                        // 脏检查基线，否则下次保存会误判为未修改。
+                        view.saved_text = written;
+                        view.dirty =
+                            view.right.read(cx).value().as_ref() != view.saved_text.as_str();
                     }
                     Err(e) => {
                         log::error!("diff save failed for {}: {e}", view.path);
+                        view.save_error = Some(e.clone());
+                        // 保存失败必须让用户看见；此前只写了一行日志，用户
+                        // 会误以为已经存盘。
+                        if let Some(editor) = view.editor.upgrade() {
+                            editor.update(cx, |editor, cx| {
+                                editor.show_notification(
+                                    format!("保存失败：{e}"),
+                                    crate::components::notification::NotificationKind::Error,
+                                    cx,
+                                );
+                            });
+                        }
                     }
                 }
                 cx.notify();
@@ -975,11 +1062,25 @@ impl DiffView {
             this.update(cx, |view, cx| {
                 view.refreshing = false;
                 if let Ok((old, new)) = result {
-                    view.old_text = old.into();
-                    view.saved_text = new.clone();
-                    view.dirty = false;
-                    view.right.update(cx, |state, cx| {
-                        state.set_text(new, cx);
+                    view.old_text = old.clone().into();
+                    if view.dirty {
+                        // 右栏有未保存编辑时绝不覆盖：刷新只是重新拉取 HEAD
+                        // 与磁盘内容，静默丢弃用户正在编辑的文本是不可接受的。
+                        log::warn!(
+                            "diff refresh for {}: 保留未保存编辑，仅刷新 HEAD 侧",
+                            view.path
+                        );
+                    } else {
+                        view.saved_text = new.clone();
+                        view.right.update(cx, |state, cx| {
+                            state.set_text(new, cx);
+                        });
+                    }
+                    // 左栏存的是 HEAD 内容，必须一起更新。此前只换了
+                    // `old_text` 而不动左栏，hunks 按新 HEAD 计算、左栏却还是
+                    // 旧 HEAD，两栏的内容与染色会整体错位。
+                    view.left.update(cx, |state, cx| {
+                        state.set_text(old, cx);
                     });
                     view.recompute(cx);
                 }
@@ -1505,6 +1606,15 @@ fn hunk_decorations(
 
 /// Map a line number on the old side to the corresponding line on the new
 /// side, using cumulative hunk deltas (context regions map exactly).
+///
+/// Inside a hunk there is no line-for-line correspondence, so the offset
+/// within the hunk is reused directly and then **clamped** to the hunk's last
+/// new-side row. The clamp is what makes the two directions converge: feeding
+/// the clamped row back through [`map_line_new_to_old`] lands inside the same
+/// hunk, and the round trip settles on a fixed point within two steps. Without
+/// it a shrinking hunk would produce e.g. `15 -> 15 -> 23 -> 15 -> 23 ...`,
+/// which `sync_scroll` sees as a permanent mismatch and corrects every frame
+/// (visible ping-pong between the two panes).
 fn map_line_old_to_new(old_line: u32, hunks: &[DiffHunk]) -> u32 {
     let mut delta = 0i64;
     for h in hunks {
@@ -1515,9 +1625,11 @@ fn map_line_old_to_new(old_line: u32, hunks: &[DiffHunk]) -> u32 {
             delta += (h.new_rows.end - h.new_rows.start) as i64
                 - (h.old_rows.end - h.old_rows.start) as i64;
         } else {
-            // Inside a hunk: approximate with proportional offset.
-            let rel = (old_line - h.old_rows.start) as i64;
-            return (h.new_rows.start as i64 + rel).max(0) as u32;
+            let rel = old_line - h.old_rows.start;
+            // A pure deletion has an empty new range; `saturating_sub` plus the
+            // `max(start)` keeps the result inside `new_rows.start..=start`.
+            let last_new_row = h.new_rows.end.saturating_sub(1).max(h.new_rows.start);
+            return h.new_rows.start.saturating_add(rel).min(last_new_row);
         }
     }
     (old_line as i64 + delta).max(0) as u32
@@ -1525,6 +1637,8 @@ fn map_line_old_to_new(old_line: u32, hunks: &[DiffHunk]) -> u32 {
 
 /// Map a line number on the new side to the corresponding line on the old
 /// side, using cumulative hunk deltas.
+///
+/// See [`map_line_old_to_new`] for why the in-hunk result is clamped.
 fn map_line_new_to_old(new_line: u32, hunks: &[DiffHunk]) -> u32 {
     let mut delta = 0i64;
     for h in hunks {
@@ -1535,8 +1649,9 @@ fn map_line_new_to_old(new_line: u32, hunks: &[DiffHunk]) -> u32 {
             delta += (h.old_rows.end - h.old_rows.start) as i64
                 - (h.new_rows.end - h.new_rows.start) as i64;
         } else {
-            let rel = (new_line - h.new_rows.start) as i64;
-            return (h.old_rows.start as i64 + rel).max(0) as u32;
+            let rel = new_line - h.new_rows.start;
+            let last_old_row = h.old_rows.end.saturating_sub(1).max(h.old_rows.start);
+            return h.old_rows.start.saturating_add(rel).min(last_old_row);
         }
     }
     (new_line as i64 + delta).max(0) as u32
@@ -2289,5 +2404,143 @@ mod tests {
             total_consumed += line_text.len();
         }
         assert_eq!(total_consumed, 8, "only visible bytes consumed");
+    }
+
+    // ---- scroll-sync line mapping (regression: ping-pong between panes) ----
+
+    fn hunk(old: Range<u32>, new: Range<u32>) -> DiffHunk {
+        DiffHunk {
+            old_rows: old,
+            new_rows: new,
+            old_word_ranges: Vec::new(),
+            new_word_ranges: Vec::new(),
+        }
+    }
+
+    /// The counterexample from the audit: a hunk that shrinks `10..20` to
+    /// `10..12`. Before the clamp, `15 -> 15 -> 23 -> 15 -> 23 ...` never
+    /// settled, so `sync_scroll` corrected both panes on every frame.
+    #[test]
+    fn test_scroll_sync_map_shrinking_hunk_settles() {
+        let hunks = vec![hunk(10..20, 10..12)];
+        assert_eq!(map_line_old_to_new(15, &hunks), 11);
+        // Round trip must be a fixed point, not an oscillation.
+        assert_eq!(map_line_new_to_old(11, &hunks), 11);
+        assert_eq!(map_line_old_to_new(11, &hunks), 11);
+    }
+
+    #[test]
+    fn test_scroll_sync_map_never_leaves_the_hunk() {
+        let hunks = vec![
+            hunk(10..20, 10..12), // shrink
+            hunk(30..40, 22..42), // grow
+            hunk(50..52, 52..62), // pure insertion region on the new side
+        ];
+        for old in 0..80u32 {
+            let new = map_line_old_to_new(old, &hunks);
+            let starts_hunk = hunks.iter().any(|h| h.old_rows.contains(&old));
+            if starts_hunk {
+                let h = hunks.iter().find(|h| h.old_rows.contains(&old)).unwrap();
+                assert!(
+                    new >= h.new_rows.start && new < h.new_rows.end.max(h.new_rows.start + 1),
+                    "old {old} inside new {:?} mapped to {new}, outside the new range",
+                    h.new_rows
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_scroll_sync_map_is_monotone() {
+        let hunks = vec![
+            hunk(10..20, 10..12),
+            hunk(30..40, 22..42),
+            hunk(50..55, 52..53),
+        ];
+        let mut prev_old = map_line_old_to_new(0, &hunks);
+        for old in 1..100u32 {
+            let cur = map_line_old_to_new(old, &hunks);
+            assert!(cur >= prev_old, "old->new not monotone at {old}");
+            prev_old = cur;
+        }
+        let mut prev_new = map_line_new_to_old(0, &hunks);
+        for new in 1..100u32 {
+            let cur = map_line_new_to_old(new, &hunks);
+            assert!(cur >= prev_new, "new->old not monotone at {new}");
+            prev_new = cur;
+        }
+    }
+
+    /// Outside every hunk the two sides are offset by a constant delta, and
+    /// that mapping must be exactly invertible.
+    #[test]
+    fn test_scroll_sync_map_context_is_exact() {
+        let hunks = vec![hunk(10..20, 10..12), hunk(30..40, 22..42)];
+        for old in [0u32, 5, 9, 25, 29, 45, 60] {
+            let new = map_line_old_to_new(old, &hunks);
+            assert_eq!(
+                map_line_new_to_old(new, &hunks),
+                old,
+                "context row {old} did not survive the round trip"
+            );
+        }
+        // Deltas: -8 after the first hunk, +2 after the second.
+        assert_eq!(map_line_old_to_new(25, &hunks), 17);
+        assert_eq!(map_line_old_to_new(45, &hunks), 47);
+    }
+
+    /// A pure deletion has an empty `new_rows` range; the mapping must not
+    /// underflow or escape the hunk.
+    #[test]
+    fn test_scroll_sync_map_pure_deletion_does_not_underflow() {
+        let hunks = vec![hunk(10..20, 10..10)];
+        assert_eq!(map_line_old_to_new(14, &hunks), 10);
+        assert_eq!(map_line_old_to_new(19, &hunks), 10);
+        // Row 25 sits 5 rows past the hunk, so it shifts by -10.
+        assert_eq!(map_line_old_to_new(25, &hunks), 15);
+    }
+
+    #[test]
+    fn test_scroll_sync_map_pure_insertion_is_transparent() {
+        let hunks = vec![hunk(10..10, 10..20)];
+        // No old row falls inside the hunk, so every row keeps its number
+        // until the inserted block is passed, then shifts by +10.
+        assert_eq!(map_line_old_to_new(9, &hunks), 9);
+        assert_eq!(map_line_old_to_new(10, &hunks), 20);
+        assert_eq!(map_line_new_to_old(15, &hunks), 10);
+    }
+
+    /// Exhaustive check that the alternating correction loop used by
+    /// `sync_scroll` reaches a fixed point within one round trip.
+    #[test]
+    fn test_scroll_sync_round_trip_is_idempotent() {
+        // Every hunkset below is a *consistent* diff: the context gap between
+        // two consecutive hunks is the same number of rows on both sides.
+        let hunksets = vec![
+            vec![hunk(10..20, 10..12)],
+            vec![hunk(10..12, 10..20)],
+            vec![hunk(10..20, 10..12), hunk(30..40, 22..42)],
+            vec![hunk(10..20, 10..12), hunk(30..40, 22..42), hunk(50..55, 52..53)],
+            vec![hunk(0..5, 0..30), hunk(20..25, 45..46)],
+            vec![hunk(10..20, 10..10)],
+            vec![hunk(10..10, 10..20)],
+            Vec::new(),
+        ];
+        for hunks in &hunksets {
+            for old in 0..80u32 {
+                let y0 = map_line_old_to_new(old, hunks);
+                let x1 = map_line_new_to_old(y0, hunks);
+                let y1 = map_line_old_to_new(x1, hunks);
+                let x2 = map_line_new_to_old(y1, hunks);
+                assert_eq!(
+                    y1, y0,
+                    "new-side oscillation at old {old} ({y0} -> {x1} -> {y1})"
+                );
+                assert_eq!(
+                    x2, x1,
+                    "old-side oscillation at old {old} ({y0} -> {x1} -> {y1} -> {x2})"
+                );
+            }
+        }
     }
 }

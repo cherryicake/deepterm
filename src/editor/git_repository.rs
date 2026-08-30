@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs;
 
+use super::encoding;
 use super::git_status::{DiffStat, GitStatus, StatusEntry, parse_numstat};
 
 const REMOTE_GIT_TIMEOUT: u64 = 60;
@@ -99,6 +100,22 @@ impl GitBackend {
         match self {
             GitBackend::Local => execute_local_git(args, cwd),
             GitBackend::Remote { config } => execute_remote_git(config, args, cwd),
+        }
+    }
+
+    /// 拿到命令的**原始字节**。
+    ///
+    /// 读取文件内容（如 `git show HEAD:path`）必须走这条路径：`execute` 会先
+    /// `from_utf8_lossy` 成 `String`，BOM 被保留成开头的 U+FEFF、非 UTF-8 字节
+    /// 被替换成 U+FFFD，之后就没法再还原出原始编码了。
+    fn execute_bytes(&self, args: &[&str], cwd: &str) -> Result<Vec<u8>, String> {
+        match self {
+            GitBackend::Local => execute_local_git_bytes(args, cwd),
+            // 远端会话已经把 stdout 解成了 `String`（有损），重新编码回字节
+            // 对合法 UTF-8 是无损的，BOM 也得以保留下来等待剥离。
+            GitBackend::Remote { .. } => {
+                self.execute(args, cwd).map(|stdout| stdout.into_bytes())
+            }
         }
     }
 }
@@ -315,7 +332,7 @@ impl GitRepository {
         match &self.backend {
             GitBackend::Local => {
                 let head_ref = format!("HEAD:{path}");
-                let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+                let old = self.head_text(&head_ref);
                 let new = match self.read_file_content(path)? {
                     DiffSideContent::Text(text) => text,
                     DiffSideContent::Missing => String::new(),
@@ -356,13 +373,13 @@ impl GitRepository {
                 let head_ref = format!("HEAD:{path}");
                 let (old, new) = if let Some(cached_new) = file_cache_hit {
                     // Only need HEAD via git — saves one RTT + SFTP read.
-                    let old = self.run_git(&["show", &head_ref]).unwrap_or_default();
+                    let old = self.head_text(&head_ref);
                     (old, cached_new)
                 } else {
                     // 3. Parallel fetch of both sides; SFTP read picks pipelined
                     // path for large files based on the stat size already known.
                     std::thread::scope(|s| {
-                        let h_old = s.spawn(|| self.run_git(&["show", &head_ref]).unwrap_or_default());
+                        let h_old = s.spawn(|| self.head_text(&head_ref));
                         let h_new = s.spawn(|| {
                             let is_large = size != u64::MAX && size > 512 * 1024;
                             let content = if is_large {
@@ -420,7 +437,39 @@ impl GitRepository {
         result
     }
 
+    /// 探测工作区文件的磁盘编码。
+    ///
+    /// 保存时必须按原编码写回：读取侧会剥离 BOM、并把 GBK / UTF-16 统一解码
+    /// 成 UTF-8，若写回时不做逆变换，BOM 会被永久删除、非 UTF-8 文件会被
+    /// 整体改写为 UTF-8（用户无感知的内容损坏）。
+    ///
+    /// 探测失败（文件不存在、无读权限等）时回退 UTF-8。
+    pub fn detect_encoding(&self, path: &str) -> encoding::FileEncoding {
+        let detect = |bytes: &[u8]| encoding::decode_bytes(bytes).encoding;
+
+        match &self.backend {
+            GitBackend::Local => {
+                let file_path = Path::new(&self.root).join(path);
+                std::fs::read(&file_path)
+                    .map(|bytes| detect(&bytes))
+                    .unwrap_or(encoding::FileEncoding::Utf8)
+            }
+            GitBackend::Remote { config } => {
+                let remote_path = join_remote_path(&self.root, path);
+                sftp_fs::read_file_bytes(config, &remote_path)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| detect(&bytes))
+                    .unwrap_or(encoding::FileEncoding::Utf8)
+            }
+        }
+    }
+
     /// Write content to a working-tree file (local fs or remote via SFTP).
+    ///
+    /// 仅用于写入已经是 UTF-8、且无需保留 BOM / 行尾风格的内容（例如补丁
+    /// 导出）。写回用户正在编辑的文件请走 `detect_encoding` +
+    /// `crate::editor::editor::save_text_to_file`，否则会破坏编码。
     pub fn write_file(&self, path: &str, content: &str) -> Result<(), String> {
         match &self.backend {
             GitBackend::Local => {
@@ -502,6 +551,26 @@ impl GitRepository {
         }
     }
 
+    /// HEAD 侧内容，按仓库里存的字节解码（含 BOM 剥离）。
+    ///
+    /// 工作区侧走的是 [`classify_bytes`] → `encoding::decode_bytes`：剥掉 BOM、
+    /// 把 GBK / UTF-16 解成 UTF-8。HEAD 侧先前用的是 `run_git`，它内部
+    /// `from_utf8_lossy`，于是同一个文件得到
+    /// `old = "\u{FEFF}line1\n…"` 与 `new = "line1\n…"`，首行被判为永久修改，
+    /// 非 UTF-8 文件更是整篇对不上。
+    ///
+    /// 未跟踪文件 / 尚无 HEAD 提交时 `git show` 会失败，此时返回空串（与旧
+    /// 行为一致）。
+    fn head_text(&self, head_ref: &str) -> String {
+        let Ok(bytes) = self.backend.execute_bytes(&["show", head_ref], &self.root) else {
+            return String::new();
+        };
+        if bytes.is_empty() || sftp_fs::is_binary_bytes(&bytes) {
+            return String::new();
+        }
+        encoding::decode_bytes(&bytes).text
+    }
+
     /// Stage files
     pub fn stage(&self, paths: &[&str]) -> Result<(), String> {
         let mut args = Vec::with_capacity(1 + paths.len());
@@ -532,6 +601,12 @@ impl GitRepository {
 }
 
 fn execute_local_git(args: &[&str], cwd: &str) -> Result<String, String> {
+    let stdout = execute_local_git_bytes(args, cwd)?;
+    Ok(String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// 与 [`execute_local_git`] 相同，但返回未解码的原始字节（供编码探测使用）。
+fn execute_local_git_bytes(args: &[&str], cwd: &str) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -543,7 +618,7 @@ fn execute_local_git(args: &[&str], cwd: &str) -> Result<String, String> {
         return Err(format!("git {} failed: {stderr}", args.join(" ")));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output.stdout)
 }
 
 fn execute_remote_git(
@@ -726,6 +801,77 @@ mod tests {
         let status = repo.status().unwrap();
         assert_eq!(status.len(), 1);
         assert!(status[0].status.is_modified());
+
+        cleanup(&temp);
+    }
+
+    /// 回归测试：HEAD 侧必须与工作区侧走同一套解码。
+    ///
+    /// 曾经 HEAD 侧用 `run_git`（内部 `from_utf8_lossy`），BOM 被保留成开头的
+    /// U+FEFF，而工作区侧的 `decode_bytes` 会剥掉它 —— 于是未做任何修改的
+    /// BOM 文件首行永远被判为"已修改"。GBK 文件同理（整篇对不上）。
+    #[test]
+    fn test_head_side_strips_bom_and_decodes_like_worktree() {
+        let temp = temp_dir("deepterm-git-bom");
+        init_repo(&temp);
+
+        let content = "line1\nline2\n";
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(content.as_bytes());
+        std::fs::write(temp.join("bom.txt"), &bytes).unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "bom.txt"])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+
+        let (old, new) = repo.diff_file_contents("bom.txt").unwrap();
+        assert!(!old.starts_with('\u{feff}'), "HEAD 侧必须剥掉 BOM: {old:?}");
+        assert!(!new.starts_with('\u{feff}'), "工作区侧必须剥掉 BOM: {new:?}");
+        assert_eq!(old, new, "未修改的 BOM 文件不应产生任何差异");
+        assert_eq!(new, content);
+
+        cleanup(&temp);
+    }
+
+    /// 真正改了内容的 BOM 文件仍要正常出差异（确认上面的相等不是"两头都空"）。
+    #[test]
+    fn test_bom_file_still_reports_real_changes() {
+        let temp = temp_dir("deepterm-git-bom-mod");
+        init_repo(&temp);
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("line1\nline2\n".as_bytes());
+        std::fs::write(temp.join("bom.txt"), &bytes).unwrap();
+
+        let _ = Command::new("git")
+            .args(["add", "bom.txt"])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        // 只改第二行，第一行的 BOM 必须不再制造伪差异。
+        let mut modified = vec![0xEF, 0xBB, 0xBF];
+        modified.extend_from_slice("line1\nline2 changed\n".as_bytes());
+        std::fs::write(temp.join("bom.txt"), &modified).unwrap();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+        let (old, new) = repo.diff_file_contents("bom.txt").unwrap();
+        assert_eq!(old, "line1\nline2\n");
+        assert_eq!(new, "line1\nline2 changed\n");
 
         cleanup(&temp);
     }

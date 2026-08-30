@@ -76,9 +76,6 @@ fn combine_highlights_stable(
     out
 }
 
-/// VS Code 风格缩进参考线网格：每 N 列一个 guide，空白行按上下文插值，活跃块高亮
-const INDENT_GUIDE_SIZE: usize = 4;
-
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
@@ -408,7 +405,20 @@ impl TextElement {
             } else {
                 // Not visible (before visible range or hidden/folded).
                 // Just increase the offset_y and prev_lines_offset for scroll tracking.
-                if prev_lines_offset >= cursor && cursor_pos.is_none() {
+                //
+                // 本行"覆盖"某个偏移，当且仅当它落在
+                // `[行首, 行尾含换行符)` 之内。此前判据写成
+                // `prev_lines_offset >= target`（取第一个行首 ≥ 目标的行），
+                // 命中的其实是光标所在行的**下一行**；更糟的是当光标落在折叠
+                // 的最后一个隐藏行时，那一行不满足判据，循环会一直走到折叠后
+                // 的第一个可见行，而可见分支用的是 `saturating_sub`，任何早于
+                // 该行的光标都会被算成它的第 0 列 —— 当前行高亮因此跳出折叠，
+                // 落在折叠之后那一行上。
+                let contains_offset = |target: usize| {
+                    target >= prev_lines_offset
+                        && target < prev_lines_offset + wrap_line.len() + 1
+                };
+                if contains_offset(cursor) && cursor_pos.is_none() {
                     current_row = Some(row);
                     // A cursor inside a fold — or at its end (the visible tail,
                     // e.g. `}`) — is drawn on the fold header's display row:
@@ -446,10 +456,11 @@ impl TextElement {
                         cursor_pos = Some(line_origin);
                     }
                 }
-                if prev_lines_offset >= selected_range.start && cursor_start.is_none() {
+                // 与 `cursor` 同一套包含判据，选区两端才不会各自偏到下一行。
+                if contains_offset(selected_range.start) && cursor_start.is_none() {
                     cursor_start = Some(line_origin);
                 }
-                if prev_lines_offset >= selected_range.end && cursor_end.is_none() {
+                if contains_offset(selected_range.end) && cursor_end.is_none() {
                     cursor_end = Some(line_origin);
                 }
 
@@ -1449,13 +1460,15 @@ impl TextElement {
             };
 
             // The text after the fold end on the closing row (usually a `}`).
+            //
+            // `fold.end_offset` is `line_start(end.row) + end.column`, and the
+            // old tail_end recomputed exactly that value — so the two were
+            // always equal and the tail was never painted (folds rendered as
+            // `fn main() {⋯` with the closing brace missing). Take the end of
+            // the closing row's *content* instead: that trailing text is what
+            // has to stay visible next to the `⋯` placeholder.
             let tail_start = fold.end_offset;
-            let tail_end = {
-                let line = text.slice_line(fold.end.row);
-                let line_len = line.len();
-                let end_col = fold.end.column.min(line_len);
-                text.line_start_offset(fold.end.row) + end_col
-            };
+            let tail_end = text.line_content_end_offset(fold.end.row);
             let tail = if tail_end > tail_start {
                 let tail_text: SharedString =
                     text.slice(tail_start..tail_end).to_string().into();
@@ -1669,9 +1682,19 @@ impl TextElement {
 
         for &buffer_line in last_layout.visible_buffer_lines.iter() {
             let line_text: String = display_text.slice_line(buffer_line).into();
-            let line_item = buffer_lines
-                .get(buffer_line)
-                .expect("line should exists in wrapper");
+            // `buffer_lines` 与 `display_text` 偶尔会失同步（折叠/编辑时序），
+            // 用 `expect` 会让整个编辑器在绘制期 panic。降级为跳过该行：少画
+            // 一行远好过整个应用崩溃。
+            let Some(line_item) = buffer_lines.get(buffer_line) else {
+                log::error!(
+                    "layout_lines: buffer_line {buffer_line} missing from wrapper \
+                     (wrapper_len={}, visible={:?}, text_len={})",
+                    buffer_lines.len(),
+                    last_layout.visible_buffer_lines,
+                    display_text.len()
+                );
+                continue;
+            };
 
             debug_assert_eq!(line_item.len(), line_text.len());
 
@@ -2496,11 +2519,51 @@ impl Element for TextElement {
         let invisible_top_padding = prepaint.last_layout.visible_top;
         let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
 
-        // Paint active line
-        let mut offset_y = px(0.);
-        if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
-            offset_y += invisible_top_padding;
+        // Geometry of every visible line: (buffer row, y offset, height).
+        //
+        // Derived from the layout rather than from `line_numbers`, so the
+        // current-line highlight keeps working when line numbers are hidden.
+        let line_geometry: Vec<(usize, Pixels, Pixels)> = {
+            let mut y = invisible_top_padding;
+            let mut out = Vec::with_capacity(prepaint.last_layout.visible_buffer_lines.len());
+            for (line, &buffer_line) in prepaint
+                .last_layout
+                .lines
+                .iter()
+                .zip(prepaint.last_layout.visible_buffer_lines.iter())
+            {
+                let height = line_height * line.wrapped_lines.len().max(1) as f32;
+                out.push((buffer_line, y, height));
+                y += height;
+            }
+            out
+        };
 
+        // Paint the current line background.
+        //
+        // This used to live inside the `line_numbers` block below, so hiding
+        // line numbers also silently disabled the active-line highlight.
+        //
+        // At most one visible line can be the current row, so a `find` is
+        // enough — no need to scan the rest of the geometry.
+        if selected_range.is_empty() {
+            if let Some(bg_color) = active_line_color {
+                if let Some(&(_, y, height)) = line_geometry
+                    .iter()
+                    .find(|(buffer_line, _, _)| prepaint.current_row == Some(*buffer_line))
+                {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(input_bounds.origin.x, origin.y + y),
+                            size(bounds.size.width, height),
+                        ),
+                        bg_color,
+                    ));
+                }
+            }
+        }
+
+        if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             let diff_line_colors = &self.state.read(cx).diff_line_colors;
             // Git 变更标记（行号区右缘窄色条）
             let (git_gutter_enabled, git_line_marks, fold_gutter_width) = {
@@ -2513,29 +2576,16 @@ impl Element for TextElement {
                 (state.git_gutter, &state.git_line_marks, fold_w)
             };
 
-            // Each item is the normal lines.
-            for (lines, &buffer_line) in line_numbers
-                .iter()
-                .zip(prepaint.last_layout.visible_buffer_lines.iter())
-            {
-                let is_active = prepaint.current_row == Some(buffer_line);
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
-                let height = line_height * lines.len() as f32;
+            // Each item is the normal lines; `line_numbers` is parallel to
+            // `line_geometry`, so the height comes from the geometry above.
+            for (&(buffer_line, y, height), _) in line_geometry.iter().zip(line_numbers) {
+                let p = point(input_bounds.origin.x, origin.y + y);
                 // Paint diff line background (added/deleted) below everything else
                 if let Some(bg_color) = diff_line_colors.get(&(buffer_line as u32)) {
                     window.paint_quad(fill(
                         Bounds::new(p, size(bounds.size.width, height)),
                         *bg_color,
                     ));
-                }
-                // Paint the current line background
-                if is_active && selected_range.is_empty() {
-                    if let Some(bg_color) = active_line_color {
-                        window.paint_quad(fill(
-                            Bounds::new(p, size(bounds.size.width, height)),
-                            bg_color,
-                        ));
-                    }
                 }
                 // Paint git gutter marks：新增绿 / 修改蓝 / 删除红（顶部小短条）
                 if git_gutter_enabled {
@@ -2575,7 +2625,6 @@ impl Element for TextElement {
                         }
                     }
                 }
-                offset_y += height;
             }
         }
 
@@ -2609,7 +2658,9 @@ impl Element for TextElement {
 
         // Paint indent guides — VS Code style: grid-aligned, whitespace-interpolated, active-block highlighted
         if state.indent_guides && state.mode.is_multi_line() && !state.masked && state.text.len() > 0 {
-            let indent_size = INDENT_GUIDE_SIZE;
+            // 层级宽度跟随缩进配置（`TabSize`，默认硬 Tab / 4 列），而不是
+            // 写死常量 —— 否则把缩进切成 2 空格后参考线仍按 4 列画。
+            let indent_size = state.indent_width();
             let style = window.text_style();
             let font_size = state
                 .font_size
@@ -2631,46 +2682,148 @@ impl Element for TextElement {
                 )
                 .width;
             if space_width > px(0.) {
+                // Tab 的真实推进宽度：默认缩进单元就是 `"\t"`（`TabSize::HARD_TABS`），
+                // 若字体给 Tab 的推进量不等于 `indent_size` 个空格，按空格宽度
+                // 线性外推算出来的参考线 x 就会与正文整体错位。
+                let tab_width = window
+                    .text_system()
+                    .shape_line(
+                        SharedString::from("\t"),
+                        font_size,
+                        &[TextRun {
+                            len: 1,
+                            font: style.font(),
+                            color: style.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                    .width
+                    .max(space_width);
+
                 let total_lines = state.text.lines_len();
-                // Indent columns: -1 for blank lines, else leading columns (space=1, tab=indent_size)
-                let mut indents = Vec::with_capacity(total_lines);
-                for idx in 0..total_lines {
+                // 行首缩进列数（空格记 1 列，Tab 向上取整到 indent_size 的倍数）。
+                let leading_columns = |line: &str| -> i32 {
+                    let mut cols = 0;
+                    for ch in line.chars() {
+                        match ch {
+                            ' ' => cols += 1,
+                            '\t' => cols = cols - cols % indent_size as i32 + indent_size as i32,
+                            _ => break,
+                        }
+                    }
+                    cols
+                };
+                // 每级参考线的实际 x（相对正文左缘）：按前缀里空格 / Tab 的
+                // 真实推进量累加，而不是 `space_width * 列数`。
+                let guide_xs = |line: &str| -> Vec<Pixels> {
+                    let mut out = Vec::new();
+                    let mut cols = 0usize;
+                    let mut width = px(0.);
+                    for ch in line.chars() {
+                        match ch {
+                            ' ' => {
+                                cols += 1;
+                                width += space_width;
+                            }
+                            '\t' => {
+                                cols = cols - cols % indent_size + indent_size;
+                                width += tab_width;
+                            }
+                            _ => break,
+                        }
+                        // Tab 与制表位、参考线层级都是 `indent_size` 的倍数，
+                        // 所以层级边界一定落在某个字符之后。
+                        while out.len() * indent_size < cols {
+                            out.push(width);
+                        }
+                    }
+                    out
+                };
+                // 空行返回 -1：它们的参考线数量由邻近非空行插值得到。
+                let line_indent = |row: usize| -> i32 {
+                    let line: String = state.text.slice_line(row).into();
+                    if line.trim().is_empty() {
+                        -1
+                    } else {
+                        leading_columns(&line)
+                    }
+                };
+
+                // 只有可视区内的行会被真正画出来，所以把整段计算裁到这个窗口上。
+                // 此前每一行都要 `slice_line` 成 String、再跑三趟 O(总行数) 的
+                // 前缀/后缀扫描，10 万行文件每帧就是 10 万次堆分配 + 40 万次迭代。
+                let cursor_line = state.cursor_position().line as usize;
+                let mut win_start = prepaint
+                    .last_layout
+                    .visible_buffer_lines
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(0);
+                let mut win_end = prepaint
+                    .last_layout
+                    .visible_buffer_lines
+                    .iter()
+                    .copied()
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0);
+                // 活跃块判定要从光标所在行出发，把光标行也纳入窗口。
+                win_start = win_start.min(cursor_line).min(total_lines);
+                win_end = win_end.max(cursor_line + 1).min(total_lines);
+                win_end = win_end.max(win_start);
+                let win_lines = win_end - win_start;
+
+                let mut indents = Vec::with_capacity(win_lines);
+                let mut indent_xs: Vec<Vec<Pixels>> = Vec::with_capacity(win_lines);
+                for idx in win_start..win_end {
                     let line: String = state.text.slice_line(idx).into();
                     if line.trim().is_empty() {
                         indents.push(-1);
+                        indent_xs.push(Vec::new());
                     } else {
-                        let mut cols = 0;
-                        for ch in line.chars() {
-                            match ch {
-                                ' ' => cols += 1,
-                                '\t' => cols = cols - cols % indent_size as i32 + indent_size as i32,
-                                _ => break,
-                            }
-                        }
-                        indents.push(cols);
+                        indents.push(leading_columns(&line));
+                        indent_xs.push(guide_xs(&line));
                     }
                 }
+
+                // 窗口外紧邻的非空行缩进：空行要沿用邻近非空行的缩进，而
+                // 位于窗口边缘的空行需要向窗口外看一眼。两个循环都在遇到
+                // 第一个非空行时停下，正常情况下只走几行。
+                let above_window = (0..win_start)
+                    .rev()
+                    .map(line_indent)
+                    .find(|indent| *indent >= 0)
+                    .unwrap_or(-1);
+                let below_window = (win_end..total_lines)
+                    .map(line_indent)
+                    .find(|indent| *indent >= 0)
+                    .unwrap_or(-1);
+
                 // Guides per line with VS Code whitespace interpolation
                 let off_side = matches!(state.language().as_deref(), Some("python") | Some("yaml"));
                 let guides_counts = {
-                    let mut prev = vec![-1; total_lines];
-                    let mut last = -1;
-                    for i in 0..total_lines {
+                    let mut prev = vec![-1; win_lines];
+                    let mut last = above_window;
+                    for i in 0..win_lines {
                         if indents[i] >= 0 {
                             last = indents[i];
                         }
                         prev[i] = last;
                     }
-                    let mut next = vec![-1; total_lines];
-                    let mut nxt = -1;
-                    for i in (0..total_lines).rev() {
+                    let mut next = vec![-1; win_lines];
+                    let mut nxt = below_window;
+                    for i in (0..win_lines).rev() {
                         if indents[i] >= 0 {
                             nxt = indents[i];
                         }
                         next[i] = nxt;
                     }
-                    let mut counts = vec![0; total_lines];
-                    for i in 0..total_lines {
+                    let mut counts = vec![0; win_lines];
+                    for i in 0..win_lines {
                         let cur = indents[i];
                         if cur >= 0 {
                             counts[i] = (cur as usize).div_ceil(indent_size);
@@ -2688,36 +2841,47 @@ impl Element for TextElement {
                     }
                     counts
                 };
-                // Active indent block for the cursor line
-                let (active_start, active_end, active_level) = {
-                    let cursor_line = state.cursor_position().line as usize;
-                    if cursor_line >= total_lines {
+                // 窗口外的行一律当作 0 层：活跃块的向外扩张因此会停在窗口边缘，
+                // 而窗口本来就覆盖了所有可见行，绘制结果完全一致。
+                let count_at = |row: usize| -> usize {
+                    if row >= win_start && row < win_end {
+                        guides_counts[row - win_start]
+                    } else {
+                        0
+                    }
+                };
+                // Active indent block for the cursor line.
+                //
+                // 区间统一用 **0-based 半开区间** `[active_start, active_end)`，
+                // 旧实现里 `start` 是 1-based 闭区间、`end` 却是 0-based 开区间，
+                // 两种约定混在一处，边界极易差一行。
+                let (active_start, active_end, active_level) = if cursor_line >= total_lines {
+                    (0, 0, 0)
+                } else {
+                    let mut level = count_at(cursor_line);
+                    // 0 行的半开区间：只含光标行本身。
+                    let mut start = cursor_line;
+                    let mut end = cursor_line + 1;
+                    if level == 0
+                        && cursor_line + 1 < total_lines
+                        && count_at(cursor_line + 1) == 1
+                    {
+                        // 光标停在块的第一行（缩进尚未展开）：整块从下一行起算。
+                        level = 1;
+                        start = cursor_line + 1;
+                        end = start + 1;
+                    }
+                    if level == 0 {
                         (0, 0, 0)
                     } else {
-                        let mut level = guides_counts[cursor_line];
-                        let mut start = cursor_line + 1;
-                        let mut end = cursor_line + 1;
-                        if level == 0
-                            && cursor_line + 1 < total_lines
-                            && guides_counts[cursor_line + 1] == 1
-                        {
-                            level = 1;
-                            start = cursor_line + 2;
-                            end = start;
+                        // 向上并吞所有缩进不低于本层的行（含首行）。
+                        while start > 0 && count_at(start - 1) >= level {
+                            start -= 1;
                         }
-                        if level == 0 {
-                            (0, 0, 0)
-                        } else {
-                            let mut s = start;
-                            while s > 1 && guides_counts[s - 2] >= level {
-                                s -= 1;
-                            }
-                            let mut e = end;
-                            while e < total_lines && guides_counts[e] >= level {
-                                e += 1;
-                            }
-                            (s, e, level)
+                        while end < total_lines && count_at(end) >= level {
+                            end += 1;
                         }
+                        (start, end, level)
                     }
                 };
                 let base_color = cx.theme().border.opacity(0.28);
@@ -2730,19 +2894,37 @@ impl Element for TextElement {
                     .iter()
                     .enumerate()
                 {
-                    let line = &prepaint.last_layout.lines[vi];
+                    // `lines` 与 `visible_buffer_lines` 正常情况下一一对应，
+                    // 但空文本分支是按 placeholder 生成的，长度可能不等价 ——
+                    // 直接下标会在绘制期 panic。
+                    let Some(line) = prepaint.last_layout.lines.get(vi) else {
+                        break;
+                    };
                     let line_h = line.size(line_height).height;
                     let line_y = origin.y + gy;
-                    let count = guides_counts.get(buffer_line).copied().unwrap_or(0);
+                    let count = count_at(buffer_line);
+                    let xs = if buffer_line >= win_start && buffer_line < win_end {
+                        indent_xs[buffer_line - win_start].as_slice()
+                    } else {
+                        &[]
+                    };
                     for level in 1..=count {
                         let visible_column = (level - 1) * indent_size + 1;
-                        let x = origin.x + gutter_width + space_width * (visible_column - 1) as f32;
+                        // 优先用实测推进量；层级超出缩进前缀（空行插值出来
+                        // 的层级）时退回按空格宽度线性外推。
+                        let offset = match xs.get(level - 1) {
+                            Some(x) => *x,
+                            None => space_width * (visible_column - 1) as f32,
+                        };
+                        let x = origin.x + gutter_width + offset;
                         if x >= input_bounds.right() {
                             break;
                         }
+                        // 半开区间：[active_start, active_end)
                         let is_active = level == active_level
                             && active_level != 0
-                            && (active_start <= buffer_line + 1 && buffer_line < active_end);
+                            && buffer_line >= active_start
+                            && buffer_line < active_end;
                         let color = if is_active { active_color } else { base_color };
                         window.paint_quad(fill(
                             Bounds::new(point(x, line_y), size(px(1.), line_h)),
@@ -2979,10 +3161,21 @@ impl Element for TextElement {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
+            let scroll_changed =
+                state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
 
-            cx.notify();
+            // 这里曾经无条件 `cx.notify()`：paint 阶段标脏会让实体在下一帧
+            // 重新走一遍 prepaint + paint，空闲时也是满帧空转，而 paint 里还
+            // 叠着若干 O(总行数) 的扫描。
+            //
+            // 只有滚动位置真的动了才需要再来一帧 —— 钳制后的偏移与本次布局
+            // 采用的值不同，可见区要按最终值重算。其余状态（滚动条几何、点击
+            // 热区、布局缓存）都只影响后续事件处理，不需要重绘。
+            // 光标闪烁走独立的 `blink_cursor` 实体定时器，不依赖这里的 notify。
+            if scroll_changed {
+                cx.notify();
+            }
         });
 
         self.paint_mouse_listeners(window, cx);

@@ -22,6 +22,21 @@ pub(crate) struct LineItem {
     pub(crate) wrapped_lines: Vec<Range<usize>>,
 }
 
+/// 把字节下标收敛成一个可以安全切片的位置：钳进 `[min, len]`，并对齐到
+/// UTF-8 字符边界。
+///
+/// `wrap_line` 的边界来自字体测量，正常情况下总落在字符边界上；但增量更新
+/// 一旦让 `self.text` 与 `self.lines` 短暂失同步，越界或落在多字节字符中间
+/// 的下标会让 `&line_str[ix..]` 直接 panic —— 而这些下标还会被存进
+/// `LineItem::wrapped_lines`，最终在 paint 路径上引爆。
+fn clamp_boundary(line: &str, ix: usize, min: usize) -> usize {
+    let mut ix = ix.clamp(min, line.len());
+    while ix > min && !line.is_char_boundary(ix) {
+        ix -= 1;
+    }
+    ix
+}
+
 impl LineItem {
     /// Get the bytes length of this line.
     #[inline]
@@ -99,6 +114,11 @@ impl TextWrapper {
     #[inline]
     pub(crate) fn line(&self, row: usize) -> Option<&LineItem> {
         self.lines.get(row)
+    }
+
+    /// 当前的换行宽度（`None` = 不换行，内部按 `Pixels::MAX` 处理）。
+    pub(crate) fn wrap_width(&self) -> Option<Pixels> {
+        self.wrap_width
     }
 
     pub(crate) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
@@ -222,14 +242,19 @@ impl TextWrapper {
             if let Some(wrap_width) = wrap_width {
                 // Here only have wrapped line, if there is no wrap meet, the `line_wraps` result will empty.
                 for boundary in wrap_line(&line_str, wrap_width) {
-                    wrapped_lines.push(prev_boundary_ix..boundary.ix);
-                    prev_boundary_ix = boundary.ix;
+                    let ix = clamp_boundary(&line_str, boundary.ix, prev_boundary_ix);
+                    if ix > prev_boundary_ix {
+                        wrapped_lines.push(prev_boundary_ix..ix);
+                        prev_boundary_ix = ix;
+                    }
                 }
             }
 
+            prev_boundary_ix = clamp_boundary(&line_str, prev_boundary_ix, 0);
+
             // Reset of the line
-            if !line_str[prev_boundary_ix..].is_empty() || prev_boundary_ix == 0 {
-                wrapped_lines.push(prev_boundary_ix..line.len());
+            if prev_boundary_ix < line_str.len() || prev_boundary_ix == 0 {
+                wrapped_lines.push(prev_boundary_ix..line_str.len());
             }
 
             new_lines.push(LineItem {
@@ -265,7 +290,6 @@ impl TextWrapper {
     pub(crate) fn offset_to_display_point(&self, offset: usize) -> WrapDisplayPoint {
         let row = self.text.offset_to_point(offset).row;
         let start = self.text.line_start_offset(row);
-        let line = &self.lines[row];
 
         let mut wrapped_row = self
             .lines
@@ -273,6 +297,12 @@ impl TextWrapper {
             .take(row)
             .map(|l| l.lines_len())
             .sum::<usize>();
+
+        // `self.text` 与 `self.lines` 在增量更新时序错开时会短暂不一致，
+        // 直接下标会 panic；宁可返回退化的显示点。
+        let Some(line) = self.lines.get(row) else {
+            return WrapDisplayPoint::new(wrapped_row, 0, 0);
+        };
 
         let local_offset = offset.saturating_sub(start);
         for (ix, range) in line.wrapped_lines.iter().enumerate() {

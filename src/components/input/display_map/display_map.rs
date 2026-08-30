@@ -257,10 +257,15 @@ impl DisplayMap {
         self.rebuild_fold_projection();
     }
 
-    /// Update layout parameters (wrap width or font)
-    pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
-        self.wrap_map.on_layout_changed(wrap_width, cx);
+    /// Update layout parameters (wrap width or font).
+    ///
+    /// 返回是否真的变了（宽度未变时跳过全量重排与折叠投影重建）。
+    pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) -> bool {
+        if !self.wrap_map.on_layout_changed(wrap_width, cx) {
+            return false;
+        }
         self.rebuild_fold_projection();
+        true
     }
 
     /// Set font parameters
@@ -360,6 +365,16 @@ impl DisplayMap {
     pub fn visible_wrap_row_count_for_buffer_line(&self, line: usize) -> usize {
         self.wrap_map
             .visible_wrap_row_count_for_line(line, &self.fold_map)
+    }
+
+    /// 目标 buffer 行之前的可见显示行数 —— 即该行首个子行所在的 display row。
+    ///
+    /// 等价于 `sum(visible_wrap_row_count_for_buffer_line(ix) for ix in 0..line)`，
+    /// 但走 wrap_map 的前缀和与 fold_map 的可见行二分，是 O(log n)。调用点
+    /// 在每次光标移动的滚动路径上，逐行累加在 10 万行文件末尾是 10 万次迭代。
+    pub fn display_row_for_buffer_line(&self, line: usize) -> usize {
+        let wrap_row = self.wrap_map.buffer_line_to_first_wrap_row(line);
+        self.fold_map.visible_display_rows_before(wrap_row)
     }
 
     /// Get the wrap row count (before folding)

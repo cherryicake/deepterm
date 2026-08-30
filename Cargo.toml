@@ -76,6 +76,10 @@ aho-corasick = "1"
 ropey = { version = "2.0.0-beta.1", features = [
     "metric_lines_lf",
     "metric_utf16",
+    # char 度量：让 char <-> byte 互转走 O(log N) 的树查询，而不是逐字符累加。
+    # masked 输入框在 paint 路径（`masked_display_offset`）和每次 `on_drag_move`
+    # 都要做这个转换。
+    "metric_chars",
 ] }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 smallvec = "1"

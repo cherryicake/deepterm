@@ -154,8 +154,50 @@ pub trait RopeExt {
     /// assert_eq!(rope.slice_lines(2..5).to_string(), "This is a test 中文\nRope");
     /// assert_eq!(rope.slice_lines(3..10).to_string(), "Rope");
     /// assert_eq!(rope.slice_lines(5..10).to_string(), ""); // out of bounds
+    /// assert_eq!(rope.slice_lines(2..2).to_string(), ""); // empty range
     /// ```
     fn slice_lines(&self, rows_range: Range<usize>) -> RopeSlice<'_>;
+
+    /// The line's content with **any** trailing terminator removed, i.e. both
+    /// `\n` and `\r\n` are stripped (unlike [`RopeExt::slice_line`], which keeps
+    /// a trailing `\r`).
+    ///
+    /// Use this for line-level operations (join, move line, delete line, …),
+    /// otherwise CRLF documents leak stray `\r` bytes into the content.
+    ///
+    /// ```
+    /// use gpui_component::{Rope, RopeExt};
+    /// let rope = Rope::from("Hello\nWorld\r\nlast");
+    /// assert_eq!(rope.line_content(0).to_string(), "Hello");
+    /// assert_eq!(rope.line_content(1).to_string(), "World");
+    /// assert_eq!(rope.line_content(2).to_string(), "last");
+    /// assert_eq!(rope.line_content(9).to_string(), ""); // out of bounds
+    /// ```
+    fn line_content(&self, row: usize) -> RopeSlice<'_>;
+
+    /// Byte length of the line's trailing terminator: `2` for `\r\n`, `1` for
+    /// `\n`, `0` when the line has no terminator (last line).
+    ///
+    /// ```
+    /// use gpui_component::{Rope, RopeExt};
+    /// let rope = Rope::from("Hello\nWorld\r\nlast");
+    /// assert_eq!(rope.line_terminator_len(0), 1);
+    /// assert_eq!(rope.line_terminator_len(1), 2);
+    /// assert_eq!(rope.line_terminator_len(2), 0);
+    /// ```
+    fn line_terminator_len(&self, row: usize) -> usize;
+
+    /// Byte offset just past the line's content, i.e. **before** its
+    /// terminator. Equals `line_end_offset(row) - line_terminator_len(row)`.
+    ///
+    /// ```
+    /// use gpui_component::{Rope, RopeExt};
+    /// let rope = Rope::from("Hello\nWorld\r\nlast");
+    /// assert_eq!(rope.line_content_end_offset(0), 5);
+    /// assert_eq!(rope.line_content_end_offset(1), 11);
+    /// assert_eq!(rope.line_content_end_offset(2), 17);
+    /// ```
+    fn line_content_end_offset(&self, row: usize) -> usize;
 
     /// Return an iterator over all lines in the rope.
     ///
@@ -231,6 +273,25 @@ pub trait RopeExt {
     /// Get byte offset from the given point (row, column).
     ///
     /// The column is 0-based in bytes.
+    ///
+    /// The result is always a valid offset into the rope: the row is clamped
+    /// to the last line, the column is clamped to that row's *content* (so an
+    /// over-long column never spills into the next line), and the final offset
+    /// is snapped to a UTF-8 character boundary (so callers can slice at it
+    /// without panicking).
+    ///
+    /// ```
+    /// use gpui_component::{Rope, RopeExt};
+    /// let rope = Rope::from("Hello\nWorld\r\n中文 ab");
+    /// assert_eq!(rope.point_to_offset(gpui::Point::new(0, 0)), 0);
+    /// assert_eq!(rope.point_to_offset(gpui::Point::new(1, 5)), 11);
+    /// // Column past the end of the line is clamped, not spilled over.
+    /// assert_eq!(rope.point_to_offset(gpui::Point::new(1, 99)), 11);
+    /// // Row past the end of the buffer clamps to the buffer end.
+    /// assert_eq!(rope.point_to_offset(gpui::Point::new(99, 0)), rope.len());
+    /// // A byte column landing mid-character snaps to the boundary.
+    /// assert_eq!(rope.point_to_offset(gpui::Point::new(2, 1)), 13);
+    /// ```
     fn point_to_offset(&self, point: Point) -> usize;
 
     /// Get the word byte range at the given byte offset (0-based).
@@ -272,7 +333,7 @@ pub trait RopeExt {
 
     /// Convert offset in characters to byte offset (0-based).
     ///
-    /// Run in O(n) time.
+    /// Run in O(log n) time.
     ///
     /// # Example
     ///
@@ -288,7 +349,7 @@ pub trait RopeExt {
 
     /// Convert byte offset (0-based) to offset in characters.
     ///
-    /// Run in O(n) time.
+    /// Run in O(log n) time.
     ///
     /// # Example
     ///
@@ -301,6 +362,26 @@ pub trait RopeExt {
     /// assert_eq!(rope.offset_to_char_index(4), 3);
     /// ```
     fn offset_to_char_index(&self, offset: usize) -> usize;
+}
+
+/// Byte length of `line` with any trailing `\n` / `\r\n` removed.
+///
+/// This is a free function rather than a trait method on purpose:
+/// [`RopeExt::line_start_offset`] is implemented in terms of
+/// [`RopeExt::point_to_offset`], so `point_to_offset` must be able to measure a
+/// line without routing back through the trait (that would recurse forever).
+///
+/// Only ASCII terminator bytes are trimmed, so the result always sits on a
+/// UTF-8 char boundary and `slice(..end)` cannot panic.
+fn content_len(line: &RopeSlice<'_>) -> usize {
+    let mut end = line.len();
+    while end > 0 {
+        match line.byte(end - 1) {
+            b'\r' | b'\n' => end -= 1,
+            _ => break,
+        }
+    }
+    end
 }
 
 impl RopeExt for Rope {
@@ -322,9 +403,35 @@ impl RopeExt for Rope {
     }
 
     fn slice_lines(&self, rows_range: Range<usize>) -> RopeSlice<'_> {
+        // An empty (or inverted) range has no content. Returning early also
+        // avoids a panic: `line_end_offset(end - 1)` would land *before*
+        // `line_start_offset(start)`, and `Rope::slice` panics when
+        // `start > end`.
+        if rows_range.start >= rows_range.end {
+            return self.slice(0..0);
+        }
+
         let start = self.line_start_offset(rows_range.start);
         let end = self.line_end_offset(rows_range.end.saturating_sub(1));
-        self.slice(start..end)
+        self.slice(start..end.max(start))
+    }
+
+    fn line_content(&self, row: usize) -> RopeSlice<'_> {
+        let line = self.slice_line(row);
+        line.slice(..content_len(&line))
+    }
+
+    fn line_terminator_len(&self, row: usize) -> usize {
+        if row >= self.lines_len() {
+            return 0;
+        }
+
+        let full = self.line(row, LineType::LF).len();
+        full.saturating_sub(self.line_content(row).len())
+    }
+
+    fn line_content_end_offset(&self, row: usize) -> usize {
+        self.line_start_offset(row) + self.line_content(row).len()
     }
 
     fn iter_lines(&self) -> RopeLines<'_> {
@@ -352,8 +459,16 @@ impl RopeExt for Rope {
             return self.len();
         }
 
+        // Only ropey primitives below: `line_start_offset` delegates back to
+        // this method, so any `RopeExt` call here would recurse forever.
         let line_start = self.line_to_byte_idx(point.row, LineType::LF);
-        line_start + point.column
+        let line = self.line(point.row, LineType::LF);
+        // Clamp the column to the row's content, excluding its terminator, so
+        // a stale or externally supplied column cannot leap into the following
+        // line or past the end of the buffer.
+        let offset = line_start + point.column.min(content_len(&line));
+        // The column counts bytes and may land inside a multi-byte character.
+        self.clip_offset(offset, Bias::Left)
     }
 
     fn position_to_offset(&self, pos: &Position) -> usize {
@@ -481,12 +596,20 @@ impl RopeExt for Rope {
     }
 
     fn char_index_to_offset(&self, char_offset: usize) -> usize {
-        self.chars().take(char_offset).map(|c| c.len_utf8()).sum()
+        // `char_to_byte_idx` 是 O(log n) 的树查询，但越界会 panic；旧实现
+        // （`chars().take(n)`）越界时饱和到全文长度，这里沿用该语义。
+        if char_offset >= self.len_chars() {
+            self.len()
+        } else {
+            self.char_to_byte_idx(char_offset)
+        }
     }
 
     fn offset_to_char_index(&self, offset: usize) -> usize {
+        // `clip_offset` 已保证落在字符边界且不越界，因此 `byte_to_char_idx`
+        // （O(log n)）不会 panic，且端点语义与旧实现一致。
         let offset = self.clip_offset(offset, Bias::Right);
-        self.slice(..offset).chars().count()
+        self.byte_to_char_idx(offset)
     }
 }
 
@@ -755,5 +878,191 @@ mod tests {
         assert_eq!(rope.offset_to_char_index(5), 3);
         assert_eq!(rope.offset_to_char_index(6), 4);
         assert_eq!(rope.offset_to_char_index(10), 5);
+    }
+
+    /// 越界/边界语义：`char_index_to_offset` 饱和到全文长度，不 panic。
+    #[test]
+    fn test_char_offset_conversions_are_saturating() {
+        let rope = Rope::from("a 中文🎉 test\nRope");
+        let chars = rope.chars().count();
+        assert_eq!(rope.char_index_to_offset(chars), rope.len());
+        assert_eq!(rope.char_index_to_offset(chars + 1), rope.len());
+        assert_eq!(rope.char_index_to_offset(usize::MAX), rope.len());
+        assert_eq!(rope.offset_to_char_index(usize::MAX), chars);
+        assert_eq!(rope.offset_to_char_index(rope.len()), chars);
+
+        // 空 rope 也不能 panic。
+        let empty = Rope::new();
+        assert_eq!(empty.char_index_to_offset(0), 0);
+        assert_eq!(empty.char_index_to_offset(7), 0);
+        assert_eq!(empty.offset_to_char_index(0), 0);
+        assert_eq!(empty.offset_to_char_index(3), 0);
+    }
+
+    /// 差分测试：O(log n) 的树查询必须与朴素逐字符实现在每个字节/字符位置上都
+    /// 给出相同答案（审计 3.11 把这两处从 O(n) 换成了 O(log n)）。
+    #[test]
+    fn char_offset_conversions_match_naive() {
+        let text = "a 中文🎉 test\nRope\tending 中文abc\n🎉🎉";
+        let rope = Rope::from(text);
+        let naive_char_to_byte = |n: usize| -> usize {
+            text.chars().take(n).map(|c| c.len_utf8()).sum::<usize>()
+        };
+        let naive_byte_to_char = |offset: usize| -> usize {
+            let offset = offset.min(text.len());
+            let mut end = offset;
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            text[..end].chars().count()
+        };
+
+        for i in 0..=rope.len_chars() + 2 {
+            assert_eq!(
+                rope.char_index_to_offset(i),
+                naive_char_to_byte(i),
+                "char_index_to_offset({i})"
+            );
+        }
+        for b in 0..=rope.len() + 2 {
+            assert_eq!(
+                rope.offset_to_char_index(b),
+                naive_byte_to_char(b),
+                "offset_to_char_index({b})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slice_lines_edge_cases() {
+        let rope = Rope::from("a\nb\nc");
+
+        // Empty ranges used to panic: `line_end_offset(end - 1)` landed before
+        // `line_start_offset(start)`, and `Rope::slice` rejects `start > end`.
+        assert_eq!(rope.slice_lines(2..2).to_string(), "");
+        assert_eq!(rope.slice_lines(0..0).to_string(), "");
+        assert_eq!(rope.slice_lines(3..1).to_string(), "");
+
+        // Normal ranges keep working.
+        assert_eq!(rope.slice_lines(0..2).to_string(), "a\nb");
+        assert_eq!(rope.slice_lines(1..3).to_string(), "b\nc");
+    }
+
+    #[test]
+    fn test_line_content_strips_crlf() {
+        let rope = Rope::from("Hello\nWorld\r\nlast");
+
+        // `slice_line` deliberately keeps the `\r`…
+        assert_eq!(rope.slice_line(1).to_string(), "World\r");
+        // …whereas `line_content` strips any terminator.
+        assert_eq!(rope.line_content(0).to_string(), "Hello");
+        assert_eq!(rope.line_content(1).to_string(), "World");
+        assert_eq!(rope.line_content(2).to_string(), "last");
+
+        assert_eq!(rope.line_terminator_len(0), 1);
+        assert_eq!(rope.line_terminator_len(1), 2);
+        assert_eq!(rope.line_terminator_len(2), 0);
+        // Out of bounds rows report no content and no terminator.
+        assert_eq!(rope.line_content(9).to_string(), "");
+        assert_eq!(rope.line_terminator_len(9), 0);
+    }
+
+    #[test]
+    fn test_line_content_end_offset() {
+        let rope = Rope::from("Hello\nWorld\r\nlast");
+        // "Hello\nWorld\r\nlast": W starts at 6, so row 1's content ends at 11.
+        assert_eq!(rope.line_content_end_offset(0), 5);
+        assert_eq!(rope.line_content_end_offset(1), 11);
+        assert_eq!(rope.line_content_end_offset(2), 17);
+
+        // Content end must sit exactly where the terminator starts.
+        for row in 0..3 {
+            let content_end = rope.line_content_end_offset(row);
+            let next_start = rope.line_start_offset(row + 1);
+            assert_eq!(
+                next_start - content_end,
+                rope.line_terminator_len(row),
+                "row {row}: terminator should fill the gap to the next line"
+            );
+        }
+    }
+
+    #[test]
+    fn test_line_content_with_multibyte_and_crlf() {
+        // Regression guard: trimming the terminator must not slice into a
+        // multi-byte character.
+        let rope = Rope::from("中文\r\nsecond");
+        assert_eq!(rope.line_content(0).to_string(), "中文");
+        assert_eq!(rope.line_content_end_offset(0), "中文".len());
+        assert_eq!(rope.line_terminator_len(0), 2);
+        assert_eq!(rope.line_content(1).to_string(), "second");
+    }
+
+    #[test]
+    fn test_point_to_offset_clamps_column_to_line_content() {
+        // "Hello\n" = 0..6, "World\r\n" = 6..13, "中文 ab" = 13..22
+        let rope = Rope::from("Hello\nWorld\r\n中文 ab");
+        assert_eq!(rope.point_to_offset(Point::new(0, 0)), 0);
+        assert_eq!(rope.point_to_offset(Point::new(1, 0)), 6);
+        assert_eq!(rope.point_to_offset(Point::new(1, 5)), 11);
+
+        // Columns past the row's content must clamp instead of spilling into
+        // the next line (row 1's content ends at 11, its `\r\n` runs 11..13).
+        assert_eq!(rope.point_to_offset(Point::new(1, 99)), 11);
+        assert_eq!(rope.point_to_offset(Point::new(0, 99)), 5);
+
+        // Rows past the end clamp to the buffer end.
+        assert_eq!(rope.point_to_offset(Point::new(99, 0)), rope.len());
+    }
+
+    #[test]
+    fn test_point_to_offset_snaps_to_char_boundary() {
+        let rope = Rope::from("Hello\nWorld\r\n中文 ab");
+        // Byte column 1 lands inside `中` (bytes 13..16); the result must snap
+        // back to 13 so that callers can slice at it without panicking.
+        let offset = rope.point_to_offset(Point::new(2, 1));
+        assert_eq!(offset, 13);
+        assert!(rope.is_char_boundary(offset));
+
+        // Every byte column of the multibyte row must produce a boundary.
+        for column in 0..12 {
+            let offset = rope.point_to_offset(Point::new(2, column));
+            assert!(
+                rope.is_char_boundary(offset),
+                "column {column} produced non-boundary offset {offset}"
+            );
+            assert!(offset <= rope.len());
+        }
+    }
+
+    #[test]
+    fn test_point_to_offset_round_trips_with_offset_to_point() {
+        let rope = Rope::from("Hello\nWorld\r\n中文 ab\nlast\n");
+        for row in 0..rope.lines_len() {
+            let start = rope.line_start_offset(row);
+            let content_end = rope.line_content_end_offset(row);
+            for offset in start..=content_end {
+                let clipped = rope.clip_offset(offset, Bias::Left);
+                let point = rope.offset_to_point(clipped);
+                assert_eq!(
+                    rope.point_to_offset(point),
+                    clipped,
+                    "round trip failed for offset {offset} -> {point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_point_to_offset_clamps_terminator_offsets() {
+        // Offsets that land *on* a terminator are not representable as a point
+        // any more: the column is clamped back to the end of the line content,
+        // exactly like Zed's `clip_point`.
+        let rope = Rope::from("Hello\nWorld\r\nlast");
+        // 11 is the `\r` and 12 the `\n` of row 1; row 1's content ends at 11.
+        assert_eq!(rope.offset_to_point(11), Point::new(1, 5));
+        assert_eq!(rope.point_to_offset(Point::new(1, 6)), 11);
+        assert_eq!(rope.point_to_offset(Point::new(1, 7)), 11);
+        assert_eq!(rope.line_content_end_offset(1), 11);
     }
 }

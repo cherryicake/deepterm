@@ -245,6 +245,18 @@ impl FoldMap {
             .flatten()
     }
 
+    /// 严格小于 `wrap_row` 的可见 wrap 行数。
+    ///
+    /// 也就是「`wrap_row` 处（若被折叠，则是其后首个可见行）的 display row」——
+    /// 用于把「目标行上方的累计高度」从 O(行号) 的逐行累加换成 O(log n) 查询。
+    /// `visible_wrap_rows` 按升序构建，可以直接二分。
+    pub fn visible_display_rows_before(&self, wrap_row: usize) -> usize {
+        if self.folds.is_empty() {
+            return wrap_row.min(self.cached_wrap_row_count);
+        }
+        self.visible_wrap_rows.partition_point(|&row| row < wrap_row)
+    }
+
     /// Convert display_row to wrap_row.
     pub fn display_row_to_wrap_row(&self, display_row: usize) -> Option<usize> {
         if self.folds.is_empty() {
@@ -286,21 +298,27 @@ impl FoldMap {
         if self.folds.is_empty() {
             return;
         }
-        let delta = new_len as isize - (edit.end - edit.start) as isize;
+        let edit = edit.start.min(edit.end)..edit.end;
+        let delta = new_len as isize - edit.len() as isize;
+        // 位移后仍不能越过 0；`saturating_add_signed` 会把负数夹到 0 而不是绕回。
+        let shift = |offset: usize| offset.saturating_add_signed(delta);
 
         let mut folds = std::mem::take(&mut self.folds);
         folds.retain_mut(|fold| {
             if edit.end <= fold.start_offset {
-                // Edit entirely before the fold: shift it.
-                fold.start_offset = (fold.start_offset as isize + delta).max(0) as usize;
-                fold.end_offset = (fold.end_offset as isize + delta).max(0) as usize;
+                // Edit entirely before the fold (or a pure insertion at its
+                // start): shift the whole fold.
+                fold.start_offset = shift(fold.start_offset);
+                fold.end_offset = shift(fold.end_offset);
             } else if edit.start >= fold.end_offset {
-                // Edit entirely after the fold: unchanged.
-            } else if edit.start > fold.start_offset && edit.end < fold.end_offset {
-                // Edit strictly inside the fold: keep it, shift the end.
-                fold.end_offset = (fold.end_offset as isize + delta) as usize;
+                // Edit entirely after the fold (or a pure insertion at its
+                // end, i.e. at the start of the closing line): unchanged.
+            } else if edit.start > fold.start_offset && edit.end <= fold.end_offset {
+                // Edit inside the fold that leaves the closing line alone:
+                // keep the fold, just move its end.
+                fold.end_offset = shift(fold.end_offset);
             } else {
-                // Edit overlaps a fold boundary: drop the fold.
+                // Edit touches the fold's header boundary: drop the fold.
                 return false;
             }
             fold.start_offset < fold.end_offset
@@ -572,6 +590,71 @@ mod tests {
         assert!(map.folds().is_empty());
     }
 
+    /// 纯插入落在折叠边界上时不应该丢折叠。
+    ///
+    /// 折叠区间是 `start..end`（`end` 为闭合行的行首），两侧边界上的纯插入都应保留折叠：
+    /// - 插在 `start_offset`：折叠整体后移（头行变长，内容跟着走）；
+    /// - 插在 `end_offset`：插到闭合行行首，折叠区间本身不动。
+    #[test]
+    fn adjust_folds_keeps_pure_insertion_at_boundaries() {
+        // "fn main() {\n    a();\n}\nnext\n"
+        // fold = 12..22（12 = 头行行尾，22 = `}` 行行首）
+        let text = Rope::from("fn main() {\n    a();\n}\nnext\n");
+        let mut map = FoldMap::new();
+        let f = fold(&text, 0).unwrap();
+        map.fold([f]);
+        let (start, end) = (f.start_offset, f.end_offset);
+
+        // 在 end_offset 处纯插入 3 字节：插到闭合行行首，折叠区间不动。
+        map.adjust_folds_for_edit(end..end, 3);
+        assert_eq!(map.folds().len(), 1, "end_offset 处纯插入不应丢弃折叠");
+        assert_eq!(map.folds()[0].start_offset, start);
+        assert_eq!(map.folds()[0].end_offset, end);
+
+        // 在 start_offset 处纯插入 3 字节：头行变长，折叠整体右移。
+        map.adjust_folds_for_edit(start..start, 3);
+        assert_eq!(map.folds().len(), 1, "start_offset 处纯插入不应丢弃折叠");
+        assert_eq!(map.folds()[0].start_offset, start + 3);
+        assert_eq!(map.folds()[0].end_offset, end + 3);
+    }
+
+    /// 替换区间**恰好止于** `end_offset`（闭合行未被触碰）时应保留折叠。
+    #[test]
+    fn adjust_folds_keeps_edit_ending_at_fold_end() {
+        // "fn main() {\n    a();\n}\nnext\n" → fold = 11..21
+        let text = Rope::from("fn main() {\n    a();\n}\nnext\n");
+        let mut map = FoldMap::new();
+        let f = fold(&text, 0).unwrap();
+        map.fold([f]);
+        let end = f.end_offset;
+
+        // 替换折叠内最后一行的内容（17..21 → 2 字节），闭合行未动。
+        map.adjust_folds_for_edit(end - 4..end, 2);
+        assert_eq!(map.folds().len(), 1, "闭合行未参与编辑时应保留折叠");
+        assert_eq!(map.folds()[0].end_offset, end - 2);
+    }
+
+    /// `delta` 为大负数时不能下溢（debug 下 panic）或产生反转区间。
+    #[test]
+    fn adjust_folds_survives_huge_deletion() {
+        let text = Rope::from("fn main() {\n    a();\n}\nnext\n");
+        let mut map = FoldMap::new();
+        let f = fold(&text, 0).unwrap();
+        map.fold([f]);
+
+        // 折叠之后的整段被删除（delta = -100）。
+        map.adjust_folds_for_edit(30..130, 0);
+        // 折叠整体在编辑点之前，不受影响。
+        assert_eq!(map.folds().len(), 1);
+        assert_eq!(map.folds()[0].start_offset, f.start_offset);
+
+        // 折叠之前的整段被删除（delta 为大负数）→ 折叠退化被丢弃，且不能 panic。
+        map.adjust_folds_for_edit(0..200, 0);
+        assert!(
+            map.folds().is_empty() || map.folds()[0].start_offset <= map.folds()[0].end_offset
+        );
+    }
+
     #[test]
     fn adjust_folds_shifts_following_folds() {
         // Two functions:
@@ -584,6 +667,37 @@ mod tests {
         // Insert 4 bytes before the second function (at end of line 3).
         map.adjust_folds_for_edit(17..17, 4);
         assert_eq!(map.folds()[1].start_offset, f2.start_offset + 4);
+    }
+
+    /// `visible_display_rows_before` 是滚动定位用的 O(log n) 查询：它必须与
+    /// 「逐行累加可见行数」完全一致，否则光标在折叠区之后会滚错位置。
+    #[test]
+    fn visible_display_rows_before_matches_naive_sum() {
+        let naive = |map: &FoldMap, wrap_row: usize| -> usize {
+            (0..wrap_row)
+                .filter(|&r| map.wrap_row_to_display_row(r).is_some())
+                .count()
+        };
+
+        // 无折叠：identity 映射。
+        let mut map = FoldMap::new();
+        map.rebuild_identity(10);
+        for wr in 0..=12 {
+            assert_eq!(map.visible_display_rows_before(wr), naive(&map, wr), "wr={wr}");
+        }
+
+        // 有折叠："fn main() {\n    a();\n}\nnext\n" → 行 1、2 被隐藏，
+        // 可见 wrap 行 = [0, 3, 4]。
+        let text = Rope::from("fn main() {\n    a();\n}\nnext\n");
+        let mut map = FoldMap::new();
+        map.fold([fold(&text, 0).unwrap()]);
+        map.rebuild_identity(5);
+        for wr in 0..=7 {
+            assert_eq!(map.visible_display_rows_before(wr), naive(&map, wr), "wr={wr}");
+        }
+        assert_eq!(map.visible_display_rows_before(1), 1);
+        assert_eq!(map.visible_display_rows_before(3), 1);
+        assert_eq!(map.visible_display_rows_before(4), 2);
     }
 
     #[test]

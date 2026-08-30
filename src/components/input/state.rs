@@ -11,6 +11,7 @@ use gpui::{
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use sum_tree::Bias;
@@ -21,6 +22,7 @@ use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
 use crate::components::input::history::History;
+use crate::components::input::indent::TabSize;
 use crate::components::input::movement::MoveDirection;
 use crate::components::input::rope_ext::Position;
 use crate::components::input::{
@@ -166,10 +168,15 @@ pub(crate) const RAINBOW_BRACKETS_MAX_TEXT_LEN: usize = 2_000_000;
 const OCCURRENCE_MAX_MATCHES: usize = 2_000;
 /// 同词高亮扫描的最大文件长度（字节）。
 const OCCURRENCE_MAX_TEXT_LEN: usize = 2_000_000;
+/// 词移动 / 词删除的扫描窗口（字节）。
+///
+/// 词边界判定需要 `&str`，只能把文本复制出来；限定窗口后，大文件里按
+/// alt-← / alt-backspace 的代价与文件大小无关（窗口整体是空白时才全量扫）。
+const WORD_SCAN_WINDOW: usize = 4096;
 
 /// 行首缩进的每级字节边界：第 k 个元素 = 第 k+1 个缩进单位结束处的字节偏移。
 ///
-/// Tab 算 1 级，每 4 个空格算 1 级（与 SPACE_OUTDENT_WIDTH 一致）。
+/// Tab 算 1 级，每 4 个空格算 1 级（与 `TabSize::HARD_TABS` 的列宽一致）。
 #[allow(dead_code)] // legacy: kept for tests; guides now use indent columns
 pub(crate) fn indent_level_bounds(line_text: &str) -> Vec<usize> {
     let mut bounds = Vec::new();
@@ -270,12 +277,67 @@ fn find_word_occurrences(
     }
     let target: Vec<u8> = text.slice(word.clone()).bytes().collect();
     let len = text.len();
+
+    // 流式扫描：只保留一个 ≤ `wlen + 2` 字节的滑动窗口（左邻字节 + 目标 +
+    // 右邻字节），直接在 rope 的字节迭代器上滑。
+    //
+    // 旧实现先把整个文档收集成 `Vec<u8>`，而调用点在 paint 路径上、缓存键只
+    // 要光标换词就失效 —— 大文件里每敲一个键就要多分配一份全文（上限 2MB）。
+    let mut window: VecDeque<u8> = VecDeque::with_capacity(wlen + 2);
+    // 已读入的字节数；`window` 覆盖 `[consumed - window.len(), consumed)`。
+    let mut consumed = 0usize;
+    // 下一个待判定的起点。
+    let mut i = 0usize;
+    let mut result = Vec::new();
+
+    for byte in text.bytes() {
+        window.push_back(byte);
+        consumed += 1;
+        if window.len() > wlen + 2 {
+            window.pop_front();
+        }
+
+        // 起点 `i` 要等它完整的 `wlen` 个字节都进窗口才能判定；右邻字节则
+        // 要么已经读入，要么已经确定不存在（`i + wlen == len`）。
+        while i + wlen <= consumed && (i + wlen < consumed || consumed == len) {
+            let start = consumed - window.len();
+            let rel = i - start;
+            let matched = window.iter().skip(rel).take(wlen).eq(target.iter())
+                && (i == 0 || !is_ascii_word_byte(window[rel - 1]))
+                && (i + wlen == len || !is_ascii_word_byte(window[rel + wlen]));
+            if matched {
+                result.push(i..i + wlen);
+                if result.len() > max_matches {
+                    return None;
+                }
+                i += wlen;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    Some(result)
+}
+
+/// 朴素全量实现，仅用于测试对照（流式扫描的正确性基准）。
+#[cfg(test)]
+fn find_word_occurrences_naive(
+    text: &Rope,
+    word: &Range<usize>,
+    max_matches: usize,
+) -> Option<Vec<Range<usize>>> {
+    let wlen = word.len();
+    if wlen == 0 {
+        return None;
+    }
+    let target: Vec<u8> = text.slice(word.clone()).bytes().collect();
+    let len = text.len();
     let bytes: Vec<u8> = text.bytes().collect();
     let mut result = Vec::new();
     let mut i = 0;
     while i + wlen <= len {
-        if bytes[i] == target[0]
-            && &bytes[i..i + wlen] == target.as_slice()
+        if &bytes[i..i + wlen] == target.as_slice()
             && (i == 0 || !is_ascii_word_byte(bytes[i - 1]))
             && (i + wlen == len || !is_ascii_word_byte(bytes[i + wlen]))
         {
@@ -743,6 +805,10 @@ pub struct InputState {
     pub(crate) rainbow_cache: Option<RainbowCache>,
     /// 缩进参考线。
     pub(crate) indent_guides: bool,
+    /// 缩进单元配置（硬 Tab / 空格，以及单元列宽）。
+    ///
+    /// 默认 [`TabSize::HARD_TABS`]，即与历史行为一致的「Tab 字符 + 4 列」。
+    pub(crate) tab_size: TabSize,
     /// 悬浮滚动条。
     pub(crate) scrollbar: bool,
     /// 滚动条几何（每次 paint 后写入）。
@@ -881,6 +947,7 @@ impl InputState {
             rainbow_brackets: true,
             rainbow_cache: None,
             indent_guides: true,
+            tab_size: TabSize::default(),
             scrollbar: true,
             scrollbar_geometry: None,
             scrollbar_drag: None,
@@ -991,8 +1058,8 @@ impl InputState {
     /// Default options:
     ///
     /// - line_number: true
-    /// - tab_size: 2
-    /// - hard_tabs: false
+    /// - 缩进单元：Tab 字符、4 列宽（[`TabSize::HARD_TABS`]，可用
+    ///   [`Self::tab_size`] 改成空格缩进）
     /// - height: 100%
     /// - multi_line: true
     /// - indent_guides: true
@@ -1302,6 +1369,58 @@ impl InputState {
         cx.notify();
     }
 
+    /// Replace the whole content as an **undoable** edit, preserving both the
+    /// scroll offset and (as far as possible) the cursor.
+    ///
+    /// [`Self::set_value`] clears the undo history and jumps to the top of the
+    /// document, which is the right behaviour when loading a file but wrong for
+    /// a user-visible mutation — reverting a diff hunk went through it and was
+    /// therefore impossible to undo, while throwing the user back to line 1.
+    pub fn set_value_undoable(
+        &mut self,
+        value: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scroll = self.scroll_handle.offset();
+        let cursor = self.cursor();
+
+        let was_ignoring = self.history.ignore;
+        self.history.ignore = false;
+        self.replace_text(value, window, cx);
+        self.history.ignore = was_ignoring;
+
+        // Clamp the cursor into the new text instead of resetting it to 0.
+        let cursor = cursor.min(self.text.len());
+        self.selected_range = (cursor..cursor).into();
+
+        if self.mode.is_code_editor() {
+            self._pending_update = true;
+        }
+
+        self.update_preferred_column();
+        self.scroll_handle.set_offset(scroll);
+        cx.notify();
+    }
+
+    /// 记录「文档内容已变化」，并使所有按版本号做的缓存/闸门失效。
+    ///
+    /// **不变式：任何改写 `self.text` 的路径都必须调用它。** 目前有且仅有三处：
+    /// - [`Self::replace_text_in_range_inner`] —— 常规键入 / 粘贴 / `set_value`
+    /// - [`Self::set_text`] —— 整体替换（文件加载、切标签页、重载）
+    /// - `EntityInputHandler::replace_and_mark_text_in_range` —— IME 组字
+    ///
+    /// 漏掉的后果不止一处：
+    /// - `editor.rs` 的脏检查以 `last_checked_text_version != text_version` 为闸门，
+    ///   版本不动 → 未保存标记永远不更新（IME 输入后文件不显示“已修改”）。
+    /// - `occurrence_cache`（同词高亮）以 `text_version` 为缓存键 → 文本换了而键
+    ///   没换，会把旧文档的命中范围套在新文档上。
+    /// - `dispatch_background_parse` 的 stale 判定形同虚设 → 可能把针对旧文本解析
+    ///   出的语法树应用到新文本上。
+    fn bump_text_version(&mut self) {
+        self.text_version = self.text_version.wrapping_add(1);
+    }
+
     /// Set the text of the input field without requiring a window.
     ///
     /// Unlike [`Self::set_value`], this does not need a `Window` and is safe to call from
@@ -1311,6 +1430,7 @@ impl InputState {
         self.history.ignore = true;
         let text: SharedString = text.into();
         self.text = Rope::from(text.as_ref());
+        self.bump_text_version();
         if self.mode.is_single_line() {
             self.selected_range = (self.text.len()..self.text.len()).into();
         } else {
@@ -1318,6 +1438,12 @@ impl InputState {
         }
         self.ime_marked_range = None;
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        // Folds are stored as raw byte offsets into the previous buffer. After
+        // a wholesale text replacement those offsets point into unrelated
+        // content (and may even exceed the new buffer length), so keeping them
+        // folds arbitrary regions of the new file. `set_text` is used for file
+        // loads / tab switches, where a fresh document must start unfolded.
+        self.display_map.clear_folds();
         self.display_map.set_text(&self.text, cx);
         if self.mode.is_code_editor() {
             self.reset_highlighter(cx);
@@ -1378,7 +1504,10 @@ impl InputState {
         let was_disabled = self.disabled;
         self.disabled = false;
         let text: SharedString = text.into();
-        let range = 0..self.text.chars().map(|c| c.len_utf16()).sum();
+        // `Rope::len_utf16` is O(1); walking every char was O(N) on every
+        // replace, i.e. on every file load and every keystroke in the
+        // single-line path.
+        let range = 0..self.text.len_utf16();
         self.replace_text_in_range_silent(Some(range), &text, window, cx);
         self.reset_highlighter(cx);
         self.disabled = was_disabled;
@@ -1466,6 +1595,19 @@ impl InputState {
     pub fn indent_guides(mut self, enable: bool) -> Self {
         self.indent_guides = enable;
         self
+    }
+
+    /// 缩进单元配置（默认 [`TabSize::HARD_TABS`]）。
+    ///
+    /// 影响 Tab / Shift+Tab、回车智能缩进、闭合括号自动反缩进与缩进参考线层级。
+    pub fn tab_size(mut self, tab_size: TabSize) -> Self {
+        self.tab_size = tab_size;
+        self
+    }
+
+    /// 当前缩进单元的列宽（缩进参考线层级用）。
+    pub(crate) fn indent_width(&self) -> usize {
+        self.tab_size.tab_size.clamp(1, 64)
     }
 
     /// 悬浮滚动条（默认开启）。
@@ -1801,29 +1943,64 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
+    /// 词边界分段里最后一个非纯空白分段的起点（相对 `text`；`None` = 全是空白）。
+    fn last_word_start(text: &str) -> Option<usize> {
+        UnicodeSegmentation::split_word_bound_indices(text)
+            .rfind(|(_, s)| !s.trim_start().is_empty())
+            .map(|(i, _)| i)
+    }
+
+    /// 词边界分段里第一个非纯空白分段的终点（相对 `text`；`None` = 全是空白）。
+    fn first_word_end(text: &str) -> Option<usize> {
+        UnicodeSegmentation::split_word_bound_indices(text)
+            .find(|(_, s)| !s.trim_start().is_empty())
+            .map(|(i, s)| i + s.len())
+    }
+
     /// Return the start offset of the previous word.
     pub(crate) fn previous_start_of_word(&mut self) -> usize {
         let offset = self.selected_range.start;
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-        // FIXME: Avoid to_string
-        let left_part = self.text.slice(0..offset).to_string();
 
-        UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
-            .rfind(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // `split_word_bound_indices` 需要 `&str`，无法直接吃 `RopeSlice`。
+        // 每次都把光标之前的整段复制成 String 的话，2MB 文件在末尾按一次
+        // alt-← 就要分配 2MB。词边界几乎总落在最近的一段文本里，所以先只扫
+        // `WORD_SCAN_WINDOW` 字节；窗口整体是空白（超长空行/缩进）时才退回
+        // 全量扫描，保证语义与不做窗口时完全一致。
+        let start = self
+            .text
+            .clip_offset(offset.saturating_sub(WORD_SCAN_WINDOW), Bias::Right);
+        let left_part = self.text.slice(start..offset).to_string();
+
+        match Self::last_word_start(&left_part) {
+            Some(i) => start + i,
+            None if start > 0 => {
+                Self::last_word_start(&self.text.slice(0..offset).to_string()).unwrap_or(0)
+            }
+            None => 0,
+        }
     }
 
     /// Return the next end offset of the next word.
     pub(crate) fn next_end_of_word(&mut self) -> usize {
         let offset = self.cursor();
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-        let right_part = self.text.slice(offset..self.text.len()).to_string();
+        let len = self.text.len();
+        let end = self
+            .text
+            .clip_offset((offset + WORD_SCAN_WINDOW).min(len), Bias::Left);
+        let right_part = self.text.slice(offset..end).to_string();
 
-        UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
-            .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| offset + i + s.len())
-            .unwrap_or(self.text.len())
+        match Self::first_word_end(&right_part) {
+            Some(i) => offset + i,
+            // 窗口内没有非空白内容：要么文档尾部就是空白（结果同为 `len`），
+            // 要么窗口被空白填满，需要放宽到余下全文。
+            None if end < len => {
+                Self::first_word_end(&self.text.slice(offset..len).to_string())
+                    .map_or(len, |i| offset + i)
+            }
+            None => len,
+        }
     }
 
     /// Get start of line byte offset of cursor.
@@ -1864,7 +2041,9 @@ impl InputState {
 
         let row = self.text.offset_to_point(self.cursor()).row;
         let logical_start = self.text.line_start_offset(row);
-        let logical_end = self.text.line_end_offset(row);
+        // 用内容边界而非 `line_end_offset`：后者在 CRLF 下指向 `\n`，会把 `\r`
+        // 算进行内容，导致 End 键停在 `\r` 之后、`cmd-delete` 删出孤立 `\r`。
+        let logical_end = self.text.line_content_end_offset(row);
 
         if self.soft_wrap && self.mode.is_code_editor() {
             let wrap_point = self.display_map.offset_to_wrap_display_point(self.cursor());
@@ -1927,7 +2106,7 @@ impl InputState {
         let before = self.text.slice(line_start..cursor).to_string();
         let base = before[..before.len() - before.trim_start().len()].to_string();
         let next = self.text.slice(cursor..).chars().next();
-        let unit = Self::INDENT_UNIT;
+        let unit = self.tab_size.indent_unit();
 
         match Self::newline_indent_kind(&before, next) {
             NewlineIndent::BlankBetween => {
@@ -2058,11 +2237,11 @@ impl InputState {
                 let new_prefix = match prefix.strip_suffix('\t') {
                     Some(p) => p.to_string(),
                     None => {
-                        // 空格缩进：去掉一个单位（至多 SPACE_OUTDENT_WIDTH 个空格）
+                        // 空格缩进：去掉一个单元（`tab_size` 个空格）。
                         // 按**字符**裁剪：行首空白可能是全角空格（U+3000）等
                         // 多字节字符，按字节切片会落在字符中间导致 panic。
                         let chars: Vec<char> = prefix.chars().collect();
-                        let keep = chars.len().saturating_sub(Self::SPACE_OUTDENT_WIDTH);
+                        let keep = chars.len().saturating_sub(self.indent_width());
                         chars[..keep].iter().collect()
                     }
                 };
@@ -2129,6 +2308,18 @@ impl InputState {
             end_row -= 1;
         }
         start_row..=end_row
+    }
+
+    /// 插入新行时使用的行尾符，取自 `row` 自身的终止符（`\r\n` 或 `\n`）。
+    ///
+    /// 编辑 CRLF 文档时若硬编码 `\n`，会往文件里掺入混用行尾——这也是
+    /// 合并行 / 上下移动行 / 复制行在 CRLF 文件上产出错乱内容的根因。
+    fn insert_line_ending(&self, row: usize) -> &'static str {
+        if self.text.line_terminator_len(row) == 2 {
+            "\r\n"
+        } else {
+            "\n"
+        }
     }
 
     /// 行 span：[首行行首, 末行下一行行首或文件尾)（含末行行尾换行）。
@@ -2257,10 +2448,21 @@ impl InputState {
 
         // 交换相邻两个行块：新内容 = block + prev
         let new_text = if block.ends_with('\n') {
+            // 两块各自带着自己的终止符，直接交换即可（LF / CRLF 都对）。
             format!("{block}{prev}")
         } else {
-            // block 在文件尾无换行：需补分隔换行并去掉 prev 尾部换行
-            format!("{block}\n{}", &prev[..prev.len() - 1])
+            // block 是文件尾、没有终止符：它要接管 prev 的终止符。
+            // 必须整段剥掉 prev 的终止符（CRLF 是 2 字节，只砍 1 字节会留下
+            // 孤立的 `\r`），再按文档自身的行尾风格重新插回。
+            let prev_row = *rows.start() - 1;
+            let content_len = prev
+                .len()
+                .saturating_sub(self.text.line_terminator_len(prev_row));
+            format!(
+                "{block}{}{}",
+                self.insert_line_ending(prev_row),
+                &prev[..content_len]
+            )
         };
         let range_utf16 = self.range_to_utf16(&(prev_start..span.end));
         self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
@@ -2304,8 +2506,18 @@ impl InputState {
         let new_text = if below.ends_with('\n') {
             format!("{below}{block}")
         } else {
-            // below 是文件尾无换行的行：补分隔换行并去掉 block 尾部换行
-            format!("{below}\n{}", &block[..block.len() - 1])
+            // below 是文件尾、没有终止符，而 block 带着自己的终止符。
+            // 交换后 block 变成末行，因此要把它的终止符让给 below：整段剥掉
+            // block 的终止符（CRLF 是 2 字节），再按文档行尾风格插到中间。
+            let block_last_row = *rows.end();
+            let content_len = block
+                .len()
+                .saturating_sub(self.text.line_terminator_len(block_last_row));
+            format!(
+                "{below}{}{}",
+                self.insert_line_ending(block_last_row),
+                &block[..content_len]
+            )
         };
         let range_utf16 = self.range_to_utf16(&(span.start..below_end));
         self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
@@ -2336,11 +2548,13 @@ impl InputState {
         let insert = if content.ends_with('\n') {
             content.clone()
         } else {
-            format!("\n{content}")
+            // 末行没有终止符：补一个与文档风格一致的行尾符再接内容。
+            format!("{}{content}", self.insert_line_ending(*rows.end()))
         };
         let range_utf16 = self.range_to_utf16(&(span.end..span.end));
         self.replace_text_in_range_silent(Some(range_utf16), &insert, window, cx);
         self.scroll_to(self.cursor(), None, cx);
+        self.update_preferred_column();
         cx.notify();
     }
 
@@ -2359,9 +2573,14 @@ impl InputState {
         if span.start >= span.end {
             return;
         }
-        // 删除文件最后的行时连同前一个换行一起删，避免留下尾部空行
+        // 删除文件最后的行时连同前一个行尾符一起删，避免留下尾部空行。
+        // 行尾符可能是 2 字节（`\r\n`），只退 1 字节会让文件以孤立的 `\r` 结尾。
         if span.end >= self.text.len() && span.start > 0 {
-            span.start -= 1;
+            let start_row = self.text.offset_to_point(span.start).row;
+            let prev_row = start_row.saturating_sub(1);
+            span.start = span
+                .start
+                .saturating_sub(self.text.line_terminator_len(prev_row));
         }
         let range_utf16 = self.range_to_utf16(&span);
         self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
@@ -2387,17 +2606,24 @@ impl InputState {
         if row + 1 > self.text.lines_len().saturating_sub(1) {
             return; // 已是最后一行
         }
-        let line_end = self.text.line_end_offset(row);
-        let next_end = self.text.line_end_offset(row + 1);
-        let next_line = self.text.slice(line_end + 1..next_end).to_string();
-        if next_line.trim().is_empty() && next_end >= self.text.len() {
-            // 下一行是文件尾空行：仅删换行符
-            let range_utf16 = self.range_to_utf16(&(line_end..line_end + 1));
+        // 一律用「内容边界」而不是 `line_end_offset`：`line_end_offset` 在 CRLF
+        // 文档里指向 `\n`，其前面的 `\r` 会被算进行内容，导致合并时把 `\r`
+        // 拼进正文、并且因为 `ends_with(whitespace)` 恒真而永远不加空格。
+        let row_start = self.text.line_start_offset(row);
+        let row_content_end = self.text.line_content_end_offset(row);
+        let next_start = self.text.line_start_offset(row + 1);
+        let next_content_end = self.text.line_content_end_offset(row + 1);
+
+        let next_line = self.text.slice(next_start..next_content_end).to_string();
+        if next_line.trim().is_empty() && next_content_end >= self.text.len() {
+            // 下一行是文件尾空行：仅删本行的行尾符（CRLF 下是 2 字节）
+            let range_utf16 = self.range_to_utf16(&(row_content_end..next_start));
             self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
             cx.notify();
             return;
         }
-        let cur_line = self.text.slice(self.text.line_start_offset(row)..line_end).to_string();
+
+        let cur_line = self.text.slice(row_start..row_content_end).to_string();
         let trimmed = next_line.trim_start();
         let sep = if cur_line.is_empty() || cur_line.ends_with(char::is_whitespace) {
             ""
@@ -2405,9 +2631,10 @@ impl InputState {
             " "
         };
         let text = format!("{sep}{trimmed}");
-        let range_utf16 = self.range_to_utf16(&(line_end..next_end));
+        // 替换区间 = 本行行尾符 + 下一行内容，下一行的行尾符原样保留。
+        let range_utf16 = self.range_to_utf16(&(row_content_end..next_content_end));
         self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
-        let new_cursor = line_end + sep.len();
+        let new_cursor = row_content_end + sep.len();
         self.selected_range = (new_cursor..new_cursor).into();
         self.update_preferred_column();
         cx.notify();
@@ -2814,7 +3041,11 @@ impl InputState {
 
         let mut offset = self.end_of_line();
         if offset == self.cursor() {
-            offset = (offset + 1).clamp(0, self.text.len());
+            // 已在行内容末尾：连行尾符一起删掉。CRLF 下是 2 字节，只退 1 字节
+            // 会留下孤立的 `\r`。
+            let row = self.text.offset_to_point(self.cursor()).row;
+            let terminator = self.text.line_terminator_len(row);
+            offset = (offset + terminator).clamp(0, self.text.len());
         }
         self.replace_text_in_range_silent(
             Some(self.range_to_utf16(&(self.cursor()..offset))),
@@ -2891,13 +3122,9 @@ impl InputState {
         });
     }
 
-    /// 代码编辑器中 Tab / Shift+Tab 的缩进单元：
-    /// 统一使用 Tab 字符（Makefile 等对制表符敏感的格式依赖它；
-    /// 后续若引入软缩进配置可替换此处）。
-    const INDENT_UNIT: &'static str = "\t";
-    /// 无 Tab 风格（空格缩进）下 outdent 一次最多删除的空格数。
-    const SPACE_OUTDENT_WIDTH: usize = 4;
-
+    /// 代码编辑器中 Tab / Shift+Tab 的缩进单元由 [`Self::tab_size`] 决定：
+    /// 默认 [`TabSize::HARD_TABS`]（Makefile 等对制表符敏感的格式依赖它），
+    /// 也可切成空格缩进。
     pub(crate) fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
         self.indent_or_outdent_lines(false, window, cx);
     }
@@ -2922,20 +3149,6 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         self.indent_or_outdent_lines(true, window, cx);
-    }
-
-    /// 行首一个缩进单元的长度（字节）：优先 Tab，其次最多 4 个空格。
-    fn outdent_unit_len(line: &str) -> usize {
-        let bytes = line.as_bytes();
-        if bytes.first() == Some(&b'\t') {
-            1
-        } else {
-            bytes
-                .iter()
-                .take_while(|&&b| b == b' ')
-                .take(Self::SPACE_OUTDENT_WIDTH)
-                .count()
-        }
     }
 
     /// Tab / Shift+Tab / Cmd+] / Cmd+[ 的核心实现。
@@ -2965,7 +3178,8 @@ impl InputState {
             if outdent {
                 self.outdent_cursor_line(start, window, cx);
             } else {
-                self.replace_text_in_range_silent(None, Self::INDENT_UNIT, window, cx);
+                let unit = self.tab_size.indent_unit();
+                self.replace_text_in_range_silent(None, &unit, window, cx);
             }
             return;
         }
@@ -2982,16 +3196,18 @@ impl InputState {
         let line_start = self.text.line_start_offset(start_row);
         let line_end = self.text.line_end_offset(last_row);
 
+        let unit = self.tab_size.indent_unit();
         let mut new_text = String::new();
         let mut removed = Vec::with_capacity(last_row - start_row + 1);
         for row in start_row..=last_row {
             let line = self.text.slice_line(row).to_string();
             if outdent {
-                let n = Self::outdent_unit_len(&line);
+                // 行首反缩进一次要删掉的字节数由 [`Self::tab_size`] 决定。
+                let n = self.tab_size.outdent_len(&line);
                 removed.push(n);
                 new_text.push_str(&line[n..]);
             } else {
-                new_text.push_str(Self::INDENT_UNIT);
+                new_text.push_str(&unit);
                 new_text.push_str(&line);
             }
             if row != last_row {
@@ -3013,7 +3229,10 @@ impl InputState {
                 shifted_outdent_offset(end, &edits),
             )
         } else {
-            (start + 1, end + (last_row - start_row + 1))
+            // 每行行首插入一个缩进单元：起点平移一个单元，终点平移「行数 ×
+            // 单元长度」（此前写死 +1，只在缩进单元是单个 Tab 时成立）。
+            let unit_len = unit.len();
+            (start + unit_len, end + unit_len * (last_row - start_row + 1))
         };
         self.selected_range = Selection::new(new_start, new_end);
         self.update_preferred_column();
@@ -3029,7 +3248,7 @@ impl InputState {
         let row = self.text.offset_to_point(offset).row;
         let line_start = self.text.line_start_offset(row);
         let line = self.text.slice_line(row).to_string();
-        let n = Self::outdent_unit_len(&line);
+        let n = self.tab_size.outdent_len(&line);
         if n == 0 {
             return;
         }
@@ -3181,12 +3400,18 @@ impl InputState {
         }
     }
 
+    /// 应用滚动偏移，返回**是否发生了变化**。
+    ///
+    /// 调用方据此决定是否需要再请求一帧。此前这里无条件 `cx.notify()`，而
+    /// `paint` 每帧都会调用本函数 —— 于是画完就把实体标脏、下一帧再画一遍，
+    /// 空闲时也是满帧空转（叠加 paint 里的 O(N) 扫描，代价很可观）。
     pub(crate) fn update_scroll_offset(
         &mut self,
         offset: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
-    ) {
-        let mut offset = offset.unwrap_or(self.scroll_handle.offset());
+    ) -> bool {
+        let previous = self.scroll_handle.offset();
+        let mut offset = offset.unwrap_or(previous);
         // In addition to left alignment, a cursor position will be reserved on the right side
         let safe_x_offset = if self.text_align == TextAlign::Left {
             px(0.)
@@ -3206,7 +3431,13 @@ impl InputState {
         };
         offset.x = offset.x.clamp(safe_x_range.start, safe_x_range.end);
         self.scroll_handle.set_offset(offset);
-        cx.notify();
+        // 只有真的挪动了才需要重绘：钳制后的偏移与原来相同是常态（例如已经
+        // 停在顶部还在往上滚），这种情况下没必要再请求一帧。
+        let changed = offset != previous;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     /// Scroll to make the given offset visible.
@@ -3233,16 +3464,10 @@ impl InputState {
 
         let row = point.row;
 
-        let mut row_offset_y = px(0.);
-        for (ix, _wrap_line) in self.display_map.lines().iter().enumerate() {
-            if ix == row {
-                break;
-            }
-
-            // Only accumulate height for visible (non-folded) wrap rows
-            let visible_wrap_rows = self.display_map.visible_wrap_row_count_for_buffer_line(ix);
-            row_offset_y += line_height * visible_wrap_rows;
-        }
+        // 目标行上方的累计高度 = 它之前的可见显示行数 × 行高。逐行累加是
+        // O(光标行号)，光标在长文件末尾时每次移动都要扫全表；改走 display_map
+        // 的前缀和 + 二分（`display_row_for_buffer_line`）后是 O(log n)。
+        let mut row_offset_y = line_height * self.display_map.display_row_for_buffer_line(row) as f32;
 
         // Apart from left alignment, just leave enough space for the cursor size on the right side.
         let safety_margin = if last_layout.text_align == TextAlign::Left {
@@ -3250,10 +3475,11 @@ impl InputState {
         } else {
             CURSOR_WIDTH
         };
-        if let Some(line) = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
-        {
+        // `lines` is a compact array of *visible* lines, so it cannot be
+        // indexed with `row - visible_range.start`; that arithmetic only holds
+        // when nothing is folded. `LastLayout::line` binary-searches
+        // `visible_buffer_lines` and is correct in both cases.
+        if let Some(line) = last_layout.line(row) {
             // Check to scroll horizontally and soft wrap lines
             if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
@@ -3317,24 +3543,18 @@ impl InputState {
         let point = self.text.offset_to_point(offset);
         let row = point.row;
 
-        let mut row_offset_y = px(0.);
-        for (ix, _wrap_line) in self.display_map.lines().iter().enumerate() {
-            if ix == row {
-                break;
-            }
-
-            // Only accumulate height for visible (non-folded) wrap rows
-            let visible_wrap_rows = self.display_map.visible_wrap_row_count_for_buffer_line(ix);
-            row_offset_y += line_height * visible_wrap_rows;
-        }
+        // 同 `scroll_to`：目标行上方的累计高度走 O(log n) 的 display row 查询。
+        let mut row_offset_y = line_height * self.display_map.display_row_for_buffer_line(row) as f32;
 
         let mut scroll_offset = self.scroll_handle.offset();
 
         // 行内列偏移：在前面各行总高度之上，同时供下方水平可见性逻辑复用
         // （与 scroll_to 不同，这里只需查询一次）。
+        // Same as `scroll_to`: `lines` is compact, so look the row up through
+        // `LastLayout::line`'s binary search rather than subtracting the
+        // visible range start (which is wrong as soon as a fold is active).
         let pos = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
+            .line(row)
             .and_then(|line| line.position_for_index(point.column, last_layout, false));
         if let Some(pos) = pos {
             row_offset_y += pos.y;
@@ -3410,7 +3630,12 @@ impl InputState {
         if let Some(clipboard) = cx.read_from_clipboard() {
             let mut new_text = clipboard.text().unwrap_or_default();
             if !self.mode.is_multi_line() {
-                new_text = new_text.replace('\n', "");
+                // 单行输入框：整段压平。CRLF 文本里的 `\r` 也要去掉，否则会
+                // 在输入框里显示成一串裸 `\r`。
+                new_text = new_text
+                    .chars()
+                    .filter(|c| *c != '\n' && *c != '\r')
+                    .collect();
             }
 
             self.replace_text_in_range_silent(None, &new_text, window, cx);
@@ -3418,7 +3643,14 @@ impl InputState {
         }
     }
 
-    fn push_history(&mut self, text: &Rope, range: &Range<usize>, new_text: &str) {
+    fn push_history(
+        &mut self,
+        text: &Rope,
+        range: &Range<usize>,
+        new_text: &str,
+        old_selection: Range<usize>,
+        new_selection: Range<usize>,
+    ) {
         if self.history.ignore {
             return;
         }
@@ -3428,45 +3660,83 @@ impl InputState {
         let old_text = text.slice(range.clone()).to_string();
         let new_range = range.start..range.start + new_text.len();
 
-        self.history
-            .push(Change::new(range, &old_text, new_range, new_text));
+        self.history.push(
+            Change::new(range, &old_text, new_range, new_text)
+                .with_selections(old_selection, new_selection),
+        );
+    }
+
+    /// 把选区恢复到指定偏移，越界时钳到文档末尾。
+    fn restore_selection(&mut self, selection: Option<(usize, usize)>) {
+        let Some((start, end)) = selection else {
+            return;
+        };
+        let len = self.text.len();
+        let start = start.min(len);
+        let end = end.clamp(start, len);
+        self.selected_range = (start..end).into();
+        self.selection_reversed = false;
     }
 
     pub(crate) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
+            // `changes` 逆序排列（最近一次编辑在前），所以最后一条才是本组
+            // 最早的编辑 —— 它记录的 `old_selection` 就是整组开始前的光标。
+            // 没有它，撤销后光标会停在被恢复文本的末尾而不是编辑前的位置。
+            let restore = changes.last().and_then(|c| c.old_selection);
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range);
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
+            self.restore_selection(restore);
+            self.update_preferred_column();
+            self.scroll_to(self.cursor(), None, cx);
         }
         self.history.ignore = false;
+        // 撤销本身不属于任何编辑组：否则紧接着的输入会被并进刚撤销那一组的
+        // 版本号里，与"撤销"这个动作混为一谈。
+        self.history.break_group();
+        cx.notify();
     }
 
     pub(crate) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
+            // redo 栈里 `changes` 是正序的（最早的在前），最后一条是本组最近
+            // 的编辑，它的 `new_selection` 才是整组完成后的光标位置。
+            let restore = changes.last().and_then(|c| c.new_selection);
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range);
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
+            self.restore_selection(restore);
+            self.update_preferred_column();
+            self.scroll_to(self.cursor(), None, cx);
         }
         self.history.ignore = false;
+        self.history.break_group();
+        cx.notify();
     }
 
     /// Get byte offset of the cursor.
     ///
-    /// The offset is the UTF-8 offset.
+    /// The offset is the UTF-8 offset, and is always clamped into the current
+    /// text and snapped to a char boundary: `selected_range` / `ime_marked_range`
+    /// can transiently point past the end (external `set_value`, IME
+    /// composition while the text shrinks), which would make the ubiquitous
+    /// `text.slice(..cursor)` panic.
     pub fn cursor(&self) -> usize {
-        if let Some(ime_marked_range) = &self.ime_marked_range {
-            return ime_marked_range.end;
-        }
-
-        if self.selection_reversed {
+        let offset = if let Some(ime_marked_range) = &self.ime_marked_range {
+            ime_marked_range.end
+        } else if self.selection_reversed {
             self.selected_range.start
         } else {
             self.selected_range.end
-        }
+        };
+
+        self.text
+            .clip_offset(offset.min(self.text.len()), Bias::Left)
     }
 
     pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -3627,22 +3897,31 @@ impl InputState {
         }
     }
 
+    /// The previous cursor position, never resting inside a line terminator.
+    ///
+    /// A `\r\n` pair counts as a single stop: stepping left from the start of a
+    /// line lands on the end of the previous line's *content*, not between
+    /// `\r` and `\n`.
     pub(crate) fn previous_boundary(&self, offset: usize) -> usize {
         let mut offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset -= 1;
-            }
+        // Step back over the terminator. `\n` and `\r` are ASCII, so the
+        // single-byte step stays on a char boundary; `saturating_sub` guards
+        // the start of the document, where the old `offset -= 1` underflowed
+        // whenever the text began with `\r\n`.
+        if self.text.char_at(offset) == Some('\n') {
+            offset = offset.saturating_sub(1);
         }
         self.clamp_offset_to_visible_backward(offset)
     }
 
+    /// The next cursor position, skipping whole line terminators.
     pub(crate) fn next_boundary(&self, offset: usize) -> usize {
-        let mut offset = self.text.clip_offset(offset + 1, Bias::Right);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset += 1;
-            }
+        let mut offset = self.text.clip_offset(offset.saturating_add(1), Bias::Right);
+        if self.text.char_at(offset) == Some('\r') && self.text.char_at(offset + 1) == Some('\n')
+        {
+            offset += 2;
+        } else if self.text.char_at(offset) == Some('\n') {
+            offset += 1;
         }
         self.clamp_offset_to_visible_forward(offset)
     }
@@ -3714,6 +3993,14 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
+    /// 是否真的挂了校验规则（`validate` 闭包或 `pattern` 正则）。
+    ///
+    /// 没有规则时 `is_valid_input` 必然返回 true，此时不必为了「校验」把整段
+    /// 文本复制成 `String`（单行输入每次按键都会走到那里）。
+    fn needs_validation(&self) -> bool {
+        self.validate.is_some() || self.pattern.is_some()
+    }
+
     fn is_valid_input(&self, new_text: &str, cx: &mut Context<Self>) -> bool {
         if new_text.is_empty() {
             return true;
@@ -3732,24 +4019,32 @@ impl InputState {
         pattern.is_match(new_text)
     }
 
+    /// 同步元素尺寸，必要时让 display_map 按新宽度重排软换行。
+    ///
+    /// 判据必须是**换行宽度本身**，而不是 `bounds.size.width`：换行宽度 =
+    /// 元素宽度 − 行号栏 − 右安全边距。行数越过 9999/99999 阈值（行号位数
+    /// 变化）或开关折叠图标时，行号栏宽度变了而元素宽度没变，只比对元素宽度
+    /// 会让 display_map 永远收不到更新，软换行一直停在陈旧宽度上。
+    ///
+    /// 另外这里读的是**本帧**的 `last_layout.line_number_width`（paint 结束前
+    /// 刚写进去的），而不是上一帧算出的 `wrap_width` —— 后者滞后一帧。
     pub(crate) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;
         self.input_bounds = new_bounds;
 
-        // Update display_map wrap_width if changed.
-        if let Some(last_layout) = self.last_layout.as_ref() {
-            if wrap_width_changed {
-                let wrap_width = if !self.soft_wrap {
-                    // None to disable wrapping (will use Pixels::MAX)
-                    None
-                } else {
-                    last_layout.wrap_width
-                };
+        // 与 prepaint 中 `wrap_width` 的算法保持一致。
+        let wrap_width = match self.last_layout.as_ref() {
+            Some(last_layout) if self.soft_wrap && self.mode.is_multi_line() => Some(
+                (new_bounds.size.width - last_layout.line_number_width - RIGHT_MARGIN)
+                    .max(px(1.)),
+            ),
+            // None 表示不换行（内部按 Pixels::MAX 处理）
+            _ => None,
+        };
 
-                self.display_map.on_layout_changed(wrap_width, cx);
-                self.mode.update_auto_grow(&self.display_map);
-                cx.notify();
-            }
+        // 宽度没变时 `on_layout_changed` 会直接返回，不会触发全文档重排。
+        if self.display_map.on_layout_changed(wrap_width, cx) {
+            self.mode.update_auto_grow(&self.display_map);
+            cx.notify();
         }
     }
 
@@ -3831,12 +4126,14 @@ impl InputState {
             }))
             .unwrap_or(self.selected_range.into());
 
+        // 编辑前的选区：记进 undo 记录，撤销时才能把光标放回原处。
+        let old_selection: Range<usize> = self.selected_range.into();
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 
         let new_offset = (range.start + new_text.len()).min(self.text.len());
 
-        if self.mode.is_single_line() {
+        if self.mode.is_single_line() && self.needs_validation() {
             let pending_text = self.text.to_string();
             // Check if the new text is valid
             if !self.is_valid_input(&pending_text, cx) {
@@ -3845,7 +4142,16 @@ impl InputState {
             }
         }
 
-        self.push_history(&old_text, &range, new_text);
+        self.push_history(
+            &old_text,
+            &range,
+            new_text,
+            old_selection,
+            new_offset..new_offset,
+        );
+        // IME 组字期间开的分组在这里收口：组字中途按 Esc 走的是 `unmark_text`，
+        // 那条路径不经过本函数，必须自己复位，否则其后键入的第一个字符会被
+        // 并进 IME 那一组一起撤销。
         self.history.end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -3855,6 +4161,13 @@ impl InputState {
         self.display_map.adjust_folds_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
+
+        // Bump the version *before* dispatching the background parse. The task
+        // captures the current version and, on completion, drops its result if
+        // the version moved on (the user kept typing). Dispatching first and
+        // bumping afterwards made that comparison always true, so every
+        // background tree was silently discarded.
+        self.bump_text_version();
 
         let bg = self
             .mode
@@ -3867,7 +4180,6 @@ impl InputState {
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.mode.update_auto_grow(&self.display_map);
-        self.text_version = self.text_version.wrapping_add(1);
         self.update_search(cx);
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -4018,6 +4330,11 @@ impl EntityInputHandler for InputState {
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         self.ime_marked_range = None;
+        // Esc 取消组字。分组是在 `replace_and_mark_text_in_range` 里开的，而
+        // 那条路径不经过 `replace_text_in_range_inner`（后者负责收口），所以
+        // 必须在这里显式结束：否则 `grouping` 一直为真，之后键入的第一个字符
+        // 会被并进刚才那次 IME 组里，一次撤销就全没了。
+        self.history.end_grouping();
     }
 
     /// Replace text in range.
@@ -4056,10 +4373,12 @@ impl EntityInputHandler for InputState {
             }))
             .unwrap_or(self.selected_range.into());
 
+        // 组字开始前的选区，供 undo 恢复光标。
+        let old_selection: Range<usize> = self.selected_range.into();
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 
-        if self.mode.is_single_line() {
+        if self.mode.is_single_line() && self.needs_validation() {
             let pending_text = self.text.to_string();
             if !self.is_valid_input(&pending_text, cx) {
                 self.text = old_text;
@@ -4075,6 +4394,10 @@ impl EntityInputHandler for InputState {
         self.display_map.adjust_folds_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
+
+        // IME 组字同样是文档编辑：每次组字更新都要推进版本号，否则脏检查闸门、
+        // 同词高亮缓存、后台解析的 stale 判定全会把它当成「文本没变」。
+        self.bump_text_version();
 
         let bg = self
             .mode
@@ -4101,7 +4424,13 @@ impl EntityInputHandler for InputState {
         }
         self.mode.update_auto_grow(&self.display_map);
         self.history.start_grouping();
-        self.push_history(&old_text, &range, new_text);
+        self.push_history(
+            &old_text,
+            &range,
+            new_text,
+            old_selection,
+            self.selected_range.into(),
+        );
         cx.notify();
     }
 
@@ -4226,9 +4555,16 @@ fn line_text_for_clipboard(text: &ropey::Rope, offset: usize) -> (String, std::o
         (text.slice(start..end).to_string(), start..end)
     } else {
         // 最后一行：内容到行尾，并补结尾换行。
-        let end = text.line_end_offset(row);
+        //
+        // 补的换行符要沿用文档自身的风格：CRLF 文档补 `\n` 会制造混用行尾。
+        // 末行本身没有终止符，所以从上一行推断，没有上一行时回退到 `\n`。
+        let end = text.line_content_end_offset(row);
         let mut content = text.slice(start..end).to_string();
-        content.push('\n');
+        if row > 0 && text.line_terminator_len(row - 1) == 2 {
+            content.push_str("\r\n");
+        } else {
+            content.push('\n');
+        }
         (content, start..end)
     }
 }
@@ -4238,16 +4574,19 @@ mod tests {
     use super::*;
     use crate::components::input::{InputState, Rope};
 
+    /// 反缩进的长度语义现在由 `TabSize` 承载（审计 3.14），这里验证默认配置
+    /// （硬 Tab，列宽 4）下的行为不变；`indent.rs` 的测试覆盖空格配置。
     #[test]
     fn outdent_unit_len_prefers_tab() {
-        assert_eq!(InputState::outdent_unit_len("\tfoo"), 1);
-        assert_eq!(InputState::outdent_unit_len("\t\tfoo"), 1);
-        assert_eq!(InputState::outdent_unit_len("foo"), 0);
-        assert_eq!(InputState::outdent_unit_len("    foo"), 4); // 空格缩进
-        assert_eq!(InputState::outdent_unit_len("  foo"), 2);
-        assert_eq!(InputState::outdent_unit_len("      foo"), 4); // 最多 4 个
-        assert_eq!(InputState::outdent_unit_len("  \tfoo"), 2); // 空格在 tab 前
-        assert_eq!(InputState::outdent_unit_len(""), 0);
+        let tab = TabSize::default();
+        assert_eq!(tab.outdent_len("\tfoo"), 1);
+        assert_eq!(tab.outdent_len("\t\tfoo"), 1);
+        assert_eq!(tab.outdent_len("foo"), 0);
+        assert_eq!(tab.outdent_len("    foo"), 4); // 空格缩进
+        assert_eq!(tab.outdent_len("  foo"), 2);
+        assert_eq!(tab.outdent_len("      foo"), 4); // 最多 4 个
+        assert_eq!(tab.outdent_len("  \tfoo"), 2); // 空格在 tab 前
+        assert_eq!(tab.outdent_len(""), 0);
     }
 
     #[test]
@@ -4396,6 +4735,55 @@ mod tests {
         let many = "ab ".repeat(50);
         let rope = Rope::from_str(&many);
         assert!(find_word_occurrences(&rope, &(0..2), 10).is_none());
+    }
+
+    /// `find_word_occurrences` 改成定长滑动窗口的流式扫描后，用朴素全量实现
+    /// 做差分对照：窗口边界、文档首尾、多字节字符都不能改变结果。
+    #[test]
+    fn word_occurrences_streaming_matches_naive() {
+        // 覆盖：任意词长 × 各种文档长度，含文档首尾命中与相邻重复。
+        let alphabet = ['a', 'b', ' ', '_', '中'];
+        let mut seed = 0x2545_F491_4F6D_D1A9u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for doc_len in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 33, 64, 129] {
+            for _ in 0..12 {
+                let text: String = (0..doc_len)
+                    .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                    .collect();
+                let rope = Rope::from_str(&text);
+                // 词范围必须落在字符边界上（生产路径由 `word_range_at` 保证）。
+                let bounds: Vec<usize> = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(text.len()))
+                    .collect();
+
+                for (bi, &start) in bounds.iter().enumerate() {
+                    for &end in bounds.iter().skip(bi + 1) {
+                        // 词长封顶：再长就是同一套窗口逻辑的重复验证。
+                        if end - start > 8 {
+                            break;
+                        }
+                        let got = find_word_occurrences(&rope, &(start..end), 1000);
+                        let want = find_word_occurrences_naive(&rope, &(start..end), 1000);
+                        assert_eq!(got, want, "doc={text:?} word={start}..{end}");
+                    }
+                }
+            }
+        }
+
+        // 长文档（远超窗口容量）上的跨边界命中。
+        let long = "foo ".repeat(5000);
+        let rope = Rope::from_str(long.trim_end());
+        let got = find_word_occurrences(&rope, &(0..3), 100_000).unwrap();
+        assert_eq!(got.len(), 5000);
+        assert_eq!(got.last(), Some(&(19996..19999)));
     }
 
     #[test]
@@ -4722,6 +5110,157 @@ mod tests {
             assert_eq!(backward, 11, "should clamp back to the fold start (end of row 0)");
             let forward = state.next_boundary(30);
             assert_eq!(forward, 60, "should clamp forward to the fold end (row 5 closing brace start)");
+        });
+    }
+
+    /// 整体换文档（文件加载 / 标签切换）后不能把旧折叠按 offset 重映射到新文档上。
+    #[gpui::test]
+    fn wholesale_replacement_clears_folds(cx: &mut gpui::TestAppContext) {
+        struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                let mut state =
+                    InputState::new(window, cx).code_editor("rust").multi_line(true);
+                state.set_value(FOLD_TEST_TEXT, window, cx);
+                state
+            });
+
+            input.update(cx, |state, cx| {
+                state.fold_at(0, cx);
+                state.fold_at(7, cx);
+                assert!(state.display_map.is_line_folded(0));
+                assert!(state.display_map.is_line_folded(7));
+            });
+
+            // `set_value` 走整体 replace（0..len），与折叠边界重叠 → 折叠全部丢弃。
+            input.update(cx, |state, cx| {
+                state.set_value("fn fresh() {\n    x();\n}\n", window, cx);
+                assert!(
+                    state.display_map.folds().is_empty(),
+                    "set_value 后不应残留旧文档的折叠"
+                );
+            });
+
+            // `set_text`（后台文件加载路径，无 Window）同样必须清折叠。
+            input.update(cx, |state, cx| {
+                state.fold_at(0, cx);
+                assert!(state.display_map.is_line_folded(0));
+                state.set_text("fn other() {\n    y();\n}\n", cx);
+                assert!(
+                    state.display_map.folds().is_empty(),
+                    "set_text 后不应残留旧文档的折叠"
+                );
+            });
+
+            Host(input)
+        });
+    }
+
+    /// `text_version` 是「文档内容已变化」的唯一信号，三条改写 `self.text` 的
+    /// 路径都必须推进它 —— 少一处，脏检查闸门 / 同词高亮缓存 / 后台解析的
+    /// stale 判定就会把这次编辑当成「文本没变」。
+    ///
+    /// IME 组字路径最容易漏（它不经过 `replace_text_in_range_inner`）：中文输入
+    /// 时文件不会显示“已修改”，直到用户敲一个非组字键。
+    #[gpui::test]
+    fn text_version_advances_on_every_mutation(cx: &mut gpui::TestAppContext) {
+        struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).code_editor("rust").multi_line(true)
+            });
+
+            // 1) 常规键入（EntityInputHandler）
+            input.update(cx, |state, cx| {
+                let before = state.text_version;
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    None,
+                    "let a = 1;",
+                    window,
+                    cx,
+                );
+                assert!(
+                    state.text_version > before,
+                    "常规键入未推进 text_version（{} -> {}）",
+                    before,
+                    state.text_version
+                );
+            });
+
+            // 2) 整体替换（后台文件加载 / 切标签页 / 重载）
+            input.update(cx, |state, cx| {
+                let before = state.text_version;
+                state.set_text("fn reloaded() {}\n", cx);
+                assert!(
+                    state.text_version > before,
+                    "set_text 未推进 text_version（{} -> {}）",
+                    before,
+                    state.text_version
+                );
+            });
+
+            // 3) IME 组字：每一步都算一次编辑，都要推进版本号。
+            input.update(cx, |state, cx| {
+                state.set_text("", cx);
+                for ch in ["n", "ni", "你", "你好"] {
+                    let before = state.text_version;
+                    gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                        state,
+                        None,
+                        ch,
+                        None,
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        state.text_version > before,
+                        "IME 组字 {ch:?} 未推进 text_version（{before} -> {}）",
+                        state.text_version
+                    );
+                    assert_eq!(state.value().as_ref(), ch);
+                }
+            });
+
+            // 4) 校验失败回滚时不应推进版本号（文本最终没变）。
+            let validated = cx.new(|cx| {
+                // 默认即单行模式；`pattern` 只接受数字。
+                InputState::new(window, cx).pattern(regex::Regex::new(r"^\d*$").unwrap())
+            });
+            validated.update(cx, |state, cx| {
+                state.set_value("123", window, cx);
+                let before = state.text_version;
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state, None, "abc", window, cx,
+                );
+                assert_eq!(state.value().as_ref(), "123", "非法输入应被拒绝");
+                assert_eq!(
+                    state.text_version, before,
+                    "被拒绝的输入不应推进 text_version"
+                );
+            });
+
+            Host(input)
         });
     }
 

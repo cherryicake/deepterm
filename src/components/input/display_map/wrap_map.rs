@@ -142,10 +142,17 @@ impl WrapMap {
         self.rebuild_cache();
     }
 
-    /// Update layout parameters (wrap width or font)
-    pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
+    /// Update layout parameters (wrap width or font).
+    ///
+    /// 返回是否真的变了。宽度没变时直接返回 —— `rebuild_cache` 是 O(总行数)
+    /// 的全量重建，而 `set_input_bounds` 每帧都会调用到这里。
+    pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) -> bool {
+        if self.wrapper.wrap_width() == wrap_width {
+            return false;
+        }
         self.wrapper.set_wrap_width(wrap_width, cx);
         self.rebuild_cache();
+        true
     }
 
     /// Set font parameters
