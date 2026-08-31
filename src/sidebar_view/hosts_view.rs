@@ -3,11 +3,27 @@ use gpui::{App, SharedString};
 
 actions!(
     host_actions,
-    [ConnectHost, EditHost, CopyHostAddress, DeleteHost]
+    [
+        ConnectHost,
+        EditHost,
+        CopyHostAddress,
+        DeleteHost,
+        CreateHost,
+        CreateFolder,
+        RenameFolder,
+        DeleteFolder,
+        ConnectFolder,
+        SortNameAsc,
+        SortNameDesc,
+        SortCreatedDesc,
+        SortCreatedAsc,
+        SortCountDesc,
+        SortCustom
+    ]
 );
 
 use crate::assets::Icon;
-use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
+use crate::ssh::config::{AuthMethod, HostGroup, SortMode, SshConnectionConfig, SshGlobalConfig};
 use crate::ssh::keychain::{KeychainKeyFlavor, KeychainStore};
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::theme::ActiveTheme;
@@ -29,6 +45,9 @@ pub struct Host {
     pub auth_label: Option<SharedString>,
     pub icon_color: HostIconColor,
     pub os_icon: Option<Icon>,
+    pub group_id: Option<SharedString>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub sort_order: Option<u32>,
 }
 
 impl Host {
@@ -46,6 +65,9 @@ impl Host {
             auth_label: None,
             icon_color: HostIconColor::Orange,
             os_icon: None,
+            group_id: None,
+            created_at: None,
+            sort_order: None,
         }
     }
 
@@ -71,6 +93,21 @@ impl Host {
 
     pub fn with_os_icon(mut self, icon: Icon) -> Self {
         self.os_icon = Some(icon);
+        self
+    }
+
+    pub fn with_group_id(mut self, group_id: Option<SharedString>) -> Self {
+        self.group_id = group_id;
+        self
+    }
+
+    pub fn with_created_at(mut self, created_at: chrono::DateTime<chrono::Utc>) -> Self {
+        self.created_at = Some(created_at);
+        self
+    }
+
+    pub fn with_sort_order(mut self, sort_order: Option<u32>) -> Self {
+        self.sort_order = sort_order;
         self
     }
 
@@ -114,8 +151,35 @@ impl HostIconColor {
     }
 }
 
+pub fn sort_hosts(hosts: &mut [Host], mode: SortMode) {
+    match mode {
+        SortMode::NameAsc | SortMode::CountDesc => {
+            // Count has no meaning for hosts; treat as name order
+            hosts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }
+        SortMode::NameDesc => {
+            hosts.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()))
+        }
+        SortMode::CreatedDesc => hosts.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        SortMode::CreatedAsc => hosts.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        SortMode::Custom => {
+            hosts.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)))
+        }
+    }
+}
+
+pub fn folder_subtitle(count: usize) -> String {
+    format!("{}台主机", count)
+}
+
 /// Load hosts from SSH config file, returning hosts and configs
+#[allow(dead_code)]
 pub fn load_hosts_from_config() -> (Vec<Host>, Vec<SshConnectionConfig>) {
+    let (hosts, configs, _) = load_grouped_hosts();
+    (hosts, configs)
+}
+
+pub fn load_grouped_hosts() -> (Vec<Host>, Vec<SshConnectionConfig>, Vec<HostGroup>) {
     let config = SshGlobalConfig::load();
     let keychain = KeychainStore::load_or_default();
 
@@ -164,18 +228,21 @@ pub fn load_hosts_from_config() -> (Vec<Host>, Vec<SshConnectionConfig>) {
                 .as_deref()
                 .map(RemoteOS::from_id)
                 .unwrap_or_else(|| guess_os_from_text(&display_name));
-            let host = Host::new(conn.id(), display_name, HostType::Ssh)
+            let base = Host::new(conn.id(), display_name, HostType::Ssh)
                 .with_username(&conn.username)
                 .with_hostname(&conn.host)
                 .with_auth_label(auth_label)
-                .with_icon_color(icon_color);
+                .with_icon_color(icon_color)
+                .with_group_id(conn.group_id.clone().map(SharedString::from))
+                .with_created_at(conn.created_at)
+                .with_sort_order(conn.sort_order);
             if os != RemoteOS::Unknown {
-                host.with_os_icon(os.icon())
+                base.with_os_icon(os.icon())
             } else {
-                host
+                base
             }
         })
         .collect();
 
-    (hosts, config.saved_connections)
+    (hosts, config.saved_connections, config.host_groups)
 }

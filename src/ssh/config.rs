@@ -2,6 +2,7 @@
 //!
 //! 提供 SSH 连接所需的配置结构和认证方式定义。
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,8 +17,94 @@ fn generate_id(username: &str, host: &str, port: u16, nickname: Option<&str>) ->
     }
 }
 
-/// SSH 连接配置
+/// 文件夹排序方式
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortMode {
+    NameAsc,
+    NameDesc,
+    CreatedDesc,
+    CreatedAsc,
+    CountDesc,
+    Custom,
+}
+
+impl Default for SortMode {
+    fn default() -> Self {
+        SortMode::NameAsc
+    }
+}
+
+impl SortMode {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "名称 A → Z",
+            SortMode::NameDesc => "名称 Z → A",
+            SortMode::CreatedDesc => "创建时间 新→旧",
+            SortMode::CreatedAsc => "创建时间 旧→新",
+            SortMode::CountDesc => "主机数 多→少",
+            SortMode::Custom => "自定义排序",
+        }
+    }
+}
+
+fn validate_group_name(
+    name: &str,
+    existing: &[HostGroup],
+    exclude_id: Option<&str>,
+) -> Result<String, String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("文件夹名称不能为空".to_string());
+    }
+    if trimmed.chars().count() > 20 {
+        return Err("文件夹名称不能超过20字符".to_string());
+    }
+    let is_duplicate = existing.iter().any(|g| {
+        if let Some(exclude) = exclude_id {
+            if g.id == exclude {
+                return false;
+            }
+        }
+        g.name.eq_ignore_ascii_case(&trimmed)
+    });
+    if is_duplicate {
+        return Err(format!("文件夹 '{}' 已存在", trimmed));
+    }
+    Ok(trimmed)
+}
+
+fn cmp_name_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase().cmp(&b.to_lowercase())
+}
+
+/// Host 文件夹分组
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HostGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub sort_order: u32,
+    pub created_at: DateTime<Utc>,
+    /// 兼容旧折叠字段，现不使用但保留以避免反序列化失败
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+impl HostGroup {
+    pub fn new(name: impl Into<String>, sort_order: u32) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            sort_order,
+            created_at: Utc::now(),
+            collapsed: false,
+        }
+    }
+}
+
+/// SSH 连接配置
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SshConnectionConfig {
     /// 主机地址（IP 或域名）
     pub host: String,
@@ -42,7 +129,35 @@ pub struct SshConnectionConfig {
     /// 检测到的远程操作系统 ID
     #[serde(default)]
     pub os: Option<String>,
+    /// 所属文件夹分组 id，None 表示未分组
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// 组内排序
+    #[serde(default)]
+    pub sort_order: Option<u32>,
+    /// 创建时间
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
 }
+
+impl PartialEq for SshConnectionConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.port == other.port
+            && self.username == other.username
+            && self.auth_method == other.auth_method
+            && self.nickname == other.nickname
+            && self.extra_args == other.extra_args
+            && self.timeout == other.timeout
+            && self.save_config == other.save_config
+            && self.os == other.os
+            && self.group_id == other.group_id
+            && self.sort_order == other.sort_order
+        // created_at is metadata and intentionally excluded from equality
+    }
+}
+
+impl Eq for SshConnectionConfig {}
 
 impl SshConnectionConfig {
     /// 获取连接唯一标识符（基于用户名、主机、端口和昵称生成）
@@ -53,6 +168,11 @@ impl SshConnectionConfig {
             self.port,
             self.nickname.as_deref(),
         )
+    }
+
+    pub fn with_group_id(mut self, group_id: Option<String>) -> Self {
+        self.group_id = group_id;
+        self
     }
 }
 
@@ -88,6 +208,9 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: default_save(),
             os: None,
+            group_id: None,
+            sort_order: None,
+            created_at: Utc::now(),
         }
     }
 
@@ -103,6 +226,9 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: false,
             os: None,
+            group_id: None,
+            sort_order: None,
+            created_at: Utc::now(),
         }
     }
 
@@ -125,6 +251,9 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: default_save(),
             os: None,
+            group_id: None,
+            sort_order: None,
+            created_at: Utc::now(),
         }
     }
 
@@ -350,6 +479,31 @@ impl KnownHost {
     }
 }
 
+pub fn sort_host_groups(
+    groups: &mut [HostGroup],
+    mode: SortMode,
+    host_counts: Option<&std::collections::HashMap<String, usize>>,
+) {
+    match mode {
+        SortMode::NameAsc => groups.sort_by(|a, b| cmp_name_insensitive(&a.name, &b.name)),
+        SortMode::NameDesc => groups.sort_by(|a, b| cmp_name_insensitive(&b.name, &a.name)),
+        SortMode::CreatedDesc => groups.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        SortMode::CreatedAsc => groups.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        SortMode::CountDesc => {
+            if let Some(counts) = host_counts {
+                groups.sort_by(|a, b| {
+                    let ca = counts.get(&a.id).copied().unwrap_or(0);
+                    let cb = counts.get(&b.id).copied().unwrap_or(0);
+                    cb.cmp(&ca).then_with(|| a.name.cmp(&b.name))
+                });
+            } else {
+                groups.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
+        SortMode::Custom => groups.sort_by_key(|g| g.sort_order),
+    }
+}
+
 /// SSH 全局配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SshGlobalConfig {
@@ -381,6 +535,15 @@ pub struct SshGlobalConfig {
     /// 此后用户显式设置的 true 会被尊重，不会再被改写。
     #[serde(default)]
     host_key_strict_migrated: bool,
+    /// Host 文件夹列表
+    #[serde(default)]
+    pub host_groups: Vec<HostGroup>,
+    /// 文件夹排序方式
+    #[serde(default)]
+    pub folder_sort: SortMode,
+    /// Host 排序方式
+    #[serde(default)]
+    pub host_sort: SortMode,
 }
 
 fn default_true() -> bool {
@@ -412,7 +575,108 @@ impl SshGlobalConfig {
             use_agent: true,
             // 新建配置本身就是新默认值，无需迁移
             host_key_strict_migrated: true,
+            host_groups: Vec::new(),
+            folder_sort: SortMode::default(),
+            host_sort: SortMode::default(),
         }
+    }
+
+    // ─── HostGroup 管理 ────────────────────────────────────────────────
+    pub fn create_group(&mut self, name: &str) -> Result<HostGroup, String> {
+        let trimmed = validate_group_name(name, &self.host_groups, None)?;
+        let sort_order = self.host_groups.len() as u32;
+        let group = HostGroup::new(trimmed, sort_order);
+        self.host_groups.push(group.clone());
+        Ok(group)
+    }
+
+    pub fn rename_group(&mut self, id: &str, new_name: &str) -> Result<(), String> {
+        let trimmed = validate_group_name(new_name, &self.host_groups, Some(id))?;
+        let group = self
+            .host_groups
+            .iter_mut()
+            .find(|g| g.id == id)
+            .ok_or("未找到文件夹")?;
+        group.name = trimmed;
+        Ok(())
+    }
+
+    pub fn delete_group(&mut self, id: &str, delete_hosts: bool) -> Result<(), String> {
+        let pos = self.host_groups.iter().position(|g| g.id == id).ok_or("未找到文件夹")?;
+        self.host_groups.remove(pos);
+        // 归一化 sort_order
+        for (i, g) in self.host_groups.iter_mut().enumerate() {
+            g.sort_order = i as u32;
+        }
+        if delete_hosts {
+            self.saved_connections.retain(|c| c.group_id.as_deref() != Some(id));
+        } else {
+            for c in &mut self.saved_connections {
+                if c.group_id.as_deref() == Some(id) {
+                    c.group_id = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn move_hosts_to_group(&mut self, host_ids: &[String], target: Option<&str>) {
+        let host_ids: std::collections::HashSet<&String> = host_ids.iter().collect();
+        let mut next_sort = self
+            .saved_connections
+            .iter()
+            .filter(|c| c.group_id.as_deref() == target)
+            .filter_map(|c| c.sort_order)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        for conn in &mut self.saved_connections {
+            if host_ids.contains(&conn.id()) {
+                conn.group_id = target.map(|s| s.to_string());
+                conn.sort_order = Some(next_sort);
+                next_sort += 1;
+            }
+        }
+    }
+
+    pub fn reorder_groups(&mut self, ordered_ids: Vec<String>) {
+        let mut map: std::collections::HashMap<String, HostGroup> =
+            self.host_groups.drain(..).map(|g| (g.id.clone(), g)).collect();
+        let mut new_groups = Vec::new();
+        for (i, id) in ordered_ids.iter().enumerate() {
+            if let Some(mut g) = map.remove(id) {
+                g.sort_order = i as u32;
+                new_groups.push(g);
+            }
+        }
+        // 剩余未在 ordered_ids 中的按原 sort_order 追加
+        let mut remaining: Vec<HostGroup> = map.into_values().collect();
+        remaining.sort_by_key(|g| g.sort_order);
+        for mut g in remaining {
+            g.sort_order = new_groups.len() as u32;
+            new_groups.push(g);
+        }
+        self.host_groups = new_groups;
+    }
+
+    pub fn find_group(&self, id: &str) -> Option<&HostGroup> {
+        self.host_groups.iter().find(|g| g.id == id)
+    }
+
+    /// 自愈孤儿 group_id（指向不存在分组的 Host 归为未分组）
+    fn heal_orphan_group_ids(&mut self) -> bool {
+        let valid: std::collections::HashSet<String> =
+            self.host_groups.iter().map(|g| g.id.clone()).collect();
+        let mut changed = false;
+        for conn in &mut self.saved_connections {
+            if let Some(gid) = conn.group_id.as_deref() {
+                if !valid.contains(gid) {
+                    conn.group_id = None;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// 添加保存的连接
@@ -512,6 +776,9 @@ impl SshGlobalConfig {
                 log::warn!("SSH: 回写 strict_host_key_checking 迁移结果失败: {e}");
             }
         }
+        if config.heal_orphan_group_ids() {
+            log::warn!("SSH: 自愈孤儿 group_id，已归为未分组");
+        }
         config
     }
 
@@ -567,6 +834,7 @@ impl SshGlobalConfig {
         if config.migrate_legacy_host_key_strict() {
             let _ = config.save();
         }
+        let _ = config.heal_orphan_group_ids();
         Ok(config)
     }
 
@@ -721,5 +989,71 @@ mod tests {
         let mut cfg = SshGlobalConfig::new();
         assert!(!cfg.strict_host_key_checking);
         assert!(!cfg.migrate_legacy_host_key_strict(), "新建配置无需迁移");
+    }
+
+    #[test]
+    fn host_group_crud_and_sort() {
+        let mut cfg = SshGlobalConfig::new();
+        let g1 = cfg.create_group("生产").unwrap();
+        let g2 = cfg.create_group("测试").unwrap();
+        assert_eq!(cfg.host_groups.len(), 2);
+        assert!(cfg.create_group("生产").is_err()); // 重名大小写不敏感
+        assert!(cfg.create_group("").is_err());
+        // rename
+        cfg.rename_group(&g1.id, "预发").unwrap();
+        assert_eq!(cfg.find_group(&g1.id).unwrap().name, "预发");
+        assert!(cfg.rename_group(&g2.id, "预发").is_err());
+        // move hosts
+        let mut conn = SshConnectionConfig::new("10.0.0.1", "root", AuthMethod::Agent);
+        let conn_id = conn.id();
+        cfg.add_connection(conn);
+        cfg.move_hosts_to_group(&[conn_id.clone()], Some(&g1.id));
+        assert_eq!(cfg.find_connection(&conn_id).unwrap().group_id.as_deref(), Some(g1.id.as_str()));
+        // delete group keeps hosts
+        cfg.delete_group(&g1.id, false).unwrap();
+        assert_eq!(cfg.find_connection(&conn_id).unwrap().group_id, None);
+        // recreate and delete with hosts
+        let g3 = cfg.create_group("临时").unwrap();
+        cfg.move_hosts_to_group(&[conn_id.clone()], Some(&g3.id));
+        cfg.delete_group(&g3.id, true).unwrap();
+        assert!(cfg.find_connection(&conn_id).is_none());
+    }
+
+    #[test]
+    fn legacy_ssh_json_without_groups_loads() {
+        let json = r#"{
+            "saved_connections": [{"host":"1.1.1.1","port":22,"username":"root","auth_type":"agent","auth_data":null}]
+        }"#;
+        let cfg: SshGlobalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host_groups.len(), 0);
+        assert_eq!(cfg.saved_connections[0].group_id, None);
+        assert_eq!(cfg.folder_sort, SortMode::NameAsc);
+    }
+
+    #[test]
+    fn sort_host_groups_name_and_count() {
+        let mut groups = vec![
+            HostGroup { id: "2".into(), name: "b".into(), sort_order: 1, created_at: Utc::now(), collapsed: false },
+            HostGroup { id: "1".into(), name: "a".into(), sort_order: 0, created_at: Utc::now(), collapsed: false },
+        ];
+        sort_host_groups(&mut groups, SortMode::NameAsc, None);
+        assert_eq!(groups[0].name, "a");
+        sort_host_groups(&mut groups, SortMode::NameDesc, None);
+        assert_eq!(groups[0].name, "b");
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("1".to_string(), 5);
+        counts.insert("2".to_string(), 10);
+        sort_host_groups(&mut groups, SortMode::CountDesc, Some(&counts));
+        assert_eq!(groups[0].id, "2");
+    }
+
+    #[test]
+    fn heal_orphan_group_ids() {
+        let mut cfg = SshGlobalConfig::new();
+        let mut conn = SshConnectionConfig::new("1.1.1.1", "root", AuthMethod::Agent);
+        conn.group_id = Some("nonexistent".into());
+        cfg.add_connection(conn);
+        assert!(cfg.heal_orphan_group_ids());
+        assert_eq!(cfg.saved_connections[0].group_id, None);
     }
 }

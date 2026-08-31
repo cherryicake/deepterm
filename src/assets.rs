@@ -50,6 +50,7 @@ pub enum Icon {
     Check,
     Git,
     EllipsisCircleFill,
+    Ellipsis,
     Host,
     KeyShield,
     ChevronDown,
@@ -82,6 +83,7 @@ pub enum Icon {
     PersonBadgeKey,
     Clock,
     FolderOutline,
+    FolderBadgePlus,
     XmarkCircleFill,
     // Git status icons
     SquareDot,   // Modified
@@ -118,6 +120,7 @@ impl Icon {
             Icon::Check => SharedString::new_static("icons/check.svg"),
             Icon::Git => SharedString::new_static("icons/git.svg"),
             Icon::EllipsisCircleFill => SharedString::new_static("icons/ellipsis.circle.fill.svg"),
+            Icon::Ellipsis => SharedString::new_static("icons/ellipsis.svg"),
             Icon::Host => SharedString::new_static("icons/host.svg"),
             Icon::KeyShield => SharedString::new_static("icons/key_shield.svg"),
             Icon::ChevronDown => SharedString::new_static("icons/chevron.down.svg"),
@@ -149,6 +152,7 @@ impl Icon {
             Icon::PersonBadgeKey => SharedString::new_static("icons/person.badge.key.fill.svg"),
             Icon::Clock => SharedString::new_static("icons/clock.svg"),
             Icon::FolderOutline => SharedString::new_static("icons/folder.svg"),
+            Icon::FolderBadgePlus => SharedString::new_static("icons/folder.badge.plus.svg"),
             Icon::XmarkCircleFill => SharedString::new_static("icons/xmark.circle.fill.svg"),
             Icon::SquareDot => SharedString::new_static("icons/square_dot.svg"),
             Icon::SquarePlus => SharedString::new_static("icons/square_plus.svg"),

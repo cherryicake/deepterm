@@ -57,6 +57,9 @@ pub struct NewHostForm {
     keychain_options: Vec<(String, String)>,
     selected_keychain_id: Option<String>,
     editing_config_id: Option<String>,
+    group_select: Entity<MacosSelect>,
+    group_options: Vec<Option<String>>,
+    selected_group_id: Option<String>,
 
     error_message: Option<String>,
     success_message: Option<String>,
@@ -121,6 +124,7 @@ impl NewHostForm {
                 MacosSelect::new(window, cx, auth_labels, AuthType::Agent.display_name());
 
             let keychain_select = MacosSelect::new(window, cx, vec![], "—");
+            let group_select = MacosSelect::new(window, cx, vec!["未分组".into()], "未分组");
 
             let entity = cx.entity();
             auth_type_select.update(cx, |select, _cx| {
@@ -153,6 +157,15 @@ impl NewHostForm {
                     });
                 });
             });
+            let entity3 = entity.clone();
+            group_select.update(cx, |select, _cx| {
+                select.on_select(move |_label, index, _window, cx| {
+                    cx.update_entity(&entity3, |this: &mut NewHostForm, cx| {
+                        this.selected_group_id = this.group_options.get(index).and_then(|v| v.clone());
+                        cx.notify();
+                    });
+                });
+            });
 
             let mut this = Self {
                 focus_handle,
@@ -170,14 +183,47 @@ impl NewHostForm {
                 keychain_options: Vec::new(),
                 selected_keychain_id: None,
                 editing_config_id: None,
+                group_select,
+                group_options: vec![None],
+                selected_group_id: None,
                 error_message: None,
                 success_message: None,
                 on_cancel: None,
                 on_saved: None,
             };
             this.refresh_keychain_options(cx);
+            this.refresh_group_options(cx);
             this
         })
+    }
+
+    fn refresh_group_options(&mut self, cx: &mut Context<Self>) {
+        let cfg = SshGlobalConfig::load();
+        let mut labels = Vec::with_capacity(cfg.host_groups.len() + 1);
+        let mut opts = Vec::with_capacity(cfg.host_groups.len() + 1);
+        labels.push("未分组".into());
+        opts.push(None);
+        for group in &cfg.host_groups {
+            labels.push(group.name.clone().into());
+            opts.push(Some(group.id.clone()));
+        }
+        self.group_options = opts;
+        let current_label = self
+            .selected_group_id
+            .as_ref()
+            .and_then(|id| cfg.host_groups.iter().find(|g| &g.id == id))
+            .map(|g| SharedString::from(g.name.clone()))
+            .unwrap_or_else(|| "未分组".into());
+        self.group_select.update(cx, |select, cx| {
+            select.set_items(labels, cx);
+            select.set_selected(current_label, cx);
+        });
+    }
+
+    pub fn set_target_group(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        self.selected_group_id = group_id;
+        self.refresh_group_options(cx);
+        cx.notify();
     }
 
     pub fn on_cancel<F>(&mut self, callback: F)
@@ -252,7 +298,9 @@ impl NewHostForm {
         self.keychain_options.clear();
         self.selected_keychain_id = None;
         self.editing_config_id = None;
+        self.selected_group_id = None;
         self.refresh_keychain_options(cx);
+        self.refresh_group_options(cx);
         self.error_message = None;
         self.success_message = None;
         cx.notify();
@@ -316,6 +364,8 @@ impl NewHostForm {
         }
 
         self.editing_config_id = Some(config.id());
+        self.selected_group_id = config.group_id.clone();
+        self.refresh_group_options(cx);
         cx.notify();
     }
 
@@ -450,6 +500,7 @@ impl NewHostForm {
                 } else {
                     Some(nickname.trim().to_string())
                 };
+                existing.group_id = self.selected_group_id.clone();
                 true
             } else {
                 false
@@ -462,6 +513,15 @@ impl NewHostForm {
             if !nickname.trim().is_empty() {
                 config = config.with_nickname(nickname.trim());
             }
+            config.group_id = self.selected_group_id.clone();
+            let next_sort = global_config
+                .saved_connections
+                .iter()
+                .filter(|c| c.group_id == config.group_id)
+                .filter_map(|c| c.sort_order)
+                .max()
+                .map_or(0, |max| max + 1);
+            config.sort_order = Some(next_sort);
             global_config.add_connection(config);
             true
         };
@@ -632,6 +692,7 @@ impl Render for NewHostForm {
             .children(self.render_message(cx))
             // ── Basic Info ──
             .child(self.render_section_title("基本信息", cx))
+            .child(self.render_row("分组", false, self.group_select.clone(), cx))
             .child(self.render_row("昵称", false, EditorInput::new(&self.nickname_input), cx))
             .child(self.render_row("地址", false, EditorInput::new(&self.hostname_input), cx))
             .child(
