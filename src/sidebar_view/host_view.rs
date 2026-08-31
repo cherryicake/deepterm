@@ -226,7 +226,6 @@ impl Focusable for HostView {
 impl Render for HostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance.is_dark();
         let (hosts, configs) = load_hosts_from_config();
 
         let on_select = self.on_select.clone();
@@ -249,9 +248,9 @@ impl Render for HostView {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(8.0))
@@ -282,9 +281,9 @@ impl Render for HostView {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(12.0))
@@ -355,7 +354,7 @@ impl Render for HostView {
                     this.bg(theme.accent).text_color(theme.accent_foreground)
                 })
                 .when(!is_selected, |this| {
-                    this.hover(|style| style.bg(hover_bg(is_dark)))
+                    this.hover(|style| style.bg(hover_bg(theme)))
                         .text_color(theme.text)
                 })
                 .child(

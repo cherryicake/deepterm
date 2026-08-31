@@ -361,7 +361,6 @@ impl MacosSidebar {
     pub(super) fn render_tab_groups_section(
         &mut self,
         cx: &mut Context<Self>,
-        is_dark: bool,
         theme: crate::theme::UiTheme,
     ) -> gpui::Div {
         let chevron_icon = if self.tab_groups_collapsed {
@@ -445,7 +444,6 @@ impl MacosSidebar {
             groups = groups
                 .child(self.render_tab_group_row(
                     cx,
-                    is_dark,
                     theme,
                     group_id.clone(),
                     group_label,
@@ -498,7 +496,6 @@ impl MacosSidebar {
     pub(super) fn render_tab_group_row(
         &self,
         cx: &mut Context<Self>,
-        is_dark: bool,
         theme: crate::theme::UiTheme,
         group_id: String,
         label: String,
@@ -551,7 +548,7 @@ impl MacosSidebar {
                 this.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .when(!is_selected, |this| {
-                this.hover(|style| style.bg(hover_bg(is_dark)))
+                this.hover(|style| style.bg(hover_bg(theme)))
                     .text_color(theme.text)
             })
             .child(
@@ -572,7 +569,7 @@ impl MacosSidebar {
                     .flex_1()
                     .min_w_0()
                     .h(px(24.0))
-                    .bg(hover_bg(is_dark))
+                    .bg(theme.tab_hover_background)
                     .border(px(2.0))
                     .border_color(theme.accent.opacity(0.65))
                     .overflow_hidden()
@@ -743,7 +740,7 @@ impl MacosSidebar {
                     .gap(px(6.0))
                     .rounded(px(8.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(hover_bg(cx.theme().appearance.is_dark())))
+                    .hover(|style| style.bg(hover_bg(theme)))
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             if event.click_count() == 2 {

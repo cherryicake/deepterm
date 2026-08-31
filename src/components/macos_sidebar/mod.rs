@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, App, Context, CursorStyle, Element, Entity, EventEmitter,
+    Animation, AnimationExt, App, BoxShadow, Context, CursorStyle, Element, Entity, EventEmitter,
     GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, MouseMoveEvent,
     MouseUpEvent, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
-    WindowControlArea, anchored, deferred, div, ease_in_out, px,
+    WindowControlArea, anchored, deferred, div, ease_in_out, point, px,
 };
 
 use crate::assets::Icon;
@@ -39,7 +39,10 @@ use crate::sidebar_view::file_tree_panel_tabs::{self, TAB_ITEMS};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
-use crate::sidebar_view::style::{border_color, button_bg, button_bg_hover, glass_bg, hover_bg};
+use crate::sidebar_view::style::{
+    border_color, button_bg, button_bg_hover, glass_bg, glass_bottom_shade, glass_top_highlight,
+    hover_bg,
+};
 use crate::sidebar_view::theme_view;
 use crate::ssh::SshConnectionConfig;
 use crate::terminal_view::TerminalView;
@@ -527,30 +530,66 @@ impl Render for MacosSidebar {
                 }))
             });
 
+        // 玻璃装饰层：顶部反光 + 底部体积阴影，均带 12px 圆角与容器对齐
+        //（GPUI 的 absolute 子层不做圆角裁剪，矩形层会以直角伸出容器外）。
+        // 高度拉到 140/120px 让渐隐更缓，与 glass_bg 的整高明度坡度无缝衔接，
+        // 避免在 72px 处出现新的色阶拐点。二者不注册鼠标监听，不形成交互
+        // hitbox，不挡下层交互。
+        let glass_highlight = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(140.0))
+            .rounded(px(12.0))
+            .bg(glass_top_highlight(theme));
+        let glass_shade = div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(120.0))
+            .rounded(px(12.0))
+            .bg(glass_bottom_shade(theme));
+
         let inner = div()
             .relative()
             .h_full()
             .rounded(px(12.0))
-            .bg(glass_bg(is_dark))
+            .bg(glass_bg(theme, is_dark))
             .border(px(0.5))
-            .border_color(border_color(is_dark))
+            .border_color(border_color(theme))
+            // 双层投影制造悬浮感：近影收紧轮廓、远影大范围柔化，
+            // 亮度取值比 Modal 稍轻，符合「侧边栏浮起但不喧宾夺主」。
+            .shadow(vec![
+                BoxShadow {
+                    color: theme.shadow.opacity(if is_dark { 0.42 } else { 0.14 }),
+                    offset: point(px(0.0), px(2.0)),
+                    blur_radius: px(8.0),
+                    spread_radius: px(-2.0),
+                    inset: false,
+                },
+                BoxShadow {
+                    color: theme.shadow.opacity(if is_dark { 0.32 } else { 0.10 }),
+                    offset: point(px(0.0), px(12.0)),
+                    blur_radius: px(36.0),
+                    spread_radius: px(-10.0),
+                    inset: false,
+                },
+            ])
             .flex()
             .flex_col()
             .pt(px(48.0))
             .pb(px(16.0))
             .pl(px(12.0))
             .pr(px(12.0))
+            .child(glass_shade)
+            .child(glass_highlight)
             .child(drag_region)
             .child(match self.current_view {
-                SidebarView::Menu => self
-                    .render_menu_content(cx, is_dark, theme)
-                    .into_any_element(),
-                SidebarView::Theme => self
-                    .render_theme_content(cx, is_dark, theme)
-                    .into_any_element(),
-                SidebarView::Font => self
-                    .render_font_content(cx, is_dark, theme)
-                    .into_any_element(),
+                SidebarView::Menu => self.render_menu_content(cx, theme).into_any_element(),
+                SidebarView::Theme => self.render_theme_content(cx, theme).into_any_element(),
+                SidebarView::Font => self.render_font_content(cx, theme).into_any_element(),
                 SidebarView::Host => self.render_host_content().into_any_element(),
                 SidebarView::Keychain => self.render_keychain_content().into_any_element(),
                 SidebarView::FileTree => self.render_file_tree_content(cx).into_any_element(),

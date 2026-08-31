@@ -38,7 +38,6 @@ pub const TAB_ITEMS: &[TabItem] = &[
 pub fn build_tab_button(
     item: &TabItem,
     is_active: bool,
-    is_dark: bool,
     theme: &UiTheme,
 ) -> gpui::Stateful<gpui::Div> {
     let text_color = if is_active {
@@ -55,14 +54,14 @@ pub fn build_tab_button(
         .justify_center()
         .rounded(px(14.0))
         .overflow_hidden()
-        .bg(button_bg(is_dark))
+        .bg(button_bg(*theme))
         .when(is_active, |this| this.bg(theme.accent))
         .cursor_pointer()
         .hover(move |style| {
             if is_active {
                 style
             } else {
-                style.bg(button_bg_hover(is_dark))
+                style.bg(button_bg_hover(*theme))
             }
         })
         .child(

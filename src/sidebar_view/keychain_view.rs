@@ -165,7 +165,6 @@ impl Focusable for KeychainSidebarView {
 impl Render for KeychainSidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance.is_dark();
         let items = KeychainStore::load_or_default().items;
 
         let on_select = self.on_select.clone();
@@ -212,9 +211,9 @@ impl Render for KeychainSidebarView {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(8.0))
@@ -245,9 +244,9 @@ impl Render for KeychainSidebarView {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(12.0))
@@ -316,7 +315,6 @@ impl Render for KeychainSidebarView {
                     index,
                     Icon::KeyShield,
                     theme.accent,
-                    is_dark,
                     theme,
                     &self.selected_ids,
                     on_select.clone(),
@@ -351,7 +349,6 @@ impl Render for KeychainSidebarView {
                     index + keys.len(),
                     Icon::PersonBadgeKey,
                     theme.success,
-                    is_dark,
                     theme,
                     &self.selected_ids,
                     on_select.clone(),
@@ -454,7 +451,6 @@ fn render_keychain_item_row(
     index: usize,
     icon: Icon,
     icon_color: gpui::Hsla,
-    is_dark: bool,
     theme: crate::theme::UiTheme,
     selected_ids: &HashSet<SharedString>,
     on_select: OptionalStrCallback,
@@ -477,7 +473,7 @@ fn render_keychain_item_row(
             this.bg(theme.accent).text_color(theme.accent_foreground)
         })
         .when(!is_selected, |this| {
-            this.hover(|style| style.bg(hover_bg(is_dark)))
+            this.hover(|style| style.bg(hover_bg(theme)))
                 .text_color(theme.text)
         })
         .child(

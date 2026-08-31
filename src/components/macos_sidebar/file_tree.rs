@@ -297,7 +297,6 @@ impl MacosSidebar {
 
     pub(super) fn render_file_tree_content(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme().ui;
-        let is_dark = cx.theme().appearance.is_dark();
 
         let header = div()
             .w_full()
@@ -315,9 +314,9 @@ impl MacosSidebar {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(8.0))
@@ -332,7 +331,7 @@ impl MacosSidebar {
                         }),
                     ),
             )
-            .child(self.render_file_tree_panel_tabs(is_dark, cx));
+            .child(self.render_file_tree_panel_tabs(cx));
 
         let content_element: gpui::AnyElement = match self.file_tree_panel_tabs.current {
             FileTreePanel::Files => {
@@ -388,11 +387,7 @@ impl MacosSidebar {
             )
     }
 
-    fn render_file_tree_panel_tabs(
-        &self,
-        is_dark: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_file_tree_panel_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().ui;
         let current = &self.file_tree_panel_tabs.current;
         let prev = &self.file_tree_panel_tabs.prev;
@@ -411,7 +406,7 @@ impl MacosSidebar {
             let active_w = item.active_width;
             let label = item.label;
 
-            let btn = file_tree_panel_tabs::build_tab_button(item, is_active, is_dark, &theme)
+            let btn = file_tree_panel_tabs::build_tab_button(item, is_active, &theme)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(move |this, _, _window, cx| {

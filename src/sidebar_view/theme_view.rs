@@ -11,7 +11,6 @@ use crate::theme::ThemeState;
 pub fn render_theme_sidebar<F>(
     cx: &App,
     on_select: Rc<F>,
-    is_dark: bool,
     theme: crate::theme::UiTheme,
     scroll_handle: &ScrollHandle,
 ) -> gpui::Div
@@ -38,9 +37,9 @@ where
                 .items_center()
                 .justify_center()
                 .rounded(px(999.0))
-                .bg(button_bg(is_dark))
+                .bg(button_bg(theme))
                 .cursor_pointer()
-                .hover(|style| style.bg(button_bg_hover(is_dark)))
+                .hover(|style| style.bg(button_bg_hover(theme)))
                 .child(
                     gpui::svg()
                         .size(px(8.0))
@@ -70,7 +69,7 @@ where
         .px(px(10.0))
         .gap(px(6.0))
         .rounded(px(8.0))
-        .bg(hover_bg(is_dark))
+        .bg(theme.tab_hover_background)
         .mb(px(12.0))
         .child(
             gpui::svg()
@@ -132,7 +131,7 @@ where
                 this.bg(theme.accent).text_color(theme.accent_foreground)
             })
             .when(!is_active, |this| {
-                this.hover(|style| style.bg(hover_bg(is_dark)))
+                this.hover(|style| style.bg(hover_bg(theme)))
                     .text_color(theme.text)
             })
             .flex()

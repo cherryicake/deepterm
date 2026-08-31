@@ -189,7 +189,6 @@ impl MacosSidebar {
     pub(super) fn render_menu_content(
         &mut self,
         cx: &mut Context<Self>,
-        is_dark: bool,
         theme: crate::theme::UiTheme,
     ) -> gpui::Div {
         let mut menu_content = div().w_full().flex().flex_col();
@@ -203,7 +202,6 @@ impl MacosSidebar {
         menu_content = menu_content
             .child(self.render_tab_group_row(
                 cx,
-                is_dark,
                 theme,
                 DEFAULT_TAB_GROUP_ID.to_string(),
                 default_label,
@@ -222,7 +220,7 @@ impl MacosSidebar {
                 ("default-tab-group-tabs", self.default_tab_group_epoch),
             ))
             .child(div().h(px(16.0)))
-            .child(self.render_tab_groups_section(cx, is_dark, theme))
+            .child(self.render_tab_groups_section(cx, theme))
             .child(div().h(px(12.0)));
 
         // 分组菜单
@@ -336,7 +334,7 @@ impl MacosSidebar {
                         this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
                     .when(!is_selected, |this| {
-                        this.hover(|style| style.bg(hover_bg(is_dark)))
+                        this.hover(|style| style.bg(hover_bg(theme)))
                             .text_color(theme.text)
                     })
                     .child(
@@ -442,7 +440,6 @@ impl MacosSidebar {
     pub(super) fn render_font_content(
         &self,
         cx: &mut Context<Self>,
-        is_dark: bool,
         theme: crate::theme::UiTheme,
     ) -> gpui::Div {
         // 顶部导航栏
@@ -462,9 +459,9 @@ impl MacosSidebar {
                     .items_center()
                     .justify_center()
                     .rounded(px(999.0))
-                    .bg(button_bg(is_dark))
+                    .bg(button_bg(theme))
                     .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(is_dark)))
+                    .hover(|style| style.bg(button_bg_hover(theme)))
                     .child(
                         gpui::svg()
                             .size(px(8.0))
@@ -516,7 +513,6 @@ impl MacosSidebar {
     pub(super) fn render_theme_content(
         &self,
         cx: &mut Context<Self>,
-        is_dark: bool,
         theme: crate::theme::UiTheme,
     ) -> gpui::Div {
         let on_select = Rc::new({
@@ -530,7 +526,7 @@ impl MacosSidebar {
                 }
             }
         });
-        theme_view::render_theme_sidebar(cx, on_select, is_dark, theme, &self.theme_scroll_handle)
+        theme_view::render_theme_sidebar(cx, on_select, theme, &self.theme_scroll_handle)
     }
 
     pub(super) fn render_host_content(&self) -> gpui::Div {
