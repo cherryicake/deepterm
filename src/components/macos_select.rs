@@ -108,6 +108,8 @@ pub struct MacosSelect {
     _close_task: Option<Task<()>>,
     /// 下拉弹窗的显示位置。
     popup_position: SelectPopupPosition,
+    /// 在该索引之后绘制分割线（用于将标签页组与一级菜单隔开）
+    separator_after: Option<usize>,
 }
 
 impl MacosSelect {
@@ -135,6 +137,7 @@ impl MacosSelect {
                 anim_epoch: 0,
                 _close_task: None,
                 popup_position: SelectPopupPosition::default(),
+                separator_after: None,
             }
         })
     }
@@ -147,7 +150,18 @@ impl MacosSelect {
     }
 
     pub fn set_items(&mut self, items: Vec<SharedString>, cx: &mut Context<Self>) {
+        self.set_items_with_separator(items, None, cx);
+    }
+
+    /// 设置选项，并在 `separator_after` 指定的索引之后绘制一条分割线（分割线不占选项索引）。
+    pub fn set_items_with_separator(
+        &mut self,
+        items: Vec<SharedString>,
+        separator_after: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         self.all_items = items;
+        self.separator_after = separator_after;
         self.highlighted_index = self
             .all_items
             .iter()
@@ -299,89 +313,102 @@ impl Render for MacosSelect {
             SelectPopupPosition::BelowTrigger => Some(trigger_bounds_value.size.width),
         };
 
-        let item_elements: Vec<gpui::AnyElement> = self
-            .all_items
-            .iter()
-            .enumerate()
-            .map(|(item_idx, item)| {
-                let is_selected = *item == selected;
-                let is_highlighted = item_idx == highlighted;
-                let item_clone = item.clone();
-                div()
-                    .id(("macos-select-item", item_idx))
-                    .h(px(SELECT_ITEM_H))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .when(is_highlighted, |d| {
-                        d.bg(theme_accent).text_color(theme.accent_foreground)
+        let separator_after = self.separator_after;
+        let mut item_elements: Vec<gpui::AnyElement> = Vec::with_capacity(
+            self.all_items.len() + if separator_after.is_some() { 1 } else { 0 },
+        );
+        for (item_idx, item) in self.all_items.iter().enumerate() {
+            let is_selected = *item == selected;
+            let is_highlighted = item_idx == highlighted;
+            let item_clone = item.clone();
+            let el = div()
+                .id(("macos-select-item", item_idx))
+                .h(px(SELECT_ITEM_H))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .when(is_highlighted, |d| {
+                    d.bg(theme_accent).text_color(theme.accent_foreground)
+                })
+                .when(!is_highlighted, |d| {
+                    d.when(is_selected, |d| {
+                        d.bg(theme_accent.opacity(if cx.theme().appearance.is_dark() {
+                            0.85
+                        } else {
+                            0.12
+                        }))
                     })
-                    .when(!is_highlighted, |d| {
-                        d.when(is_selected, |d| {
-                            d.bg(theme_accent.opacity(if cx.theme().appearance.is_dark() {
-                                0.85
-                            } else {
-                                0.12
-                            }))
-                        })
-                        .when(!is_selected, |d| {
-                            d.hover(|s| s.bg(theme.tab_hover_background))
-                        })
+                    .when(!is_selected, |d| {
+                        d.hover(|s| s.bg(theme.tab_hover_background))
                     })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.confirm(item_clone.clone(), item_idx, window, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .w(px(16.0))
-                                    .h(px(16.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(if is_highlighted {
-                                                theme.accent_foreground
-                                            } else if is_selected {
-                                                theme_accent
-                                            } else {
-                                                gpui::transparent_black()
-                                            })
-                                            .child("✓"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if is_highlighted {
-                                        theme.accent_foreground
-                                    } else if is_selected {
-                                        theme_text
-                                    } else {
-                                        theme_text_muted
-                                    })
-                                    .child(item.to_string()),
-                            )
-                            // 尾部占位与左侧勾选框列（16px + gap）镜像对称：
-                            // 弹窗宽度由最宽选项的自然宽度决定时，最长标签
-                            // 名两侧的空白区域保持一致。
-                            .child(div().w(px(16.0)).h(px(16.0))),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.confirm(item_clone.clone(), item_idx, window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(if is_highlighted {
+                                            theme.accent_foreground
+                                        } else if is_selected {
+                                            theme_accent
+                                        } else {
+                                            gpui::transparent_black()
+                                        })
+                                        .child("✓"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(if is_highlighted {
+                                    theme.accent_foreground
+                                } else if is_selected {
+                                    theme_text
+                                } else {
+                                    theme_text_muted
+                                })
+                                .child(item.to_string()),
+                        )
+                        .child(div().w(px(16.0)).h(px(16.0))),
+                )
+                .into_any_element();
+            item_elements.push(el);
+            if separator_after == Some(item_idx) {
+                item_elements.push(
+                    div()
+                        .h(px(9.))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .h(px(1.))
+                                .w_full()
+                                .mx(px(8.))
+                                .bg(theme.menu_separator.opacity(0.6)),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
 
         div()
             .relative()

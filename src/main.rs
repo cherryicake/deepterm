@@ -60,6 +60,15 @@ actions!(app, [Quit, NewWindow]);
 
 const CONTEXT: &str = "AppWindow";
 
+/// 顶部标签页组下拉在标签页组之后追加的一级菜单（用分割线隔开），
+/// 让二级页可以直接切换而无需先返回一级菜单。(菜单 id, 显示名)
+const SIDEBAR_QUICK_MENUS: &[(&str, &str)] = &[
+    ("host", "Host"),
+    ("keychain", "Keychain"),
+    ("themes", "主题"),
+    ("font", "字体"),
+];
+
 /// Root component that contains title bar, sidebar and workspace
 struct TabGroupWorkspace {
     id: String,
@@ -183,16 +192,43 @@ impl AppWindow {
             select.set_popup_position(SelectPopupPosition::BelowTrigger, cx);
             select.on_select(move |_label, index, window, cx| {
                 if let Some(app_window) = app_window_for_select.upgrade() {
-                    app_window.update(cx, |this, cx| {
-                        let default_label = {
-                            let count = this.default_workspace.read(cx).tab_bar.read(cx).tabs.len();
-                            format!("{}个标签页", count)
-                        };
-                        let items = this.sidebar.read(cx).tab_group_select_items(default_label);
-                        if let Some((group_id, _)) = items.get(index) {
-                            this.switch_tab_group_workspace(group_id, window, cx);
+                    // 先以只读方式取标签页组快照，避免在回调内嵌套 update AppWindow
+                    let tab_items = {
+                        let app = app_window.read(cx);
+                        let count = app.default_workspace.read(cx).tab_bar.read(cx).tabs.len();
+                        app.sidebar
+                            .read(cx)
+                            .tab_group_select_items(format!("{}个标签页", count))
+                    };
+                    let tab_count = tab_items.len();
+                    if index < tab_count {
+                        if let Some((group_id, _)) = tab_items.get(index) {
+                            let group_id = group_id.clone();
+                            app_window.update(cx, |this, cx| {
+                                this.switch_tab_group_workspace(&group_id, window, cx);
+                            });
                         }
-                    });
+                    } else if let Some((menu_id, menu_label)) =
+                        SIDEBAR_QUICK_MENUS.get(index - tab_count)
+                    {
+                        let menu_id = menu_id.to_string();
+                        let menu_label = menu_label.to_string();
+                        // 延后到下一帧更新 sidebar / MacosSelect，避开
+                        // MacosSelect::confirm 更新栈内的重入 panic
+                        let app_window = app_window.clone();
+                        window.defer(cx, move |_window, cx| {
+                            app_window.update(cx, |this, cx| {
+                                this.sidebar.update(cx, |sidebar, cx| {
+                                    sidebar.handle_item_select(&menu_id, cx);
+                                });
+                                // 二级页本身即为选中态，触发器显示对应一级菜单名
+                                this.tab_group_select.update(cx, |select, cx| {
+                                    select.set_selected(menu_label.clone(), cx);
+                                });
+                                cx.notify();
+                            });
+                        });
+                    }
                 }
             });
         });
@@ -678,18 +714,35 @@ impl AppWindow {
 
         let default_tab_count = self.default_workspace.read(cx).tab_bar.read(cx).tabs.len();
         let default_label = format!("{}个标签页", default_tab_count);
-        let (items, selected_label) = self.sidebar.update(cx, |sidebar, _cx| {
+        let (items, tab_selected_label) = self.sidebar.update(cx, |sidebar, _cx| {
             let items = sidebar.tab_group_select_items(default_label.clone());
             let selected_label = items
                 .iter()
                 .find(|(id, _)| id == &self.active_tab_group_id())
                 .map(|(_, label)| label.clone())
-                .unwrap_or_else(|| default_label.into());
+                .unwrap_or_else(|| default_label.clone().into());
             (items, selected_label)
         });
-        let item_labels: Vec<_> = items.into_iter().map(|(_, label)| label).collect();
+        // 根据侧边栏当前视图决定下拉的选中态：二级页时高亮对应一级菜单
+        let current_view = self.sidebar.read(cx).current_view().clone();
+        let selected_label: SharedString = match current_view {
+            crate::components::macos_sidebar::SidebarView::Host => "Host".into(),
+            crate::components::macos_sidebar::SidebarView::Keychain => "Keychain".into(),
+            crate::components::macos_sidebar::SidebarView::Theme => "主题".into(),
+            crate::components::macos_sidebar::SidebarView::Font => "字体".into(),
+            _ => tab_selected_label,
+        };
+        let mut item_labels: Vec<SharedString> =
+            items.into_iter().map(|(_, label)| label).collect();
+        let separator_after = item_labels.len().checked_sub(1);
+        // 追加一级菜单，带分隔线与标签页组隔开
+        item_labels.extend(
+            SIDEBAR_QUICK_MENUS
+                .iter()
+                .map(|(_, label)| SharedString::from(*label)),
+        );
         self.tab_group_select.update(cx, |select, cx| {
-            select.set_items(item_labels, cx);
+            select.set_items_with_separator(item_labels, separator_after, cx);
             select.set_selected(selected_label, cx);
         });
     }
@@ -741,6 +794,7 @@ impl AppWindow {
     ) {
         let from_group_id = self.active_tab_group_id();
         if from_group_id == group_id {
+            self.defer_return_to_file_tree(window, cx);
             return;
         }
 
@@ -769,9 +823,7 @@ impl AppWindow {
 
         if group_id == DEFAULT_TAB_GROUP_ID {
             self.bind_active_workspace(self.default_workspace.clone(), window, cx);
-            // 恢复默认标签页组的编辑器状态（如果有的话）
-            // 注意：此时 current_file_tree_key 为 None，文件树切换时会自动恢复
-            self.sync_file_tree_with_active_tab(window, cx);
+            self.defer_return_to_file_tree(window, cx);
             self.defer_save_session(cx);
             return;
         }
@@ -807,11 +859,38 @@ impl AppWindow {
         };
 
         self.bind_active_workspace(workspace, window, cx);
-        // 恢复目标标签页组的编辑器状态（如果有的话）
-        // 注意：此时 current_file_tree_key 为 None，文件树切换时会自动恢复
-
-        self.sync_file_tree_with_active_tab(window, cx);
+        self.defer_return_to_file_tree(window, cx);
         self.defer_save_session(cx);
+    }
+
+    /// 延后返回文件树：若当前在二级页（Host/Keychain/主题/字体）则切到文件树，
+    /// 并将文件树同步到当前活动终端的目录。
+    ///
+    /// 必须通过 window.defer 延后执行：切换可能发自 MacosSelect::confirm 的
+    /// 更新栈内，同步读取/更新 MacosSidebar 会触发重入 panic。
+    /// 已在文件树/菜单页时同步为无操作（同终端提前返回 / 非文件树页跳过）。
+    fn defer_return_to_file_tree(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let app_window = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            if let Some(app_window) = app_window.upgrade() {
+                app_window.update(cx, |this, cx| {
+                    let is_secondary_view = {
+                        let view = this.sidebar.read(cx).current_view();
+                        !matches!(
+                            view,
+                            crate::components::macos_sidebar::SidebarView::Menu
+                                | crate::components::macos_sidebar::SidebarView::FileTree
+                        )
+                    };
+                    if is_secondary_view {
+                        this.sidebar.update(cx, |sidebar, _| {
+                            sidebar.show_file_tree_page();
+                        });
+                    }
+                    this.sync_file_tree_with_active_tab(window, cx);
+                });
+            }
+        });
     }
 
     /// 文件树切换时调用：保存旧文件树的编辑器状态，恢复新文件树的编辑器状态
