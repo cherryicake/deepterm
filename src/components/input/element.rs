@@ -2546,7 +2546,14 @@ impl Element for TextElement {
         //
         // At most one visible line can be the current row, so a `find` is
         // enough — no need to scan the rest of the geometry.
-        if selected_range.is_empty() {
+        //
+        // 仅在多行编辑器中获得焦点时绘制（与 Zed 一致）：
+        // - 失焦不画 —— 失焦的输入框不应有任何行高亮；
+        // - 单行输入框（搜索框、表单）永不画 —— active line 的色值接近
+        //   编辑器底色，铺在 `tab_hover_background` 等更亮的输入框容器上
+        //   会形成一块色差明显的矩形，导致输入区背景色不一致。
+        let single_line = !state.mode.is_multi_line();
+        if focused && !single_line && selected_range.is_empty() {
             if let Some(bg_color) = active_line_color {
                 if let Some(&(_, y, height)) = line_geometry
                     .iter()
