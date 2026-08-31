@@ -312,7 +312,7 @@ impl Render for HostView {
             .px(px(10.0))
             .gap(px(6.0))
             .rounded(px(12.0))
-            .bg(hover_bg(is_dark))
+            .bg(theme.tab_hover_background)
             .when(search_focused, |this| {
                 this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
             })
