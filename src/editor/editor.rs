@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, App, Context, CursorStyle, Element, ElementId, Entity,
+    Animation, AnimationExt, App, BoxShadow, Context, CursorStyle, Element, ElementId, Entity,
     GlobalElementId, IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled,
-    Subscription, WeakEntity, Window, actions, div, px,
+    Subscription, WeakEntity, Window, actions, div, point, px,
 };
 
 use crate::assets::Icon;
@@ -257,6 +257,10 @@ impl Editor {
 
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tab_bar = TabBar::new("editor-tab-bar", cx);
+        tab_bar.update(cx, |bar, cx| {
+            bar.set_transparent_bg(true, cx);
+            bar.set_compact(true, cx);
+        });
 
         let mut this = Self {
             tab_bar,
@@ -2476,42 +2480,32 @@ impl Render for Editor {
         let tab_bar: gpui::AnyElement = if is_empty {
             div()
                 .w(px(0.0))
-                .h(px(44.0))
+                .h(px(30.0))
                 .overflow_hidden()
                 .child(inner)
                 .into_any_element()
         } else {
+            let base = div()
+                .h(px(30.0))
+                .w(px((self.width - 8.0).max(0.0)))
+                .px(px(6.0))
+                .child(inner);
             let epoch = self.tab_bar_pad_epoch;
             let start = self.tab_bar_pad_start;
             let end = self.tab_bar_pad_end;
             let dur = self.tab_bar_pad_duration_ms;
-
             if epoch > 0 {
                 let id = ("editor-tab-pad", epoch);
-                div()
-                    .h(px(44.0))
-                    .w(px((self.width - 8.0).max(0.0)))
-                    .child(inner)
-                    .with_animation(
-                        id,
-                        Animation::new(Duration::from_millis(dur)).with_easing(gpui::ease_in_out),
-                        move |this, delta| this.pl(px(start + (end - start) * delta)),
-                    )
-                    .into_any_element()
+                base.with_animation(
+                    id,
+                    Animation::new(Duration::from_millis(dur)).with_easing(gpui::ease_in_out),
+                    move |this, delta| this.pl(px(start + (end - start) * delta)),
+                )
+                .into_any_element()
             } else if end > 0.0 {
-                div()
-                    .h(px(44.0))
-                    .w(px((self.width - 8.0).max(0.0)))
-                    .pl(px(end))
-                    .child(inner)
-                    .into_any_element()
+                base.pl(px(end)).into_any_element()
             } else {
-                div()
-                    .h(px(44.0))
-                    .w(px((self.width - 8.0).max(0.0)))
-                    .pl(px(6.0))
-                    .child(inner)
-                    .into_any_element()
+                base.into_any_element()
             }
         };
 
@@ -2529,13 +2523,10 @@ impl Render for Editor {
                             .flex_1()
                             .min_h_0()
                             .overflow_hidden()
-                            .bg(theme.app_background)
-                            .when(self.content_left_padding > 0.0, |this| {
-                                this.pl(px(self.content_left_padding))
-                            })
-                            .when(self.content_bottom_padding > 0.0, |this| {
-                                this.pb(px(self.content_bottom_padding))
-                            })
+                            .bg(gpui::transparent_black())
+                            .px(px(6.0))
+                            .pl(px(self.content_left_padding + 6.0))
+                            .pb(px(self.content_bottom_padding))
                             .child(diff.clone())
                             .into_any_element()
                     } else if let Some(image) = &file.image {
@@ -2544,13 +2535,10 @@ impl Render for Editor {
                             .flex_1()
                             .min_h_0()
                             .overflow_hidden()
-                            .bg(theme.app_background)
-                            .when(self.content_left_padding > 0.0, |this| {
-                                this.pl(px(self.content_left_padding))
-                            })
-                            .when(self.content_bottom_padding > 0.0, |this| {
-                                this.pb(px(self.content_bottom_padding))
-                            })
+                            .bg(gpui::transparent_black())
+                            .px(px(6.0))
+                            .pl(px(self.content_left_padding + 6.0))
+                            .pb(px(self.content_bottom_padding))
                             .child(image.clone())
                             .into_any_element()
                     } else if let Some(markdown) = &file.markdown {
@@ -2562,13 +2550,10 @@ impl Render for Editor {
                             .flex_1()
                             .min_h_0()
                             .overflow_hidden()
-                            .bg(theme.app_background)
-                            .when(self.content_left_padding > 0.0, |this| {
-                                this.pl(px(self.content_left_padding))
-                            })
-                            .when(self.content_bottom_padding > 0.0, |this| {
-                                this.pb(px(self.content_bottom_padding))
-                            })
+                            .bg(gpui::transparent_black())
+                            .px(px(6.0))
+                            .pl(px(self.content_left_padding + 6.0))
+                            .pb(px(self.content_bottom_padding))
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(
@@ -2604,13 +2589,10 @@ impl Render for Editor {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .bg(theme.app_background)
-                            .when(self.content_left_padding > 0.0, |this| {
-                                this.pl(px(self.content_left_padding))
-                            })
-                            .when(self.content_bottom_padding > 0.0, |this| {
-                                this.pb(px(self.content_bottom_padding))
-                            })
+                            .bg(gpui::transparent_black())
+                            .px(px(6.0))
+                            .pl(px(self.content_left_padding + 6.0))
+                            .pb(px(self.content_bottom_padding))
                             .child(
                                 div()
                                     .relative()
@@ -2647,15 +2629,16 @@ impl Render for Editor {
             div().into_any_element()
         };
 
+        let is_dark = cx.theme().appearance.is_dark();
         let resize_handle: gpui::AnyElement = if !is_empty {
             div()
                 .absolute()
                 .right(px(0.0))
-                .top(px(0.0))
-                .bottom(px(0.0))
-                .w(px(2.0))
+                .top(px(8.0))
+                .bottom(px(8.0))
+                .w(px(4.0))
                 .cursor_col_resize()
-                .bg(theme.border.opacity(0.5))
+                .hover(|s| s.bg(theme.drop_target.opacity(0.3)))
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -2684,83 +2667,156 @@ impl Render for Editor {
             target_width
         };
 
-        let root: gpui::AnyElement = div()
-            .key_context("EditorPanel")
-            .on_action(cx.listener(|this, _: &CloseActiveEditorTab, window, cx| {
-                if let Some(active_id) = this.active_file_id.clone() {
-                    let id = active_id.as_ref().to_string();
-                    this.close_file(&id, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &SaveActiveEditorTab, _window, cx| {
-                this.save_active_file(cx);
-            }))
-            .on_action(cx.listener(|this, _: &GotoLine, window, cx| {
-                this.toggle_goto_line(&GotoLine, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_file(&tab_id, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
-                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_other_tabs(&tab_id, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CloseRightTabs, window, cx| {
-                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_right_tabs(&tab_id, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
-                this.close_all_tabs(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseLeftTabs, window, cx| {
-                if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
-                    this.close_left_tabs(&tab_id, window, cx);
-                }
-            }))
-            .w_full()
-            .h_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .items_start()
-            .overflow_hidden()
+        let with_panel_actions = |panel: gpui::Div| {
+            panel
+                .on_action(cx.listener(|this, _: &CloseActiveEditorTab, window, cx| {
+                    if let Some(active_id) = this.active_file_id.clone() {
+                        this.close_file(active_id.as_ref(), window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &SaveActiveEditorTab, _window, cx| {
+                    this.save_active_file(cx);
+                }))
+                .on_action(cx.listener(|this, _: &GotoLine, window, cx| {
+                    this.toggle_goto_line(&GotoLine, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                    if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                        this.close_file(&tab_id, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &CloseOtherTabs, window, cx| {
+                    if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                        this.close_other_tabs(&tab_id, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &CloseRightTabs, window, cx| {
+                    if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                        this.close_right_tabs(&tab_id, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &CloseAllTabs, window, cx| {
+                    this.close_all_tabs(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseLeftTabs, window, cx| {
+                    if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
+                        this.close_left_tabs(&tab_id, window, cx);
+                    }
+                }))
+        };
+        let language_menu = |menu: Entity<crate::components::menu::PopupMenu>| {
+            gpui::deferred(
+                gpui::anchored().child(
+                    div()
+                        .w(window.bounds().size.width)
+                        .h(window.bounds().size.height)
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            gpui::anchored()
+                                .position(self.language_menu_position)
+                                .snap_to_window_with_margin(px(8.0))
+                                .child(menu.clone()),
+                        ),
+                ),
+            )
+            .with_priority(1)
+        };
+        let root: gpui::AnyElement = if is_empty {
+            with_panel_actions(
+                div()
+                    .key_context("EditorPanel")
+                    .w_full()
+                    .h_full()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .overflow_hidden(),
+            )
             .child(tab_bar)
             .child(content)
-            .child(resize_handle)
-            // 语言选择弹出菜单：与 ContextMenu 相同的 deferred+anchored 机制
             .when_some(self.language_menu.clone(), |this, menu| {
-                this.child(
-                    gpui::deferred(
-                        gpui::anchored().child(
-                            div()
-                                .w(window.bounds().size.width)
-                                .h(window.bounds().size.height)
-                                .on_scroll_wheel(|_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .child(
-                                    gpui::anchored()
-                                        .position(self.language_menu_position)
-                                        .snap_to_window_with_margin(px(8.0))
-                                        .child(menu.clone()),
-                                ),
-                        ),
-                    )
-                    .with_priority(1),
-                )
+                this.child(language_menu(menu))
             })
-            .when(!is_empty, |this| {
-                this.child(EditorResizeElement {
+            .into_any_element()
+        } else {
+            let is_selected = self.tab_bar.read(cx).is_focused(window)
+                || self.active_file_id.as_ref().is_some_and(|active_id| {
+                    self.open_files.iter().any(|f| {
+                        &f.id == active_id
+                            && f.editor_state.read(cx).focus_handle.is_focused(window)
+                    })
+                });
+            let border_color = if is_selected {
+                theme.border_strong
+            } else {
+                theme.border
+            };
+            let glass_panel: gpui::AnyElement = div()
+                .relative()
+                .h_full()
+                .w_full()
+                .rounded(px(12.0))
+                .bg(theme.app_background)
+                .border_1()
+                .border_color(border_color)
+                .shadow(vec![
+                    BoxShadow {
+                        color: theme.shadow.opacity(if is_dark { 0.45 } else { 0.22 }),
+                        offset: point(px(0.0), px(2.0)),
+                        blur_radius: px(8.0),
+                        spread_radius: px(-1.0),
+                        inset: false,
+                    },
+                    BoxShadow {
+                        color: theme.shadow.opacity(if is_dark { 0.34 } else { 0.14 }),
+                        offset: point(px(0.0), px(14.0)),
+                        blur_radius: px(36.0),
+                        spread_radius: px(-10.0),
+                        inset: false,
+                    },
+                ])
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(tab_bar)
+                .child(content)
+                .into_any_element();
+            let padded: gpui::AnyElement = div()
+                .w_full()
+                .h_full()
+                .pl(px(8.0))
+                .pt(px(8.0))
+                .pb(px(8.0))
+                .relative()
+                .child(glass_panel)
+                .child(resize_handle)
+                .child(EditorResizeElement {
                     editor: cx.entity().downgrade(),
                 })
+                .into_any_element();
+            with_panel_actions(
+                div()
+                    .key_context("EditorPanel")
+                    .w_full()
+                    .h_full()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden(),
+            )
+            .child(padded)
+            .when_some(self.language_menu.clone(), |this, menu| {
+                this.child(language_menu(menu))
             })
-            .into_any_element();
+            .into_any_element()
+        };
 
-        let wrapper = div().w(px(display_width)).h_full().child(root);
+        let wrapper = div()
+            .w(px(display_width))
+            .h_full()
+            .overflow_hidden()
+            .child(root);
         if animating {
             wrapper
                 .with_animation(

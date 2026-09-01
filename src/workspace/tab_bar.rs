@@ -242,6 +242,8 @@ pub struct TabBar {
     id: ElementId,
     pub tabs: Vec<TabItem>,
     pub active_tab_id: Option<SharedString>,
+    transparent_bg: bool,
+    compact: bool,
     on_tab_click: OptionalTabCallback,
     on_tab_close: OptionalTabCallback,
     on_new_tab: Option<NewTabCallback>,
@@ -284,6 +286,8 @@ impl TabBar {
             id,
             tabs,
             active_tab_id,
+            transparent_bg: false,
+            compact: false,
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
@@ -316,6 +320,26 @@ impl TabBar {
     ) -> Entity<Self> {
         let focus_handle = cx.focus_handle();
         cx.new(|_cx| Self::build(id.into(), focus_handle, tabs))
+    }
+
+    /// 编辑器悬浮面板使用透明背景以透出玻璃材质
+    pub fn set_transparent_bg(&mut self, transparent: bool, cx: &mut Context<Self>) {
+        if self.transparent_bg != transparent {
+            self.transparent_bg = transparent;
+            cx.notify();
+        }
+    }
+
+    /// 编辑器紧凑模式：降低标签高度并微调内边距，使文字与终端标签对齐
+    pub fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if self.compact != compact {
+            self.compact = compact;
+            cx.notify();
+        }
+    }
+
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window)
     }
 
     pub fn clear_tabs(&mut self, cx: &mut Context<Self>) {
@@ -813,9 +837,21 @@ impl TabBar {
             self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
         let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
 
+        let tab_height = if self.compact { px(24.0) } else { px(TAB_HEIGHT_PX) };
+        let (border, bg, hover_bg) = if self.compact {
+            (theme.transparent(), gpui::transparent_black(), None)
+        } else if is_active {
+            (theme.tab_active_border, theme.tab_active_background, None)
+        } else {
+            (
+                theme.transparent(),
+                theme.tab_inactive_background,
+                Some(theme.tab_hover_background),
+            )
+        };
         let tab_inner = div()
             .id(tab_id.clone())
-            .h(px(TAB_HEIGHT_PX))
+            .h(tab_height)
             .px(px(TAB_PADDING_X_PX))
             .flex()
             .flex_shrink_0()
@@ -823,22 +859,11 @@ impl TabBar {
             .gap(px(6.0))
             .rounded(px(TAB_RADIUS_PX))
             .border_1()
-            .border_color(if is_active {
-                theme.tab_active_border
-            } else {
-                theme.transparent()
-            })
-            .bg(if is_active {
-                theme.tab_active_background
-            } else {
-                theme.tab_inactive_background
-            })
-            .hover(move |style| {
-                if !is_active {
-                    style.bg(theme.tab_hover_background)
-                } else {
-                    style
-                }
+            .border_color(border)
+            .bg(bg)
+            .hover(move |style| match hover_bg {
+                Some(hover) => style.bg(hover),
+                None => style,
             })
             .on_hover(cx.listener({
                 let tab_id = tab_id.clone();
@@ -1146,12 +1171,27 @@ impl Render for TabBar {
             .w_full()
             .flex()
             .items_center()
-            // 标签栏背景强制与 app 背景保持一致，避免部分主题中 tab_bar_background
-            // 与 app_background 不一致导致的「脱节」感。
-            .bg(theme.app_background)
+            // 标签栏背景：编辑器悬浮面板内需透明以透出玻璃材质，其余场景保持 app 背景避免脱节
+            .bg(if self.transparent_bg {
+                gpui::transparent_black()
+            } else {
+                theme.app_background
+            })
             .overflow_hidden()
-            .pt_1()
-            .pb(px(2.))
+            .pt(if self.compact {
+                px(2.5)
+            } else if self.transparent_bg {
+                px(4.)
+            } else {
+                px(1.)
+            })
+            .pb(if self.compact {
+                px(3.5)
+            } else if self.transparent_bg {
+                px(4.)
+            } else {
+                px(2.)
+            })
             // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
             .on_mouse_down(
                 gpui::MouseButton::Left,
