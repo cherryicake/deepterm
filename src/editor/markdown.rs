@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, ListAlignment, ListState, Render,
-    SharedString, StyleRefinement, TextRun, TextStyleRefinement, WhiteSpace, Window, div, list, px,
-    rems,
+    actions, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement,
+    KeyBinding, ListAlignment, ListState, Render, SharedString, StyleRefinement, TextRun,
+    TextStyleRefinement, WhiteSpace, Window, div, list, px, rems,
 };
 
 use crate::sidebar_view::font_settings::{
@@ -161,18 +161,73 @@ impl MarkdownStyle {
     }
 }
 
+actions!(markdown, [Copy, SelectAll]);
+
+#[derive(Clone, Debug, Default)]
+pub struct MarkdownSelection {
+    pub anchor_fragment: usize,
+    pub anchor_offset: usize,
+    pub focus_fragment: usize,
+    pub focus_offset: usize,
+    pub pending: bool,
+    pub has_selection: bool,
+}
+
+impl MarkdownSelection {
+    pub fn is_empty(&self) -> bool {
+        !self.has_selection
+            || (self.anchor_fragment == self.focus_fragment
+                && self.anchor_offset == self.focus_offset)
+    }
+
+    pub fn set_anchor(&mut self, fragment: usize, offset: usize) {
+        self.anchor_fragment = fragment;
+        self.anchor_offset = offset;
+        self.has_selection = true;
+    }
+
+    pub fn set_focus(&mut self, fragment: usize, offset: usize) {
+        self.focus_fragment = fragment;
+        self.focus_offset = offset;
+        self.has_selection = true;
+    }
+
+    pub fn clear(&mut self) {
+        self.has_selection = false;
+        self.pending = false;
+    }
+
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.anchor_fragment, self.anchor_offset);
+        let b = (self.focus_fragment, self.focus_offset);
+        if a <= b { (a, b) } else { (b, a) }
+    }
+}
+
 pub struct Markdown {
     source: SharedString,
     events: Vec<(Range<usize>, MarkdownEvent)>,
     item_ranges: Vec<Range<usize>>,
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
     wrapped_code_blocks: std::collections::HashSet<usize>,
     copied_code_blocks: std::collections::HashSet<usize>,
     highlight_cache: HighlightCache,
     list_state: ListState,
+    pub(crate) selection: MarkdownSelection,
+    /// fragment_id -> text, populated lazily during render for copy. Wrapped in Rc<RefCell> so builder can write without Entity borrow during render.
+    pub(crate) fragment_texts: Rc<RefCell<std::collections::HashMap<usize, String>>>,
 }
 
 impl Markdown {
+    pub fn init(cx: &mut gpui::App) {
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", Copy, Some("Markdown")),
+            KeyBinding::new("ctrl-c", Copy, Some("Markdown")),
+            KeyBinding::new("cmd-a", SelectAll, Some("Markdown")),
+            KeyBinding::new("ctrl-a", SelectAll, Some("Markdown")),
+        ]);
+    }
+
     pub fn new(source: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let source = source.into();
         let focus_handle = cx.focus_handle();
@@ -185,6 +240,8 @@ impl Markdown {
             copied_code_blocks: std::collections::HashSet::new(),
             highlight_cache: Rc::new(RefCell::new(HashMap::new())),
             list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
+            selection: MarkdownSelection::default(),
+            fragment_texts: Default::default(),
         };
         this.set_text(source, cx);
         this
@@ -199,6 +256,8 @@ impl Markdown {
         self.wrapped_code_blocks.clear();
         self.copied_code_blocks.clear();
         self.highlight_cache.borrow_mut().clear();
+        self.selection.clear();
+        self.fragment_texts.borrow_mut().clear();
         self.parse();
         cx.notify();
     }
@@ -207,6 +266,142 @@ impl Markdown {
         self.events = parse_markdown(&self.source);
         self.item_ranges = compute_item_ranges(&self.events);
         self.list_state.reset(self.item_ranges.len());
+    }
+
+    pub(crate) fn local_selection_for_fragment(
+        &self,
+        fragment_id: usize,
+        fragment_len: usize,
+    ) -> Option<Range<usize>> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let ((s_frag, s_off), (e_frag, e_off)) = self.selection.ordered();
+        if fragment_id < s_frag || fragment_id > e_frag {
+            return None;
+        }
+        if s_frag == e_frag && s_frag == fragment_id {
+            let start = s_off.min(e_off).min(fragment_len);
+            let end = s_off.max(e_off).min(fragment_len);
+            if start < end {
+                return Some(start..end);
+            } else {
+                return None;
+            }
+        }
+        if fragment_id == s_frag {
+            let start = s_off.min(fragment_len);
+            if start < fragment_len {
+                return Some(start..fragment_len);
+            } else {
+                return None;
+            }
+        }
+        if fragment_id == e_frag {
+            let end = e_off.min(fragment_len);
+            if end > 0 {
+                return Some(0..end);
+            } else {
+                return None;
+            }
+        }
+        // Fully inside selection
+        Some(0..fragment_len)
+    }
+
+    pub fn selected_plain_text(&self, _cx: &App) -> String {
+        if self.selection.is_empty() {
+            return String::new();
+        }
+        let ((s_frag, s_off), (e_frag, e_off)) = self.selection.ordered();
+        // Collect fragments in order
+        let mut ids: Vec<usize> = self.fragment_texts.borrow().keys().cloned().collect();
+        ids.sort_unstable();
+
+        fn snap_forward(text: &str, mut offset: usize) -> usize {
+            while offset < text.len() && !text.is_char_boundary(offset) {
+                offset += 1;
+            }
+            offset.min(text.len())
+        }
+        fn snap_backward(text: &str, mut offset: usize, min: usize) -> usize {
+            while offset > min && !text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        }
+
+        let mut out = String::new();
+        let mut first = true;
+        for &frag_id in &ids {
+            if frag_id < s_frag || frag_id > e_frag {
+                continue;
+            }
+            let Some(text) = self.fragment_texts.borrow().get(&frag_id).cloned() else {
+                continue;
+            };
+            let slice = if s_frag == e_frag {
+                let start = snap_forward(&text, s_off.min(e_off).min(text.len()));
+                let end = snap_backward(&text, s_off.max(e_off).min(text.len()), start);
+                &text[start..end]
+            } else if frag_id == s_frag {
+                let start = snap_forward(&text, s_off.min(text.len()));
+                &text[start..]
+            } else if frag_id == e_frag {
+                let end = snap_backward(&text, e_off.min(text.len()), 0);
+                &text[..end]
+            } else {
+                text.as_str()
+            };
+            if slice.is_empty() {
+                continue;
+            }
+            if !first {
+                let prev_item = (frag_id - 1) >> 20;
+                let cur_item = frag_id >> 20;
+                let sep = if prev_item != cur_item { "\n\n" } else { "\n" };
+                out.push_str(sep);
+            }
+            out.push_str(slice);
+            first = false;
+        }
+        out
+    }
+
+    pub fn copy_selection(&self, _window: &mut Window, cx: &mut App) {
+        let text = self.selected_plain_text(cx);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if self.fragment_texts.borrow().is_empty() {
+            return;
+        }
+        let mut ids: Vec<usize> = self.fragment_texts.borrow().keys().cloned().collect();
+        ids.sort_unstable();
+        if let (Some(first), Some(last)) = (ids.first(), ids.last()) {
+            let last_len = self.fragment_texts.borrow().get(last).map(|s| s.len()).unwrap_or(0);
+            self.selection.anchor_fragment = *first;
+            self.selection.anchor_offset = 0;
+            self.selection.focus_fragment = *last;
+            self.selection.focus_offset = last_len;
+            self.selection.has_selection = true;
+            self.selection.pending = false;
+            cx.notify();
+        }
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.has_selection {
+            self.selection.clear();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn register_fragment(&self, fragment_id: usize, text: String) {
+        self.fragment_texts.borrow_mut().insert(fragment_id, text);
     }
 
     pub fn source(&self) -> &SharedString {
@@ -254,6 +449,9 @@ impl Render for Markdown {
         let markdown = cx.entity();
         let list_state = self.list_state.clone();
         let style = MarkdownStyle::themed(_window, cx);
+        // Register actions for copy/select-all when focused
+        let markdown_for_copy = markdown.clone();
+        let markdown_for_select_all = markdown.clone();
 
         // Notion/Typora 版式：居中窄栏，最大 780px (≈72ch)，
         // 外层负责背景与居中，内层窄栏承载 list，实现优雅的阅读宽度。
@@ -261,12 +459,34 @@ impl Render for Markdown {
             .id("markdown")
             .key_context("Markdown")
             .track_focus(&self.focus_handle)
+            .on_action({
+                let markdown = markdown_for_copy.clone();
+                move |_: &Copy, window, cx| {
+                    markdown.update(cx, |m, cx| m.copy_selection(window, cx));
+                }
+            })
+            .on_action({
+                let markdown = markdown_for_select_all.clone();
+                move |_: &SelectAll, _window, cx| {
+                    markdown.update(cx, |markdown, cx| {
+                        markdown.select_all(cx);
+                    });
+                }
+            })
             .flex()
             .flex_col()
             .items_center()
             .size_full()
             .overflow_hidden()
             .bg(theme.app_background)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if !this.selection.pending && this.selection.has_selection {
+                        this.clear_selection(cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -306,9 +526,10 @@ impl Markdown {
             )
         });
 
-        let elements =
-            MarkdownElementBuilder::new(style, wrapped, copied, markdown, highlight_cache)
-                .build(&events, cx);
+        let elements = MarkdownElementBuilder::new_with_item(
+            style, wrapped, copied, markdown, highlight_cache, ix,
+        )
+        .build(&events, cx);
 
         div().w_full().children(elements).into_any_element()
     }

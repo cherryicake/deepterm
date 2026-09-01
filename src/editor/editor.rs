@@ -49,6 +49,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    crate::editor::markdown::Markdown::init(cx);
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),

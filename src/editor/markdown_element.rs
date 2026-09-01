@@ -8,6 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use super::markdown_selectable::SelectableText;
 use crate::theme::ActiveTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,16 +171,29 @@ pub struct MarkdownElementBuilder {
     copied_code_blocks: std::collections::HashSet<usize>,
     markdown: Entity<Markdown>,
     highlight_cache: HighlightCache,
+    item_ix: usize,
+    fragment_counter: usize,
+    pending_fragments: Vec<(usize, String)>,
 }
 
 impl MarkdownElementBuilder {
     pub fn new(
         style: MarkdownStyle,
-        #[allow(dead_code)]
-    wrapped_code_blocks: std::collections::HashSet<usize>,
+        wrapped_code_blocks: std::collections::HashSet<usize>,
         copied_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
         highlight_cache: HighlightCache,
+    ) -> Self {
+        Self::new_with_item(style, wrapped_code_blocks, copied_code_blocks, markdown, highlight_cache, 0)
+    }
+
+    pub fn new_with_item(
+        style: MarkdownStyle,
+        wrapped_code_blocks: std::collections::HashSet<usize>,
+        copied_code_blocks: std::collections::HashSet<usize>,
+        markdown: Entity<Markdown>,
+        highlight_cache: HighlightCache,
+        item_ix: usize,
     ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
@@ -208,6 +222,9 @@ impl MarkdownElementBuilder {
             copied_code_blocks,
             markdown,
             highlight_cache,
+            item_ix,
+            fragment_counter: 0,
+            pending_fragments: Vec::new(),
         }
     }
 
@@ -223,6 +240,9 @@ impl MarkdownElementBuilder {
         self.flush_text();
         while self.div_stack.len() > 1 {
             self.pop_div();
+        }
+        for (id, text) in std::mem::take(&mut self.pending_fragments) {
+            self.markdown.read(cx).register_fragment(id, text);
         }
         self.div_stack
             .pop()
@@ -1003,14 +1023,35 @@ impl MarkdownElementBuilder {
         }
     }
 
+    fn fragment_id(&mut self) -> usize {
+        const SHIFT: usize = 20;
+        let id = (self.item_ix << SHIFT) | self.fragment_counter;
+        self.fragment_counter += 1;
+        id
+    }
+
     fn flush_text(&mut self) {
         if self.pending_line.text.is_empty() {
             return;
         }
-        let styled_text = StyledText::new(self.pending_line.text.clone())
-            .with_runs(self.pending_line.runs.clone());
-        self.append_child(div().min_w_0().child(styled_text).into_any_element());
-        self.pending_line = PendingLine::default();
+        let PendingLine { text, runs } = std::mem::take(&mut self.pending_line);
+        let frag_id = self.fragment_id();
+        self.pending_fragments.push((frag_id, text.clone()));
+        self.append_child(
+            div()
+                .min_w_0()
+                .child(
+                    SelectableText::new(
+                        SharedString::from(format!("sel-{}", frag_id)),
+                        SharedString::from(text),
+                        runs,
+                        frag_id,
+                        self.markdown.clone(),
+                    )
+                    .into_any_element(),
+                )
+                .into_any_element(),
+        );
     }
 
     fn append_child(&mut self, child: AnyElement) {
@@ -1071,17 +1112,14 @@ impl MarkdownElementBuilder {
         let panel_bg = cx.theme().ui.panel_background;
         // Notion 表头：略深的底色 + 加粗感（由 cell runs 的 strong 承担），斑马纹保留
 
+        let rows = self.table.rows.clone();
         let mut children = Vec::new();
-        for (row_idx, row) in self.table.rows.iter().enumerate() {
+        for (row_idx, row) in rows.iter().enumerate() {
             let is_header = row_idx == 0;
             for col in 0..col_count {
                 let cell = row.get(col);
                 let cell_text = cell.map(|c| c.text.as_str()).unwrap_or("");
                 let mut cell_div = div().px_3().py_2().text_size(px(14.));
-                // 分割线画在自身元素上（同元素内先背景后边框，边框不会被覆盖）。
-                // 因此用左/上边框而非右/下边框：右/下边框属于前一个单元格，
-                // 会被相邻（后绘制）单元格的背景盖住（表头/隔行背景尤甚）。
-                // 第一行/第一列由容器外框兜底。
                 let has_left_divider = col > 0;
                 let has_top_divider = row_idx > 0;
                 if has_left_divider || has_top_divider {
@@ -1104,13 +1142,22 @@ impl MarkdownElementBuilder {
                     ColumnAlign::Right => cell_div = cell_div.justify_end(),
                     ColumnAlign::None => {}
                 }
-                // 优先使用单元格自身保留的样式 runs；空单元格/缺列回退到 base 样式
                 let cell_runs = cell
                     .map(|c| c.runs.clone())
                     .filter(|runs| !runs.is_empty())
                     .unwrap_or_else(|| vec![base_style.to_run(cell_text.len())]);
-                let cell_styled = StyledText::new(cell_text.to_string()).with_runs(cell_runs);
-                cell_div = cell_div.child(cell_styled);
+                // 表格单元格支持选中复制
+                let frag_id = self.fragment_id();
+                let cell_text_owned = cell_text.to_string();
+                self.pending_fragments.push((frag_id, cell_text_owned.clone()));
+                let selectable = SelectableText::new(
+                    SharedString::from(format!("sel-cell-{}", frag_id)),
+                    SharedString::from(cell_text_owned),
+                    cell_runs,
+                    frag_id,
+                    self.markdown.clone(),
+                );
+                cell_div = cell_div.child(selectable);
                 children.push(cell_div.into_any_element());
             }
         }
