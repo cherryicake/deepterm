@@ -7,7 +7,7 @@
       "appearance": "light",
       "ui": {
         "app_background": "#F5F5F7",
-        "panel_background": "#F5F5F7",
+        "panel_background": "#ECECEF",
         "elevated_background": "#F5F5F7",
         "overlay_background": "#000000",
         "title_bar_background": "#F5F5F7",

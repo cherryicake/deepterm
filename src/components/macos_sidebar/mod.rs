@@ -542,7 +542,7 @@ impl Render for MacosSidebar {
             .right_0()
             .h(px(140.0))
             .rounded(px(12.0))
-            .bg(glass_top_highlight(theme));
+            .bg(glass_top_highlight(theme, is_dark));
         let glass_shade = div()
             .absolute()
             .bottom_0()
@@ -550,28 +550,28 @@ impl Render for MacosSidebar {
             .right_0()
             .h(px(120.0))
             .rounded(px(12.0))
-            .bg(glass_bottom_shade(theme));
+            .bg(glass_bottom_shade(theme, is_dark));
 
         let inner = div()
             .relative()
             .h_full()
             .rounded(px(12.0))
             .bg(glass_bg(theme, is_dark))
-            .border(px(0.5))
-            .border_color(border_color(theme))
+            .border(px(if is_dark { 0.5 } else { 0.75 }))
+            .border_color(border_color(theme, is_dark))
             // 双层投影制造悬浮感：近影收紧轮廓、远影大范围柔化，
-            // 亮度取值比 Modal 稍轻，符合「侧边栏浮起但不喧宾夺主」。
+            // 亮色下明显加强以弥补白色主题下描边不足的层次。
             .shadow(vec![
                 BoxShadow {
-                    color: theme.shadow.opacity(if is_dark { 0.42 } else { 0.14 }),
+                    color: theme.shadow.opacity(if is_dark { 0.45 } else { 0.22 }),
                     offset: point(px(0.0), px(2.0)),
                     blur_radius: px(8.0),
-                    spread_radius: px(-2.0),
+                    spread_radius: px(-1.0),
                     inset: false,
                 },
                 BoxShadow {
-                    color: theme.shadow.opacity(if is_dark { 0.32 } else { 0.10 }),
-                    offset: point(px(0.0), px(12.0)),
+                    color: theme.shadow.opacity(if is_dark { 0.34 } else { 0.14 }),
+                    offset: point(px(0.0), px(14.0)),
                     blur_radius: px(36.0),
                     spread_radius: px(-10.0),
                     inset: false,
