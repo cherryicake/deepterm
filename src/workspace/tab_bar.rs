@@ -1183,14 +1183,14 @@ impl Render for TabBar {
             } else if self.transparent_bg {
                 px(4.)
             } else {
-                px(1.)
+                px(5.)
             })
             .pb(if self.compact {
                 px(3.5)
             } else if self.transparent_bg {
                 px(4.)
             } else {
-                px(2.)
+                px(3.)
             })
             // 阻止 TabBar 区域的鼠标事件冒泡到 TitleBar，防止触发窗口拖拽
             .on_mouse_down(
