@@ -617,6 +617,44 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 原子写远程文件：先写同目录临时文件再 rename，避免崩溃产生半截文件。
+    pub fn write_file_bytes_atomic(&mut self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        let tmp = {
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{path}.tmp.{pid}-{nanos}")
+        };
+
+        let write_ok = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let mut file = self.sftp.create(tmp.clone()).await?;
+            file.write_all(bytes).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            file.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        if let Err(e) = write_ok {
+            let _ = self.remove_file(&tmp);
+            return Err(e);
+        }
+
+        let rename_result = self.rename(&tmp, path);
+        if rename_result.is_ok() {
+            return Ok(());
+        }
+        // 部分服务端在目标已存在时拒绝覆盖：先删除再重试
+        let first = rename_result.unwrap_err();
+        let _ = self.remove_file(path);
+        self.rename(&tmp, path).map_err(|e| {
+            let _ = self.remove_file(&tmp);
+            anyhow::anyhow!("atomic rename failed: {first}; retry: {e}")
+        })
+    }
+
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
     pub fn execute_command(
@@ -1104,6 +1142,15 @@ pub fn write_file_bytes(
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     with_cached_session(config, |session| session.write_file_bytes(path, bytes))
+}
+
+/// 原子写远程文件（见 `BlockingSftpSession::write_file_bytes_atomic`）
+pub fn write_file_bytes_atomic(
+    config: &SshConnectionConfig,
+    path: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    with_cached_session(config, |session| session.write_file_bytes_atomic(path, bytes))
 }
 
 /// 查询远程文件权限位（mode），失败或不可用时返回 None。

@@ -122,9 +122,30 @@ pub(crate) struct LoadedText {
     pub read_only: bool,
 }
 
+/// 编辑器允许打开的最大文件（字节）。超过则拒绝，避免一次分配过大导致 OOM。
+const MAX_EDITOR_FILE_MB: usize = 20;
+const MAX_EDITOR_FILE_BYTES: usize = MAX_EDITOR_FILE_MB * 1024 * 1024;
+
 /// 读取并解码本地文件字节（后台线程调用）。
 pub(crate) fn load_local_text(path: &Path) -> Result<LoadedText, String> {
+    let too_large = |len: u64, with_hint: bool| {
+        let mb = len / (1024 * 1024);
+        if with_hint {
+            format!("文件过大（{mb} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制，请用外部编辑器打开")
+        } else {
+            format!("文件过大（{mb} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制")
+        }
+    };
+    // 先用 metadata 粗筛，避免对超大文件做无谓的 read
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_EDITOR_FILE_BYTES as u64 {
+            return Err(too_large(meta.len(), true));
+        }
+    }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_EDITOR_FILE_BYTES {
+        return Err(too_large(bytes.len() as u64, false));
+    }
     if crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
         return Err("二进制文件，无法作为文本编辑".to_string());
     }
@@ -147,6 +168,12 @@ pub(crate) fn load_remote_text(
     let bytes = crate::ssh::sftp_fs::read_file_bytes(config, path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "文件不存在或为空".to_string())?;
+    if bytes.len() > MAX_EDITOR_FILE_BYTES {
+        return Err(format!(
+            "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制",
+            bytes.len() / (1024 * 1024)
+        ));
+    }
     if crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
         return Err("二进制文件，无法作为文本编辑".to_string());
     }
@@ -239,7 +266,8 @@ pub struct Editor {
     /// (hover popup, completion menu, search matches, cursor, …) re-render
     /// the Editor — the popups are rendered by EditorInput, not by the input
     /// element itself, so without this the UI never updates.
-    editor_state_subscriptions: Vec<Subscription>,
+    /// key = tab_id, value = subscription; removed when tab closes to avoid leak.
+    editor_state_subscriptions: HashMap<SharedString, Subscription>,
     /// tab_id -> in-flight load generation (supersedes stale tasks after tab-group swap).
     loading_gens: HashMap<String, u64>,
     /// 跳转到行面板（cmd-l / ctrl-g 切换）。
@@ -282,7 +310,7 @@ impl Editor {
             content_bottom_padding: 0.0,
             watcher_subscription: None,
             remote_watcher_subscription: None,
-            editor_state_subscriptions: Vec::new(),
+            editor_state_subscriptions: HashMap::new(),
             loading_gens: HashMap::new(),
             goto_line_panel: None,
             language_menu: None,
@@ -482,9 +510,11 @@ impl Editor {
         // Re-render the Editor when the restored editor's InputState changes
         // (hover popup / completion menu / search matches).
         let restored_tab_id = file_info.id.clone();
-        self.editor_state_subscriptions.push(cx.observe(
-            &editor_state,
-            move |this, state_entity, cx| {
+        self.editor_state_subscriptions.insert(
+            restored_tab_id.clone(),
+            cx.observe(
+                &editor_state,
+                move |this, state_entity, cx| {
                 // 与 open_file_with_content 相同的脏检查逻辑，恢复后同样需要维护未保存标记。
                 let text_version = state_entity.read(cx).text_version;
                 let idx = this
@@ -928,6 +958,7 @@ impl Editor {
         self.open_files.clear();
         self.active_file_id = None;
         self.loading_gens.clear();
+        self.editor_state_subscriptions.clear();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
         });
@@ -1909,7 +1940,8 @@ impl Editor {
         // which only re-renders when the Editor does.
         let sync_path = path_str.clone();
         let sync_tab_id = tab_id.clone();
-        self.editor_state_subscriptions.push(
+        self.editor_state_subscriptions.insert(
+            sync_tab_id.clone().into(),
             cx.observe(&editor_state, move |this, state_entity, cx| {
                 // 未保存标记：仅在文本版本变化时重新比较（O(1) 闸门，
                 // 避免每次光标移动 / 重绘都对整个缓冲区做全量比较）。
@@ -2296,6 +2328,7 @@ impl Editor {
     /// - 文件加载失败后关闭（加载失败的文件保持 disabled，不可能有未保存内容）。
     fn close_file_direct(&mut self, id: &str, cx: &mut Context<Self>) {
         self.loading_gens.remove(id);
+        self.editor_state_subscriptions.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             let path = self.open_files[index].path.clone();
@@ -2903,19 +2936,65 @@ pub(crate) fn save_text_to_file(
     }
 
     if let Some(config) = ssh_config {
-        crate::ssh::sftp_fs::write_file_bytes(config, path, &bytes)
+        crate::ssh::sftp_fs::write_file_bytes_atomic(config, path, &bytes)
             .map_err(|e| format!("写入远程文件失败: {e}"))?;
     } else {
-        let p = Path::new(path);
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("创建目录失败: {e}"))?;
-            }
-        }
-        std::fs::write(p, &bytes).map_err(|e| format!("写入本地文件失败: {e}"))?;
+        atomic_write_local(Path::new(path), &bytes)
+            .map_err(|e| format!("写入本地文件失败: {e}"))?;
     }
     Ok(output)
+}
+
+/// 原子写本地文件：先写同目录临时文件再 rename，保证崩溃时不产生半截文件。
+fn atomic_write_local(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = parent {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    #[cfg(unix)]
+    let orig_mode = std::fs::metadata(path)
+        .ok()
+        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
+    #[cfg(not(unix))]
+    let orig_mode: Option<u32> = None;
+
+    let tmp = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+        let mut p = path.to_path_buf();
+        p.set_file_name(format!(".{file_name}.tmp.{pid}-{nanos}"));
+        p
+    };
+
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        if let Some(mode) = orig_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Some(dir) = parent {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn guess_language_from_extension(path: &Path) -> String {

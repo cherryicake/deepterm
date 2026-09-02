@@ -1846,8 +1846,8 @@ impl TextElement {
             let mut range_start: Option<usize> = None;
 
             while let Some(&line) = visible_iter.next() {
-                // Check if this line is too long for highlighting
-                let line_len = text.slice_line(line).len();
+                // Check if this line is too long for highlighting; use content length without terminator
+                let line_len = text.line_content(line).len();
                 if line_len > MAX_HIGHLIGHT_LINE_LENGTH {
                     // Flush any accumulated range first
                     if let Some(start) = range_start.take() {
@@ -2289,7 +2289,7 @@ impl Element for TextElement {
         // 2. Multi-line with soft wrap disabled.
         if state.mode.is_single_line() || !state.soft_wrap {
             let longest_row = state.display_map.longest_row();
-            let longest_line: SharedString = state.text.slice_line(longest_row).to_string().into();
+            let longest_line: SharedString = state.text.line_content(longest_row).to_string().into();
             longest_line_width = window
                 .text_system()
                 .shape_line(
@@ -2751,7 +2751,7 @@ impl Element for TextElement {
                 };
                 // 空行返回 -1：它们的参考线数量由邻近非空行插值得到。
                 let line_indent = |row: usize| -> i32 {
-                    let line: String = state.text.slice_line(row).into();
+                    let line = state.text.line_content(row).to_string();
                     if line.trim().is_empty() {
                         -1
                     } else {
@@ -2787,7 +2787,7 @@ impl Element for TextElement {
                 let mut indents = Vec::with_capacity(win_lines);
                 let mut indent_xs: Vec<Vec<Pixels>> = Vec::with_capacity(win_lines);
                 for idx in win_start..win_end {
-                    let line: String = state.text.slice_line(idx).into();
+                    let line = state.text.line_content(idx).to_string();
                     if line.trim().is_empty() {
                         indents.push(-1);
                         indent_xs.push(Vec::new());
