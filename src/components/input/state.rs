@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
@@ -243,31 +243,71 @@ fn is_sticky_definition_kind(kind: &str) -> bool {
     )
 }
 
-/// ASCII 词字符（同词高亮只用 ASCII 词，避免 CJK 单字噪音）。
+/// 词字符：Unicode 字母/数字 + 下划线（`is_alphanumeric` 覆盖 CJK 等）。
+/// 单个 CJK 字符不做同词高亮（噪音），由 `word_range_at` 过滤。
+pub(crate) fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// ASCII 词字符（字节路径专用快速判定）。
 fn is_ascii_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// 光标处的词字节范围（要求光标在词内或紧贴词边界）。
+///
+/// 支持 Unicode 标识符（如 `变量1`）；单个非 ASCII 字符（如孤立 CJK 单字）
+/// 返回 `None` 以避免全文件单字噪音（延续此前 ASCII 策略的意图）。
 fn word_range_at(text: &Rope, offset: usize) -> Option<Range<usize>> {
+    use sum_tree::Bias;
     let len = text.len();
-    let prev_is_word = offset > 0 && text.get_byte(offset - 1).is_some_and(is_ascii_word_byte);
-    let next_is_word = offset < len && text.get_byte(offset).is_some_and(is_ascii_word_byte);
+    // 光标恒在字符边界（见 `cursor()`），先钳到边界。ropey 2.0 的 `get_char`
+    // 取字节下标，前一字符需经 `clip_offset(Left)` 回到其起始边界。
+    let offset = text.clip_offset(offset.min(len), Bias::Left);
+    let prev_is_word = if offset == 0 {
+        false
+    } else {
+        let pb = text.clip_offset(offset - 1, Bias::Left);
+        text.get_char(pb).is_ok_and(is_word_char)
+    };
+    let next_is_word = offset < len && text.get_char(offset).is_ok_and(is_word_char);
     if !prev_is_word && !next_is_word {
         return None;
     }
     let mut start = offset;
-    while start > 0 && text.get_byte(start - 1).is_some_and(is_ascii_word_byte) {
-        start -= 1;
+    while start > 0 {
+        let pb = text.clip_offset(start - 1, Bias::Left);
+        match text.get_char(pb) {
+            Ok(c) if is_word_char(c) => start = pb,
+            _ => break,
+        }
     }
     let mut end = offset;
-    while end < len && text.get_byte(end).is_some_and(is_ascii_word_byte) {
-        end += 1;
+    while end < len {
+        match text.get_char(end) {
+            Ok(c) if is_word_char(c) => end += c.len_utf8(),
+            _ => break,
+        }
+    }
+    if start >= end {
+        return None;
+    }
+    // 单个非 ASCII 字符：视为噪音，不高亮。
+    let mut chars = text.slice(start..end).chars();
+    let first = chars.next();
+    if chars.next().is_none()
+        && first.is_some_and(|c| !c.is_ascii())
+    {
+        return None;
     }
     Some(start..end)
 }
 
 /// 全文件找 `word`（字节范围）的所有边界完整出现。超过 `max_matches` 返回 None。
+///
+/// ASCII 词走原有字节流式扫描（paint 路径零大分配）；含非 ASCII 的词走
+/// `String::match_indices` + 字符边界判定（Unicode 标识符如 `变量` 也能高亮，
+/// 边界按 `is_word_char` 而非 ASCII 判定）。
 fn find_word_occurrences(
     text: &Rope,
     word: &Range<usize>,
@@ -278,6 +318,10 @@ fn find_word_occurrences(
         return None;
     }
     let target: Vec<u8> = text.slice(word.clone()).bytes().collect();
+    let is_ascii_word = target.iter().all(|b| b.is_ascii());
+    if !is_ascii_word {
+        return find_word_occurrences_unicode(text, word, max_matches);
+    }
     let len = text.len();
 
     // 流式扫描：只保留一个 ≤ `wlen + 2` 字节的滑动窗口（左邻字节 + 目标 +
@@ -319,6 +363,39 @@ fn find_word_occurrences(
         }
     }
 
+    Some(result)
+}
+
+/// Unicode 词的全文件查找：`match_indices` 定位子串，再按字符判定左右边界。
+/// `&str` 的 `chars().next_back()` 只解码末尾最多 4 字节，逐匹配 O(1)。
+fn find_word_occurrences_unicode(
+    text: &Rope,
+    word: &Range<usize>,
+    max_matches: usize,
+) -> Option<Vec<Range<usize>>> {
+    let target = text.slice(word.clone()).to_string();
+    if target.is_empty() {
+        return None;
+    }
+    let full = text.to_string();
+    let mut result = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = full[search_from..].find(&target) {
+        let s = search_from + rel;
+        let e = s + target.len();
+        let left_ok = s == 0 || !full[..s].chars().next_back().is_some_and(is_word_char);
+        let right_ok = e == full.len() || !full[e..].chars().next().is_some_and(is_word_char);
+        if left_ok && right_ok {
+            result.push(s..e);
+            if result.len() > max_matches {
+                return None;
+            }
+        }
+        search_from = s + target.len().max(1);
+        if search_from >= full.len() {
+            break;
+        }
+    }
     Some(result)
 }
 
@@ -411,18 +488,104 @@ pub(crate) fn pair_bracket_tokens(
     spans
 }
 
-/// 纯文本括号扫描（无语法树时的 fallback）：不区分字符串/注释，
-/// 但配对算法与 tree 版一致（类型配对 + 交错容忍）。
+/// 纯文本括号扫描（无语法树时的 fallback）：跳过字符串与 C 风格注释后，
+/// 配对算法与 tree 版一致（类型配对 + 交错容忍）。
+///
+/// 跳过 `\"...\"` / `'...'` / `` `...` ``（`\\` 转义）与 `//...` / `/*...*/`。
+/// `#` 注释不跳过（Rust 属性 `#[...]` 与 Python `#` 无法在无语言信息下区分；
+/// 有语法树时走 `scan_bracket_spans_tree` 精确排除，此处保守只处理 C 风格）。
 pub(crate) fn scan_bracket_spans_text(text: &Rope) -> Vec<(Range<usize>, usize, bool, bool)> {
+    let bytes: Vec<u8> = text.bytes().collect();
+    let len = bytes.len();
     let mut tokens = Vec::new();
-    for (i, b) in text.bytes().enumerate() {
+    let mut i = 0usize;
+    let mut string: Option<u8> = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_depth = 0usize;
+    while i < len {
+        let b = bytes[i];
+        if let Some(q) = string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if line_comment {
+            if b == b'\n' {
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                block_depth += 1;
+                i += 2;
+                continue;
+            }
+            if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                block_depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         match b {
-            b'(' | b'[' | b'{' => tokens.push((i, true, b)),
-            b')' | b']' | b'}' => tokens.push((i, false, b)),
-            _ => {}
+            b'"' | b'\'' | b'`' => {
+                string = Some(b);
+                i += 1;
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+                line_comment = true;
+                i += 2;
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                block_depth = 1;
+                i += 2;
+            }
+            b'(' | b'[' | b'{' => {
+                tokens.push((i, true, b));
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                tokens.push((i, false, b));
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     pair_bracket_tokens(&tokens)
+}
+
+/// 判定 `offset` 处的括号字节是否为代码括号（非字符串/注释内）。
+///
+/// 复用 tree 版的“独立叶子 token”定义：覆盖该字节的最小节点必须恰为
+/// 单字节且 kind 等于括号字面量；字符串/注释内的括号属于更大的原子节点，
+/// `byte_range` 更长，直接拒绝。无树时调用方保留旧行为。
+pub(crate) fn is_code_bracket(tree: &tree_sitter::Tree, offset: usize, b: u8) -> bool {
+    let expected: &str = match b {
+        b'(' => "(",
+        b')' => ")",
+        b'[' => "[",
+        b']' => "]",
+        b'{' => "{",
+        b'}' => "}",
+        _ => return false,
+    };
+    let Some(node) = tree
+        .root_node()
+        .descendant_for_byte_range(offset, offset + 1)
+    else {
+        return false;
+    };
+    node.byte_range() == (offset..offset + 1) && node.kind() == expected
 }
 
 /// 从 tree-sitter 语法树收集括号 token：只把「独立叶子 token」的括号算作代码括号，
@@ -1268,29 +1431,41 @@ impl InputState {
     }
 
     /// 给单行加注释（缩进之后插入 `token + " "`）。返回 (新行, 插入点)。
+    /// `at` 为显式插入列（字节偏移）；`None` 时沿用本行自身缩进。
     fn add_line_comment(line: &str, token: &str) -> (String, usize) {
+        Self::add_line_comment_at(line, token, None)
+    }
+
+    /// 在 `at` 列插入行注释（用于多行对齐到最小缩进列，Zed 行为）。
+    fn add_line_comment_at(line: &str, token: &str, at: Option<usize>) -> (String, usize) {
         let indent_len = line.len() - line.trim_start().len();
+        let at = at.unwrap_or(indent_len).min(line.len());
+        // `at` 必须落在行首空白区内，否则回落自身缩进（避免把注释插进代码中间）。
+        let at = if line[..at].trim().is_empty() {
+            at
+        } else {
+            indent_len
+        };
         let mut out = String::with_capacity(line.len() + token.len() + 1);
-        out.push_str(&line[..indent_len]);
+        out.push_str(&line[..at]);
         out.push_str(token);
         out.push(' ');
-        out.push_str(&line[indent_len..]);
-        (out, indent_len)
+        out.push_str(&line[at..]);
+        (out, at)
     }
 
     /// 去掉单行注释（连同 token 后的一个空格）。返回 (新行, 原 token 位置)。
+    /// 只认行首空白后的 token，避免误删字符串内的 `//`（如 `let s = "// hi"`）。
     fn strip_line_comment(line: &str, token: &str) -> (String, usize) {
-        let Some(idx) = line.find(token) else {
+        let indent_len = line.len() - line.trim_start().len();
+        let Some(rest) = line[indent_len..].strip_prefix(token) else {
             return (line.to_string(), 0);
         };
-        let mut rest = &line[idx + token.len()..];
-        if let Some(stripped) = rest.strip_prefix(' ') {
-            rest = stripped;
-        }
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
         let mut out = String::with_capacity(line.len());
-        out.push_str(&line[..idx]);
+        out.push_str(&line[..indent_len]);
         out.push_str(rest);
-        (out, idx)
+        (out, indent_len)
     }
 
     /// 括号/引号自动配对表：`(开, 闭)`。
@@ -1911,7 +2086,7 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let offset = self.start_of_line();
+        let offset = self.smart_home_offset();
         self.select_to(offset, cx);
     }
 
@@ -1945,18 +2120,85 @@ impl InputState {
         self.select_to(offset, cx);
     }
 
-    /// 词边界分段里最后一个非纯空白分段的起点（相对 `text`；`None` = 全是空白）。
+    /// 词边界分段里最后一个词段的子词起点（相对 `text`；`None` = 全是空白）。
+    ///
+    /// - 尾随纯标点段跳过一段（VSCode/Zed 行为：`hello.|` 的 alt-← 落到 `hello` 首）；
+    /// - 词段内再按 `_` 与驼峰切子词（`foo_bar`、`fooBar`、`HTMLParser` 逐段停）。
     fn last_word_start(text: &str) -> Option<usize> {
-        UnicodeSegmentation::split_word_bound_indices(text)
-            .rfind(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, _)| i)
+        let segs: Vec<(usize, &str)> = UnicodeSegmentation::split_word_bound_indices(text)
+            .filter(|(_, s)| !s.trim_start().is_empty())
+            .collect();
+        if segs.is_empty() {
+            return None;
+        }
+        // 跳过紧贴光标的尾随纯标点段（无字母数字/`_`）。
+        let mut idx = segs.len() - 1;
+        if idx > 0 && !segs[idx].1.chars().any(|c| c.is_alphanumeric() || c == '_') {
+            idx -= 1;
+        }
+        let (seg_start, seg) = segs[idx];
+        let sub = Self::last_subword_start_in(seg)?;
+        Some(seg_start + sub)
     }
 
-    /// 词边界分段里第一个非纯空白分段的终点（相对 `text`；`None` = 全是空白）。
+    /// 词段内最后一个子词的起点（相对段首字节偏移）。
+    fn last_subword_start_in(seg: &str) -> Option<usize> {
+        let starts = Self::subword_starts(seg);
+        starts.last().copied()
+    }
+
+    /// 词段的子词起点表（含 0），按 `_` 与驼峰切分。
+    fn subword_starts(seg: &str) -> Vec<usize> {
+        let chars: Vec<(usize, char)> = seg.char_indices().collect();
+        if chars.is_empty() {
+            return Vec::new();
+        }
+        let mut starts = vec![0];
+        for k in 1..chars.len() {
+            let (byte_i, c) = chars[k];
+            let (_, p) = chars[k - 1];
+            let next = chars.get(k + 1).map(|(_, n)| *n);
+            let boundary = c == '_'
+                || p == '_'
+                || (p.is_lowercase() && c.is_uppercase())
+                || (p.is_ascii_digit() && c.is_uppercase())
+                || (p.is_lowercase() && c.is_ascii_digit())
+                || (p.is_uppercase()
+                    && c.is_uppercase()
+                    && next.is_some_and(|n| n.is_lowercase()));
+            if boundary {
+                starts.push(byte_i);
+            }
+        }
+        starts
+    }
+
+    /// 词段内第一个子词的终点（相对段首字节偏移）。
+    fn first_subword_end_in(seg: &str) -> Option<usize> {
+        let starts = Self::subword_starts(seg);
+        if starts.is_empty() {
+            return None;
+        }
+        if starts.len() >= 2 {
+            Some(starts[1])
+        } else {
+            Some(seg.len())
+        }
+    }
+
+    /// 词边界分段里第一个词段的首个子词终点（相对 `text`；`None` = 全是空白）。
+    /// 前导纯标点段直接越过（返回其终点）；词段内按子词切分，`fooBar` 先停 `foo` 末。
     fn first_word_end(text: &str) -> Option<usize> {
-        UnicodeSegmentation::split_word_bound_indices(text)
-            .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| i + s.len())
+        for (i, s) in UnicodeSegmentation::split_word_bound_indices(text) {
+            if s.trim_start().is_empty() {
+                continue;
+            }
+            if !s.chars().any(|c| c.is_alphanumeric() || c == '_') {
+                return Some(i + s.len());
+            }
+            return Self::first_subword_end_in(s).map(|e| i + e);
+        }
+        None
     }
 
     /// Return the start offset of the previous word.
@@ -2369,6 +2611,23 @@ impl InputState {
                 .all(|l| commented(l.trim_end_matches(['\n', '\r'])));
 
         // 逐行重建；记录每行 (orig_start, new_start, delta, insert_point) 以恢复选区
+        // 多行注释时对齐到最小缩进列（Zed：min_column），避免每行注释符参差不齐。
+        let min_indent = if !all_commented {
+            raw_lines
+                .iter()
+                .filter_map(|raw| {
+                    let no_nl = raw.strip_suffix('\n').unwrap_or(raw);
+                    let line = no_nl.strip_suffix('\r').unwrap_or(no_nl);
+                    if line.trim().is_empty() {
+                        None
+                    } else {
+                        Some(line.len() - line.trim_start().len())
+                    }
+                })
+                .min()
+        } else {
+            None
+        };
         let mut new_span = String::new();
         let mut orig_offset = span.start;
         let mut line_maps: Vec<(usize, usize, isize, usize)> = Vec::new();
@@ -2385,6 +2644,8 @@ impl InputState {
                 Self::strip_line_comment(line, token)
             } else if line.trim().is_empty() && multi {
                 (line.to_string(), 0)
+            } else if let Some(min) = min_indent {
+                Self::add_line_comment_at(line, token, Some(min))
             } else {
                 Self::add_line_comment(line, token)
             };
@@ -3603,14 +3864,22 @@ impl InputState {
     pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         // 仅在多行编辑器（代码编辑器）中，无选区时复制整行（与 Zed 一致）；
         // 单行输入框保持系统直觉：无选区不做事。
-        let selected_text = if self.selected_range.is_empty() && self.mode.is_multi_line() {
-            line_text_for_clipboard(&self.text, self.cursor()).0
+        if self.selected_range.is_empty() && self.mode.is_multi_line() {
+            let (selected_text, _) = line_text_for_clipboard(&self.text, self.cursor());
+            let meta = vec![ClipboardSelection::entire_line(
+                selected_text.len(),
+                self.first_line_indent_for_offset(self.cursor()),
+            )];
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                selected_text,
+                meta,
+            ));
         } else if self.selected_range.is_empty() {
             return;
         } else {
-            self.text.slice(self.selected_range).to_string()
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+            let selected_text = self.text.slice(self.selected_range).to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+        }
     }
 
     pub(crate) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -3620,7 +3889,14 @@ impl InputState {
             }
             // 无选区：剪切当前整行（含换行），与 Zed 的 cut_common 一致。
             let (selected_text, range) = line_text_for_clipboard(&self.text, self.cursor());
-            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+            let meta = vec![ClipboardSelection::entire_line(
+                selected_text.len(),
+                self.first_line_indent_for_offset(self.cursor()),
+            )];
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                selected_text,
+                meta,
+            ));
             let range_utf16 = self.range_to_utf16(&range);
             self.replace_text_in_range_silent(Some(range_utf16), "", window, cx);
             // 删除后光标落在 range.start（上一行末尾 / 文档开头 / 末尾），
@@ -3631,6 +3907,12 @@ impl InputState {
 
             self.replace_text_in_range_silent(None, "", window, cx);
         }
+    }
+
+    /// 复制时记录的首行缩进（列数），用于整行粘贴的元数据（Zed `ClipboardSelection` 子集）。
+    fn first_line_indent_for_offset(&self, offset: usize) -> u32 {
+        let row = self.text.offset_to_point(offset).row;
+        self.tab_size.indent_count(&self.text.slice_line(row)) as u32
     }
 
     pub(crate) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -3645,7 +3927,26 @@ impl InputState {
                     .collect();
             }
 
-            self.replace_text_in_range_silent(None, &new_text, window, cx);
+            // 整行复制的粘贴：空选区时插到当前行首之前（新起一行），而非光标处
+            // 截断当前行（Zed `do_paste` 的 entire_line 分支单光标子集）。
+            // 有选区时沿用替换选区语义；缩进调整暂不做（无 auto-indent 引擎），
+            // 原缩进存于元数据供后续使用。
+            let entire_line = !self.mode.is_single_line()
+                && self.selected_range.is_empty()
+                && clipboard.entries().first().is_some_and(|e| {
+                    use gpui::ClipboardEntry;
+                    matches!(e, ClipboardEntry::String(s)
+                        if s.metadata_json::<Vec<ClipboardSelection>>()
+                            .is_some_and(|m| m.first().is_some_and(|s| s.is_entire_line)))
+                });
+            if entire_line {
+                let row = self.text.offset_to_point(self.cursor()).row;
+                let line_start = self.text.line_start_offset(row);
+                let range_utf16 = self.range_to_utf16(&(line_start..line_start));
+                self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
+            } else {
+                self.replace_text_in_range_silent(None, &new_text, window, cx);
+            }
             self.scroll_to(self.cursor(), None, cx);
         }
     }
@@ -4320,7 +4621,7 @@ impl EntityInputHandler for InputState {
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range.into()),
-            reversed: false,
+            reversed: self.selection_reversed,
         })
     }
 
@@ -4522,6 +4823,25 @@ impl EntityInputHandler for InputState {
 impl Focusable for InputState {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// 整行复制的剪贴板元数据（Zed `ClipboardSelection` 单光标子集）。
+/// `len` 为文本字节数，`first_line_indent` 为复制时首行缩进列（供后续自动缩进用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ClipboardSelection {
+    len: usize,
+    is_entire_line: bool,
+    first_line_indent: u32,
+}
+
+impl ClipboardSelection {
+    fn entire_line(len: usize, first_line_indent: u32) -> Self {
+        Self {
+            len,
+            is_entire_line: true,
+            first_line_indent,
+        }
     }
 }
 
@@ -4732,9 +5052,13 @@ mod tests {
         let occ = find_word_occurrences(&rope, &(0..6), 100).unwrap();
         assert_eq!(occ.len(), 1);
 
-        // CJK 不参与同词高亮
+        // CJK：孤立单字不参与（噪音），多字词参与高亮。
+        let rope = Rope::from_str("中 foo");
+        assert_eq!(word_range_at(&rope, 0), None);
         let rope = Rope::from_str("中文 foo 中文");
-        assert_eq!(word_range_at(&rope, 1), None);
+        assert_eq!(word_range_at(&rope, 0), Some(0..6));
+        let occ = find_word_occurrences(&rope, &(0..6), 100).unwrap();
+        assert_eq!(occ, vec![0..6, 11..17]);
 
         // 超出次数上限 → None
         let many = "ab ".repeat(50);
@@ -4744,10 +5068,12 @@ mod tests {
 
     /// `find_word_occurrences` 改成定长滑动窗口的流式扫描后，用朴素全量实现
     /// 做差分对照：窗口边界、文档首尾、多字节字符都不能改变结果。
+    /// ASCII 词对照 ASCII 朴素实现；Unicode 词走独立断言（边界按字符判定，
+    /// 与 ASCII 字节判定天然不一致，不直接对照）。
     #[test]
     fn word_occurrences_streaming_matches_naive() {
         // 覆盖：任意词长 × 各种文档长度，含文档首尾命中与相邻重复。
-        let alphabet = ['a', 'b', ' ', '_', '中'];
+        let alphabet = ['a', 'b', ' ', '_'];
         let mut seed = 0x2545_F491_4F6D_D1A9u64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -4789,6 +5115,32 @@ mod tests {
         let got = find_word_occurrences(&rope, &(0..3), 100_000).unwrap();
         assert_eq!(got.len(), 5000);
         assert_eq!(got.last(), Some(&(19996..19999)));
+    }
+
+    #[test]
+    fn word_occurrences_unicode_boundaries() {
+        // Unicode 词按字符判定边界：`变量` 在标点/空格间命中，黏连时不命中。
+        let rope = Rope::from_str("变量,变量;变量x x变量 变量");
+        let word = word_range_at(&rope, 0).unwrap();
+        assert_eq!(&rope.slice(word.clone()).to_string(), "变量");
+        let occ = find_word_occurrences(&rope, &word, 100).unwrap();
+        // `变量x` / `x变量` 因边界黏连被排除，仅 3 处独立出现。
+        assert_eq!(occ.len(), 3);
+    }
+
+    #[test]
+    fn subword_motion_splits_snake_and_camel() {
+        // 蛇形：末段起点
+        assert_eq!(InputState::last_word_start("foo_bar"), Some(4));
+        assert_eq!(InputState::first_word_end("foo_bar"), Some(3));
+        // 驼峰：Bar 起点 / foo 终点
+        assert_eq!(InputState::last_word_start("fooBar"), Some(3));
+        assert_eq!(InputState::first_word_end("fooBar"), Some(3));
+        // 首字母缩写：HTML|Parser
+        assert_eq!(InputState::last_word_start("HTMLParser"), Some(4));
+        assert_eq!(InputState::first_word_end("HTMLParser"), Some(4));
+        // 尾随标点跳过：hello.| 取 hello 首
+        assert_eq!(InputState::last_word_start("hello."), Some(0));
     }
 
     #[test]
@@ -4889,8 +5241,8 @@ mod tests {
         assert_eq!(starts, vec![7, 8, 10, 62, 68, 71]);
         assert!(spans.iter().all(|(_, _, _, m)| *m));
 
-        // 纯文本扫描则会计入字符串/注释里的括号（fallback 行为，共 9 个）
-        assert_eq!(scan_bracket_spans_text(&rope).len(), 9);
+        // 纯文本 fallback 同样跳过字符串/注释里的括号（C 风格），与 tree 一致。
+        assert_eq!(scan_bracket_spans_text(&rope).len(), 6);
     }
 
     #[test]

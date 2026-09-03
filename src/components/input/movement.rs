@@ -218,8 +218,47 @@ impl InputState {
 
     pub(crate) fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
         self.pause_blink_cursor(cx);
-        let offset = self.start_of_line();
+        let offset = self.smart_home_offset();
         self.move_to(offset, Some(MoveDirection::Up), cx);
+    }
+
+    /// Zed `indented_line_beginning` 的偏移域移植：软换行可视行首 → 缩进 → 逻辑行首。
+    pub(crate) fn smart_home_offset(&self) -> usize {
+        if self.mode.is_single_line() {
+            return 0;
+        }
+        let cursor = self.cursor();
+        let row = self.text.offset_to_point(cursor).row;
+        let logical_start = self.text.line_start_offset(row);
+        // 首个非空白（仅空格/Tab；空行回落行首，避免在空白行来回跳）。
+        let line = self.text.slice_line(row).to_string();
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let indent_start = if trimmed.trim().is_empty() {
+            logical_start
+        } else {
+            let prefix: usize = trimmed
+                .bytes()
+                .take_while(|b| *b == b' ' || *b == b'\t')
+                .count();
+            logical_start + prefix
+        };
+        // 软换行可视行首（与 `start_of_line` 同算法，但不做两步切换，只取值）。
+        let mut visual_start = logical_start;
+        if self.soft_wrap && self.mode.is_code_editor() {
+            let wrap_point = self.display_map.offset_to_wrap_display_point(cursor);
+            if let Some(wline) = self.display_map.lines().get(row)
+                && let Some(range) = wline.wrapped_lines.get(wrap_point.local_row)
+            {
+                visual_start = logical_start + range.start;
+            }
+        }
+        if visual_start > indent_start && cursor != visual_start {
+            visual_start
+        } else if cursor > indent_start || cursor == logical_start {
+            indent_start
+        } else {
+            logical_start
+        }
     }
 
     pub(crate) fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {

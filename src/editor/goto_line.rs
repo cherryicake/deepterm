@@ -14,7 +14,7 @@ pub struct GotoLinePanel {
     editor: Entity<InputState>,
     total_lines: usize,
     /// 最近一次解析错误提示（如超出范围）。
-    error: Option<&'static str>,
+    error: Option<String>,
     window_handle: gpui::AnyWindowHandle,
     _subscription: Subscription,
 }
@@ -66,23 +66,41 @@ impl GotoLinePanel {
     fn confirm(&mut self, cx: &mut Context<Self>) {
         let raw = self.input.read(cx).value().to_string();
         let total = self.total_lines.max(1);
-        let parse = |s: &str| -> Option<(usize, usize)> {
+        enum ParseErr {
+            Invalid,
+            OutOfRange,
+        }
+        let parse = |s: &str| -> Result<(usize, usize), ParseErr> {
             let mut parts = s.trim().splitn(2, ':');
-            let line = parts.next()?.trim().parse::<usize>().ok()?;
+            let line = parts
+                .next()
+                .and_then(|p| p.trim().parse::<usize>().ok())
+                .ok_or(ParseErr::Invalid)?;
             let col = match parts.next().map(|c| c.trim().parse::<usize>()) {
                 Some(Ok(col)) => col,
-                Some(Err(_)) => return None,
+                Some(Err(_)) => return Err(ParseErr::Invalid),
                 None => 1,
             };
             if line == 0 {
-                return None;
+                return Err(ParseErr::Invalid);
             }
-            Some((line.min(total), col.max(1)))
+            if line > total {
+                return Err(ParseErr::OutOfRange);
+            }
+            Ok((line, col.max(1)))
         };
-        let Some((line, col)) = parse(&raw) else {
-            self.error = Some("格式无效，示例：42 或 42:7");
-            cx.notify();
-            return;
+        let (line, col) = match parse(&raw) {
+            Ok(v) => v,
+            Err(ParseErr::Invalid) => {
+                self.error = Some("格式无效，示例：42 或 42:7".to_string());
+                cx.notify();
+                return;
+            }
+            Err(ParseErr::OutOfRange) => {
+                self.error = Some(format!("超出范围（1-{total})"));
+                cx.notify();
+                return;
+            }
         };
 
         let editor = self.editor.clone();
@@ -145,12 +163,12 @@ impl gpui::Render for GotoLinePanel {
             .border_1()
             .border_color(theme.border)
             .shadow_lg()
-            .when_some(self.error, |this, _| {
+            .when_some(self.error.clone(), |this, err| {
                 this.child(
                     div()
                         .text_color(theme.error_foreground)
                         .text_size(px(12.0))
-                        .child("格式无效"),
+                        .child(err),
                 )
             })
             .child(

@@ -19,7 +19,10 @@ use crate::{
 use super::{
     GitLineMark, InputState, LastLayout, RainbowCache, ScrollbarGeometry, WhitespaceIndicators,
     mode::InputMode,
-    state::{RAINBOW_BRACKETS_MAX_TEXT_LEN, scan_bracket_spans_text, scan_bracket_spans_tree},
+    state::{
+        RAINBOW_BRACKETS_MAX_TEXT_LEN, is_code_bracket, scan_bracket_spans_text,
+        scan_bracket_spans_tree,
+    },
 };
 
 /// Deterministic replacement for `gpui::combine_highlights`.
@@ -1123,20 +1126,47 @@ impl TextElement {
         window: &Window,
         cx: &mut App,
     ) -> Vec<Path<Pixels>> {
-        let state = self.state.read(cx);
-        if state.mode.is_single_line() || state.masked {
+        let (is_single, is_masked, has_sel, focused, cursor, text, tree) = {
+            let state = self.state.read(cx);
+            let tree = match &state.mode {
+                InputMode::CodeEditor { highlighter, .. } => highlighter
+                    .borrow()
+                    .as_ref()
+                    .and_then(|h| h.tree().cloned()),
+                _ => None,
+            };
+            (
+                state.mode.is_single_line(),
+                state.masked,
+                !state.selected_range.is_empty(),
+                state.focus_handle.is_focused(window),
+                state.cursor(),
+                state.text.clone(),
+                tree,
+            )
+        };
+        if is_single || is_masked {
             return Vec::new();
         }
-        if !state.selected_range.is_empty() {
+        if has_sel {
             return Vec::new();
         }
-        if !state.focus_handle.is_focused(window) {
+        if !focused {
             return Vec::new();
         }
-        let cursor = state.cursor();
-        let Some((open, close)) = InputState::matching_bracket(&state.text, cursor) else {
+        let Some((open, close)) = InputState::matching_bracket(&text, cursor) else {
             return Vec::new();
         };
+        // 有语法树时过滤字符串/注释内的误匹配（纯字节扫描无法区分）。
+        if let Some(tree) = tree.as_ref() {
+            let ok = [open, close].iter().all(|off| {
+                text.get_byte(*off)
+                    .is_some_and(|b| is_code_bracket(tree, *off, b))
+            });
+            if !ok {
+                return Vec::new();
+            }
+        }
         let mut paths = Vec::with_capacity(2);
         for off in [open, close] {
             if let Some(path) = Self::layout_match_range(off..off + 1, last_layout, bounds) {

@@ -3045,23 +3045,19 @@ pub(crate) fn guess_language_from_extension(path: &Path) -> String {
             "cpp" | "cc" | "cxx" | "hpp" => "cpp",
             "c" | "h" => "c",
             "html" | "htm" | "vue" | "svelte" => "html",
-            "css" => "css",
-            "scss" | "sass" => "scss",
+            "css" | "scss" | "sass" => "css",
             "md" | "markdown" => "markdown",
             "sh" | "bash" | "zsh" => "bash",
             "toml" => "toml",
             "yaml" | "yml" => "yaml",
             "xml" => "xml",
-            "sql" => "sql",
-            "rb" => "ruby",
+            // 暂无高亮查询的语言统一回落 plain，避免存下无配置的非规范 id
+            //（"sql"/"ruby"/"swift"/"php"/"perl"/"groovy" 会使高亮静默为空
+            // 且状态栏需二次回落）。后续补 query 时再把对应分支改回规范 id。
             "java" => "java",
             "kt" | "kts" => "kotlin",
-            "swift" => "swift",
-            "php" => "php",
-            "pl" | "pm" => "perl",
             "lua" => "lua",
             "zig" => "zig",
-            "gradle" => "groovy",
             _ => "text",
         })
         .unwrap_or("text")

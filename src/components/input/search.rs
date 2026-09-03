@@ -90,10 +90,18 @@ enum SearchQuery {
     Regex(regex::Regex),
 }
 
+/// 搜索扫描上限：超大文件跳过匹配（避免每次按键全量扫描卡死）；
+/// 单次匹配数封顶（避免 `a` 这类查询在几 MB 文件里撑爆 Vec）。
+const SEARCH_MAX_TEXT_LEN: usize = 5_000_000;
+const SEARCH_MAX_MATCHES: usize = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct SearchMatcher {
     text: Rope,
     query: Option<SearchQuery>,
+    /// 字面量全字匹配：保留 Aho-Corasick 字面扫描，按字符判定边界过滤
+    ///（比转正则更快，且与同词高亮共用 Unicode 词定义，CJK 行为一致）。
+    literal_whole_word: bool,
 
     pub(super) matched_ranges: Rc<Vec<Range<usize>>>,
     pub(super) current_match_ix: usize,
@@ -113,6 +121,7 @@ impl SearchMatcher {
         Self {
             text: "".into(),
             query: None,
+            literal_whole_word: false,
             matched_ranges: Rc::new(Vec::new()),
             current_match_ix: 0,
             replacing: false,
@@ -131,23 +140,38 @@ impl SearchMatcher {
 
     fn update_matches(&mut self) {
         let mut new_ranges = Vec::new();
-        if let Some(query) = &self.query {
-            let text = self.text.to_string();
-            match query {
-                SearchQuery::Literal(matcher) => {
-                    for query_match in matcher.stream_find_iter(text.as_bytes()) {
-                        // 关键防御：流式匹配理论上恒 Ok，但渲染路径不得 expect panic，
-                        // 出错时跳过该匹配，保证搜索永不崩溃。
-                        let Ok(query_match) = query_match else {
-                            log::warn!("搜索字面量匹配流异常，已跳过");
-                            continue;
-                        };
-                        new_ranges.push(query_match.range());
+        if self.text.len() <= SEARCH_MAX_TEXT_LEN {
+            if let Some(query) = &self.query {
+                let text = self.text.to_string();
+                match query {
+                    SearchQuery::Literal(matcher) => {
+                        let whole = self.literal_whole_word;
+                        for query_match in matcher.stream_find_iter(text.as_bytes()) {
+                            // 关键防御：流式匹配理论上恒 Ok，但渲染路径不得 expect panic，
+                            // 出错时跳过该匹配，保证搜索永不崩溃。
+                            let Ok(query_match) = query_match else {
+                                log::warn!("搜索字面量匹配流异常，已跳过");
+                                continue;
+                            };
+                            let range = query_match.range();
+                            if whole
+                                && !Self::literal_word_boundary(&text, &range)
+                            {
+                                continue;
+                            }
+                            new_ranges.push(range);
+                            if new_ranges.len() >= SEARCH_MAX_MATCHES {
+                                break;
+                            }
+                        }
                     }
-                }
-                SearchQuery::Regex(re) => {
-                    for m in re.find_iter(&text) {
-                        new_ranges.push(m.range());
+                    SearchQuery::Regex(re) => {
+                        for m in re.find_iter(&text) {
+                            new_ranges.push(m.range());
+                            if new_ranges.len() >= SEARCH_MAX_MATCHES {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -166,7 +190,18 @@ impl SearchMatcher {
         self.update_query_ext(query, case_insensitive, use_regex, false);
     }
 
-    /// 扩展版：支持全字匹配（literal 转为 \b 包裹正则）。
+    /// 字面量全字边界：左右邻字符均非词字符（与同词高亮共用 Unicode 定义）。
+    fn literal_word_boundary(text: &str, range: &Range<usize>) -> bool {
+        use super::state::is_word_char;
+        let left_ok = range.start == 0
+            || !text[..range.start].chars().next_back().is_some_and(is_word_char);
+        let right_ok = range.end >= text.len()
+            || !text[range.end..].chars().next().is_some_and(is_word_char);
+        left_ok && right_ok
+    }
+
+    /// 扩展版：支持全字匹配。字面量全字走 Aho 扫描 + 字符边界过滤
+    ///（与同词高亮同一定義，CJK 一致）；正则全字仍用 `\b` 包裹。
     /// 非法正则时 query 置 None，由调用方标记错误状态。
     pub fn update_query_ext(
         &mut self,
@@ -177,16 +212,13 @@ impl SearchMatcher {
     ) {
         if query.is_empty() {
             self.query = None;
-        } else if use_regex || whole_word {
-            let body = if use_regex {
-                query.to_string()
-            } else {
-                regex::escape(query)
-            };
+            self.literal_whole_word = false;
+        } else if use_regex {
+            self.literal_whole_word = false;
             let expr = if whole_word {
-                format!(r"\b(?:{})\b", body)
+                format!(r"\b(?:{})\b", query)
             } else {
-                body
+                query.to_string()
             };
             let expr = if case_insensitive {
                 format!("(?i){expr}")
@@ -194,6 +226,16 @@ impl SearchMatcher {
                 expr
             };
             self.query = regex::Regex::new(&expr).ok().map(SearchQuery::Regex);
+        } else if whole_word {
+            // 字面量 + 全字：不转正则，按字符边界过滤（见 update_matches）。
+            self.literal_whole_word = true;
+            // 关键防御：用户任意输入（含超大 query）导致构建失败时降级为无查询而非 panic。
+            self.query = AhoCorasick::builder()
+                .ascii_case_insensitive(case_insensitive)
+                .build(&[query.to_string()])
+                .inspect_err(|e| log::warn!("搜索查询构建失败，已清空查询: {e}"))
+                .ok()
+                .map(SearchQuery::Literal);
         } else {
             // 关键防御：用户任意输入（含超大 query）导致构建失败时降级为无查询而非 panic。
             self.query = AhoCorasick::builder()

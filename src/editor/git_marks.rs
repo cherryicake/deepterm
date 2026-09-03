@@ -29,8 +29,14 @@ pub fn compute_git_line_marks(old_text: &str, new_text: &str) -> Vec<(u32, GitLi
         let new_count = new_rows.end - new_rows.start;
         if new_count == 0 {
             // 纯删除：挂在 hunk 之后的第一行（行号 = new_rows.start）。
-            // new_rows 为空区间时 start 即插入点之后的新行号。
-            let anchor = new_rows.start;
+            // new_rows 为空区间时 start 即插入点之后的新行号；若指向末尾
+            // 之外（尾部删除）则钳到末行，保证渲染层总能画出（此前越界行号
+            // 永不可见，尾删无任何提示）。空文件无行可挂，直接丢弃。
+            if new_line_count == 0 {
+                continue;
+            }
+            let last = (new_line_count - 1) as u32;
+            let anchor = new_rows.start.min(last);
             marks.push((anchor, GitLineMark::Deleted));
             continue;
         }
@@ -113,8 +119,8 @@ mod tests {
         let old = "a\nb\n";
         let new = "a\n";
         let marks = compute_git_line_marks(old, new);
-        // b 删除后 new_rows 空区间 start = 1（超出最后行 0）→ 锚点 1 不存在，
-        // 渲染层按“超出末尾”处理为不显示（或画在最后一行下方）。
-        assert_eq!(marks, vec![(1, GitLineMark::Deleted)]);
+        // b 删除后 new_rows 空区间 start = 1（超出最后行 0）→ 钳到末行 0，
+        // 保证尾删可见（此前锚点 1 永不可见）。
+        assert_eq!(marks, vec![(0, GitLineMark::Deleted)]);
     }
 }
