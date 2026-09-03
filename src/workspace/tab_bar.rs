@@ -837,7 +837,11 @@ impl TabBar {
             self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
         let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
 
-        let tab_height = if self.compact { px(24.0) } else { px(TAB_HEIGHT_PX) };
+        let tab_height = if self.compact {
+            px(24.0)
+        } else {
+            px(TAB_HEIGHT_PX)
+        };
         let (border, bg, hover_bg) = if self.compact {
             (theme.transparent(), gpui::transparent_black(), None)
         } else if is_active {
@@ -1126,10 +1130,7 @@ impl TabBar {
     }
 
     /// 新建标签按钮 - 放在滚动区域外面，始终可见
-    fn render_new_tab_button(
-        theme: UiTheme,
-        on_new_tab: NewTabCallback,
-    ) -> Stateful<Div> {
+    fn render_new_tab_button(theme: UiTheme, on_new_tab: NewTabCallback) -> Stateful<Div> {
         div()
             .id("new-tab-btn")
             .w(px(NEW_TAB_BUTTON_SIZE_PX))

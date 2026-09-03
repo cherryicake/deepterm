@@ -233,6 +233,9 @@ impl GitStatus {
         let mut entries: Vec<StatusEntry> = output
             .split('\0')
             .filter_map(|entry| {
+                // 关键安全说明：`get(2..3)` 成功即保证 entry 至少 3 字节且切分点在字符边界，
+                // 因此后续 `as_bytes()[0]/[1]` 与 `&entry[3..]` 不会越界或 panic；
+                // 畸形行直接返回 None 跳过，保证解析永不崩溃。
                 let sep = entry.get(2..3)?;
                 if sep != " " {
                     return None;

@@ -67,8 +67,22 @@ impl TransferSummary {
     }
 }
 
+/// 转义单引号内的内容（**不含外层单引号**）。
+///
+/// 调用方必须手写 `'{}'` 包裹，例如：
+/// `format!("'{}'", shell_single_quote(path))`。
+/// 忘记包裹即构成命令注入，故本函数标记 `#[must_use]` 并在文档中显式警告。
+/// 如需直接得到带引号的结果，请用 [`shell_quote_single`]。
+#[must_use]
 pub fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\\''")
+}
+
+/// 返回带外层单引号的安全 shell 词（推荐新代码使用）。
+/// 与 `git_repository::shell_quote` 语义一致，避免“忘记包裹”类注入。
+#[must_use]
+pub fn shell_quote_single(value: &str) -> String {
+    format!("'{}'", shell_single_quote(value))
 }
 
 pub fn local_file_name(path: &Path) -> anyhow::Result<String> {
@@ -85,6 +99,32 @@ pub fn remote_file_name(path: &str) -> anyhow::Result<String> {
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow!("{} 没有文件名", path))?;
     Ok(file_name.to_string())
+}
+
+/// 校验用户输入的重命名文件名，防止路径遍历逃出目标目录。
+///
+/// 拒绝：空字符串、含 `/` `\` `\0`、为 `.`/`..`、或经 `components` 解析后不止一个
+/// 正常组件（含 `../` 前缀）。调用方应在 `destination_dir.join(rename_to)` 之前调用。
+pub fn validate_rename_to(rename_to: &str) -> anyhow::Result<()> {
+    if rename_to.is_empty() {
+        bail!("重命名文件名不能为空");
+    }
+    if rename_to.contains('\0') {
+        bail!("重命名文件名不能包含空字符");
+    }
+    if rename_to.contains('/') || rename_to.contains('\\') {
+        bail!("重命名文件名不能包含路径分隔符: {rename_to:?}");
+    }
+    if rename_to == "." || rename_to == ".." {
+        bail!("重命名文件名不能为 {rename_to:?}");
+    }
+    // 防御编码变体：按 Path 组件解析，必须恰好一个正常文件组件。
+    // `..` 会被解析为 ParentDir，此处连同未来改动一并收敛到单次匹配中确认。
+    let mut components = Path::new(rename_to).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => bail!("重命名文件名不合法: {rename_to:?}"),
+    }
 }
 
 pub fn is_local_noop_move(source_path: &Path, destination_dir: &Path) -> bool {
@@ -443,5 +483,33 @@ mod tests {
     #[test]
     fn shell_single_quote_empty() {
         assert_eq!(shell_single_quote(""), "");
+    }
+
+    #[test]
+    fn shell_quote_single_wraps_with_quotes() {
+        // 新 API 直接返回带外层引号的结果，避免调用方忘记包裹导致注入。
+        assert_eq!(shell_quote_single("hello"), "'hello'");
+        assert_eq!(shell_quote_single("foo'bar"), "'foo'\\''bar'");
+        assert_eq!(shell_quote_single(""), "''");
+    }
+
+    #[test]
+    fn validate_rename_to_accepts_normal_names() {
+        assert!(validate_rename_to("file.txt").is_ok());
+        assert!(validate_rename_to("报告-2024_final.tar.gz").is_ok());
+        assert!(validate_rename_to("a").is_ok());
+    }
+
+    #[test]
+    fn validate_rename_to_rejects_traversal() {
+        // 路径分隔符与父目录引用必须拒绝，防止逃出目标目录。
+        assert!(validate_rename_to("").is_err());
+        assert!(validate_rename_to(".").is_err());
+        assert!(validate_rename_to("..").is_err());
+        assert!(validate_rename_to("../evil").is_err());
+        assert!(validate_rename_to("a/b").is_err());
+        assert!(validate_rename_to("a\\b").is_err());
+        assert!(validate_rename_to("a\0b").is_err());
+        assert!(validate_rename_to("/abs/path").is_err());
     }
 }

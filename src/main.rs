@@ -12,6 +12,7 @@ pub mod components;
 pub mod editor;
 pub mod file_icons;
 pub mod file_manager;
+pub mod safe_open;
 mod sidebar_view;
 pub mod ssh;
 pub mod ssh_view;

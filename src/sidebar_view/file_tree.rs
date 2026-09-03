@@ -644,7 +644,10 @@ impl SidebarFileTree {
         let Some(ssh_cfg) = self.loader.ssh_config().cloned() else {
             return;
         };
-        if RemoteFileTreeCache::global().lock().is_file_fresh(&ssh_cfg, &path) {
+        if RemoteFileTreeCache::global()
+            .lock()
+            .is_file_fresh(&ssh_cfg, &path)
+        {
             return;
         }
         if self.is_large_or_non_file(&path) {
@@ -677,18 +680,30 @@ impl SidebarFileTree {
                 continue;
             }
             let cache = RemoteFileTreeCache::global().lock();
-            if cache.is_file_fresh(&ssh_cfg, path) || cache.get_file_content(&ssh_cfg, path).is_some() {
+            if cache.is_file_fresh(&ssh_cfg, path)
+                || cache.get_file_content(&ssh_cfg, path).is_some()
+            {
                 continue;
             }
             drop(cache);
-            self.spawn_prefetch_task(path.clone(), ssh_cfg.clone(), Duration::from_millis(150), false, cx);
+            self.spawn_prefetch_task(
+                path.clone(),
+                ssh_cfg.clone(),
+                Duration::from_millis(150),
+                false,
+                cx,
+            );
             spawned += 1;
         }
     }
 
     fn is_large_or_non_file(&self, path: &Path) -> bool {
-        let Some(parent) = path.parent() else { return false; };
-        let Some(entries) = self.loader.get_cached(parent) else { return false; };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Some(entries) = self.loader.get_cached(parent) else {
+            return false;
+        };
         entries
             .iter()
             .find(|e| e.path == path)
@@ -725,14 +740,19 @@ impl SidebarFileTree {
                 .spawn({
                     let backend = backend.clone();
                     let path = task_path.clone();
-                    async move { backend.read_file_bytes(&path) }
+                    // 关键性能：用 `read_preview_bytes(128KB)` 替代全量读，
+                    // 先 metadata 预检，超限直接跳过，避免大文件浪费 IO/RTT。
+                    async move { backend.read_preview_bytes(&path, 128 * 1024) }
                 })
                 .await;
             if let Ok(Some(bytes)) = result {
                 if bytes.len() <= 128 * 1024 && !crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
                     let decoded = crate::editor::encoding::decode_bytes(&bytes);
                     RemoteFileTreeCache::global().lock().insert_file_content(
-                        &task_cfg, &task_path, decoded.text, decoded.encoding,
+                        &task_cfg,
+                        &task_path,
+                        decoded.text,
+                        decoded.encoding,
                     );
                 }
             }

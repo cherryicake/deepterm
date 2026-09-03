@@ -93,12 +93,8 @@ pub fn shell_split_tokens(area: &str, base_offset: usize) -> Vec<ShellToken> {
                     // 其余情况（如 `\n`、`\:`）反斜杠是字面字符。
                     // 旧实现把任意 `\x` 都当转义，会静默丢掉路径里的字面反斜杠
                     // （如 `"C:\\new"` 变成 `C:new`）。
-                    '\\'
-                        if idx + 1 < total
-                            && matches!(
-                                chars[idx + 1].1,
-                                '$' | '`' | '"' | '\\' | '\n'
-                            ) =>
+                    '\\' if idx + 1 < total
+                        && matches!(chars[idx + 1].1, '$' | '`' | '"' | '\\' | '\n') =>
                     {
                         value.push(chars[idx + 1].1);
                         idx += 2;
@@ -771,7 +767,11 @@ mod anchor_tests {
 
     fn assert_safe(buffer: &str, cursor: usize) {
         if let Some(anchor) = path_anchor_byte(buffer, cursor) {
-            assert!(anchor <= buffer.len(), "anchor {anchor} > len {}", buffer.len());
+            assert!(
+                anchor <= buffer.len(),
+                "anchor {anchor} > len {}",
+                buffer.len()
+            );
             assert!(
                 buffer.is_char_boundary(anchor),
                 "anchor {anchor} not a char boundary in {buffer:?}"

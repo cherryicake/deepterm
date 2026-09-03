@@ -3,10 +3,9 @@ use std::{ops::Range, rc::Rc};
 use gpui::{
     App, Bounds, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
-    MouseDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ShapedLine,
-    SharedString,
-    Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, fill, point, px,
-    relative, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ShapedLine,
+    SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, fill, point,
+    px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -20,9 +19,7 @@ use crate::{
 use super::{
     GitLineMark, InputState, LastLayout, RainbowCache, ScrollbarGeometry, WhitespaceIndicators,
     mode::InputMode,
-    state::{
-        RAINBOW_BRACKETS_MAX_TEXT_LEN, scan_bracket_spans_text, scan_bracket_spans_tree,
-    },
+    state::{RAINBOW_BRACKETS_MAX_TEXT_LEN, scan_bracket_spans_text, scan_bracket_spans_tree},
 };
 
 /// Deterministic replacement for `gpui::combine_highlights`.
@@ -48,7 +45,11 @@ fn combine_highlights_stable(
         return Vec::new();
     }
     // Ends (false) before starts (true) at the same position.
-    endpoints.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    endpoints.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
     let mut active = std::collections::BTreeSet::new();
     let mut out = Vec::new();
@@ -57,9 +58,9 @@ fn combine_highlights_stable(
     while i < endpoints.len() {
         let pos = endpoints[i].0;
         if pos > cursor && !active.is_empty() {
-            let style = active
-                .iter()
-                .fold(HighlightStyle::default(), |acc, &id| acc.highlight(highlights[id]));
+            let style = active.iter().fold(HighlightStyle::default(), |acc, &id| {
+                acc.highlight(highlights[id])
+            });
             out.push((cursor..pos, style));
         }
         while i < endpoints.len() && endpoints[i].0 == pos {
@@ -237,8 +238,7 @@ impl TextElement {
                     return;
                 }
                 let delta = event.position.y - start_y;
-                let new_scroll = (start_scroll
-                    + delta * (max_scroll / scrollable_thumb))
+                let new_scroll = (start_scroll + delta * (max_scroll / scrollable_thumb))
                     .clamp(px(0.), max_scroll);
                 state.update(cx, |state, cx| {
                     let mut offset = state.scroll_handle.offset();
@@ -340,13 +340,12 @@ impl TextElement {
         let mut cursor_bounds = None;
 
         // If the input has a fixed height (Otherwise is auto-grow), we need to add a bottom margin to the input.
-        let top_bottom_margin = if state.mode.is_auto_grow()
-            || visible_range.len() < BOTTOM_MARGIN_ROWS * 8
-        {
-            line_height
-        } else {
-            BOTTOM_MARGIN_ROWS * line_height
-        };
+        let top_bottom_margin =
+            if state.mode.is_auto_grow() || visible_range.len() < BOTTOM_MARGIN_ROWS * 8 {
+                line_height
+            } else {
+                BOTTOM_MARGIN_ROWS * line_height
+            };
 
         // The cursor corresponds to the current cursor position in the text no only the line.
         let mut cursor_pos = None;
@@ -415,8 +414,7 @@ impl TextElement {
                 // 该行的光标都会被算成它的第 0 列 —— 当前行高亮因此跳出折叠，
                 // 落在折叠之后那一行上。
                 let contains_offset = |target: usize| {
-                    target >= prev_lines_offset
-                        && target < prev_lines_offset + wrap_line.len() + 1
+                    target >= prev_lines_offset && target < prev_lines_offset + wrap_line.len() + 1
                 };
                 if contains_offset(cursor) && cursor_pos.is_none() {
                     current_row = Some(row);
@@ -434,11 +432,8 @@ impl TextElement {
                         let placeholder =
                             fold_placeholders.iter().find(|p| p.row == fold.start.row)?;
                         let last_y = offset_y - line_height;
-                        let last_width = line
-                            .wrapped_lines
-                            .last()
-                            .map(|l| l.width)
-                            .unwrap_or(px(0.));
+                        let last_width =
+                            line.wrapped_lines.last().map(|l| l.width).unwrap_or(px(0.));
                         let x = if cursor >= fold.end_offset {
                             let mut x = last_width
                                 + placeholder.ellipsis.width
@@ -557,12 +552,8 @@ impl TextElement {
         // on a row hidden by a fold (e.g. at the fold end, on the closing
         // bracket row), the fold's header row is the active one — it receives
         // the active-line highlight and shows the fold disclosure icon.
-        let current_row = current_row.map(|row| {
-            state
-                .display_map
-                .fold_header_for_row(row)
-                .unwrap_or(row)
-        });
+        let current_row =
+            current_row.map(|row| state.display_map.fold_header_for_row(row).unwrap_or(row));
 
         bounds.origin += scroll_offset;
 
@@ -741,10 +732,7 @@ impl TextElement {
             if len > 0. {
                 let ux = dx / len;
                 let uy = dy / len;
-                builder.move_to(path_origin + point(
-                    curr.x - px(ux * r),
-                    curr.y - px(uy * r),
-                ));
+                builder.move_to(path_origin + point(curr.x - px(ux * r), curr.y - px(uy * r)));
             } else {
                 builder.move_to(path_origin + curr);
             }
@@ -764,10 +752,7 @@ impl TextElement {
                 if len_in > 0. {
                     let ux_in = dx_in / len_in;
                     let uy_in = dy_in / len_in;
-                    let start = point(
-                        curr.x - px(ux_in * r),
-                        curr.y - px(uy_in * r),
-                    );
+                    let start = point(curr.x - px(ux_in * r), curr.y - px(uy_in * r));
 
                     let dx_out = f32::from(next.x) - f32::from(curr.x);
                     let dy_out = f32::from(next.y) - f32::from(curr.y);
@@ -775,10 +760,7 @@ impl TextElement {
                     if len_out > 0. {
                         let ux_out = dx_out / len_out;
                         let uy_out = dy_out / len_out;
-                        let end = point(
-                            curr.x + px(ux_out * r),
-                            curr.y + px(uy_out * r),
-                        );
+                        let end = point(curr.x + px(ux_out * r), curr.y + px(uy_out * r));
 
                         // Skip line_to for vertex[0] since move_to already placed us at start
                         if i > 0 {
@@ -970,12 +952,7 @@ impl TextElement {
                         let start = range.start.max(line_start) - line_start;
                         let end = (range.end.min(line_start + text_bytes)) - line_start;
                         if end > start {
-                            runs.push(
-                                base_style
-                                    .clone()
-                                    .highlight(style)
-                                    .to_run(end - start),
-                            );
+                            runs.push(base_style.clone().highlight(style).to_run(end - start));
                         }
                     }
                 }
@@ -988,17 +965,18 @@ impl TextElement {
                 runs.push(base_style.clone().to_run(text_bytes - runs_len));
             }
 
-            let shaped_text = window
-                .text_system()
-                .shape_line(SharedString::from(line_text), text_size, &runs, None);
-            let number: SharedString =
-                format!("{:>width$}", buffer_line + 1, width = line_number_len).into();
-            let shaped_number = window.text_system().shape_line(
-                number,
+            let shaped_text = window.text_system().shape_line(
+                SharedString::from(line_text),
                 text_size,
-                &number_muted_runs,
+                &runs,
                 None,
             );
+            let number: SharedString =
+                format!("{:>width$}", buffer_line + 1, width = line_number_len).into();
+            let shaped_number =
+                window
+                    .text_system()
+                    .shape_line(number, text_size, &number_muted_runs, None);
 
             let row_bounds = Bounds::new(
                 point(bounds.origin.x, bounds.origin.y + line_height * ix as f32),
@@ -1046,9 +1024,11 @@ impl TextElement {
         let mut styles = styles?;
 
         // 树指纹：树被替换（后台解析落地/换语言）时变化，缓存随之失效
-        let tree_key = highlighter
-            .as_ref()
-            .and_then(|h| h.borrow().as_ref().and_then(|h| h.tree().map(|t| t.root_node().id())));
+        let tree_key = highlighter.as_ref().and_then(|h| {
+            h.borrow()
+                .as_ref()
+                .and_then(|h| h.tree().map(|t| t.root_node().id()))
+        });
         let cached = {
             let state = self.state.read(cx);
             match &state.rainbow_cache {
@@ -1375,8 +1355,7 @@ impl TextElement {
 
             // zed: `is_foldable |= !use_lsp_folding_ranges && starts_indent(row)`.
             let folded = state.display_map.is_line_folded(buffer_line);
-            let is_foldable =
-                folded || state.display_map.starts_indent(&state.text, buffer_line);
+            let is_foldable = folded || state.display_map.starts_indent(&state.text, buffer_line);
             if is_foldable {
                 // Center the icon in the fold area (zed centers the crease
                 // toggle within `gutter_dimensions.fold_area_width()`), on the
@@ -1385,12 +1364,8 @@ impl TextElement {
                 let icon_x = bounds.origin.x + last_layout.line_number_width
                     - FOLD_ICON_HITBOX_WIDTH
                     + (FOLD_ICON_HITBOX_WIDTH - icon_size).half();
-                let icon_y =
-                    bounds.origin.y + offset_y + (line_height - icon_size).half();
-                let icon_bounds = Bounds::new(
-                    point(icon_x, icon_y),
-                    size(icon_size, icon_size),
-                );
+                let icon_y = bounds.origin.y + offset_y + (line_height - icon_size).half();
+                let icon_bounds = Bounds::new(point(icon_x, icon_y), size(icon_size, icon_size));
                 let hitbox = window.insert_hitbox(
                     Bounds::new(
                         point(
@@ -1470,8 +1445,7 @@ impl TextElement {
             let tail_start = fold.end_offset;
             let tail_end = text.line_content_end_offset(fold.end.row);
             let tail = if tail_end > tail_start {
-                let tail_text: SharedString =
-                    text.slice(tail_start..tail_end).to_string().into();
+                let tail_text: SharedString = text.slice(tail_start..tail_end).to_string().into();
                 let tail_runs: Vec<TextRun> = if let Some(highlighter) =
                     highlighter.as_deref_mut().and_then(|h| h.as_mut())
                 {
@@ -1548,12 +1522,9 @@ impl TextElement {
                 .unwrap_or(line_height);
 
             if state.display_map.is_line_folded(buffer_line) {
-                if let Some(placeholder) =
-                    placeholders.iter_mut().find(|p| p.row == buffer_line)
-                {
+                if let Some(placeholder) = placeholders.iter_mut().find(|p| p.row == buffer_line) {
                     let line = last_layout.lines.get(i);
-                    let wrap_count =
-                        line.map(|l| l.wrapped_lines.len()).unwrap_or(1).max(1);
+                    let wrap_count = line.map(|l| l.wrapped_lines.len()).unwrap_or(1).max(1);
                     let last_width = line
                         .and_then(|l| l.wrapped_lines.last())
                         .map(|l| l.width)
@@ -1561,14 +1532,11 @@ impl TextElement {
                     let pill_bounds = Bounds::new(
                         point(
                             bounds.origin.x + last_layout.line_number_width + last_width,
-                            bounds.origin.y
-                                + offset_y
-                                + line_height * (wrap_count as f32 - 1.),
+                            bounds.origin.y + offset_y + line_height * (wrap_count as f32 - 1.),
                         ),
                         size(placeholder.pill_width(), line_height),
                     );
-                    let hitbox =
-                        window.insert_hitbox(pill_bounds, HitboxBehavior::Normal);
+                    let hitbox = window.insert_hitbox(pill_bounds, HitboxBehavior::Normal);
                     placeholder.pill_bounds = Some(pill_bounds);
                     placeholder.hitbox = Some(hitbox);
                 }
@@ -1677,8 +1645,8 @@ impl TextElement {
         // offsets keep the two in sync even when lines are folded — without
         // this, every run after a fold is shifted and words get painted
         // half-highlighted / half-white.
-        let first_line_start = display_text
-            .line_start_offset(*last_layout.visible_buffer_lines.first().unwrap_or(&0));
+        let first_line_start =
+            display_text.line_start_offset(*last_layout.visible_buffer_lines.first().unwrap_or(&0));
 
         for &buffer_line in last_layout.visible_buffer_lines.iter() {
             let line_text: String = display_text.slice_line(buffer_line).into();
@@ -1870,7 +1838,11 @@ impl TextElement {
                 }
 
                 // Flush the contiguous range
-                let start_line = range_start.take().unwrap();
+                // 关键防御：range_start 理论上恒为 Some（上一行刚 get_or_insert），
+                // 但 paint 路径不得 unwrap，异常时跳过该段高亮而非崩溃整帧。
+                let Some(start_line) = range_start.take() else {
+                    continue;
+                };
                 flush_range(start_line, line, false, &mut styles);
             }
 
@@ -1914,9 +1886,7 @@ impl TextElement {
                 text.line_end_offset(last)
             };
             if fill_end > fill_start {
-                styles.sort_by(|a, b| {
-                    a.0.start.cmp(&b.0.start).then(a.0.end.cmp(&b.0.end))
-                });
+                styles.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(a.0.end.cmp(&b.0.end)));
                 let input = std::mem::take(&mut styles);
                 let mut filled: Vec<(Range<usize>, HighlightStyle)> =
                     Vec::with_capacity(input.len() * 2 + 1);
@@ -2013,10 +1983,7 @@ impl IntoElement for TextElement {
 
 /// A debug function to print points as SVG path.
 #[allow(unused)]
-fn print_points_as_svg_path(
-    line_corners: &[Corners<Point<Pixels>>],
-    points: &[Point<Pixels>],
-) {
+fn print_points_as_svg_path(line_corners: &[Corners<Point<Pixels>>], points: &[Point<Pixels>]) {
     for corners in line_corners {
         println!(
             "tl: ({}, {}), tr: ({}, {}), bl: ({}, {}), br: ({}, {})",
@@ -2289,7 +2256,8 @@ impl Element for TextElement {
         // 2. Multi-line with soft wrap disabled.
         if state.mode.is_single_line() || !state.soft_wrap {
             let longest_row = state.display_map.longest_row();
-            let longest_line: SharedString = state.text.line_content(longest_row).to_string().into();
+            let longest_line: SharedString =
+                state.text.line_content(longest_row).to_string().into();
             longest_line_width = window
                 .text_system()
                 .shape_line(
@@ -2386,7 +2354,13 @@ impl Element for TextElement {
 
         // Pills are positioned where the header lines are painted, so this
         // must run after the cursor layout has scrolled `bounds`.
-        self.layout_fold_placeholder_bounds(&bounds, &last_layout, &mut fold_placeholders, window, cx);
+        self.layout_fold_placeholder_bounds(
+            &bounds,
+            &last_layout,
+            &mut fold_placeholders,
+            window,
+            cx,
+        );
 
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
         let search_match_paths = self.layout_search_matches(&last_layout, &bounds, cx);
@@ -2463,8 +2437,6 @@ impl Element for TextElement {
             window,
             cx,
         );
-
-        
 
         PrepaintState {
             bounds,
@@ -2603,29 +2575,20 @@ impl Element for TextElement {
                         match mark {
                             GitLineMark::Added => {
                                 window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(bar_x, p.y),
-                                        size(px(3.), height),
-                                    ),
+                                    Bounds::new(point(bar_x, p.y), size(px(3.), height)),
                                     cx.theme().success,
                                 ));
                             }
                             GitLineMark::Modified => {
                                 window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(bar_x, p.y),
-                                        size(px(3.), height),
-                                    ),
+                                    Bounds::new(point(bar_x, p.y), size(px(3.), height)),
                                     cx.theme().accent,
                                 ));
                             }
                             GitLineMark::Deleted => {
                                 // 此处上方有删除行：行顶小短条示意
                                 window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(bar_x, p.y),
-                                        size(px(7.), px(3.)),
-                                    ),
+                                    Bounds::new(point(bar_x, p.y), size(px(7.), px(3.))),
                                     cx.theme().error,
                                 ));
                             }
@@ -2664,7 +2627,11 @@ impl Element for TextElement {
         }
 
         // Paint indent guides — VS Code style: grid-aligned, whitespace-interpolated, active-block highlighted
-        if state.indent_guides && state.mode.is_multi_line() && !state.masked && state.text.len() > 0 {
+        if state.indent_guides
+            && state.mode.is_multi_line()
+            && !state.masked
+            && state.text.len() > 0
+        {
             // 层级宽度跟随缩进配置（`TabSize`，默认硬 Tab / 4 列），而不是
             // 写死常量 —— 否则把缩进切成 2 空格后参考线仍按 4 列画。
             let indent_size = state.indent_width();
@@ -2869,9 +2836,7 @@ impl Element for TextElement {
                     // 0 行的半开区间：只含光标行本身。
                     let mut start = cursor_line;
                     let mut end = cursor_line + 1;
-                    if level == 0
-                        && cursor_line + 1 < total_lines
-                        && count_at(cursor_line + 1) == 1
+                    if level == 0 && cursor_line + 1 < total_lines && count_at(cursor_line + 1) == 1
                     {
                         // 光标停在块的第一行（缩进尚未展开）：整块从下一行起算。
                         level = 1;
@@ -2895,11 +2860,8 @@ impl Element for TextElement {
                 let active_color = cx.theme().border.opacity(0.85);
                 let gutter_width = prepaint.last_layout.line_number_width;
                 let mut gy = invisible_top_padding;
-                for (vi, &buffer_line) in prepaint
-                    .last_layout
-                    .visible_buffer_lines
-                    .iter()
-                    .enumerate()
+                for (vi, &buffer_line) in
+                    prepaint.last_layout.visible_buffer_lines.iter().enumerate()
                 {
                     // `lines` 与 `visible_buffer_lines` 正常情况下一一对应，
                     // 但空文本分支是按 placeholder 生成的，长度可能不等价 ——
@@ -3086,15 +3048,15 @@ impl Element for TextElement {
         if !prepaint.sticky_lines.is_empty() {
             let sticky_h = line_height * prepaint.sticky_lines.len() as f32;
             window.paint_quad(fill(
-                Bounds::new(
-                    input_bounds.origin,
-                    size(input_bounds.size.width, sticky_h),
-                ),
+                Bounds::new(input_bounds.origin, size(input_bounds.size.width, sticky_h)),
                 cx.theme().editor_background().opacity(0.92),
             ));
             window.paint_quad(fill(
                 Bounds::new(
-                    point(input_bounds.origin.x, input_bounds.origin.y + sticky_h - px(1.)),
+                    point(
+                        input_bounds.origin.x,
+                        input_bounds.origin.y + sticky_h - px(1.),
+                    ),
                     size(input_bounds.size.width, px(1.)),
                 ),
                 cx.theme().border,
@@ -3293,23 +3255,42 @@ mod tests {
     #[test]
     fn combine_highlights_stable_rainbow_overrides_syntax() {
         // Nested "((  ))" - overlay (rainbow) must win and paired brackets share the same color.
-        let gray = HighlightStyle { color: Some(gpui::rgb(0xb2b9c6).into()), ..Default::default() };
-        let gold = HighlightStyle { color: Some(gpui::rgb(0xE2B93D).into()), ..Default::default() };
-        let blue = HighlightStyle { color: Some(gpui::rgb(0x4FC1FF).into()), ..Default::default() };
-        let syntax = vec![(0..1, gray.clone()), (1..2, gray.clone()), (2..3, gray.clone()), (3..4, gray)];
-        let rainbow = vec![(0..1, gold.clone()), (1..2, blue.clone()), (2..3, blue.clone()), (3..4, gold.clone())];
+        // 注意：`HighlightStyle` 为 `Copy`，直接按值使用，无需 `.clone()`。
+        let gray = HighlightStyle {
+            color: Some(gpui::rgb(0xb2b9c6).into()),
+            ..Default::default()
+        };
+        let gold = HighlightStyle {
+            color: Some(gpui::rgb(0xE2B93D).into()),
+            ..Default::default()
+        };
+        let blue = HighlightStyle {
+            color: Some(gpui::rgb(0x4FC1FF).into()),
+            ..Default::default()
+        };
+        let syntax = vec![(0..1, gray), (1..2, gray), (2..3, gray), (3..4, gray)];
+        let rainbow = vec![(0..1, gold), (1..2, blue), (2..3, blue), (3..4, gold)];
         let merged = combine_highlights_stable(syntax, rainbow);
-        assert_eq!(merged, vec![(0..1, gold.clone()), (1..2, blue.clone()), (2..3, blue.clone()), (3..4, gold.clone())]);
+        assert_eq!(
+            merged,
+            vec![(0..1, gold), (1..2, blue), (2..3, blue), (3..4, gold)]
+        );
         assert_eq!(merged[0].1.color, merged[3].1.color);
         assert_eq!(merged[1].1.color, merged[2].1.color);
     }
 
     #[test]
     fn combine_highlights_stable_deterministic_for_nested() {
-        let base = HighlightStyle { color: Some(gpui::red()), ..Default::default() };
-        let overlay = HighlightStyle { color: Some(gpui::blue()), ..Default::default() };
-        let a = vec![(0..5, base.clone()), (4..10, base.clone())];
-        let b = vec![(2..6, overlay.clone())];
+        let base = HighlightStyle {
+            color: Some(gpui::red()),
+            ..Default::default()
+        };
+        let overlay = HighlightStyle {
+            color: Some(gpui::blue()),
+            ..Default::default()
+        };
+        let a = vec![(0..5, base), (4..10, base)];
+        let b = vec![(2..6, overlay)];
         let r1 = combine_highlights_stable(a.clone(), b.clone());
         let r2 = combine_highlights_stable(a, b);
         assert_eq!(r1, r2);

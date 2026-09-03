@@ -155,16 +155,19 @@ pub fn sort_hosts(hosts: &mut [Host], mode: SortMode) {
     match mode {
         SortMode::NameAsc | SortMode::CountDesc => {
             // Count has no meaning for hosts; treat as name order
-            hosts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            // 用 `sort_by_cached_key` 避免每次比较重复 `to_lowercase()` 分配。
+            hosts.sort_by_cached_key(|h| h.name.to_lowercase())
         }
         SortMode::NameDesc => {
-            hosts.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()))
+            hosts.sort_by_cached_key(|h| std::cmp::Reverse(h.name.to_lowercase()))
         }
-        SortMode::CreatedDesc => hosts.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        SortMode::CreatedAsc => hosts.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
-        SortMode::Custom => {
-            hosts.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then_with(|| a.name.cmp(&b.name)))
-        }
+        SortMode::CreatedDesc => hosts.sort_by_key(|h| std::cmp::Reverse(h.created_at)),
+        SortMode::CreatedAsc => hosts.sort_by_key(|h| h.created_at),
+        SortMode::Custom => hosts.sort_by(|a, b| {
+            a.sort_order
+                .cmp(&b.sort_order)
+                .then_with(|| a.name.cmp(&b.name))
+        }),
     }
 }
 

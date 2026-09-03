@@ -218,7 +218,10 @@ impl FsWatcher {
                     log::warn!("Failed to watch {}: {e}", path.display());
                 }
             } else {
-                log::warn!("File watcher disabled, ignoring watch for {}", path.display());
+                log::warn!(
+                    "File watcher disabled, ignoring watch for {}",
+                    path.display()
+                );
             }
         }
         cx.notify();
@@ -244,7 +247,10 @@ impl FsWatcher {
                     log::warn!("Failed to watch {}: {e}", path.display());
                 }
             } else {
-                log::warn!("File watcher disabled, ignoring watch for {}", path.display());
+                log::warn!(
+                    "File watcher disabled, ignoring watch for {}",
+                    path.display()
+                );
             }
         }
         cx.notify();
@@ -493,7 +499,6 @@ impl RemoteFsWatcher {
                     .await;
 
                 for (path, meta, entries, content_hash) in all_results {
-
                     let meta = match meta {
                         Ok(m) => m,
                         Err(e) => {
@@ -610,6 +615,8 @@ pub trait WatcherContext {
     fn unwatch_remote_path(&mut self, path: &Path);
 }
 
+// `App` 与 `Context<'a, T>` 的便捷方法实现保持一致：
+// 若修改其中一处，请同步更新另一处。
 impl WatcherContext for App {
     fn fs_watcher(&self) -> Entity<FsWatcher> {
         FsWatcherGlobal::watcher(self)

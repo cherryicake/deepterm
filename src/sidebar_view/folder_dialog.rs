@@ -8,7 +8,10 @@ use crate::theme::ActiveTheme;
 pub enum FolderDialogMode {
     Create,
     #[allow(dead_code)]
-    Rename { id: String, old_name: String },
+    Rename {
+        id: String,
+        old_name: String,
+    },
 }
 
 pub struct FolderNameDialog {

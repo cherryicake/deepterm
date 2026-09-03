@@ -6,15 +6,15 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement,
-    KeyBinding, ListAlignment, ListState, Render, SharedString, StyleRefinement, TextRun,
-    TextStyleRefinement, WhiteSpace, Window, div, list, px, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyBinding,
+    ListAlignment, ListState, Render, SharedString, StyleRefinement, TextRun, TextStyleRefinement,
+    WhiteSpace, Window, actions, div, list, px, rems,
 };
 
+use crate::editor::syntax::SyntaxHighlighter;
 use crate::sidebar_view::font_settings::{
     platform_default_fallbacks, platform_default_font_family,
 };
-use crate::editor::syntax::SyntaxHighlighter;
 use crate::theme::{ActiveTheme, AppTheme};
 
 use super::markdown_element::MarkdownElementBuilder;
@@ -382,7 +382,12 @@ impl Markdown {
         let mut ids: Vec<usize> = self.fragment_texts.borrow().keys().cloned().collect();
         ids.sort_unstable();
         if let (Some(first), Some(last)) = (ids.first(), ids.last()) {
-            let last_len = self.fragment_texts.borrow().get(last).map(|s| s.len()).unwrap_or(0);
+            let last_len = self
+                .fragment_texts
+                .borrow()
+                .get(last)
+                .map(|s| s.len())
+                .unwrap_or(0);
             self.selection.anchor_fragment = *first;
             self.selection.anchor_offset = 0;
             self.selection.focus_fragment = *last;
@@ -527,7 +532,12 @@ impl Markdown {
         });
 
         let elements = MarkdownElementBuilder::new_with_item(
-            style, wrapped, copied, markdown, highlight_cache, ix,
+            style,
+            wrapped,
+            copied,
+            markdown,
+            highlight_cache,
+            ix,
         )
         .build(&events, cx);
 
@@ -553,10 +563,9 @@ fn compute_item_ranges(events: &[(Range<usize>, MarkdownEvent)]) -> Vec<Range<us
                     ranges.push(start..i + 1);
                 }
             }
-            MarkdownEvent::Rule
-                if depth == 0 => {
-                    ranges.push(i..i + 1);
-                }
+            MarkdownEvent::Rule if depth == 0 => {
+                ranges.push(i..i + 1);
+            }
             _ => {}
         }
     }

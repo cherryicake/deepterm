@@ -6,7 +6,6 @@ use gpui::{
 use std::path::PathBuf;
 
 use crate::assets::Icon;
-use crate::workspace::tab_bar::{DragPreview, DraggedTab};
 use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
@@ -14,6 +13,7 @@ use crate::theme::ActiveTheme;
 use crate::workspace::session_state::{
     PanelContentSessionState, PanelSessionState, TerminalSessionState,
 };
+use crate::workspace::tab_bar::{DragPreview, DraggedTab};
 
 // Re-export for convenience
 pub use crate::ssh::SshConnectionConfig;
@@ -421,10 +421,7 @@ impl Panel {
                 if let Some(cmd) = command {
                     TerminalView::new_with_command(cx, &cmd, &args)
                 } else {
-                    TerminalView::new_with_working_directory(
-                        cx,
-                        cwd.map(std::path::PathBuf::from),
-                    )
+                    TerminalView::new_with_working_directory(cx, cwd.map(std::path::PathBuf::from))
                 }
             }
         };

@@ -684,9 +684,7 @@ fn parse_color(value: &str) -> anyhow::Result<Hsla> {
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value);
     if hex.len() != 6 && hex.len() != 8 {
-        anyhow::bail!(
-            "invalid color literal '{value}': expected #RRGGBB or #RRGGBBAA"
-        );
+        anyhow::bail!("invalid color literal '{value}': expected #RRGGBB or #RRGGBBAA");
     }
     let parsed = u32::from_str_radix(hex, 16)?;
 

@@ -1,9 +1,9 @@
 pub mod file_tree;
 pub mod file_tree_panel_tabs;
+pub mod folder_dialog;
 pub mod font_settings;
 pub mod font_view;
 pub mod git_panel;
-pub mod folder_dialog;
 pub mod host_form;
 pub mod host_view;
 pub mod hosts_view;

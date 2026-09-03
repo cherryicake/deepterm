@@ -42,7 +42,9 @@ impl HostKeyPolicy {
 /// `SshGlobalConfig::load()` 读不到配置时返回 new()（AcceptNew），
 /// 与默认行为一致。
 pub fn policy_from_global_config() -> HostKeyPolicy {
-    HostKeyPolicy::from_strict_flag(crate::ssh::config::SshGlobalConfig::load().strict_host_key_checking)
+    HostKeyPolicy::from_strict_flag(
+        crate::ssh::config::SshGlobalConfig::load().strict_host_key_checking,
+    )
 }
 
 /// 校验服务端主机密钥。
@@ -79,7 +81,10 @@ pub fn check_and_trust_host_key(
             }
             HostKeyPolicy::Strict => {
                 let hint = match crate::ssh::config::SshGlobalConfig::config_path() {
-                    Some(path) => format!("（配置文件：{} 中 strict_host_key_checking）", path.display()),
+                    Some(path) => format!(
+                        "（配置文件：{} 中 strict_host_key_checking）",
+                        path.display()
+                    ),
                     None => String::new(),
                 };
                 log::error!(
@@ -103,6 +108,19 @@ pub fn check_and_trust_host_key(
             Err(russh::Error::Inconsistent)
         }
     }
+}
+
+/// 供 `russh::client::Handler::check_server_key` 统一调用的薄封装。
+/// 终端通道（`russh_terminal::SshClientHandler`）与 SFTP 通道
+/// （`sftp_fs::SftpClientHandler`）必须共用此逻辑，避免一侧漏检。
+/// 关键质量：此前两处 11 行实现逐字节重复，现收敛至此，单点维护。
+pub async fn verify_server_key(
+    host: &str,
+    port: u16,
+    server_public_key: &PublicKey,
+    policy: HostKeyPolicy,
+) -> Result<bool, russh::Error> {
+    check_and_trust_host_key(host, port, server_public_key, policy)
 }
 
 #[cfg(test)]

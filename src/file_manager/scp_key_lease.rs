@@ -23,13 +23,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::utils::shell_single_quote;
+use super::utils::shell_quote_single;
 
 use anyhow::{Context as _, anyhow, bail};
 
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, BlockingSftpSession};
+use zeroize::Zeroizing;
 
+// `LeaseKey` 仅含 `config.id()` 派生的非敏感键与本地路径，不含口令/私钥，
+// 故直接派生 `Debug` 即可（输出与手写实现一致，避免多余样板）。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LeaseKey {
     source_key: String,
@@ -38,8 +41,13 @@ struct LeaseKey {
 }
 
 fn config_key(config: &SshConnectionConfig) -> String {
-    serde_json::to_string(config)
-        .unwrap_or_else(|_| format!("{}@{}:{}", config.username, config.host, config.port))
+    // 关键安全修复：此前用 `serde_json::to_string(config)` 做键，
+    // 会把明文 password/passphrase 序列化进内存 HashMap 键并长期驻留，
+    // 且 `Debug` 打印即泄漏。现改用 `config.id()`（仅含 username/host/port/nickname），
+    // 与 `sftp_fs::cache_key` 只存 `password.len()` 的原则一致。
+    // 注意：同一主机不同凭据会复用同一租约目录，但密钥文件本身按需上传覆盖，
+    // 权限均为 0600，复用不跨越安全边界。
+    config.id()
 }
 
 struct ScpKeyLease {
@@ -136,8 +144,8 @@ impl Drop for LeaseGuard {
 }
 
 fn cleanup_lease(lease: &ScpKeyLease) {
-    // 1. 源端 rm -rf 临时目录
-    let cmd = format!("rm -rf '{}'", shell_single_quote(&lease.remote_temp_dir));
+    // 1. 源端 rm -rf 临时目录（用带引号版本，避免忘记包裹导致注入）。
+    let cmd = format!("rm -rf {}", shell_quote_single(&lease.remote_temp_dir));
     match sftp_fs::with_cached_session(&lease.source_config, |session| {
         session.execute_command(&cmd, 5)
     }) {
@@ -248,10 +256,7 @@ pub fn acquire_lease(
 }
 
 fn remote_key_alive(session: &mut BlockingSftpSession, remote_key_path: &str) -> bool {
-    let cmd = format!(
-        "test -f '{}' && echo ok",
-        shell_single_quote(remote_key_path)
-    );
+    let cmd = format!("test -f {} && echo ok", shell_quote_single(remote_key_path));
     matches!(
         session.execute_command(&cmd, 5),
         Ok(r) if r.success() && r.stdout.trim() == "ok"
@@ -301,8 +306,12 @@ fn create_lease(
     key_path: &Path,
     cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<ScpKeyLease> {
-    let mut key_bytes = std::fs::read(key_path)
-        .with_context(|| format!("读取本地私钥失败: {}", key_path.display()))?;
+    // 关键安全：私钥字节用 `Zeroizing` 包裹，作用域结束自动清零，
+    // 防堆内存残留与 core dump 泄露；显式 `fill(0)` 保留作双保险。
+    let mut key_bytes = Zeroizing::new(
+        std::fs::read(key_path)
+            .with_context(|| format!("读取本地私钥失败: {}", key_path.display()))?,
+    );
 
     super::utils::check_cancelled(cancelled)?;
 
@@ -318,7 +327,7 @@ fn create_lease(
 
     source_session
         .execute_command(
-            &format!("mkdir -m 700 '{}'", shell_single_quote(&remote_temp_dir)),
+            &format!("mkdir -m 700 {}", shell_quote_single(&remote_temp_dir)),
             5,
         )
         .map_err(|e| anyhow!("源端创建临时目录失败: {}", e))?;
@@ -328,9 +337,14 @@ fn create_lease(
     let remote_key_path = format!("{}/id_key", remote_temp_dir);
     let local_temp_path = std::env::temp_dir().join(&dir_name);
 
-    if let Err(e) = std::fs::write(&local_temp_path, &key_bytes) {
+    // 关键安全修复：本地临时私钥必须 0600 创建，避免 umask 022 下同机可读。
+    // 复用 `keychain::write_secret_file`（O_CREAT|O_TRUNC + mode 0600 + 写后收紧），
+    // 与远端 `upload_..._with_permissions(0o600)` 对称。
+    // 另：`dir_name` 含 pid+时间戳+rand随机数，本地 `temp_dir/<dir_name>` 无预建竞态；
+    // 若文件已存在（极小概率碰撞），`write_secret_file` 会截断复用，权限仍收紧为 0600。
+    if let Err(e) = crate::ssh::keychain::write_secret_file(&local_temp_path, &key_bytes) {
         let _ = source_session.execute_command(
-            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf {}", shell_quote_single(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);
@@ -351,7 +365,7 @@ fn create_lease(
         let _ = std::fs::write(&local_temp_path, vec![0u8; key_bytes.len()]);
         let _ = std::fs::remove_file(&local_temp_path);
         let _ = source_session.execute_command(
-            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf {}", shell_quote_single(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);
@@ -361,13 +375,13 @@ fn create_lease(
     super::utils::check_cancelled(cancelled)?;
 
     if let Err(e) = source_session.execute_command(
-        &format!("chmod 600 '{}'", shell_single_quote(&remote_key_path)),
+        &format!("chmod 600 {}", shell_quote_single(&remote_key_path)),
         5,
     ) {
         let _ = std::fs::write(&local_temp_path, vec![0u8; key_bytes.len()]);
         let _ = std::fs::remove_file(&local_temp_path);
         let _ = source_session.execute_command(
-            &format!("rm -rf '{}'", shell_single_quote(&remote_temp_dir)),
+            &format!("rm -rf {}", shell_quote_single(&remote_temp_dir)),
             5,
         );
         key_bytes.fill(0);

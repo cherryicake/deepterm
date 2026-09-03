@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use crate::ssh::SshConnectionConfig;
 
+// 允许大枚举变体差异（中文说明）：
+// `Remote` 含完整 `SshConnectionConfig`（约 248B），`Local` 仅 `PathBuf`。
+// 该枚举用于传输任务描述（低频克隆，非每帧热点），装箱会增加堆分配与解引用成本，
+// 且需改动全部构造点，收益低于风险，故显式允许。传输热点已用 `Arc`/`引用` 优化。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileEndpoint {
     Local {

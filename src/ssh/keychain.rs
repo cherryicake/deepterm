@@ -469,8 +469,7 @@ impl KeychainStore {
 
     /// 原子写入 + 权限限制，与 ssh.json 保持一致
     fn persist(&self) -> anyhow::Result<()> {
-        let path = Self::config_path()
-            .ok_or_else(|| anyhow!("无法确定 keychain 配置路径"))?;
+        let path = Self::config_path().ok_or_else(|| anyhow!("无法确定 keychain 配置路径"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -598,18 +598,22 @@ impl TerminalElement {
             }
 
             let key = BatchStyleKey::for_cell(cell, is_hovered_url);
-            let batch_extends = current_batch.is_some()
-                && current_key.as_ref() == Some(&key)
-                && {
-                    let (start_col, _, _, cell_count) = current_batch.as_ref().unwrap();
-                    *start_col + *cell_count == cell.point.column.0
-                };
+            // 关键防御：用 let 链替代 unwrap，逻辑错乱时降级为断开批次而非整帧 panic。
+            let batch_extends = match (current_batch.as_ref(), current_key.as_ref()) {
+                (Some((start_col, _, _, cell_count)), Some(cur_key)) => {
+                    cur_key == &key && *start_col + *cell_count == cell.point.column.0
+                }
+                _ => false,
+            };
 
             if batch_extends {
-                let (_, text, style, cell_count) = current_batch.as_mut().unwrap();
-                text.push(ch);
-                *cell_count += 1;
-                style.len += ch.len_utf8();
+                // 此处 current_batch 必为 Some（由 batch_extends 保证），
+                // 仍用 if-let 防御，避免理论外的 panic 拖垮渲染。
+                if let Some((_, text, style, cell_count)) = current_batch.as_mut() {
+                    text.push(ch);
+                    *cell_count += 1;
+                    style.len += ch.len_utf8();
+                }
             } else {
                 Self::flush_text_batch(
                     row_idx,
@@ -1256,7 +1260,12 @@ impl Element for TerminalElement {
                         // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
                         view.cached_theme_id = Some(active_theme_id.clone());
                         view.flattened_render_cache = FlattenedRenderCache::default();
-                        (Vec::new(), true, FlattenedRenderCache::default(), selection_changed)
+                        (
+                            Vec::new(),
+                            true,
+                            FlattenedRenderCache::default(),
+                            selection_changed,
+                        )
                     }
                 }
             });
@@ -1398,14 +1407,17 @@ impl Element for TerminalElement {
                     row_cache.box_cells = Some(row_boxes);
                 } else if is_dirty {
                     if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
-                        let row_boxes = Self::update_box_cells_in_range(
-                            row_idx,
-                            cached_row_boxes,
-                            row_cells,
-                            range,
-                            &terminal_theme,
-                        );
+                        // 关键防御：缓存理论上为 Some，异常时全量重算而非 panic。
+                        let row_boxes = match row_cache.box_cells.as_ref() {
+                            Some(cached_row_boxes) => Self::update_box_cells_in_range(
+                                row_idx,
+                                cached_row_boxes,
+                                row_cells,
+                                range,
+                                &terminal_theme,
+                            ),
+                            None => Self::box_cells_for_row(row_idx, row_cells, &terminal_theme),
+                        };
                         if rebuild_flattened_cache {
                             box_cells.extend_from_slice(&row_boxes);
                         }
@@ -1419,8 +1431,10 @@ impl Element for TerminalElement {
                         row_cache.box_cells = Some(row_boxes);
                     }
                 } else if rebuild_flattened_cache {
-                    let cached_row_boxes = row_cache.box_cells.as_ref().unwrap();
-                    box_cells.extend_from_slice(cached_row_boxes);
+                    // 关键防御：缓存缺失时跳过而非 panic，下帧会重建。
+                    if let Some(cached_row_boxes) = row_cache.box_cells.as_ref() {
+                        box_cells.extend_from_slice(cached_row_boxes);
+                    }
                 }
 
                 if row_cache.background_spans.is_none() {
@@ -1432,14 +1446,19 @@ impl Element for TerminalElement {
                     row_cache.background_spans = Some(backgrounds);
                 } else if is_dirty {
                     if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
-                        let backgrounds = Self::update_background_spans_in_range(
-                            row_idx,
-                            cached_backgrounds,
-                            row_cells,
-                            range,
-                            &terminal_theme,
-                        );
+                        // 关键防御：缓存缺失时全量重算，保证渲染永不 panic。
+                        let backgrounds = match row_cache.background_spans.as_ref() {
+                            Some(cached_backgrounds) => Self::update_background_spans_in_range(
+                                row_idx,
+                                cached_backgrounds,
+                                row_cells,
+                                range,
+                                &terminal_theme,
+                            ),
+                            None => {
+                                Self::background_spans_for_row(row_idx, row_cells, &terminal_theme)
+                            }
+                        };
                         if rebuild_flattened_cache {
                             background_spans.extend_from_slice(&backgrounds);
                         }
@@ -1453,8 +1472,9 @@ impl Element for TerminalElement {
                         row_cache.background_spans = Some(backgrounds);
                     }
                 } else if rebuild_flattened_cache {
-                    let cached_backgrounds = row_cache.background_spans.as_ref().unwrap();
-                    background_spans.extend_from_slice(cached_backgrounds);
+                    if let Some(cached_backgrounds) = row_cache.background_spans.as_ref() {
+                        background_spans.extend_from_slice(cached_backgrounds);
+                    }
                 }
 
                 if selection_changed || row_cache.selection_cols.is_none() {
@@ -1466,13 +1486,16 @@ impl Element for TerminalElement {
                     row_cache.selection_cols = Some(selected_cols);
                 } else if is_dirty {
                     if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                        let selected_cols = Self::update_selected_cols_in_range(
-                            cached_selected_cols,
-                            row_cells,
-                            range,
-                            &selection_range,
-                        );
+                        // 关键防御：缓存缺失时全量重算。
+                        let selected_cols = match row_cache.selection_cols.as_ref() {
+                            Some(cached_selected_cols) => Self::update_selected_cols_in_range(
+                                cached_selected_cols,
+                                row_cells,
+                                range,
+                                &selection_range,
+                            ),
+                            None => Self::selected_cols_for_row(row_cells, &selection_range),
+                        };
                         if rebuild_flattened_cache {
                             selection_spans
                                 .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
@@ -1488,33 +1511,43 @@ impl Element for TerminalElement {
                         row_cache.selection_cols = Some(selected_cols);
                     }
                 } else if rebuild_flattened_cache {
-                    let cached_selected_cols = row_cache.selection_cols.as_ref().unwrap();
-                    selection_spans.extend(Self::selection_spans_for_cols(
-                        row_idx,
-                        cached_selected_cols,
-                    ));
+                    if let Some(cached_selected_cols) = row_cache.selection_cols.as_ref() {
+                        selection_spans.extend(Self::selection_spans_for_cols(
+                            row_idx,
+                            cached_selected_cols,
+                        ));
+                    }
                 }
 
                 #[cfg(debug_assertions)]
                 if validate_row_cache {
-                    let row_runs = &row_cache.layout.as_ref().unwrap().runs;
-                    let row_boxes = row_cache.box_cells.as_ref().unwrap();
-                    let row_backgrounds = row_cache.background_spans.as_ref().unwrap();
-                    let row_selection_cols = row_cache.selection_cols.as_ref().unwrap();
-                    Self::assert_row_consistency(
-                        row_idx,
-                        row_cells,
-                        row_runs,
-                        row_boxes,
-                        row_backgrounds,
-                        row_selection_cols,
-                        window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                        &selection_range,
-                    );
+                    // 调试校验：缓存缺失时跳过校验而非 panic，避免 debug 模式误崩。
+                    if let (
+                        Some(layout),
+                        Some(row_boxes),
+                        Some(row_backgrounds),
+                        Some(row_selection_cols),
+                    ) = (
+                        row_cache.layout.as_ref(),
+                        row_cache.box_cells.as_ref(),
+                        row_cache.background_spans.as_ref(),
+                        row_cache.selection_cols.as_ref(),
+                    ) {
+                        Self::assert_row_consistency(
+                            row_idx,
+                            row_cells,
+                            &layout.runs,
+                            row_boxes,
+                            row_backgrounds,
+                            row_selection_cols,
+                            window,
+                            &text_style,
+                            font_size,
+                            cell_width,
+                            &terminal_theme,
+                            &selection_range,
+                        );
+                    }
                 }
             }
 

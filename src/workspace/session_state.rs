@@ -65,6 +65,11 @@ pub enum SplitSessionDirection {
     Vertical,
 }
 
+// 允许大枚举变体差异（中文说明）：
+// `Split` 含递归 `Vec`，`Panel` 含终端会话（含 SSH 配置）。
+// 会话状态仅在标签切换/持久化时克隆（低频），装箱会复杂化 `serde` 结构，
+// 故显式允许。渲染热点不经过此枚举。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SplitSessionState {
     Panel(PanelSessionState),

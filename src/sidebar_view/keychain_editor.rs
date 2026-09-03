@@ -602,7 +602,9 @@ impl KeychainEditor {
                     )
                     .into_any_element(),
             )
-        } else { self.success_message.as_ref().map(|success| div()
+        } else {
+            self.success_message.as_ref().map(|success| {
+                div()
                     .w_full()
                     .px(px(12.0))
                     .py(px(8.0))
@@ -616,7 +618,9 @@ impl KeychainEditor {
                             .text_color(theme.success_foreground)
                             .child(success.clone()),
                     )
-                    .into_any_element()) }
+                    .into_any_element()
+            })
+        }
     }
 }
 
@@ -808,7 +812,22 @@ fn sanitize_filename(value: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn choose_file_with_osascript(initial_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let dir = initial_dir.to_string_lossy().replace('"', "\\\"");
+    // 关键安全修复：`initial_dir` 来自用户路径（如克隆仓的恶意目录名），
+    // 不得仅转义双引号。AppleScript 双引号字符串中 `\` 与 `"` 均需转义，
+    // 且换行/控制字符必须剔除，否则可跳出字符串字面量执行任意 AppleScript。
+    // 注：此处经 `Command::args` 直接传参，不经过 shell，故无需处理 `$`、反引号；
+    // 风险面仅为 AppleScript 字符串逃逸，已由下述转义覆盖。
+    let raw = initial_dir.to_string_lossy();
+    let mut dir = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' => dir.push_str("\\\\"),
+            '"' => dir.push_str("\\\""),
+            '\n' | '\r' => dir.push(' '),
+            c if c.is_control() => continue,
+            c => dir.push(c),
+        }
+    }
     let script = format!(
         "POSIX path of (choose file with prompt \"Import key file\" default location (POSIX file \"{}\"))",
         dir

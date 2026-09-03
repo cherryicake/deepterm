@@ -33,7 +33,12 @@ impl FileEntry {
             FileEntryKind::Other
         };
         let size = entry.metadata().map_or(0, |m| m.len());
-        Some(Self { name, path, kind, size })
+        Some(Self {
+            name,
+            path,
+            kind,
+            size,
+        })
     }
 
     pub fn sort_key(&self) -> (u8, String) {

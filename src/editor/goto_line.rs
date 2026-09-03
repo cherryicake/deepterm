@@ -43,16 +43,13 @@ impl GotoLinePanel {
         });
 
         let subscription = panel.update(cx, |_, cx| {
-            cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-                match event {
-                    InputEvent::Submit => this.confirm(cx),
-                    InputEvent::Change
-                        if this.error.is_some() => {
-                            this.error = None;
-                            cx.notify();
-                        }
-                    _ => {}
+            cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+                InputEvent::Submit => this.confirm(cx),
+                InputEvent::Change if this.error.is_some() => {
+                    this.error = None;
+                    cx.notify();
                 }
+                _ => {}
             })
         });
         panel.update(cx, |this, _| this._subscription = subscription);
@@ -62,11 +59,7 @@ impl GotoLinePanel {
 
     /// 打开时聚焦输入框。
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.input
-            .read(cx)
-            .focus_handle
-            .clone()
-            .focus(window, cx);
+        self.input.read(cx).focus_handle.clone().focus(window, cx);
     }
 
     /// 解析输入（"42" 或 "42:7"）并跳转。

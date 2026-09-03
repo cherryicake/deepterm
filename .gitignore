@@ -1,5 +1,6 @@
 /target/
-*.lock
+# 注意：binary crate 的 `Cargo.lock` 必须提交以锁定构建，
+# 故不得使用 `*.lock` 全局忽略。如需忽略其他 lock 文件请逐个声明。
 *.swp
 *.swo
 *~
@@ -7,7 +8,6 @@
 /DeepTerm.app/
 *.dmg
 .deepseek/
-/docs
 .omo/
 .mimocode/
 .workbuddy/

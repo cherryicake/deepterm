@@ -141,7 +141,6 @@ impl gpui::Element for ScrollbarElement {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        
     }
 
     fn paint(

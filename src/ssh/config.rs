@@ -434,7 +434,6 @@ impl AuthMethod {
     }
 }
 
-
 /// SSH 已知主机配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KnownHost {
@@ -487,8 +486,8 @@ pub fn sort_host_groups(
     match mode {
         SortMode::NameAsc => groups.sort_by(|a, b| cmp_name_insensitive(&a.name, &b.name)),
         SortMode::NameDesc => groups.sort_by(|a, b| cmp_name_insensitive(&b.name, &a.name)),
-        SortMode::CreatedDesc => groups.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        SortMode::CreatedAsc => groups.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        SortMode::CreatedDesc => groups.sort_by_key(|g| std::cmp::Reverse(g.created_at)),
+        SortMode::CreatedAsc => groups.sort_by_key(|g| g.created_at),
         SortMode::CountDesc => {
             if let Some(counts) = host_counts {
                 groups.sort_by(|a, b| {
@@ -602,14 +601,19 @@ impl SshGlobalConfig {
     }
 
     pub fn delete_group(&mut self, id: &str, delete_hosts: bool) -> Result<(), String> {
-        let pos = self.host_groups.iter().position(|g| g.id == id).ok_or("未找到文件夹")?;
+        let pos = self
+            .host_groups
+            .iter()
+            .position(|g| g.id == id)
+            .ok_or("未找到文件夹")?;
         self.host_groups.remove(pos);
         // 归一化 sort_order
         for (i, g) in self.host_groups.iter_mut().enumerate() {
             g.sort_order = i as u32;
         }
         if delete_hosts {
-            self.saved_connections.retain(|c| c.group_id.as_deref() != Some(id));
+            self.saved_connections
+                .retain(|c| c.group_id.as_deref() != Some(id));
         } else {
             for c in &mut self.saved_connections {
                 if c.group_id.as_deref() == Some(id) {
@@ -640,8 +644,11 @@ impl SshGlobalConfig {
     }
 
     pub fn reorder_groups(&mut self, ordered_ids: Vec<String>) {
-        let mut map: std::collections::HashMap<String, HostGroup> =
-            self.host_groups.drain(..).map(|g| (g.id.clone(), g)).collect();
+        let mut map: std::collections::HashMap<String, HostGroup> = self
+            .host_groups
+            .drain(..)
+            .map(|g| (g.id.clone(), g))
+            .collect();
         let mut new_groups = Vec::new();
         for (i, id) in ordered_ids.iter().enumerate() {
             if let Some(mut g) = map.remove(id) {
@@ -763,7 +770,10 @@ impl SshGlobalConfig {
                         return Some(cfg);
                     }
                 }
-                log::warn!("Failed to parse {} and no valid .bak, using empty config", config_path.display());
+                log::warn!(
+                    "Failed to parse {} and no valid .bak, using empty config",
+                    config_path.display()
+                );
                 None
             })
             .unwrap_or_else(Self::new);
@@ -813,7 +823,11 @@ impl SshGlobalConfig {
                     if legacy != config_path {
                         if let Ok(legacy_content) = std::fs::read_to_string(&legacy) {
                             if let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content) {
-                                log::info!("Migrating SSH config (load_or_create) {} -> {}", legacy.display(), config_path.display());
+                                log::info!(
+                                    "Migrating SSH config (load_or_create) {} -> {}",
+                                    legacy.display(),
+                                    config_path.display()
+                                );
                                 let _ = cfg.migrate_keychain_refs();
                                 // 保存到新路径
                                 let _ = cfg.save();
@@ -847,7 +861,10 @@ impl SshGlobalConfig {
                 AuthMethod::Password { .. } => {
                     return Err("拒绝保存：存在明文密码，请先完成 Keychain 迁移".into());
                 }
-                AuthMethod::PrivateKey { passphrase: Some(_), .. } => {
+                AuthMethod::PrivateKey {
+                    passphrase: Some(_),
+                    ..
+                } => {
                     return Err("拒绝保存：存在明文私钥口令，请先完成 Keychain 迁移".into());
                 }
                 _ => {}
@@ -1008,7 +1025,10 @@ mod tests {
         let conn_id = conn.id();
         cfg.add_connection(conn);
         cfg.move_hosts_to_group(&[conn_id.clone()], Some(&g1.id));
-        assert_eq!(cfg.find_connection(&conn_id).unwrap().group_id.as_deref(), Some(g1.id.as_str()));
+        assert_eq!(
+            cfg.find_connection(&conn_id).unwrap().group_id.as_deref(),
+            Some(g1.id.as_str())
+        );
         // delete group keeps hosts
         cfg.delete_group(&g1.id, false).unwrap();
         assert_eq!(cfg.find_connection(&conn_id).unwrap().group_id, None);
@@ -1033,8 +1053,20 @@ mod tests {
     #[test]
     fn sort_host_groups_name_and_count() {
         let mut groups = vec![
-            HostGroup { id: "2".into(), name: "b".into(), sort_order: 1, created_at: Utc::now(), collapsed: false },
-            HostGroup { id: "1".into(), name: "a".into(), sort_order: 0, created_at: Utc::now(), collapsed: false },
+            HostGroup {
+                id: "2".into(),
+                name: "b".into(),
+                sort_order: 1,
+                created_at: Utc::now(),
+                collapsed: false,
+            },
+            HostGroup {
+                id: "1".into(),
+                name: "a".into(),
+                sort_order: 0,
+                created_at: Utc::now(),
+                collapsed: false,
+            },
         ];
         sort_host_groups(&mut groups, SortMode::NameAsc, None);
         assert_eq!(groups[0].name, "a");

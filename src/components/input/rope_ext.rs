@@ -905,9 +905,8 @@ mod tests {
     fn char_offset_conversions_match_naive() {
         let text = "a 中文🎉 test\nRope\tending 中文abc\n🎉🎉";
         let rope = Rope::from(text);
-        let naive_char_to_byte = |n: usize| -> usize {
-            text.chars().take(n).map(|c| c.len_utf8()).sum::<usize>()
-        };
+        let naive_char_to_byte =
+            |n: usize| -> usize { text.chars().take(n).map(|c| c.len_utf8()).sum::<usize>() };
         let naive_byte_to_char = |offset: usize| -> usize {
             let offset = offset.min(text.len());
             let mut end = offset;
@@ -941,7 +940,14 @@ mod tests {
         // `line_start_offset(start)`, and `Rope::slice` rejects `start > end`.
         assert_eq!(rope.slice_lines(2..2).to_string(), "");
         assert_eq!(rope.slice_lines(0..0).to_string(), "");
-        assert_eq!(rope.slice_lines(3..1).to_string(), "");
+        // 注意：此处用变量构造反转区间，避免 clippy::empty_range 对字面量 `3..1` 报错；
+        // 语义仍是 start > end，应返回空串而非 panic。
+        let inverted_start = 3;
+        let inverted_end = 1;
+        assert_eq!(
+            rope.slice_lines(inverted_start..inverted_end).to_string(),
+            ""
+        );
 
         // Normal ranges keep working.
         assert_eq!(rope.slice_lines(0..2).to_string(), "a\nb");

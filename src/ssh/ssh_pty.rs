@@ -97,7 +97,11 @@ impl SshPtyTerminal {
 
         // 日志脱敏：密码等敏感参数不得写入日志（SSHPASS 经环境变量传递，
         // argv 中不再包含密码，此处仍做兜底过滤以防未来引入含密码的参数）。
-        log::info!("SSH 命令: {} {:?}", ssh_program, redact_sensitive_args(&ssh_args));
+        log::info!(
+            "SSH 命令: {} {:?}",
+            ssh_program,
+            redact_sensitive_args(&ssh_args)
+        );
 
         // 创建 PTY 选项 - 使用共享的环境变量设置
         let mut env = crate::terminal::mappings::default_terminal_env();

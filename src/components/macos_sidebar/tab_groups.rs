@@ -674,9 +674,7 @@ impl MacosSidebar {
             }))
             .when(is_menu_open, |this| {
                 if let Some(menu) = self.tab_group_popup_menu.clone() {
-                    let position = self
-                        .tab_group_menu_position
-                        .unwrap_or_default();
+                    let position = self.tab_group_menu_position.unwrap_or_default();
                     this.child(
                         deferred(
                             anchored()

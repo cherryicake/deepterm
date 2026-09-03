@@ -1001,11 +1001,8 @@ mod tests {
     fn scp_handler_multi_source_requires_dir_destination() {
         // 多源时目标不能是具体文件名（无尾斜杠会被 split_destination 视为重命名）。
         let saved = vec![host(Some("prod"), "deploy", "prod.example.com")];
-        let result = ScpHandler.execute_with_configs(
-            Some("a.txt b.txt prod:/tmp/x"),
-            scp_ctx(),
-            &saved,
-        );
+        let result =
+            ScpHandler.execute_with_configs(Some("a.txt b.txt prod:/tmp/x"), scp_ctx(), &saved);
         match result {
             CommandResult::Error { message } => {
                 assert!(message.contains("目录"), "msg: {}", message);
@@ -1382,10 +1379,9 @@ mod tests {
                 // 若解析为远端（用户恰好保存了 localhost:2222）也接受；
                 // 但绝不能把 `2222:/tmp/x` 当本机路径
                 match &request.sources[0] {
-                    FileEndpoint::Local { path } => panic!(
-                        "BUG: quoted localhost:port parsed as local path {:?}",
-                        path
-                    ),
+                    FileEndpoint::Local { path } => {
+                        panic!("BUG: quoted localhost:port parsed as local path {:?}", path)
+                    }
                     _ => {}
                 }
             }
@@ -1397,11 +1393,8 @@ mod tests {
     fn scp_handler_remote_filename_with_digits_colon() {
         // 远端文件名恰含 `123:abc`：不应被端口语法劫持（host 匹配失败后回落常规解析）
         let saved = vec![host(Some("alice"), "root", "1.2.3.4")];
-        let result = ScpHandler.execute_with_configs(
-            Some("alice:123:abc /tmp/"),
-            scp_ctx(),
-            &saved,
-        );
+        let result =
+            ScpHandler.execute_with_configs(Some("alice:123:abc /tmp/"), scp_ctx(), &saved);
         let req = unwrap_transfer(result);
         match &req.sources[0] {
             FileEndpoint::Remote { path, .. } => {

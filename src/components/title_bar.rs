@@ -17,8 +17,8 @@ use gpui::{
     WindowControlArea, div, px,
 };
 
-use crate::workspace::tab_bar::TabBar;
 use crate::theme::ActiveTheme;
+use crate::workspace::tab_bar::TabBar;
 use crate::workspace::workspace::Workspace;
 
 pub const TITLE_BAR_HEIGHT: Pixels = px(44.);

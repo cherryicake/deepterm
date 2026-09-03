@@ -2,6 +2,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::editor::encoding::FileEncoding;
@@ -54,7 +55,9 @@ const FILE_TTL: Duration = Duration::from_secs(30);
 
 /// 单个目录的缓存条目
 struct DirNode {
-    entries: Vec<FileEntry>,
+    // 关键性能：用 `Arc<[]>` 存储目录项，`get_shared()` 可零拷贝返回，
+    // 避免千级文件目录每次读取即全量 `clone()`。写时仍为独占，无额外成本。
+    entries: std::sync::Arc<[FileEntry]>,
     #[allow(dead_code)]
     loaded_at: Instant,
 }
@@ -129,8 +132,18 @@ impl RemoteFileTreeCache {
         }
         for (key, persisted_server) in persisted.servers {
             let mut tree = ServerTree::new();
-            for (p_str, entries) in persisted_server.nodes.into_iter().take(MAX_PERSISTED_DIRS_PER_HOST) {
-                tree.nodes.insert(PathBuf::from(p_str), DirNode { entries, loaded_at: Instant::now() });
+            for (p_str, entries) in persisted_server
+                .nodes
+                .into_iter()
+                .take(MAX_PERSISTED_DIRS_PER_HOST)
+            {
+                tree.nodes.insert(
+                    PathBuf::from(p_str),
+                    DirNode {
+                        entries: std::sync::Arc::from(entries),
+                        loaded_at: Instant::now(),
+                    },
+                );
             }
             for p_str in persisted_server.expanded {
                 tree.expanded.insert(PathBuf::from(p_str));
@@ -155,7 +168,10 @@ impl RemoteFileTreeCache {
             }
             self.file_caches.insert(key, fc);
         }
-        log::debug!("FileTreeCache loaded from disk: {} servers", self.servers.len());
+        log::debug!(
+            "FileTreeCache loaded from disk: {} servers",
+            self.servers.len()
+        );
     }
 
     fn to_persisted(&self) -> PersistedCache {
@@ -167,9 +183,13 @@ impl RemoteFileTreeCache {
                     .nodes
                     .iter()
                     .take(MAX_PERSISTED_DIRS_PER_HOST)
-                    .map(|(path, node)| (path.to_string_lossy().to_string(), node.entries.clone()))
+                    .map(|(path, node)| (path.to_string_lossy().to_string(), node.entries.to_vec()))
                     .collect();
-                let expanded = tree.expanded.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                let expanded = tree
+                    .expanded
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
                 (key.clone(), PersistedServer { nodes, expanded })
             })
             .collect();
@@ -185,30 +205,86 @@ impl RemoteFileTreeCache {
                     .map(|(path, entry)| {
                         (
                             path.to_string_lossy().to_string(),
-                            PersistedFileContent { content: entry.content.clone(), encoding: entry.encoding },
+                            PersistedFileContent {
+                                content: entry.content.clone(),
+                                encoding: entry.encoding,
+                            },
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                if files.is_empty() { None } else { Some((key.clone(), files)) }
+                if files.is_empty() {
+                    None
+                } else {
+                    Some((key.clone(), files))
+                }
             })
             .collect();
-        PersistedCache { version: PERSISTED_VERSION, servers, file_caches }
+        PersistedCache {
+            version: PERSISTED_VERSION,
+            servers,
+            file_caches,
+        }
     }
 
     /// P2: 异步落盘（后台线程，不阻塞 UI）
+    /// 关键性能修复（中文）：
+    ///此前每次 `insert/save_expanded/on_fs_event` 都在 UI 线程全量 `clone()` 目录树+文件内容
+    /// 并 `thread::spawn` 落盘，浏览目录即 `O(全缓存)` 拷贝 + 线程爆炸。
+    /// 现改为 500ms 防抖合并 + 克隆移入后台线程：
+    /// UI 线程仅更新内存并记录时间戳，后台线程持全局锁做 `to_persisted()` 克隆与序列化，
+    /// 高频浏览时多次写合并为一次落盘。
     fn schedule_save(&self) {
-        let persisted = self.to_persisted();
-        std::thread::spawn(move || {
-            let path = cache_file_path();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(json) = serde_json::to_string(&persisted) {
-                // 缓存里含远端文件的实际内容（可能是 .env、凭据类文件），
-                // 必须 0600，与 ssh.json / keychain.json 的口径一致
-                let _ = crate::ssh::keychain::write_secret_file(&path, json.as_bytes());
-            }
-        });
+        const DEBOUNCE_MS: u64 = 500;
+        static LAST_REQ_MS: AtomicU64 = AtomicU64::new(0);
+        static PENDING: AtomicU64 = AtomicU64::new(0);
+        fn wall_ms(fallback: u64) -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(fallback)
+        }
+
+        LAST_REQ_MS.store(wall_ms(0), Ordering::Relaxed);
+        // 已有待执行的防抖任务则直接返回，由它合并本次写。
+        if PENDING.swap(1, Ordering::AcqRel) == 1 {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("sftp-cache-save".into())
+            .spawn(move || {
+                loop {
+                    let last = LAST_REQ_MS.load(Ordering::Relaxed);
+                    let elapsed = wall_ms(last).saturating_sub(last);
+                    if elapsed < DEBOUNCE_MS {
+                        std::thread::sleep(Duration::from_millis(DEBOUNCE_MS - elapsed));
+                        continue;
+                    }
+                    // 防抖窗口已过：后台持锁克隆并落盘（UI 线程早已释放锁）。
+                    // 关键正确性：必须用阻塞锁，后台线程可等待，不影响 UI。
+                    // 若用 try_lock，恰逢 UI 持锁时将静默丢一次持久化，
+                    // 其后无新写则脏缓存永久不落盘，退出即丢浏览记录。
+                    let persisted = Self::global().lock().to_persisted();
+                    let path = cache_file_path();
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(json) = serde_json::to_string(&persisted) {
+                        // 缓存里含远端文件的实际内容（可能是 .env、凭据类文件），
+                        // 必须 0600，与 ssh.json / keychain.json 的口径一致
+                        let _ = crate::ssh::keychain::write_secret_file(&path, json.as_bytes());
+                    }
+                    PENDING.store(0, Ordering::Release);
+                    // 竞态兜底：保存期间若有新写到达（LAST_REQ 更新），再跑一轮。
+                    let last_after = LAST_REQ_MS.load(Ordering::Relaxed);
+                    if wall_ms(last_after).saturating_sub(last_after) < DEBOUNCE_MS
+                        && PENDING.swap(1, Ordering::AcqRel) == 0
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            })
+            .ok();
     }
 
     /// 生成服务器唯一标识（基于用户名、主机、端口）
@@ -217,7 +293,18 @@ impl RemoteFileTreeCache {
     }
 
     /// 查询目录缓存，返回该目录的子项列表
+    /// 兼容旧接口（返回 `Vec` 拷贝）；高频路径请用 [`Self::get_shared`] 零拷贝版本。
     pub fn get(&self, config: &SshConnectionConfig, path: &Path) -> Option<Vec<FileEntry>> {
+        self.get_shared(config, path).map(|arc| arc.to_vec())
+    }
+
+    /// 查询目录缓存的零拷贝版本，返回 `Arc<[FileEntry]>`。
+    /// 千级文件目录下避免每次读取即全量 `clone()`，调用方仅读不写时优先使用。
+    pub fn get_shared(
+        &self,
+        config: &SshConnectionConfig,
+        path: &Path,
+    ) -> Option<std::sync::Arc<[FileEntry]>> {
         let key = Self::server_key(config);
         let tree = self.servers.get(&key)?;
         let node = tree.nodes.get(path)?;
@@ -231,7 +318,7 @@ impl RemoteFileTreeCache {
         tree.nodes.insert(
             path.to_path_buf(),
             DirNode {
-                entries,
+                entries: std::sync::Arc::from(entries),
                 loaded_at: Instant::now(),
             },
         );
@@ -424,7 +511,7 @@ impl RemoteFileTreeCache {
                             tree.nodes.insert(
                                 event.path.clone(),
                                 DirNode {
-                                    entries: entries.clone(),
+                                    entries: std::sync::Arc::from(entries.clone()),
                                     loaded_at: Instant::now(),
                                 },
                             );

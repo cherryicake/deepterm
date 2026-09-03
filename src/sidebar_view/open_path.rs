@@ -27,7 +27,12 @@ pub fn handle_open_path(
                 .spawn({
                     let backend = backend.clone();
                     let remote_path = remote_path.clone();
-                    async move { backend.metadata(&remote_path).map(|m| m.is_dir).unwrap_or(false) }
+                    async move {
+                        backend
+                            .metadata(&remote_path)
+                            .map(|m| m.is_dir)
+                            .unwrap_or(false)
+                    }
                 })
                 .await;
             cx.update_window(window_handle, |_view, window, cx| {

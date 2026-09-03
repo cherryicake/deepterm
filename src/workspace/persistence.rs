@@ -16,7 +16,10 @@ impl PersistenceManager {
         // 确保配置目录存在；失败仅日志，不崩溃
         if !config_dir.exists() {
             if let Err(e) = fs::create_dir_all(&config_dir) {
-                log::error!("Failed to create config directory {}: {e}", config_dir.display());
+                log::error!(
+                    "Failed to create config directory {}: {e}",
+                    config_dir.display()
+                );
             }
         }
 
@@ -46,7 +49,10 @@ impl PersistenceManager {
         }
         // 极端情况：无 home，退化到临时目录，避免 panic
         let fallback = std::env::temp_dir().join("deepterm");
-        log::error!("No config/home directory found, using temp fallback: {}", fallback.display());
+        log::error!(
+            "No config/home directory found, using temp fallback: {}",
+            fallback.display()
+        );
         fallback
     }
 
@@ -61,14 +67,25 @@ impl PersistenceManager {
         }
         // 新目录不存在但旧目录存在，尝试迁移
         match fs::rename(legacy, new_dir) {
-            Ok(_) => log::info!("Migrated legacy config {} -> {}", legacy.display(), new_dir.display()),
+            Ok(_) => log::info!(
+                "Migrated legacy config {} -> {}",
+                legacy.display(),
+                new_dir.display()
+            ),
             Err(e) => {
                 // 跨文件系统 rename 失败则拷贝
-                log::warn!("Failed to rename legacy config ({}), trying copy: {e}", legacy.display());
+                log::warn!(
+                    "Failed to rename legacy config ({}), trying copy: {e}",
+                    legacy.display()
+                );
                 if let Err(copy_err) = Self::copy_dir_all(legacy, new_dir) {
                     log::error!("Failed to migrate legacy config: {copy_err}");
                 } else {
-                    log::info!("Copied legacy config {} -> {}", legacy.display(), new_dir.display());
+                    log::info!(
+                        "Copied legacy config {} -> {}",
+                        legacy.display(),
+                        new_dir.display()
+                    );
                 }
             }
         }
@@ -99,7 +116,10 @@ impl PersistenceManager {
         fs::write(&tmp, content)?;
         // 保留旧文件备份（仅 session/state）
         if path.exists() {
-            let bak = path.with_extension(format!("{}.bak", path.extension().and_then(|s| s.to_str()).unwrap_or("json")));
+            let bak = path.with_extension(format!(
+                "{}.bak",
+                path.extension().and_then(|s| s.to_str()).unwrap_or("json")
+            ));
             let _ = fs::copy(path, &bak);
         }
         fs::rename(&tmp, path)?;
@@ -113,7 +133,10 @@ impl PersistenceManager {
     /// 兼容：尝试从旧路径加载并迁移
     fn legacy_session_path() -> Option<PathBuf> {
         let home = dirs::home_dir()?;
-        let p = home.join(".config").join("deepterm").join("session_state.json");
+        let p = home
+            .join(".config")
+            .join("deepterm")
+            .join("session_state.json");
         if p.exists() { Some(p) } else { None }
     }
 
@@ -197,19 +220,21 @@ mod migration_tests {
 
     fn sample_session() -> AppSessionState {
         let mut session = AppSessionState::default();
-        session.groups.push(crate::workspace::session_state::WorkspaceGroupSessionState {
-            id: "g1".into(),
-            label: Some("测试组".into()),
-            collapsed: false,
-            workspace: Some(WorkspaceSessionState {
-                workspace_id: "ws-1".into(),
-                active_tab_id: "tab-0".into(),
-                next_tab_id: 1,
-                next_panel_id: 1,
-                local_terminal_count: 1,
-                tabs: vec![],
-            }),
-        });
+        session.groups.push(
+            crate::workspace::session_state::WorkspaceGroupSessionState {
+                id: "g1".into(),
+                label: Some("测试组".into()),
+                collapsed: false,
+                workspace: Some(WorkspaceSessionState {
+                    workspace_id: "ws-1".into(),
+                    active_tab_id: "tab-0".into(),
+                    next_tab_id: 1,
+                    next_panel_id: 1,
+                    local_terminal_count: 1,
+                    tabs: vec![],
+                }),
+            },
+        );
         session
     }
 
@@ -227,7 +252,10 @@ mod migration_tests {
             let loaded = mgr.load_session().expect("load").expect("some session");
             assert_eq!(loaded.groups.len(), 1);
             assert_eq!(loaded.groups[0].id, "g1");
-            assert_eq!(loaded.version, crate::workspace::session_state::SESSION_STATE_VERSION);
+            assert_eq!(
+                loaded.version,
+                crate::workspace::session_state::SESSION_STATE_VERSION
+            );
         }
         cleanup(&dir);
     }
@@ -250,7 +278,10 @@ mod migration_tests {
             fs::write(&main, "{\"version\":2,\"acti").expect("corrupt");
 
             // 加载应回退到 .bak（即 v1）
-            let loaded = mgr.load_session().expect("load falls back to bak").expect("some");
+            let loaded = mgr
+                .load_session()
+                .expect("load falls back to bak")
+                .expect("some");
             assert_eq!(loaded.active_group_id, "v1");
         }
         cleanup(&dir);
@@ -288,7 +319,10 @@ mod migration_tests {
         assert!(!legacy.exists());
         assert!(new_dir.join("ssh.json").exists());
         let mgr = PersistenceManager::with_config_dir(new_dir.clone());
-        let loaded = mgr.load_session().expect("load migrated session").expect("some");
+        let loaded = mgr
+            .load_session()
+            .expect("load migrated session")
+            .expect("some");
         assert_eq!(loaded.groups.len(), 1);
         cleanup(&base);
     }

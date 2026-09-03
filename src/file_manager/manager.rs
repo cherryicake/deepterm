@@ -34,9 +34,9 @@ fn transfer_stripe(
     let name = rename_to
         .map(str::to_string)
         .or_else(|| match source {
-            FileEndpoint::Local { path } => path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned()),
+            FileEndpoint::Local { path } => {
+                path.file_name().map(|n| n.to_string_lossy().into_owned())
+            }
             FileEndpoint::Remote { path, .. } => path
                 .trim_end_matches('/')
                 .rsplit('/')
@@ -48,7 +48,10 @@ fn transfer_stripe(
     let dest = match destination {
         FileEndpoint::Local { path } => path.display().to_string(),
         FileEndpoint::Remote { ssh_config, path } => {
-            format!("{}@{}:{}{}", ssh_config.username, ssh_config.host, ssh_config.port, path)
+            format!(
+                "{}@{}:{}{}",
+                ssh_config.username, ssh_config.host, ssh_config.port, path
+            )
         }
     };
     let key = format!("{}|{}", dest, name);
@@ -106,11 +109,12 @@ impl TransferManager {
             conflict_policy,
             rename_to,
         } = request;
-        let rename_to = if sources.len() == 1 {
-            rename_to
-        } else {
-            None
-        };
+        let rename_to = if sources.len() == 1 { rename_to } else { None };
+        // 关键安全：集中校验重命名输入，覆盖本地/远端/跨远端全路径，
+        // 防止 `../` 逃出目标目录（各子模块亦有二次校验，此处为第一道防线）。
+        if let Some(name) = rename_to.as_deref() {
+            crate::file_manager::utils::validate_rename_to(name)?;
+        }
 
         // scp CLI 语义：`/scp src dst`（dst 无尾斜杠）在 dst 是**已存在目录**时
         // 表示“拷入该目录”，仅当 dst 不存在/是文件名时才是重命名。
@@ -178,56 +182,68 @@ impl TransferManager {
         let worker_count = sources.len().min(MAX_PARALLEL_TRANSFERS);
         let next = AtomicUsize::new(0);
 
-        let outcomes: Vec<(TransferSummary, Option<anyhow::Error>)> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..worker_count)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            let mut local = TransferSummary::default();
-                            let mut first_error: Option<anyhow::Error> = None;
-                            loop {
-                                // 已取消：不再取新源（正在传的源内部也会自行退出）。
-                                if crate::file_manager::utils::check_cancelled(cancelled).is_err()
-                                {
-                                    break;
-                                }
-                                let index = next.fetch_add(1, Ordering::Relaxed);
-                                let Some(source) = sources.get(index) else {
-                                    break;
-                                };
-                                match Self::transfer_one(
-                                    source.clone(),
-                                    destination,
-                                    operation,
-                                    conflict_policy,
-                                    rename_to,
-                                    cancelled,
-                                    progress,
-                                    resolver,
-                                    reporter,
-                                ) {
-                                    Ok(part) => local.merge(part),
-                                    Err(error) => {
-                                        if first_error.is_none() {
-                                            first_error = Some(error);
-                                        }
-                                    }
+        let outcomes: Vec<(TransferSummary, Option<anyhow::Error>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut local = TransferSummary::default();
+                        let mut first_error: Option<anyhow::Error> = None;
+                        loop {
+                            // 已取消：不再取新源（正在传的源内部也会自行退出）。
+                            if crate::file_manager::utils::check_cancelled(cancelled).is_err() {
+                                break;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(source) = sources.get(index) else {
+                                break;
+                            };
+                            match Self::transfer_one(
+                                source.clone(),
+                                destination,
+                                operation,
+                                conflict_policy,
+                                rename_to,
+                                cancelled,
+                                progress,
+                                resolver,
+                                reporter,
+                            ) {
+                                Ok(part) => local.merge(part),
+                                Err(error) => {
+                                    first_error.get_or_insert(error);
                                 }
                             }
-                            (local, first_error)
-                        })
+                        }
+                        (local, first_error)
                     })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    // 关键防御：工作线程 panic 不得直接 unwrap 传导崩溃主线程，
+                    // 应转为传输错误，保证批量传输的健壮性。
+                    h.join().unwrap_or_else(|panic_payload| {
+                        let msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "工作线程发生未知 panic".to_string());
+                        log::error!("传输工作线程 panic，已降级为错误: {msg}");
+                        (
+                            TransferSummary::default(),
+                            Some(anyhow::anyhow!("传输工作线程异常: {msg}")),
+                        )
+                    })
+                })
+                .collect()
+        });
 
         let mut summary = TransferSummary::default();
         let mut first_error: Option<anyhow::Error> = None;
         for (part, error) in outcomes {
             summary.merge(part);
-            if first_error.is_none() {
-                first_error = error;
-            }
+            first_error = first_error.or(error);
         }
         match first_error {
             Some(error) => Err(error),
@@ -270,10 +286,7 @@ impl TransferManager {
             FileEndpoint::Local { path } => {
                 let full = path.join(&name);
                 if full.is_dir() {
-                    log::info!(
-                        "/scp 目的地 {} 是已存在目录，改为拷入其中",
-                        full.display()
-                    );
+                    log::info!("/scp 目的地 {} 是已存在目录，改为拷入其中", full.display());
                     return (FileEndpoint::Local { path: full }, None);
                 }
                 (destination, Some(name))
@@ -281,9 +294,9 @@ impl TransferManager {
             FileEndpoint::Remote { ssh_config, path } => {
                 let full = crate::ssh::sftp_fs::join_remote_path(path, &name);
                 let is_dir = crate::ssh::sftp_fs::with_cached_session(ssh_config, |session| {
-                    Ok(session.metadata(&full).is_ok_and(|m| {
-                        m.kind == crate::ssh::sftp_fs::RemoteFileKind::Directory
-                    }))
+                    Ok(session
+                        .metadata(&full)
+                        .is_ok_and(|m| m.kind == crate::ssh::sftp_fs::RemoteFileKind::Directory))
                 })
                 .unwrap_or(false);
                 if is_dir {
@@ -601,10 +614,8 @@ mod tests {
     fn parallel_same_name_sources_autorename_not_overwrite() {
         // 两个目录下同名文件并行传同一目标：分条锁将其串行化，
         // 第二个应自动改名（a.txt_副本）而不是静默覆盖第一个。
-        let dir = std::env::temp_dir().join(format!(
-            "deepterm_samename_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("deepterm_samename_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("d1")).unwrap();
         std::fs::create_dir_all(dir.join("d2")).unwrap();
@@ -613,10 +624,7 @@ mod tests {
         std::fs::write(dir.join("d2/a.txt"), "second").unwrap();
 
         let request = TransferRequest {
-            sources: vec![
-                local(dir.join("d1/a.txt")),
-                local(dir.join("d2/a.txt")),
-            ],
+            sources: vec![local(dir.join("d1/a.txt")), local(dir.join("d2/a.txt"))],
             destination: local(dir.join("dst")),
             operation: TransferOperation::Copy,
             conflict_policy: ConflictPolicy::AutoRename,
@@ -639,10 +647,7 @@ mod tests {
     #[test]
     fn parallel_multi_source_skips_cancel_before_start() {
         // 并发上限不会因取消而卡死：取消后工作线程应立即退出且不报错。
-        let dir = std::env::temp_dir().join(format!(
-            "deepterm_cancel_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("deepterm_cancel_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("dst")).unwrap();
@@ -651,10 +656,7 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(true));
         let request = TransferRequest {
-            sources: vec![
-                local(dir.join("src/a.txt")),
-                local(dir.join("src/b.txt")),
-            ],
+            sources: vec![local(dir.join("src/a.txt")), local(dir.join("src/b.txt"))],
             destination: local(dir.join("dst")),
             operation: TransferOperation::Copy,
             conflict_policy: ConflictPolicy::AutoRename,

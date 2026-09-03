@@ -3,10 +3,10 @@
 //! Icons are from the Seti UI theme (MIT license), the default icon set
 //! used by Visual Studio Code.
 
+use crate::assets::Icon;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
-use std::collections::HashMap;
-use crate::assets::Icon;
 
 static FILE_NAME_ICONS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut map = HashMap::new();

@@ -161,7 +161,8 @@ impl NewHostForm {
             group_select.update(cx, |select, _cx| {
                 select.on_select(move |_label, index, _window, cx| {
                     cx.update_entity(&entity3, |this: &mut NewHostForm, cx| {
-                        this.selected_group_id = this.group_options.get(index).and_then(|v| v.clone());
+                        this.selected_group_id =
+                            this.group_options.get(index).and_then(|v| v.clone());
                         cx.notify();
                     });
                 });
@@ -628,7 +629,9 @@ impl NewHostForm {
                     .child(div().text_sm().text_color(theme.error).child(err.clone()))
                     .into_any_element(),
             )
-        } else { self.success_message.as_ref().map(|succ| div()
+        } else {
+            self.success_message.as_ref().map(|succ| {
+                div()
                     .w_full()
                     .child(
                         div()
@@ -636,7 +639,9 @@ impl NewHostForm {
                             .text_color(theme.success)
                             .child(succ.clone()),
                     )
-                    .into_any_element()) }
+                    .into_any_element()
+            })
+        }
     }
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -154,8 +154,14 @@ impl std::fmt::Debug for SidebarEvent {
         match self {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
-            Self::OpenDiffLoading { path, .. } => f.debug_struct("OpenDiffLoading").field("path", path).finish(),
-            Self::GitIndexChanged { path } => f.debug_struct("GitIndexChanged").field("path", path).finish(),
+            Self::OpenDiffLoading { path, .. } => f
+                .debug_struct("OpenDiffLoading")
+                .field("path", path)
+                .finish(),
+            Self::GitIndexChanged { path } => f
+                .debug_struct("GitIndexChanged")
+                .field("path", path)
+                .finish(),
         }
     }
 }
@@ -476,22 +482,21 @@ impl Render for MacosSidebar {
         let is_dark = cx.theme().appearance.is_dark();
         let theme = cx.theme().ui;
 
-        let (anim_id, anim_key, duration_ms, width_fn): SidebarAnimSpec<'_> =
-            if self.visible {
-                (
-                    "macos-sidebar-enter",
-                    "sidebar-enter",
-                    ANIMATION_ENTER_MS,
-                    Box::new(move |delta| target_width * delta),
-                )
-            } else {
-                (
-                    "macos-sidebar-exit",
-                    "sidebar-exit",
-                    ANIMATION_EXIT_MS,
-                    Box::new(move |delta| target_width * (1.0 - delta)),
-                )
-            };
+        let (anim_id, anim_key, duration_ms, width_fn): SidebarAnimSpec<'_> = if self.visible {
+            (
+                "macos-sidebar-enter",
+                "sidebar-enter",
+                ANIMATION_ENTER_MS,
+                Box::new(move |delta| target_width * delta),
+            )
+        } else {
+            (
+                "macos-sidebar-exit",
+                "sidebar-exit",
+                ANIMATION_EXIT_MS,
+                Box::new(move |delta| target_width * (1.0 - delta)),
+            )
+        };
 
         let is_macos = cfg!(target_os = "macos");
         let is_web = cfg!(target_arch = "wasm32");

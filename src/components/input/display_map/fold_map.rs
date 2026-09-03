@@ -174,10 +174,7 @@ impl FoldMap {
     }
 
     /// Folds intersecting the given byte range.
-    pub fn folds_in_range(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> impl Iterator<Item = &Fold> {
+    pub fn folds_in_range(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = &Fold> {
         self.folds
             .iter()
             .filter(move |f| f.start_offset < range.end && f.end_offset > range.start)
@@ -254,7 +251,8 @@ impl FoldMap {
         if self.folds.is_empty() {
             return wrap_row.min(self.cached_wrap_row_count);
         }
-        self.visible_wrap_rows.partition_point(|&row| row < wrap_row)
+        self.visible_wrap_rows
+            .partition_point(|&row| row < wrap_row)
     }
 
     /// Convert display_row to wrap_row.
@@ -650,9 +648,7 @@ mod tests {
 
         // 折叠之前的整段被删除（delta 为大负数）→ 折叠退化被丢弃，且不能 panic。
         map.adjust_folds_for_edit(0..200, 0);
-        assert!(
-            map.folds().is_empty() || map.folds()[0].start_offset <= map.folds()[0].end_offset
-        );
+        assert!(map.folds().is_empty() || map.folds()[0].start_offset <= map.folds()[0].end_offset);
     }
 
     #[test]
@@ -683,7 +679,11 @@ mod tests {
         let mut map = FoldMap::new();
         map.rebuild_identity(10);
         for wr in 0..=12 {
-            assert_eq!(map.visible_display_rows_before(wr), naive(&map, wr), "wr={wr}");
+            assert_eq!(
+                map.visible_display_rows_before(wr),
+                naive(&map, wr),
+                "wr={wr}"
+            );
         }
 
         // 有折叠："fn main() {\n    a();\n}\nnext\n" → 行 1、2 被隐藏，
@@ -693,7 +693,11 @@ mod tests {
         map.fold([fold(&text, 0).unwrap()]);
         map.rebuild_identity(5);
         for wr in 0..=7 {
-            assert_eq!(map.visible_display_rows_before(wr), naive(&map, wr), "wr={wr}");
+            assert_eq!(
+                map.visible_display_rows_before(wr),
+                naive(&map, wr),
+                "wr={wr}"
+            );
         }
         assert_eq!(map.visible_display_rows_before(1), 1);
         assert_eq!(map.visible_display_rows_before(3), 1);

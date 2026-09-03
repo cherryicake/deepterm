@@ -44,6 +44,12 @@ pub struct SimpleHighlighter {
 // All fields are `Send` (`Parser`/`Query`/`Tree` are marked `Send` by
 // tree-sitter; `Rope` is `Send + Sync`), so the highlighter can be moved
 // into background parse tasks.
+//
+// # SAFETY（中文安全说明）
+// 此 `unsafe impl` 断言上述字段在当前依赖版本下均为 `Send`。
+// 若升级 `tree-sitter`/`ropey` 后其类型变为非 `Send`，此处将构成 UB。
+// 升级相关依赖时必须重新确认字段的 `Send` 性，并在 CI 中运行
+// `cargo test syntax` 验证无数据竞争。
 unsafe impl Send for SimpleHighlighter {}
 
 fn clip_offset(rope: &Rope, offset: usize, bias: Bias) -> usize {
@@ -339,8 +345,8 @@ impl SimpleHighlighter {
             let Some(tree) = &layer.tree else {
                 continue;
             };
-            let Some(config) = crate::editor::syntax::LanguageRegistry::singleton()
-                .language(&layer.language_name)
+            let Some(config) =
+                crate::editor::syntax::LanguageRegistry::singleton().language(&layer.language_name)
             else {
                 continue;
             };
@@ -484,7 +490,8 @@ impl SimpleHighlighter {
         // 3. Parse each language's embedded content (merged ranges).
         let mut layers = std::collections::HashMap::new();
         for (lang, ranges) in by_lang {
-            let Some(config) = crate::editor::syntax::LanguageRegistry::singleton().language(&lang) else {
+            let Some(config) = crate::editor::syntax::LanguageRegistry::singleton().language(&lang)
+            else {
                 continue;
             };
             let mut parser = Parser::new();
@@ -562,10 +569,9 @@ impl<'a> Iterator for RopeByteChunks<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.at_first
-            && !self.cursor.next() {
-                return None;
-            }
+        if !self.at_first && !self.cursor.next() {
+            return None;
+        }
         self.at_first = false;
 
         let chunk_byte_start = self.cursor.byte_offset();
@@ -710,13 +716,27 @@ mod tests {
                     number: Some(crate::editor::syntax::ThemeStyle::color(gpui::yellow())),
                     string: Some(crate::editor::syntax::ThemeStyle::color(gpui::blue())),
                     comment: Some(crate::editor::syntax::ThemeStyle::color(gpui::red())),
-                    property: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
-                    constant: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x00bcd4).into())),
-                    tag: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x9b59b6).into())),
-                    attribute: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xe91e63).into())),
-                    variable: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xffeb3b).into())),
-                    variable_special: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0xff9800).into())),
-                    comment_doc: Some(crate::editor::syntax::ThemeStyle::color(gpui::rgb(0x607d8b).into())),
+                    property: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0x9b59b6).into(),
+                    )),
+                    constant: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0x00bcd4).into(),
+                    )),
+                    tag: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0x9b59b6).into(),
+                    )),
+                    attribute: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0xe91e63).into(),
+                    )),
+                    variable: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0xffeb3b).into(),
+                    )),
+                    variable_special: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0xff9800).into(),
+                    )),
+                    comment_doc: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0x607d8b).into(),
+                    )),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -860,12 +880,15 @@ mod tests {
     /// onto the host (HTML) styles at the correct byte offsets.
     #[test]
     fn test_html_injection_script_and_style() {
-        let code = "<html>\n<style>body { color: red; }</style>\n<script>let x = 1;</script>\n</html>\n";
+        let code =
+            "<html>\n<style>body { color: red; }</style>\n<script>let x = 1;</script>\n</html>\n";
         let mut h = SimpleHighlighter::new("html");
         let rope = Rope::from_str(code);
         h.update(None, &rope, None);
 
-        let data = h.injection_parse_data().expect("html has an injections query");
+        let data = h
+            .injection_parse_data()
+            .expect("html has an injections query");
         let tree = h.tree().expect("host tree").clone();
         let layers = SimpleHighlighter::compute_injection_layers(data, &tree, &rope);
         assert!(
@@ -895,9 +918,9 @@ mod tests {
         // injected CSS query (e.g. the `body` selector / `red` value).
         let style_start = code.find("<style>").expect("style tag") + "<style>".len();
         let style_end = code.find("</style>").expect("style close");
-        let styled = styles.iter().any(|(r, s)| {
-            r.start >= style_start && r.end <= style_end && s.color.is_some()
-        });
+        let styled = styles
+            .iter()
+            .any(|(r, s)| r.start >= style_start && r.end <= style_end && s.color.is_some());
         assert!(
             styled,
             "expected injected CSS styles inside <style> (range {style_start}..{style_end})"
@@ -998,7 +1021,9 @@ export function App() { return <div className="a">hi</div>; }
 
         // JS base rules: keyword `const`, comment, string.
         let colored = |needle: &str| {
-            let pos = code.find(needle).unwrap_or_else(|| panic!("{needle} in code"));
+            let pos = code
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in code"));
             styles
                 .iter()
                 .find(|(r, _)| r.start <= pos && r.end > pos)
@@ -1055,7 +1080,9 @@ export function App() { return <div className="a">hi</div>; }
         let theme = test_theme();
         let styles = h.styles(&(0..code.len()), &theme);
         let color_at = |needle: &str| {
-            let pos = code.find(needle).unwrap_or_else(|| panic!("{needle} in code"));
+            let pos = code
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} in code"));
             styles
                 .iter()
                 .find(|(r, _)| r.start <= pos && r.end > pos)
@@ -1065,10 +1092,22 @@ export function App() { return <div className="a">hi</div>; }
         };
         assert_eq!(color_at("class"), Some(gpui::red()), "keyword");
         assert_eq!(color_at("Person"), Some(gpui::blue()), "class name as type");
-        assert_eq!(color_at("name"), Some(gpui::rgb(0x9b59b6).into()), "class property");
+        assert_eq!(
+            color_at("name"),
+            Some(gpui::rgb(0x9b59b6).into()),
+            "class property"
+        );
         assert_eq!(color_at("String"), Some(gpui::blue()), "builtin type");
-        assert_eq!(color_at("greet"), Some(gpui::green()), "function declaration");
-        assert_eq!(color_at("val p"), Some(gpui::red()), "`val` keyword colored");
+        assert_eq!(
+            color_at("greet"),
+            Some(gpui::green()),
+            "function declaration"
+        );
+        assert_eq!(
+            color_at("val p"),
+            Some(gpui::red()),
+            "`val` keyword colored"
+        );
         assert_eq!(color_at("main"), Some(gpui::green()), "top-level fun");
     }
 

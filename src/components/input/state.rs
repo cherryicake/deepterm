@@ -109,7 +109,9 @@ actions!(
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
-    PressEnter { secondary: bool },
+    PressEnter {
+        secondary: bool,
+    },
     /// Emitted when a single-line input with `submit_on_enter` confirms.
     Submit,
     Focus,
@@ -411,9 +413,7 @@ pub(crate) fn pair_bracket_tokens(
 
 /// 纯文本括号扫描（无语法树时的 fallback）：不区分字符串/注释，
 /// 但配对算法与 tree 版一致（类型配对 + 交错容忍）。
-pub(crate) fn scan_bracket_spans_text(
-    text: &Rope,
-) -> Vec<(Range<usize>, usize, bool, bool)> {
+pub(crate) fn scan_bracket_spans_text(text: &Rope) -> Vec<(Range<usize>, usize, bool, bool)> {
     let mut tokens = Vec::new();
     for (i, b) in text.bytes().enumerate() {
         match b {
@@ -990,7 +990,11 @@ impl InputState {
 
     /// Override the line-number labels (indexed by buffer row; `None` entry
     /// renders a blank gutter cell). Pass `None` to restore default numbering.
-    pub fn set_diff_line_labels(&mut self, labels: Option<Vec<Option<u32>>>, cx: &mut Context<Self>) {
+    pub fn set_diff_line_labels(
+        &mut self,
+        labels: Option<Vec<Option<u32>>>,
+        cx: &mut Context<Self>,
+    ) {
         self.diff_line_labels = labels;
         cx.notify();
     }
@@ -1185,11 +1189,12 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         if let InputMode::CodeEditor {
-                language,
-                highlighter,
-                parse_task,
-                ..
-            } = &mut self.mode {
+            language,
+            highlighter,
+            parse_task,
+            ..
+        } = &mut self.mode
+        {
             *language = new_language.into();
             *highlighter.borrow_mut() = None;
             parse_task.borrow_mut().take();
@@ -1218,10 +1223,11 @@ impl InputState {
 
     fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
         if let InputMode::CodeEditor {
-                highlighter,
-                parse_task,
-                ..
-            } = &mut self.mode {
+            highlighter,
+            parse_task,
+            ..
+        } = &mut self.mode
+        {
             *highlighter.borrow_mut() = None;
             parse_task.borrow_mut().take();
         }
@@ -1629,11 +1635,7 @@ impl InputState {
     }
 
     /// 写入 Git 行变更标记（由 Editor 侧异步计算后调用）。
-    pub fn set_git_line_marks(
-        &mut self,
-        marks: Vec<(u32, GitLineMark)>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_git_line_marks(&mut self, marks: Vec<(u32, GitLineMark)>, cx: &mut Context<Self>) {
         self.git_line_marks = marks.into_iter().collect();
         cx.notify();
     }
@@ -1995,10 +1997,8 @@ impl InputState {
             Some(i) => offset + i,
             // 窗口内没有非空白内容：要么文档尾部就是空白（结果同为 `len`），
             // 要么窗口被空白填满，需要放宽到余下全文。
-            None if end < len => {
-                Self::first_word_end(&self.text.slice(offset..len).to_string())
-                    .map_or(len, |i| offset + i)
-            }
+            None if end < len => Self::first_word_end(&self.text.slice(offset..len).to_string())
+                .map_or(len, |i| offset + i),
             None => len,
         }
     }
@@ -2166,9 +2166,14 @@ impl InputState {
                         b']' => (b'[', b']'),
                         _ => (b'{', b'}'),
                     };
-                    if let Some(m) =
-                        scan_matching_bracket(text, off, true, open, close, BRACKET_MATCH_SCAN_LIMIT)
-                    {
+                    if let Some(m) = scan_matching_bracket(
+                        text,
+                        off,
+                        true,
+                        open,
+                        close,
+                        BRACKET_MATCH_SCAN_LIMIT,
+                    ) {
                         return Some((m, off));
                     }
                 }
@@ -2181,13 +2186,14 @@ impl InputState {
     /// 回车缩进决策（纯函数，便于测试）：基于光标前行内容与光标后字符。
     fn newline_indent_kind(before: &str, next: Option<char>) -> NewlineIndent {
         let trimmed_end = before.trim_end();
-        let ends_with_open = trimmed_end.ends_with('{')
-            || trimmed_end.ends_with('[')
-            || trimmed_end.ends_with('(');
+        let ends_with_open =
+            trimmed_end.ends_with('{') || trimmed_end.ends_with('[') || trimmed_end.ends_with('(');
         if ends_with_open {
             let open = trimmed_end.chars().last().unwrap();
             if let Some(next) = next
-                && Self::AUTO_PAIRS.iter().any(|(o, c)| *o == open && *c == next)
+                && Self::AUTO_PAIRS
+                    .iter()
+                    .any(|(o, c)| *o == open && *c == next)
             {
                 return NewlineIndent::BlankBetween;
             }
@@ -2272,13 +2278,11 @@ impl InputState {
 
             // 空选区：引号只在词边界处配对（避免 don't、a"b 这类场景）
             if quote {
-                let wordlike = |c: Option<char>| {
-                    c.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false)
-                };
+                let wordlike =
+                    |c: Option<char>| c.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
                 let before = self.text.slice(..sel.start).chars().last();
                 let after = self.text.slice(sel.end..).chars().next();
-                if wordlike(before)
-                    || after.map(|c| wordlike(Some(c)) || c == ch).unwrap_or(false)
+                if wordlike(before) || after.map(|c| wordlike(Some(c)) || c == ch).unwrap_or(false)
                 {
                     return false; // 按普通引号插入
                 }
@@ -2377,14 +2381,13 @@ impl InputState {
                 None => (no_nl, false),
             };
 
-            let (new_core, insert_point) =
-                if all_commented && commented(line) {
-                    Self::strip_line_comment(line, token)
-                } else if line.trim().is_empty() && multi {
-                    (line.to_string(), 0)
-                } else {
-                    Self::add_line_comment(line, token)
-                };
+            let (new_core, insert_point) = if all_commented && commented(line) {
+                Self::strip_line_comment(line, token)
+            } else if line.trim().is_empty() && multi {
+                (line.to_string(), 0)
+            } else {
+                Self::add_line_comment(line, token)
+            };
 
             let new_raw_len = new_core.len() + has_cr as usize + has_nl as usize;
             let delta = new_raw_len as isize - raw.len() as isize;
@@ -2410,7 +2413,11 @@ impl InputState {
                 }
                 if offset <= *orig_start + line_len {
                     let pos = offset - orig_start;
-                    let adjusted = if pos > *insert_point { pos as isize + delta } else { pos as isize };
+                    let adjusted = if pos > *insert_point {
+                        pos as isize + delta
+                    } else {
+                        pos as isize
+                    };
                     return span.start + new_start + adjusted as usize;
                 }
                 cumulative += delta;
@@ -2662,12 +2669,7 @@ impl InputState {
 
     /// Port of Zed's `Editor::toggle_fold`: if any fold intersects the current
     /// selection, unfold it; otherwise fold the enclosing crease.
-    pub(crate) fn toggle_fold(
-        &mut self,
-        _: &ToggleFold,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn toggle_fold(&mut self, _: &ToggleFold, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_folding() {
             return;
         }
@@ -2688,13 +2690,17 @@ impl InputState {
                 end = end.max(fold.end_offset);
             }
             self.text
-                .point_to_offset(crate::components::input::Point::new(row, 0))
-                ..end
+                .point_to_offset(crate::components::input::Point::new(row, 0))..end
         } else {
             selection.start..selection.end
         };
 
-        if self.display_map.folds_in_range(range.clone()).next().is_some() {
+        if self
+            .display_map
+            .folds_in_range(range.clone())
+            .next()
+            .is_some()
+        {
             self.unfold_lines(cx);
         } else {
             self.fold_selection(cx);
@@ -2743,7 +2749,10 @@ impl InputState {
             (selection.end, selection.start)
         };
         let buffer_start_row = self.text.offset_to_point(range_start).row;
-        let range_end_row = self.text.offset_to_point(range_end.min(self.text.len())).row;
+        let range_end_row = self
+            .text
+            .offset_to_point(range_end.min(self.text.len()))
+            .row;
 
         let mut to_fold = Vec::new();
 
@@ -2804,16 +2813,16 @@ impl InputState {
         if !self.mode.is_folding() {
             return;
         }
-        let intersection_range =
-            self.text.point_to_offset(crate::components::input::Point::new(buffer_row, 0))
-                ..self.text.point_to_offset(crate::components::input::Point::new(
+        let intersection_range = self
+            .text
+            .point_to_offset(crate::components::input::Point::new(buffer_row, 0))
+            ..self
+                .text
+                .point_to_offset(crate::components::input::Point::new(
                     buffer_row,
                     self.text.slice_line(buffer_row).len(),
                 ));
-        if self
-            .display_map
-            .unfold_ranges(&[intersection_range], true)
-        {
+        if self.display_map.unfold_ranges(&[intersection_range], true) {
             self.after_fold_change(cx);
         }
     }
@@ -2839,10 +2848,12 @@ impl InputState {
         let range = self
             .text
             .point_to_offset(crate::components::input::Point::new(start_row, 0))
-            ..self.text.point_to_offset(crate::components::input::Point::new(
-                end_row,
-                self.text.slice_line(end_row).len(),
-            ));
+            ..self
+                .text
+                .point_to_offset(crate::components::input::Point::new(
+                    end_row,
+                    self.text.slice_line(end_row).len(),
+                ));
         if self.display_map.unfold_ranges(&[range], true) {
             self.after_fold_change(cx);
         }
@@ -2856,8 +2867,7 @@ impl InputState {
 
         let mut fold_creases = Vec::new();
         for row in 0..self.text.lines_len() {
-            if let Some(foldable_range) = self.display_map.crease_for_buffer_row(&self.text, row)
-            {
+            if let Some(foldable_range) = self.display_map.crease_for_buffer_row(&self.text, row) {
                 fold_creases.push(foldable_range);
             }
         }
@@ -3232,19 +3242,17 @@ impl InputState {
             // 每行行首插入一个缩进单元：起点平移一个单元，终点平移「行数 ×
             // 单元长度」（此前写死 +1，只在缩进单元是单个 Tab 时成立）。
             let unit_len = unit.len();
-            (start + unit_len, end + unit_len * (last_row - start_row + 1))
+            (
+                start + unit_len,
+                end + unit_len * (last_row - start_row + 1),
+            )
         };
         self.selected_range = Selection::new(new_start, new_end);
         self.update_preferred_column();
     }
 
     /// Shift+Tab：删除光标所在行行首的一个缩进单元，光标按删除量回退。
-    fn outdent_cursor_line(
-        &mut self,
-        offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn outdent_cursor_line(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         let row = self.text.offset_to_point(offset).row;
         let line_start = self.text.line_start_offset(row);
         let line = self.text.slice_line(row).to_string();
@@ -3271,8 +3279,6 @@ impl InputState {
     }
 
     pub(crate) fn escape(&mut self, _action: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        
-
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
         }
@@ -3467,7 +3473,8 @@ impl InputState {
         // 目标行上方的累计高度 = 它之前的可见显示行数 × 行高。逐行累加是
         // O(光标行号)，光标在长文件末尾时每次移动都要扫全表；改走 display_map
         // 的前缀和 + 二分（`display_row_for_buffer_line`）后是 O(log n)。
-        let mut row_offset_y = line_height * self.display_map.display_row_for_buffer_line(row) as f32;
+        let mut row_offset_y =
+            line_height * self.display_map.display_row_for_buffer_line(row) as f32;
 
         // Apart from left alignment, just leave enough space for the cursor size on the right side.
         let safety_margin = if last_layout.text_align == TextAlign::Left {
@@ -3498,9 +3505,8 @@ impl InputState {
         // If row offset is not in the viewport, scroll to make it visible.
         let edge_height = if direction.is_some() && self.mode.is_code_editor() {
             match self.cursor_surrounding_lines {
-                Some(lines) => (lines as f32 * line_height).min(
-                    (last_layout.visible_range.len() as f32 * line_height).half(),
-                ),
+                Some(lines) => (lines as f32 * line_height)
+                    .min((last_layout.visible_range.len() as f32 * line_height).half()),
                 None => 3 * line_height,
             }
         } else {
@@ -3544,7 +3550,8 @@ impl InputState {
         let row = point.row;
 
         // 同 `scroll_to`：目标行上方的累计高度走 O(log n) 的 display row 查询。
-        let mut row_offset_y = line_height * self.display_map.display_row_for_buffer_line(row) as f32;
+        let mut row_offset_y =
+            line_height * self.display_map.display_row_for_buffer_line(row) as f32;
 
         let mut scroll_offset = self.scroll_handle.offset();
 
@@ -3917,8 +3924,7 @@ impl InputState {
     /// The next cursor position, skipping whole line terminators.
     pub(crate) fn next_boundary(&self, offset: usize) -> usize {
         let mut offset = self.text.clip_offset(offset.saturating_add(1), Bias::Right);
-        if self.text.char_at(offset) == Some('\r') && self.text.char_at(offset + 1) == Some('\n')
-        {
+        if self.text.char_at(offset) == Some('\r') && self.text.char_at(offset + 1) == Some('\n') {
             offset += 2;
         } else if self.text.char_at(offset) == Some('\n') {
             offset += 1;
@@ -4034,8 +4040,7 @@ impl InputState {
         // 与 prepaint 中 `wrap_width` 的算法保持一致。
         let wrap_width = match self.last_layout.as_ref() {
             Some(last_layout) if self.soft_wrap && self.mode.is_multi_line() => Some(
-                (new_bounds.size.width - last_layout.line_number_width - RIGHT_MARGIN)
-                    .max(px(1.)),
+                (new_bounds.size.width - last_layout.line_number_width - RIGHT_MARGIN).max(px(1.)),
             ),
             // None 表示不换行（内部按 Pixels::MAX 处理）
             _ => None,
@@ -4693,14 +4698,14 @@ mod tests {
             BlankBetween
         );
         // 不配对的闭括号不触发空行
-        assert_eq!(
-            InputState::newline_indent_kind("foo(", Some('}')),
-            Deeper
-        );
+        assert_eq!(InputState::newline_indent_kind("foo(", Some('}')), Deeper);
         // 冒号（Python/YAML 风格，行内无花括号）→ 深入
         assert_eq!(InputState::newline_indent_kind("def foo():", None), Deeper);
         // 行尾冒号但行内含花括号（JS 对象字面量）→ 不深入
-        assert_eq!(InputState::newline_indent_kind("  foo({ key:", None), Inherit);
+        assert_eq!(
+            InputState::newline_indent_kind("  foo({ key:", None),
+            Inherit
+        );
         assert_eq!(InputState::newline_indent_kind("let x = 1", None), Inherit);
         assert_eq!(InputState::newline_indent_kind("", None), Inherit);
     }
@@ -4930,14 +4935,24 @@ mod tests {
     #[test]
     fn rainbow_pair_depth_stable_for_nested_mixed() {
         let cases = [
-            ("((()))", vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)]),
-            ("({[]})", vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)]),
-            ("a(b[c]{d}e)f", vec![(1, 0), (3, 1), (5, 1), (6, 1), (8, 1), (10, 0)]),
+            (
+                "((()))",
+                vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)],
+            ),
+            (
+                "({[]})",
+                vec![(0, 0), (1, 1), (2, 2), (3, 2), (4, 1), (5, 0)],
+            ),
+            (
+                "a(b[c]{d}e)f",
+                vec![(1, 0), (3, 1), (5, 1), (6, 1), (8, 1), (10, 0)],
+            ),
         ];
         for (text, expected) in cases {
             let rope = Rope::from_str(text);
             let spans = scan_bracket_spans_text(&rope);
-            let depths: Vec<(usize, usize)> = spans.iter().map(|(r, d, _, _)| (r.start, *d)).collect();
+            let depths: Vec<(usize, usize)> =
+                spans.iter().map(|(r, d, _, _)| (r.start, *d)).collect();
             assert_eq!(depths, expected, "text={text}");
         }
     }
@@ -5007,9 +5022,7 @@ mod tests {
         input
             .downgrade()
             .update_in(cx, |state, window, cx| {
-                gpui::EntityInputHandler::replace_text_in_range(
-                    state, None, "(", window, cx,
-                );
+                gpui::EntityInputHandler::replace_text_in_range(state, None, "(", window, cx);
                 assert_eq!(state.value().as_ref(), "()");
                 // 光标应停在配对括号中间
                 assert_eq!(state.cursor(), 1);
@@ -5019,27 +5032,23 @@ mod tests {
 
     // ==================== Code folding (zed semantics) ====================
 
-    const FOLD_TEST_TEXT: &str =
-        "fn main() {\n    let a = 1;\n    if true {\n        a();\n    }\n}\n\nfn other() {\n    let b = 2;\n}\n";
+    const FOLD_TEST_TEXT: &str = "fn main() {\n    let a = 1;\n    if true {\n        a();\n    }\n}\n\nfn other() {\n    let b = 2;\n}\n";
 
     fn build_fold_input(
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<InputState>, &mut gpui::VisualTestContext) {
         struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
         impl gpui::Render for Host {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
         let cell = std::cell::RefCell::new(None);
         let (_host, cx) = cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| {
-                let mut state =
-                    InputState::new(window, cx).code_editor("rust").multi_line(true);
+                let mut state = InputState::new(window, cx)
+                    .code_editor("rust")
+                    .multi_line(true);
                 state.set_value(FOLD_TEST_TEXT, window, cx);
                 state
             });
@@ -5107,9 +5116,15 @@ mod tests {
             // clamps keep the cursor out of the hidden range.
             state.selected_range = (30..30).into(); // row 3 (`a();`) inside the fold
             let backward = state.previous_boundary(30);
-            assert_eq!(backward, 11, "should clamp back to the fold start (end of row 0)");
+            assert_eq!(
+                backward, 11,
+                "should clamp back to the fold start (end of row 0)"
+            );
             let forward = state.next_boundary(30);
-            assert_eq!(forward, 60, "should clamp forward to the fold end (row 5 closing brace start)");
+            assert_eq!(
+                forward, 60,
+                "should clamp forward to the fold end (row 5 closing brace start)"
+            );
         });
     }
 
@@ -5118,19 +5133,16 @@ mod tests {
     fn wholesale_replacement_clears_folds(cx: &mut gpui::TestAppContext) {
         struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
         impl gpui::Render for Host {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
 
         cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| {
-                let mut state =
-                    InputState::new(window, cx).code_editor("rust").multi_line(true);
+                let mut state = InputState::new(window, cx)
+                    .code_editor("rust")
+                    .multi_line(true);
                 state.set_value(FOLD_TEST_TEXT, window, cx);
                 state
             });
@@ -5176,18 +5188,16 @@ mod tests {
     fn text_version_advances_on_every_mutation(cx: &mut gpui::TestAppContext) {
         struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
         impl gpui::Render for Host {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
 
         cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| {
-                InputState::new(window, cx).code_editor("rust").multi_line(true)
+                InputState::new(window, cx)
+                    .code_editor("rust")
+                    .multi_line(true)
             });
 
             // 1) 常规键入（EntityInputHandler）
@@ -5226,12 +5236,7 @@ mod tests {
                 for ch in ["n", "ni", "你", "你好"] {
                     let before = state.text_version;
                     gpui::EntityInputHandler::replace_and_mark_text_in_range(
-                        state,
-                        None,
-                        ch,
-                        None,
-                        window,
-                        cx,
+                        state, None, ch, None, window, cx,
                     );
                     assert!(
                         state.text_version > before,
@@ -5250,9 +5255,7 @@ mod tests {
             validated.update(cx, |state, cx| {
                 state.set_value("123", window, cx);
                 let before = state.text_version;
-                gpui::EntityInputHandler::replace_text_in_range(
-                    state, None, "abc", window, cx,
-                );
+                gpui::EntityInputHandler::replace_text_in_range(state, None, "abc", window, cx);
                 assert_eq!(state.value().as_ref(), "123", "非法输入应被拒绝");
                 assert_eq!(
                     state.text_version, before,

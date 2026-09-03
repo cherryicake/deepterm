@@ -25,7 +25,6 @@ pub use keychain::{KeychainItem, KeychainItemKind, KeychainStore};
 pub use russh_terminal::RusshTerminal;
 pub use ssh_pty::SshPtyTerminal;
 
-
 const REMOTE_BASH_INTEGRATION: &str =
     include_str!("../../assets/shell-integration/bash/deepterm.bash");
 const REMOTE_BASH_PREEXEC: &str =

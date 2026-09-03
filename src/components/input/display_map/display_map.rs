@@ -132,7 +132,13 @@ impl DisplayMap {
     pub fn fold_ranges(&mut self, text: &Rope, ranges: Vec<Range<usize>>) -> bool {
         let folds = ranges
             .into_iter()
-            .map(|range| Fold::from_points(text.offset_to_point(range.start), text.offset_to_point(range.end), text))
+            .map(|range| {
+                Fold::from_points(
+                    text.offset_to_point(range.start),
+                    text.offset_to_point(range.end),
+                    text,
+                )
+            })
             .collect::<Vec<_>>();
         let changed = self.fold_map.fold(folds);
         if changed {
@@ -226,8 +232,7 @@ impl DisplayMap {
     /// Computes the foldable region that starts on `buffer_row`
     /// (port of Zed's `DisplaySnapshot::crease_for_buffer_row`).
     pub fn crease_for_buffer_row(&self, text: &Rope, buffer_row: usize) -> Option<Crease> {
-        let is_line_folded =
-            |row: usize| self.fold_map.is_line_folded(row);
+        let is_line_folded = |row: usize| self.fold_map.is_line_folded(row);
         super::folding::crease_for_buffer_row(text, buffer_row, is_line_folded)
     }
 
@@ -238,7 +243,8 @@ impl DisplayMap {
     /// Must be called with the edit range in the OLD text and the
     /// replacement length (see [`FoldMap::adjust_folds_for_edit`]).
     pub fn adjust_folds_for_edit(&mut self, range: &Range<usize>, new_text: &str) {
-        self.fold_map.adjust_folds_for_edit(range.clone(), new_text.len());
+        self.fold_map
+            .adjust_folds_for_edit(range.clone(), new_text.len());
     }
 
     /// Update text (incremental or full)

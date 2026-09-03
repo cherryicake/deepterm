@@ -76,7 +76,9 @@ impl<E: ParentElement + Styled> ContextMenu<E> {
         window.with_optional_element_state::<ContextMenuState, _>(
             Some(id),
             |element_state, window| {
-                let mut element_state = element_state.unwrap().unwrap_or_default();
+                // 关键防御：外层 Option 为 None（元素状态未初始化）时
+                // 不得 unwrap，应降级为 Default，保证首帧渲染不崩溃。
+                let mut element_state = element_state.unwrap_or_default().unwrap_or_default();
                 let result = f(self, &mut element_state, window, cx);
                 (result, Some(element_state))
             },
@@ -155,8 +157,24 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        // 关键防御：GPUI 在某些情况下会传 None（例如元素未挂载），
+        // 此时不得 unwrap panic，应降级为普通布局，保证渲染永不崩溃。
+        let Some(global_id) = id else {
+            let mut element = self.element.take().map(|e| e.into_any_element());
+            let layout_id = match element.as_mut() {
+                Some(el) => el.request_layout(window, cx),
+                None => window.request_layout(gpui::Style::default(), [], cx),
+            };
+            return (
+                layout_id,
+                ContextMenuState {
+                    element,
+                    ..Default::default()
+                },
+            );
+        };
         self.with_element_state(
-            id.unwrap(),
+            global_id,
             window,
             cx,
             |this, state: &mut ContextMenuState, window, cx| {
@@ -206,12 +224,13 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                     }
                 }
 
-                let mut element = this
-                    .element
-                    .take()
-                    .expect("Element should exists.")
-                    .children(menu_element)
-                    .into_any_element();
+                let mut element = match this.element.take() {
+                    // 正常路径：取内部元素并挂载菜单浮层。
+                    Some(inner) => inner.children(menu_element).into_any_element(),
+                    // 防御路径：二次 request_layout 时 element 已被 take，
+                    // 用空容器占位，避免 `expect` panic 导致整帧崩溃。
+                    None => div().children(menu_element).into_any_element(),
+                };
 
                 let layout_id = element.request_layout(window, cx);
 
@@ -258,8 +277,16 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         // Take the builder before setting up element state to avoid borrow issues
         let builder = self.menu.clone();
 
+        // 关键防御：paint 路径 id 为 None 时直接跳过菜单事件绑定，
+        // 仅绘制已有内容，保证渲染永不 panic。
+        let Some(global_id) = id else {
+            if let Some(element) = &mut request_layout.element {
+                element.paint(window, cx);
+            }
+            return;
+        };
         self.with_element_state(
-            id.unwrap(),
+            global_id,
             window,
             cx,
             |_view, state: &mut ContextMenuState, window, _| {

@@ -19,9 +19,6 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, BroadcastMsg)>> 
 }
 
 use crate::components::button::Icon as MenuIcon;
-use crate::workspace::tab_bar::{
-    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
-};
 use crate::file_manager::TransferStatusReporter;
 use crate::file_manager::{
     ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
@@ -38,6 +35,9 @@ use crate::workspace::session_state::{
     TabSessionState, TabSessionType, TerminalSessionState, WorkspaceSessionState,
 };
 use crate::workspace::split_manager::{SplitContainer, SplitDirection};
+use crate::workspace::tab_bar::{
+    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
+};
 
 // Define workspace actions
 actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
@@ -415,10 +415,11 @@ impl Workspace {
             .collect();
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, tab_items);
 
-        let active_tab_id = if state
-            .tabs
-            .iter()
-            .any(|tab| tab.id == state.active_tab_id) { state.active_tab_id.clone() } else { state.tabs[0].id.clone() };
+        let active_tab_id = if state.tabs.iter().any(|tab| tab.id == state.active_tab_id) {
+            state.active_tab_id.clone()
+        } else {
+            state.tabs[0].id.clone()
+        };
 
         let tabs = state
             .tabs
@@ -2529,7 +2530,6 @@ impl Element for ResizeHandlerElement {
         _window: &mut Window,
         _cx: &mut App,
     ) {
-        
     }
 
     fn paint(

@@ -350,12 +350,12 @@ impl BuiltinCommandManager {
         key: (String, String),
         config: crate::ssh::SshConnectionConfig,
     ) {
-        self.pending_remote_keys.entry(key).or_insert_with(|| {
-            PendingRemoteLoad {
+        self.pending_remote_keys
+            .entry(key)
+            .or_insert_with(|| PendingRemoteLoad {
                 config,
                 started: false,
-            }
-        });
+            });
     }
 
     /// 获取当前缓冲区内容
@@ -723,7 +723,9 @@ impl BuiltinCommandManager {
         // /scp 至少 2 个参数（多源时可在最后一个 token 前手动继续追加源），
         // 因此参数 token ≥ 2 后不再自动前移。
         let total_tokens = scp_completion::shell_split_tokens(
-            buffer.split_once(|c: char| c.is_whitespace()).map(|x| x.1)
+            buffer
+                .split_once(|c: char| c.is_whitespace())
+                .map(|x| x.1)
                 .unwrap_or(""),
             0,
         )
@@ -850,7 +852,9 @@ impl BuiltinCommandManager {
         };
 
         let current_input = state.buffer().to_string();
-        let args = current_input.split_once(|c: char| c.is_whitespace()).map(|x| x.1)
+        let args = current_input
+            .split_once(|c: char| c.is_whitespace())
+            .map(|x| x.1)
             .unwrap_or("");
 
         let new_input = if args.is_empty() {
@@ -2366,13 +2370,10 @@ where
                                     })
                                 })
                                 .when(interactive, |this| {
-                                    this.on_mouse_up(
-                                        MouseButton::Left,
-                                        move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            on_pick(index, window, cx);
-                                        },
-                                    )
+                                    this.on_mouse_up(MouseButton::Left, move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        on_pick(index, window, cx);
+                                    })
                                 })
                                 .child({
                                     let svg_element = svg()
@@ -2612,7 +2613,7 @@ mod tests {
             replacement.match_indices('"').nth(1).map(|(i, _)| i)
         });
         assert!(
-            close_quote_pos.map_or(false, |p| p < colon_pos),
+            close_quote_pos.is_some_and(|p| p < colon_pos),
             "expected closing quote before colon, got {}",
             replacement
         );
@@ -3087,11 +3088,8 @@ mod scp_placeholder_tests {
 
     fn remote_terminal_manager() -> (BuiltinCommandManager, String) {
         use crate::ssh::config::{AuthMethod, SshConnectionConfig};
-        let cfg = SshConnectionConfig::new(
-            "1.2.3.4".to_string(),
-            "root".to_string(),
-            AuthMethod::Agent,
-        );
+        let cfg =
+            SshConnectionConfig::new("1.2.3.4".to_string(), "root".to_string(), AuthMethod::Agent);
         let cfg_id = cfg.id();
         let mut manager = BuiltinCommandManager::new();
         manager.set_terminal_context(Some(cfg), Some("/srv/app".to_string()));

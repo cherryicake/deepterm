@@ -7,8 +7,8 @@ use gpui::{
     TextStyleRefinement, div, px, rems, svg,
 };
 
-use crate::assets::Icon;
 use super::markdown_selectable::SelectableText;
+use crate::assets::Icon;
 use crate::theme::ActiveTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +54,12 @@ impl CalloutKind {
     }
 
     fn bg_color(&self, cx: &gpui::App) -> gpui::Hsla {
-        self.accent_color(cx).opacity(if cx.theme().appearance.is_dark() { 0.18 } else { 0.13 })
+        self.accent_color(cx)
+            .opacity(if cx.theme().appearance.is_dark() {
+                0.18
+            } else {
+                0.13
+            })
     }
 }
 
@@ -65,14 +70,12 @@ enum CalloutState {
     Kind(CalloutKind),
 }
 
-
 #[derive(Clone, Debug)]
 struct ImageState {
     url: String,
     alt: String,
     runs: Vec<TextRun>,
 }
-
 
 use super::markdown::{HighlightCache, Markdown, MarkdownStyle, highlight_code_runs};
 use super::markdown_parser::{ColumnAlign, MarkdownEvent, MarkdownTag, MarkdownTagEnd};
@@ -184,7 +187,14 @@ impl MarkdownElementBuilder {
         markdown: Entity<Markdown>,
         highlight_cache: HighlightCache,
     ) -> Self {
-        Self::new_with_item(style, wrapped_code_blocks, copied_code_blocks, markdown, highlight_cache, 0)
+        Self::new_with_item(
+            style,
+            wrapped_code_blocks,
+            copied_code_blocks,
+            markdown,
+            highlight_cache,
+            0,
+        )
     }
 
     pub fn new_with_item(
@@ -285,7 +295,12 @@ impl MarkdownElementBuilder {
                         4 => div().mt_6().mb_2(),
                         _ => div().mt_4().mb_2(),
                     };
-                    heading = heading.w_full().flex().flex_wrap().items_start().group("heading");
+                    heading = heading
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_start()
+                        .group("heading");
                     heading.style().refine(&self.style.heading);
                     if let Some(refinement) = self
                         .style
@@ -360,7 +375,11 @@ impl MarkdownElementBuilder {
                     let task_info = self.pending_task.clone();
                     let (bullet, is_task, is_checked) = match task_info {
                         Some((checked, _)) => (
-                            if checked { "☑".to_string() } else { "☐".to_string() },
+                            if checked {
+                                "☑".to_string()
+                            } else {
+                                "☐".to_string()
+                            },
                             true,
                             checked,
                         ),
@@ -460,12 +479,7 @@ impl MarkdownElementBuilder {
                     } else {
                         cx.theme().ui.text.opacity(0.03)
                     };
-                    let mut block = div()
-                        .my_3()
-                        .py_3()
-                        .pr_4()
-                        .rounded(px(6.0))
-                        .bg(quote_bg);
+                    let mut block = div().my_3().py_3().pr_4().rounded(px(6.0)).bg(quote_bg);
                     block.style().refine(&StyleRefinement {
                         padding: gpui::EdgesRefinement {
                             left: Some(gpui::DefiniteLength::Absolute(
@@ -489,7 +503,15 @@ impl MarkdownElementBuilder {
                     self.table.current_row.clear();
                     let col_count = self.table.alignments.len().max(1);
                     // 表格：外层滚动 + 内层 grid，圆角 8px
-                    let table_border = cx.theme().ui.border.opacity(if cx.theme().appearance.is_dark() { 0.28 } else { 0.22 });
+                    let table_border =
+                        cx.theme()
+                            .ui
+                            .border
+                            .opacity(if cx.theme().appearance.is_dark() {
+                                0.28
+                            } else {
+                                0.22
+                            });
                     let outer = div()
                         .id(format!("table-outer-{}", range.start))
                         .w_full()
@@ -599,7 +621,7 @@ impl MarkdownElementBuilder {
                             .bg(cx.theme().ui.text.opacity(0.06))
                             .text_size(px(10.0))
                             .font_weight(gpui::FontWeight(600.))
-                                                        .text_color(cx.theme().ui.text_muted)
+                            .text_color(cx.theme().ui.text_muted)
                             .child(lang.to_uppercase())
                             .into_any_element();
                         self.append_child(label);
@@ -707,7 +729,9 @@ impl MarkdownElementBuilder {
                             .gap_1()
                             .cursor_pointer()
                             .on_click(move |_: &ClickEvent, _, _cx| {
-                                let _ = open::that(&url);
+                                // 关键安全：仅允许 http/https 直接打开，
+                                // file:// 与自定义 Scheme 默认拦截（见 safe_open 模块）。
+                                crate::safe_open::open_url_safely(&url);
                             })
                             .child(styled_text)
                             .when(is_external, |this| {
@@ -715,7 +739,7 @@ impl MarkdownElementBuilder {
                                     div()
                                         .text_size(px(11.))
                                         .text_color(cx.theme().ui.accent.opacity(0.6))
-                                        .child("↗")
+                                        .child("↗"),
                                 )
                             })
                             .into_any_element();
@@ -763,7 +787,8 @@ impl MarkdownElementBuilder {
                                 .on_click({
                                     let url = url_for_click.clone();
                                     move |_: &ClickEvent, _, _cx| {
-                                        let _ = open::that(&url);
+                                        // 关键安全：图片点击同样走白名单，防止 file:// 泄露。
+                                        crate::safe_open::open_url_safely(&url);
                                     }
                                 });
                             if let Some((img_arc, (w, h))) = maybe_image {
@@ -814,10 +839,13 @@ impl MarkdownElementBuilder {
                                             .child(div().text_size(px(18.)).child("🖼"))
                                             .child({
                                                 let txt = alt.clone();
-                                                let mut t =
-                                                    div().text_size(px(13.)).text_color(cx.theme().ui.text);
+                                                let mut t = div()
+                                                    .text_size(px(13.))
+                                                    .text_color(cx.theme().ui.text);
                                                 if let Some(runs) = alt_runs.clone() {
-                                                    t = t.child(StyledText::new(txt).with_runs(runs));
+                                                    t = t.child(
+                                                        StyledText::new(txt).with_runs(runs),
+                                                    );
                                                 } else {
                                                     t = t.child(txt);
                                                 }
@@ -837,13 +865,27 @@ impl MarkdownElementBuilder {
                         let caption = if alt_text.is_empty() || alt_text == img_state.url {
                             None
                         } else {
-                            Some(div().px_3().py_2().text_size(px(12.)).text_color(cx.theme().ui.text_muted).child(alt_text.clone()).into_any_element())
+                            Some(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().ui.text_muted)
+                                    .child(alt_text.clone())
+                                    .into_any_element(),
+                            )
                         };
                         let card: AnyElement = image_card;
                         // caption 放在卡片下方外部，保持 Notion 图注风格
                         if let Some(cap) = caption {
                             // 将卡片与 caption 包一层
-                            let wrapper = div().flex().flex_col().w_full().child(card).child(cap).into_any_element();
+                            let wrapper = div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .child(card)
+                                .child(cap)
+                                .into_any_element();
                             self.append_child(wrapper);
                         } else {
                             self.append_child(card);
@@ -1001,7 +1043,18 @@ impl MarkdownElementBuilder {
 
     fn push_code_text(&mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         let style = self.text_style();
-        let language = self.code_block_language.last().unwrap().clone().unwrap();
+        // 关键防御：非代码块误调用或栈状态不一致时不得 panic，
+        // 降级为普通文本，保证渲染路径永不崩溃。
+        let Some(lang_opt) = self.code_block_language.last() else {
+            self.pending_line.text.push_str(text);
+            self.pending_line.runs.push(style.to_run(text.len()));
+            return;
+        };
+        let Some(language) = lang_opt.clone() else {
+            self.pending_line.text.push_str(text);
+            self.pending_line.runs.push(style.to_run(text.len()));
+            return;
+        };
         let key = (language.clone(), range.clone());
         let mut cache = self.highlight_cache.borrow_mut();
         let cached = cache
@@ -1107,7 +1160,15 @@ impl MarkdownElementBuilder {
         let col_count = self.table.alignments.len().max(1);
         let base_style = self.style.base_text_style.clone();
         let alignments = self.table.alignments.clone();
-        let border_color = cx.theme().ui.border.opacity(if cx.theme().appearance.is_dark() { 0.28 } else { 0.22 });
+        let border_color = cx
+            .theme()
+            .ui
+            .border
+            .opacity(if cx.theme().appearance.is_dark() {
+                0.28
+            } else {
+                0.22
+            });
         let elevated_bg = cx.theme().ui.elevated_background;
         let panel_bg = cx.theme().ui.panel_background;
         // Notion 表头：略深的底色 + 加粗感（由 cell runs 的 strong 承担），斑马纹保留
@@ -1149,7 +1210,8 @@ impl MarkdownElementBuilder {
                 // 表格单元格支持选中复制
                 let frag_id = self.fragment_id();
                 let cell_text_owned = cell_text.to_string();
-                self.pending_fragments.push((frag_id, cell_text_owned.clone()));
+                self.pending_fragments
+                    .push((frag_id, cell_text_owned.clone()));
                 let selectable = SelectableText::new(
                     SharedString::from(format!("sel-cell-{}", frag_id)),
                     SharedString::from(cell_text_owned),
@@ -1171,12 +1233,52 @@ impl MarkdownElementBuilder {
         if url.starts_with("http://") || url.starts_with("https://") {
             return None;
         }
-        let p = std::path::Path::new(url);
-        for cand in [
-            p.to_path_buf(),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(url),
-        ] {
+        // 关键安全修复：
+        // 1. 仅允许图片扩展名，避免 `![](../../.ssh/id_rsa)` 触发任意文件读入内存；
+        // 2. 先经 metadata 预检大小（>20MB 直接拒绝），避免大文件同步读卡死 render；
+        // 3. 拒绝 `..` 跨目录逃逸与空路径；移除 `CARGO_MANIFEST_DIR` 兜底（仅开发期有效，
+        //    生产包中会误读包内路径）。
+        // TODO(性能)：仍在 render 同步读文件，应迁移至 `cx.spawn + background_executor`
+        // + `Arc` 缓存 + 像素上限，此处先以大小/扩展名收敛风险。
+        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        let trimmed = url.trim().trim_start_matches("file://");
+        if trimmed.is_empty() || trimmed.len() > 1024 {
+            return None;
+        }
+        let p = std::path::Path::new(trimmed);
+        // 拒绝 `..` 组件，防止工作区越狱；绝对路径仅允许存在且为文件的情况（仍受扩展名/大小约束）。
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            log::warn!("已拦截含 `..` 的本地图片路径: {trimmed:?}");
+            return None;
+        }
+        let ext_ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "ico"
+                )
+            })
+            .unwrap_or(false);
+        if !ext_ok {
+            return None;
+        }
+        // 仅尝试相对当前工作目录的直接路径（不再拼接 MANIFEST_DIR），并预检大小。
+        let candidates = [p.to_path_buf()];
+        for cand in candidates {
+            let Ok(meta) = std::fs::metadata(&cand) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES || meta.len() == 0 {
+                continue;
+            }
             if let Ok(bytes) = std::fs::read(&cand) {
+                if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                    continue;
+                }
                 if let Ok(img) = crate::editor::image_viewer::load_image_from_bytes(&bytes, &cand) {
                     return Some(img);
                 }
@@ -1195,7 +1297,11 @@ impl MarkdownElementBuilder {
                 let marker = &trimmed[..=end];
                 if let Some(kind) = CalloutKind::from_marker(marker) {
                     let rest = trimmed[end + 1..].trim_start();
-                    let remainder = if rest.is_empty() { None } else { Some(rest.to_string()) };
+                    let remainder = if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.to_string())
+                    };
                     return Some((kind, remainder));
                 }
             }

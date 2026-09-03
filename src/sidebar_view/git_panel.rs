@@ -25,10 +25,7 @@ const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Git panel events
 pub enum GitPanelEvent {
     /// Instant open: content loads asynchronously in DiffView.
-    OpenDiffLoading {
-        path: String,
-        repo: GitRepository,
-    },
+    OpenDiffLoading { path: String, repo: GitRepository },
     /// Emitted after `git add` succeeds; the HEAD → worktree diff must be recomputed.
     StageFile { path: String },
     /// Emitted after `git reset` succeeds; same effect as [`Self::StageFile`].
@@ -204,9 +201,8 @@ impl GitPanel {
         let weak = cx.entity().downgrade();
         self.watcher_subscription = if is_local {
             let watcher = cx.fs_watcher();
-            Some(cx.subscribe(
-                &watcher,
-                move |_, _, event: &FsChangeEvent, cx| {
+            Some(
+                cx.subscribe(&watcher, move |_, _, event: &FsChangeEvent, cx| {
                     if is_git_noise_path(event) {
                         return;
                     }
@@ -216,13 +212,12 @@ impl GitPanel {
                             this.schedule_refresh(cx);
                         });
                     });
-                },
-            ))
+                }),
+            )
         } else {
             let watcher = cx.remote_fs_watcher();
-            Some(cx.subscribe(
-                &watcher,
-                move |_, _, event: &FsChangeEvent, cx| {
+            Some(
+                cx.subscribe(&watcher, move |_, _, event: &FsChangeEvent, cx| {
                     if is_git_noise_path(event) {
                         return;
                     }
@@ -232,8 +227,8 @@ impl GitPanel {
                             this.schedule_refresh(cx);
                         });
                     });
-                },
-            ))
+                }),
+            )
         };
 
         self.workspace_generation += 1;
@@ -389,7 +384,9 @@ impl GitPanel {
                         let repo = repo.clone();
                         let path = entry.path.clone();
                         cx.background_executor()
-                            .spawn(async move { let _ = repo.diff_file_contents(&path); })
+                            .spawn(async move {
+                                let _ = repo.diff_file_contents(&path);
+                            })
                             .detach();
                     }
                 }
@@ -415,9 +412,7 @@ impl GitPanel {
 
         let weak = cx.entity().downgrade();
         self.refresh_debounce_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(REFRESH_DEBOUNCE_DELAY)
-                .await;
+            cx.background_executor().timer(REFRESH_DEBOUNCE_DELAY).await;
             let _ = weak.update(cx, |this, cx| {
                 this.refresh_debounce_task = None;
                 if this.refresh_pending && !this.loading {
@@ -452,7 +447,9 @@ impl GitPanel {
         let repo = repo.clone();
         let path = path.to_owned();
         cx.background_executor()
-            .spawn(async move { let _ = repo.diff_file_contents(&path); })
+            .spawn(async move {
+                let _ = repo.diff_file_contents(&path);
+            })
             .detach();
     }
 
@@ -771,9 +768,7 @@ fn is_git_noise_path(event: &FsChangeEvent) -> bool {
         for rest in components.by_ref() {
             match rest.as_os_str().to_str() {
                 Some("objects") | Some("logs") | Some("hooks") | Some("info") => return true,
-                Some(name)
-                    if name.ends_with(".lock") || name.starts_with("tmp_") =>
-                {
+                Some(name) if name.ends_with(".lock") || name.starts_with("tmp_") => {
                     return true;
                 }
                 _ => {}
@@ -807,9 +802,7 @@ mod tests {
     #[test]
     fn git_high_frequency_paths_are_noise() {
         // objects/logs/hooks 每次写对象都会刷事件，必须忽略
-        assert!(is_git_noise_path(&event(
-            "/repo/.git/objects/ab/cdef123"
-        )));
+        assert!(is_git_noise_path(&event("/repo/.git/objects/ab/cdef123")));
         assert!(is_git_noise_path(&event("/repo/.git/logs/HEAD")));
         assert!(is_git_noise_path(&event("/repo/.git/hooks/pre-commit")));
         assert!(is_git_noise_path(&event("/repo/.git/info/exclude")));

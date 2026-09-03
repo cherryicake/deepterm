@@ -77,7 +77,12 @@ fn line_range_for_index(text: &str, index: usize) -> std::ops::Range<usize> {
     start..end
 }
 
-fn closest_offset_for_position(layout: &TextLayout, text: &str, raw_index: usize, x: Pixels) -> usize {
+fn closest_offset_for_position(
+    layout: &TextLayout,
+    text: &str,
+    raw_index: usize,
+    x: Pixels,
+) -> usize {
     if raw_index >= text.len() {
         return text.len();
     }
@@ -98,11 +103,7 @@ fn closest_offset_for_position(layout: &TextLayout, text: &str, raw_index: usize
     match (pos, next_pos) {
         (Some(a), Some(b)) if (b.y - a.y).abs() < px(1.) => {
             // Same line: use midpoint
-            if x > (a.x + b.x) / 2. {
-                next_idx
-            } else {
-                idx
-            }
+            if x > (a.x + b.x) / 2. { next_idx } else { idx }
         }
         // Different lines (wrapped) or missing data: keep idx
         _ => idx,
@@ -281,13 +282,24 @@ impl Element for SelectableText {
                 let raw_index = match layout.index_for_position(event.position) {
                     Ok(ix) | Err(ix) => ix.min(text_len),
                 };
-                let frag_text = markdown.read(cx).fragment_texts.borrow().get(&fragment_id).cloned().unwrap_or_default();
-                let text_ref = if !frag_text.is_empty() { frag_text } else { layout.text() };
+                let frag_text = markdown
+                    .read(cx)
+                    .fragment_texts
+                    .borrow()
+                    .get(&fragment_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let text_ref = if !frag_text.is_empty() {
+                    frag_text
+                } else {
+                    layout.text()
+                };
                 let mut index = raw_index;
                 while index < text_ref.len() && !text_ref.is_char_boundary(index) {
                     index += 1;
                 }
-                index = closest_offset_for_position(&layout, &text_ref, index, event.position.x).min(text_len);
+                index = closest_offset_for_position(&layout, &text_ref, index, event.position.x)
+                    .min(text_len);
 
                 markdown.update(cx, |markdown, cx| {
                     if event.modifiers.shift && !markdown.selection.is_empty() {
@@ -346,8 +358,18 @@ impl Element for SelectableText {
                 if !vertically_inside {
                     return;
                 }
-                let frag_text = markdown.read(cx).fragment_texts.borrow().get(&fragment_id).cloned().unwrap_or_default();
-                let text_ref = if !frag_text.is_empty() { frag_text } else { layout.text() };
+                let frag_text = markdown
+                    .read(cx)
+                    .fragment_texts
+                    .borrow()
+                    .get(&fragment_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let text_ref = if !frag_text.is_empty() {
+                    frag_text
+                } else {
+                    layout.text()
+                };
                 let index = if event.position.x < hitbox.bounds.left() {
                     0
                 } else if event.position.x >= hitbox.bounds.right() {
@@ -360,7 +382,8 @@ impl Element for SelectableText {
                     while idx < text_ref.len() && !text_ref.is_char_boundary(idx) {
                         idx += 1;
                     }
-                    closest_offset_for_position(&layout, &text_ref, idx, event.position.x).min(text_len)
+                    closest_offset_for_position(&layout, &text_ref, idx, event.position.x)
+                        .min(text_len)
                 };
                 markdown.update(cx, |markdown, cx| {
                     markdown.selection.set_focus(fragment_id, index);

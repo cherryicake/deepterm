@@ -4,7 +4,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     App, ClipboardItem, Context, DismissEvent, Entity, FocusHandle, Focusable, IntoElement,
-    MouseButton, Point, Pixels, Render, ScrollHandle, SharedString, Subscription, Window, anchored,
+    MouseButton, Pixels, Point, Render, ScrollHandle, SharedString, Subscription, Window, anchored,
     deferred, div, point, px,
 };
 
@@ -20,7 +20,9 @@ use crate::sidebar_view::hosts_view::{
     sort_hosts,
 };
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
-use crate::ssh::config::{HostGroup, SortMode, SshConnectionConfig, SshGlobalConfig, sort_host_groups};
+use crate::ssh::config::{
+    HostGroup, SortMode, SshConnectionConfig, SshGlobalConfig, sort_host_groups,
+};
 use crate::theme::ActiveTheme;
 
 /// SSH 主机回调（连接 / 编辑主机时触发），参数为该主机的连接配置。
@@ -173,7 +175,12 @@ impl HostView {
         self.active_modal = ActiveModal::None;
     }
 
-    fn open_host_modal(&mut self, target_group: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_host_modal(
+        &mut self,
+        target_group: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let form = self
             .host_form
             .get_or_insert_with(|| NewHostForm::new(window, cx))
@@ -260,11 +267,13 @@ impl HostView {
         self.modal_state.update(cx, |modal, cx| modal.open(cx));
     }
 
-    fn open_rename_folder_dialog(&mut self, folder_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(group) = SshGlobalConfig::load()
-            .find_group(&folder_id)
-            .cloned()
-        else {
+    fn open_rename_folder_dialog(
+        &mut self,
+        folder_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = SshGlobalConfig::load().find_group(&folder_id).cloned() else {
             return;
         };
         let dialog = FolderNameDialog::new(
@@ -342,50 +351,83 @@ impl HostView {
         let host_view = cx.entity().clone();
         let host_view2 = host_view.clone();
         let current_folder_clone = self.current_folder.clone();
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            let mut m = menu;
-            m = m.item(
-                PopupMenuItem::new("新建主机")
-                    .icon(crate::components::button::Icon::new("icons/plus.svg"))
-                    .on_click({
-                        let host_view = host_view.clone();
-                        let current_folder_clone = current_folder_clone.clone();
-                        move |_, window, cx| {
-                            let target = current_folder_clone.clone().map(|s| s.to_string());
-                            host_view.update(cx, |this, cx| {
-                                this.close_header_menu(cx);
-                                this.open_host_modal(target, window, cx);
-                            });
-                        }
-                    }),
-            );
-            m = m.item(
-                PopupMenuItem::new("新建文件夹")
-                    .icon(crate::components::button::Icon::new("icons/folder.badge.plus.svg"))
-                    .on_click({
-                        let host_view = host_view2.clone();
-                        move |_, window, cx| {
-                            host_view.update(cx, |this, cx| {
-                                this.close_header_menu(cx);
-                                this.open_create_folder_dialog(window, cx);
-                            });
-                        }
-                    }),
-            );
-            m = m.separator();
-            m = m.item(PopupMenuItem::label("排序方式"));
-            let sort_options = [
-                ("名称 A → Z", SortMode::NameAsc, if is_root { folder_sort == SortMode::NameAsc } else { host_sort == SortMode::NameAsc }),
-                ("名称 Z → A", SortMode::NameDesc, if is_root { folder_sort == SortMode::NameDesc } else { host_sort == SortMode::NameDesc }),
-                ("创建时间 新→旧", SortMode::CreatedDesc, if is_root { folder_sort == SortMode::CreatedDesc } else { host_sort == SortMode::CreatedDesc }),
-                ("创建时间 旧→新", SortMode::CreatedAsc, if is_root { folder_sort == SortMode::CreatedAsc } else { host_sort == SortMode::CreatedAsc }),
-            ];
-            for (label, mode, checked) in sort_options {
-                let host_view = host_view.clone();
+        let menu =
+            PopupMenu::build(window, cx, move |menu, _window, _cx| {
+                let mut m = menu;
                 m = m.item(
-                    PopupMenuItem::new(label)
-                        .checked(checked)
-                        .on_click(move |_, _, cx| {
+                    PopupMenuItem::new("新建主机")
+                        .icon(crate::components::button::Icon::new("icons/plus.svg"))
+                        .on_click({
+                            let host_view = host_view.clone();
+                            let current_folder_clone = current_folder_clone.clone();
+                            move |_, window, cx| {
+                                let target = current_folder_clone.clone().map(|s| s.to_string());
+                                host_view.update(cx, |this, cx| {
+                                    this.close_header_menu(cx);
+                                    this.open_host_modal(target, window, cx);
+                                });
+                            }
+                        }),
+                );
+                m = m.item(
+                    PopupMenuItem::new("新建文件夹")
+                        .icon(crate::components::button::Icon::new(
+                            "icons/folder.badge.plus.svg",
+                        ))
+                        .on_click({
+                            let host_view = host_view2.clone();
+                            move |_, window, cx| {
+                                host_view.update(cx, |this, cx| {
+                                    this.close_header_menu(cx);
+                                    this.open_create_folder_dialog(window, cx);
+                                });
+                            }
+                        }),
+                );
+                m = m.separator();
+                m = m.item(PopupMenuItem::label("排序方式"));
+                let sort_options = [
+                    (
+                        "名称 A → Z",
+                        SortMode::NameAsc,
+                        if is_root {
+                            folder_sort == SortMode::NameAsc
+                        } else {
+                            host_sort == SortMode::NameAsc
+                        },
+                    ),
+                    (
+                        "名称 Z → A",
+                        SortMode::NameDesc,
+                        if is_root {
+                            folder_sort == SortMode::NameDesc
+                        } else {
+                            host_sort == SortMode::NameDesc
+                        },
+                    ),
+                    (
+                        "创建时间 新→旧",
+                        SortMode::CreatedDesc,
+                        if is_root {
+                            folder_sort == SortMode::CreatedDesc
+                        } else {
+                            host_sort == SortMode::CreatedDesc
+                        },
+                    ),
+                    (
+                        "创建时间 旧→新",
+                        SortMode::CreatedAsc,
+                        if is_root {
+                            folder_sort == SortMode::CreatedAsc
+                        } else {
+                            host_sort == SortMode::CreatedAsc
+                        },
+                    ),
+                ];
+                for (label, mode, checked) in sort_options {
+                    let host_view = host_view.clone();
+                    m = m.item(PopupMenuItem::new(label).checked(checked).on_click(
+                        move |_, _, cx| {
                             host_view.update(cx, |_, cx| {
                                 let mut cfg = SshGlobalConfig::load();
                                 if is_root {
@@ -397,11 +439,11 @@ impl HostView {
                                 let _ = cfg.save();
                                 cx.notify();
                             });
-                        }),
-                );
-            }
-            m
-        });
+                        },
+                    ));
+                }
+                m
+            });
 
         let sub = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.close_header_menu(cx);
@@ -446,7 +488,12 @@ impl HostView {
         )
     }
 
-    fn render_header(&self, title: String, cx: &mut Context<Self>, theme: crate::theme::UiTheme) -> gpui::AnyElement {
+    fn render_header(
+        &self,
+        title: String,
+        cx: &mut Context<Self>,
+        theme: crate::theme::UiTheme,
+    ) -> gpui::AnyElement {
         div()
             .w_full()
             .h(px(36.0))
@@ -902,7 +949,10 @@ impl HostView {
                                             let ids: Vec<String> = if this.selected_ids.is_empty() {
                                                 vec![hid.clone()]
                                             } else {
-                                                this.selected_ids.iter().map(|s| s.to_string()).collect()
+                                                this.selected_ids
+                                                    .iter()
+                                                    .map(|s| s.to_string())
+                                                    .collect()
                                             };
                                             let mut cfg = SshGlobalConfig::load();
                                             cfg.move_hosts_to_group(&ids, None);
@@ -933,7 +983,10 @@ impl HostView {
                                             let ids: Vec<String> = if this.selected_ids.is_empty() {
                                                 vec![hid.clone()]
                                             } else {
-                                                this.selected_ids.iter().map(|s| s.to_string()).collect()
+                                                this.selected_ids
+                                                    .iter()
+                                                    .map(|s| s.to_string())
+                                                    .collect()
                                             };
                                             let mut cfg = SshGlobalConfig::load();
                                             cfg.move_hosts_to_group(&ids, Some(&gid));
@@ -1048,7 +1101,8 @@ impl Render for HostView {
                 // 若 query 非空且文件夹名不匹配，检查组内是否有匹配主机，有则仍显示
                 if !query_str.is_empty() && !Self::folder_matches_query(g, query_str) {
                     let has_matching_host = hosts.iter().any(|h| {
-                        h.group_id.as_deref() == Some(g.id.as_str()) && Self::host_matches_query(h, query_str)
+                        h.group_id.as_deref() == Some(g.id.as_str())
+                            && Self::host_matches_query(h, query_str)
                     });
                     if !has_matching_host {
                         continue;
@@ -1119,11 +1173,28 @@ impl Render for HostView {
             }
 
             for host in &ungrouped {
-                list = list.child(self.render_host_row(host, &configs, &groups, cx, theme, &on_select, &on_connect));
+                list = list.child(self.render_host_row(
+                    host,
+                    &configs,
+                    &groups,
+                    cx,
+                    theme,
+                    &on_select,
+                    &on_connect,
+                ));
             }
         } else {
             // 文件夹内页
-            let fid = self.current_folder.clone().unwrap();
+            // 关键防御：用 match 替代 unwrap，文件夹被删除/导航竞态时
+            // 降级为空列表而非 panic，保证侧边栏渲染永不崩溃。
+            let fid_opt = self.current_folder.clone();
+            let fid = match fid_opt {
+                Some(v) => v,
+                None => {
+                    // 竞态兜底：视为空文件夹，渲染“暂无主机”占位。
+                    gpui::SharedString::new("")
+                }
+            };
             let mut folder_hosts: Vec<Host> = hosts
                 .into_iter()
                 .filter(|h| h.group_id.as_deref() == Some(fid.as_ref()))
@@ -1144,11 +1215,7 @@ impl Render for HostView {
                             .text_sm()
                             .text_color(theme.text_muted)
                             .child("暂无主机")
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child("点击右上角 ⋯ 新建主机"),
-                            ),
+                            .child(div().text_xs().child("点击右上角 ⋯ 新建主机")),
                     );
                 } else {
                     list = list.child(
@@ -1162,7 +1229,15 @@ impl Render for HostView {
                 }
             }
             for host in &folder_hosts {
-                list = list.child(self.render_host_row(host, &configs, &groups, cx, theme, &on_select, &on_connect));
+                list = list.child(self.render_host_row(
+                    host,
+                    &configs,
+                    &groups,
+                    cx,
+                    theme,
+                    &on_select,
+                    &on_connect,
+                ));
             }
         }
 
@@ -1311,4 +1386,3 @@ impl Render for HostView {
             )
     }
 }
-

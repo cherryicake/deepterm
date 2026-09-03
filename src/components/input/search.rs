@@ -136,7 +136,12 @@ impl SearchMatcher {
             match query {
                 SearchQuery::Literal(matcher) => {
                     for query_match in matcher.stream_find_iter(text.as_bytes()) {
-                        let query_match = query_match.expect("query match");
+                        // 关键防御：流式匹配理论上恒 Ok，但渲染路径不得 expect panic，
+                        // 出错时跳过该匹配，保证搜索永不崩溃。
+                        let Ok(query_match) = query_match else {
+                            log::warn!("搜索字面量匹配流异常，已跳过");
+                            continue;
+                        };
                         new_ranges.push(query_match.range());
                     }
                 }
@@ -190,12 +195,13 @@ impl SearchMatcher {
             };
             self.query = regex::Regex::new(&expr).ok().map(SearchQuery::Regex);
         } else {
-            self.query = Some(SearchQuery::Literal(
-                AhoCorasick::builder()
-                    .ascii_case_insensitive(case_insensitive)
-                    .build(&[query.to_string()])
-                    .expect("failed to build AhoCorasick query in SearchMatcher"),
-            ));
+            // 关键防御：用户任意输入（含超大 query）导致构建失败时降级为无查询而非 panic。
+            self.query = AhoCorasick::builder()
+                .ascii_case_insensitive(case_insensitive)
+                .build(&[query.to_string()])
+                .inspect_err(|e| log::warn!("搜索查询构建失败，已清空查询: {e}"))
+                .ok()
+                .map(SearchQuery::Literal);
         }
         self.update_matches();
     }

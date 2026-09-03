@@ -8,7 +8,7 @@ use anyhow::Context as _;
 use crate::file_manager::utils::{
     TransferSummary, check_cancelled, copy_local_file_interruptible, is_local_noop_move,
     prevent_local_recursive_copy, remove_local_source, resolve_local_conflict,
-    temporary_local_path,
+    temporary_local_path, validate_rename_to,
 };
 use crate::file_manager::{ConflictPolicy, ConflictResolver};
 
@@ -25,6 +25,10 @@ pub fn copy_local_to_local(
         .with_context(|| format!("无法检查源文件 {}", source_path.display()))?;
     fs::create_dir_all(destination_dir)?;
     let file_name = super::utils::local_file_name(source_path)?;
+    // 关键安全：重命名输入为用户自由文本，必须先校验，防止 `../` 逃出目标目录。
+    if let Some(name) = rename_to {
+        validate_rename_to(name)?;
+    }
     let effective_name = rename_to.unwrap_or(&file_name);
     let desired_path = destination_dir.join(effective_name);
 
@@ -83,6 +87,10 @@ pub fn move_local_to_local(
     }
 
     let file_name = super::utils::local_file_name(source_path)?;
+    // 关键安全：移动路径同样校验重命名，防止遍历。
+    if let Some(name) = rename_to {
+        validate_rename_to(name)?;
+    }
     let effective_name = if metadata.is_file() {
         rename_to.unwrap_or(&file_name)
     } else {

@@ -322,9 +322,27 @@ pub fn load_image_from_bytes(
     bytes: &[u8],
     path: &std::path::Path,
 ) -> anyhow::Result<(Arc<gpui::Image>, (u32, u32))> {
+    // 关键安全/性能：限制解码炸弹。SVG 用受限 Options（禁用外部资源），
+    // 位图先读尺寸，超限直接拒绝，避免 `image` 全量解码耗尽内存。
+    const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+    const MAX_IMAGE_PIXELS: u64 = 8000 * 8000;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("图片过大（{} bytes），超过 20MB 限制", bytes.len());
+    }
     if path.extension().and_then(|e| e.to_str()) == Some("svg") {
-        let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())?;
+        let opt = usvg::Options {
+            resources_dir: None,
+            ..usvg::Options::default()
+        };
+        let tree = usvg::Tree::from_data(bytes, &opt)?;
         let size = tree.size();
+        // SVG 逻辑尺寸过大同样拒绝（防 `<use>` 指数膨胀导致的渲染卡死）。
+        if (size.width() as u64) * (size.height() as u64) > MAX_IMAGE_PIXELS
+            || size.width() > 8000.0
+            || size.height() > 8000.0
+        {
+            anyhow::bail!("SVG 尺寸过大，拒绝渲染");
+        }
         let image = Arc::new(gpui::Image::from_bytes(ImageFormat::Svg, bytes.to_vec()));
         return Ok((image, (size.width() as u32, size.height() as u32)));
     }
@@ -344,6 +362,10 @@ pub fn load_image_from_bytes(
 
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let (width, height) = reader.into_dimensions()?;
+    // 位图像素总数同样设限，防解压炸弹耗尽内存。
+    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
+        anyhow::bail!("图片像素超限（{width}x{height}），拒绝渲染");
+    }
 
     let image = Arc::new(gpui::Image::from_bytes(gpui_format, bytes.to_vec()));
     Ok((image, (width, height)))

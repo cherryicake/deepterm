@@ -92,7 +92,9 @@ pub enum GitBackend {
     /// `SshConnectionConfig` 有 184 字节。内嵌它会让 `GitBackend` 膨胀到 184 字节，
     /// 连带把 `GitRepository`（208 字节）和所有携带它的事件枚举一起撑大。
     /// 装箱后 `GitBackend` 降到 8 字节，`GitRepository` 降到 32 字节。
-    Remote { config: Box<SshConnectionConfig> },
+    Remote {
+        config: Box<SshConnectionConfig>,
+    },
 }
 
 impl GitBackend {
@@ -113,9 +115,7 @@ impl GitBackend {
             GitBackend::Local => execute_local_git_bytes(args, cwd),
             // 远端会话已经把 stdout 解成了 `String`（有损），重新编码回字节
             // 对合法 UTF-8 是无损的，BOM 也得以保留下来等待剥离。
-            GitBackend::Remote { .. } => {
-                self.execute(args, cwd).map(|stdout| stdout.into_bytes())
-            }
+            GitBackend::Remote { .. } => self.execute(args, cwd).map(|stdout| stdout.into_bytes()),
         }
     }
 }
@@ -260,7 +260,10 @@ impl GitRepository {
         }
         let result = self.status_uncached()?;
         let mut cache = status_cache().lock();
-        let diff_stat = cache.get(&key).map(|(_, _, d)| d.clone()).unwrap_or_default();
+        let diff_stat = cache
+            .get(&key)
+            .map(|(_, _, d)| d.clone())
+            .unwrap_or_default();
         cache.insert(key, (Instant::now(), result.clone(), diff_stat));
         Ok(result)
     }
@@ -278,7 +281,10 @@ impl GitRepository {
         }
         let result = self.diff_stat_uncached()?;
         let mut cache = status_cache().lock();
-        let status = cache.get(&key).map(|(_, s, _)| s.clone()).unwrap_or_default();
+        let status = cache
+            .get(&key)
+            .map(|(_, s, _)| s.clone())
+            .unwrap_or_default();
         cache.insert(key, (Instant::now(), status, result.clone()));
         Ok(result)
     }
@@ -287,7 +293,9 @@ impl GitRepository {
     pub fn diff_file(&self, path: &str) -> Result<String, String> {
         let mut diff = self.run_git(&["diff", "--", path])?;
 
-        let staged = self.run_git(&["diff", "--staged", "--", path]).unwrap_or_default();
+        let staged = self
+            .run_git(&["diff", "--staged", "--", path])
+            .unwrap_or_default();
         if !staged.is_empty() {
             if !diff.is_empty() {
                 diff.push('\n');
@@ -348,9 +356,20 @@ impl GitRepository {
                 // Fetch HEAD and stat in parallel.
                 let remote_path = join_remote_path(&self.root, path);
                 let (head_commit, meta_res) = std::thread::scope(|scope| {
-                    let head = scope.spawn(|| self.head_commit().unwrap_or_else(|| "no-head".into()));
+                    let head =
+                        scope.spawn(|| self.head_commit().unwrap_or_else(|| "no-head".into()));
                     let stat = scope.spawn(|| sftp_fs::metadata(config, &remote_path));
-                    (head.join().unwrap(), stat.join().unwrap())
+                    // 关键防御：线程 join 失败不得 unwrap 拖垮 UI，
+                    // 降级为默认值，保证远端 diff 永不因后台 panic 而崩溃。
+                    let head_commit = head.join().unwrap_or_else(|_| {
+                        log::warn!("git远端HEAD查询线程异常，降级为no-head");
+                        "no-head".to_string()
+                    });
+                    let meta_res = stat.join().unwrap_or_else(|_| {
+                        log::warn!("git远端stat线程异常，降级为空元数据");
+                        Err(anyhow::anyhow!("stat线程异常"))
+                    });
+                    (head_commit, meta_res)
                 });
                 let (size, mtime) = meta_res
                     .map(|meta| (meta.size, meta.modified_at))
@@ -365,7 +384,9 @@ impl GitRepository {
                         crate::file_manager::file_tree_cache::RemoteFileTreeCache::global().lock();
                     let path_ref = std::path::Path::new(&remote_path);
                     if cache.is_file_fresh(config, path_ref) {
-                        cache.get_file_content(config, path_ref).map(|(content, _)| content)
+                        cache
+                            .get_file_content(config, path_ref)
+                            .map(|(content, _)| content)
                     } else {
                         None
                     }
@@ -387,9 +408,10 @@ impl GitRepository {
                                     .ok()
                                     .flatten()
                                     .map(|bytes| classify_bytes(&bytes))
-                                    .unwrap_or_else(|| self
-                                        .read_file_content(path)
-                                        .unwrap_or(DiffSideContent::Missing))
+                                    .unwrap_or_else(|| {
+                                        self.read_file_content(path)
+                                            .unwrap_or(DiffSideContent::Missing)
+                                    })
                             } else {
                                 self.read_file_content(path)
                                     .unwrap_or(DiffSideContent::Missing)
@@ -402,10 +424,19 @@ impl GitRepository {
                                 }
                             }
                         });
-                        (h_old.join().unwrap_or_default(), h_new.join().unwrap_or_default())
+                        (
+                            h_old.join().unwrap_or_default(),
+                            h_new.join().unwrap_or_default(),
+                        )
                     })
                 };
-                remote_diff_cache_insert(cache_key, head_commit, size, mtime, (old.clone(), new.clone()));
+                remote_diff_cache_insert(
+                    cache_key,
+                    head_commit,
+                    size,
+                    mtime,
+                    (old.clone(), new.clone()),
+                );
                 Ok((old, new))
             }
         }
@@ -433,7 +464,9 @@ impl GitRepository {
         .filter(|r| r.success())
         .map(|r| r.stdout.trim().to_string())
         .filter(|s| !s.is_empty());
-        head_cache().lock().insert(self.root.clone(), (Instant::now(), result.clone()));
+        head_cache()
+            .lock()
+            .insert(self.root.clone(), (Instant::now(), result.clone()));
         result
     }
 
@@ -532,7 +565,7 @@ impl GitRepository {
                 let bytes = match std::fs::read(&file_path) {
                     Ok(bytes) => bytes,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(DiffSideContent::Missing)
+                        return Ok(DiffSideContent::Missing);
                     }
                     Err(e) => return Err(format!("Failed to read file: {e}")),
                 };
@@ -835,7 +868,10 @@ mod tests {
 
         let (old, new) = repo.diff_file_contents("bom.txt").unwrap();
         assert!(!old.starts_with('\u{feff}'), "HEAD 侧必须剥掉 BOM: {old:?}");
-        assert!(!new.starts_with('\u{feff}'), "工作区侧必须剥掉 BOM: {new:?}");
+        assert!(
+            !new.starts_with('\u{feff}'),
+            "工作区侧必须剥掉 BOM: {new:?}"
+        );
         assert_eq!(old, new, "未修改的 BOM 文件不应产生任何差异");
         assert_eq!(new, content);
 

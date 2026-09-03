@@ -24,6 +24,23 @@ pub trait FileSystem: Send + Sync + 'static {
     fn matches(&self, is_local: bool, ssh_config: Option<&SshConnectionConfig>) -> bool {
         self.is_local() == is_local && self.ssh_config().as_ref() == ssh_config
     }
+
+    /// 预览读取（最多 `limit` 字节），用于文件树悬停预取等场景。
+    /// 默认实现先经 `metadata` 预检，超限直接跳过；小文件才读并截断。
+    /// 注意（中文）：默认实现依赖“stat 与读之间文件不变”，存在理论 TOCTOU，
+    /// 因此所有生产实现（本地/远端）均已覆盖为 `take(limit)` 有界读。
+    /// 新增实现者必须同样覆盖本方法并保证内存占用不超过 `limit`，
+    /// 不得直接复用默认实现读取不可信来源。
+    fn read_preview_bytes(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let meta = self.metadata(path)?;
+        if meta.is_dir || meta.size > limit as u64 {
+            return Ok(None);
+        }
+        Ok(self.read_file_bytes(path)?.map(|mut bytes| {
+            bytes.truncate(limit);
+            bytes
+        }))
+    }
 }
 
 pub struct LocalFileSystem;
@@ -53,6 +70,22 @@ impl FileSystem for LocalFileSystem {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// 本地高效预览：先 `metadata` 预检，超限直接跳过；
+    /// 小文件用 `File::take(limit)` 仅读前 `limit` 字节，避免全量读。
+    fn read_preview_bytes(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > limit as u64 {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        file.take(limit as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| e.to_string())?;
+        Ok((!buf.is_empty()).then_some(buf))
     }
 
     fn home_dir(&self) -> Option<PathBuf> {
@@ -122,6 +155,23 @@ impl FileSystem for RemoteFileSystem {
     fn read_file_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
         let path_str = path.to_string_lossy();
         sftp_fs::read_file_bytes(&self.config, &path_str).map_err(|e| e.to_string())
+    }
+
+    /// 远端高效预览：底层走 `take(limit)` 有界读，内存占用恒不超过 `limit`。
+    /// 关键正确性（中文）：不得用“先 `metadata` 预检 + 再全量读 + 事后截断”，
+    /// 远端文件可能在两次 RPC 之间增大（持续写入的日志），全量读仍会 OOM。
+    /// `metadata` 仅用于快速跳过非文件，安全边界由 `take` 有界读保证。
+    fn read_preview_bytes(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let path_str = path.to_string_lossy();
+        // 快速跳过非文件，避免一次多余的 open RPC。
+        // 注意：即使 stat 与 open 之间文件增大，下方的有界读依然保证内存安全。
+        let meta =
+            sftp_fs::with_cached_session(&self.config, |session| session.metadata(&path_str))
+                .map_err(|e| e.to_string())?;
+        if !matches!(meta.kind, sftp_fs::RemoteFileKind::File) {
+            return Ok(None);
+        }
+        sftp_fs::read_preview_bytes(&self.config, &path_str, limit).map_err(|e| e.to_string())
     }
 
     fn home_dir(&self) -> Option<PathBuf> {

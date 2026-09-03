@@ -1623,7 +1623,9 @@ impl TerminalView {
         !self.builtin_command_manager.is_active()
             && text.starts_with('/')
             && !text.contains(['\n', '\r'])
-            && self.terminal.update(cx, |terminal, _| terminal.input_line_blank())
+            && self
+                .terminal
+                .update(cx, |terminal, _| terminal.input_line_blank())
     }
 
     /// 把文本写入内建命令缓冲，并刷新浮层。
@@ -1768,7 +1770,9 @@ impl TerminalView {
             }
             Some(CommandResult::FallThrough { shell_command }) => {
                 // Handler 做完副作用 / 预处理，把（原始或改写过的）文本交给 shell
-                let to_send = shell_command.clone().unwrap_or_else(|| command_line.to_string());
+                let to_send = shell_command
+                    .clone()
+                    .unwrap_or_else(|| command_line.to_string());
                 if mode == BuiltinExecMode::Interactive {
                     self.send_command_line_to_shell(&to_send, cx);
                 } else if self.can_trigger_builtin_command_here(cx) {
@@ -1798,7 +1802,10 @@ impl TerminalView {
         // 记录到命令历史（仅首 token 命中注册表的内建命令），供下次召回整行。
         // 只在执行成功时记录：失败的命令（如未知主机）召回出来只会再次失败。
         if crate::builtin_commands::find_builtin_command(&command_line).is_some()
-            && !matches!(result, Some(crate::builtin_commands::CommandResult::Error { .. }))
+            && !matches!(
+                result,
+                Some(crate::builtin_commands::CommandResult::Error { .. })
+            )
         {
             crate::builtin_commands::history::record_command(&command_line);
         }
@@ -1950,7 +1957,8 @@ impl TerminalView {
                 .unwrap_or(true);
             if needs_reload {
                 let configs = crate::ssh::config::SshGlobalConfig::load().saved_connections;
-                self.builtin_command_manager.set_ssh_configs(configs.clone());
+                self.builtin_command_manager
+                    .set_ssh_configs(configs.clone());
                 self.scp_hosts_cache = Some((std::time::Instant::now(), configs));
             }
         }
@@ -2817,9 +2825,9 @@ impl Render for TerminalView {
 
                     if is_cmd {
                         if let Some(ref link) = this.hovered_link {
-                            if let Err(e) = open::that(link.url.as_ref()) {
-                                log::warn!("Failed to open URL '{}': {}", link.url, e);
-                            }
+                            // 关键安全：终端链接经 link_detector 识别（仅 http/www），
+                            // 此处再经白名单二次校验，防御未来识别器放宽后的风险。
+                            crate::safe_open::open_url_safely(link.url.as_ref());
                             return;
                         }
                     }

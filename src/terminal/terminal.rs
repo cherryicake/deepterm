@@ -196,6 +196,8 @@ fn shell_integration_root() -> PathBuf {
     {
         // temp_dir 本身在 macOS/Linux 上就是按用户隔离的，再叠加 uid
         // 兜底（如 TMPDIR 被指向共享目录时）
+        // SAFETY（中文）：`getuid` 为 async-signal-safe 的纯查询调用，
+        // 无指针参数、无全局状态写入，多线程并发调用安全。
         let uid = unsafe { libc::getuid() };
         std::env::temp_dir().join(format!("deepterm-shell-integration-{uid}"))
     }
@@ -212,6 +214,8 @@ fn integration_dir_is_trusted(root: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     match fs::metadata(root) {
         Ok(md) => {
+            // SAFETY（中文）：`getuid` 同上，为只读查询，并发安全；
+            // `metadata` 结果与 `getuid` 比较用于防同机预建目录攻击。
             md.is_dir()
                 && md.uid() == unsafe { libc::getuid() }
                 && md.permissions().mode() & 0o022 == 0
@@ -250,10 +254,22 @@ fn write_local_shell_integration_files() -> Option<PathBuf> {
     // 只做 DeepTerm 命名适配。运行时复制资源文件，而不是手写/拼接 shell
     // wrapper，避免 zsh/bash 启动语义和 Ghostty 分叉。
     let integration_files = [
-        (bash_dir.join("deepterm.bash"), include_str!("../../assets/shell-integration/bash/deepterm.bash")),
-        (bash_dir.join("bash-preexec.sh"), include_str!("../../assets/shell-integration/bash/bash-preexec.sh")),
-        (zsh_dir.join(".zshenv"), include_str!("../../assets/shell-integration/zsh/.zshenv")),
-        (zsh_dir.join("deepterm-integration"), include_str!("../../assets/shell-integration/zsh/deepterm-integration")),
+        (
+            bash_dir.join("deepterm.bash"),
+            include_str!("../../assets/shell-integration/bash/deepterm.bash"),
+        ),
+        (
+            bash_dir.join("bash-preexec.sh"),
+            include_str!("../../assets/shell-integration/bash/bash-preexec.sh"),
+        ),
+        (
+            zsh_dir.join(".zshenv"),
+            include_str!("../../assets/shell-integration/zsh/.zshenv"),
+        ),
+        (
+            zsh_dir.join("deepterm-integration"),
+            include_str!("../../assets/shell-integration/zsh/deepterm-integration"),
+        ),
     ];
 
     for (path, content) in integration_files {
@@ -606,6 +622,9 @@ impl Terminal {
         #[cfg(unix)]
         let (child_process_id, shell_process_group_id, pty_master_fd) = {
             let pid = pty.child().id();
+            // SAFETY（中文）：`getpgid` 传入刚创建的子进程 pid（有效正整数），
+            // 无指针参数，失败时返回 -1 并设置 errno，已判 `>=0` 处理；
+            // fd 复用竞态理论存在但窗口极小，失败仅降级为 None，不影响终端创建。
             let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
             (
                 Some(pid),
@@ -1143,6 +1162,8 @@ impl Terminal {
         #[cfg(unix)]
         {
             match self.pty_master_fd {
+                // SAFETY（中文）：`tcgetpgrp` 传入存活的 pty master fd，
+                // 失败返回 -1，已判 `>=0`；fd 关闭竞态下仅降级为 false，不扩散。
                 Some(fd) => match unsafe { libc::tcgetpgrp(fd) } {
                     pgid if pgid >= 0 => self.shell_process_group_id == Some(pgid),
                     _ => false,
@@ -1182,6 +1203,7 @@ impl Terminal {
         #[cfg(unix)]
         {
             let fd = self.pty_master_fd?;
+            // SAFETY（中文）：同上，`tcgetpgrp` 只读查询，失败判 `<0` 后返回 None。
             let pgid = unsafe { libc::tcgetpgrp(fd) };
             if pgid < 0 {
                 return None;
@@ -2002,11 +2024,17 @@ impl Terminal {
         }
         self.link_hover_active = active;
         if active {
-            let TerminalContent { cells, row_ranges, url_ranges, .. } = &mut self.last_content;
+            let TerminalContent {
+                cells,
+                row_ranges,
+                url_ranges,
+                ..
+            } = &mut self.last_content;
             url_ranges.clear();
             url_ranges.reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
-                let ranges = crate::terminal::link_detector::detect_urls_in_line(&cells[*start..*end]);
+                let ranges =
+                    crate::terminal::link_detector::detect_urls_in_line(&cells[*start..*end]);
                 url_ranges.push(ranges);
             }
         } else {

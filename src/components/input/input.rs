@@ -153,7 +153,9 @@ impl RenderOnce for EditorInput {
                             .on_action(window.listener_for(&self.state, InputState::delete_line))
                             .on_action(window.listener_for(&self.state, InputState::join_lines))
                             .on_action(window.listener_for(&self.state, InputState::toggle_fold))
-                            .on_action(window.listener_for(&self.state, InputState::toggle_fold_all))
+                            .on_action(
+                                window.listener_for(&self.state, InputState::toggle_fold_all),
+                            )
                             .on_action(window.listener_for(&self.state, InputState::fold))
                             .on_action(window.listener_for(&self.state, InputState::unfold))
                             .on_action(window.listener_for(&self.state, InputState::fold_all))

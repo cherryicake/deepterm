@@ -44,12 +44,14 @@ impl client::Handler for SshClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        crate::ssh::host_key::check_and_trust_host_key(
+        // 统一走 host_key::verify_server_key，与 SFTP 通道共用逻辑（防一侧漏检）。
+        crate::ssh::host_key::verify_server_key(
             &self.host,
             self.port,
             server_public_key,
             self.host_key_policy,
         )
+        .await
     }
 }
 
@@ -136,8 +138,8 @@ impl RusshTerminal {
                                         let _ = input_tx.send(InputMsg::Data(data));
                                     }
                                     if let Some((cols, rows)) = state.pending_resize.take() {
-                                        let _ =
-                                            input_tx.send(InputMsg::Resize(cols as u32, rows as u32));
+                                        let _ = input_tx
+                                            .send(InputMsg::Resize(cols as u32, rows as u32));
                                     }
                                     state.terminal = Some(RusshTerminalInner { input_tx });
                                     false

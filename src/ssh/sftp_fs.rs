@@ -69,12 +69,14 @@ impl client::Handler for SftpClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        crate::ssh::host_key::check_and_trust_host_key(
+        // 统一走 host_key::verify_server_key，与终端通道共用逻辑（防一侧漏检）。
+        crate::ssh::host_key::verify_server_key(
             &self.host,
             self.port,
             server_public_key,
             self.host_key_policy,
         )
+        .await
     }
 }
 
@@ -580,8 +582,30 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 有界预览读取（最多 `limit` 字节），用于文件树悬停预取等场景。
+    /// 关键正确性（中文）：必须用 `take(limit)` 有界读，而非“先 stat 预检 +
+    /// 再全量读”。远端文件可能在两次 RPC 之间增大（持续写入的日志），
+    /// 全量读 + 事后 `truncate` 仍会把 GB 级内容载入内存（TOCTOU）。
+    /// `take` 保证内存占用恒 `<= limit`，与 `read_text_preview` 的 64KB 语义一致。
+    pub fn read_preview_bytes(
+        &mut self,
+        path: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+            let file = self.sftp.open(path).await?;
+            let mut bytes = Vec::new();
+            file.take(limit as u64).read_to_end(&mut bytes).await?;
+            Ok((!bytes.is_empty()).then_some(bytes))
+        })
+    }
+
     /// 大文件流水线读取（通过 bulk RawSftpSession 并行 16×248K）
-    pub fn read_file_bytes_pipelined(&mut self, path: &str, size: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    pub fn read_file_bytes_pipelined(
+        &mut self,
+        path: &str,
+        size: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         if size == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -1150,7 +1174,9 @@ pub fn write_file_bytes_atomic(
     path: &str,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
-    with_cached_session(config, |session| session.write_file_bytes_atomic(path, bytes))
+    with_cached_session(config, |session| {
+        session.write_file_bytes_atomic(path, bytes)
+    })
 }
 
 /// 查询远程文件权限位（mode），失败或不可用时返回 None。
@@ -1164,7 +1190,10 @@ fn cached_file_size(config: &SshConnectionConfig, path: &str) -> Option<u64> {
     let parent = Path::new(path).parent()?;
     let entries = RemoteFileTreeCache::global().lock().get(config, parent)?;
     let file_name = Path::new(path).file_name()?.to_string_lossy();
-    entries.into_iter().find(|e| e.name == file_name).map(|e| e.size)
+    entries
+        .into_iter()
+        .find(|e| e.name == file_name)
+        .map(|e| e.size)
 }
 
 pub fn read_file_bytes(
@@ -1172,9 +1201,21 @@ pub fn read_file_bytes(
     path: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(size) = cached_file_size(config, path).filter(|s| *s > LARGE_FILE_THRESHOLD) {
-        return with_cached_session(config, |session| session.read_file_bytes_pipelined(path, size));
+        return with_cached_session(config, |session| {
+            session.read_file_bytes_pipelined(path, size)
+        });
     }
     with_cached_session(config, |session| session.read_file_bytes(path))
+}
+
+/// 有界预览读取（最多 `limit` 字节），供文件树悬停预取等场景使用。
+/// 底层走 `take(limit)`，内存占用恒有界，不受文件后续增大影响（无 TOCTOU）。
+pub fn read_preview_bytes(
+    config: &SshConnectionConfig,
+    path: &str,
+    limit: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    with_cached_session(config, |session| session.read_preview_bytes(path, limit))
 }
 
 /// 供编辑器等调用的显式流水线入口（已知 size 时）
@@ -1184,7 +1225,9 @@ pub fn read_file_bytes_pipelined(
     path: &str,
     size: u64,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    with_cached_session(config, |session| session.read_file_bytes_pipelined(path, size))
+    with_cached_session(config, |session| {
+        session.read_file_bytes_pipelined(path, size)
+    })
 }
 
 async fn connect_sftp(
@@ -1706,7 +1749,9 @@ async fn pipelined_read_to_vec(
 
     while let Some((offset, data)) = reads.next().await.transpose()? {
         if data.is_empty() && (offset as usize) < buffer.len() {
-            return Err(anyhow!("远程文件在 offset={offset} 提前结束 (预期大小 {size})"));
+            return Err(anyhow!(
+                "远程文件在 offset={offset} 提前结束 (预期大小 {size})"
+            ));
         }
         let end = offset as usize + data.len();
         if end > buffer.len() {

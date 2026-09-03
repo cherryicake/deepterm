@@ -37,8 +37,7 @@ use crate::theme::ActiveTheme;
 use ropey::Rope;
 
 use super::diff_model::{
-    DiffHunk, LineKind, UnifiedSource, compute_hunks, line_count, line_range,
-    line_starts,
+    DiffHunk, LineKind, UnifiedSource, compute_hunks, line_count, line_range, line_starts,
 };
 
 /// Maximum length of a line that participates in syntax highlighting.
@@ -171,7 +170,6 @@ pub struct DiffView {
 }
 
 impl DiffView {
-
     /// Creates the view with empty editors and fetches content in the background.
     /// The tab appears instantly; batched remote fetch makes it feel local.
     pub fn new_loading(
@@ -231,12 +229,14 @@ impl DiffView {
                 }
             },
         ));
-        this._subscriptions.push(cx.observe(&this.left.clone(), |this, _, cx| {
-            this.sync_scroll(Side::Left, cx);
-        }));
-        this._subscriptions.push(cx.observe(&this.right.clone(), |this, _, cx| {
-            this.sync_scroll(Side::Right, cx);
-        }));
+        this._subscriptions
+            .push(cx.observe(&this.left.clone(), |this, _, cx| {
+                this.sync_scroll(Side::Left, cx);
+            }));
+        this._subscriptions
+            .push(cx.observe(&this.right.clone(), |this, _, cx| {
+                this.sync_scroll(Side::Right, cx);
+            }));
 
         this.fetch_contents(cx);
         this
@@ -260,16 +260,19 @@ impl DiffView {
                     Ok((old_text, new_text)) => {
                         view.loading = false;
                         view.load_error = None;
-                        let language =
-                            crate::editor::guess_language_from_extension(std::path::Path::new(&view.path));
+                        let language = crate::editor::guess_language_from_extension(
+                            std::path::Path::new(&view.path),
+                        );
                         view.old_highlighter = SimpleHighlighter::new(&language);
                         view.new_highlighter = SimpleHighlighter::new(&language);
                         view.old_text = old_text.clone().into();
                         view.saved_text = new_text.clone();
                         view.old_parsed = None;
                         view.new_parsed = None;
-                        view.left.update(cx, |state, cx| state.set_text(old_text, cx));
-                        view.right.update(cx, |state, cx| state.set_text(new_text, cx));
+                        view.left
+                            .update(cx, |state, cx| state.set_text(old_text, cx));
+                        view.right
+                            .update(cx, |state, cx| state.set_text(new_text, cx));
                         view.recompute(cx);
                     }
                     Err(error) => {
@@ -401,8 +404,9 @@ impl DiffView {
                         }
                     }
 
-                    let unified =
-                        super::diff_model::build_unified_collapsed(&task_old, &task_new, &hunks, &expanded);
+                    let unified = super::diff_model::build_unified_collapsed(
+                        &task_old, &task_new, &hunks, &expanded,
+                    );
                     let hunk_rows = unified.hunk_rows.clone();
                     let separators = unified.separators.clone();
                     let runs = if should_highlight {
@@ -521,21 +525,17 @@ impl DiffView {
     }
 
     /// 滚动指定编辑器到目标 buffer 行（顶部保留 `context` 行上文）。
-    fn scroll_editor_to_row(
-        editor: &Entity<InputState>,
-        row: u32,
-        context: u32,
-        cx: &mut App,
-    ) {
+    fn scroll_editor_to_row(editor: &Entity<InputState>, row: u32, context: u32, cx: &mut App) {
         let target = row.saturating_sub(context);
         let line_height = editor.read(cx).last_layout.as_ref().map(|l| l.line_height);
-        let Some(line_height) = line_height else { return };
+        let Some(line_height) = line_height else {
+            return;
+        };
         if line_height <= px(0.) {
             return;
         }
         editor.update(cx, |state, cx| {
-            state
-                .update_scroll_offset(Some(point(px(0.), -(line_height * target as f32))), cx);
+            state.update_scroll_offset(Some(point(px(0.), -(line_height * target as f32))), cx);
         });
     }
 
@@ -573,7 +573,8 @@ impl DiffView {
                 }
                 Self::scroll_editor_to_row(&right, hunk.new_rows.start, 3, cx);
                 // 左侧经映射同步（显式设置，不依赖 observe 时序）
-                let left_row = map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
+                let left_row =
+                    map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
                 let left = self.left.clone();
                 Self::scroll_editor_to_row(&left, left_row, 0, cx);
                 self.pending_jump = false;
@@ -598,13 +599,29 @@ impl DiffView {
         let top_row: u32 = match self.effective_mode() {
             DiffMode::Unified => {
                 let state = self.unified.read(cx);
-                let lh = state.last_layout.as_ref().map(|l| l.line_height).unwrap_or(px(0.));
-                if lh <= px(0.) { 0 } else { ((-state.scroll_handle.offset().y) / lh).max(0.) as u32 }
+                let lh = state
+                    .last_layout
+                    .as_ref()
+                    .map(|l| l.line_height)
+                    .unwrap_or(px(0.));
+                if lh <= px(0.) {
+                    0
+                } else {
+                    ((-state.scroll_handle.offset().y) / lh).max(0.) as u32
+                }
             }
             DiffMode::Split => {
                 let state = self.right.read(cx);
-                let lh = state.last_layout.as_ref().map(|l| l.line_height).unwrap_or(px(0.));
-                if lh <= px(0.) { 0 } else { ((-state.scroll_handle.offset().y) / lh).max(0.) as u32 }
+                let lh = state
+                    .last_layout
+                    .as_ref()
+                    .map(|l| l.line_height)
+                    .unwrap_or(px(0.));
+                if lh <= px(0.) {
+                    0
+                } else {
+                    ((-state.scroll_handle.offset().y) / lh).max(0.) as u32
+                }
             }
         };
         // 视口顶部所在或之后的第一个 hunk；若已滚过所有 hunk 则取最后一个。
@@ -612,7 +629,10 @@ impl DiffView {
             DiffMode::Unified => self.unified_hunk_rows.clone(),
             DiffMode::Split => self.hunks.iter().map(|h| h.new_rows.start).collect(),
         };
-        let idx = rows.iter().position(|&r| r + 1 >= top_row).unwrap_or(rows.len().saturating_sub(1));
+        let idx = rows
+            .iter()
+            .position(|&r| r + 1 >= top_row)
+            .unwrap_or(rows.len().saturating_sub(1));
         Some(idx)
     }
 
@@ -625,13 +645,16 @@ impl DiffView {
         match self.effective_mode() {
             DiffMode::Split => {
                 let hunk = &self.hunks[ix];
-                let left_row = map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
+                let left_row =
+                    map_line_new_to_old(hunk.new_rows.start.saturating_sub(3), &self.hunks);
                 let (right, left) = (self.right.clone(), self.left.clone());
                 Self::scroll_editor_to_row(&right, hunk.new_rows.start, 3, cx);
                 Self::scroll_editor_to_row(&left, left_row, 0, cx);
             }
             DiffMode::Unified => {
-                let Some(row) = self.unified_hunk_rows.get(ix).copied() else { return };
+                let Some(row) = self.unified_hunk_rows.get(ix).copied() else {
+                    return;
+                };
                 let editor = self.unified.clone();
                 Self::scroll_editor_to_row(&editor, row, 3, cx);
             }
@@ -671,7 +694,12 @@ impl DiffView {
         let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
         let mut i = 0;
         while i < unified.lines.len() {
-            let is_old = matches!(unified.lines[i].kind, LineKind::Del);
+            // 关键防御：用 get 替代直接索引，陈旧数据导致越界时跳过而非 panic。
+            let Some(current_line) = unified.lines.get(i) else {
+                i += 1;
+                continue;
+            };
+            let is_old = matches!(current_line.kind, LineKind::Del);
             let (highlighter, src_text, src_starts) = if is_old {
                 (&mut *old_highlighter, old_text, &old_starts[..])
             } else {
@@ -679,15 +707,15 @@ impl DiffView {
             };
 
             let first_row = if is_old {
-                unified.lines[i].old_lineno
+                current_line.old_lineno
             } else {
-                unified.lines[i].new_lineno
+                current_line.new_lineno
             };
             let Some(first_row) = first_row else {
                 i += 1;
                 continue;
             };
-            if unified.lines[i].merged_range.len() > MAX_HIGHLIGHT_LINE_LENGTH {
+            if current_line.merged_range.len() > MAX_HIGHLIGHT_LINE_LENGTH {
                 i += 1;
                 continue;
             }
@@ -709,11 +737,14 @@ impl DiffView {
 
             let first_src = line_range(src_text, src_starts, first_row);
             let mut members: Vec<(Range<usize>, Range<usize>)> =
-                vec![(first_src.clone(), unified.lines[i].merged_range.clone())];
+                vec![(first_src.clone(), current_line.merged_range.clone())];
             let mut group_end = first_src.end;
             let mut j = i + 1;
             while j < unified.lines.len() && members.len() < MAX_GROUP_LINES {
-                let line = &unified.lines[j];
+                // 关键防御：用 get 替代索引，数据竞态时中断分组而非 panic。
+                let Some(line) = unified.lines.get(j) else {
+                    break;
+                };
                 let same_kind = matches!(
                     (is_old, line.kind),
                     (true, LineKind::Del) | (false, LineKind::Context | LineKind::Add)
@@ -805,7 +836,8 @@ impl DiffView {
             // `Effect::Notify` for the destination.
             let this = cx.weak_entity();
             cx.defer(move |cx| {
-                this.update(cx, |this, _cx| this.scroll_syncing = false).ok();
+                this.update(cx, |this, _cx| this.scroll_syncing = false)
+                    .ok();
             });
         }
     }
@@ -892,7 +924,10 @@ impl DiffView {
                     .abs_diff(stale.old_rows.start)
                     .min(h.old_rows.start.abs_diff(stale.old_rows.end))
             };
-            (old_distance, h.new_rows.start.abs_diff(stale.new_rows.start))
+            (
+                old_distance,
+                h.new_rows.start.abs_diff(stale.new_rows.start),
+            )
         };
 
         let matched = fresh
@@ -1212,8 +1247,14 @@ impl DiffView {
                     .child(
                         button("diff-prev-hunk", "‹ 上一个", nav_enabled, theme).on_click(
                             cx.listener(|this, _, _, cx| {
-                                let Some(cur) = this.active_hunk_index(cx) else { return };
-                                let prev = if cur == 0 { this.hunks.len() - 1 } else { cur - 1 };
+                                let Some(cur) = this.active_hunk_index(cx) else {
+                                    return;
+                                };
+                                let prev = if cur == 0 {
+                                    this.hunks.len() - 1
+                                } else {
+                                    cur - 1
+                                };
                                 this.jump_to_hunk(prev, cx);
                             }),
                         ),
@@ -1224,7 +1265,11 @@ impl DiffView {
                             .flex()
                             .justify_center()
                             .text_size(px(11.0))
-                            .text_color(if nav_enabled { theme.text_muted } else { theme.text_subtle })
+                            .text_color(if nav_enabled {
+                                theme.text_muted
+                            } else {
+                                theme.text_subtle
+                            })
                             .child(if nav_enabled {
                                 format!("{}/{}", hunk_current.min(hunk_total), hunk_total)
                             } else {
@@ -1234,7 +1279,9 @@ impl DiffView {
                     .child(
                         button("diff-next-hunk", "下一个 ›", nav_enabled, theme).on_click(
                             cx.listener(|this, _, _, cx| {
-                                let Some(cur) = this.active_hunk_index(cx) else { return };
+                                let Some(cur) = this.active_hunk_index(cx) else {
+                                    return;
+                                };
                                 let next = (cur + 1) % this.hunks.len();
                                 this.jump_to_hunk(next, cx);
                             }),
@@ -1690,7 +1737,8 @@ mod tests {
         old_hl.update(None, &Rope::from_str(old), None);
         new_hl.update(None, &Rope::from_str(new), None);
         let theme = test_theme();
-        let runs = DiffView::merged_highlight_runs(&unified, old, new, &mut old_hl, &mut new_hl, &theme);
+        let runs =
+            DiffView::merged_highlight_runs(&unified, old, new, &mut old_hl, &mut new_hl, &theme);
         (unified, runs)
     }
 
@@ -1721,18 +1769,32 @@ mod tests {
         let (unified, runs) = build_runs(old, new);
         assert_contiguous(&runs, unified.text.len());
 
-        let del = unified.lines.iter().position(|l| l.kind == LineKind::Del).unwrap();
-        let add = unified.lines.iter().position(|l| l.kind == LineKind::Add).unwrap();
+        let del = unified
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Del)
+            .unwrap();
+        let add = unified
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Add)
+            .unwrap();
 
         // Deleted `def";` is still inside the HEAD string literal.
         let off = line_offset(&unified, del, "def\"");
-        let run = runs.iter().find(|(r, _)| r.start <= off && r.end > off).unwrap();
+        let run = runs
+            .iter()
+            .find(|(r, _)| r.start <= off && r.end > off)
+            .unwrap();
         assert_eq!(run.1.color, Some(gpui::blue()), "del line inside string");
 
         // Code after the hunk must NOT be swallowed by the merged-text
         // string: the `let` keyword after the add block is keyword-colored.
         let let_off = line_offset(&unified, add + 1, "let");
-        let run = runs.iter().find(|(r, _)| r.start <= let_off && r.end > let_off).unwrap();
+        let run = runs
+            .iter()
+            .find(|(r, _)| r.start <= let_off && r.end > let_off)
+            .unwrap();
         assert_eq!(run.1.color, Some(gpui::red()), "keyword after hunk");
     }
 
@@ -1745,29 +1807,57 @@ mod tests {
         let (unified, runs) = build_runs(old, new);
         assert_contiguous(&runs, unified.text.len());
 
-        let del = unified.lines.iter().position(|l| l.kind == LineKind::Del).unwrap();
-        let add = unified.lines.iter().position(|l| l.kind == LineKind::Add).unwrap();
+        let del = unified
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Del)
+            .unwrap();
+        let add = unified
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Add)
+            .unwrap();
 
         let off = line_offset(&unified, del, "foo");
-        let run = runs.iter().find(|(r, _)| r.start <= off && r.end > off).unwrap();
-        assert_eq!(run.1.color, Some(gpui::green()), "deleted call from HEAD tree");
+        let run = runs
+            .iter()
+            .find(|(r, _)| r.start <= off && r.end > off)
+            .unwrap();
+        assert_eq!(
+            run.1.color,
+            Some(gpui::green()),
+            "deleted call from HEAD tree"
+        );
 
         let off = line_offset(&unified, add, "bar");
-        let run = runs.iter().find(|(r, _)| r.start <= off && r.end > off).unwrap();
-        assert_eq!(run.1.color, Some(gpui::green()), "added call from working-tree");
+        let run = runs
+            .iter()
+            .find(|(r, _)| r.start <= off && r.end > off)
+            .unwrap();
+        assert_eq!(
+            run.1.color,
+            Some(gpui::green()),
+            "added call from working-tree"
+        );
     }
 
     #[test]
     fn test_fill_gaps() {
         let mut runs = vec![
-            (2..4, HighlightStyle {
-                color: Some(gpui::red()),
-                ..Default::default()
-            }),
-            (5..6, HighlightStyle {
-                color: Some(gpui::blue()),
-                ..Default::default()
-            }),
+            (
+                2..4,
+                HighlightStyle {
+                    color: Some(gpui::red()),
+                    ..Default::default()
+                },
+            ),
+            (
+                5..6,
+                HighlightStyle {
+                    color: Some(gpui::blue()),
+                    ..Default::default()
+                },
+            ),
         ];
         fill_gaps(&mut runs, 8);
         assert_eq!(runs.len(), 5);
@@ -1793,7 +1883,9 @@ mod tests {
         let mut old = String::new();
         let mut new = String::new();
         for i in 0..200 {
-            old.push_str(&format!("fn fn_{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"));
+            old.push_str(&format!(
+                "fn fn_{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"
+            ));
         }
         new.push_str(&old[..old.len()]);
         // Mid-file hunk: replace one block, leaving an unclosed string in the
@@ -1828,7 +1920,7 @@ mod tests {
             if s > cursor {
                 styles.push((cursor..s, HighlightStyle::default()));
             }
-            styles.push((s..e, style.clone()));
+            styles.push((s..e, *style));
             cursor = e.max(cursor);
         }
         if cursor < byte_end {
@@ -1870,7 +1962,9 @@ mod tests {
         let mut old = String::new();
         let mut new = String::new();
         for i in 0..120 {
-            old.push_str(&format!("fn f{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"));
+            old.push_str(&format!(
+                "fn f{i}() -> u32 {{\n    let v = {i};\n    v + 1\n}}\n"
+            ));
         }
         new.push_str(&old[..old.len()]);
         // Mid-file hunk with an unclosed string in an added line.
@@ -1902,7 +1996,7 @@ mod tests {
                     if s > cursor {
                         styles.push((cursor..s, HighlightStyle::default()));
                     }
-                    styles.push((s..e, style.clone()));
+                    styles.push((s..e, *style));
                     cursor = e.max(cursor);
                 }
                 if cursor < byte_end {
@@ -1923,8 +2017,7 @@ mod tests {
                     };
                     for range in &wrapped {
                         // Inline copy of runs_for_range
-                        let g_range =
-                            (run_offset + range.start)..(run_offset + range.end);
+                        let g_range = (run_offset + range.start)..(run_offset + range.end);
                         let mut cur = 0usize;
                         let mut pulled = 0usize;
                         for &len in &run_lens {
@@ -1964,7 +2057,9 @@ mod tests {
         let mut old = String::new();
         let mut new = String::new();
         for i in 0..60 {
-            old.push_str(&format!("fn f{i}() -> u32 {{\r\n    let s = \"中文{i}；测试\\n\";\r\n    s.len()\r\n}}\r\n"));
+            old.push_str(&format!(
+                "fn f{i}() -> u32 {{\r\n    let s = \"中文{i}；测试\\n\";\r\n    s.len()\r\n}}\r\n"
+            ));
         }
         new.push_str(&old[..old.len()]);
         let marker = "fn f30";
@@ -1994,7 +2089,7 @@ mod tests {
                     if s > cursor {
                         styles.push((cursor..s, HighlightStyle::default()));
                     }
-                    styles.push((s..e, style.clone()));
+                    styles.push((s..e, *style));
                     cursor = e.max(cursor);
                 }
                 if cursor < byte_end {
@@ -2145,7 +2240,7 @@ mod tests {
                 if s > cursor {
                     styles.push((cursor..s, HighlightStyle::default()));
                 }
-                styles.push((s..e, style.clone()));
+                styles.push((s..e, *style));
                 cursor = e.max(cursor);
             }
             if cursor < byte_end {
@@ -2153,10 +2248,8 @@ mod tests {
             }
 
             // ---- prepaint: offset-dropped TextRun list (len + color) ----
-            let text_runs: Vec<(usize, Option<gpui::Hsla>)> = styles
-                .iter()
-                .map(|(r, s)| (r.len(), s.color))
-                .collect();
+            let text_runs: Vec<(usize, Option<gpui::Hsla>)> =
+                styles.iter().map(|(r, s)| (r.len(), s.color)).collect();
 
             // ---- layout_lines walk ----
             let mut run_offset = 0;
@@ -2262,11 +2355,7 @@ mod tests {
                     .iter()
                     .find(|(r, _)| r.start <= pos && r.end > pos)
                     .unwrap_or_else(|| panic!("no run at {pos}"));
-                assert_eq!(
-                    run.1.color,
-                    Some(gpui::red()),
-                    "keyword at {pos} not red"
-                );
+                assert_eq!(run.1.color, Some(gpui::red()), "keyword at {pos} not red");
                 off = pos + 1;
             }
         }
@@ -2316,7 +2405,8 @@ mod tests {
         let fill_end = rope.line_start_offset(last + 1);
         styles.sort_by(|a, b| a.0.start.cmp(&b.0.start).then(a.0.end.cmp(&b.0.end)));
         let input = std::mem::take(&mut styles);
-        let mut filled: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(input.len() * 2 + 1);
+        let mut filled: Vec<(Range<usize>, HighlightStyle)> =
+            Vec::with_capacity(input.len() * 2 + 1);
         let mut cursor = fill_start;
         for (range, style) in input {
             if range.end <= fill_start || range.start >= fill_end {
@@ -2520,7 +2610,11 @@ mod tests {
             vec![hunk(10..20, 10..12)],
             vec![hunk(10..12, 10..20)],
             vec![hunk(10..20, 10..12), hunk(30..40, 22..42)],
-            vec![hunk(10..20, 10..12), hunk(30..40, 22..42), hunk(50..55, 52..53)],
+            vec![
+                hunk(10..20, 10..12),
+                hunk(30..40, 22..42),
+                hunk(50..55, 52..53),
+            ],
             vec![hunk(0..5, 0..30), hunk(20..25, 45..46)],
             vec![hunk(10..20, 10..10)],
             vec![hunk(10..10, 10..20)],

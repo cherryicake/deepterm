@@ -171,11 +171,11 @@ impl TransferBellPanel {
         // 生效，而不是“关→开”抖动。
         if !self.panel_open
             && let Some(dismissed_at) = self.panel_dismissed_at
-                && dismissed_at.elapsed() < Duration::from_millis(300)
-            {
-                self.panel_dismissed_at = None;
-                return;
-            }
+            && dismissed_at.elapsed() < Duration::from_millis(300)
+        {
+            self.panel_dismissed_at = None;
+            return;
+        }
         if self.panel_open {
             self.close_panel(cx);
         } else {

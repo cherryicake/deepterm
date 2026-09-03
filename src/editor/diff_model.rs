@@ -65,28 +65,24 @@ pub fn compute_hunks(old_text: &str, new_text: &str) -> Vec<DiffHunk> {
                 0..0
             };
 
-            let (old_word_ranges, new_word_ranges) = if should_word_diff(
-                &old_rows,
-                &old_byte_range,
-                &new_rows,
-                &new_byte_range,
-            ) {
-                let (mut o, mut n) = word_diff_ranges(
-                    &old_text[old_byte_range.clone()],
-                    &new_text[new_byte_range.clone()],
-                );
-                for r in &mut o {
-                    r.start += old_byte_range.start;
-                    r.end += old_byte_range.start;
-                }
-                for r in &mut n {
-                    r.start += new_byte_range.start;
-                    r.end += new_byte_range.start;
-                }
-                (o, n)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+            let (old_word_ranges, new_word_ranges) =
+                if should_word_diff(&old_rows, &old_byte_range, &new_rows, &new_byte_range) {
+                    let (mut o, mut n) = word_diff_ranges(
+                        &old_text[old_byte_range.clone()],
+                        &new_text[new_byte_range.clone()],
+                    );
+                    for r in &mut o {
+                        r.start += old_byte_range.start;
+                        r.end += old_byte_range.start;
+                    }
+                    for r in &mut n {
+                        r.start += new_byte_range.start;
+                        r.end += new_byte_range.start;
+                    }
+                    (o, n)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
             DiffHunk {
                 old_rows,
@@ -141,13 +137,13 @@ pub fn build_unified(old_text: &str, new_text: &str) -> UnifiedSource {
     let mut lines = Vec::new();
 
     let push_line = |kind: LineKind,
-                         old_lineno: Option<u32>,
-                         new_lineno: Option<u32>,
-                         source: &str,
-                         source_range: Range<usize>,
-                         word_ranges: &[Range<usize>],
-                         text: &mut String,
-                         lines: &mut Vec<UnifiedLine>| {
+                     old_lineno: Option<u32>,
+                     new_lineno: Option<u32>,
+                     source: &str,
+                     source_range: Range<usize>,
+                     word_ranges: &[Range<usize>],
+                     text: &mut String,
+                     lines: &mut Vec<UnifiedLine>| {
         let merged_start = text.len();
         text.push_str(&source[source_range.clone()]);
         let merged_end = text.len();
@@ -347,7 +343,9 @@ pub(crate) fn build_unified_collapsed(
             return;
         }
         if gap_len <= 2 * CONTEXT_LINES {
-            push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+            push_context(
+                text, lines, new_text, new_starts, new_from, new_to, old_from,
+            );
             return;
         }
 
@@ -369,7 +367,9 @@ pub(crate) fn build_unified_collapsed(
         // id = new-side start line of the hidden region: stable across
         // recomputes, so it doubles as the expansion key.
         if expanded.contains(&hidden_start) {
-            push_context(text, lines, new_text, new_starts, new_from, new_to, old_from);
+            push_context(
+                text, lines, new_text, new_starts, new_from, new_to, old_from,
+            );
             return;
         }
         if !trailing {
@@ -448,7 +448,16 @@ pub(crate) fn build_unified_collapsed(
                 old_lineno: Some(row),
                 new_lineno: None,
                 merged_range: start..text.len() - 1,
-                word_ranges: hunk.old_word_ranges.iter().filter(|r| r.start < range.end && r.end > range.start).map(|r| { let s = r.start.max(range.start) - range.start + start; let e = r.end.min(range.end) - range.start + start; s..e }).collect(),
+                word_ranges: hunk
+                    .old_word_ranges
+                    .iter()
+                    .filter(|r| r.start < range.end && r.end > range.start)
+                    .map(|r| {
+                        let s = r.start.max(range.start) - range.start + start;
+                        let e = r.end.min(range.end) - range.start + start;
+                        s..e
+                    })
+                    .collect(),
             });
         }
         for row in hunk.new_rows.start..hunk.new_rows.end {
@@ -461,7 +470,16 @@ pub(crate) fn build_unified_collapsed(
                 old_lineno: None,
                 new_lineno: Some(row),
                 merged_range: start..text.len() - 1,
-                word_ranges: hunk.new_word_ranges.iter().filter(|r| r.start < range.end && r.end > range.start).map(|r| { let s = r.start.max(range.start) - range.start + start; let e = r.end.min(range.end) - range.start + start; s..e }).collect(),
+                word_ranges: hunk
+                    .new_word_ranges
+                    .iter()
+                    .filter(|r| r.start < range.end && r.end > range.start)
+                    .map(|r| {
+                        let s = r.start.max(range.start) - range.start + start;
+                        let e = r.end.min(range.end) - range.start + start;
+                        s..e
+                    })
+                    .collect(),
             });
         }
         old_cursor = hunk.old_rows.end;

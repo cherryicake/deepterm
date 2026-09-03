@@ -264,9 +264,7 @@ impl SyntaxColors {
             // CSS at-rules (emitted by tree-sitter-css) are keywords in VSCode.
             "charset" | "keyframes" | "media" | "supports" => "keyword",
             "function.macro" | "function.method" | "function.call" | "function.builtin"
-            | "function.special" | "method" | "method.call" | "method.definition" => {
-                "function"
-            }
+            | "function.special" | "method" | "method.call" | "method.definition" => "function",
             "constant.builtin" | "constant.macro" => "constant",
             "float" | "number.float" => "number",
             "variable.builtin" | "variable.special" => "variable.special",
@@ -431,8 +429,7 @@ impl StatusColors {
 
     #[inline]
     pub fn error_background(&self, _cx: &App) -> Hsla {
-        self.error_background
-            .unwrap_or(gpui::red().alpha(0.2))
+        self.error_background.unwrap_or(gpui::red().alpha(0.2))
     }
 
     #[inline]
@@ -447,8 +444,7 @@ impl StatusColors {
 
     #[inline]
     pub fn warning_background(&self, _cx: &App) -> Hsla {
-        self.warning_background
-            .unwrap_or(gpui::yellow().alpha(0.2))
+        self.warning_background.unwrap_or(gpui::yellow().alpha(0.2))
     }
 
     #[inline]
@@ -463,8 +459,7 @@ impl StatusColors {
 
     #[inline]
     pub fn info_background(&self, _cx: &App) -> Hsla {
-        self.info_background
-            .unwrap_or(gpui::blue().alpha(0.2))
+        self.info_background.unwrap_or(gpui::blue().alpha(0.2))
     }
 
     #[inline]
@@ -479,8 +474,7 @@ impl StatusColors {
 
     #[inline]
     pub fn success_background(&self, _cx: &App) -> Hsla {
-        self.success_background
-            .unwrap_or(gpui::green().alpha(0.2))
+        self.success_background.unwrap_or(gpui::green().alpha(0.2))
     }
 
     #[inline]
@@ -588,22 +582,32 @@ impl LanguageRegistry {
 
     /// Registers a new language configuration to the registry.
     pub fn register(&self, lang: &str, config: &LanguageConfig) {
+        // 关键防御：后台高亮线程 panic 可能毒化锁，不得 unwrap 拖垮 UI，
+        // 毒化时取内部数据继续服务，保证语法高亮永不因锁问题崩溃。
         self.languages
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(lang.to_string().into(), config.clone());
     }
 
     /// Returns a list of all registered language names.
     pub fn languages(&self) -> Vec<SharedString> {
-        self.languages.lock().unwrap().keys().cloned().collect()
+        self.languages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Returns the language configuration for the given language name.
     pub fn language(&self, name: &str) -> Option<LanguageConfig> {
         // Try to get by name first, there may have a custom language registered
         // Then try to get built-in language to support short language names, e.g. "js" for "javascript"
-        let languages = self.languages.lock().unwrap();
+        let languages = self
+            .languages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         languages
             .get(name)
             .or_else(|| languages.get(languages::Language::from_id(name).name()))
@@ -613,8 +617,8 @@ impl LanguageRegistry {
 
 #[cfg(test)]
 mod tests {
-    use crate::editor::syntax::LanguageConfig;
     use super::SyntaxColors;
+    use crate::editor::syntax::LanguageConfig;
 
     #[test]
     fn test_registry() {
