@@ -14,18 +14,33 @@ use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::file_manager::TRANSFER_CANCELLED_MSG;
+use crate::ssh::TRANSFER_CANCELLED_MSG;
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
-use crate::ssh::auth::{try_agent_auth, try_default_keys};
+use crate::ssh::auth::try_agent_auth;
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
     ResolvedAuthMethod, load_certificate, load_key_material, resolve_auth_method,
 };
 
+/// 在共享 tokio runtime 上同步执行一个 SFTP 异步块。
+///
+/// sftp_fs 的同步 API 大量采用「`block_on(async { … })`」包装；此宏把
+/// runtime 获取 + block_on 的样板收敛到一处，每个调用点只留业务逻辑。
+macro_rules! sftp_block_on {
+    ($body:block) => {
+        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async $body)
+    };
+}
+
 /// 命令输出的实时进度回调：每收到一块 stderr 数据调用一次。
 type ProgressCallback<'a> = Option<&'a mut dyn FnMut(&[u8])>;
 /// 分片读取任务：成功时返回 `(分片起始偏移, 数据)`。
 type ChunkReadFuture<'a> = futures::future::BoxFuture<'a, anyhow::Result<(u64, Vec<u8>)>>;
+
+/// `execute_command*` 家族的 stdout/stderr 累积上限（64MB）。
+/// 该 API 是通用入口（file_manager 用它跑 scp/du/find 等），无上限时一条
+/// 失控命令可在超时（默认上限 24h）前耗尽本机内存。
+const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteFileKind {
@@ -117,7 +132,7 @@ impl BlockingSftpSession {
     }
 
     pub fn canonicalize(&mut self, path: &str) -> anyhow::Result<String> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp
                 .canonicalize(path)
                 .await
@@ -126,7 +141,7 @@ impl BlockingSftpSession {
     }
 
     pub fn metadata(&mut self, path: &str) -> anyhow::Result<RemoteFileMetadata> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let metadata = self.sftp.metadata(path).await?;
             Ok(convert_metadata(
                 metadata.file_type(),
@@ -140,7 +155,7 @@ impl BlockingSftpSession {
     /// 与 [`metadata`](Self::metadata) 相同，但**不跟随符号链接**：返回链接自身的属性。
     /// 用于删源等需要区分"链接本身"与"链接目标"的场景，避免误删/误递归到目标。
     pub fn symlink_metadata(&mut self, path: &str) -> anyhow::Result<RemoteFileMetadata> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let metadata = self.sftp.symlink_metadata(path).await?;
             Ok(convert_metadata(
                 metadata.file_type(),
@@ -152,14 +167,14 @@ impl BlockingSftpSession {
     }
 
     pub fn permissions(&mut self, path: &str) -> anyhow::Result<Option<u32>> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let metadata = self.sftp.metadata(path).await?;
             Ok(metadata.permissions)
         })
     }
 
     pub fn set_permissions(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut attrs = FileAttributes::empty();
             attrs.permissions = Some(mode);
             self.sftp.set_metadata(path, attrs).await?;
@@ -168,7 +183,7 @@ impl BlockingSftpSession {
     }
 
     pub fn exists(&mut self, path: &str) -> anyhow::Result<bool> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp
                 .try_exists(path)
                 .await
@@ -193,15 +208,14 @@ impl BlockingSftpSession {
                 continue;
             }
 
-            crate::ssh::shared_runtime::shared_ssh_runtime()
-                .block_on(async { self.sftp.create_dir(current.clone()).await })?;
+            sftp_block_on!({ self.sftp.create_dir(current.clone()).await })?;
         }
 
         Ok(())
     }
 
     pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp
                 .rename(from, to)
                 .await
@@ -210,7 +224,7 @@ impl BlockingSftpSession {
     }
 
     pub fn remove_file(&mut self, path: &str) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp
                 .remove_file(path)
                 .await
@@ -219,7 +233,7 @@ impl BlockingSftpSession {
     }
 
     pub fn remove_dir(&mut self, path: &str) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp
                 .remove_dir(path)
                 .await
@@ -257,7 +271,7 @@ impl BlockingSftpSession {
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
         let mut local_file = File::open(local_path)?;
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut remote_file = self.sftp.create(remote_path).await?;
             let mut transferred = 0;
             let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
@@ -304,7 +318,7 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
     ) -> anyhow::Result<u64> {
         let mut local_file = File::open(local_path)?;
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let attrs = FileAttributes {
                 permissions: Some(mode),
                 ..FileAttributes::empty()
@@ -375,7 +389,7 @@ impl BlockingSftpSession {
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
         let mut local_file = File::create(local_path)?;
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut remote_file = self.sftp.open(remote_path).await?;
             let mut transferred = 0;
             let mut buffer = vec![0; Self::TRANSFER_BUFFER_SIZE];
@@ -419,8 +433,16 @@ impl BlockingSftpSession {
     ) -> anyhow::Result<u64> {
         let source_permissions = self.permissions(source_path).ok().flatten();
         let size = self.metadata(source_path)?.size;
-        // 使用临时文件避免传输中断时污染目标路径
-        let temporary_path = format!("{}.deepterm-part", destination_path);
+        // 临时文件名带 pid+纳秒：多个并发任务复制到同一目标时不会
+        // 互相删除/覆盖对方的 .deepterm-part 文件。
+        let temporary_path = format!(
+            "{destination_path}.deepterm-part.{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
 
         if self.exists(&temporary_path)? {
             let _ = self.remove_file(&temporary_path);
@@ -491,7 +513,7 @@ impl BlockingSftpSession {
     }
 
     pub fn read_dir(&mut self, path: &str) -> anyhow::Result<Vec<RemoteFileEntry>> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let entries = self
                 .sftp
                 .read_dir(path)
@@ -516,7 +538,7 @@ impl BlockingSftpSession {
     /// 发送轻量级 SFTP ping（stat "."）以保持 SSH 连接活跃。
     /// 适合用于心跳保活场景。
     pub fn ping(&mut self) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             self.sftp.metadata(".").await?;
             Ok(())
         })
@@ -525,7 +547,7 @@ impl BlockingSftpSession {
     pub fn read_text_preview(&mut self, path: &str) -> anyhow::Result<Option<String>> {
         const PREVIEW_BYTES: usize = 64 * 1024;
 
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.take(PREVIEW_BYTES as u64)
@@ -551,7 +573,7 @@ impl BlockingSftpSession {
 
     /// 读取完整远程文件内容，若检测到二进制内容则返回 None。
     pub fn read_file_to_string(&mut self, path: &str) -> anyhow::Result<Option<String>> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
@@ -574,7 +596,7 @@ impl BlockingSftpSession {
     }
 
     pub fn read_file_bytes_simple(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).await?;
@@ -592,7 +614,7 @@ impl BlockingSftpSession {
         path: &str,
         limit: usize,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
             file.take(limit as u64).read_to_end(&mut bytes).await?;
@@ -618,7 +640,7 @@ impl BlockingSftpSession {
 
     /// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
     pub fn write_file_string(&mut self, path: &str, content: &str) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut file = self.sftp.create(path).await?;
             file.write_all(content.as_bytes()).await?;
             file.flush().await?;
@@ -631,7 +653,7 @@ impl BlockingSftpSession {
     /// 将原始字节整体写入远程文件（覆盖已存在的文件）。
     /// 用于按非 UTF-8 编码（GBK / UTF-16 等）保存编辑器内容。
     pub fn write_file_bytes(&mut self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut file = self.sftp.create(path).await?;
             file.write_all(bytes).await?;
             file.flush().await?;
@@ -652,7 +674,7 @@ impl BlockingSftpSession {
             format!("{path}.tmp.{pid}-{nanos}")
         };
 
-        let write_ok = crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        let write_ok = sftp_block_on!({
             let mut file = self.sftp.create(tmp.clone()).await?;
             file.write_all(bytes).await?;
             file.flush().await?;
@@ -670,12 +692,96 @@ impl BlockingSftpSession {
         if rename_result.is_ok() {
             return Ok(());
         }
-        // 部分服务端在目标已存在时拒绝覆盖：先删除再重试
-        let first = rename_result.unwrap_err();
-        let _ = self.remove_file(path);
-        self.rename(&tmp, path).map_err(|e| {
-            let _ = self.remove_file(&tmp);
-            anyhow::anyhow!("atomic rename failed: {first}; retry: {e}")
+        let first_err = rename_result.unwrap_err();
+
+        // rename 失败有两类原因，处理策略不同：
+        // 1) 会话失活（连接被断）：立即放弃，保留 tmp —— 此时删除目标文件只会
+        //    造成数据丢失（删除和重试大概率也失败）。
+        // 2) 应用级失败：部分服务端（SFTPv3 语义，如 OpenSSH 默认配置）在目标
+        //    已存在时拒绝 rename 覆盖 —— 需要走「备份原文件 → 删目标 → 重命名」。
+        //    任何一步失败都保留备份 / tmp，保证至少存在一份可恢复的数据。
+        if self.ping().is_err() {
+            anyhow::bail!(
+                "写入 {path} 失败（会话已断开）: {first_err}；新内容已保留在临时文件 {tmp}"
+            );
+        }
+        if !self.exists(path)? {
+            // 目标不存在却 rename 失败：可能是瞬时错误，直接重试一次。
+            if self.rename(&tmp, path).is_ok() {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "写入 {path} 失败: {first_err}；新内容已保留在临时文件 {tmp}"
+            );
+        }
+
+        // 目标已存在（覆盖保存）。先把原文件复制为同目录备份，再删目标、重命名；
+        // 重命名失败时用备份恢复原文件。绝不进入「原文件已删且新内容也丢」的状态。
+        let bak = format!(
+            "{path}.deepterm-bak.{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let copied = self.copy_remote_file_streamed(path, &bak);
+        if let Err(e) = copied {
+            anyhow::bail!(
+                "写入 {path} 失败: {first_err}；覆盖前备份原文件也失败: {e}；已中止写入，新内容保留在 {tmp}"
+            );
+        }
+
+        // 备份就绪：删除旧目标并落位新内容。
+        let remove_result = self.remove_file(path);
+        if let Err(e) = remove_result {
+            let _ = self.remove_file(&bak);
+            anyhow::bail!(
+                "写入 {path} 失败: {first_err}；删除旧文件失败: {e}；新内容保留在 {tmp}"
+            );
+        }
+        match self.rename(&tmp, path) {
+            Ok(()) => {
+                let _ = self.remove_file(&bak);
+                Ok(())
+            }
+            Err(e) => {
+                // 落位失败：恢复原文件；tmp（新内容）与 bak（旧内容）都保留，
+                // 用户可手动恢复任意一份。
+                let restore = self.rename(&bak, path);
+                if let Err(restore_err) = restore {
+                    anyhow::bail!(
+                        "写入 {path} 失败: {first_err}; retry: {e}；恢复原文件也失败: {restore_err}；\
+                         旧内容保留在 {bak}，新内容保留在 {tmp}"
+                    );
+                }
+                anyhow::bail!(
+                    "写入 {path} 失败: {first_err}; retry: {e}；已恢复原文件，新内容保留在 {tmp}"
+                );
+            }
+        }
+    }
+
+    /// 同目录内的流式复制（256KB 分块），供原子写的覆盖前备份使用。
+    /// 全程不把文件完整读入内存，大文件也只占固定缓冲。
+    fn copy_remote_file_streamed(&mut self, src: &str, dst: &str) -> anyhow::Result<u64> {
+        sftp_block_on!({
+            let mut input = self.sftp.open(src).await?;
+            let mut output = self.sftp.create(dst.to_string()).await?;
+            let mut buffer = vec![0u8; Self::TRANSFER_BUFFER_SIZE];
+            let mut total: u64 = 0;
+            loop {
+                let n = input.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..n]).await?;
+                total += n as u64;
+            }
+            output.flush().await?;
+            output.sync_all().await?;
+            output.shutdown().await?;
+            Ok::<u64, anyhow::Error>(total)
         })
     }
 
@@ -758,7 +864,7 @@ impl BlockingSftpSession {
         mut progress_cb: ProgressCallback<'_>,
         agent_forward: bool,
     ) -> anyhow::Result<RemoteCommandResult> {
-        crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async {
+        sftp_block_on!({
             let mut channel = self
                 .handle
                 .channel_open_session()
@@ -807,12 +913,31 @@ impl BlockingSftpSession {
                     };
                     match msg {
                         Some(russh::ChannelMsg::Data { data }) => {
+                            // 输出上限：execute_command 是通用入口（file_manager
+                            // 用它跑 scp/du/find 等），一条失控命令（误把
+                            // `cat /dev/zero` 之类当作命令）不能在超时前耗尽内存。
+                            if stdout.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                return Err(anyhow!(
+                                    "命令输出超过上限 {} 字节（可能不是预期命令）",
+                                    MAX_COMMAND_OUTPUT_BYTES
+                                ));
+                            }
                             stdout.extend_from_slice(&data);
                         }
                         // `ext == 1` 即 stderr，直接写成字面量模式，无需 guard。
                         Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
                             if let Some(cb) = progress_cb.as_mut() {
                                 cb(&data);
+                            }
+                            if stderr.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                return Err(anyhow!(
+                                    "命令 stderr 超过上限 {} 字节",
+                                    MAX_COMMAND_OUTPUT_BYTES
+                                ));
                             }
                             stderr.extend_from_slice(&data);
                         }
@@ -936,6 +1061,17 @@ fn idle_check(entry: &CacheEntry) -> IdleCheck {
     }
 }
 
+/// FNV-1a 64 位哈希：用于 cache_key 中区分密码内容而不驻留明文。
+/// 非加密用途（仅需区分不同输入），无需加密强度。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn cache_key(config: &SshConnectionConfig) -> String {
     // v2: inactivity_timeout disabled for long file transfers
     // Build a compact key from identifying fields instead of full JSON serialization
@@ -953,8 +1089,11 @@ fn cache_key(config: &SshConnectionConfig) -> String {
     use crate::ssh::config::AuthMethod;
     match &config.auth_method {
         AuthMethod::Password { password } => {
+            // 用内容哈希而非明文或长度：长度无法区分同长度不同密码（改密后命中旧
+            // 会话）；明文会随 key 长期驻留 HashMap。FNV-1a 单向、无碰撞性对本
+            // 用途（进程内缓存区分）足够。
             use std::fmt::Write;
-            let _ = write!(key, ":pw:{}", password.len());
+            let _ = write!(key, ":pw:{:016x}", fnv1a64(password.as_bytes()));
         }
         AuthMethod::PasswordRef { keychain_id } => {
             use std::fmt::Write;
@@ -1087,10 +1226,21 @@ pub fn with_cached_session<T>(
     let first = f(&mut session.lock());
     let result = match first {
         Ok(result) => Ok(result),
-        Err(_) => {
-            // 失败一次：剔除该会话并重连一次（连接可能在传输中被服务端关闭）。
-            // 注意必须复用同一个绑定，最终归还的是重连后的会话，
-            // 而不是这个已被剔除的坏会话。
+        Err(err) => {
+            // 仅当会话确实失活（连接被服务端/网络中断）时才重连重跑一次；
+            // 会话仍然存活说明是应用级错误（用户取消、路径校验失败、远端
+            // 返回的业务错误等），直接返回，避免非幂等操作（rm/scp/覆盖写）
+            // 被执行两次，也避免取消传输触发一次无意义的重连。
+            if session.lock().ping().is_ok() {
+                log::debug!(
+                    "with_cached_session: 会话存活，按应用错误返回（不重试）: {err:#}"
+                );
+                checkin_session(&key, session);
+                return Err(err);
+            }
+            // 会话失活：剔除并重连一次。注意必须复用同一个绑定，最终归还的
+            // 是重连后的会话，而不是这个已被剔除的坏会话。
+            log::debug!("with_cached_session: 会话失活，重连重试: {err:#}");
             evict_session(&key, &session);
             session = get_or_connect_session(config, &key)?;
             f(&mut session.lock())
@@ -1240,16 +1390,28 @@ async fn connect_sftp(
         ..Default::default()
     });
 
-    let mut handle = client::connect(
-        russh_config,
-        (config.host.as_str(), config.port),
-        SftpClientHandler {
-            host: config.host.clone(),
-            port: config.port,
-            host_key_policy: crate::ssh::host_key::policy_from_global_config(),
-        },
+    // config.timeout 生效：TCP+SSH 握手整体限时（此前从未被使用）。
+    let mut handle = tokio::time::timeout(
+        std::time::Duration::from_secs(config.timeout.max(1)),
+        client::connect(
+            russh_config,
+            (config.host.as_str(), config.port),
+            SftpClientHandler {
+                host: config.host.clone(),
+                port: config.port,
+                host_key_policy: crate::ssh::host_key::policy_from_global_config(),
+            },
+        ),
     )
     .await
+    .map_err(|_| {
+        anyhow!(
+            "连接超时（{} 秒内未完成与 {}:{} 的 TCP/SSH 握手）",
+            config.timeout,
+            config.host,
+            config.port
+        )
+    })?
     .map_err(|e| anyhow!("TCP/SSH 握手失败: {}", e))?;
 
     let auth_result = authenticate(&mut handle, config).await?;
@@ -1311,7 +1473,7 @@ async fn authenticate(
 
     match &resolved_auth {
         ResolvedAuthMethod::Password { password } => handle
-            .authenticate_password(&config.username, password)
+            .authenticate_password(&config.username, password.as_str())
             .await
             .map_err(|e| anyhow!("密码认证失败: {}", e)),
         ResolvedAuthMethod::PrivateKey {
@@ -1320,7 +1482,7 @@ async fn authenticate(
             certificate_path,
             ..
         } => {
-            let key = load_key_material(path, passphrase.as_deref())?;
+            let key = load_key_material(path, passphrase.as_deref().map(|p| p.as_str()))?;
             if let Some(certificate_path) = certificate_path {
                 let cert = load_certificate(certificate_path)?;
                 handle
@@ -1343,7 +1505,8 @@ async fn authenticate(
                     .map_err(|e| anyhow!("公钥认证失败: {}", e))
             }
         }
-        ResolvedAuthMethod::Auto => try_default_keys(handle, config).await,
+        // Auto 语义与终端通道一致：agent → 默认密钥（此前只试默认密钥）。
+        ResolvedAuthMethod::Auto => try_agent_auth(handle, config).await,
         ResolvedAuthMethod::Agent => try_agent_auth(handle, config).await,
     }
 }

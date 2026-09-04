@@ -6,11 +6,12 @@ use std::process::Command;
 use anyhow::anyhow;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    MouseButton, Render, ScrollHandle, ScrollWheelEvent, Window, div, px,
+    App, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, IntoElement,
+    KeyDownEvent, MouseButton, Render, ScrollHandle, ScrollWheelEvent, UTF16Selection, Window,
+    div, px,
 };
 
-use crate::callbacks::{OptionalAppCallback, OptionalStrAppCallback};
+use crate::components::callbacks::{OptionalAppCallback, OptionalStrAppCallback};
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::ssh::keychain::{
@@ -26,6 +27,9 @@ pub struct MultilineTextArea {
     height: f32,
     scroll_handle: ScrollHandle,
     on_change: OptionalStrAppCallback,
+    /// IME 组字区间（String 字节区间）：组字期间键盘输入被系统接管，
+    /// 仅在 unmark 后恢复普通插入路径。
+    marked_range: Option<std::ops::Range<usize>>,
 }
 
 impl MultilineTextArea {
@@ -37,6 +41,7 @@ impl MultilineTextArea {
             height: 120.0,
             scroll_handle: ScrollHandle::new(),
             on_change: None,
+            marked_range: None,
         }
     }
 
@@ -110,15 +115,141 @@ impl MultilineTextArea {
             }
             "enter" | "return" => self.append_text("\n", cx),
             "space" => self.append_text(" ", cx),
-            _ if key.len() == 1 => self.append_text(key, cx),
+            // 普通字符（含非 ASCII/IME 输入）统一走 EntityInputHandler 的
+            // replace_text_in_range / replace_and_mark_text_in_range，
+            // 避免双写与 IME 无法输入的问题。
             _ => {}
         }
     }
 }
 
-impl Focusable for MultilineTextArea {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+crate::impl_focusable!(MultilineTextArea);
+
+/// UTF-16 坐标 → 字节坐标（组字区间换算用）。
+/// 返回 None 表示坐标落在 surrogate pair 中间，按向上取整处理。
+fn utf16_index_to_byte(text: &str, utf16_idx: usize) -> Option<usize> {
+    let mut units = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if units == utf16_idx {
+            return Some(byte_idx);
+        }
+        units += ch.len_utf16();
+    }
+    (units == utf16_idx).then_some(text.len())
+}
+
+/// 简单的纯文本输入模型：光标永远在末尾，无选区编辑。
+/// 实现该 trait 后键盘/IME 输入走 GPUI 的系统输入通道（含中文组字），
+/// 修复此前 `key.len() == 1` 只接受 ASCII、IME 无法输入的问题。
+impl EntityInputHandler for MultilineTextArea {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // 光标在末尾（UTF-16 坐标）
+        let utf16_len = self.text.encode_utf16().count();
+        Some(UTF16Selection {
+            range: utf16_len..utf16_len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        // GPUI 要求 UTF-16 坐标；文本无 surrogate 时与字节坐标一致，
+        // 用前缀计数保准确。
+        self.marked_range.as_ref().map(|r| {
+            let prefix = self.text[..r.start].encode_utf16().count();
+            let len = self.text[r.clone()].encode_utf16().count();
+            prefix..prefix + len
+        })
+    }
+
+    fn text_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        // UTF-16 → 字节坐标换算
+        let byte_start = utf16_index_to_byte(&self.text, range_utf16.start)?;
+        let byte_end = utf16_index_to_byte(&self.text, range_utf16.end)?;
+        Some(self.text[byte_start..byte_end].to_string())
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        // 简单模型不支持按区间定位光标矩形：返回 None，系统退化为不绘制
+        // IME 组字候选窗口的精确定位（仍在输入面板附近弹出）。
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 确认插入：若存在组字区间则替换之（IME 提交），否则末尾追加。
+        // 注意：提交发生在 replace_and_mark 建立的组字区间上时，系统可能
+        // 不会先调 unmark，所以这里必须自行清除组字区间。
+        match self.marked_range.take() {
+            Some(range) => {
+                self.text.replace_range(range, new_text);
+                if let Some(ref callback) = self.on_change {
+                    callback(&self.text, cx);
+                }
+                cx.notify();
+            }
+            None => self.append_text(new_text, cx),
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // IME 组字中：用组字文本替换当前组字区间（或末尾追加）
+        let start = match self.marked_range.take() {
+            Some(range) => range.start,
+            None => self.text.len(),
+        };
+        self.text.replace_range(start..self.text.len(), new_text);
+        let new_len = new_text.len();
+        self.marked_range = Some(start..start + new_len);
+        if let Some(ref callback) = self.on_change {
+            callback(&self.text, cx);
+        }
+        cx.notify();
     }
 }
 
@@ -374,31 +505,46 @@ impl KeychainEditor {
     fn import_key_from_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
+            // osascript 的 `.output()` 会阻塞到用户关闭系统文件对话框——
+            // 此前在 UI 线程同步调用，对话框期间整个界面假死（无法重绘/
+            // 动画停摆）。移到后台线程执行，完成后回实体（与非 macOS 分支
+            // 的 prompt_for_paths 异步模式一致）。
             let ssh_dir = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".ssh");
-            let prompt = choose_file_with_osascript(&ssh_dir);
-            match prompt {
-                Ok(Some(path)) => {
-                    self.start_new_key(cx);
-                    match normalize_imported_key_path(path) {
-                        Ok((private_key_path, certificate_path)) => {
-                            self.load_key_bundle(private_key_path, certificate_path, cx);
+            let _ = window;
+            cx.spawn_in(window, async move |this, cx| {
+                let prompt = cx
+                    .background_executor()
+                    .spawn(async move { choose_file_with_osascript(&ssh_dir) })
+                    .await;
+                match prompt {
+                    Ok(Some(path)) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.start_new_key(cx);
+                            match normalize_imported_key_path(path) {
+                                Ok((private_key_path, certificate_path)) => {
+                                    this.load_key_bundle(private_key_path, certificate_path, cx);
+                                    cx.notify();
+                                }
+                                Err(err) => {
+                                    this.error_message = Some(err.to_string());
+                                    cx.notify();
+                                }
+                            }
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.error_message = Some(err.to_string());
                             cx.notify();
-                        }
-                        Err(err) => {
-                            self.error_message = Some(err.to_string());
-                            cx.notify();
-                        }
+                        });
                     }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    self.error_message = Some(err.to_string());
-                    cx.notify();
-                }
-            }
-            let _ = window;
+                anyhow::Ok(())
+            })
+            .detach();
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -624,11 +770,7 @@ impl KeychainEditor {
     }
 }
 
-impl Focusable for KeychainEditor {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(KeychainEditor);
 
 impl Render for KeychainEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

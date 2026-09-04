@@ -604,27 +604,13 @@ impl RemoteFsWatcher {
 }
 
 /// Helper trait to subscribe to the global watcher from a component context.
-pub trait WatcherContext {
+///
+/// 只有 `fs_watcher` / `remote_fs_watcher` 是每个实现的真实差异点，
+/// 其余 6 个方法均为默认实现（`let watcher = self.fs_watcher();
+/// watcher.update(self, …)`），App / Context 两个 impl 不再各自复制一份。
+pub trait WatcherContext: AppContext + Sized {
     fn fs_watcher(&self) -> Entity<FsWatcher>;
     fn remote_fs_watcher(&self) -> Entity<RemoteFsWatcher>;
-    fn watch_path(&mut self, path: &Path);
-    fn watch_recursive_path(&mut self, path: &Path);
-    fn unwatch_path(&mut self, path: &Path);
-    fn unwatch_recursive_path(&mut self, path: &Path);
-    fn watch_remote_path(&mut self, path: &Path, fs: Arc<dyn FileSystem>);
-    fn unwatch_remote_path(&mut self, path: &Path);
-}
-
-// `App` 与 `Context<'a, T>` 的便捷方法实现保持一致：
-// 若修改其中一处，请同步更新另一处。
-impl WatcherContext for App {
-    fn fs_watcher(&self) -> Entity<FsWatcher> {
-        FsWatcherGlobal::watcher(self)
-    }
-
-    fn remote_fs_watcher(&self) -> Entity<RemoteFsWatcher> {
-        RemoteFsWatcherGlobal::watcher(self)
-    }
 
     fn watch_path(&mut self, path: &Path) {
         let watcher = self.fs_watcher();
@@ -654,6 +640,16 @@ impl WatcherContext for App {
     fn unwatch_remote_path(&mut self, path: &Path) {
         let watcher = self.remote_fs_watcher();
         watcher.update(self, |w, cx| w.unwatch(path, cx));
+    }
+}
+
+impl WatcherContext for App {
+    fn fs_watcher(&self) -> Entity<FsWatcher> {
+        FsWatcherGlobal::watcher(self)
+    }
+
+    fn remote_fs_watcher(&self) -> Entity<RemoteFsWatcher> {
+        RemoteFsWatcherGlobal::watcher(self)
     }
 }
 
@@ -664,36 +660,6 @@ impl<'a, T> WatcherContext for Context<'a, T> {
 
     fn remote_fs_watcher(&self) -> Entity<RemoteFsWatcher> {
         RemoteFsWatcherGlobal::watcher(self)
-    }
-
-    fn watch_path(&mut self, path: &Path) {
-        let watcher = self.fs_watcher();
-        watcher.update(self, |w, cx| w.watch(path, cx));
-    }
-
-    fn watch_recursive_path(&mut self, path: &Path) {
-        let watcher = self.fs_watcher();
-        watcher.update(self, |w, cx| w.watch_recursive(path, cx));
-    }
-
-    fn unwatch_path(&mut self, path: &Path) {
-        let watcher = self.fs_watcher();
-        watcher.update(self, |w, cx| w.unwatch(path, cx));
-    }
-
-    fn unwatch_recursive_path(&mut self, path: &Path) {
-        let watcher = self.fs_watcher();
-        watcher.update(self, |w, cx| w.unwatch_recursive(path, cx));
-    }
-
-    fn watch_remote_path(&mut self, path: &Path, fs: Arc<dyn FileSystem>) {
-        let watcher = self.remote_fs_watcher();
-        watcher.update(self, |w, cx| w.watch(path, fs, cx));
-    }
-
-    fn unwatch_remote_path(&mut self, path: &Path) {
-        let watcher = self.remote_fs_watcher();
-        watcher.update(self, |w, cx| w.unwatch(path, cx));
     }
 }
 
@@ -853,7 +819,7 @@ mod tests {
         assert_eq!(watched.get(path).map(|s| s.ref_count), Some(1));
 
         assert!(watch_decrement(&mut watched, path));
-        assert!(watched.get(path).is_none());
+        assert!(!watched.contains_key(path));
 
         assert!(!watch_decrement(&mut watched, path));
     }

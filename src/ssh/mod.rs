@@ -21,6 +21,12 @@ pub mod shared_runtime;
 pub mod ssh_pty;
 
 pub use config::{AuthMethod, SshConnectionConfig};
+
+/// 传输取消的统一错误标识（按字符串匹配）。
+///
+/// 定义在 `ssh` 层：sftp_fs 的取消检查早于、且不依赖 file_manager 的组装逻辑，
+/// 之前的 `ssh → file_manager` 反向依赖是层次倒置；file_manager 侧 re-export 保持旧路径。
+pub const TRANSFER_CANCELLED_MSG: &str = "transfer cancelled";
 pub use keychain::{KeychainItem, KeychainItemKind, KeychainStore};
 pub use russh_terminal::RusshTerminal;
 pub use ssh_pty::SshPtyTerminal;
@@ -55,8 +61,12 @@ pub fn remote_shell_tracking_command(initial_cwd: Option<&str>) -> String {
     let mut script = String::new();
     script.push_str(
         r#"set +e
-__deepterm_root="${TMPDIR:-/tmp}/deepterm-shell-integration.$$"
-mkdir -p "$__deepterm_root/shell-integration/bash" "$__deepterm_root/shell-integration/zsh" 2>/dev/null
+# 目录名必须不可预测：路径仅含 $$（PID）时，远端任意本地用户可预先创建同路径
+# 目录并放入恶意 .zshrc（ZDOTDIR 下交互式 zsh 会自动 source），构成本地提权
+# 的竞态攻击面。mktemp -d 创建 0700 目录且名字随机，失败（无法写 TMPDIR）则
+# 直接放弃注入而不是静默降级。
+__deepterm_root="$(mktemp -d "${TMPDIR:-/tmp}/deepterm-shell-integration.XXXXXXXX")" || exit 1
+mkdir -p "$__deepterm_root/shell-integration/bash" "$__deepterm_root/shell-integration/zsh"
 "#,
     );
 
@@ -247,28 +257,43 @@ pub fn get_current_username() -> Option<String> {
 pub fn parse_ssh_target(target: &str) -> (String, String, u16) {
     let target = target.trim();
 
-    // 解析 user@host 部分和 port 部分
-    let (user_host, port) = if let Some(colon_pos) = target.rfind(':') {
-        // 检查是否是 IPv6 地址的结尾
-        let before_colon = &target[..colon_pos];
-        let after_colon = &target[colon_pos + 1..];
-
-        // 如果冒号后面是数字，则认为是端口
-        if after_colon.chars().all(|c| c.is_ascii_digit()) {
-            let port = after_colon.parse::<u16>().unwrap_or(22);
-            (before_colon, port)
+    // 先分离 user@ 前缀：IPv6 判定只看 host 部分
+    // （`root@[fe80::1%25eth0]:2222` 的 zone-id 段不含冒号，
+    // 若把 user 前缀一起数冒号会误判端口位置）。
+    let (user_host, port) = {
+        let hostport = target.rfind('@').map(|i| &target[i + 1..]).unwrap_or(target);
+        if let Some(rest) = hostport.strip_prefix('[') {
+            // [addr]:port 或 [addr] 形式的 IPv6：括号内是 host，`]` 后可选 :port
+            let close = rest.find(']').unwrap_or(rest.len());
+            let host = &rest[..close];
+            // close 是 `]` 自身的下标，其后从 close+1 起看可选的 `:port` 段
+            let port = rest[(close + 1).min(rest.len())..]
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(22);
+            (host, port)
+        } else if hostport.matches(':').count() > 1 {
+            // 裸 IPv6 地址（无方括号）：整体是 host，不允许端口段
+            // （否则 `::1` 的最后一段 `1` 会被误认成端口 → host=":" port=1）
+            (hostport, 22)
+        } else if let Some(colon_pos) = hostport.rfind(':') {
+            let after_colon = &hostport[colon_pos + 1..];
+            // 空端口段（`host:`）或非数字段都视为无端口（host 保留冒号前部分）
+            if !after_colon.is_empty() && after_colon.chars().all(|c| c.is_ascii_digit()) {
+                let port = after_colon.parse::<u16>().unwrap_or(22);
+                (&hostport[..colon_pos], port)
+            } else {
+                (&hostport[..colon_pos], 22)
+            }
         } else {
-            (target, 22)
+            (hostport, 22)
         }
-    } else {
-        (target, 22)
     };
 
-    // 解析 user@host
-    let (user, host) = if let Some(at_pos) = user_host.rfind('@') {
-        let user = user_host[..at_pos].to_string();
-        let host = user_host[at_pos + 1..].to_string();
-        (user, host)
+    // 解析 user@host：user 前缀已在上方剥离 host 部分时一并取出
+    let (user, host) = if let Some(at_pos) = target.rfind('@') {
+        let user = target[..at_pos].to_string();
+        (user, user_host.to_string())
     } else {
         // 没有用户名，使用当前系统用户名
         let user = get_current_username().unwrap_or_else(|| "root".to_string());
@@ -304,6 +329,35 @@ mod tests {
         let (_, host, port) = parse_ssh_target("example.com");
         // 使用当前系统用户名
         assert!(!host.is_empty());
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn test_parse_ssh_target_ipv6() {
+        // 回归：裸 IPv6 的最后一段 `1` 曾被误认成端口（host=":" port=1）
+        let (_, host, port) = parse_ssh_target("::1");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 22);
+
+        // [addr]:port 形式：剥离方括号后 host 不再带括号（带括号 russh 无法解析）
+        let (_, host, port) = parse_ssh_target("[::1]:2222");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 2222);
+
+        // [addr] 无端口
+        let (_, host, port) = parse_ssh_target("[2001:db8::a]");
+        assert_eq!(host, "2001:db8::a");
+        assert_eq!(port, 22);
+
+        // 完整 IPv6 带 user@ 前缀
+        let (user, host, port) = parse_ssh_target("root@[fe80::1%25eth0]:2222");
+        assert_eq!(user, "root");
+        assert_eq!(host, "fe80::1%25eth0");
+        assert_eq!(port, 2222);
+
+        // host: 空端口段不再解析为 port=0
+        let (_, host, port) = parse_ssh_target("example.com:");
+        assert_eq!(host, "example.com");
         assert_eq!(port, 22);
     }
 

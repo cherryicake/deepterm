@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::callbacks::OptionalStrCallback;
+use crate::components::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use crate::components::modal::{Modal, ModalState};
@@ -1018,11 +1018,7 @@ impl HostView {
     }
 }
 
-impl Focusable for HostView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(HostView);
 
 impl Render for HostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1048,7 +1044,7 @@ impl Render for HostView {
         let title = if let Some(ref fid) = self.current_folder {
             groups
                 .iter()
-                .find(|g| &g.id == fid.as_ref())
+                .find(|g| g.id == *fid.as_ref())
                 .map(|g| g.name.clone())
                 .unwrap_or_else(|| "文件夹".to_string())
         } else {

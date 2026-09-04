@@ -55,12 +55,18 @@ impl client::Handler for SshClientHandler {
     }
 }
 
+/// 连接期间的输入缓冲上限（字节）：连接期通常只有键盘节奏的输入，
+/// 但大段粘贴会一次写入大块；超限后从最旧的开始丢弃，防止内存无限增长。
+const PENDING_INPUT_MAX_BYTES: usize = 256 * 1024;
+
 /// 连接状态的内部共享状态
 struct ConnectionState {
     /// 连接成功后的实际终端（连接前为 None）
     terminal: Option<RusshTerminalInner>,
     /// 连接期间的输入缓冲队列
     pending_input: VecDeque<Vec<u8>>,
+    /// 输入缓冲的字节总量（与 pending_input 同步维护）
+    pending_input_bytes: usize,
     /// 连接期间的大小调整缓冲
     pending_resize: Option<(u16, u16)>,
     /// 连接是否已失败
@@ -96,6 +102,7 @@ impl RusshTerminal {
         let state = Arc::new(Mutex::new(ConnectionState {
             terminal: None,
             pending_input: VecDeque::new(),
+            pending_input_bytes: 0,
             pending_resize: None,
             failed: false,
             error_message: None,
@@ -103,6 +110,9 @@ impl RusshTerminal {
         }));
 
         let state_for_task = state.clone();
+        // spawn 失败分支（inspect_err）专用句柄：spawn 闭包按 move 捕获
+        // state_for_task，若共用同一变量会在编译期与之冲突。
+        let state_for_spawn_err = state.clone();
         let config_clone = config.clone();
         let driver_listener_for_task = driver_listener.clone();
         let initial_cwd_for_task = initial_cwd.clone();
@@ -134,7 +144,9 @@ impl RusshTerminal {
                                     true
                                 } else {
                                     // 先发送待处理的输入
-                                    for data in std::mem::take(&mut state.pending_input) {
+                                    let pending = std::mem::take(&mut state.pending_input);
+                                    state.pending_input_bytes = 0;
+                                    for data in pending {
                                         let _ = input_tx.send(InputMsg::Data(data));
                                     }
                                     if let Some((cols, rows)) = state.pending_resize.take() {
@@ -154,6 +166,7 @@ impl RusshTerminal {
 
                             // 启动 I/O 循环
                             Self::io_loop(
+                                state_for_task.clone(),
                                 handle,
                                 channel,
                                 input_rx,
@@ -174,6 +187,15 @@ impl RusshTerminal {
                         }
                     }
                 });
+            })
+            .inspect_err(|e| {
+                // 线程资源耗尽等 spawn 失败：此前被 `.ok()` 静默吞掉，
+                // ConnectionState 永远停在"连接中"，UI 卡死在转圈。
+                // 必须立即置失败并通知监听方。
+                log::error!("russh: 连接线程启动失败: {}", e);
+                let mut state = state_for_spawn_err.lock();
+                state.failed = true;
+                state.error_message = Some(format!("无法启动连接线程: {}", e));
             })
             .ok();
 
@@ -205,11 +227,14 @@ impl RusshTerminal {
             // 连接已就绪，直接发送
             terminal.input_tx.send(InputMsg::Data(data.to_vec())).ok();
         } else if !state.failed && !state.closed {
-            // 连接中，缓存数据
+            // 连接中，缓存数据；按字节限流（条数限制对大块粘贴无效）
+            state.pending_input_bytes += data.len();
             state.pending_input.push_back(data.to_vec());
-            // 限制缓冲区大小，防止内存无限增长
-            if state.pending_input.len() > 1000 {
-                state.pending_input.pop_front();
+            while state.pending_input_bytes > PENDING_INPUT_MAX_BYTES {
+                match state.pending_input.pop_front() {
+                    Some(d) => state.pending_input_bytes -= d.len(),
+                    None => break,
+                }
             }
         }
     }
@@ -256,23 +281,40 @@ impl RusshTerminal {
         russh::Channel<client::Msg>,
     )> {
         let russh_config = Arc::new(client::Config {
-            inactivity_timeout: Some(Duration::from_secs(60)),
+            // keepalive 30s × 3 次无响应 = 90s 判定断连。inactivity 若设为
+            // 60s 会先于 keepalive 兜底触发（keepalive_max 形同虚设），故置
+            // None，让断连判定完全由 keepalive 负责；对正常空闲会话（keepalive
+            // 有响应）无影响。
+            inactivity_timeout: None,
             keepalive_interval: Some(Duration::from_secs(30)),
             keepalive_max: 3,
             ..Default::default()
         });
 
         log::info!("russh: 连接到 {}:{}", config.host, config.port);
-        let mut handle = client::connect(
-            russh_config,
-            (config.host.as_str(), config.port),
-            SshClientHandler {
-                host: config.host.clone(),
-                port: config.port,
-                host_key_policy: crate::ssh::host_key::policy_from_global_config(),
-            },
+        // config.timeout 生效：TCP+SSH 握手整体限时。此前该配置从未被使用，
+        // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
+        let mut handle = tokio::time::timeout(
+            Duration::from_secs(config.timeout.max(1)),
+            client::connect(
+                russh_config,
+                (config.host.as_str(), config.port),
+                SshClientHandler {
+                    host: config.host.clone(),
+                    port: config.port,
+                    host_key_policy: crate::ssh::host_key::policy_from_global_config(),
+                },
+            ),
         )
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "连接超时（{} 秒内未完成与 {}:{} 的 TCP/SSH 握手）",
+                config.timeout,
+                config.host,
+                config.port
+            )
+        })?
         .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {}", e))?;
 
         log::info!("russh: 开始认证 (用户: {})", config.username);
@@ -336,7 +378,7 @@ impl RusshTerminal {
                 ..
             } => {
                 log::info!("russh: 私钥认证 ({:?})", path);
-                let key = load_key_material(path, passphrase.as_deref())?;
+                let key = load_key_material(path, passphrase.as_deref().map(|p| p.as_str()))?;
                 if let Some(certificate_path) = certificate_path {
                     let cert = load_certificate(certificate_path)?;
                     handle
@@ -361,54 +403,12 @@ impl RusshTerminal {
             }
 
             ResolvedAuthMethod::Auto => {
-                log::info!("russh: 自动认证模式（依次尝试默认密钥）");
-                let default_keys = crate::ssh::find_default_ssh_keys();
-
-                if default_keys.is_empty() {
-                    return Err(anyhow::anyhow!("自动认证失败：~/.ssh 中未找到密钥文件"));
-                }
-
-                // 服务器 RSA hash 偏好在整个连接中不变，只需协商一次
-                let hash_alg = handle
-                    .best_supported_rsa_hash()
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-
-                for key_path in &default_keys {
-                    log::info!("russh: 尝试密钥 {:?}", key_path);
-                    let key = match russh::keys::load_secret_key(key_path, None) {
-                        Ok(k) => k,
-                        Err(e) => {
-                            log::debug!("russh: 跳过密钥 {:?}: {}", key_path, e);
-                            continue;
-                        }
-                    };
-                    match handle
-                        .authenticate_publickey(
-                            &config.username,
-                            PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                        )
-                        .await
-                    {
-                        Ok(result) if result.success() => {
-                            log::info!("russh: 密钥认证成功 ({:?})", key_path);
-                            return Ok(result);
-                        }
-                        Ok(_) => {
-                            log::debug!("russh: 密钥 {:?} 认证未成功，继续尝试", key_path);
-                        }
-                        Err(e) => {
-                            log::debug!("russh: 密钥 {:?} 认证错误: {}", key_path, e);
-                        }
-                    }
-                }
-
-                Err(anyhow::anyhow!(
-                    "自动认证失败：所有默认密钥均无效（用户: {}）",
-                    config.username
-                ))
+                // "尝试多种方法"语义：agent → 默认密钥。auth.rs 的 try_agent_auth
+                // 已实现完整回退链（agent 不可达/无密钥时自动尝试 ~/.ssh 默认密钥），
+                // 此前这里只试默认密钥，agent 有密钥但 ~/.ssh 无默认密钥的用户
+                // 在 Auto 模式下认证失败（与 SFTP 通道行为一致地错）。
+                log::info!("russh: 自动认证模式（agent → 默认密钥）");
+                try_agent_auth(handle, config).await
             }
 
             ResolvedAuthMethod::Agent => {
@@ -424,6 +424,7 @@ impl RusshTerminal {
     /// - SSH 服务器 → VTE 处理器 → alacritty Term → 终端显示
     /// - 用户键盘输入 → SSH 通道 → 远程服务器
     async fn io_loop(
+        self_state: Arc<Mutex<ConnectionState>>,
         handle: client::Handle<SshClientHandler>,
         mut channel: russh::Channel<client::Msg>,
         mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputMsg>,
@@ -436,16 +437,11 @@ impl RusshTerminal {
                 msg_opt = channel.wait() => {
                     match msg_opt {
                         Some(ChannelMsg::Data { data }) => {
-                            driver_listener
-                                .0
-                                .unbounded_send(DriverEvent::RemoteData(data))
-                                .ok();
+                            // 有界通道：UI 消费不过来时在此挂起，背压传导到远端
+                            driver_listener.0.send(DriverEvent::RemoteData(data)).await.ok();
                         }
                         Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                            driver_listener
-                                .0
-                                .unbounded_send(DriverEvent::RemoteData(data))
-                                .ok();
+                            driver_listener.0.send(DriverEvent::RemoteData(data)).await.ok();
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
                             log::info!("russh: 远程进程退出，代码: {}", exit_status);
@@ -454,11 +450,11 @@ impl RusshTerminal {
                         }
                         Some(ChannelMsg::Eof) | None => {
                             log::info!("russh: 连接关闭 (EOF)");
-                            driver_listener
-                                .0
-                                .unbounded_send(DriverEvent::AbnormalDisconnect {
+                            driver_listener.0
+                                .send(DriverEvent::AbnormalDisconnect {
                                     reason: "连接意外关闭 (EOF)".to_string(),
                                 })
+                                .await
                                 .ok();
                             break;
                         }
@@ -472,11 +468,11 @@ impl RusshTerminal {
                         Some(InputMsg::Data(data)) => {
                             if let Err(e) = channel.data(data.as_ref()).await {
                                 log::error!("russh: 发送数据到服务器失败: {}", e);
-                                driver_listener
-                                    .0
-                                    .unbounded_send(DriverEvent::AbnormalDisconnect {
+                                driver_listener.0
+                                    .send(DriverEvent::AbnormalDisconnect {
                                         reason: format!("发送数据失败: {}", e),
                                     })
+                                    .await
                                     .ok();
                                 break;
                             }
@@ -501,6 +497,21 @@ impl RusshTerminal {
         }
 
         log::info!("russh: I/O 循环结束");
+        // 循环退出即连接终结：清理 terminal 句柄并置 failed，让
+        // is_ready() 反映真实状态。此前 terminal 残留为 Some，上层
+        // 查询恒为"就绪"，write() 的输入被静默送进已关闭的 channel 丢失。
+        {
+            let mut state = self_state.lock();
+            let user_closed = state.closed;
+            state.terminal = None;
+            if !user_closed {
+                state.failed = true;
+                if state.error_message.is_none() {
+                    state.error_message = Some("连接已断开".to_string());
+                }
+            }
+        }
+        listener.send_event(AlacTermEvent::Wakeup);
     }
 }
 

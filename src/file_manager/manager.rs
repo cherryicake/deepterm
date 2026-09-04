@@ -62,46 +62,49 @@ fn transfer_stripe(
     &TRANSFER_LOCKS[(hash as usize) % TRANSFER_LOCK_STRIPES]
 }
 
+/// 一次传输执行的完整上下文：取消标志 / 进度计数 / 冲突解决器 / 状态上报。
+///
+/// 取代旧的一串 `execute_blocking_with_cancel_and_progress_and_resolver_and_reporter`
+/// 参数阶梯（每个新参数就多一层包装函数，命名失控）。
+#[derive(Clone, Default)]
+pub struct TransferRun<'a> {
+    /// 取消标志（None ⇒ 新建未取消标志，与旧行为一致）
+    pub cancelled: Option<Arc<AtomicBool>>,
+    /// 进度字节计数（写入共享的 AtomicU64）
+    pub progress: Option<Arc<AtomicU64>>,
+    /// 冲突解决器
+    pub resolver: Option<&'a dyn ConflictResolver>,
+    /// 状态上报回调
+    pub reporter: Option<&'a dyn TransferStatusReporter>,
+}
+
+impl<'a> TransferRun<'a> {
+    /// 无任何辅助能力的最小执行上下文（不可取消、无进度、自动解决冲突策略）。
+    pub fn bare() -> Self {
+        Self::default()
+    }
+
+    fn cancelled(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    fn progress(&self) -> Option<&Arc<AtomicU64>> {
+        self.progress.as_ref()
+    }
+}
+
 impl TransferManager {
-    pub fn execute_blocking(request: TransferRequest) -> anyhow::Result<TransferSummary> {
-        Self::execute_blocking_with_cancel(request, Arc::new(AtomicBool::new(false)))
-    }
-
-    pub fn execute_blocking_with_cancel(
+    /// 同步执行一次传输（完整能力入口）。
+    ///
+    /// 调用方通常在后台线程 / `smol::unblock` 里执行。
+    pub fn execute_blocking(
         request: TransferRequest,
-        cancelled: Arc<AtomicBool>,
+        run: TransferRun<'_>,
     ) -> anyhow::Result<TransferSummary> {
-        Self::execute_blocking_with_cancel_and_progress(request, cancelled, None)
-    }
-
-    pub fn execute_blocking_with_cancel_and_progress(
-        request: TransferRequest,
-        cancelled: Arc<AtomicBool>,
-        progress: Option<Arc<AtomicU64>>,
-    ) -> anyhow::Result<TransferSummary> {
-        Self::execute_blocking_with_cancel_and_progress_and_resolver(
-            request, cancelled, progress, None,
-        )
-    }
-
-    pub fn execute_blocking_with_cancel_and_progress_and_resolver(
-        request: TransferRequest,
-        cancelled: Arc<AtomicBool>,
-        progress: Option<Arc<AtomicU64>>,
-        resolver: Option<&dyn ConflictResolver>,
-    ) -> anyhow::Result<TransferSummary> {
-        Self::execute_blocking_with_cancel_and_progress_and_resolver_and_reporter(
-            request, cancelled, progress, resolver, None,
-        )
-    }
-
-    pub fn execute_blocking_with_cancel_and_progress_and_resolver_and_reporter(
-        request: TransferRequest,
-        cancelled: Arc<AtomicBool>,
-        progress: Option<Arc<AtomicU64>>,
-        resolver: Option<&dyn ConflictResolver>,
-        reporter: Option<&dyn TransferStatusReporter>,
-    ) -> anyhow::Result<TransferSummary> {
+        let cancelled = run.cancelled();
+        let progress = run.progress().map(|p| p.as_ref());
+        let resolver = run.resolver;
+        let reporter = run.reporter;
         let TransferRequest {
             sources,
             destination,
@@ -136,7 +139,7 @@ impl TransferManager {
                     conflict_policy,
                     rename_to.as_deref(),
                     &cancelled,
-                    progress.as_deref(),
+                    progress,
                     resolver,
                     reporter,
                 )?);
@@ -153,7 +156,7 @@ impl TransferManager {
             conflict_policy,
             rename_to.as_deref(),
             &cancelled,
-            progress.as_deref(),
+            progress,
             resolver,
             reporter,
         )
@@ -162,6 +165,7 @@ impl TransferManager {
     /// 多源并行传输：最多 [`MAX_PARALLEL_TRANSFERS`] 个工作线程轮流取源，
     /// 任意时刻至多 N 条传输在跑；取消后不再取新源，其余源继续尝试传完，
     /// 汇总后返回第一个错误（与文件管理器“其余文件照常”的语义一致）。
+    #[allow(clippy::too_many_arguments)]
     fn transfer_many_parallel(
         sources: Vec<FileEndpoint>,
         destination: &FileEndpoint,
@@ -246,7 +250,21 @@ impl TransferManager {
             first_error = first_error.or(error);
         }
         match first_error {
-            Some(error) => Err(error),
+            Some(error) => {
+                // 部分失败：summary 里已成功的部分此前被整体丢弃——
+                // 10 个文件传成功 9 个、1 个权限失败时，UI 只显示"失败"，
+                // 用户无从得知 9 个其实已完成。把成功统计附进错误消息。
+                let done = summary.files_transferred;
+                let skipped = summary.skipped;
+                if done > 0 {
+                    Err(error.context(format!(
+                        "（注意：{} 个条目已成功传输、{} 个被跳过，其余未完成）",
+                        done, skipped
+                    )))
+                } else {
+                    Err(error)
+                }
+            }
             None => Ok(summary),
         }
     }
@@ -318,6 +336,7 @@ impl TransferManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transfer_one(
         source: FileEndpoint,
         destination: &FileEndpoint,
@@ -525,7 +544,7 @@ mod tests {
             conflict_policy: ConflictPolicy::Ask,
             rename_to: Some("existing_dir".to_string()),
         };
-        let summary = TransferManager::execute_blocking(request).unwrap();
+        let summary = TransferManager::execute_blocking(request, TransferRun::bare()).unwrap();
         assert_eq!(summary.files_transferred, 1);
         assert!(
             dir.join("existing_dir/a.txt").exists(),
@@ -557,7 +576,7 @@ mod tests {
             conflict_policy: ConflictPolicy::Ask,
             rename_to: Some("newname.txt".to_string()),
         };
-        let summary = TransferManager::execute_blocking(request).unwrap();
+        let summary = TransferManager::execute_blocking(request, TransferRun::bare()).unwrap();
         assert_eq!(summary.files_transferred, 1);
         assert!(dir.join("newname.txt").exists(), "不存在的名字应保持重命名");
         let _ = std::fs::remove_dir_all(&dir);
@@ -592,7 +611,7 @@ mod tests {
             conflict_policy: ConflictPolicy::AutoRename,
             rename_to: None,
         };
-        let summary = TransferManager::execute_blocking(request).unwrap();
+        let summary = TransferManager::execute_blocking(request, TransferRun::bare()).unwrap();
 
         assert_eq!(summary.files_transferred, 3, "三个文件都应传完");
         assert_eq!(summary.skipped, 0);
@@ -630,7 +649,7 @@ mod tests {
             conflict_policy: ConflictPolicy::AutoRename,
             rename_to: None,
         };
-        let summary = TransferManager::execute_blocking(request).unwrap();
+        let summary = TransferManager::execute_blocking(request, TransferRun::bare()).unwrap();
 
         assert_eq!(summary.files_transferred, 2);
         // 两个文件都在，且内容互不覆盖（顺序取决于哪个 worker 先取到源）。
@@ -662,7 +681,13 @@ mod tests {
             conflict_policy: ConflictPolicy::AutoRename,
             rename_to: None,
         };
-        let result = TransferManager::execute_blocking_with_cancel(request, cancelled);
+        let result = TransferManager::execute_blocking(
+            request,
+            crate::file_manager::TransferRun {
+                cancelled: Some(cancelled),
+                ..TransferRun::bare()
+            },
+        );
         assert!(result.is_err(), "已取消时应返回取消错误");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString, Window, div,
+    App, Context, Entity, FocusHandle, IntoElement, Render, SharedString, Window, div,
     px,
 };
 
-use crate::callbacks::OptionalAppCallback;
+use crate::components::callbacks::OptionalAppCallback;
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
@@ -675,11 +675,7 @@ impl NewHostForm {
     }
 }
 
-impl Focusable for NewHostForm {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(NewHostForm);
 
 impl Render for NewHostForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

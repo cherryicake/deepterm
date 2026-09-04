@@ -48,6 +48,10 @@ impl SshPtyTerminal {
             "ServerAliveInterval=60".to_string(),
             "-o".to_string(),
             "ServerAliveCountMax=3".to_string(),
+            // config.timeout 在系统 ssh 路径同样生效（与 russh 路径一致），
+            // 避免不可达主机等 OS 级 SYN 重试（约 75-130s）。
+            "-o".to_string(),
+            format!("ConnectTimeout={}", config.timeout.max(1)),
             "-p".to_string(),
             config.port.to_string(),
             "-l".to_string(),
@@ -112,7 +116,7 @@ impl SshPtyTerminal {
         // 不会出现在 ps 输出中）
         if use_sshpass_env {
             if let ResolvedAuthMethod::Password { password } = &resolved_auth {
-                env.insert("SSHPASS".to_string(), password.clone());
+                env.insert("SSHPASS".to_string(), password.to_string());
             }
         }
 

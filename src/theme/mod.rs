@@ -9,9 +9,9 @@ pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::editor::syntax::{
-    HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle,
-};
+pub mod syntax_theme;
+
+use syntax_theme::{HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors, ThemeStyle};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -607,11 +607,10 @@ impl ThemePreference {
             anyhow::bail!("unable to resolve theme config path");
         };
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::to_string_pretty(self)?;
+        // 原子写（tmp + rename）：与 session 状态等其它落盘点同一标准，
+        // 避免崩溃时留下截断的主题配置。
+        crate::utils::fs_atomic::atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 

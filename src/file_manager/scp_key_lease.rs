@@ -44,7 +44,7 @@ fn config_key(config: &SshConnectionConfig) -> String {
     // 关键安全修复：此前用 `serde_json::to_string(config)` 做键，
     // 会把明文 password/passphrase 序列化进内存 HashMap 键并长期驻留，
     // 且 `Debug` 打印即泄漏。现改用 `config.id()`（仅含 username/host/port/nickname），
-    // 与 `sftp_fs::cache_key` 只存 `password.len()` 的原则一致。
+    // 与 `sftp_fs::cache_key` 对密码只存内容哈希的原则一致。
     // 注意：同一主机不同凭据会复用同一租约目录，但密钥文件本身按需上传覆盖，
     // 权限均为 0600，复用不跨越安全边界。
     config.id()
@@ -232,22 +232,62 @@ pub fn acquire_lease(
         registry().leases.lock().remove(&lease_key);
     }
 
-    // 2) 未命中：建租约
+    // 2) 未命中：建租约。
+    //    create_lease（网络操作）在锁外执行；插入前在注册表锁内复查一次，
+    //    若其它 worker 已在竞态窗口中插入同 key 的租约，则复用对方的
+    //    并回收自己刚建的重复目录——否则后插者会覆盖先插者的表项，
+    //    先插者 Drop 时会按 key 查到别人的租约并 rm -rf 掉对方正在使用的
+    //    远端密钥目录（并发多文件 scp 直连的 4 worker 同 key 场景真实可触发）。
     let new_lease = create_lease(source_session, source_config, key_path, cancelled)?;
-    let remote_key_path = new_lease.remote_key_path.clone();
-    log::info!(
-        "SCP 密钥租约登记: src={}@{} dst={}@{} key={} remote_dir={}",
-        source_config.username,
-        source_config.host,
-        destination_config.username,
-        destination_config.host,
-        key_path.display(),
-        new_lease.remote_temp_dir
-    );
-    registry()
-        .leases
-        .lock()
-        .insert(lease_key.clone(), Arc::new(Mutex::new(new_lease)));
+    let remote_key_path;
+
+    {
+        let mut leases = registry().leases.lock();
+        if let Some(existing_arc) = leases.get(&lease_key).cloned() {
+            // 竞态：另一个 worker 抢先登记了同 key 租约。复用它，回收重复资源。
+            let existing_remote_key_path = existing_arc.lock().remote_key_path.clone();
+            leases.remove(&lease_key);
+            drop(leases);
+            let mut existing = existing_arc.lock();
+            existing.ref_count += 1;
+            log::info!(
+                "SCP 密钥租约竞态复用: refs={} src={}@{} dst={}@{} key={}",
+                existing.ref_count,
+                source_config.username,
+                source_config.host,
+                destination_config.username,
+                destination_config.host,
+                key_path.display()
+            );
+            let dup = ScpKeyLease {
+                local_temp_path: new_lease.local_temp_path.clone(),
+                remote_temp_dir: new_lease.remote_temp_dir.clone(),
+                remote_key_path: new_lease.remote_key_path.clone(),
+                key_size: new_lease.key_size,
+                ref_count: 0,
+                source_config: new_lease.source_config.clone(),
+            };
+            // 回收自己刚建的目录/本地临时密钥（cleanup_lease 内部走后台线程模式，
+            // 但这里调用方已不在 with_cached_session 的源会话锁内持有路径——
+            // 实际在锁内，因此显式起后台线程，与 LeaseGuard::drop 同一模式）。
+            let _ = std::thread::Builder::new()
+                .name("scp-key-cleanup".into())
+                .spawn(move || cleanup_lease(&dup));
+            remote_key_path = existing_remote_key_path;
+        } else {
+            remote_key_path = new_lease.remote_key_path.clone();
+            log::info!(
+                "SCP 密钥租约登记: src={}@{} dst={}@{} key={} remote_dir={}",
+                source_config.username,
+                source_config.host,
+                destination_config.username,
+                destination_config.host,
+                key_path.display(),
+                new_lease.remote_temp_dir
+            );
+            leases.insert(lease_key.clone(), Arc::new(Mutex::new(new_lease)));
+        }
+    }
 
     Ok(LeaseGuard {
         key: lease_key,
@@ -320,7 +360,9 @@ fn create_lease(
         .unwrap_or_default()
         .as_secs();
     let pid = std::process::id();
-    let nonce = rand::random::<u32>();
+    // nonce 由 uuid v4 的前 4 字节派生（uuid 已依赖且内含随机源），
+    // 省掉 rand 整棵依赖树（全仓仅此一处使用）。
+    let nonce = uuid::Uuid::new_v4().as_u128() as u32;
     // 目录名包含 pid + 时间戳 + 随机数：防同进程内冲突，便于排障定位。
     let dir_name = format!(".deepterm-scp-{}-{}-{}", pid, timestamp, nonce);
     let remote_temp_dir = format!("/tmp/{}", dir_name);

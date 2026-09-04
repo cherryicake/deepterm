@@ -526,7 +526,26 @@ impl MacosSidebar {
                 }
             }
         });
-        theme_view::render_theme_sidebar(cx, on_select, theme, &self.theme_scroll_handle)
+        let search_query = self.theme_search_query.clone();
+        theme_view::render_theme_sidebar(
+            cx,
+            on_select,
+            theme,
+            &self.theme_scroll_handle,
+            &search_query,
+            {
+                // 搜索输入直接写回 MacosSidebar 实体并 notify 过滤列表
+                let sidebar = cx.entity().downgrade();
+                Rc::new(move |text: &str, cx: &mut App| {
+                    if let Some(s) = sidebar.upgrade() {
+                        s.update(cx, |this, cx| {
+                            this.theme_search_query = text.to_string();
+                            cx.notify();
+                        });
+                    }
+                })
+            },
+        )
     }
 
     pub(super) fn render_host_content(&self) -> gpui::Div {

@@ -624,11 +624,7 @@ impl Panel {
     }
 }
 
-impl Focusable for Panel {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(Panel);
 
 impl Panel {
     /// 获取内部 TerminalView 的 focus handle（如果有）
@@ -908,8 +904,14 @@ impl Panel {
 
     /// 处理放置事件
     fn handle_drop(&mut self, dragged: &DraggedTab, cx: &mut Context<Self>) {
-        // 如果有preview就使用它，否则默认使用Right
-        let placement = self.drag_preview.unwrap_or(PanelPlacement::Right);
+        // drag_preview == None 表示指针落在面板中心区（calculate_placement
+        // 明确返回 None 的"无操作"区域），此时屏幕上没有任何预览提示。
+        // 若默认按 Right 分屏，会出现"预览说无操作、松手却意外分屏"的
+        // 状态不同步 —— 与视觉预览保持一致：中心区直接吞掉事件。
+        let Some(placement) = self.drag_preview else {
+            cx.notify();
+            return;
+        };
 
         // 发送放置事件
         cx.emit(PanelEvent::Drop {
@@ -981,8 +983,12 @@ impl Panel {
             return;
         }
 
-        // 如果有preview就使用它，否则默认使用Right
-        let placement = self.drag_preview.unwrap_or(PanelPlacement::Right);
+        // 与 handle_drop 同一原则：中心区（drag_preview == None）无预览
+        // 提示，不产生任何放置行为，避免预览与行为脱节。
+        let Some(placement) = self.drag_preview else {
+            cx.notify();
+            return;
+        };
 
         // 发送Panel放置事件
         cx.emit(PanelEvent::PanelDrop {

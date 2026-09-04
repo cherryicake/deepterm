@@ -4,6 +4,13 @@ pub use simple::*;
 mod registry;
 pub use registry::*;
 
+// 主题类型已下沉到 theme::syntax_theme（修复 theme→editor 层次倒置），
+// 此处 re-export 保持 `editor::syntax::*` 旧路径兼容。
+pub use crate::theme::syntax_theme::{
+    FontStyle, FontWeightContent, HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors,
+    ThemeStyle, HIGHLIGHT_NAMES,
+};
+
 pub mod languages;
 
 use ropey::Rope;

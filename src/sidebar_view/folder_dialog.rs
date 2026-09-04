@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window, div, px};
+use gpui::{App, Context, Entity, FocusHandle, IntoElement, Render, Window, div, px};
 
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
@@ -98,11 +98,7 @@ impl FolderNameDialog {
     }
 }
 
-impl Focusable for FolderNameDialog {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(FolderNameDialog);
 
 impl Render for FolderNameDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

@@ -23,7 +23,7 @@ pub use conflict::{
 pub use cross_remote::{NoopReporter, TransferStatusReporter};
 pub use endpoint::FileEndpoint;
 pub use filesystem::{FileMetadata, FileSystem, LocalFileSystem, RemoteFileSystem};
-pub use manager::TransferManager;
+pub use manager::{TransferManager, TransferRun};
 pub use request::{ConflictPolicy, TransferOperation, TransferRequest};
 pub use utils::{TRANSFER_CANCELLED_MSG, TransferSummary};
 pub use view::{

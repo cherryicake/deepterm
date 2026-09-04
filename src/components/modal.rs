@@ -1,4 +1,4 @@
-use crate::callbacks::OptionalWindowCallback;
+use crate::components::callbacks::OptionalWindowCallback;
 use crate::components::animation::easing;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;

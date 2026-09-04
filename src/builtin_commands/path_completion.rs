@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::file_icons::file_icon_or_default;
+use crate::assets::file_icon_or_default;
 
 /// 补全项的语义分类
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

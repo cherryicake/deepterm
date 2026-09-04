@@ -4,7 +4,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId, Entity,
-    FocusHandle, Focusable, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle,
+    FocusHandle, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle,
     SharedString, Stateful, TextRun, TextStyle, Transformation, Window, actions, div, ease_in_out,
     ease_out_quint, percentage, px, svg,
 };
@@ -720,11 +720,7 @@ impl TabBar {
     }
 }
 
-impl Focusable for TabBar {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(TabBar);
 
 impl TabBar {
     /// 右键菜单动作的统一监听器：取用并清除 `context_menu_tab_id`，

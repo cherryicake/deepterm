@@ -19,7 +19,7 @@ use crate::editor::git_repository::GitRepository;
 use crate::editor::goto_line;
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::editor::syntax::languages::Language;
-use crate::file_icons::file_icon_or_default;
+use crate::assets::file_icon_or_default;
 use crate::file_manager::filesystem::RemoteFileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
@@ -825,6 +825,7 @@ impl Editor {
                             std::path::Path::new(path),
                             content.clone(),
                             encoding,
+                            true,
                         );
                 }
                 self.open_files[file_ix].pending_reload = false;
@@ -907,6 +908,7 @@ impl Editor {
                                     std::path::Path::new(&prompt_path),
                                     prompt_content.clone(),
                                     encoding,
+                                    true,
                                 );
                         }
                         this.tab_bar.update(cx, |tab_bar, cx| {
@@ -1505,6 +1507,7 @@ impl Editor {
                                             std::path::Path::new(&file.path),
                                             loaded.text.clone(),
                                             loaded.encoding,
+                                            true,
                                         );
                                 }
                                 // 后台计算 Git 行变更标记（行号区色条）
@@ -1720,6 +1723,7 @@ impl Editor {
                                 Path::new(&path),
                                 fresh_text,
                                 fresh_enc,
+                                true,
                             );
                     });
                 })
@@ -2257,6 +2261,7 @@ impl Editor {
                                         std::path::Path::new(&file.path),
                                         written,
                                         file_encoding,
+                                        true,
                                     );
                             }
                             let msg = format!("已保存 {label}");

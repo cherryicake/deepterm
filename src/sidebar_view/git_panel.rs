@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, ParentElement,
+    Context, EventEmitter, FocusHandle, IntoElement, MouseButton, ParentElement,
     Render, Stateful, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px, svg,
     uniform_list,
 };
@@ -102,7 +102,10 @@ pub struct GitPanel {
     file_entries: Vec<GitFileEntry>,
     scroll_handle: UniformListScrollHandle,
     loading: bool,
-    hovered_index: Option<usize>,
+    /// hover 行标识。此前存列表下标：entries 刷新（status 轮询/暂存操作）
+    /// 后下标与行错位，hover 高亮与 diff 预取作用到错误文件。改用 path
+    /// 作稳定键。
+    hovered_path: Option<String>,
     watcher_subscription: Option<Subscription>,
     refresh_debounce_task: Option<Task<()>>,
     status_poll_task: Option<Task<()>>,
@@ -126,7 +129,7 @@ impl GitPanel {
             file_entries: Vec::new(),
             scroll_handle: UniformListScrollHandle::new(),
             loading: false,
-            hovered_index: None,
+            hovered_path: None,
             watcher_subscription: None,
             refresh_debounce_task: None,
             status_poll_task: None,
@@ -453,8 +456,13 @@ impl GitPanel {
             .detach();
     }
 
-    /// Stage a file
-    fn stage_file(&self, path: &str, cx: &mut Context<Self>) {
+    /// Stage / Unstage 的共享实现（两者仅 git 子命令与事件不同）。
+    fn run_index_op(
+        &self,
+        path: &str,
+        staged: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(repo) = self.repo.as_ref() else {
             return;
         };
@@ -467,12 +475,22 @@ impl GitPanel {
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { repo.stage(&[&path_for_spawn]) })
+                .spawn(async move {
+                    if staged {
+                        repo.stage(&[&path_for_spawn])
+                    } else {
+                        repo.unstage(&[&path_for_spawn])
+                    }
+                })
                 .await;
 
             if result.is_ok() {
                 let _ = weak.update(cx, |this, cx| {
-                    cx.emit(GitPanelEvent::StageFile { path });
+                    if staged {
+                        cx.emit(GitPanelEvent::StageFile { path });
+                    } else {
+                        cx.emit(GitPanelEvent::UnstageFile { path });
+                    }
                     this.refresh(cx);
                 });
             }
@@ -480,31 +498,14 @@ impl GitPanel {
         .detach();
     }
 
+    /// Stage a file
+    fn stage_file(&self, path: &str, cx: &mut Context<Self>) {
+        self.run_index_op(path, true, cx);
+    }
+
     /// Unstage a file
     fn unstage_file(&self, path: &str, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo.as_ref() else {
-            return;
-        };
-
-        let path = path.to_string();
-        let path_for_spawn = path.clone();
-        let repo = repo.clone();
-        let weak = cx.entity().downgrade();
-
-        cx.spawn(async move |_, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { repo.unstage(&[&path_for_spawn]) })
-                .await;
-
-            if result.is_ok() {
-                let _ = weak.update(cx, |this, cx| {
-                    cx.emit(GitPanelEvent::UnstageFile { path });
-                    this.refresh(cx);
-                });
-            }
-        })
-        .detach();
+        self.run_index_op(path, false, cx);
     }
 
     fn render_header(&self, section: Section, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
@@ -542,10 +543,10 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
         let theme = cx.theme().ui;
-        let is_hovered = self.hovered_index == Some(index);
+        let path = entry.path.clone();
+        let is_hovered = self.hovered_path.as_deref() == Some(path.as_str());
         let status_color = entry.status_color(&theme);
         let status_icon = entry.status_icon();
-        let path = entry.path.clone();
         let path_clone = path.clone();
         let entry_clone = entry.clone();
 
@@ -564,11 +565,11 @@ impl GitPanel {
             .cursor_pointer()
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 if *hovered {
-                    this.hovered_index = Some(index);
+                    this.hovered_path = Some(hover_path.clone());
                     // Warm cache on hover.
                     this.prefetch_diff(&hover_path, cx);
-                } else if this.hovered_index == Some(index) {
-                    this.hovered_index = None;
+                } else if this.hovered_path.as_deref() == Some(hover_path.as_str()) {
+                    this.hovered_path = None;
                 }
                 cx.notify();
             }))
@@ -663,11 +664,7 @@ impl GitPanel {
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
 
-impl Focusable for GitPanel {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(GitPanel);
 
 impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

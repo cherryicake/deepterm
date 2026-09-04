@@ -641,13 +641,17 @@ fn copy_via_agent_forward_scp(
 
     let scp_cmd = format!(
         "scp{recurse}{port_arg} -p -B \
-         -o StrictHostKeyChecking=accept-new \
-         -o UserKnownHostsFile=/dev/null \
+         -o StrictHostKeyChecking={strict} \
          -o LogLevel=ERROR \
          -o ConnectTimeout=10 \
          '{src}' '{dst}'",
         recurse = recurse,
         port_arg = port_arg,
+        // 源服务器上的 scp 用源端登录用户的 ~/.ssh/known_hosts 做 TOFU，
+        // 与全局 HostKeyPolicy 同一策略（Strict 时未记录的主机直接拒绝）。
+        // 此前用 UserKnownHostsFile=/dev/null 使 accept-new 每次都"首次连接"，
+        // 主机密钥验证在这条最重要的传输路径上形同虚设。
+        strict = crate::ssh::host_key::policy_from_global_config().openssh_str(),
         src = shell_single_quote(remote_path),
         dst = dst_arg,
     );
@@ -807,6 +811,10 @@ fn monitor_dest_progress(
         return;
     };
     let mut last_size = 0u64;
+    // 连续失败熔断：会话断开后 execute_command/metadata 持续 Err，监控循环
+    // 不退出也不重建连接，只是空转持有这条死会话（scp 超时上限 24h，期间
+    // 整条 SSH 连接白白占着）。连续失败 3 次即放弃监控。
+    let mut consecutive_failures = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) || cancelled.load(Ordering::Relaxed) {
             break;
@@ -818,15 +826,32 @@ fn monitor_dest_progress(
                 shell_single_quote(destination_path)
             );
             match session.execute_command(&cmd, 5) {
-                Ok(result) if result.success() => result.stdout.trim().parse::<u64>().ok(),
-                _ => None,
+                Ok(result) if result.success() => {
+                    consecutive_failures = 0;
+                    result.stdout.trim().parse::<u64>().ok()
+                }
+                Ok(_) => None,
+                Err(_) => {
+                    consecutive_failures += 1;
+                    None
+                }
             }
         } else {
-            session
-                .metadata(destination_path)
-                .ok()
-                .map(|meta| meta.size)
+            match session.metadata(destination_path) {
+                Ok(meta) => {
+                    consecutive_failures = 0;
+                    Some(meta.size)
+                }
+                Err(_) => {
+                    consecutive_failures += 1;
+                    None
+                }
+            }
         };
+        if consecutive_failures >= 3 {
+            log::warn!("传输进度监控：目标会话连续失败，停止监控（传输继续，仅进度不再更新）");
+            break;
+        }
         if let Some(size) = size {
             if size > last_size {
                 progress.fetch_add(size - last_size, Ordering::Relaxed);
@@ -914,7 +939,8 @@ fn copy_via_remote_scp(
 
     log::warn!(
         "远程 scp 直连使用 trust-on-first-use 主机密钥验证 \
-        （StrictHostKeyChecking=accept-new），第一次连接无法防范 MITM 攻击"
+        （StrictHostKeyChecking=accept-new + 源端 ~/.ssh/known_hosts），\
+        第一次连接无法防范 MITM 攻击"
     );
 
     let recurse = if is_directory { "-r " } else { "" };
@@ -933,13 +959,15 @@ fn copy_via_remote_scp(
 
     let scp_cmd = format!(
         "scp {recurse}{port_flag}-p -B \
-         -o StrictHostKeyChecking=accept-new \
-         -o UserKnownHostsFile=/dev/null \
+         -o StrictHostKeyChecking={strict} \
          -o LogLevel=ERROR \
          -o ConnectTimeout=10 \
          -i '{key}' '{src}' '{dst}'",
         recurse = recurse,
         port_flag = port_flag,
+        // 用源端 known_hosts 做真正的 TOFU（不再 /dev/null 重置信任），
+        // 与 agent forwarding 路径及全局 HostKeyPolicy 一致。
+        strict = crate::ssh::host_key::policy_from_global_config().openssh_str(),
         key = shell_single_quote(&remote_key_path),
         src = shell_single_quote(remote_path),
         dst = dst_arg,

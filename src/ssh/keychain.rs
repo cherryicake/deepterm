@@ -159,12 +159,14 @@ pub struct KeychainStore {
 
 #[derive(Clone, Debug)]
 pub enum ResolvedAuthMethod {
+    /// 密码用 `Zeroizing` 包裹：drop 时自动清零堆内存，Debug 输出脱敏。
+    /// （解析后的密码仅在连接建立期间存活，是最值得零化的瞬态窗口。）
     Password {
-        password: String,
+        password: zeroize::Zeroizing<String>,
     },
     PrivateKey {
         path: PathBuf,
-        passphrase: Option<String>,
+        passphrase: Option<zeroize::Zeroizing<String>>,
         certificate_path: Option<PathBuf>,
         key_flavor: KeychainKeyFlavor,
     },
@@ -189,12 +191,47 @@ impl KeychainStore {
 
     pub fn load() -> Option<Self> {
         let path = Self::config_path()?;
-        match std::fs::read_to_string(&path) {
+        // mtime+size 缓存：命中则免读盘免解析（keychain_view / host_view 的
+        // render 路径会频繁 load）。persist() 后同步刷新。
+        if let Some((mtime, len)) = Self::stat_sig(&path) {
+            if let Ok(cache) = keychain_cache().lock() {
+                if let Some(entry) = cache.as_ref() {
+                    if entry.path == path && entry.mtime == mtime && entry.len == len {
+                        return Some(entry.store.as_ref().clone());
+                    }
+                }
+            }
+        }
+        let store = Self::load_uncached(&path);
+        Self::store_cache(&path, &store);
+        Some(store)
+    }
+
+    fn stat_sig(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+        let md = std::fs::metadata(path).ok()?;
+        Some((md.modified().ok()?, md.len()))
+    }
+
+    fn store_cache(path: &Path, store: &Self) {
+        if let Some((mtime, len)) = Self::stat_sig(path) {
+            if let Ok(mut cache) = keychain_cache().lock() {
+                *cache = Some(CachedKeychain {
+                    path: path.to_path_buf(),
+                    mtime,
+                    len,
+                    store: std::sync::Arc::new(store.clone()),
+                });
+            }
+        }
+    }
+
+    fn load_uncached(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
-                Ok(store) => Some(store),
+                Ok(store) => store,
                 Err(e) => {
                     log::warn!("Failed to parse {}: {e}, trying .bak", path.display());
-                    Self::load_from_bak(&path)
+                    Self::load_from_bak(path).unwrap_or_default()
                 }
             },
             Err(_) => {
@@ -211,12 +248,12 @@ impl KeychainStore {
                                 if let Err(e) = store.save() {
                                     log::warn!("Failed to migrate keychain: {e}");
                                 }
-                                return Some(store);
+                                return store;
                             }
                         }
                     }
                 }
-                Some(Self::new())
+                Self::new()
             }
         }
     }
@@ -229,6 +266,18 @@ impl KeychainStore {
                 log::info!("Recovered keychain from backup {}", bak.display());
                 return Some(store);
             }
+        }
+        // 主文件与 .bak 都损坏：返回空库前把坏文件留一份 .corrupt 副本。
+        // 否则任何后续 save()（如新增一条凭据）会以空库覆盖主文件，
+        // 用户的 keychain 引用列表被清空（secret 本体在系统钥匙串，
+        // 但配置侧全部指向失效 id），且无任何可恢复的痕迹。
+        let corrupt = path.with_extension("json.corrupt");
+        if !corrupt.exists() {
+            let _ = std::fs::copy(path, &corrupt);
+            log::warn!(
+                "keychain 主文件与备份均损坏，已保留坏文件副本 {}；使用空配置继续",
+                corrupt.display()
+            );
         }
         Some(Self::new())
     }
@@ -485,8 +534,24 @@ impl KeychainStore {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
+        // 落盘成功后同步刷新进程内缓存，后续 load() 直接命中
+        Self::store_cache(&path, self);
         Ok(())
     }
+}
+
+/// 进程内 keychain.json 解析结果缓存（见 [`KeychainStore::load`]）。
+struct CachedKeychain {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    len: u64,
+    store: std::sync::Arc<KeychainStore>,
+}
+
+fn keychain_cache() -> &'static std::sync::Mutex<Option<CachedKeychain>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedKeychain>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// 以 0600 权限写入敏感文件（私钥、凭据缓存等）。
@@ -570,7 +635,7 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
             let password = store
                 .get_password_secret(keychain_id)?
                 .ok_or_else(|| anyhow!("系统 Keychain 中缺少身份密码: {}", keychain_id))?;
-            Ok(ResolvedAuthMethod::Password { password })
+            Ok(ResolvedAuthMethod::Password { password: password.into() })
         }
         AuthMethod::PrivateKeyRef { keychain_id } => {
             let store = KeychainStore::load_or_default();
@@ -585,7 +650,9 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
                 .clone()
                 .ok_or_else(|| anyhow!("Keychain 私钥缺少路径配置: {}", keychain_id))?;
             let (path, inferred_certificate_path) = normalize_private_key_path(&path)?;
-            let passphrase = store.get_key_passphrase_secret(keychain_id)?;
+            let passphrase = store
+                .get_key_passphrase_secret(keychain_id)?
+                .map(zeroize::Zeroizing::new);
             Ok(ResolvedAuthMethod::PrivateKey {
                 path,
                 passphrase,
@@ -594,14 +661,14 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
             })
         }
         AuthMethod::Password { password } => Ok(ResolvedAuthMethod::Password {
-            password: password.clone(),
+            password: password.clone().into(),
         }),
         AuthMethod::PrivateKey { path, passphrase } => {
             let (path, certificate_path) = normalize_private_key_path(path)?;
             let key_flavor = classify_key_flavor(&path, certificate_path.as_deref());
             Ok(ResolvedAuthMethod::PrivateKey {
                 path,
-                passphrase: passphrase.clone(),
+                passphrase: passphrase.clone().map(zeroize::Zeroizing::new),
                 certificate_path,
                 key_flavor,
             })

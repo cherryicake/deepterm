@@ -348,8 +348,11 @@ pub enum AuthMethod {
     },
     /// SSH Agent 认证
     Agent,
-    /// 尝试多种方法
-    #[serde(skip)]
+    /// 尝试多种方法（agent → 默认密钥）。
+    ///
+    /// serde：adjacent tag 布局下带数据的变体要求 content 字段，`Auto` 无数据
+    /// 不能用 `#[serde(skip)]`（skip 变体序列化必然失败，导致"密码/密钥留空
+    /// 保存主机"必然报英文 serde 错误）。改为显式空 content 的单元形式。
     #[default]
     Auto,
 }
@@ -562,6 +565,21 @@ fn default_identity_files() -> Vec<PathBuf> {
     }
 }
 
+/// 进程内 ssh.json 解析结果缓存（见 [`SshGlobalConfig::load`]）：
+/// mtime+size 未变时免读盘免解析。save() 后同步刷新。
+struct CachedSshConfig {
+    path: std::path::PathBuf,
+    mtime: std::time::SystemTime,
+    len: u64,
+    config: std::sync::Arc<SshGlobalConfig>,
+}
+
+fn ssh_config_cache() -> &'static std::sync::Mutex<Option<CachedSshConfig>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedSshConfig>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 impl SshGlobalConfig {
     /// 创建默认配置
     pub fn new() -> Self {
@@ -722,14 +740,58 @@ impl SshGlobalConfig {
     /// 从配置文件加载
     /// 优先 dirs::config_dir()/deepterm/ssh.json，兼容旧路径 ~/.config/deepterm/ssh.json
     /// 如果文件不存在或解析失败，返回默认配置（不自动创建文件）
+    ///
+    /// 进程内缓存：mtime+size 未变时直接复用上次的解析结果（一次 stat 代替
+    /// 读盘+JSON 解析）。HostView/KeychainView 的 render 路径会频繁调用 load()，
+    /// 避免每帧读盘；save() 后同步刷新缓存，其它窗口/进程的写入靠 mtime 失效。
     pub fn load() -> Self {
         let config_path = match Self::config_path() {
             Some(path) => path,
             None => return Self::new(),
         };
+        if let Some(cached) = Self::cached(&config_path) {
+            return cached;
+        }
+        let config = Self::load_uncached(&config_path);
+        Self::store_cache(&config_path, &config);
+        config
+    }
 
+    /// 查询缓存：路径 + mtime + size 完全一致时返回克隆。
+    fn cached(path: &std::path::Path) -> Option<Self> {
+        let (mtime, len) = Self::stat_sig(path)?;
+        let cache = ssh_config_cache().lock().ok()?;
+        let entry = cache.as_ref()?;
+        if entry.path == path && entry.mtime == mtime && entry.len == len {
+            Some((*entry.config).clone())
+        } else {
+            None
+        }
+    }
+
+    /// 写入缓存（load 解析完 / save 落盘后调用）。
+    fn store_cache(path: &std::path::Path, config: &Self) {
+        let Some((mtime, len)) = Self::stat_sig(path) else {
+            return;
+        };
+        if let Ok(mut cache) = ssh_config_cache().lock() {
+            *cache = Some(CachedSshConfig {
+                path: path.to_path_buf(),
+                mtime,
+                len,
+                config: std::sync::Arc::new(config.clone()),
+            });
+        }
+    }
+
+    fn stat_sig(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let md = std::fs::metadata(path).ok()?;
+        Some((md.modified().ok()?, md.len()))
+    }
+
+    fn load_uncached(config_path: &std::path::Path) -> Self {
         // 优先新路径，若不存在则尝试旧路径（自动迁移）
-        let content = match std::fs::read_to_string(&config_path) {
+        let content = match std::fs::read_to_string(config_path) {
             Ok(c) => c,
             Err(_) => {
                 if let Some(legacy) = Self::legacy_config_path() {
@@ -815,6 +877,11 @@ impl SshGlobalConfig {
     pub fn load_or_create() -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = Self::config_path().ok_or("Failed to get config path")?;
 
+        // 与 load() 同样的 mtime 缓存：命中则免读盘。
+        if let Some(cached) = Self::cached(&config_path) {
+            return Ok(cached);
+        }
+
         let mut config = match std::fs::read_to_string(&config_path) {
             Ok(content) => serde_json::from_str(&content)?,
             Err(_) => {
@@ -849,6 +916,7 @@ impl SshGlobalConfig {
             let _ = config.save();
         }
         let _ = config.heal_orphan_group_ids();
+        Self::store_cache(&config_path, &config);
         Ok(config)
     }
 
@@ -891,6 +959,8 @@ impl SshGlobalConfig {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
         }
+        // 落盘成功后同步刷新进程内缓存，后续 load() 直接命中
+        Self::store_cache(&config_path, self);
         Ok(())
     }
 
@@ -964,6 +1034,23 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_method_auto_serde_roundtrip() {
+        // 回归：Auto 曾带 #[serde(skip)]，导致保存"密码/密钥留空"的主机时
+        // 序列化必然失败（host_form 保存路径返回 Auto）。
+        let json = serde_json::to_string(&AuthMethod::Auto).expect("Auto 必须可序列化");
+        let back: AuthMethod = serde_json::from_str(&json).expect("Auto 必须可反序列化");
+        assert!(matches!(back, AuthMethod::Auto));
+
+        // 整个连接配置（save() 的实际形态）也要能往返。
+        let config =
+            SshConnectionConfig::new("example.com", "admin", AuthMethod::Auto);
+        let json = serde_json::to_string(&config).expect("含 Auto 的配置必须可序列化");
+        let back: SshConnectionConfig =
+            serde_json::from_str(&json).expect("含 Auto 的配置必须可反序列化");
+        assert!(matches!(back.auth_method, AuthMethod::Auto));
+    }
+
+    #[test]
     fn test_known_host_matching() {
         let host = KnownHost::new("example.com", "SHA256:abc123", "ssh-ed25519");
 
@@ -1021,10 +1108,10 @@ mod tests {
         assert_eq!(cfg.find_group(&g1.id).unwrap().name, "预发");
         assert!(cfg.rename_group(&g2.id, "预发").is_err());
         // move hosts
-        let mut conn = SshConnectionConfig::new("10.0.0.1", "root", AuthMethod::Agent);
+        let conn = SshConnectionConfig::new("10.0.0.1", "root", AuthMethod::Agent);
         let conn_id = conn.id();
         cfg.add_connection(conn);
-        cfg.move_hosts_to_group(&[conn_id.clone()], Some(&g1.id));
+        cfg.move_hosts_to_group(std::slice::from_ref(&conn_id), Some(&g1.id));
         assert_eq!(
             cfg.find_connection(&conn_id).unwrap().group_id.as_deref(),
             Some(g1.id.as_str())
@@ -1034,7 +1121,7 @@ mod tests {
         assert_eq!(cfg.find_connection(&conn_id).unwrap().group_id, None);
         // recreate and delete with hosts
         let g3 = cfg.create_group("临时").unwrap();
-        cfg.move_hosts_to_group(&[conn_id.clone()], Some(&g3.id));
+        cfg.move_hosts_to_group(std::slice::from_ref(&conn_id), Some(&g3.id));
         cfg.delete_group(&g3.id, true).unwrap();
         assert!(cfg.find_connection(&conn_id).is_none());
     }

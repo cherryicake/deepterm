@@ -1,4 +1,4 @@
-use crate::callbacks::{OptionalBoxedClickCallback, OptionalBoxedHoverCallback};
+use crate::components::callbacks::{OptionalBoxedClickCallback, OptionalBoxedHoverCallback};
 use crate::components::button::Disableable;
 use crate::theme::ActiveTheme;
 use gpui::{

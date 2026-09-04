@@ -11,7 +11,7 @@ use crate::file_manager::{
 };
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
-pub const TRANSFER_CANCELLED_MSG: &str = "transfer cancelled";
+pub use crate::ssh::TRANSFER_CANCELLED_MSG;
 
 #[derive(Clone, Debug, Default)]
 pub struct TransferSummary {
@@ -370,33 +370,47 @@ pub fn resolve_remote_conflict(
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
                 ConflictResolution::AutoRename => {
-                    for index in 1..10_000 {
-                        if cancelled.load(Ordering::Relaxed) {
-                            bail!("{}", TRANSFER_CANCELLED_MSG);
-                        }
-                        let candidate = renamed_remote_candidate(desired_path, index)?;
-                        if !session.exists(&candidate)? {
-                            return Ok(Some(candidate));
-                        }
-                    }
-                    bail!("无法为 {} 找到可用的远程文件名", desired_path)
+                    Ok(first_available_remote_rename(session, desired_path, cancelled)?)
                 }
                 ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
             }
         }
-        ConflictPolicy::AutoRename => {
-            for index in 1..10_000 {
-                if cancelled.load(Ordering::Relaxed) {
-                    bail!("{}", TRANSFER_CANCELLED_MSG);
-                }
-                let candidate = renamed_remote_candidate(desired_path, index)?;
-                if !session.exists(&candidate)? {
-                    return Ok(Some(candidate));
-                }
-            }
-            bail!("无法为 {} 找到可用的远程文件名", desired_path)
+        ConflictPolicy::AutoRename => first_available_remote_rename(session, desired_path, cancelled),
+    }
+}
+
+/// AutoRename 的可用名探测。
+///
+/// 此前对 1..10_000 逐个候选发一次 `session.exists`（每次一个 SFTP RTT）——
+/// 目录里已有上千个 `xxx_副本N` 时一次改名要付出 O(N) 次网络往返（50ms/RTT
+/// 下 1000 个副本 ≈ 50 秒）。改为一次 `read_dir` 把父目录现有名字收进
+/// HashSet，本地直接跳到第一个空位；read_dir 失败时退回逐个探测。
+fn first_available_remote_rename(
+    session: &mut sftp_fs::BlockingSftpSession,
+    desired_path: &str,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Option<String>> {
+    let parent = sftp_fs::remote_parent(desired_path)
+        .ok_or_else(|| anyhow!("无法解析远程父目录: {desired_path}"))?;
+    let existing: Option<std::collections::HashSet<String>> = session
+        .read_dir(&parent)
+        .ok()
+        .map(|entries| entries.into_iter().map(|e| e.name).collect());
+
+    for index in 1..10_000 {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("{}", TRANSFER_CANCELLED_MSG);
+        }
+        let candidate = renamed_remote_candidate(desired_path, index)?;
+        let taken = match &existing {
+            Some(names) => names.contains(&remote_file_name(&candidate).unwrap_or_default()),
+            None => session.exists(&candidate)?,
+        };
+        if !taken {
+            return Ok(Some(candidate));
         }
     }
+    bail!("无法为 {} 找到可用的远程文件名", desired_path)
 }
 
 pub fn renamed_remote_candidate(path: &str, index: usize) -> anyhow::Result<String> {

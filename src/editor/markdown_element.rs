@@ -731,7 +731,7 @@ impl MarkdownElementBuilder {
                             .on_click(move |_: &ClickEvent, _, _cx| {
                                 // 关键安全：仅允许 http/https 直接打开，
                                 // file:// 与自定义 Scheme 默认拦截（见 safe_open 模块）。
-                                crate::safe_open::open_url_safely(&url);
+                                crate::utils::safe_open::open_url_safely(&url);
                             })
                             .child(styled_text)
                             .when(is_external, |this| {
@@ -788,7 +788,7 @@ impl MarkdownElementBuilder {
                                     let url = url_for_click.clone();
                                     move |_: &ClickEvent, _, _cx| {
                                         // 关键安全：图片点击同样走白名单，防止 file:// 泄露。
-                                        crate::safe_open::open_url_safely(&url);
+                                        crate::utils::safe_open::open_url_safely(&url);
                                     }
                                 });
                             if let Some((img_arc, (w, h))) = maybe_image {

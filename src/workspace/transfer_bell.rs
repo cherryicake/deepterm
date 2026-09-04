@@ -162,6 +162,10 @@ impl TransferBellPanel {
         self.panel_dismissed_at = None;
         self.panel_open = true;
         self.anim_epoch = self.anim_epoch.wrapping_add(1);
+        // 上一轮刷新循环可能已因"无运行任务且 popover 不可见"退出；
+        // 不重启的话，popover 里的进度条/状态直到切换 workspace 才会动
+        // （observer 只在 bind_workspace 时调用 start_progress_refresh）。
+        self.start_progress_refresh(cx);
         cx.notify();
     }
 

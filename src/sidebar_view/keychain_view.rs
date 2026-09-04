@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::callbacks::OptionalStrCallback;
+use crate::components::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
@@ -156,11 +156,7 @@ impl KeychainSidebarView {
     }
 }
 
-impl Focusable for KeychainSidebarView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(KeychainSidebarView);
 
 impl Render for KeychainSidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

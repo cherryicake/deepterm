@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, Render, SharedString,
+    App, Context, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString,
     Window, div, px,
 };
 
@@ -248,11 +248,7 @@ impl FontSettingsView {
     }
 }
 
-impl Focusable for FontSettingsView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(FontSettingsView);
 
 impl Render for FontSettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

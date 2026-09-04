@@ -80,6 +80,21 @@ pub enum SplitSessionState {
     },
 }
 
+impl SplitSessionState {
+    /// 递归收集树内所有 panel id，供恢复会话时推算 id 序号，
+    /// 避免新分配的 id 与恢复出来的 id 冲突。
+    pub fn collect_panel_ids(&self, out: &mut Vec<String>) {
+        match self {
+            SplitSessionState::Panel(panel) => out.push(panel.id.clone()),
+            SplitSessionState::Split { children, .. } => {
+                for child in children {
+                    child.collect_panel_ids(out);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PanelSessionState {
     pub id: String,

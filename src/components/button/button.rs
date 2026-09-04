@@ -1,4 +1,4 @@
-use crate::callbacks::{OptionalClickCallback, OptionalHoverCallback};
+use crate::components::callbacks::{OptionalClickCallback, OptionalHoverCallback};
 use crate::components::button::button_icon::{ButtonIcon, Disableable, Selectable, Sizable, Size};
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder;

@@ -47,12 +47,9 @@ async fn create_agent_client() -> Result<AgentClient<NamedPipeClient>, anyhow::E
 /// - `Ok(false)`：agent 可达但未加载任何 key。
 /// - `Err(_)`：agent 不可达（通常是 `SSH_AUTH_SOCK` 未设置或 socket 连不上）。
 pub fn agent_is_available() -> anyhow::Result<bool> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow!("创建临时 runtime 失败: {}", e))?;
-
-    rt.block_on(async move {
+    // 复用全局共享 runtime（与 sftp_fs 一致）：调用方都在后台线程的同步上下文里，
+    // 不在 runtime 内部，block_on 安全；避免每次调用新建 runtime 的开销。
+    crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async move {
         let mut client = create_agent_client().await?;
         let identities = client
             .request_identities()
@@ -69,8 +66,12 @@ pub fn agent_is_available() -> anyhow::Result<bool> {
 /// 或 socket 连不上）。
 pub fn agent_has_key(key_path: &Path) -> anyhow::Result<bool> {
     // 读取私钥并计算其公钥指纹，用于与 agent 中的 identities 比对。
-    let key_bytes = std::fs::read(key_path)
-        .map_err(|e| anyhow!("读取私钥 {} 失败: {}", key_path.display(), e))?;
+    // Zeroizing：私钥字节 drop 时清零堆内存，不留残留
+    // （与 scp_key_lease 处理临时密钥的口径一致）。
+    let key_bytes = zeroize::Zeroizing::new(
+        std::fs::read(key_path)
+            .map_err(|e| anyhow!("读取私钥 {} 失败: {}", key_path.display(), e))?,
+    );
 
     // 仅支持无密码短语的私钥——带 passphrase 的密钥通常不会直接进入 agent
     // （进入时 ssh-add 会提示解锁）；我们这里假设已加载的密钥就是解锁过的。
@@ -80,14 +81,8 @@ pub fn agent_has_key(key_path: &Path) -> anyhow::Result<bool> {
     let public = private.public_key().clone();
     let target_fp = public.fingerprint(HashAlg::Sha256);
 
-    // AgentClient 需要 tokio runtime；这里起一个临时 current_thread runtime，
-    // 调用者通常不在 async 上下文里。
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow!("创建临时 runtime 失败: {}", e))?;
-
-    let has = rt.block_on(async move {
+    // 复用共享 runtime（见 agent_is_available 说明）：调用方为后台同步线程。
+    crate::ssh::shared_runtime::shared_ssh_runtime().block_on(async move {
         let mut client = create_agent_client().await?;
         let identities = client
             .request_identities()
@@ -98,9 +93,7 @@ pub fn agent_has_key(key_path: &Path) -> anyhow::Result<bool> {
                 .iter()
                 .any(|id| identity_matches(id, &public, &target_fp)),
         )
-    })?;
-
-    Ok(has)
+    })
 }
 
 fn identity_matches(

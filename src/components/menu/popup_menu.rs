@@ -1,11 +1,11 @@
-use crate::callbacks::OptionalClickCallback;
+use crate::components::callbacks::OptionalClickCallback;
 use crate::components::button::button_icon::Sizable;
 use crate::components::button::{Icon, Size};
 use crate::components::menu::menu_item::MenuItemElement;
 use crate::theme::ActiveTheme;
 use gpui::{
     Action, App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
     SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rems,
 };
 use std::rc::Rc;
@@ -422,11 +422,7 @@ impl PopupMenu {
 }
 
 impl EventEmitter<DismissEvent> for PopupMenu {}
-impl Focusable for PopupMenu {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(PopupMenu);
 
 impl Render for PopupMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyBinding,
+    App, ClipboardItem, Context, Entity, FocusHandle, Hsla, IntoElement, KeyBinding,
     ListAlignment, ListState, Render, SharedString, StyleRefinement, TextRun, TextStyleRefinement,
     WhiteSpace, Window, actions, div, list, px, rems,
 };
@@ -442,11 +442,7 @@ impl Markdown {
     }
 }
 
-impl Focusable for Markdown {
-    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(Markdown);
 
 impl Render for Markdown {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

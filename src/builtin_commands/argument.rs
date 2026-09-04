@@ -42,37 +42,14 @@ impl ParsedArgument {
         }
     }
 
-    /// 简单的分词：支持双引号包裹的路径
+    /// 分词：委托 [`crate::builtin_commands::scp_completion::shell_split_tokens`]，
+    /// 与 /scp 补全同一条 shell 语义（双引号/单引号/反斜杠转义），避免两套
+    /// 分词器对同一输入给出不同 token 列表。
     fn tokenize(input: &str) -> Vec<String> {
-        let mut tokens = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-
-        for c in input.chars() {
-            match c {
-                '"' if !in_quotes => {
-                    in_quotes = true;
-                }
-                '"' if in_quotes => {
-                    in_quotes = false;
-                }
-                c if c.is_whitespace() && !in_quotes => {
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                }
-                c => {
-                    current.push(c);
-                }
-            }
-        }
-
-        if !current.is_empty() {
-            tokens.push(current);
-        }
-
-        tokens
+        crate::builtin_commands::scp_completion::shell_split_tokens(input, 0)
+            .into_iter()
+            .map(|t| t.value)
+            .collect()
     }
 
     /// 检查是否有参数

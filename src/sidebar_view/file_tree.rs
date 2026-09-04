@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, FocusHandle, Focusable, GlobalElementId,
+    AnyElement, App, AvailableSpace, Bounds, Context, FocusHandle, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ParentElement,
     Pixels, Point, Render, Stateful, Styled, Subscription, Task, UniformListDecoration,
     UniformListScrollHandle, Window, div, point, px, size, svg, uniform_list,
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::assets::Icon;
-use crate::file_icons::file_icon_or_default;
+use crate::assets::file_icon_or_default;
 use crate::file_manager::FileSystem;
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::file_tree_event::FileTreeEvent;
@@ -753,6 +753,10 @@ impl SidebarFileTree {
                         &task_path,
                         decoded.text,
                         decoded.encoding,
+                        // hover/目录预取只进内存缓存，不落盘（隐私边界）：
+                        // 此前鼠标划过服务器上的 .env / 私钥即明文持久化
+                        // 到 sftp_cache.json 且无过期机制。
+                        false,
                     );
                 }
             }
@@ -1111,11 +1115,7 @@ impl SidebarFileTree {
     }
 }
 
-impl Focusable for SidebarFileTree {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(SidebarFileTree);
 
 struct StickyFolderDecoration {
     entity: gpui::Entity<SidebarFileTree>,

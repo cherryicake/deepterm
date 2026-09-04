@@ -7,18 +7,16 @@ use std::time::Duration;
 
 pub mod assets;
 pub mod builtin_commands;
-pub mod callbacks;
 pub mod components;
 pub mod editor;
-pub mod file_icons;
 pub mod file_manager;
-pub mod safe_open;
 mod sidebar_view;
 pub mod ssh;
 pub mod ssh_view;
 pub mod terminal;
 pub mod terminal_view;
 pub mod theme;
+pub mod utils;
 pub mod workspace;
 
 use gpui::prelude::*;
@@ -117,6 +115,25 @@ pub struct AppWindow {
     last_fullscreen: bool,
 }
 
+    /// AppWindow::new 构建的全部实体（从 300 行内联构造拆出，便于阅读）。
+struct BuiltEntities {
+    workspace: Entity<Workspace>,
+    transfer_bell: Entity<TransferBellPanel>,
+    title_bar: Entity<TitleBar>,
+    ssh_picker: Entity<SshPicker>,
+    host_view: Entity<HostView>,
+    keychain_view: Entity<KeychainSidebarView>,
+    sidebar: Entity<MacosSidebar>,
+    is_main_window: bool,
+}
+
+/// wire_callbacks 产出的实体与订阅。
+struct WiredCallbacks {
+    subscription: Subscription,
+    tab_group_select: Entity<MacosSelect>,
+    editor: Entity<Editor>,
+}
+
 impl AppWindow {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let persistence = PersistenceManager::new();
@@ -132,6 +149,54 @@ impl AppWindow {
                 })
             })
             .unwrap_or_else(|| Workspace::new(window, cx));
+        let bundle = Self::build_entities(workspace.clone(), window, cx);
+
+        let wired = Self::wire_callbacks(&bundle, window, cx);
+        let mut this = Self {
+            title_bar: bundle.title_bar.clone(),
+            transfer_bell: bundle.transfer_bell.clone(),
+            default_workspace: workspace.clone(),
+            workspace: bundle.workspace.clone(),
+            tab_group_workspaces: Vec::new(),
+            ssh_picker: bundle.ssh_picker.clone(),
+            sidebar: bundle.sidebar.clone(),
+            editor: wired.editor,
+            notification_manager: cx.new(|_cx| NotificationManager::new()),
+            tab_group_select: wired.tab_group_select,
+            default_file_tree_editor_states: HashMap::new(),
+            current_file_tree_key: None,
+            _sidebar_hide_task: None,
+            host_view: bundle.host_view.clone(),
+            keychain_view: bundle.keychain_view.clone(),
+            persistence,
+            is_main_window: bundle.is_main_window,
+            workspace_subscriptions: HashMap::new(),
+            pending_save_task: None,
+            _sidebar_subscription: Some(wired.subscription),
+            title_pad_epoch: 0,
+            title_pad_start: 0.0,
+            title_pad_end: 0.0,
+            title_pad_ms: 0,
+            last_sidebar_epoch: 0,
+            last_editor_epoch: 0,
+            tab_pad_epoch: 0,
+            last_fullscreen: window.is_fullscreen(),
+        };
+
+        this.subscribe_workspace_events(workspace.clone(), window, cx);
+        if let Some(session) = session {
+            this.restore_tab_group_workspaces(session, cx);
+        }
+        this.sync_sidebar_tab_groups(cx);
+
+        this
+    }
+
+    fn build_entities(
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BuiltEntities {
 
         let tab_bar = workspace.read(cx).tab_bar.clone();
         let workspace_weak = workspace.downgrade();
@@ -174,6 +239,39 @@ impl AppWindow {
             sidebar.bind_app_window(app_window.downgrade());
             sidebar
         });
+        BuiltEntities {
+            workspace: workspace.clone(),
+            transfer_bell,
+            title_bar,
+            ssh_picker,
+            host_view: host_view.clone(),
+            keychain_view: keychain_view.clone(),
+            sidebar: sidebar.clone(),
+            is_main_window,
+        }
+    }
+
+    fn wire_callbacks(
+        bundle: &BuiltEntities,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WiredCallbacks {
+        // 解构为与旧 new 内联代码相同的局部名，避免逐行改写接线代码。
+        let BuiltEntities {
+            workspace,
+            transfer_bell: _,
+            title_bar: _,
+            ssh_picker: _,
+            host_view,
+            keychain_view,
+            sidebar,
+            is_main_window: _,
+        } = bundle;
+        let _workspace = workspace.clone();
+        let host_view = host_view.clone();
+        let keychain_view = keychain_view.clone();
+        let sidebar = sidebar.clone();
+        let app_window = cx.entity();
 
         let app_window_for_tab_group = app_window.downgrade();
         sidebar.update(cx, |sidebar, _cx| {
@@ -374,44 +472,11 @@ impl AppWindow {
             },
         );
 
-        let mut this = Self {
-            title_bar,
-            transfer_bell,
-            default_workspace: workspace.clone(),
-            workspace: workspace.clone(),
-            tab_group_workspaces: Vec::new(),
-            ssh_picker,
-            sidebar,
-            editor,
-            notification_manager: cx.new(|_cx| NotificationManager::new()),
+        WiredCallbacks {
+            subscription: sidebar_subscription,
             tab_group_select,
-            default_file_tree_editor_states: HashMap::new(),
-            current_file_tree_key: None,
-            _sidebar_hide_task: None,
-            host_view,
-            keychain_view,
-            persistence,
-            is_main_window,
-            workspace_subscriptions: HashMap::new(),
-            pending_save_task: None,
-            _sidebar_subscription: Some(sidebar_subscription),
-            title_pad_epoch: 0,
-            title_pad_start: 0.0,
-            title_pad_end: 0.0,
-            title_pad_ms: 0,
-            last_sidebar_epoch: 0,
-            last_editor_epoch: 0,
-            tab_pad_epoch: 0,
-            last_fullscreen: window.is_fullscreen(),
-        };
-
-        this.subscribe_workspace_events(workspace.clone(), window, cx);
-        if let Some(session) = session {
-            this.restore_tab_group_workspaces(session, cx);
+            editor,
         }
-        this.sync_sidebar_tab_groups(cx);
-
-        this
     }
 
     /// 提取侧边栏标签页单击/双击的公共切换逻辑：切换 workspace、top tab、聚焦终端、高亮侧边栏。
@@ -683,7 +748,7 @@ impl AppWindow {
                 .timer(Duration::from_millis(300))
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // 清理句柄，避免 удерживать Task
+                // 清理句柄，避免持有 Task
                 this.pending_save_task = None;
                 this.save_session(cx);
             });

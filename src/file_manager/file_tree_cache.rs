@@ -68,6 +68,12 @@ struct FileContentEntry {
     /// 文件磁盘编码（缓存命中时无需重新检测）。
     encoding: FileEncoding,
     loaded_at: Instant,
+    /// 是否随 sftp_cache.json 落盘。
+    ///
+    /// 仅"用户显式打开过的文件"才允许持久化：鼠标悬停预取 / 目录首批文件
+    /// 的内容也走本缓存（进程内秒开），但 hover 一划即把服务器上 `.env` /
+    /// 私钥等明文写进磁盘缓存属隐私越界，且磁盘无过期机制。
+    persist: bool,
 }
 
 /// 单台远程服务器的文件内容缓存
@@ -163,6 +169,8 @@ impl RemoteFileTreeCache {
                         content: persisted_file.content,
                         encoding: persisted_file.encoding,
                         loaded_at: Instant::now(),
+                        // 磁盘恢复的条目本来就是持久化的，保持原语义
+                        persist: true,
                     },
                 );
             }
@@ -200,6 +208,8 @@ impl RemoteFileTreeCache {
                 let files = fc
                     .files
                     .iter()
+                    // 仅持久化用户显式打开过的文件（persist=false 为 hover/目录预取）
+                    .filter(|(_, entry)| entry.persist)
                     .take(MAX_PERSISTED_FILES_PER_HOST)
                     .filter(|(_, entry)| entry.content.len() <= MAX_CACHED_FILE_SIZE)
                     .map(|(path, entry)| {
@@ -422,13 +432,14 @@ impl RemoteFileTreeCache {
             .unwrap_or_default()
     }
 
-    /// 缓存远程文件内容
+    /// 缓存远程文件内容（默认持久化；hover / 目录预取请传 `persist: false`）
     pub fn insert_file_content(
         &mut self,
         config: &SshConnectionConfig,
         path: &Path,
         content: String,
         encoding: FileEncoding,
+        persist: bool,
     ) {
         let key = Self::server_key(config);
         let file_cache = self
@@ -436,7 +447,8 @@ impl RemoteFileTreeCache {
             .entry(key.clone())
             .or_insert_with(ServerFileCache::new);
         log::debug!(
-            "FileTreeCache insert file content: {}{}",
+            "FileTreeCache insert file content (persist={}): {}{}",
+            persist,
             key,
             path.display()
         );
@@ -446,9 +458,12 @@ impl RemoteFileTreeCache {
                 content,
                 encoding,
                 loaded_at: Instant::now(),
+                persist,
             },
         );
-        self.schedule_save();
+        if persist {
+            self.schedule_save();
+        }
     }
 
     /// 获取缓存的远程文件内容及其磁盘编码

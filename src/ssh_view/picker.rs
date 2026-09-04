@@ -614,11 +614,7 @@ impl SshPicker {
     }
 }
 
-impl Focusable for SshPicker {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(SshPicker);
 
 impl Render for SshPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

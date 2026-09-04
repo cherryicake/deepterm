@@ -157,40 +157,36 @@ where
         self.redos.clear();
     }
 
-    /// 执行 undo，返回被撤销的变更列表
-    pub fn undo(&mut self) -> Option<Vec<I>> {
-        let first_change = self.undos.pop_back()?;
+    /// 从 `from` 弹出一个版本组（同 version 的连续变更），整体克隆一份压回 `to`，
+    /// 返回弹出的变更列表。undo / redo 的共享实现。
+    fn pop_group(
+        from: &mut VecDeque<I>,
+        to: &mut VecDeque<I>,
+    ) -> Option<Vec<I>> {
+        let first_change = from.pop_back()?;
         let target_version = first_change.version();
         let mut changes = vec![first_change];
         // 收集同一版本的所有变更
-        while let Some(change) = self.undos.back() {
+        while let Some(change) = from.back() {
             if change.version() == target_version {
-                changes.push(self.undos.pop_back().unwrap());
+                changes.push(from.pop_back().unwrap());
             } else {
                 break;
             }
         }
-        // 将变更放入 redo 栈
-        self.redos.extend(changes.iter().cloned());
+        // 将变更放入对侧栈
+        to.extend(changes.iter().cloned());
         Some(changes)
+    }
+
+    /// 执行 undo，返回被撤销的变更列表
+    pub fn undo(&mut self) -> Option<Vec<I>> {
+        Self::pop_group(&mut self.undos, &mut self.redos)
     }
 
     /// 执行 redo，返回被重做的变更列表
     pub fn redo(&mut self) -> Option<Vec<I>> {
-        let first_change = self.redos.pop_back()?;
-        let target_version = first_change.version();
-        let mut changes = vec![first_change];
-        // 收集同一版本的所有变更
-        while let Some(change) = self.redos.back() {
-            if change.version() == target_version {
-                changes.push(self.redos.pop_back().unwrap());
-            } else {
-                break;
-            }
-        }
-        // 将变更放入 undo 栈
-        self.undos.extend(changes.iter().cloned());
-        Some(changes)
+        Self::pop_group(&mut self.redos, &mut self.undos)
     }
 }
 
@@ -288,11 +284,15 @@ mod tests {
     /// 版本号永不递增，整段输入被折叠成一个 undo 组。
     #[test]
     fn test_group_interval_measures_from_group_start() {
-        let mut history = History::new().group_interval(std::time::Duration::from_millis(100));
-        // 每 60ms 敲一次，节奏稳定且小于 100ms 的分组间隔。
+        // 时间线（无调度延迟时）：push 依次落在 0/300/600/900/1200ms，
+        // 按"距组起点"计算分组得 a b | c d | e。
+        // 容错边距：分组判定要求"距上次 push < 500ms 且距组起点 ≥ 500ms"，
+        // 每段 sleep 允许最多 ~200ms 的调度延迟仍保持预期分组——
+        // 旧的 60ms/100ms 组合只容 40ms 延迟，在并行测试负载下是 flaky。
+        let mut history = History::new().group_interval(std::time::Duration::from_millis(500));
         for (i, ch) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             history.push(Change::new(i..i, "", i..i + 1, ch));
-            std::thread::sleep(std::time::Duration::from_millis(60));
+            std::thread::sleep(std::time::Duration::from_millis(300));
         }
 
         // 累积间隔跨过 100ms 就应该切组：a b | c d | e，共 3 组。

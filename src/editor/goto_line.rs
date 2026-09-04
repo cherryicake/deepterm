@@ -108,7 +108,9 @@ impl GotoLinePanel {
         editor.update(cx, |state, cx| {
             let row = line - 1;
             let line_start = state.text().line_start_offset(row);
-            let line_end = state.text().line_end_offset(row);
+            // line_end_offset 含行尾 `\r`（CRLF 文件），会把回车当成一列消耗，
+            // 列号整体错 1。line_content_end_offset 正确剥离 \r\n。
+            let line_end = state.text().line_content_end_offset(row);
             // 列按字符计（1 起）：跳过本行前 col-1 个字符
             let mut offset = line_start;
             let mut remaining = col - 1;

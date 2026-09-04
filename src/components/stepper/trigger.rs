@@ -3,7 +3,7 @@ use gpui::{
     RenderOnce, StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
-use crate::callbacks::BoxedClickCallback;
+use crate::components::callbacks::BoxedClickCallback;
 use crate::components::spinner::Spinner;
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;

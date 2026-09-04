@@ -3,7 +3,7 @@ use gpui::{
     RenderOnce, StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, px, relative,
 };
 
-use crate::callbacks::BoxedClickCallback;
+use crate::components::callbacks::BoxedClickCallback;
 use crate::components::stepper::StepperSize;
 use crate::components::stepper::stepper::StepperStatus;
 use crate::components::stepper::trigger::StepperTrigger;

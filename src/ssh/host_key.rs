@@ -75,7 +75,15 @@ pub fn check_and_trust_host_key(
                 if let Err(e) =
                     russh::keys::known_hosts::learn_known_hosts(host, port, server_public_key)
                 {
-                    log::warn!("ssh: 写入 known_hosts 失败: {e}");
+                    // 学习失败必须拒绝：known_hosts 被篡改/移走时 russh 的读取
+                    // 静默返回"无记录"（File::open 失败 → 空 vec），若此处仍放行，
+                    // accept-new 会退化成"永远信任任意密钥"——每条连接都是首次连接
+                    // 且永远学不进去，MITM 防线整体失效。拒绝并给出修复指引。
+                    log::error!(
+                        "ssh: 写入 known_hosts 失败，拒绝连接: {e}。\
+                        请检查 ~/.ssh/known_hosts 是否存在且可写"
+                    );
+                    return Err(russh::Error::Inconsistent);
                 }
                 Ok(true)
             }

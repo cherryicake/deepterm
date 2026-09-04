@@ -1,7 +1,4 @@
-use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Styled, Window, div,
-};
+use gpui::{App, AppContext, Entity, SharedString};
 
 use crate::workspace::panel::{Panel, PanelPlacement};
 use crate::workspace::session_state::{SplitSessionDirection, SplitSessionState};
@@ -176,13 +173,14 @@ impl SplitContainer {
         }
     }
 
-    /// 收集所有面板
-    pub fn collect_panels(&self, panels: &mut Vec<Entity<Panel>>) {
+    /// 收集所有面板（递归辅助函数：`collect_panels_vec` 与外部
+    /// `collect_panels(&mut Vec)` 两种用法共用，避免两份完全相同的实现）
+    pub fn collect_panels_into(&self, panels: &mut Vec<Entity<Panel>>) {
         match self {
             SplitContainer::Panel(panel) => panels.push(panel.clone()),
             SplitContainer::Split { children, .. } => {
                 for child in children {
-                    child.collect_panels(panels);
+                    child.collect_panels_into(panels);
                 }
             }
         }
@@ -191,19 +189,8 @@ impl SplitContainer {
     /// 收集所有面板（不需要Context）
     pub fn collect_panels_vec(&self) -> Vec<Entity<Panel>> {
         let mut panels = Vec::new();
-        self.collect_panels_vec_recursive(&mut panels);
+        self.collect_panels_into(&mut panels);
         panels
-    }
-
-    pub fn collect_panels_vec_recursive(&self, panels: &mut Vec<Entity<Panel>>) {
-        match self {
-            SplitContainer::Panel(panel) => panels.push(panel.clone()),
-            SplitContainer::Split { children, .. } => {
-                for child in children {
-                    child.collect_panels_vec_recursive(panels);
-                }
-            }
-        }
     }
 
     /// 计算容器中的panel数量
@@ -478,77 +465,6 @@ impl From<SplitSessionDirection> for SplitDirection {
             SplitSessionDirection::Horizontal => SplitDirection::Horizontal,
             SplitSessionDirection::Vertical => SplitDirection::Vertical,
         }
-    }
-}
-
-/// 分割管理器
-pub struct SplitManager {
-    root: SplitContainer,
-    focus_handle: FocusHandle,
-    next_panel_id: usize,
-}
-
-impl SplitManager {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let focus_handle = cx.focus_handle();
-
-        // 创建一个临时的空面板，稍后会被替换
-        let temp_panel =
-            cx.new(|cx| crate::workspace::panel::Panel::new("temp", "temp-group", None, cx));
-
-        Self {
-            root: SplitContainer::new_panel(temp_panel),
-            focus_handle,
-            next_panel_id: 0,
-        }
-    }
-
-    /// 初始化根面板
-    pub fn init_root(&mut self, panel: Entity<Panel>) {
-        self.root = SplitContainer::new_panel(panel);
-        self.next_panel_id = 1;
-    }
-
-    /// 获取根容器
-    pub fn root(&self) -> &SplitContainer {
-        &self.root
-    }
-
-    /// 获取根容器（可变）
-    pub fn root_mut(&mut self) -> &mut SplitContainer {
-        &mut self.root
-    }
-
-    /// 生成新面板 ID
-    pub fn generate_panel_id(&mut self) -> String {
-        let id = format!("panel-{}", self.next_panel_id);
-        self.next_panel_id += 1;
-        id
-    }
-
-    /// 为指定workspace组生成panel ID
-    pub fn generate_panel_id_for_workspace(&self, workspace_id: &str) -> String {
-        format!("{}-panel-{}", workspace_id, self.next_panel_id)
-    }
-
-    /// 收集所有面板
-    pub fn collect_panels(&self) -> Vec<Entity<Panel>> {
-        let mut panels = Vec::new();
-        self.root.collect_panels(&mut panels);
-        panels
-    }
-}
-
-impl Focusable for SplitManager {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for SplitManager {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // SplitManager 本身不渲染，由 Workspace 来渲染
-        div().size_full()
     }
 }
 

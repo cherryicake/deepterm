@@ -106,24 +106,21 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// 原子写入：先写临时文件再 rename，避免崩溃产生截断 JSON
+    /// 原子写入：先写临时文件再 rename，避免崩溃产生截断 JSON。
+    /// tmp+rename 委托给 [`crate::utils::fs_atomic`]，与主题等其它落盘点共用同一实现。
     fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // 使用 pid + 随机避免并发冲突
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&tmp, content)?;
         // 保留旧文件备份（仅 session/state）
         if path.exists() {
             let bak = path.with_extension(format!(
                 "{}.bak",
                 path.extension().and_then(|s| s.to_str()).unwrap_or("json")
             ));
-            let _ = fs::copy(path, &bak);
+            // 备份失败必须中止写入而非忽略：.bak 是"上一版完整会话"的
+            // 崩溃恢复兜底，复制失败（磁盘满/权限）后继续覆盖主文件，
+            // 会出现"主文件写坏 + 备份已丢"的双废窗口，会话全丢。
+            fs::copy(path, &bak)?;
         }
-        fs::rename(&tmp, path)?;
-        Ok(())
+        crate::utils::fs_atomic::atomic_write(path, content)
     }
 
     fn get_session_file_path(&self) -> PathBuf {

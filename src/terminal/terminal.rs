@@ -50,7 +50,7 @@ use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
 };
-use crate::terminal_view::terminal_view::CTRL_V;
+
 
 /// 最大滚动缓冲区行数限制
 const MAX_SCROLLBACK_LINES: usize = 100000;
@@ -101,8 +101,12 @@ pub enum Event {
 #[derive(Clone)]
 pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
 
+/// 远程数据驱动事件通道。
+///
+/// 有界（async_channel）：SSH 读循环在 UI 消费不过来时通过 `send().await`
+/// 挂起，背压经 SSH 窗口传导到远端，避免无界队列在 UI 卡顿时无限膨胀。
 #[derive(Clone)]
-pub struct DriverListener(pub UnboundedSender<DriverEvent>);
+pub struct DriverListener(pub async_channel::Sender<DriverEvent>);
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
@@ -233,6 +237,31 @@ fn ensure_secure_dir(path: &std::path::Path) -> Option<()> {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
     }
     Some(())
+}
+
+/// 当前主机名（OSC 7 本地主机校验用）。
+///
+/// unix：gethostname(2) 纯 syscall（此前为一次 `/bin/hostname` 的
+/// fork+exec+waitpid，且发生在数据处理路径上）。Windows：
+/// COMPUTERNAME 环境变量足够本校验用途。
+fn hostname_via_syscall() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY（中文）：gethostname 为只读 syscall，缓冲区指针/长度均有效；
+        // 名字超长时 Linux 截断并补 NUL、macOS 返回 ERANGE（此时退回空串）。
+        let ok =
+            unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if ok != 0 {
+            return String::new();
+        }
+        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..nul]).trim().to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
 }
 
 fn write_local_shell_integration_files() -> Option<PathBuf> {
@@ -564,6 +593,10 @@ pub struct Terminal {
     /// this flag is set. See `set_link_hover_active`.
     link_hover_active: bool,
     last_mouse_position: Option<Point<Pixels>>,
+    /// MOUSE_MOTION 模式下最近一次已上报的网格坐标（行,列）。
+    /// 移动事件可达数百 Hz，同一 cell 内的重复移动不再向 PTY 发报文
+    /// （alacritty 同样按 cell 去重），避免远端重绘回报放大成全帧重排版。
+    last_reported_mouse_cell: Option<(Line, Column)>,
     /// Scroll accumulator for smooth scrolling (trackpad support)
     /// Accumulates partial scroll amounts and applies them when they reach a full line
     scroll_px: Pixels,
@@ -685,6 +718,7 @@ impl Terminal {
                 mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
+            last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
@@ -815,6 +849,7 @@ impl Terminal {
             mouse_report_active: false,
             link_hover_active: false,
             last_mouse_position: None,
+            last_reported_mouse_cell: None,
             scroll_px: px(0.0),
             scrollbar_drag_offset: Rc::new(Cell::new(None)),
             last_scroll_time: Cell::new(Instant::now()),
@@ -824,93 +859,6 @@ impl Terminal {
             russh_handle: None,
             focused: true,
         }
-    }
-
-    /// 创建新的 SSH 远程终端
-    ///
-    /// # 参数
-    ///
-    /// * `cx` - GPUI 上下文
-    /// * `ssh_config` - SSH 连接配置
-    /// * `on_data` - 数据发送回调，用于发送数据到 SSH 通道
-    /// * `on_resize` - 调整大小回调，用于通知远程主机窗口大小变化
-    pub fn new_remote<F, R>(
-        cx: &mut App,
-        ssh_config: &SshConnectionConfig,
-        on_data: F,
-        on_resize: R,
-    ) -> Entity<Self>
-    where
-        F: Fn(&[u8]) + Send + 'static,
-        R: Fn(u16, u16) + Send + 'static,
-    {
-        let (events_tx, events_rx) = unbounded();
-        let listener = ZedListener(events_tx.clone());
-
-        let default_bounds = TerminalBounds::default();
-
-        let term = Arc::new(FairMutex::new(Term::new(
-            Self::default_terminal_config(),
-            &default_bounds,
-            listener.clone(),
-        )));
-
-        // 创建远程终端
-        cx.new(|cx| {
-            let term_clone = term.clone();
-
-            let event_loop_task = cx.spawn(async move |this, cx| {
-                let mut events_rx = events_rx;
-                while let Some(event) = events_rx.next().await {
-                    let _ = this.update(cx, |terminal: &mut Self, cx| {
-                        terminal.process_event(event, cx);
-                    });
-                    smol::future::yield_now().await;
-                }
-            });
-
-            Self {
-                term: term_clone,
-                child_process_id: None,
-                shell_process_group_id: None,
-                pty_master_fd: None,
-                shell_program: None,
-                remote_shell_ready: false,
-                reported_working_directory: None,
-                remote_os: None,
-                remote_process_name: None,
-                window_title: None,
-                sender: None, // 远程终端不使用本地 sender
-                last_content: TerminalContent::default(),
-                content_generation: 0,
-                content_dirty: false,
-                dirty_rows: Vec::new(),
-                dirty_row_bounds: Vec::new(),
-                event_loop_task: Some(event_loop_task),
-                driver_task: None,
-                vte_processor: Processor::<StdSyncHandler>::new(),
-                input_area_start: None,
-                shell_fg_observed: None,
-                pending_osc: Vec::new(),
-                terminal_bounds: default_bounds,
-                selection_phase: SelectionPhase::Ended,
-                mouse_report_active: false,
-                link_hover_active: false,
-                last_mouse_position: None,
-                scroll_px: px(0.0),
-                scrollbar_drag_offset: Rc::new(Cell::new(None)),
-                last_scroll_time: Cell::new(Instant::now()),
-                terminal_type: TerminalType::Remote {
-                    host: ssh_config.host.clone(),
-                    username: ssh_config.username.clone(),
-                    port: ssh_config.port,
-                },
-                remote_input_callback: Some(Box::new(on_data)),
-                remote_resize_callback: Some(Box::new(on_resize)),
-                russh_handle: None,
-                focused: true,
-            }
-        })
     }
 
     /// 创建新的 SSH 远程终端
@@ -946,7 +894,8 @@ impl Terminal {
         remote_cwd: Option<String>,
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
-        let (driver_tx, driver_rx) = unbounded();
+        // 有界通道（256 ≈ 8MB 在途上限）：见 DriverListener 文档。
+        let (driver_tx, driver_rx) = async_channel::bounded(256);
         let listener = ZedListener(events_tx.clone());
         let driver_listener = DriverListener(driver_tx);
 
@@ -995,7 +944,7 @@ impl Terminal {
         remote_cwd: Option<String>,
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
-        let (_driver_tx, driver_rx) = unbounded();
+        let (_driver_tx, driver_rx) = async_channel::bounded(1);
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
 
@@ -1053,7 +1002,7 @@ impl Terminal {
         ssh_config: &SshConnectionConfig,
         term: Arc<FairMutex<Term<ZedListener>>>,
         events_rx: UnboundedReceiver<AlacTermEvent>,
-        driver_rx: UnboundedReceiver<DriverEvent>,
+        driver_rx: async_channel::Receiver<DriverEvent>,
         input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
         resize_handler: impl Fn(u16, u16) + Send + Sync + 'static,
         russh_handle: Option<RusshTerminal>,
@@ -1074,8 +1023,9 @@ impl Terminal {
             });
 
             let driver_task = cx.spawn(async move |this, cx| {
-                let mut driver_rx = driver_rx;
-                while let Some(event) = driver_rx.next().await {
+                let driver_rx = driver_rx;
+                // async_channel::Receiver 为 !Unpin，用其原生 recv()（返回 Err 即通道关闭）
+                while let Ok(event) = driver_rx.recv().await {
                     let _ = this.update(cx, |terminal: &mut Self, cx| match event {
                         DriverEvent::RemoteData(data) => terminal.handle_remote_data(&data, cx),
                         DriverEvent::AbnormalDisconnect { reason } => {
@@ -1114,6 +1064,7 @@ impl Terminal {
                 mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
+            last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
@@ -1261,13 +1212,6 @@ impl Terminal {
 
     pub fn reported_working_directory(&self) -> Option<&str> {
         self.reported_working_directory.as_deref()
-    }
-
-    /// 兼容旧调用点：历史上这个值只来自 SSH OSC，所以 API 名称包含 remote。
-    /// 现在本地 PTY 也会通过 OSC 7 上报 cwd，新代码应优先使用
-    /// `reported_working_directory` 表达更准确的语义。
-    pub fn remote_working_directory(&self) -> Option<&str> {
-        self.reported_working_directory()
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
@@ -1542,16 +1486,8 @@ impl Terminal {
 
         fn cached_hostname() -> &'static str {
             static HOSTNAME: OnceLock<String> = OnceLock::new();
-            HOSTNAME.get_or_init(|| {
-                std::process::Command::new("/bin/hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default()
-            })
+            HOSTNAME.get_or_init(hostname_via_syscall)
         }
-
         let hostname = cached_hostname();
         host == hostname
             || hostname
@@ -1661,7 +1597,7 @@ impl Terminal {
                     .and_then(|item| item.text().map(|t| t.to_string()))
                     .unwrap_or_default();
                 let response = format(&clipboard_content);
-                self.write(response.as_bytes());
+                self.write_raw(response.as_bytes());
             }
             AlacTermEvent::TextAreaSizeRequest(format) => {
                 // 响应窗口大小查询 (CSI t)
@@ -1672,10 +1608,10 @@ impl Terminal {
                     cell_height: self.terminal_bounds.line_height.as_f32() as u16,
                 };
                 let response = format(window_size);
-                self.write(response.as_bytes());
+                self.write_raw(response.as_bytes());
             }
             AlacTermEvent::PtyWrite(text) => {
-                self.write(text.as_bytes());
+                self.write_raw(text.as_bytes());
             }
             AlacTermEvent::MouseCursorDirty => {
                 // 鼠标光标形状可能需要变化，触发刷新
@@ -1695,7 +1631,7 @@ impl Terminal {
                 });
                 drop(term);
                 let response = format(color);
-                self.write(response.as_bytes());
+                self.write_raw(response.as_bytes());
             }
             AlacTermEvent::CursorBlinkingChange => {
                 // Application requested a cursor blink state change via DEC
@@ -1894,6 +1830,24 @@ impl Terminal {
         }
 
         // 远程终端：通过回调发送到 SSH 通道
+        if let Some(ref callback) = self.remote_input_callback {
+            callback(data);
+        }
+    }
+
+    /// 应用程序回写的原始通道（终端查询应答 / 程序注入），**不维护输入区锚点**。
+    ///
+    /// `write` 是用户输入路径：含 CRLF 时失效锚点（提示符重绘）是其语义的一部分。
+    /// 但 ClipboardLoad / PtyWrite / TextAreaSizeRequest / ColorRequest 这类
+    /// 应答如果也走 `write`，应答文本中恰含 `\r`（如剪贴板回写任意文本）就会
+    /// 误清锚点并把锚点重捕到程序输出末尾，使 `input_line_blank` 在非空行上
+    /// 误报 true，导致 `/` 前缀被错误拦截进内建命令。
+    pub fn write_raw(&mut self, data: &[u8]) {
+        if let Some(ref sender) = self.sender {
+            let msg = Msg::Input(Cow::Owned(data.to_vec()));
+            let _ = sender.send(msg);
+            return;
+        }
         if let Some(ref callback) = self.remote_input_callback {
             callback(data);
         }
@@ -2279,6 +2233,14 @@ impl Terminal {
                 self.last_content.display_offset,
             );
 
+            // 按网格坐标去重：MOUSE_MOTION 模式下移动事件可达数百 Hz，
+            // 每个（行,列）只发一次报文（alacritty 同样按 cell 去重），
+            // 否则远端应用的重绘回报会成倍放大为全帧重排版。
+            if self.last_reported_mouse_cell == Some((point.line, point.column)) {
+                return;
+            }
+            self.last_reported_mouse_cell = Some((point.line, point.column));
+
             if let Some(bytes) =
                 mouse_moved_report(point, e.pressed_button, e.modifiers, self.last_content.mode)
             {
@@ -2412,54 +2374,39 @@ impl Terminal {
     // 注意：scroll_display 只更新 term 内部的 display_offset，视口快照
     // （last_content）依赖 sync() 的 content_dirty 分支刷新。这里统一置位
     // content_dirty，否则键盘滚动后视口/选区高亮会停留在旧数据。
-    pub fn scroll_line_up(&mut self) {
+    /// 所有滚动入口的公共尾部：滚动 + 置脏 + 记录时间。
+    fn scroll_by(&mut self, scroll: AlacScroll) {
         let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Delta(1));
+        term.scroll_display(scroll);
         drop(term);
         self.content_dirty = true;
         self.last_scroll_time.set(Instant::now());
+    }
+
+    pub fn scroll_line_up(&mut self) {
+        self.scroll_by(AlacScroll::Delta(1));
     }
 
     pub fn scroll_line_down(&mut self) {
-        let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Delta(-1));
-        drop(term);
-        self.content_dirty = true;
-        self.last_scroll_time.set(Instant::now());
+        self.scroll_by(AlacScroll::Delta(-1));
     }
 
     pub fn scroll_page_up(&mut self) {
-        let mut term = self.term.lock();
-        let lines = term.screen_lines() as i32;
-        term.scroll_display(AlacScroll::Delta(lines));
-        drop(term);
-        self.content_dirty = true;
-        self.last_scroll_time.set(Instant::now());
+        let lines = self.term.lock().screen_lines() as i32;
+        self.scroll_by(AlacScroll::Delta(lines));
     }
 
     pub fn scroll_page_down(&mut self) {
-        let mut term = self.term.lock();
-        let lines = term.screen_lines() as i32;
-        term.scroll_display(AlacScroll::Delta(-lines));
-        drop(term);
-        self.content_dirty = true;
-        self.last_scroll_time.set(Instant::now());
+        let lines = self.term.lock().screen_lines() as i32;
+        self.scroll_by(AlacScroll::Delta(-lines));
     }
 
     pub fn scroll_to_top(&mut self) {
-        let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Top);
-        drop(term);
-        self.content_dirty = true;
-        self.last_scroll_time.set(Instant::now());
+        self.scroll_by(AlacScroll::Top);
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        let mut term = self.term.lock();
-        term.scroll_display(AlacScroll::Bottom);
-        drop(term);
-        self.content_dirty = true;
-        self.last_scroll_time.set(Instant::now());
+        self.scroll_by(AlacScroll::Bottom);
     }
 
     /// Set the display offset directly (for scrollbar dragging)
@@ -2467,10 +2414,7 @@ impl Terminal {
         let current_offset = self.last_content.display_offset;
         let delta = offset as i32 - current_offset as i32;
         if delta != 0 {
-            let mut term = self.term.lock();
-            term.scroll_display(AlacScroll::Delta(delta));
-            self.content_dirty = true;
-            self.last_scroll_time.set(Instant::now());
+            self.scroll_by(AlacScroll::Delta(delta));
             cx.emit(Event::Wakeup);
         }
     }
@@ -2494,7 +2438,7 @@ impl Terminal {
             ClipboardEntry::Image(image) => !image.bytes.is_empty(),
             _ => false,
         }) {
-            self.write(&[CTRL_V]);
+            self.write(&[crate::terminal::CTRL_V]);
             return;
         }
 

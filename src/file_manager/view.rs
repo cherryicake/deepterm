@@ -8,7 +8,7 @@ use gpui::prelude::*;
 use gpui::{App, ClickEvent, Context, Div, MouseButton, Window, div, px, relative, rgb};
 
 use crate::assets::Icon;
-use crate::file_icons::file_icon_or_default;
+use crate::assets::file_icon_or_default;
 fn format_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = size as f64;

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription, Task,
     UTF16Selection, Window, actions, div, point, px,
 };
@@ -51,7 +51,11 @@ pub enum Event {
 impl EventEmitter<Event> for TerminalView {}
 
 /// ASCII control character for Ctrl+V (SYN - Synchronous Idle)
-pub const CTRL_V: u8 = 0x16;
+///
+/// 定义在 `terminal` 模块（终端域常量）；此处 re-export 保持
+/// `terminal_view::CTRL_V` 旧路径。此前定义在本模块，使 `terminal`
+/// 反向 use `terminal_view`，形成 terminal ↔ terminal_view 模块环。
+pub use crate::terminal::CTRL_V;
 
 /// IME state for tracking marked (pre-edit) text during composition
 pub struct ImeState {
@@ -886,7 +890,16 @@ impl TerminalView {
 
                 // 创建新的终端
                 let remote_cwd = this.current_remote_working_directory(cx);
+                let old_terminal = this.terminal.clone();
                 let new_terminal = Terminal::new_ssh_with_remote_cwd(cx, config, remote_cwd);
+                // 旧终端显式关闭：避免依赖引用计数回收时的 Drop 兜底，
+                // 也确保旧 SSH 会话立即断开而非等到下次回收。
+                old_terminal.update(cx, |t, _| t.kill());
+                // 旧终端的行渲染缓存/扁平化缓存内容属于旧 terminal 实体。
+                // 新实体 dirty_rows 初始为空，若保留旧缓存，连接完成的首帧
+                // （尚无 Wakeup）可能复用旧终端的文本内容闪现一帧。
+                this.row_render_cache.clear();
+                this.flattened_render_cache = Default::default();
                 this.terminal_subscription =
                     Some(this.subscribe_terminal_events(&new_terminal, cx));
                 this.terminal = new_terminal;
@@ -2585,11 +2598,7 @@ impl TerminalView {
     }
 }
 
-impl Focusable for TerminalView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(TerminalView);
 
 impl EntityInputHandler for TerminalView {
     fn selected_text_range(
@@ -2827,7 +2836,7 @@ impl Render for TerminalView {
                         if let Some(ref link) = this.hovered_link {
                             // 关键安全：终端链接经 link_detector 识别（仅 http/www），
                             // 此处再经白名单二次校验，防御未来识别器放宽后的风险。
-                            crate::safe_open::open_url_safely(link.url.as_ref());
+                            crate::utils::safe_open::open_url_safely(link.url.as_ref());
                             return;
                         }
                     }

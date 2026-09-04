@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::callbacks::OptionalStrCallback;
+use crate::components::callbacks::OptionalStrCallback;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
 use crate::file_manager::file_tree_event::FileTreeEvent;
@@ -199,6 +199,8 @@ pub struct MacosSidebar {
     hovered_section: Option<usize>,
     current_view: SidebarView,
     theme_scroll_handle: ScrollHandle,
+    /// 主题视图的搜索过滤词（空 = 不过滤）。此前主题搜索框是纯装饰。
+    theme_search_query: String,
     font_scroll_handle: ScrollHandle,
     font_view: Option<Entity<FontSettingsView>>,
     host_view: Option<Entity<HostView>>,
@@ -262,6 +264,7 @@ impl MacosSidebar {
             hovered_section: None,
             current_view: SidebarView::Menu,
             theme_scroll_handle: ScrollHandle::new(),
+            theme_search_query: String::new(),
             font_scroll_handle: ScrollHandle::new(),
             font_view: None,
             host_view: None,

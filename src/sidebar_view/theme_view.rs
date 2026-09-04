@@ -8,14 +8,17 @@ use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::theme::ThemeState;
 
 /// 渲染主题侧边栏视图
-pub fn render_theme_sidebar<F>(
+pub fn render_theme_sidebar<F, G>(
     cx: &App,
     on_select: Rc<F>,
     theme: crate::theme::UiTheme,
     scroll_handle: &ScrollHandle,
+    search_query: &str,
+    on_search_change: Rc<G>,
 ) -> gpui::Div
 where
     F: Fn(&str, &mut Window, &mut App) + 'static,
+    G: Fn(&str, &mut App) + 'static,
 {
     let active_theme_id = ThemeState::global(cx).active_theme_id().to_string();
     let themes = ThemeState::themes(cx).to_vec();
@@ -60,7 +63,7 @@ where
         )
         .child(div().w(px(28.0)));
 
-    // 搜索框
+    // 搜索框（真实过滤：输入即时过滤下方主题列表）
     let search_box = div()
         .w_full()
         .h(px(32.0))
@@ -81,13 +84,34 @@ where
             div()
                 .text_sm()
                 .text_color(theme.text_muted)
-                .child("搜索主题"),
-        );
+                .child(if search_query.is_empty() {
+                    "搜索主题".to_string()
+                } else {
+                    search_query.to_string()
+                }),
+        )
+        .on_mouse_down(MouseButton::Left, {
+            // 点击搜索框：把过滤词清空重新开始输入（简单交互；完整
+            // 编辑体验后续可换 InputState 组件）。
+            let on_search_change = on_search_change.clone();
+            move |_, _window, cx| on_search_change("", cx)
+        });
 
-    // 主题列表
+    // 主题列表（按搜索词过滤，名字/中文名不区分大小写匹配）
     let mut theme_list = div().w_full().flex().flex_col().gap(px(2.0));
 
+    let query_lower = search_query.trim().to_lowercase();
     for (index, theme_item) in themes.iter().enumerate() {
+        if !query_lower.is_empty() {
+            let name_hit = theme_item.name.to_lowercase().contains(&query_lower);
+            let display_hit = theme_item
+                .description
+                .to_lowercase()
+                .contains(&query_lower);
+            if !name_hit && !display_hit {
+                continue;
+            }
+        }
         let is_active = theme_item.id == active_theme_id;
         let theme_id = theme_item.id.clone();
         let preview_colors = theme_item.terminal.preview_colors();

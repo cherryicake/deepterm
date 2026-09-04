@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, App, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    Animation, AnimationExt as _, App, Context, Entity, FocusHandle, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, Pixels, Render, ScrollHandle, SharedString, Task,
     Window, anchored, canvas, deferred, div, linear, point, px, svg,
 };
@@ -268,11 +268,7 @@ impl MacosSelect {
     }
 }
 
-impl Focusable for MacosSelect {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(MacosSelect);
 
 impl Render for MacosSelect {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

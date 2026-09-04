@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId,
+    App, Bounds, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId,
     ImageFormat, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent,
     ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, Style, Styled, Window, actions,
     checkerboard, div, img, px,
@@ -127,11 +127,7 @@ impl ImageViewer {
     }
 }
 
-impl Focusable for ImageViewer {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
+crate::impl_focusable!(ImageViewer);
 
 impl Render for ImageViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
