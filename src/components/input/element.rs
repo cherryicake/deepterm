@@ -17,7 +17,8 @@ use crate::{
 };
 
 use super::{
-    GitLineMark, InputState, LastLayout, RainbowCache, ScrollbarGeometry, WhitespaceIndicators,
+    BracketSpan, GitLineMark, InputState, LastLayout, RainbowCache, ScrollbarGeometry,
+    WhitespaceIndicators,
     mode::InputMode,
     state::{
         RAINBOW_BRACKETS_MAX_TEXT_LEN, is_code_bracket, scan_bracket_spans_text,
@@ -1000,12 +1001,16 @@ impl TextElement {
     /// 优先用 tree-sitter 树扫描（字符串/注释内的括号不参与计数，避免深度被污染），
     /// 无树时退回纯文本扫描；配对算法一致：类型配对 + 交错容忍，未配对标错误色。
     /// 结果按 (text_version, 树指纹) 缓存，树后台重解析落地后自动失效。
-    fn merge_rainbow_brackets(
-        &self,
-        styles: Option<Vec<(Range<usize>, HighlightStyle)>>,
-        visible: &Range<usize>,
-        cx: &mut App,
-    ) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+    /// 彩虹括号 span 的共享获取（命中缓存或重算并写回）。
+    ///
+    /// 可见行合并（[`Self::merge_rainbow_brackets`]）与折叠 tail（收尾行
+    /// `}`，见 `layout_fold_placeholders`）共用同一份 span 与层级色，保证
+    /// 折叠占位符两侧的括号颜色一致。返回 `None` 表示彩虹括号未启用
+    /// （关闭 / 单行 / masked / diff 视图 / 超长文本），调用方保持原语法色。
+    ///
+    /// 注意：命中失败时会写回缓存（`state.update`），调用点不得持有
+    /// `self.state.read(cx)` 的借用。
+    fn rainbow_bracket_spans(&self, cx: &mut App) -> Option<Rc<Vec<BracketSpan>>> {
         let (enabled, text, version, highlighter) = {
             let state = self.state.read(cx);
             (
@@ -1022,9 +1027,8 @@ impl TextElement {
             )
         };
         if !enabled || text.len() > RAINBOW_BRACKETS_MAX_TEXT_LEN {
-            return styles;
+            return None;
         }
-        let mut styles = styles?;
 
         // 树指纹：树被替换（后台解析落地/换语言）时变化，缓存随之失效
         let tree_key = highlighter.as_ref().and_then(|h| {
@@ -1043,8 +1047,8 @@ impl TextElement {
                 _ => None,
             }
         };
-        let spans = match cached {
-            Some(spans) => spans,
+        match cached {
+            Some(spans) => Some(spans),
             None => {
                 let computed = match highlighter
                     .as_ref()
@@ -1053,7 +1057,7 @@ impl TextElement {
                     Some(tree) => scan_bracket_spans_tree(&tree),
                     None => scan_bracket_spans_text(&text),
                 };
-                let computed = std::rc::Rc::new(computed);
+                let computed = Rc::new(computed);
                 self.state.update(cx, |state, _| {
                     state.rainbow_cache = Some(RainbowCache {
                         text_version: version,
@@ -1061,17 +1065,23 @@ impl TextElement {
                         spans: computed.clone(),
                     });
                 });
-                computed
+                Some(computed)
             }
-        };
+        }
+    }
 
-        let dark = cx.theme().appearance.is_dark();
-        let error_color = cx.theme().error;
-        let rainbow: Vec<(Range<usize>, HighlightStyle)> = spans
+    /// 把彩虹括号 span 中与 `range` 重叠的部分转成覆盖样式
+    ///（配对/未闭合括号取层级色，游离闭括号标错误色）。
+    fn rainbow_overrides_in_range(
+        spans: &[BracketSpan],
+        range: &Range<usize>,
+        dark: bool,
+        error_color: Hsla,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        spans
             .iter()
-            .filter(|(r, _, _, _)| r.start >= visible.start && r.end <= visible.end)
+            .filter(|(r, _, _, _)| r.start < range.end && r.end > range.start)
             .map(|(r, d, is_open, matched)| {
-                // 游离闭括号标错误色；未闭合的开括号保持层级色（避免输入时闪红）
                 let color = if *matched || *is_open {
                     Self::rainbow_bracket_color(*d, dark)
                 } else {
@@ -1085,7 +1095,23 @@ impl TextElement {
                     },
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    fn merge_rainbow_brackets(
+        &self,
+        styles: Option<Vec<(Range<usize>, HighlightStyle)>>,
+        visible: &Range<usize>,
+        cx: &mut App,
+    ) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+        let mut styles = styles?;
+        let Some(spans) = self.rainbow_bracket_spans(cx) else {
+            return Some(styles);
+        };
+
+        let dark = cx.theme().appearance.is_dark();
+        let error_color = cx.theme().error;
+        let rainbow = Self::rainbow_overrides_in_range(spans.iter().as_slice(), visible, dark, error_color);
         if rainbow.is_empty() {
             return Some(styles);
         }
@@ -1432,12 +1458,27 @@ impl TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<FoldPlaceholder> {
-        let state = self.state.read(cx);
-        if !state.mode.is_folding() || state.text.len() == 0 {
-            return Vec::new();
-        }
+        // 先在独立作用域里收集折叠表头行（借用随块结束），彩虹 span 获取
+        // 可能写回缓存（state.update），不能与读借用并存。
+        let (fold_header_rows, text) = {
+            let state = self.state.read(cx);
+            if !state.mode.is_folding() || state.text.len() == 0 {
+                return Vec::new();
+            }
+            let rows: Vec<usize> = last_layout
+                .visible_buffer_lines
+                .iter()
+                .copied()
+                .filter(|&buffer_line| state.display_map.fold_for_row(buffer_line).is_some())
+                .collect();
+            (rows, state.text.clone())
+        };
 
-        let text = state.text.clone();
+        // 彩虹括号 span：折叠 tail（收尾行的 `}`）与表头行的 `{` 共用同一份
+        // 层级色，否则占位符两侧括号一白一灰。
+        let rainbow_spans = self.rainbow_bracket_spans(cx);
+
+        let state = self.state.read(cx);
         let mut placeholders = Vec::new();
 
         let placeholder_color = cx.theme().text_muted;
@@ -1458,8 +1499,10 @@ impl TextElement {
 
         let mut highlighter = state.mode.highlighter().map(|h| h.borrow_mut());
         let highlight_theme = cx.theme().highlight_theme.clone();
+        let dark = cx.theme().appearance.is_dark();
+        let error_color = cx.theme().error;
 
-        for &buffer_line in last_layout.visible_buffer_lines.iter() {
+        for &buffer_line in fold_header_rows.iter() {
             let Some(fold) = state.display_map.fold_for_row(buffer_line) else {
                 continue;
             };
@@ -1479,8 +1522,22 @@ impl TextElement {
                 let tail_runs: Vec<TextRun> = if let Some(highlighter) =
                     highlighter.as_deref_mut().and_then(|h| h.as_mut())
                 {
-                    highlighter
-                        .styles(&(tail_start..tail_end), &highlight_theme)
+                    // 语法色 + 彩虹括号覆盖（与可见行同源，保证折叠两侧
+                    // 括号同色），再转 TextRun。
+                    let mut tail_styles =
+                        highlighter.styles(&(tail_start..tail_end), &highlight_theme);
+                    if let Some(spans) = &rainbow_spans {
+                        let rainbow = Self::rainbow_overrides_in_range(
+                            spans,
+                            &(tail_start..tail_end),
+                            dark,
+                            error_color,
+                        );
+                        if !rainbow.is_empty() {
+                            tail_styles = combine_highlights_stable(tail_styles, rainbow);
+                        }
+                    }
+                    tail_styles
                         .into_iter()
                         .map(|(range, style)| {
                             let len = range.len().min(tail_text.len());
@@ -2692,28 +2749,7 @@ impl Element for TextElement {
                 // 每级参考线的实际 x（相对正文左缘）：按前缀里空格 / Tab 的
                 // 真实推进量累加，而不是 `space_width * 列数`。
                 let guide_xs = |line: &str| -> Vec<Pixels> {
-                    let mut out = Vec::new();
-                    let mut cols = 0usize;
-                    let mut width = px(0.);
-                    for ch in line.chars() {
-                        match ch {
-                            ' ' => {
-                                cols += 1;
-                                width += space_width;
-                            }
-                            '\t' => {
-                                cols = cols - cols % indent_size + indent_size;
-                                width += tab_width;
-                            }
-                            _ => break,
-                        }
-                        // Tab 与制表位、参考线层级都是 `indent_size` 的倍数，
-                        // 所以层级边界一定落在某个字符之后。
-                        while out.len() * indent_size < cols {
-                            out.push(width);
-                        }
-                    }
-                    out
+                    measure_guide_xs(line, indent_size, space_width, tab_width)
                 };
                 // 空行返回 -1：它们的参考线数量由邻近非空行插值得到。
                 let line_indent = |row: usize| -> i32 {
@@ -2779,37 +2815,63 @@ impl Element for TextElement {
                 // Guides per line with VS Code whitespace interpolation
                 let off_side = matches!(state.language().as_deref(), Some("python") | Some("yaml"));
                 let guides_counts = {
-                    let mut prev = vec![-1; win_lines];
+                    // 最近非空行的缩进与行号：空行的层数与参考线 x 都以它
+                    // 为准。窗口边缘之外只能拿到缩进（行号 None），取不到
+                    // 实测 xs，参考线 x 退回外推公式。
+                    let mut prev_indent = vec![-1i32; win_lines];
+                    let mut prev_row: Vec<Option<usize>> = vec![None; win_lines];
                     let mut last = above_window;
+                    let mut last_row: Option<usize> = None;
                     for i in 0..win_lines {
                         if indents[i] >= 0 {
                             last = indents[i];
+                            last_row = Some(win_start + i);
                         }
-                        prev[i] = last;
+                        prev_indent[i] = last;
+                        prev_row[i] = last_row;
                     }
-                    let mut next = vec![-1; win_lines];
+                    let mut next_indent = vec![-1i32; win_lines];
+                    let mut next_row: Vec<Option<usize>> = vec![None; win_lines];
                     let mut nxt = below_window;
+                    let mut next_r: Option<usize> = None;
                     for i in (0..win_lines).rev() {
                         if indents[i] >= 0 {
                             nxt = indents[i];
+                            next_r = Some(win_start + i);
                         }
-                        next[i] = nxt;
+                        next_indent[i] = nxt;
+                        next_row[i] = next_r;
                     }
                     let mut counts = vec![0; win_lines];
                     for i in 0..win_lines {
                         let cur = indents[i];
-                        if cur >= 0 {
-                            counts[i] = (cur as usize).div_ceil(indent_size);
+                        counts[i] = if cur >= 0 {
+                            (cur as usize).div_ceil(indent_size)
                         } else {
-                            let above = prev[i];
-                            let below = next[i];
-                            counts[i] = match (above, below) {
+                            let above = prev_indent[i];
+                            let below = next_indent[i];
+                            match (above, below) {
                                 (-1, _) | (_, -1) => 0,
                                 (a, b) if a < b => (a as usize / indent_size) + 1,
                                 (a, b) if a == b => (b as usize).div_ceil(indent_size),
                                 (_, b) if off_side => (b as usize).div_ceil(indent_size),
                                 (_, b) => (b as usize / indent_size) + 1,
+                            }
+                        };
+                        // 空行的参考线 x 沿用决定层数的那个邻居的实测值。
+                        // 原来按空格宽度外推：邻居是 Tab 缩进（或任何混合
+                        // 缩进）时外推值必然偏离邻居实测值，空行上的参考线
+                        // 整体偏移，竖线看起来断开/错位。邻居取缩进更大的
+                        // 一侧，其 xs 覆盖插值出的全部层级。
+                        if cur < 0 && counts[i] > 0 {
+                            let src = if prev_indent[i] > next_indent[i] {
+                                prev_row[i]
+                            } else {
+                                next_row[i]
                             };
+                            if let Some(row) = src {
+                                indent_xs[i] = indent_xs[row - win_start].clone();
+                            }
                         }
                     }
                     counts
@@ -2878,11 +2940,15 @@ impl Element for TextElement {
                     };
                     for level in 1..=count {
                         let visible_column = (level - 1) * indent_size + 1;
-                        // 优先用实测推进量；层级超出缩进前缀（空行插值出来
-                        // 的层级）时退回按空格宽度线性外推。
+                        // 优先用实测推进量；层级超出缩进前缀（窗口边缘的
+                        // 空行插值）时退回按空格宽度外推。外推基准是
+                        // `visible_column` 本身——实测值恰好是
+                        // `space_width * visible_column`（第 1 层参考线在
+                        // 0 起第 1 列，即块左缘右移一格），此前多减了 1，
+                        // 空行上的参考线整体左移一个空格宽。
                         let offset = match xs.get(level - 1) {
                             Some(x) => *x,
-                            None => space_width * (visible_column - 1) as f32,
+                            None => space_width * visible_column as f32,
                         };
                         let x = origin.x + gutter_width + offset;
                         if x >= input_bounds.right() {
@@ -3189,8 +3255,80 @@ pub(super) fn runs_for_range(
     result
 }
 
+/// 一行缩进前缀的参考线实测 x 坐标（相对正文左缘）：第 k 项 = 第 k 层
+/// 参考线的 x。
+///
+/// 层级规则与 `visible_column = (level-1) * indent_size + 1` 一致：第 k 层
+/// 参考线落在 0 起第 `(k-1) * indent_size + 1` 列（块左缘右移一格），Tab
+/// 向上取整到 `indent_size` 的倍数、x 用 Tab 字形的真实推进量。空格缩进
+/// 时恒有 `xs[k-1] == space_width * ((k-1) * indent_size + 1)`，这是空行
+/// 插值回退公式的对齐基准。
+pub(super) fn measure_guide_xs(
+    line: &str,
+    indent_size: usize,
+    space_width: Pixels,
+    tab_width: Pixels,
+) -> Vec<Pixels> {
+    let mut out = Vec::new();
+    let mut cols = 0usize;
+    let mut width = px(0.);
+    for ch in line.chars() {
+        match ch {
+            ' ' => {
+                cols += 1;
+                width += space_width;
+            }
+            '\t' => {
+                cols = cols - cols % indent_size + indent_size;
+                width += tab_width;
+            }
+            _ => break,
+        }
+        // Tab 与制表位、参考线层级都是 `indent_size` 的倍数，
+        // 所以层级边界一定落在某个字符之后。
+        while out.len() * indent_size < cols {
+            out.push(width);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn measure_guide_xs_pure_spaces_matches_fallback_formula() {
+        let s = px(8.);
+        let t = px(32.);
+        // 4 空格缩进：第 1 层参考线在第 1 列
+        assert_eq!(measure_guide_xs("    x", 4, s, t), vec![s * 1.]);
+        // 8 空格：第 1 层在第 1 列、第 2 层在第 5 列
+        assert_eq!(measure_guide_xs("        x", 4, s, t), vec![s * 1., s * 5.]);
+        // 5 空格（不成层级的前缀）：仍产出 2 层，第 2 层落在第 5 列
+        assert_eq!(measure_guide_xs("     x", 4, s, t), vec![s * 1., s * 5.]);
+        // 不足一级缩进（3 空格）：只有第 1 层
+        assert_eq!(measure_guide_xs("   x", 4, s, t), vec![s * 1.]);
+        // 顶格行：无参考线
+        assert!(measure_guide_xs("x", 4, s, t).is_empty());
+    }
+
+    #[test]
+    fn measure_guide_xs_tabs_use_tab_advance() {
+        let s = px(8.);
+        let t = px(32.);
+        // 两个 Tab：第 1 层在 Tab 推进量处（列 4），第 2 层在两个 Tab 处
+        assert_eq!(measure_guide_xs("\t\tx", 4, s, t), vec![t, t * 2.]);
+        // Tab + 2 空格（混合缩进）：第 2 层 = Tab 推进 + 1 个空格
+        assert_eq!(measure_guide_xs("\t  x", 4, s, t), vec![t, t + s]);
+        // Tab + 4 空格（混合缩进）：层级边界仍按列规则 `(k-1)*indent+1`，
+        // 第 2 层在列 5 = Tab 推进 + 1 个空格（与纯空格行的列位一致）
+        assert_eq!(measure_guide_xs("\t    x", 4, s, t), vec![t, t + s]);
+    }
+}
+
+#[cfg(test)]
+mod tests_runs_for_range {
     use super::*;
 
     #[test]
@@ -3295,5 +3433,36 @@ mod tests {
         assert_eq!(r1, r2);
         let seg = r1.iter().find(|(r, _)| r.contains(&3)).unwrap();
         assert_eq!(seg.1.color, Some(gpui::blue()));
+    }
+
+    #[test]
+    fn rainbow_overrides_cover_fold_tail_bracket() {
+        // 回归锁定：折叠 tail（收尾行的 `}`）必须拿到与表头行 `{` 同源的
+        // 彩虹层级色。spans 由 scan_bracket_spans 产出，配对括号共享层级。
+        // 场景：表头 `{` 在 offset 10，tail `}` 在 offset 40，二者同 depth。
+        let dark = true;
+        let error = gpui::red();
+        let spans: Vec<BracketSpan> = vec![
+            (10..11, 2, true, true),
+            (40..41, 2, false, true),
+        ];
+        // tail range 40..41 → 只有闭括号 span 命中
+        let overrides =
+            TextElement::rainbow_overrides_in_range(&spans, &(40..41), dark, error);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].0, 40..41);
+        // tail 闭括号的颜色 = 同层级开括号的颜色（即表头 `{` 实际渲染色）
+        let header_overrides =
+            TextElement::rainbow_overrides_in_range(&spans, &(10..11), dark, error);
+        assert_eq!(overrides[0].1.color, header_overrides[0].1.color);
+        // 游离闭括号（未配对）标错误色
+        let unmatched: Vec<BracketSpan> = vec![(40..41, 2, false, false)];
+        let overrides =
+            TextElement::rainbow_overrides_in_range(&unmatched, &(40..41), dark, error);
+        assert_eq!(overrides[0].1.color, Some(error));
+        // 与 tail 不相交的 span 不产生覆盖
+        let overrides =
+            TextElement::rainbow_overrides_in_range(&spans, &(50..60), dark, error);
+        assert!(overrides.is_empty());
     }
 }

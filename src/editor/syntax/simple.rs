@@ -738,6 +738,12 @@ mod tests {
                     comment_doc: Some(crate::editor::syntax::ThemeStyle::color(
                         gpui::rgb(0x607d8b).into(),
                     )),
+                    punctuation: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0xcaccca).into(),
+                    )),
+                    punctuation_bracket: Some(crate::editor::syntax::ThemeStyle::color(
+                        gpui::rgb(0xcaccca).into(),
+                    )),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -806,6 +812,38 @@ mod tests {
                 && r.end >= main_range.end
                 && s.color == Some(gpui::green())),
             "'main' should be highlighted as function (green)"
+        );
+    }
+
+    #[test]
+    fn fold_header_and_tail_brackets_get_same_style() {
+        // 回归锁定：折叠占位符两侧括号的着色基础必须一致——
+        // 表头行（如 `struct Engine {`）走整行 range 的 styles() 调用，
+        // 折叠 tail（收尾行的 `}`）走 tail_start..tail_end 的 styles() 调用，
+        // 两次调用对同类括号必须返回相同的 capture 样式。
+        let code = "struct Engine {\n    x: u32,\n}\n";
+        let mut h = SimpleHighlighter::new("rust");
+        let rope = Rope::from_str(code);
+        h.update(None, &rope, None);
+        let theme = test_theme();
+
+        // Row 0 = "struct Engine {\n" → 0..16；tail `}` = 28..29
+        let header_styles = h.styles(&(0..16), &theme);
+        let tail_styles = h.styles(&(28..29), &theme);
+
+        let header_brace = header_styles
+            .iter()
+            .find(|(r, _)| &code[r.clone()] == "{")
+            .map(|(_, s)| s.color)
+            .expect("header range must style the `{`");
+        let tail_brace = tail_styles
+            .iter()
+            .find(|(r, _)| &code[r.clone()] == "}")
+            .map(|(_, s)| s.color)
+            .expect("tail range must style the `}`");
+        assert_eq!(
+            header_brace, tail_brace,
+            "fold header and tail brackets must get the same style"
         );
     }
 
