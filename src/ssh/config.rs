@@ -269,18 +269,6 @@ impl SshConnectionConfig {
         self
     }
 
-    /// 设置是否保存配置
-    pub fn with_save(mut self, save: bool) -> Self {
-        self.save_config = save;
-        self
-    }
-
-    /// 设置超时时间
-    pub fn with_timeout(mut self, timeout: u64) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
     /// 获取显示名称
     pub fn display_name(&self) -> String {
         self.nickname
@@ -301,29 +289,6 @@ impl SshConnectionConfig {
     /// 获取完整的连接标识符
     pub fn connection_string(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
-    }
-
-    /// 创建简单密码认证配置
-    pub fn with_password(host: &str, username: &str, password: &str) -> Self {
-        Self::new(
-            host,
-            username,
-            AuthMethod::Password {
-                password: password.to_string(),
-            },
-        )
-    }
-
-    /// 创建密钥认证配置
-    pub fn with_key(host: &str, username: &str, key_path: PathBuf) -> Self {
-        Self::new(
-            host,
-            username,
-            AuthMethod::PrivateKey {
-                path: key_path,
-                passphrase: None,
-            },
-        )
     }
 }
 
@@ -368,64 +333,10 @@ impl AuthMethod {
         }
     }
 
-    /// 是否是密码认证
-    pub fn is_password(&self) -> bool {
-        matches!(
-            self,
-            AuthMethod::PasswordRef { .. } | AuthMethod::Password { .. }
-        )
-    }
-
-    /// 是否是密钥认证
-    pub fn is_key(&self) -> bool {
-        matches!(
-            self,
-            AuthMethod::PrivateKeyRef { .. } | AuthMethod::PrivateKey { .. }
-        )
-    }
-
-    /// 是否是 Agent 认证
-    pub fn is_agent(&self) -> bool {
-        matches!(self, AuthMethod::Agent)
-    }
-
-    /// 返回引用的 keychain id
-    pub fn keychain_id(&self) -> Option<&str> {
-        match self {
-            AuthMethod::PasswordRef { keychain_id } | AuthMethod::PrivateKeyRef { keychain_id } => {
-                Some(keychain_id.as_str())
-            }
-            _ => None,
-        }
-    }
-
-    /// 创建密码认证（旧版内联配置，用于兼容测试和迁移）
-    pub fn password(password: impl Into<String>) -> Self {
-        AuthMethod::Password {
-            password: password.into(),
-        }
-    }
-
     /// 创建密码引用认证
     pub fn password_ref(keychain_id: impl Into<String>) -> Self {
         AuthMethod::PasswordRef {
             keychain_id: keychain_id.into(),
-        }
-    }
-
-    /// 创建密钥认证（旧版内联配置，用于兼容测试和迁移）
-    pub fn key(path: impl Into<PathBuf>) -> Self {
-        AuthMethod::PrivateKey {
-            path: path.into(),
-            passphrase: None,
-        }
-    }
-
-    /// 创建密钥认证（有密码）
-    pub fn key_with_passphrase(path: impl Into<PathBuf>, passphrase: impl Into<String>) -> Self {
-        AuthMethod::PrivateKey {
-            path: path.into(),
-            passphrase: Some(passphrase.into()),
         }
     }
 
@@ -434,50 +345,6 @@ impl AuthMethod {
         AuthMethod::PrivateKeyRef {
             keychain_id: keychain_id.into(),
         }
-    }
-}
-
-/// SSH 已知主机配置
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KnownHost {
-    /// 主机地址
-    pub host: String,
-    /// 端口号
-    #[serde(default = "default_port")]
-    pub port: u16,
-    /// 主机密钥指纹
-    pub fingerprint: String,
-    /// 密钥类型
-    pub key_type: String,
-    /// 是否已验证
-    #[serde(default)]
-    pub verified: bool,
-}
-
-impl KnownHost {
-    /// 创建新的已知主机记录
-    pub fn new(
-        host: impl Into<String>,
-        fingerprint: impl Into<String>,
-        key_type: impl Into<String>,
-    ) -> Self {
-        Self {
-            host: host.into(),
-            port: default_port(),
-            fingerprint: fingerprint.into(),
-            key_type: key_type.into(),
-            verified: false,
-        }
-    }
-
-    /// 匹配主机
-    pub fn matches(&self, host: &str, port: u16) -> bool {
-        self.host == host && self.port == port
-    }
-
-    /// 验证指纹
-    pub fn verify_fingerprint(&self, fingerprint: &str) -> bool {
-        self.fingerprint == fingerprint
     }
 }
 
@@ -519,18 +386,9 @@ pub struct SshGlobalConfig {
     /// 设为 true 后只接受 known_hosts 中已记录的主机，未知主机直接拒绝。
     #[serde(default)]
     pub strict_host_key_checking: bool,
-    /// 默认私钥路径列表
-    #[serde(default = "default_identity_files")]
-    pub default_identity_files: Vec<PathBuf>,
     /// 已保存的连接配置
     #[serde(default)]
     pub saved_connections: Vec<SshConnectionConfig>,
-    /// 已知主机列表
-    #[serde(default)]
-    pub known_hosts: Vec<KnownHost>,
-    /// 是否启用 SSH Agent
-    #[serde(default = "default_true")]
-    pub use_agent: bool,
     /// 一次性迁移标记：旧版本的 new() 默认写入 strict_host_key_checking=true，
     /// 且该设置从未有任何 UI、也从未被执行——旧配置文件里的 true 是序列化
     /// 默认值而非用户选择。首次加载时把它归位为 false（accept-new）。
@@ -546,23 +404,6 @@ pub struct SshGlobalConfig {
     /// Host 排序方式
     #[serde(default)]
     pub host_sort: SortMode,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_identity_files() -> Vec<PathBuf> {
-    if let Some(home_dir) = dirs::home_dir() {
-        let ssh_dir = home_dir.join(".ssh");
-        vec![
-            ssh_dir.join("id_ed25519"),
-            ssh_dir.join("id_rsa"),
-            ssh_dir.join("id_ecdsa"),
-        ]
-    } else {
-        Vec::new()
-    }
 }
 
 /// 进程内 ssh.json 解析结果缓存（见 [`SshGlobalConfig::load`]）：
@@ -586,10 +427,7 @@ impl SshGlobalConfig {
         Self {
             default_timeout: default_timeout(),
             strict_host_key_checking: false,
-            default_identity_files: default_identity_files(),
             saved_connections: Vec::new(),
-            known_hosts: Vec::new(),
-            use_agent: true,
             // 新建配置本身就是新默认值，无需迁移
             host_key_strict_migrated: true,
             host_groups: Vec::new(),
@@ -718,18 +556,6 @@ impl SshGlobalConfig {
     /// 查找连接配置
     pub fn find_connection(&self, id: &str) -> Option<&SshConnectionConfig> {
         self.saved_connections.iter().find(|c| c.id() == id)
-    }
-
-    /// 查找已知主机
-    pub fn find_known_host(&self, host: &str, port: u16) -> Option<&KnownHost> {
-        self.known_hosts.iter().find(|h| h.matches(host, port))
-    }
-
-    /// 添加或更新已知主机
-    pub fn add_known_host(&mut self, host: KnownHost) {
-        self.known_hosts
-            .retain(|h| !(h.host == host.host && h.port == host.port));
-        self.known_hosts.push(host);
     }
 
     /// 获取保存的连接数量
@@ -1007,29 +833,53 @@ mod tests {
 
     #[test]
     fn test_ssh_connection_config() {
-        let config =
-            SshConnectionConfig::new("example.com", "admin", AuthMethod::password("secret"));
+        let config = SshConnectionConfig::new(
+            "example.com",
+            "admin",
+            AuthMethod::Password {
+                password: "secret".into(),
+            },
+        );
 
         assert_eq!(config.host, "example.com");
         assert_eq!(config.username, "admin");
         assert_eq!(config.port, 22);
-        assert!(config.auth_method.is_password());
+        assert!(matches!(config.auth_method, AuthMethod::Password { .. }));
         assert_eq!(config.display_name(), "admin@example.com");
     }
 
     #[test]
     fn test_ssh_connection_with_nickname() {
-        let config =
-            SshConnectionConfig::new("192.168.1.100", "root", AuthMethod::key("~/.ssh/id_rsa"))
-                .with_nickname("My Server");
+        let config = SshConnectionConfig::new(
+            "192.168.1.100",
+            "root",
+            AuthMethod::PrivateKey {
+                path: "~/.ssh/id_rsa".into(),
+                passphrase: None,
+            },
+        )
+        .with_nickname("My Server");
 
         assert_eq!(config.display_name(), "My Server");
     }
 
     #[test]
     fn test_auth_method_display_name() {
-        assert_eq!(AuthMethod::password("test").display_name(), "密码");
-        assert_eq!(AuthMethod::key("~/.ssh/id_rsa").display_name(), "密钥");
+        assert_eq!(
+            AuthMethod::Password {
+                password: "test".into()
+            }
+            .display_name(),
+            "密码"
+        );
+        assert_eq!(
+            AuthMethod::PrivateKey {
+                path: "~/.ssh/id_rsa".into(),
+                passphrase: None,
+            }
+            .display_name(),
+            "密钥"
+        );
         assert_eq!(AuthMethod::Agent.display_name(), "SSH Agent");
     }
 
@@ -1048,15 +898,6 @@ mod tests {
         let back: SshConnectionConfig =
             serde_json::from_str(&json).expect("含 Auto 的配置必须可反序列化");
         assert!(matches!(back.auth_method, AuthMethod::Auto));
-    }
-
-    #[test]
-    fn test_known_host_matching() {
-        let host = KnownHost::new("example.com", "SHA256:abc123", "ssh-ed25519");
-
-        assert!(host.matches("example.com", 22));
-        assert!(!host.matches("example.com", 2222));
-        assert!(!host.matches("other.com", 22));
     }
 
     #[test]
@@ -1135,6 +976,25 @@ mod tests {
         assert_eq!(cfg.host_groups.len(), 0);
         assert_eq!(cfg.saved_connections[0].group_id, None);
         assert_eq!(cfg.folder_sort, SortMode::NameAsc);
+    }
+
+    #[test]
+    fn legacy_ssh_json_with_removed_fields_still_loads() {
+        // 回归锁定：known_hosts / use_agent / default_identity_files 字段
+        // 已从 SshGlobalConfig 删除（2026-09 清理），但旧版本写出的
+        // ssh.json 仍含这些字段——serde 必须忽略而非报错，否则 load()
+        // 会静默回退到空配置，用户的主机列表"消失"。
+        let json = r#"{
+            "default_timeout": 10,
+            "strict_host_key_checking": false,
+            "saved_connections": [],
+            "known_hosts": [{"host":"h","port":22,"fingerprint":"f","key_type":"t","verified":true}],
+            "default_identity_files": ["/home/u/.ssh/id_ed25519"],
+            "use_agent": true
+        }"#;
+        let cfg: SshGlobalConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.saved_connections.len(), 0);
+        assert_eq!(cfg.default_timeout, 10);
     }
 
     #[test]

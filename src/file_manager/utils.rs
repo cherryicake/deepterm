@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail};
 
@@ -12,6 +12,7 @@ use crate::file_manager::{
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
 pub use crate::ssh::TRANSFER_CANCELLED_MSG;
+pub use crate::utils::shell::{shell_quote_single, shell_single_quote};
 
 #[derive(Clone, Debug, Default)]
 pub struct TransferSummary {
@@ -65,24 +66,6 @@ impl TransferSummary {
             .saturating_add(other.bytes_transferred);
         self.skipped = self.skipped.saturating_add(other.skipped);
     }
-}
-
-/// 转义单引号内的内容（**不含外层单引号**）。
-///
-/// 调用方必须手写 `'{}'` 包裹，例如：
-/// `format!("'{}'", shell_single_quote(path))`。
-/// 忘记包裹即构成命令注入，故本函数标记 `#[must_use]` 并在文档中显式警告。
-/// 如需直接得到带引号的结果，请用 [`shell_quote_single`]。
-#[must_use]
-pub fn shell_single_quote(value: &str) -> String {
-    value.replace('\'', "'\\''")
-}
-
-/// 返回带外层单引号的安全 shell 词（推荐新代码使用）。
-/// 与 `git_repository::shell_quote` 语义一致，避免“忘记包裹”类注入。
-#[must_use]
-pub fn shell_quote_single(value: &str) -> String {
-    format!("'{}'", shell_single_quote(value))
 }
 
 pub fn local_file_name(path: &Path) -> anyhow::Result<String> {
@@ -262,6 +245,58 @@ pub fn remove_remote_dir_recursive(
     Ok(())
 }
 
+/// 重命名候选的核心算法：`stem + _副本N + .ext`（index 从 1 起）。
+/// local / remote 两版候选生成共享同一段规则，避免两处各自演化。
+fn renamed_file_name(file_name: &str, index: usize) -> String {
+    let (stem, extension) = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
+        _ => (file_name, None),
+    };
+    let suffix = if index == 1 {
+        "_副本".to_string()
+    } else {
+        format!("_副本{}", index - 1)
+    };
+    match extension {
+        Some(extension) => format!("{}{}.{}", stem, suffix, extension),
+        None => format!("{}{}", stem, suffix),
+    }
+}
+
+/// 弹出冲突询问对话框并等待用户响应；`Ask` 策略的公共实现。
+fn prompt_conflict(
+    file_name: String,
+    destination_path: String,
+    resolver: &dyn ConflictResolver,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<ConflictResolution> {
+    let (tx, rx) = async_channel::bounded(1);
+    resolver.prompt(ConflictPrompt {
+        file_name,
+        destination_path,
+        response: tx,
+    });
+    wait_for_resolution(&rx, cancelled)
+}
+
+/// AutoRename 的可用名探测循环（本地版）：逐个候选检查磁盘存在性，
+/// 1..10_000 内找不到空位即失败。
+fn first_available_local_rename(
+    desired_path: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Option<PathBuf>> {
+    for index in 1..10_000 {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("{}", TRANSFER_CANCELLED_MSG);
+        }
+        let candidate = renamed_local_candidate(desired_path, index);
+        if !candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+    bail!("无法为 {} 找到可用的文件名", desired_path.display())
+}
+
 pub fn resolve_local_conflict(
     desired_path: &Path,
     conflict_policy: ConflictPolicy,
@@ -277,47 +312,26 @@ pub fn resolve_local_conflict(
         ConflictPolicy::Skip => Ok(None),
         ConflictPolicy::Ask => {
             let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
-            let (tx, rx) = async_channel::bounded(1);
             let file_name = desired_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            resolver.prompt(ConflictPrompt {
+            let resolution = prompt_conflict(
                 file_name,
-                destination_path: desired_path.to_string_lossy().to_string(),
-                response: tx,
-            });
-
-            match wait_for_resolution(&rx, cancelled)? {
+                desired_path.to_string_lossy().to_string(),
+                resolver,
+                cancelled,
+            )?;
+            match resolution {
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_path_buf())),
                 ConflictResolution::AutoRename => {
-                    for index in 1..10_000 {
-                        if cancelled.load(Ordering::Relaxed) {
-                            bail!("{}", TRANSFER_CANCELLED_MSG);
-                        }
-                        let candidate = renamed_local_candidate(desired_path, index);
-                        if !candidate.exists() {
-                            return Ok(Some(candidate));
-                        }
-                    }
-                    bail!("无法为 {} 找到可用的文件名", desired_path.display())
+                    first_available_local_rename(desired_path, cancelled)
                 }
                 ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
             }
         }
-        ConflictPolicy::AutoRename => {
-            for index in 1..10_000 {
-                if cancelled.load(Ordering::Relaxed) {
-                    bail!("{}", TRANSFER_CANCELLED_MSG);
-                }
-                let candidate = renamed_local_candidate(desired_path, index);
-                if !candidate.exists() {
-                    return Ok(Some(candidate));
-                }
-            }
-            bail!("无法为 {} 找到可用的文件名", desired_path.display())
-        }
+        ConflictPolicy::AutoRename => first_available_local_rename(desired_path, cancelled),
     }
 }
 
@@ -330,16 +344,11 @@ pub fn renamed_local_candidate(path: &Path, index: usize) -> PathBuf {
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy());
-    let suffix = if index == 1 {
-        "_副本".to_string()
-    } else {
-        format!("_副本{}", index - 1)
+    let original_name = match extension {
+        Some(ref extension) => format!("{}.{}", stem, extension),
+        None => stem,
     };
-    let file_name = match extension {
-        Some(extension) => format!("{}{}.{}", stem, suffix, extension),
-        None => format!("{}{}", stem, suffix),
-    };
-    parent.join(file_name)
+    parent.join(renamed_file_name(&original_name, index))
 }
 
 pub fn resolve_remote_conflict(
@@ -358,15 +367,9 @@ pub fn resolve_remote_conflict(
         ConflictPolicy::Skip => Ok(None),
         ConflictPolicy::Ask => {
             let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
-            let (tx, rx) = async_channel::bounded(1);
             let file_name = remote_file_name(desired_path).unwrap_or_else(|_| "file".to_string());
-            resolver.prompt(ConflictPrompt {
-                file_name,
-                destination_path: desired_path.to_string(),
-                response: tx,
-            });
-
-            match wait_for_resolution(&rx, cancelled)? {
+            let resolution = prompt_conflict(file_name, desired_path.to_string(), resolver, cancelled)?;
+            match resolution {
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
                 ConflictResolution::AutoRename => {
@@ -416,22 +419,111 @@ fn first_available_remote_rename(
 pub fn renamed_remote_candidate(path: &str, index: usize) -> anyhow::Result<String> {
     let parent = sftp_fs::remote_parent(path).unwrap_or_else(|| "/".to_string());
     let file_name = remote_file_name(path)?;
-    let (stem, extension) = match file_name.rsplit_once('.') {
-        Some((stem, extension)) if !stem.is_empty() => {
-            (stem.to_string(), Some(extension.to_string()))
-        }
-        _ => (file_name, None),
-    };
-    let suffix = if index == 1 {
-        "_副本".to_string()
-    } else {
-        format!("_副本{}", index - 1)
-    };
-    let candidate_name = match extension {
-        Some(extension) => format!("{}{}.{}", stem, suffix, extension),
-        None => format!("{}{}", stem, suffix),
-    };
+    let candidate_name = renamed_file_name(&file_name, index);
     Ok(sftp_fs::join_remote_path(&parent, &candidate_name))
+}
+
+/// 远程目录递归传输的骨架抽象。
+///
+/// 同会话复制、远程→本地下载、跨会话复制三个场景共享「遍历条目 → 冲突
+/// 解决 → 文件/目录分派 → 汇总 TransferSummary」的循环结构；差异只在
+/// 目标路径类型、冲突探测和单条目传输方式。各场景实现本 trait 后交给
+/// [`walk_remote_dir`] 统一驱动，消除三份逐行雷同的循环体。
+///
+/// `D` 为目标路径类型（`String` 远程 / `PathBuf` 本地）。
+pub trait DirTransferDriver {
+    type Destination;
+
+    /// 读取远程源目录的条目列表。
+    fn read_entries(&mut self, remote_dir: &str) -> anyhow::Result<Vec<sftp_fs::RemoteFileEntry>>;
+
+    /// 源目录 entry 名 → 目标目录下的完整路径。
+    fn child_destination(&self, destination_dir: &Self::Destination, name: &str)
+        -> Self::Destination;
+
+    /// 冲突解决：`None` 表示跳过。
+    fn resolve_conflict(
+        &mut self,
+        desired: &Self::Destination,
+        policy: ConflictPolicy,
+        resolver: Option<&dyn ConflictResolver>,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Option<Self::Destination>>;
+
+    /// 进入一个目录层前的准备：创建目标目录并把源目录权限同步过去。
+    ///
+    /// 每层递归都会调用（与原三份内联实现一致），保证子目录的
+    /// mode 位在复制后与源保持一致。
+    fn prepare_destination_dir(
+        &mut self,
+        remote_dir: &str,
+        destination_dir: &Self::Destination,
+    ) -> anyhow::Result<()>;
+
+    /// 传输单个文件，返回增量统计。
+    fn transfer_file(
+        &mut self,
+        source_path: &str,
+        destination: &Self::Destination,
+        cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
+    ) -> anyhow::Result<TransferSummary>;
+}
+
+/// 远程目录递归传输的统一 walker。三个传输场景（同会话复制 /
+/// 下载到本地 / 跨会话复制）的公共循环：
+/// 条目分派 → 冲突 resolve → `Some` 递归或传输 / `None` skip /
+/// 不支持条目 warn + skip。
+pub fn walk_remote_dir<D>(
+    driver: &mut dyn DirTransferDriver<Destination = D>,
+    remote_dir: &str,
+    destination_dir: &D,
+    conflict_policy: ConflictPolicy,
+    cancelled: &Arc<AtomicBool>,
+    progress: Option<&AtomicU64>,
+    resolver: Option<&dyn ConflictResolver>,
+) -> anyhow::Result<TransferSummary> {
+    // 每层递归先建目录并同步源目录权限（含最顶层）。
+    driver.prepare_destination_dir(remote_dir, destination_dir)?;
+
+    let mut summary = TransferSummary::default();
+
+    for entry in driver.read_entries(remote_dir)? {
+        check_cancelled(cancelled)?;
+        let destination_path = driver.child_destination(destination_dir, &entry.name);
+
+        if entry.kind == RemoteFileKind::File {
+            match driver.resolve_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => summary.merge(
+                    driver.transfer_file(&entry.path, &path, cancelled, progress)?,
+                ),
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else if entry.kind == RemoteFileKind::Directory {
+            match driver.resolve_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
+                Some(path) => {
+                    // prepare_destination_dir 在递归的 walk_remote_dir 里执行，
+                    // 这里无需再建目录。
+                    summary.merge(walk_remote_dir(
+                        driver,
+                        &entry.path,
+                        &path,
+                        conflict_policy,
+                        cancelled,
+                        progress,
+                        resolver,
+                    )?);
+                }
+                None => summary.merge(TransferSummary::one_skipped()),
+            }
+        } else {
+            // 符号链接 / 特殊文件：计为跳过，避免 Move 在"看似全部成功"时误删源。
+            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
+            summary.merge(TransferSummary::one_skipped());
+        }
+    }
+
+    Ok(summary)
 }
 
 pub fn copy_local_file_interruptible(
@@ -490,24 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_single_quote_multiple_apostrophes() {
-        assert_eq!(shell_single_quote("it's a test"), "it'\\''s a test");
-    }
-
-    #[test]
-    fn shell_single_quote_empty() {
-        assert_eq!(shell_single_quote(""), "");
-    }
-
-    #[test]
-    fn shell_quote_single_wraps_with_quotes() {
-        // 新 API 直接返回带外层引号的结果，避免调用方忘记包裹导致注入。
-        assert_eq!(shell_quote_single("hello"), "'hello'");
-        assert_eq!(shell_quote_single("foo'bar"), "'foo'\\''bar'");
-        assert_eq!(shell_quote_single(""), "''");
-    }
-
-    #[test]
     fn validate_rename_to_accepts_normal_names() {
         assert!(validate_rename_to("file.txt").is_ok());
         assert!(validate_rename_to("报告-2024_final.tar.gz").is_ok());
@@ -525,5 +599,48 @@ mod tests {
         assert!(validate_rename_to("a\\b").is_err());
         assert!(validate_rename_to("a\0b").is_err());
         assert!(validate_rename_to("/abs/path").is_err());
+    }
+
+    #[test]
+    fn renamed_file_name_suffix_rules() {
+        // 共享核心：_副本 / _副本N 的编号规则（N 从第 2 个候选起）。
+        assert_eq!(renamed_file_name("file.txt", 1), "file_副本.txt");
+        assert_eq!(renamed_file_name("file.txt", 2), "file_副本1.txt");
+        assert_eq!(renamed_file_name("file.txt", 3), "file_副本2.txt");
+        assert_eq!(renamed_file_name("plain", 1), "plain_副本");
+        // 多级扩展名只在最后一段后插入后缀（与 Path::file_stem/extension 语义一致）
+        assert_eq!(renamed_file_name("archive.tar.gz", 1), "archive.tar_副本.gz");
+        // 隐藏文件不把首点当扩展名分隔
+        assert_eq!(renamed_file_name(".bashrc", 1), ".bashrc_副本");
+    }
+
+    #[test]
+    fn renamed_local_candidate_keeps_parent_dir() {
+        let candidate = renamed_local_candidate(Path::new("/tmp/report.pdf"), 1);
+        assert_eq!(candidate, Path::new("/tmp/report_副本.pdf"));
+        let candidate = renamed_local_candidate(Path::new("/tmp/report.pdf"), 2);
+        assert_eq!(candidate, Path::new("/tmp/report_副本1.pdf"));
+        // 隐藏文件 / 无扩展名也保持与旧实现一致
+        assert_eq!(
+            renamed_local_candidate(Path::new("/tmp/.bashrc"), 1),
+            Path::new("/tmp/.bashrc_副本")
+        );
+        assert_eq!(
+            renamed_local_candidate(Path::new("/tmp/Makefile"), 1),
+            Path::new("/tmp/Makefile_副本")
+        );
+    }
+
+    #[test]
+    fn renamed_remote_candidate_keeps_parent_dir() {
+        let candidate = renamed_remote_candidate("/srv/data/report.pdf", 1).unwrap();
+        assert_eq!(candidate, "/srv/data/report_副本.pdf");
+        let candidate = renamed_remote_candidate("/srv/data/report.pdf", 2).unwrap();
+        assert_eq!(candidate, "/srv/data/report_副本1.pdf");
+        // 根目录下的文件不能拼出 "//"
+        assert_eq!(
+            renamed_remote_candidate("/report.pdf", 1).unwrap(),
+            "/report_副本.pdf"
+        );
     }
 }

@@ -409,10 +409,6 @@ impl AppTheme {
             .editor_background
             .unwrap_or(self.ui.panel_background)
     }
-
-    pub fn input_background(&self) -> Hsla {
-        self.ui.panel_background
-    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1271,16 +1271,6 @@ impl BuiltinCommandManager {
         }
     }
 
-    /// 获取参数提示文本（如 "file_path"）。
-    pub fn argument_hint(&self) -> Option<&'static str> {
-        self.resolved_command
-            .as_ref()
-            .and_then(|cmd| match cmd.argument {
-                ArgumentType::Optional { hint } => hint,
-                ArgumentType::Required { hint } => Some(hint),
-                ArgumentType::None => None,
-            })
-    }
 }
 
 impl Default for BuiltinCommandManager {

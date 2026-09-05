@@ -169,8 +169,6 @@ pub struct MarkdownElementBuilder {
     image_state: Option<ImageState>,
     blockquote_callouts: Vec<CalloutState>,
     task_done_stack: Vec<bool>,
-    #[allow(dead_code)]
-    wrapped_code_blocks: std::collections::HashSet<usize>,
     copied_code_blocks: std::collections::HashSet<usize>,
     markdown: Entity<Markdown>,
     highlight_cache: HighlightCache,
@@ -180,26 +178,8 @@ pub struct MarkdownElementBuilder {
 }
 
 impl MarkdownElementBuilder {
-    pub fn new(
-        style: MarkdownStyle,
-        wrapped_code_blocks: std::collections::HashSet<usize>,
-        copied_code_blocks: std::collections::HashSet<usize>,
-        markdown: Entity<Markdown>,
-        highlight_cache: HighlightCache,
-    ) -> Self {
-        Self::new_with_item(
-            style,
-            wrapped_code_blocks,
-            copied_code_blocks,
-            markdown,
-            highlight_cache,
-            0,
-        )
-    }
-
     pub fn new_with_item(
         style: MarkdownStyle,
-        wrapped_code_blocks: std::collections::HashSet<usize>,
         copied_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
         highlight_cache: HighlightCache,
@@ -228,7 +208,6 @@ impl MarkdownElementBuilder {
             image_state: None,
             blockquote_callouts: Vec::new(),
             task_done_stack: Vec::new(),
-            wrapped_code_blocks,
             copied_code_blocks,
             markdown,
             highlight_cache,

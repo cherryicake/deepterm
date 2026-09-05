@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use crate::file_manager::utils::{
-    TransferSummary, check_cancelled, is_remote_noop_move, prevent_remote_recursive_copy,
-    remote_file_name, remove_remote_source, resolve_remote_conflict,
+    DirTransferDriver, TransferSummary, check_cancelled, is_remote_noop_move,
+    prevent_remote_recursive_copy, remote_file_name, remove_remote_source, resolve_remote_conflict,
+    walk_remote_dir,
 };
 use crate::file_manager::{ConflictPolicy, ConflictResolver};
 use crate::ssh::SshConnectionConfig;
@@ -166,6 +167,61 @@ pub fn move_remote_to_same_remote(
     })
 }
 
+/// 同服务器目录复制的 driver：见 [`walk_remote_dir`]。
+struct SameSessionDirDriver<'a> {
+    session: &'a mut sftp_fs::BlockingSftpSession,
+}
+
+impl DirTransferDriver for SameSessionDirDriver<'_> {
+    type Destination = String;
+
+    fn read_entries(&mut self, remote_dir: &str) -> anyhow::Result<Vec<sftp_fs::RemoteFileEntry>> {
+        self.session.read_dir(remote_dir)
+    }
+
+    fn child_destination(&self, destination_dir: &String, name: &str) -> String {
+        sftp_fs::join_remote_path(destination_dir, name)
+    }
+
+    fn resolve_conflict(
+        &mut self,
+        desired: &String,
+        policy: ConflictPolicy,
+        resolver: Option<&dyn ConflictResolver>,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Option<String>> {
+        resolve_remote_conflict(self.session, desired, policy, resolver, cancelled)
+    }
+
+    fn prepare_destination_dir(
+        &mut self,
+        remote_dir: &str,
+        destination_dir: &String,
+    ) -> anyhow::Result<()> {
+        self.session.create_dir_all(destination_dir)?;
+        if let Ok(Some(mode)) = self.session.permissions(remote_dir) {
+            let _ = self.session.set_permissions(destination_dir, mode);
+        }
+        Ok(())
+    }
+
+    fn transfer_file(
+        &mut self,
+        source_path: &str,
+        destination: &String,
+        cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
+    ) -> anyhow::Result<TransferSummary> {
+        copy_remote_file_to_remote_path(
+            self.session,
+            source_path,
+            destination,
+            cancelled,
+            progress,
+        )
+    }
+}
+
 pub fn copy_remote_dir_to_remote_path(
     session: &mut sftp_fs::BlockingSftpSession,
     remote_dir: &str,
@@ -175,65 +231,15 @@ pub fn copy_remote_dir_to_remote_path(
     progress: Option<&AtomicU64>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
-    session.create_dir_all(destination_dir)?;
-
-    if let Ok(Some(mode)) = session.permissions(remote_dir) {
-        let _ = session.set_permissions(destination_dir, mode);
-    }
-
-    let mut summary = TransferSummary::default();
-
-    for entry in session.read_dir(remote_dir)? {
-        check_cancelled(cancelled)?;
-        let destination_path = sftp_fs::join_remote_path(destination_dir, &entry.name);
-
-        if entry.kind == RemoteFileKind::File {
-            match resolve_remote_conflict(
-                session,
-                &destination_path,
-                conflict_policy,
-                resolver,
-                cancelled,
-            )? {
-                Some(path) => summary.merge(copy_remote_file_to_remote_path(
-                    session,
-                    &entry.path,
-                    &path,
-                    cancelled,
-                    progress,
-                )?),
-                None => summary.merge(TransferSummary::one_skipped()),
-            }
-        } else if entry.kind == RemoteFileKind::Directory {
-            match resolve_remote_conflict(
-                session,
-                &destination_path,
-                conflict_policy,
-                resolver,
-                cancelled,
-            )? {
-                Some(path) => {
-                    session.create_dir_all(&path)?;
-                    summary.merge(copy_remote_dir_to_remote_path(
-                        session,
-                        &entry.path,
-                        &path,
-                        conflict_policy,
-                        cancelled,
-                        progress,
-                        resolver,
-                    )?);
-                }
-                None => summary.merge(TransferSummary::one_skipped()),
-            }
-        } else {
-            // 符号链接 / 特殊文件：计为跳过，避免 Move 误删源。
-            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
-            summary.merge(TransferSummary::one_skipped());
-        }
-    }
-
-    Ok(summary)
+    walk_remote_dir(
+        &mut SameSessionDirDriver { session },
+        remote_dir,
+        &destination_dir.to_string(),
+        conflict_policy,
+        cancelled,
+        progress,
+        resolver,
+    )
 }
 
 /// 同服务器远程文件复制：直接调用 session 的内存流式复制，不写本地磁盘。

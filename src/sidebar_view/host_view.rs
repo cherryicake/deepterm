@@ -280,7 +280,6 @@ impl HostView {
             window,
             cx,
             FolderDialogMode::Rename {
-                id: folder_id.clone(),
                 old_name: group.name.clone(),
             },
         );

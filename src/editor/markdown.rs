@@ -209,7 +209,6 @@ pub struct Markdown {
     events: Vec<(Range<usize>, MarkdownEvent)>,
     item_ranges: Vec<Range<usize>>,
     pub(crate) focus_handle: FocusHandle,
-    wrapped_code_blocks: std::collections::HashSet<usize>,
     copied_code_blocks: std::collections::HashSet<usize>,
     highlight_cache: HighlightCache,
     list_state: ListState,
@@ -236,7 +235,6 @@ impl Markdown {
             events: Vec::new(),
             item_ranges: Vec::new(),
             focus_handle,
-            wrapped_code_blocks: std::collections::HashSet::new(),
             copied_code_blocks: std::collections::HashSet::new(),
             highlight_cache: Rc::new(RefCell::new(HashMap::new())),
             list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
@@ -253,7 +251,6 @@ impl Markdown {
             return;
         }
         self.source = text;
-        self.wrapped_code_blocks.clear();
         self.copied_code_blocks.clear();
         self.highlight_cache.borrow_mut().clear();
         self.selection.clear();
@@ -430,16 +427,6 @@ impl Markdown {
         })
         .detach();
     }
-
-    pub fn toggle_code_block_wrap(&mut self, source_offset: usize, cx: &mut Context<Self>) {
-        if self.wrapped_code_blocks.contains(&source_offset) {
-            self.wrapped_code_blocks.remove(&source_offset);
-        } else {
-            self.wrapped_code_blocks.insert(source_offset);
-        }
-        self.list_state.reset(self.item_ranges.len());
-        cx.notify();
-    }
 }
 
 crate::impl_focusable!(Markdown);
@@ -517,10 +504,9 @@ impl Markdown {
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
-        let (wrapped, copied, events, highlight_cache) = markdown.update(cx, |markdown, _cx| {
+        let (copied, events, highlight_cache) = markdown.update(cx, |markdown, _cx| {
             let range = markdown.item_ranges[ix].clone();
             (
-                markdown.wrapped_code_blocks.clone(),
                 markdown.copied_code_blocks.clone(),
                 markdown.events[range].to_vec(),
                 markdown.highlight_cache.clone(),
@@ -529,7 +515,6 @@ impl Markdown {
 
         let elements = MarkdownElementBuilder::new_with_item(
             style,
-            wrapped,
             copied,
             markdown,
             highlight_cache,

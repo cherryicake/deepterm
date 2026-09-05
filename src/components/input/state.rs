@@ -719,16 +719,6 @@ impl InputState {
         cx.notify();
     }
 
-    /// Remove all diff decorations.
-    #[allow(dead_code)]
-    pub fn clear_diff_decorations(&mut self, cx: &mut Context<Self>) {
-        self.diff_line_colors.clear();
-        self.diff_range_colors.clear();
-        self.diff_line_labels = None;
-        self.external_highlight_runs = None;
-        cx.notify();
-    }
-
     /// Replace the syntax highlight runs with externally computed ones (e.g.
     /// per-source-tree highlights for the unified diff view). `Some(runs)`
     /// must be sorted, contiguous and gap-free over the whole buffer, and
@@ -1234,15 +1224,6 @@ impl InputState {
         self.replace_text_in_range_silent(Some(range), &text, window, cx);
         self.reset_highlighter(cx);
         self.disabled = was_disabled;
-    }
-
-    /// Set with disabled mode.
-    ///
-    /// See also: [`Self::set_disabled`], [`Self::is_disabled`].
-    #[allow(unused)]
-    pub(crate) fn disabled(mut self, disabled: bool) -> Self {
-        self.disabled = disabled;
-        self
     }
 
     /// Set with password masked state.

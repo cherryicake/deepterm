@@ -111,7 +111,6 @@ impl Language {
     ///
     /// 刻意不叫 `from_str`：它不会失败、也不实现 [`std::str::FromStr`]，
     /// 与标准 trait 同名容易误读。
-    #[allow(unused)]
     pub fn from_id(s: &str) -> Self {
         #[cfg(not(feature = "tree-sitter-languages"))]
         return Self::Json;
@@ -144,7 +143,6 @@ impl Language {
         }
     }
 
-    #[allow(unused)]
     pub(super) fn injection_languages(&self) -> Vec<SharedString> {
         #[cfg(not(feature = "tree-sitter-languages"))]
         return vec![];

@@ -25,7 +25,6 @@ impl MouseFormat {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 enum AlacMouseButton {
     LeftButton = 0,
     MiddleButton = 1,

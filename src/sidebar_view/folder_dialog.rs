@@ -7,11 +7,7 @@ use crate::theme::ActiveTheme;
 
 pub enum FolderDialogMode {
     Create,
-    #[allow(dead_code)]
-    Rename {
-        id: String,
-        old_name: String,
-    },
+    Rename { old_name: String },
 }
 
 pub struct FolderNameDialog {
@@ -29,7 +25,7 @@ impl FolderNameDialog {
             let focus_handle = cx.focus_handle();
             let (placeholder, initial) = match &mode {
                 FolderDialogMode::Create => ("文件夹名称".to_string(), String::new()),
-                FolderDialogMode::Rename { old_name, .. } => (old_name.clone(), old_name.clone()),
+                FolderDialogMode::Rename { old_name } => (old_name.clone(), old_name.clone()),
             };
             let input = cx.new(|cx| {
                 let mut state = InputState::new(window, cx)

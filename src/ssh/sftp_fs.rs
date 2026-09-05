@@ -241,28 +241,6 @@ impl BlockingSftpSession {
         })
     }
 
-    pub fn upload_file_from_local(
-        &mut self,
-        local_path: &Path,
-        remote_path: &str,
-    ) -> anyhow::Result<u64> {
-        self.upload_file_from_local_with_cancel(local_path, remote_path, &AtomicBool::new(false))
-    }
-
-    pub fn upload_file_from_local_with_cancel(
-        &mut self,
-        local_path: &Path,
-        remote_path: &str,
-        cancelled: &AtomicBool,
-    ) -> anyhow::Result<u64> {
-        self.upload_file_from_local_with_cancel_and_progress(
-            local_path,
-            remote_path,
-            cancelled,
-            None,
-        )
-    }
-
     pub fn upload_file_from_local_with_cancel_and_progress(
         &mut self,
         local_path: &Path,
@@ -357,28 +335,6 @@ impl BlockingSftpSession {
             remote_file.shutdown().await?;
             Ok(transferred)
         })
-    }
-
-    pub fn download_file_to_local(
-        &mut self,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> anyhow::Result<u64> {
-        self.download_file_to_local_with_cancel(remote_path, local_path, &AtomicBool::new(false))
-    }
-
-    pub fn download_file_to_local_with_cancel(
-        &mut self,
-        remote_path: &str,
-        local_path: &Path,
-        cancelled: &AtomicBool,
-    ) -> anyhow::Result<u64> {
-        self.download_file_to_local_with_cancel_and_progress(
-            remote_path,
-            local_path,
-            cancelled,
-            None,
-        )
     }
 
     pub fn download_file_to_local_with_cancel_and_progress(
@@ -535,42 +491,6 @@ impl BlockingSftpSession {
         })
     }
 
-    /// 发送轻量级 SFTP ping（stat "."）以保持 SSH 连接活跃。
-    /// 适合用于心跳保活场景。
-    pub fn ping(&mut self) -> anyhow::Result<()> {
-        sftp_block_on!({
-            self.sftp.metadata(".").await?;
-            Ok(())
-        })
-    }
-
-    pub fn read_text_preview(&mut self, path: &str) -> anyhow::Result<Option<String>> {
-        const PREVIEW_BYTES: usize = 64 * 1024;
-
-        sftp_block_on!({
-            let file = self.sftp.open(path).await?;
-            let mut bytes = Vec::new();
-            file.take(PREVIEW_BYTES as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-
-            if bytes.is_empty() {
-                return Ok(Some("Empty file".to_string()));
-            }
-
-            if is_binary_content(&bytes) {
-                return Ok(None);
-            }
-
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if text.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(text))
-            }
-        })
-    }
-
     /// 读取完整远程文件内容，若检测到二进制内容则返回 None。
     pub fn read_file_to_string(&mut self, path: &str) -> anyhow::Result<Option<String>> {
         sftp_block_on!({
@@ -582,7 +502,7 @@ impl BlockingSftpSession {
                 return Ok(Some(String::new()));
             }
 
-            if is_binary_content(&bytes) {
+            if is_binary_bytes(&bytes) {
                 return Ok(None);
             }
 
@@ -592,10 +512,6 @@ impl BlockingSftpSession {
 
     /// 读取完整远程文件原始字节（小文件快路径）。
     pub fn read_file_bytes(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        self.read_file_bytes_simple(path)
-    }
-
-    pub fn read_file_bytes_simple(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         sftp_block_on!({
             let mut file = self.sftp.open(path).await?;
             let mut bytes = Vec::new();
@@ -608,7 +524,7 @@ impl BlockingSftpSession {
     /// 关键正确性（中文）：必须用 `take(limit)` 有界读，而非“先 stat 预检 +
     /// 再全量读”。远端文件可能在两次 RPC 之间增大（持续写入的日志），
     /// 全量读 + 事后 `truncate` 仍会把 GB 级内容载入内存（TOCTOU）。
-    /// `take` 保证内存占用恒 `<= limit`，与 `read_text_preview` 的 64KB 语义一致。
+    /// `take` 保证内存占用恒 `<= limit`。
     pub fn read_preview_bytes(
         &mut self,
         path: &str,
@@ -636,6 +552,14 @@ impl BlockingSftpSession {
         let bytes = crate::ssh::shared_runtime::shared_ssh_runtime()
             .block_on(pipelined_read_to_vec(raw, path, size, config))?;
         Ok(Some(bytes))
+    }
+
+    /// 发送轻量级 SFTP ping（stat "."），供会话缓存健康检查使用。
+    pub fn ping(&mut self) -> anyhow::Result<()> {
+        sftp_block_on!({
+            self.sftp.metadata(".").await?;
+            Ok(())
+        })
     }
 
     /// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
@@ -815,22 +739,6 @@ impl BlockingSftpSession {
             Some(cancelled),
             None::<&mut dyn FnMut(&[u8])>,
             false,
-        )
-    }
-
-    /// 在远程服务器上执行命令，并为该通道启用 **SSH agent forwarding**。
-    pub fn execute_command_with_agent_forward(
-        &mut self,
-        command: &str,
-        timeout_secs: u64,
-        mut progress_cb: impl FnMut(&[u8]),
-    ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(
-            command,
-            timeout_secs,
-            None,
-            Some(&mut progress_cb as &mut dyn FnMut(&[u8])),
-            true,
         )
     }
 
@@ -1286,20 +1194,6 @@ pub fn read_dir(config: &SshConnectionConfig, path: &str) -> anyhow::Result<Vec<
     with_cached_session(config, |session| session.read_dir(path))
 }
 
-pub fn read_text_preview(
-    config: &SshConnectionConfig,
-    path: &str,
-) -> anyhow::Result<Option<String>> {
-    with_cached_session(config, |session| session.read_text_preview(path))
-}
-
-pub fn read_file_to_string(
-    config: &SshConnectionConfig,
-    path: &str,
-) -> anyhow::Result<Option<String>> {
-    with_cached_session(config, |session| session.read_file_to_string(path))
-}
-
 /// 将字符串内容整体写入远程文件（覆盖已存在的文件）。
 pub fn write_file_string(
     config: &SshConnectionConfig,
@@ -1307,15 +1201,6 @@ pub fn write_file_string(
     content: &str,
 ) -> anyhow::Result<()> {
     with_cached_session(config, |session| session.write_file_string(path, content))
-}
-
-/// 将原始字节整体写入远程文件（覆盖已存在的文件），用于非 UTF-8 编码保存。
-pub fn write_file_bytes(
-    config: &SshConnectionConfig,
-    path: &str,
-    bytes: &[u8],
-) -> anyhow::Result<()> {
-    with_cached_session(config, |session| session.write_file_bytes(path, bytes))
 }
 
 /// 原子写远程文件（见 `BlockingSftpSession::write_file_bytes_atomic`）
@@ -1327,11 +1212,6 @@ pub fn write_file_bytes_atomic(
     with_cached_session(config, |session| {
         session.write_file_bytes_atomic(path, bytes)
     })
-}
-
-/// 查询远程文件权限位（mode），失败或不可用时返回 None。
-pub fn file_permissions(config: &SshConnectionConfig, path: &str) -> anyhow::Result<Option<u32>> {
-    with_cached_session(config, |session| session.permissions(path))
 }
 
 const LARGE_FILE_THRESHOLD: u64 = 512 * 1024;
@@ -1366,18 +1246,6 @@ pub fn read_preview_bytes(
     limit: usize,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     with_cached_session(config, |session| session.read_preview_bytes(path, limit))
-}
-
-/// 供编辑器等调用的显式流水线入口（已知 size 时）
-#[allow(dead_code)]
-pub fn read_file_bytes_pipelined(
-    config: &SshConnectionConfig,
-    path: &str,
-    size: u64,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    with_cached_session(config, |session| {
-        session.read_file_bytes_pipelined(path, size)
-    })
 }
 
 async fn connect_sftp(
@@ -1933,12 +1801,6 @@ async fn pipelined_read_to_vec(
 }
 
 const PREVIEW_ANALYSIS_BYTES: usize = 1024;
-
-/// Detect whether a byte sequence is likely binary content.
-/// Based on zed's heuristic in worktree/src/worktree.rs.
-fn is_binary_content(bytes: &[u8]) -> bool {
-    is_binary_bytes(bytes)
-}
 
 /// 判断字节内容是否为二进制（供编辑器打开文件前的拦截）。
 pub fn is_binary_bytes(bytes: &[u8]) -> bool {

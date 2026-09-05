@@ -354,7 +354,7 @@ impl GitRepository {
             }
             GitBackend::Remote { config } => {
                 // Fetch HEAD and stat in parallel.
-                let remote_path = join_remote_path(&self.root, path);
+                let remote_path = sftp_fs::join_remote_path(&self.root, path);
                 let (head_commit, meta_res) = std::thread::scope(|scope| {
                     let head =
                         scope.spawn(|| self.head_commit().unwrap_or_else(|| "no-head".into()));
@@ -488,7 +488,7 @@ impl GitRepository {
                     .unwrap_or(encoding::FileEncoding::Utf8)
             }
             GitBackend::Remote { config } => {
-                let remote_path = join_remote_path(&self.root, path);
+                let remote_path = sftp_fs::join_remote_path(&self.root, path);
                 sftp_fs::read_file_bytes(config, &remote_path)
                     .ok()
                     .flatten()
@@ -511,7 +511,7 @@ impl GitRepository {
                     .map_err(|e| format!("Failed to write file: {e}"))
             }
             GitBackend::Remote { config } => {
-                let remote_path = join_remote_path(&self.root, path);
+                let remote_path = sftp_fs::join_remote_path(&self.root, path);
                 sftp_fs::write_file_string(config, &remote_path, content)
                     .map_err(|e| format!("Failed to write remote file: {e}"))
                     .inspect(|_| {
@@ -541,7 +541,7 @@ impl GitRepository {
                 .join(path)
                 .to_string_lossy()
                 .to_string(),
-            GitBackend::Remote { .. } => join_remote_path(&self.root, path),
+            GitBackend::Remote { .. } => sftp_fs::join_remote_path(&self.root, path),
         }
     }
 
@@ -572,7 +572,7 @@ impl GitRepository {
                 Ok(classify_bytes(&bytes))
             }
             GitBackend::Remote { config } => {
-                let remote_path = join_remote_path(&self.root, path);
+                let remote_path = sftp_fs::join_remote_path(&self.root, path);
                 // Handles encoding and pipelined read for large files.
                 let bytes_opt = sftp_fs::read_file_bytes(config, &remote_path)
                     .map_err(|e| format!("Failed to read remote file: {e}"))?;
@@ -682,30 +682,7 @@ fn execute_remote_git(
 }
 
 fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    let mut result = String::with_capacity(s.len() + 2);
-    result.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            result.push_str("'\\''");
-        } else {
-            result.push(ch);
-        }
-    }
-    result.push('\'');
-    result
-}
-
-fn join_remote_path(root: &str, path: &str) -> String {
-    let root = root.trim_end_matches('/');
-    let path = path.trim_start_matches('/');
-    if root.is_empty() {
-        format!("/{}", path)
-    } else {
-        format!("{}/{}", root, path)
-    }
+    crate::utils::shell::shell_quote_single(s)
 }
 
 #[cfg(test)]
@@ -750,18 +727,18 @@ mod tests {
     #[test]
     fn test_join_remote_path() {
         assert_eq!(
-            join_remote_path("/home/user/project", "src/main.rs"),
+            sftp_fs::join_remote_path("/home/user/project", "src/main.rs"),
             "/home/user/project/src/main.rs"
         );
         assert_eq!(
-            join_remote_path("/home/user/project/", "src/main.rs"),
+            sftp_fs::join_remote_path("/home/user/project/", "src/main.rs"),
             "/home/user/project/src/main.rs"
         );
         assert_eq!(
-            join_remote_path("/home/user/project", "/src/main.rs"),
+            sftp_fs::join_remote_path("/home/user/project", "/src/main.rs"),
             "/home/user/project/src/main.rs"
         );
-        assert_eq!(join_remote_path("/", "src/main.rs"), "/src/main.rs");
+        assert_eq!(sftp_fs::join_remote_path("/", "src/main.rs"), "/src/main.rs");
     }
 
     #[test]

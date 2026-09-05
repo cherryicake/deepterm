@@ -200,20 +200,6 @@ pub(crate) fn load_remote_text(
     })
 }
 
-/// Variant that also fetches the read-only flag (costs an extra RTT).
-#[allow(dead_code)]
-pub(crate) fn load_remote_text_with_perm(
-    config: &SshConnectionConfig,
-    path: &str,
-) -> Result<LoadedText, String> {
-    let mut loaded = load_remote_text(config, path)?;
-    loaded.read_only = crate::ssh::sftp_fs::file_permissions(config, path)
-        .ok()
-        .flatten()
-        .is_some_and(|mode| mode & 0o222 == 0);
-    Ok(loaded)
-}
-
 /// 文件树标识符，用于区分不同的文件树（终端会话）
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub struct FileTreeKey(String);
@@ -3094,9 +3080,7 @@ impl Element for EditorResizeElement {
         None
     }
 
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
+    crate::impl_source_location_none!();
 
     fn request_layout(
         &mut self,

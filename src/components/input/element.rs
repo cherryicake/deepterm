@@ -2011,35 +2011,6 @@ impl IntoElement for TextElement {
     }
 }
 
-/// A debug function to print points as SVG path.
-#[allow(unused)]
-fn print_points_as_svg_path(line_corners: &[Corners<Point<Pixels>>], points: &[Point<Pixels>]) {
-    for corners in line_corners {
-        println!(
-            "tl: ({}, {}), tr: ({}, {}), bl: ({}, {}), br: ({}, {})",
-            corners.top_left.x.as_f32() as i32,
-            corners.top_left.y.as_f32() as i32,
-            corners.top_right.x.as_f32() as i32,
-            corners.top_right.y.as_f32() as i32,
-            corners.bottom_left.x.as_f32() as i32,
-            corners.bottom_left.y.as_f32() as i32,
-            corners.bottom_right.x.as_f32() as i32,
-            corners.bottom_right.y.as_f32() as i32,
-        );
-    }
-
-    if !points.is_empty() {
-        println!(
-            "M{},{}",
-            points[0].x.as_f32() as i32,
-            points[0].y.as_f32() as i32
-        );
-        for p in points.iter().skip(1) {
-            println!("L{},{}", p.x.as_f32() as i32, p.y.as_f32() as i32);
-        }
-    }
-}
-
 impl Element for TextElement {
     type RequestLayoutState = ();
     type PrepaintState = PrepaintState;
@@ -2048,9 +2019,7 @@ impl Element for TextElement {
         None
     }
 
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
+    crate::impl_source_location_none!();
 
     fn request_layout(
         &mut self,

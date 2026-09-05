@@ -6,3 +6,4 @@
 
 pub mod fs_atomic;
 pub mod safe_open;
+pub mod shell;

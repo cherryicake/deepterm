@@ -3,9 +3,33 @@
 
 use super::*;
 use super::edit_primitives::{
-    find_word_occurrences, find_word_occurrences_naive, indent_level_bounds, word_range_at,
+    find_word_occurrences, find_word_occurrences_naive, word_range_at,
 };
 use crate::components::input::{InputState, Rope};
+
+/// 行首缩进的每级字节边界（legacy 测试辅助，不再被产品代码使用：
+/// 缩进参考线现在改用 indent columns）。
+fn indent_level_bounds(line_text: &str) -> Vec<usize> {
+    let mut bounds = Vec::new();
+    let mut spaces = 0;
+    for (i, b) in line_text.bytes().enumerate() {
+        match b {
+            b'\t' => {
+                spaces = 0;
+                bounds.push(i + 1);
+            }
+            b' ' => {
+                spaces += 1;
+                if spaces == 4 {
+                    spaces = 0;
+                    bounds.push(i + 1);
+                }
+            }
+            _ => break,
+        }
+    }
+    bounds
+}
 
 
     /// 反缩进的长度语义现在由 `TabSize` 承载（审计 3.14），这里验证默认配置

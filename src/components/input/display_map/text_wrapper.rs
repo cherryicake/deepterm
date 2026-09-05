@@ -78,7 +78,6 @@ pub(crate) struct TextWrapper {
     _initialized: bool,
 }
 
-#[allow(unused)]
 impl TextWrapper {
     pub(crate) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
         Self {
@@ -108,12 +107,6 @@ impl TextWrapper {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.soft_lines
-    }
-
-    /// Get the line item by row index.
-    #[inline]
-    pub(crate) fn line(&self, row: usize) -> Option<&LineItem> {
-        self.lines.get(row)
     }
 
     /// 当前的换行宽度（`None` = 不换行，内部按 `Pixels::MAX` 处理）。
@@ -291,7 +284,7 @@ impl TextWrapper {
         let row = self.text.offset_to_point(offset).row;
         let start = self.text.line_start_offset(row);
 
-        let mut wrapped_row = self
+        let wrapped_row = self
             .lines
             .iter()
             .take(row)
@@ -347,11 +340,6 @@ impl TextWrapper {
     pub(crate) fn display_point_to_point(&self, point: WrapDisplayPoint) -> TreeSitterPoint {
         let offset = self.display_point_to_offset(point);
         self.text.offset_to_point(offset)
-    }
-
-    pub(crate) fn point_to_display_point(&self, point: TreeSitterPoint) -> WrapDisplayPoint {
-        let offset = self.text.point_to_offset(point);
-        self.offset_to_display_point(offset)
     }
 }
 

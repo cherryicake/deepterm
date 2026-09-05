@@ -1044,11 +1044,6 @@ impl Workspace {
         }
     }
 
-    /// 获取当前广播状态
-    pub fn is_broadcast_enabled(&self) -> bool {
-        self.get_current_broadcast_state()
-    }
-
     /// 处理广播输入队列中的数据
     /// 这个方法应该在适当的时机（如render时）调用
     pub fn process_broadcast_queue(&mut self, cx: &mut Context<Self>) {
@@ -2187,9 +2182,7 @@ impl Element for ResizeHandlerElement {
         None
     }
 
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
+    crate::impl_source_location_none!();
 
     fn request_layout(
         &mut self,

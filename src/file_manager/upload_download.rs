@@ -1,13 +1,13 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use anyhow::{Context as _, anyhow};
 
 use crate::file_manager::utils::{
-    TransferSummary, check_cancelled, remote_file_name, resolve_local_conflict,
-    resolve_remote_conflict, temporary_local_path, temporary_remote_path,
+    DirTransferDriver, TransferSummary, check_cancelled, remote_file_name, resolve_local_conflict,
+    resolve_remote_conflict, temporary_local_path, temporary_remote_path, walk_remote_dir,
 };
 use crate::file_manager::{ConflictPolicy, ConflictResolver};
 use crate::ssh::SshConnectionConfig;
@@ -272,6 +272,66 @@ pub fn download_remote_to_local(
     })
 }
 
+/// 远程→本地目录下载的 driver：见 [`walk_remote_dir`]。
+struct RemoteToLocalDirDriver<'a> {
+    session: &'a mut sftp_fs::BlockingSftpSession,
+}
+
+impl DirTransferDriver for RemoteToLocalDirDriver<'_> {
+    type Destination = PathBuf;
+
+    fn read_entries(&mut self, remote_dir: &str) -> anyhow::Result<Vec<sftp_fs::RemoteFileEntry>> {
+        self.session.read_dir(remote_dir)
+    }
+
+    fn child_destination(&self, destination_dir: &PathBuf, name: &str) -> PathBuf {
+        destination_dir.join(name)
+    }
+
+    fn resolve_conflict(
+        &mut self,
+        desired: &PathBuf,
+        policy: ConflictPolicy,
+        resolver: Option<&dyn ConflictResolver>,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        resolve_local_conflict(desired, policy, resolver, cancelled)
+    }
+
+    fn prepare_destination_dir(
+        &mut self,
+        remote_dir: &str,
+        destination_dir: &PathBuf,
+    ) -> anyhow::Result<()> {
+        fs::create_dir_all(destination_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(Some(mode)) = self.session.permissions(remote_dir) {
+                let _ =
+                    fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
+            }
+        }
+        Ok(())
+    }
+
+    fn transfer_file(
+        &mut self,
+        source_path: &str,
+        destination: &PathBuf,
+        cancelled: &Arc<AtomicBool>,
+        progress: Option<&AtomicU64>,
+    ) -> anyhow::Result<TransferSummary> {
+        download_remote_file_to_local_path(
+            self.session,
+            source_path,
+            destination,
+            cancelled,
+            progress,
+        )
+    }
+}
+
 pub fn download_remote_dir_to_local_path(
     session: &mut sftp_fs::BlockingSftpSession,
     remote_dir: &str,
@@ -281,57 +341,15 @@ pub fn download_remote_dir_to_local_path(
     progress: Option<&AtomicU64>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
-    fs::create_dir_all(destination_dir)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(Some(mode)) = session.permissions(remote_dir) {
-            let _ = fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
-        }
-    }
-
-    let mut summary = TransferSummary::default();
-
-    for entry in session.read_dir(remote_dir)? {
-        check_cancelled(cancelled)?;
-        let destination_path = destination_dir.join(&entry.name);
-
-        if entry.kind == RemoteFileKind::File {
-            match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
-                Some(path) => summary.merge(download_remote_file_to_local_path(
-                    session,
-                    &entry.path,
-                    &path,
-                    cancelled,
-                    progress,
-                )?),
-                None => summary.merge(TransferSummary::one_skipped()),
-            }
-        } else if entry.kind == RemoteFileKind::Directory {
-            match resolve_local_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
-                Some(path) => {
-                    fs::create_dir_all(&path)?;
-                    summary.merge(download_remote_dir_to_local_path(
-                        session,
-                        &entry.path,
-                        &path,
-                        conflict_policy,
-                        cancelled,
-                        progress,
-                        resolver,
-                    )?);
-                }
-                None => summary.merge(TransferSummary::one_skipped()),
-            }
-        } else {
-            // 符号链接 / 设备文件等：计为跳过，保证 Move 不会因"看似全部成功"而删源。
-            log::warn!("跳过不支持的远程条目 ({:?}): {}", entry.kind, entry.path);
-            summary.merge(TransferSummary::one_skipped());
-        }
-    }
-
-    Ok(summary)
+    walk_remote_dir(
+        &mut RemoteToLocalDirDriver { session },
+        remote_dir,
+        &destination_dir.to_path_buf(),
+        conflict_policy,
+        cancelled,
+        progress,
+        resolver,
+    )
 }
 
 pub fn download_remote_file_to_local_path(

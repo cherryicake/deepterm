@@ -54,7 +54,7 @@ fn append_remote_file(script: &mut String, path: &str, marker: &str, content: &s
 }
 
 fn shell_quote_single(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    crate::utils::shell::shell_quote_single(value)
 }
 
 pub fn remote_shell_tracking_command(initial_cwd: Option<&str>) -> String {

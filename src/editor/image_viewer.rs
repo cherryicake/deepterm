@@ -179,9 +179,7 @@ impl Element for ImageContentElement {
         None
     }
 
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
+    crate::impl_source_location_none!();
 
     fn request_layout(
         &mut self,

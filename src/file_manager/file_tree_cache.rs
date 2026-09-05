@@ -58,7 +58,6 @@ struct DirNode {
     // 关键性能：用 `Arc<[]>` 存储目录项，`get_shared()` 可零拷贝返回，
     // 避免千级文件目录每次读取即全量 `clone()`。写时仍为独占，无额外成本。
     entries: std::sync::Arc<[FileEntry]>,
-    #[allow(dead_code)]
     loaded_at: Instant,
 }
 

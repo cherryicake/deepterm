@@ -1105,9 +1105,7 @@ impl Element for TerminalElement {
         Some(ElementId::Name("terminal-element".into()))
     }
 
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
+    crate::impl_source_location_none!();
 
     fn request_layout(
         &mut self,

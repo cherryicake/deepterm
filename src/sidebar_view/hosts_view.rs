@@ -175,13 +175,6 @@ pub fn folder_subtitle(count: usize) -> String {
     format!("{}台主机", count)
 }
 
-/// Load hosts from SSH config file, returning hosts and configs
-#[allow(dead_code)]
-pub fn load_hosts_from_config() -> (Vec<Host>, Vec<SshConnectionConfig>) {
-    let (hosts, configs, _) = load_grouped_hosts();
-    (hosts, configs)
-}
-
 pub fn load_grouped_hosts() -> (Vec<Host>, Vec<SshConnectionConfig>, Vec<HostGroup>) {
     let config = SshGlobalConfig::load();
     let keychain = KeychainStore::load_or_default();

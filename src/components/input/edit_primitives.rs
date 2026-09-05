@@ -21,32 +21,6 @@ pub(crate) const OCCURRENCE_MAX_TEXT_LEN: usize = 2_000_000;
 /// 同词高亮最多标记的匹配数。
 pub(crate) const OCCURRENCE_MAX_MATCHES: usize = 2_000;
 
-/// 行首缩进的每级字节边界：第 k 个元素 = 第 k+1 个缩进单位结束处的字节偏移。
-///
-/// Tab 算 1 级，每 4 个空格算 1 级（与 `TabSize::HARD_TABS` 的列宽一致）。
-#[allow(dead_code)] // legacy: kept for tests; guides now use indent columns
-pub(crate) fn indent_level_bounds(line_text: &str) -> Vec<usize> {
-    let mut bounds = Vec::new();
-    let mut spaces = 0;
-    for (i, b) in line_text.bytes().enumerate() {
-        match b {
-            b'\t' => {
-                spaces = 0;
-                bounds.push(i + 1);
-            }
-            b' ' => {
-                spaces += 1;
-                if spaces == 4 {
-                    spaces = 0;
-                    bounds.push(i + 1);
-                }
-            }
-            _ => break,
-        }
-    }
-    bounds
-}
-
 /// 单个 CJK 字符不做同词高亮（噪音），由 `word_range_at` 过滤。
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'

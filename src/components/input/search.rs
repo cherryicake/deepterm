@@ -249,7 +249,6 @@ impl SearchMatcher {
     }
 
     /// Returns the number of matches found.
-    #[allow(unused)]
     #[inline]
     fn len(&self) -> usize {
         self.matched_ranges.len()

@@ -27,6 +27,19 @@ macro_rules! impl_focusable {
     };
 }
 
+/// 为 GPUI `Element` 实现补齐无定位信息的 `source_location`（恒 `None`）。
+///
+/// GPUI 的 `Element` trait 未给 `source_location` 提供默认实现，全仓 10 处
+/// 自定义元素都被迫写同一个三行 `None` 方法体；此宏将其收敛为一行。
+#[macro_export]
+macro_rules! impl_source_location_none {
+    () => {
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+    };
+}
+
 /// Initialize the components.
 ///
 /// You must initialize the components at your application's entry point.
