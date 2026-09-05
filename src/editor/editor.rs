@@ -622,6 +622,11 @@ impl Editor {
             if Path::new(&file.path) != event.path.as_path() {
                 continue;
             }
+            // 事件来源必须与文件后端一致：多台主机可能存在相同路径字符串的文件
+            // （如两台机器的 /root/notes.txt），只有来自同一后端的事件才触发重载。
+            if !event.is_from_backend(file.ssh_config.as_ref()) {
+                continue;
+            }
             if file.pending_reload {
                 return;
             }
@@ -948,23 +953,33 @@ impl Editor {
         cx.unwatch_path(path);
     }
 
-    fn unwatch_remote_file(path: &Path, cx: &mut Context<Self>) {
-        cx.unwatch_remote_path(path);
+    fn unwatch_remote_file(
+        path: &Path,
+        ssh_config: &crate::ssh::SshConnectionConfig,
+        cx: &mut Context<Self>,
+    ) {
+        // unwatch 需要与 watch 同一台服务器的 fs 才能定位到引用计数
+        let fs: Arc<dyn crate::file_manager::FileSystem> =
+            Arc::new(crate::file_manager::filesystem::RemoteFileSystem::new(
+                ssh_config.clone(),
+            ));
+        cx.unwatch_remote_path(path, &fs);
     }
 
     fn unwatch_all_files(&mut self, cx: &mut Context<Self>) {
-        let mut paths: Vec<(PathBuf, bool)> = Vec::new();
+        // 按路径去重，并把 ssh_config 一并带走：远程文件需要自己的服务器 key
+        // 才能定位到 watch 引用计数（同一编辑器可打开多台主机的文件）。
+        let mut paths: Vec<(PathBuf, Option<crate::ssh::SshConnectionConfig>)> = Vec::new();
         for f in &self.open_files {
             let path = PathBuf::from(&f.path);
             if !paths.iter().any(|(p, _)| p == &path) {
-                paths.push((path, f.ssh_config.is_some()));
+                paths.push((path, f.ssh_config.clone()));
             }
         }
-        for (path, is_remote) in paths {
-            if is_remote {
-                Self::unwatch_remote_file(&path, cx);
-            } else {
-                Self::unwatch_file(&path, cx);
+        for (path, ssh_config) in paths {
+            match ssh_config {
+                Some(config) => Self::unwatch_remote_file(&path, &config, cx),
+                None => Self::unwatch_file(&path, cx),
             }
         }
     }
@@ -2381,9 +2396,7 @@ impl Editor {
                     crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                         .lock()
                         .remove_file(ssh_config, std::path::Path::new(&path));
-                }
-                if is_remote {
-                    Self::unwatch_remote_file(Path::new(&path), cx);
+                    Self::unwatch_remote_file(Path::new(&path), ssh_config, cx);
                 } else {
                     Self::unwatch_file(Path::new(&path), cx);
                 }

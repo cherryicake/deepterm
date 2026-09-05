@@ -164,10 +164,11 @@ impl GitPanel {
             self.refresh_pending = false;
             if self.is_local {
                 cx.unwatch_recursive_path(old_path);
-            } else {
-                cx.unwatch_remote_path(old_path);
+            } else if let Some(ref old_fs) = self.filesystem {
+                // unwatch 需要与当初 watch 同一台服务器的 fs 才能定位到引用计数
+                cx.unwatch_remote_path(old_path, old_fs);
                 for p in self.remote_git_watched.drain(..) {
-                    cx.unwatch_remote_path(&p);
+                    cx.unwatch_remote_path(&p, old_fs);
                 }
             }
         }
@@ -186,17 +187,15 @@ impl GitPanel {
         self.loading = true;
         cx.notify();
 
-        // Watch the workspace directory recursively
+        // Watch the workspace directory recursively.
+        // 注意：`.git/index` / `.git/HEAD` 不在这里 watch —— 此时尚不知
+        // 是否为仓库；对非仓库目录提前 watch 会让轮询器每轮都在 SFTP 上
+        // 报 `No such file`（日志刷屏 + 浪费往返）。确认是仓库后
+        // （下方 find 完成回调）再按需 watch，离开时由上面的 unwatch 分支统一释放。
         if is_local {
             cx.watch_recursive_path(&path);
         } else if let Some(ref fs) = filesystem {
             cx.watch_remote_path(&path, fs.clone());
-            // Watch git index/HEAD directly so stage/commit is noticed without 20s poll.
-            self.remote_git_watched.clear();
-            for git_path in [path.join(".git/index"), path.join(".git/HEAD")] {
-                cx.watch_remote_path(&git_path, fs.clone());
-                self.remote_git_watched.push(git_path);
-            }
         }
 
         // Set up file watching for auto-refresh
@@ -219,9 +218,16 @@ impl GitPanel {
             )
         } else {
             let watcher = cx.remote_fs_watcher();
+            // 参数本体后续 `GitRepository::find` 还要用，闭包捕获副本。
+            let ssh_config = ssh_config.clone();
             Some(
                 cx.subscribe(&watcher, move |_, _, event: &FsChangeEvent, cx| {
                     if is_git_noise_path(event) {
+                        return;
+                    }
+                    // 远程事件按来源服务器过滤：多台服务器可能 watch 同一路径，
+                    // 只响应自己后端的事件，避免其他主机的变更误触发本仓状态刷新。
+                    if !event.is_from_backend(ssh_config.as_ref()) {
                         return;
                     }
                     let weak = weak.clone();
@@ -279,6 +285,23 @@ impl GitPanel {
                     Ok(Some(repo)) => {
                         this.repo = Some(repo);
                         this.repo_error = None;
+                        // 确认是仓库后才 watch `.git/index|HEAD`（stage/commit 信号，
+                        // 无需等低频状态轮询）。非仓库目录不监听，避免轮询器每轮
+                        // 都报 `No such file`。代际已在上方校验，fs 与 workspace
+                        // 路径取当前值即为本次代际的；离开工作区时由
+                        // `set_workspace_path` 的 unwatch 分支统一释放。
+                        if !this.is_local {
+                            if let (Some(fs), Some(root)) =
+                                (this.filesystem.clone(), this.workspace_path.clone())
+                            {
+                                for git_path in
+                                    [root.join(".git/index"), root.join(".git/HEAD")]
+                                {
+                                    cx.watch_remote_path(&git_path, fs.clone());
+                                    this.remote_git_watched.push(git_path);
+                                }
+                            }
+                        }
                         this.refresh(cx);
                     }
                     Ok(None) => {
@@ -820,5 +843,45 @@ mod tests {
         assert!(!is_git_noise_path(&event("/repo/.git")));
         // 名字恰好含 .git 的普通文件不受影响
         assert!(!is_git_noise_path(&event("/repo/github.md")));
+    }
+
+    /// 回归：`set_workspace_path` 不得在确认仓库前 watch `.git/index|HEAD`。
+    /// 否则非仓库目录会让远程轮询器每轮都在 SFTP 上报 `No such file`
+    /// （日志刷屏 + 浪费往返）；`.git` 监听只在 find 确认 `Ok(Some)` 后建立。
+    ///
+    /// 只断言同步行为（set 返回后立即检查），不依赖后台 find 任务的时序；
+    /// find 指向本机关闭端口，会快速失败，不影响断言。
+    #[gpui::test]
+    fn git_panel_defers_git_file_watches_until_repo_confirmed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // set_workspace_path 内部经 WatcherContext 取全局 watcher，先初始化。
+        cx.update(|cx| crate::file_manager::watcher::init(cx));
+        let panel = cx.new(GitPanel::new);
+        let mut config = SshConnectionConfig::local();
+        config.host = "127.0.0.1".to_string();
+        config.port = 9;
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(crate::file_manager::filesystem::RemoteFileSystem::new(config.clone()));
+        panel.update(cx, |p, cx| {
+            p.set_workspace_path(
+                std::path::PathBuf::from("/root/sn105_workspace/docs"),
+                false,
+                Some(config),
+                Some(fs),
+                cx,
+            );
+        });
+        panel.update(cx, |p, _| {
+            assert!(
+                p.remote_git_watched.is_empty(),
+                "确认仓库前不得 watch .git 文件，实际: {:?}",
+                p.remote_git_watched
+            );
+            assert_eq!(
+                p.workspace_path.as_deref(),
+                Some(std::path::Path::new("/root/sn105_workspace/docs"))
+            );
+        });
     }
 }

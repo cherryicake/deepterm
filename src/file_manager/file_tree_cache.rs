@@ -299,7 +299,9 @@ impl RemoteFileTreeCache {
 
     /// 生成服务器唯一标识（基于用户名、主机、端口）
     fn server_key(config: &SshConnectionConfig) -> String {
-        format!("{}@{}:{}", config.username, config.host, config.port)
+        // 与 watcher 的 watch 状态 key 同源，两处必须永远一致：
+        // 共享缓存与轮询器都以服务器为隔离单元，格式漂移会导致错位。
+        crate::file_manager::watcher::remote_server_key(config)
     }
 
     /// 查询目录缓存，返回该目录的子项列表

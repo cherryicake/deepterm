@@ -452,6 +452,7 @@ mod tests {
             path: PathBuf::from("/root"),
             kind: FsChangeKind::Modify,
             entries: Some(entries(&["fresh"])),
+            server: None,
         };
         loader.handle_fs_event(Path::new("/root"), &event);
 
@@ -479,6 +480,7 @@ mod tests {
             path: PathBuf::from("/root/sub"),
             kind: FsChangeKind::Remove,
             entries: None,
+            server: None,
         };
         let ancestor = loader.handle_fs_event(Path::new("/root"), &event);
 

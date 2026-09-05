@@ -9,6 +9,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::file_manager::filesystem::{FileMetadata, FileSystem};
 use crate::file_manager::types::FileEntry;
+use crate::ssh::SshConnectionConfig;
 use futures::StreamExt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +38,14 @@ pub struct FsChangeEvent {
     /// For remote directory polling: the new directory entries already fetched by the watcher.
     /// When present, the subscriber can update its cache directly without an extra async load.
     pub entries: Option<Vec<FileEntry>>,
+    /// 事件来源的远程服务器标识（`username@host:port`）。
+    ///
+    /// 多台服务器可能 watch 同一路径（如两个终端 tab 分别连不同主机、cwd 都是 `/root`），
+    /// 轮询器会为每台服务器独立发事件。订阅方（文件树 / Git 面板 / 编辑器）
+    /// 必须用它过滤，只应用与自己后端匹配的事件（见 [`FsChangeEvent::is_from_backend`]），
+    /// 否则 A 服务器的事件会污染 B 服务器的文件树缓存。
+    /// `None` 表示本地 notify 事件（不区分后端）。
+    pub server: Option<String>,
 }
 
 impl FsChangeEvent {
@@ -45,16 +54,59 @@ impl FsChangeEvent {
             path,
             kind,
             entries: None,
+            server: None,
         }
     }
 
-    pub fn with_entries(path: PathBuf, kind: FsChangeKind, entries: Vec<FileEntry>) -> Self {
+    /// 远程事件：附上服务器标识。
+    pub fn remote(path: PathBuf, kind: FsChangeKind, server: String) -> Self {
         Self {
-            path,
-            kind,
-            entries: Some(entries),
+            server: Some(server),
+            ..Self::new(path, kind)
         }
     }
+
+    /// 远程目录轮询事件：附上新目录项与服务器标识。
+    pub fn remote_with_entries(
+        path: PathBuf,
+        kind: FsChangeKind,
+        server: String,
+        entries: Vec<FileEntry>,
+    ) -> Self {
+        Self {
+            entries: Some(entries),
+            ..Self::remote(path, kind, server)
+        }
+    }
+
+    /// 该事件是否来自 `backend_ssh_config` 对应的文件系统。
+    ///
+    /// 远程事件只匹配同一台服务器；本地事件（`server` 为 `None`）只匹配
+    /// 无 SSH 配置的本地后端。
+    pub fn is_from_backend(&self, backend_ssh_config: Option<&SshConnectionConfig>) -> bool {
+        match (backend_ssh_config, self.server.as_deref()) {
+            (Some(config), Some(server)) => remote_server_key(config) == server,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// 从 SSH 配置派生服务器标识（`username@host:port`）：远程 watch 状态、
+/// 事件过滤与 `RemoteFileTreeCache` 共享缓存都以它为隔离单元，单一实现
+/// 防止三处口径漂移。
+///
+/// 同一主机同一账号的多个 `RemoteFileSystem` 实例（每次建树都会 new 一个）
+/// 会得到相同 key，watch 状态因此共享；不同主机同路径（两台服务器的 `/root`）
+/// 则彼此独立。
+pub fn remote_server_key(config: &SshConnectionConfig) -> String {
+    format!("{}@{}:{}", config.username, config.host, config.port)
+}
+
+/// `FileSystem` 后端对应的 watch 服务器标识。
+/// 返回 `None` 表示无法识别（不会进入远程轮询器，仅用于防御性调用）。
+fn fs_server_key(fs: &Arc<dyn FileSystem>) -> Option<String> {
+    fs.ssh_config().as_ref().map(remote_server_key)
 }
 
 pub fn init(cx: &mut App) {
@@ -115,9 +167,9 @@ impl RemoteFsWatcherGlobal {
         watcher.update(cx, |w, cx| w.watch(path, fs, cx));
     }
 
-    pub fn unwatch(path: &Path, cx: &mut App) {
+    pub fn unwatch(path: &Path, fs: &Arc<dyn FileSystem>, cx: &mut App) {
         let watcher = Self::watcher(cx);
-        watcher.update(cx, |w, cx| w.unwatch(path, cx));
+        watcher.update(cx, |w, cx| w.unwatch(path, fs, cx));
     }
 }
 
@@ -389,6 +441,15 @@ fn detect_remote_change(
         } else {
             prev_meta != new_meta || prev_hash != new_hash
         }
+    } else if new_meta.is_dir {
+        // watch 刚建立后的首轮目录轮询：主动同步一次真实状态。
+        //
+        // 不emit的首轮基线存在空窗：注册 watch 到首次轮询之间发生的变化
+        // （如切换终端 tab 后立刻 `rm` 文件）会被基线吞掉 —— 基线本身就是
+        // 删除后的状态，后续轮询永无差异，已删文件将无限期留在文件树上。
+        // 改为携带真实 entries 发一次 Modify，订阅方（文件树 loader 对比
+        // 缓存）幂等吸收：相同无事发生，不同则刷新。
+        true
     } else {
         false
     };
@@ -402,8 +463,20 @@ fn detect_remote_change(
 /// Emits the same `FsChangeEvent` events as the local watcher so that subscribers do not need to
 /// distinguish between the two backends.
 pub struct RemoteFsWatcher {
-    watched: Arc<Mutex<HashMap<PathBuf, RemoteWatchState>>>,
+    watched: Arc<Mutex<HashMap<WatchKey, RemoteWatchState>>>,
     _task: gpui::Task<()>,
+}
+
+/// watch 状态的键：路径 + 服务器标识。
+///
+/// 服务器标识不可或缺：两台服务器（两个终端 tab 连不同主机）的 cwd 常常
+/// 相同（如都在 `/root`）；若只用路径做键，后注册的 fs 会被 `and_modify`
+/// 静默丢弃，轮询永远只读第一台服务器 —— 另一台终端里删除文件后，它的文件树
+/// 永远收不到事件（表现为删除的文件一直显示）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WatchKey {
+    path: PathBuf,
+    server: String,
 }
 
 struct RemoteWatchState {
@@ -422,12 +495,22 @@ struct RemoteWatchState {
 impl EventEmitter<FsChangeEvent> for RemoteFsWatcher {}
 
 fn watch_increment(
-    watched: &mut HashMap<PathBuf, RemoteWatchState>,
+    watched: &mut HashMap<WatchKey, RemoteWatchState>,
     path: &Path,
     fs: Arc<dyn FileSystem>,
 ) {
+    let Some(server) = fs_server_key(&fs) else {
+        log::warn!(
+            "RemoteFsWatcher watch called with a backend without ssh_config: {}",
+            path.display()
+        );
+        return;
+    };
     watched
-        .entry(path.to_path_buf())
+        .entry(WatchKey {
+            path: path.to_path_buf(),
+            server: server.clone(),
+        })
         .and_modify(|state| state.ref_count += 1)
         .or_insert(RemoteWatchState {
             fs,
@@ -439,20 +522,32 @@ fn watch_increment(
         });
 }
 
-fn watch_decrement(watched: &mut HashMap<PathBuf, RemoteWatchState>, path: &Path) -> bool {
-    if let Some(state) = watched.get_mut(path) {
-        state.ref_count = state.ref_count.saturating_sub(1);
-        if state.ref_count == 0 {
-            watched.remove(path);
-            return true;
-        }
+fn watch_decrement(
+    watched: &mut HashMap<WatchKey, RemoteWatchState>,
+    path: &Path,
+    fs: &Arc<dyn FileSystem>,
+) -> bool {
+    let Some(server) = fs_server_key(fs) else {
+        return false;
+    };
+    let key = WatchKey {
+        path: path.to_path_buf(),
+        server,
+    };
+    let Some(state) = watched.get_mut(&key) else {
+        return false;
+    };
+    state.ref_count = state.ref_count.saturating_sub(1);
+    if state.ref_count == 0 {
+        watched.remove(&key);
+        return true;
     }
     false
 }
 
 impl RemoteFsWatcher {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let watched = Arc::new(Mutex::new(HashMap::<PathBuf, RemoteWatchState>::new()));
+        let watched = Arc::new(Mutex::new(HashMap::<WatchKey, RemoteWatchState>::new()));
         let watched_clone = watched.clone();
         let weak = cx.entity().downgrade();
 
@@ -460,10 +555,12 @@ impl RemoteFsWatcher {
             loop {
                 cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
 
-                let to_check: Vec<(PathBuf, Arc<dyn FileSystem>)> = {
+                // 快照本轮要轮询的 (路径, 服务器, fs)；键必须含服务器标识，
+                // 否则两台服务器同路径时只会轮询到先注册的那台。
+                let to_check: Vec<(PathBuf, String, Arc<dyn FileSystem>)> = {
                     let lock = watched_clone.lock();
                     lock.iter()
-                        .map(|(p, s)| (p.clone(), s.fs.clone()))
+                        .map(|(key, s)| (key.path.clone(), key.server.clone(), s.fs.clone()))
                         .collect()
                 };
 
@@ -473,7 +570,7 @@ impl RemoteFsWatcher {
 
                 let bg = cx.background_executor().clone();
                 let all_results = futures::stream::iter(to_check)
-                    .map(|(path, fs)| {
+                    .map(|(path, server, fs)| {
                         let bg = bg.clone();
                         async move {
                             bg.spawn(async move {
@@ -489,7 +586,7 @@ impl RemoteFsWatcher {
                                     ),
                                     Err(_) => (None, None),
                                 };
-                                (path, meta, entries, content_hash)
+                                (path, server, meta, entries, content_hash)
                             })
                             .await
                         }
@@ -498,14 +595,17 @@ impl RemoteFsWatcher {
                     .collect::<Vec<_>>()
                     .await;
 
-                for (path, meta, entries, content_hash) in all_results {
+                for (path, server, meta, entries, content_hash) in all_results {
+                    let watch_key = WatchKey {
+                        path: path.clone(),
+                        server: server.clone(),
+                    };
                     let meta = match meta {
                         Ok(m) => m,
                         Err(e) => {
-                            log::warn!("Remote metadata failed for {}: {}", path.display(), e);
                             let should_emit = {
                                 let mut lock = watched_clone.lock();
-                                if let Some(state) = lock.get_mut(&path) {
+                                if let Some(state) = lock.get_mut(&watch_key) {
                                     if state.last_meta.is_some() && !state.reported_missing {
                                         state.reported_missing = true;
                                         state.last_meta = None;
@@ -519,15 +619,31 @@ impl RemoteFsWatcher {
                                     false
                                 }
                             };
+                            // 只在状态变迁（首次失败，伴随 Remove 事件）时 WARN；
+                            // 之后每轮重复失败不再携带新信息，降为 debug，避免日志刷屏。
                             if should_emit {
+                                log::warn!(
+                                    "Remote metadata failed for {} ({}): {}",
+                                    path.display(),
+                                    server,
+                                    e
+                                );
                                 if let Some(watcher) = weak.upgrade() {
                                     watcher.update(cx, |_, cx| {
-                                        cx.emit(FsChangeEvent::new(
+                                        cx.emit(FsChangeEvent::remote(
                                             path.clone(),
                                             FsChangeKind::Remove,
+                                            server.clone(),
                                         ));
                                     });
                                 }
+                            } else {
+                                log::debug!(
+                                    "Remote metadata failed for {} ({}): {}",
+                                    path.display(),
+                                    server,
+                                    e
+                                );
                             }
                             continue;
                         }
@@ -535,7 +651,7 @@ impl RemoteFsWatcher {
 
                     let (should_emit, kind, reported_missing) = {
                         let mut lock = watched_clone.lock();
-                        if let Some(state) = lock.get_mut(&path) {
+                        if let Some(state) = lock.get_mut(&watch_key) {
                             let reported_missing = state.reported_missing;
                             state.reported_missing = false;
                             let prev_meta = state.last_meta.take();
@@ -567,11 +683,20 @@ impl RemoteFsWatcher {
                             // event so subscribers reload the path even if its metadata matches
                             // the old baseline.
                             let event = if reported_missing {
-                                FsChangeEvent::new(path.clone(), FsChangeKind::Create)
+                                FsChangeEvent::remote(
+                                    path.clone(),
+                                    FsChangeKind::Create,
+                                    server.clone(),
+                                )
                             } else if let Some(entries) = entries {
-                                FsChangeEvent::with_entries(path.clone(), kind, entries)
+                                FsChangeEvent::remote_with_entries(
+                                    path.clone(),
+                                    kind,
+                                    server.clone(),
+                                    entries,
+                                )
                             } else {
-                                FsChangeEvent::new(path.clone(), kind)
+                                FsChangeEvent::remote(path.clone(), kind, server.clone())
                             };
                             watcher.update(cx, |_, cx| {
                                 cx.emit(event);
@@ -591,9 +716,11 @@ impl RemoteFsWatcher {
         cx.notify();
     }
 
-    pub fn unwatch(&mut self, path: &Path, cx: &mut Context<Self>) {
+    /// 停止一次 watch。`fs` 必须与当初 `watch` 时是同一台服务器（ssh_config 派生 key），
+    /// 否则无法定位到正确的引用计数。
+    pub fn unwatch(&mut self, path: &Path, fs: &Arc<dyn FileSystem>, cx: &mut Context<Self>) {
         let mut lock = self.watched.lock();
-        if !watch_decrement(&mut lock, path) {
+        if !watch_decrement(&mut lock, path, fs) {
             log::warn!(
                 "RemoteFsWatcher unwatch called for {} which is not watched",
                 path.display()
@@ -637,9 +764,11 @@ pub trait WatcherContext: AppContext + Sized {
         watcher.update(self, |w, cx| w.watch(path, fs, cx));
     }
 
-    fn unwatch_remote_path(&mut self, path: &Path) {
+    /// 停止远程 watch。`fs` 用于定位到正确的服务器 watch 状态
+    /// （两台服务器可能 watch 同一路径，见 [`WatchKey`]）。
+    fn unwatch_remote_path(&mut self, path: &Path, fs: &Arc<dyn FileSystem>) {
         let watcher = self.remote_fs_watcher();
-        watcher.update(self, |w, cx| w.unwatch(path, cx));
+        watcher.update(self, |w, cx| w.unwatch(path, fs, cx));
     }
 }
 
@@ -668,7 +797,9 @@ mod tests {
     use super::*;
     use crate::file_manager::filesystem::LocalFileSystem;
     use crate::file_manager::types::FileEntryKind;
+    use crate::ssh::SshConnectionConfig;
     use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
 
     fn meta(is_dir: bool, size: u64, mtime: Option<std::time::SystemTime>) -> FileMetadata {
         FileMetadata {
@@ -795,32 +926,331 @@ mod tests {
     }
 
     #[test]
-    fn detect_remote_change_first_poll_no_emit() {
+    fn detect_remote_change_file_first_poll_no_emit() {
         let new = meta(false, 5, None);
         let hash = Some(hash_bytes(b"hello"));
 
         let (emit, _) = detect_remote_change(None, None, None, &new, None, hash, false);
-        assert!(!emit);
+        assert!(!emit, "文件首轮轮询不主动同步（编辑器自行校验内容）");
+    }
+
+    /// 目录首轮轮询必须 emit（携带真实 entries 的 Modify）：
+    /// 否则 watch 注册后 ~ 一个轮询周期内的变更会被基线吞掉，
+    /// 已删除的文件将无限期留在文件树上。
+    #[test]
+    fn detect_remote_change_dir_first_poll_emits_sync() {
+        let new_meta = meta(true, 0, None);
+        let entries = vec![entry("a.txt", FileEntryKind::File)];
+
+        let (emit, kind) =
+            detect_remote_change(None, None, None, &new_meta, Some(&entries), None, false);
+        assert!(emit, "目录首轮轮询必须发同步事件");
+        assert_eq!(kind, FsChangeKind::Modify);
     }
 
     #[test]
     fn watch_ref_counting() {
         let mut watched = HashMap::new();
-        let fs = Arc::new(LocalFileSystem) as Arc<dyn FileSystem>;
         let path = Path::new("/tmp/test.txt");
+        let mock = RemoteMockFs::new("ref-count-host", &[]);
+        let key = WatchKey {
+            path: path.to_path_buf(),
+            server: remote_server_key(&mock.config),
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(mock);
 
         watch_increment(&mut watched, path, fs.clone());
-        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(1));
+        assert_eq!(watched.get(&key).map(|s| s.ref_count), Some(1));
 
         watch_increment(&mut watched, path, fs.clone());
-        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(2));
+        assert_eq!(watched.get(&key).map(|s| s.ref_count), Some(2));
 
-        assert!(!watch_decrement(&mut watched, path));
-        assert_eq!(watched.get(path).map(|s| s.ref_count), Some(1));
+        assert!(!watch_decrement(&mut watched, path, &fs));
+        assert_eq!(watched.get(&key).map(|s| s.ref_count), Some(1));
 
-        assert!(watch_decrement(&mut watched, path));
-        assert!(!watched.contains_key(path));
+        assert!(watch_decrement(&mut watched, path, &fs));
+        assert!(watched.is_empty());
 
-        assert!(!watch_decrement(&mut watched, path));
+        assert!(!watch_decrement(&mut watched, path, &fs));
+    }
+
+    /// 无 ssh_config 的后端（本地 fs 误入远程轮询器）：不注册、不 panic
+    #[test]
+    fn watch_increment_rejects_backend_without_ssh_config() {
+        let mut watched = HashMap::new();
+        let fs = Arc::new(LocalFileSystem) as Arc<dyn FileSystem>;
+        watch_increment(&mut watched, Path::new("/tmp"), fs);
+        assert!(watched.is_empty());
+    }
+
+    /// 同路径不同服务器：各自独立计数，互不干扰（回归：多主机同 cwd 切换）
+    #[test]
+    fn watch_ref_counting_isolates_servers_on_same_path() {
+        let mut watched = HashMap::new();
+        let mock_a = RemoteMockFs::new("srv-a", &[]);
+        let mock_b = RemoteMockFs::new("srv-b", &[]);
+        let server_b = remote_server_key(&mock_b.config);
+        let fs_a: Arc<dyn FileSystem> = Arc::new(mock_a);
+        let fs_b: Arc<dyn FileSystem> = Arc::new(mock_b);
+        let path = Path::new("/root");
+
+        // 服务器 A 的树 watch /root，随后服务器 B 的树也 watch /root
+        watch_increment(&mut watched, path, fs_a.clone());
+        watch_increment(&mut watched, path, fs_b.clone());
+
+        // 两条独立状态（若 key 冲突则只会剩一条 ref=2）
+        assert_eq!(watched.len(), 2, "同路径的两台服务器必须是独立的 watch 状态");
+
+        // 各自减到 0 各自移除；A unwatch 不应影响 B 的状态
+        assert!(watch_decrement(&mut watched, path, &fs_a));
+        assert_eq!(
+            watched
+                .iter()
+                .find(|(k, _)| k.path == path && k.server == server_b)
+                .map(|(_, s)| s.ref_count),
+            Some(1),
+            "A 的 unwatch 不应移除 B 的 watch 状态"
+        );
+        assert!(watch_decrement(&mut watched, path, &fs_b));
+        assert!(watched.is_empty());
+    }
+
+    /// 订阅方服务器过滤的四种匹配分支
+    #[test]
+    fn fs_change_event_is_from_backend_filters_by_server() {
+        let mut config = SshConnectionConfig::local();
+        config.host = "srv-a".to_string();
+        let mut other = SshConnectionConfig::local();
+        other.host = "srv-b".to_string();
+
+        let remote_event = FsChangeEvent::remote(
+            PathBuf::from("/root"),
+            FsChangeKind::Modify,
+            remote_server_key(&config),
+        );
+        let local_event = FsChangeEvent::new(PathBuf::from("/root"), FsChangeKind::Modify);
+
+        // 远程事件：只匹配同一台服务器
+        assert!(remote_event.is_from_backend(Some(&config)));
+        assert!(!remote_event.is_from_backend(Some(&other)));
+        assert!(!remote_event.is_from_backend(None), "远程事件不匹配本地后端");
+
+        // 本地事件：只匹配本地后端
+        assert!(local_event.is_from_backend(None));
+        assert!(!local_event.is_from_backend(Some(&config)));
+    }
+
+    // ── 轮询链路端到端测试（TestAppContext 确定性驱动，无需真实网络）──
+
+    /// 可动态变更目录项的远程 mock 文件系统（模拟一台 SFTP 服务器）。
+    struct RemoteMockFs {
+        entries: StdMutex<Vec<FileEntry>>,
+        config: SshConnectionConfig,
+    }
+
+    impl RemoteMockFs {
+        fn new(host: &str, names: &[&str]) -> Self {
+            let mut config = SshConnectionConfig::local();
+            config.host = host.to_string();
+            config.username = format!("user-{host}");
+            Self {
+                entries: StdMutex::new(
+                    names
+                        .iter()
+                        .map(|n| FileEntry {
+                            name: (*n).to_string(),
+                            path: PathBuf::from(format!("/root/{n}")),
+                            kind: FileEntryKind::File,
+                            size: 0,
+                        })
+                        .collect(),
+                ),
+                config,
+            }
+        }
+        fn remove(&self, name: &str) {
+            self.entries.lock().unwrap().retain(|e| e.name != name);
+        }
+    }
+
+    impl FileSystem for RemoteMockFs {
+        fn read_dir(&self, _path: &Path) -> Result<Vec<FileEntry>, String> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+
+        fn metadata(&self, _path: &Path) -> Result<FileMetadata, String> {
+            Ok(FileMetadata {
+                is_dir: true,
+                size: 0,
+                modified_at: None,
+            })
+        }
+
+        fn read_file_bytes(&self, _path: &Path) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+
+        fn home_dir(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn ssh_config(&self) -> Option<SshConnectionConfig> {
+            Some(self.config.clone())
+        }
+
+        fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    /// 事件收集探针：持有订阅，把收到的事件存入共享 Vec。
+    struct EventProbe {
+        _sub: Option<gpui::Subscription>,
+    }
+
+    fn make_probe(
+        cx: &mut gpui::TestAppContext,
+        watcher: &gpui::Entity<RemoteFsWatcher>,
+        events: Arc<StdMutex<Vec<FsChangeEvent>>>,
+    ) -> gpui::Entity<EventProbe> {
+        cx.new(|cx| {
+            let sink = events;
+            let sub = cx.subscribe(watcher, move |_, _, event: &FsChangeEvent, _| {
+                sink.lock().unwrap().push(event.clone());
+            });
+            EventProbe { _sub: Some(sub) }
+        })
+    }
+
+    /// 断言失败时的诊断摘要：只取路径与事件类型，避免打印整个 entries。
+    fn brief(events: &[FsChangeEvent]) -> Vec<(PathBuf, FsChangeKind)> {
+        events
+            .iter()
+            .map(|e| (e.path.clone(), e.kind.clone()))
+            .collect()
+    }
+
+    /// 轮询链路端到端测试：被 watch 目录内删除文件 → 下一轮轮询应发出携带新 entries 的 Modify 事件
+    #[gpui::test]
+    fn remote_watcher_emits_modify_with_entries_on_delete(cx: &mut gpui::TestAppContext) {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let watcher = cx.new(|cx| RemoteFsWatcher::new(cx));
+        let _probe = make_probe(cx, &watcher, events.clone());
+
+        let fs = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
+        watcher.update(cx, |w, cx| {
+            w.watch(Path::new("/root"), fs.clone(), cx)
+        });
+
+        // 首轮轮询：目录首次轮询会发一次携带真实 entries 的同步事件（幂等，
+        // 订阅方对比后无变化则无事发生）
+        cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
+        cx.run_until_parked();
+        {
+            let received = events.lock().unwrap();
+            let sync = received
+                .iter()
+                .find(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify);
+            assert!(
+                sync.is_some(),
+                "目录首轮轮询应发一次同步事件，实际收到: {:?}",
+                brief(&received)
+            );
+            let entries = sync
+                .unwrap()
+                .entries
+                .as_ref()
+                .expect("同步事件应携带真实 entries");
+            assert!(
+                entries.iter().any(|e| e.name == "b.txt"),
+                "同步事件应反映删除前的真实状态"
+            );
+        }
+        events.lock().unwrap().clear();
+
+        // 模拟终端里 `rm b.txt`
+        fs.remove("b.txt");
+        cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
+        cx.run_until_parked();
+
+        let received = events.lock().unwrap();
+        let modify = received
+            .iter()
+            .find(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify);
+        assert!(
+            modify.is_some(),
+            "删除文件后应收到 /root 的 Modify 事件，实际收到: {:?}",
+            brief(&received)
+        );
+        let modify = modify.unwrap();
+        assert!(
+            modify.server.is_some(),
+            "远程事件必须携带服务器标识，供订阅方过滤"
+        );
+        let entries = modify.entries.as_ref().expect("事件应携带新 entries");
+        assert!(
+            entries.iter().all(|e| e.name != "b.txt"),
+            "事件中的 entries 不应再包含 b.txt"
+        );
+    }
+
+    /// 复现用户报告的 Bug：两台服务器（两个终端 tab）watch 同一路径时，
+    /// 轮询只看第一台服务器，第二台终端里删除文件 → 文件树永远不刷新。
+    ///
+    /// 场景对应 `set_terminal_file_tree` 的真实切换顺序：
+    /// 新树的 watch 先发生（旧状态仍在），旧树 cleanup 的 unwatch 后发生。
+    #[gpui::test]
+    fn remote_watcher_distinguishes_servers_watching_same_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let watcher = cx.new(|cx| RemoteFsWatcher::new(cx));
+        let _probe = make_probe(cx, &watcher, events.clone());
+
+        // 服务器 A 的树先 watch /root
+        let fs_a = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
+        watcher.update(cx, |w, cx| {
+            w.watch(Path::new("/root"), fs_a.clone(), cx)
+        });
+        cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
+        cx.run_until_parked();
+        events.lock().unwrap().clear();
+
+        // 切换到服务器 B 的终端：新树 watch /root（真实顺序：旧状态还在）
+        let fs_b = Arc::new(RemoteMockFs::new("srv-b", &["a.txt", "b.txt"]));
+        watcher.update(cx, |w, cx| {
+            w.watch(Path::new("/root"), fs_b.clone(), cx)
+        });
+        // 旧树 cleanup：unwatch
+        watcher.update(cx, |w, cx| {
+            w.unwatch(Path::new("/root"), &(fs_a.clone() as Arc<dyn FileSystem>), cx)
+        });
+
+        // 在服务器 B 的终端里 `rm b.txt`
+        fs_b.remove("b.txt");
+        cx.executor().advance_clock(REMOTE_POLL_INTERVAL * 3);
+        cx.run_until_parked();
+
+        let received = events.lock().unwrap();
+        let modify = received
+            .iter()
+            .find(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify);
+        assert!(
+            modify.is_some(),
+            "服务器 B 上删除文件后必须产生事件（否则 B 的文件树永久停留旧内容），\
+             实际收到: {:?}",
+            brief(&received)
+        );
+        let modify = modify.unwrap();
+        assert_eq!(
+            modify.server.as_deref(),
+            Some(remote_server_key(&fs_b.config).as_str()),
+            "事件必须标记来源服务器，订阅方才能过滤其他主机的事件"
+        );
+        let entries = modify.entries.as_ref().expect("事件应携带新 entries");
+        assert!(
+            entries.iter().all(|e| e.name != "b.txt"),
+            "事件中的 entries 应反映服务器 B 的新状态（不含 b.txt）"
+        );
     }
 }

@@ -205,8 +205,9 @@ impl SidebarFileTree {
         if self.loader.is_local() {
             cx.unwatch_recursive_path(&old_root);
         } else {
+            let backend = self.loader.backend();
             for watched in &self.watched_paths {
-                cx.unwatch_remote_path(watched);
+                cx.unwatch_remote_path(watched, backend);
             }
             self.watched_paths.clear();
         }
@@ -242,6 +243,14 @@ impl SidebarFileTree {
     }
 
     fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
+        // 事件按来源后端过滤：多台服务器可能 watch 同一路径（两个终端 tab 连
+        // 不同主机、cwd 都是 /root），只应用来自自己后端的事件，否则 A 服务器的
+        // 目录项会污染 B 服务器的文件树。（本地后端无 ssh_config，只匹配
+        // server=None 的本地事件。）
+        if !event.is_from_backend(self.loader.backend().ssh_config().as_ref()) {
+            return;
+        }
+
         if !event.path.starts_with(&self.root_path) {
             return;
         }
@@ -286,8 +295,9 @@ impl SidebarFileTree {
                     .filter(|p| **p != self.root_path && p.starts_with(removed_path))
                     .cloned()
                     .collect();
+                let backend = self.loader.backend();
                 for p in to_unwatch {
-                    cx.unwatch_remote_path(&p);
+                    cx.unwatch_remote_path(&p, backend);
                     self.watched_paths.remove(&p);
                 }
             }
@@ -332,8 +342,9 @@ impl SidebarFileTree {
         if self.loader.is_local() {
             cx.unwatch_recursive_path(&self.root_path);
         } else {
+            let backend = self.loader.backend();
             for watched in &self.watched_paths {
-                cx.unwatch_remote_path(watched);
+                cx.unwatch_remote_path(watched, backend);
             }
             self.watched_paths.clear();
         }
@@ -596,8 +607,9 @@ impl SidebarFileTree {
                     .filter(|p| p.starts_with(&path))
                     .cloned()
                     .collect();
+                let backend = self.loader.backend();
                 for p in to_unwatch {
-                    cx.unwatch_remote_path(&p);
+                    cx.unwatch_remote_path(&p, backend);
                     self.watched_paths.remove(&p);
                 }
             }
