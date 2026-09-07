@@ -6,6 +6,7 @@ use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::{HoveredLink, TerminalView};
 use crate::theme::{ActiveTheme, TerminalTheme};
+#[cfg(test)]
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::vte::ansi::CursorShape as AlacCursorShape;
@@ -14,7 +15,6 @@ use gpui::{
     FontWeight, GlobalElementId, Hsla, IntoElement, LayoutId, MouseButton, MouseUpEvent, Pixels,
     Point, Style, TextRun, TextStyle, WhiteSpace, Window, fill, point, px, size,
 };
-use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 const TERMINAL_HORIZONTAL_PADDING: f32 = 4.0;
@@ -67,11 +67,107 @@ fn rendered_cell_colors(
     }
 }
 
-/// Pure helper: check if a grid point falls within the given selection range.
-/// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
-#[inline]
-fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
-    range.as_ref().is_some_and(|range| range.contains(*point))
+    /// Pure helper: check if a grid point falls within the given selection range.
+    /// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
+    #[inline]
+    #[cfg(test)]
+    fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
+        range.as_ref().is_some_and(|range| range.contains(*point))
+    }
+
+    /// 用算术区间求交直接产出一行内的选区 span（O(1)，不逐格扫描）。
+    ///
+    /// `cells` 的 point 与 `range` 的 start/end 同为网格坐标（line 可为负
+    /// 的 scrollback 偏移），行 line 取首格坐标。语义与逐格调用
+    /// `SelectionRange::contains` 完全等价（见 reference 平价测试）：
+    /// Simple/Semantic/Lines 选区（is_block=false）：中间行整行高亮，
+    /// 首行取 [start.col, 行尾]，尾行取 [0, end.col]；Block 选区：
+    /// 每个相交行取相同列区间 [start.col, end.col]。
+    fn selection_spans_for_row(
+        row_idx: usize,
+        row_cells: &[IndexedCell],
+        selection_range: &Option<SelectionRange>,
+    ) -> Vec<BackgroundSpan> {
+        let Some(range) = selection_range else {
+            return Vec::new();
+        };
+        let (Some(first), Some(last)) = (row_cells.first(), row_cells.last()) else {
+            return Vec::new();
+        };
+        let line = first.point.line;
+        if line < range.start.line || line > range.end.line {
+            return Vec::new();
+        }
+
+        let last_col = last.point.column.0;
+        let (left, right) = if range.is_block
+            || (line == range.start.line && line == range.end.line)
+        {
+            // Block 选区：每个相交行取相同列区间；单行选区两端点即区间。
+            (range.start.column.0, range.end.column.0)
+        } else if line == range.start.line {
+            (range.start.column.0, last_col)
+        } else if line == range.end.line {
+            (0, range.end.column.0)
+        } else {
+            (0, last_col)
+        };
+
+        // 区间与 [0, last_col] 求交：起点越界 → 该行无选区（不能截断，
+        // 否则 start.column 越界的选区会伪造一个行尾 span）；终点越界
+        // → 截到行尾（contains 语义：p.column <= end.column 对整行成立）。
+        if left > last_col {
+            return Vec::new();
+        }
+        let right = right.min(last_col);
+        if left > right {
+            return Vec::new();
+        }
+        vec![BackgroundSpan::for_selection(left, row_idx, right - left + 1)]
+    }
+
+    /// 平价测试参考实现：逐格 `SelectionRange::contains` 扫描再合并成 span。
+    /// 与 [`Self::selection_spans_for_row`] 输出必须完全一致
+    /// （`selection_spans_parity` 随机平价测试守护）。
+    #[cfg(test)]
+    fn selection_spans_for_row_reference(
+        row_idx: usize,
+        row_cells: &[IndexedCell],
+        selection_range: &Option<SelectionRange>,
+    ) -> Vec<BackgroundSpan> {
+        let mut cols: Vec<usize> = Vec::new();
+        for cell in row_cells {
+            if is_point_selected(&cell.point, selection_range) {
+                cols.push(cell.point.column.0);
+            }
+        }
+        selection_spans_for_cols(row_idx, &cols)
+    }
+
+/// Coalesce a row's sorted selected column indices into contiguous spans
+/// (`start_col`, `width`). Emits one `BackgroundSpan` per contiguous run,
+/// collapsing what would otherwise be one quad per selected cell into one
+/// quad per run. See `BackgroundSpan::for_selection`.
+///
+/// 仅由平价测试的参考实现使用；生产路径走
+/// [`selection_spans_for_row`] 的 O(1) 算术求交。
+#[cfg(test)]
+fn selection_spans_for_cols(row: usize, cols: &[usize]) -> Vec<BackgroundSpan> {
+    let mut spans = Vec::new();
+    let mut iter = cols.iter().peekable();
+    while let Some(&start) = iter.next() {
+        let mut width = 1;
+        while let Some(&&next) = iter.peek() {
+            if next == start + width {
+                width += 1;
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        spans.push(BackgroundSpan::for_selection(start, row, width));
+    }
+    spans
 }
 
 /// Cached per-row layout for one visible row.
@@ -84,7 +180,8 @@ pub struct RowLayoutEntry {
 #[derive(Clone, Default)]
 pub struct RowRenderCache {
     pub layout: Option<RowLayoutEntry>,
-    pub selection_cols: Option<Vec<usize>>,
+    /// 选区高亮，直接以合并后的 span 形式存储（一次 quad 一个连续段）。
+    pub selection_spans: Option<Vec<BackgroundSpan>>,
     pub box_cells: Option<Vec<BoxDrawingCell>>,
     pub background_spans: Option<Vec<BackgroundSpan>>,
     /// Last hovered URL column range used to build `layout`. When this changes,
@@ -97,6 +194,9 @@ pub struct RowRenderCache {
 /// 对于 U+2500–U+259F 范围内的字符，不走字体光栅化流程，
 /// 而是在 `paint` 阶段用 GPUI 矩形图元直接绘制，
 /// 以保证相邻单元格的线条精确对齐（不受字体字形影响）。
+///
+/// 注意：`row` 仅供行缓存一致校验比对（`assert_row_consistency`）；
+/// paint 阶段按行序遍历缓存，y 坐标取**遍历下标**而非此字段。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoxDrawingCell {
     pub col: usize,
@@ -147,15 +247,12 @@ pub struct RenderMetricsSignature {
     pub font_id: usize,
 }
 
+/// 跨帧渲染缓存签名（O2 优化后不再保存渲染数据的第二份拷贝）。
+///
+/// paint 阶段直接按行序遍历 `RowRenderCache`（见 `TerminalElement::paint`），
+/// 本结构只保留「缓存是否仍有效」的判定信号：排版度量签名与悬停链接状态。
 #[derive(Clone, Default)]
 pub struct FlattenedRenderCache {
-    pub runs: Arc<[BatchedTextRun]>,
-    pub box_cells: Arc<[BoxDrawingCell]>,
-    pub background_spans: Arc<[BackgroundSpan]>,
-    /// Selection highlight stored as coalesced spans (one quad per contiguous
-    /// run of selected cells in a row) rather than one entry per selected cell.
-    /// See `BackgroundSpan::for_selection` for how these are constructed.
-    pub selection_spans: Arc<[BackgroundSpan]>,
     pub metrics: Option<RenderMetricsSignature>,
     /// Tracks the hovered link state that produced this cache so we can
     /// detect changes and rebuild when the user moves between URLs.
@@ -507,7 +604,7 @@ impl TerminalElement {
         row_runs: &[BatchedTextRun],
         row_boxes: &[BoxDrawingCell],
         row_backgrounds: &[BackgroundSpan],
-        row_selection_cols: &[usize],
+        row_selection_spans: &[BackgroundSpan],
         window: &mut Window,
         text_style: &TextStyle,
         font_size: Pixels,
@@ -527,7 +624,8 @@ impl TerminalElement {
         );
         let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme);
         let full_backgrounds = Self::background_spans_for_row(row_idx, row_cells, terminal_theme);
-        let full_selection_cols = Self::selected_cols_for_row(row_cells, selection_range);
+        let full_selection_spans =
+            selection_spans_for_row(row_idx, row_cells, selection_range);
 
         if Self::run_signature(row_runs) != Self::run_signature(&full_entry.runs) {
             log::warn!("row {row_idx} run mismatch");
@@ -538,7 +636,7 @@ impl TerminalElement {
         if row_backgrounds != full_backgrounds.as_slice() {
             log::warn!("row {row_idx} background mismatch");
         }
-        if row_selection_cols != full_selection_cols.as_slice() {
+        if row_selection_spans != full_selection_spans.as_slice() {
             log::warn!("row {row_idx} selection mismatch");
         }
     }
@@ -658,68 +756,6 @@ impl TerminalElement {
             c: ch,
             color: convert_alacritty_color(fg, terminal_theme),
         })
-    }
-
-    fn selected_cols_for_row(
-        cells: &[IndexedCell],
-        selection_range: &Option<SelectionRange>,
-    ) -> Vec<usize> {
-        let mut cols = Vec::new();
-        for cell in cells {
-            if is_point_selected(&cell.point, selection_range) {
-                cols.push(cell.point.column.0);
-            }
-        }
-        cols
-    }
-
-    /// Coalesce a row's sorted selected column indices into contiguous spans
-    /// (`start_col`, `width`). Emits one `BackgroundSpan` per contiguous run,
-    /// collapsing what would otherwise be one quad per selected cell into one
-    /// quad per run. See `BackgroundSpan::for_selection`.
-    fn selection_spans_for_cols(row: usize, cols: &[usize]) -> Vec<BackgroundSpan> {
-        let mut spans = Vec::new();
-        let mut iter = cols.iter().peekable();
-        while let Some(&start) = iter.next() {
-            let mut width = 1;
-            while let Some(&&next) = iter.peek() {
-                if next == start + width {
-                    width += 1;
-                    iter.next();
-                } else {
-                    break;
-                }
-            }
-            spans.push(BackgroundSpan::for_selection(start, row, width));
-        }
-        spans
-    }
-
-    fn update_selected_cols_in_range(
-        cached_cols: &[usize],
-        cells: &[IndexedCell],
-        range: (usize, usize),
-        selection_range: &Option<SelectionRange>,
-    ) -> Vec<usize> {
-        let (left, right) = range;
-        let mut cols: Vec<usize> = cached_cols
-            .iter()
-            .copied()
-            .filter(|col| *col < left || *col > right)
-            .collect();
-
-        for cell in cells {
-            let col = cell.point.column.0;
-            if col < left || col > right {
-                continue;
-            }
-            if is_point_selected(&cell.point, selection_range) {
-                cols.push(col);
-            }
-        }
-
-        cols.sort_unstable();
-        cols
     }
 
     fn background_spans_for_row(
@@ -1086,11 +1122,17 @@ impl IntoElement for TerminalElement {
 
 impl Element for TerminalElement {
     type RequestLayoutState = ();
+    /// O2：paint 直接持有行缓存（take/restore），不再经过 4×Arc 的
+    /// flattened 拷贝。字段：行缓存、cell 度量、光标位置、光标布局、
+    /// 本地输入覆盖层。
+    ///
+    /// 不变量：prepaint 从 view `take` 出行缓存到 paint 归还期间，view
+    /// 上的 `row_render_cache` 为空。gpui 帧周期保证 prepaint×1 →
+    /// paint×1 配对执行，paint 体内无提前 return，归还必然到达；若同一
+    /// 帧意外出现第二次 prepaint（当前框架不会），会触发该次全量重排
+    /// ——行为正确、仅性能回退。
     type PrepaintState = (
-        Arc<[BatchedTextRun]>,
-        Arc<[BoxDrawingCell]>,
-        Arc<[BackgroundSpan]>,
-        Arc<[BackgroundSpan]>,
+        Vec<RowRenderCache>,
         Pixels,
         Pixels,
         usize,
@@ -1233,13 +1275,13 @@ impl Element for TerminalElement {
         // This is merged with the row-cache take below into a single
         // `view.update` to keep per-frame entity-borrow overhead low.
         let selection_range_for_cache = selection_range;
-        let (mut row_caches, theme_changed, cached_flattened, selection_changed) =
+        let (mut row_caches, cached_flattened, selection_changed) =
             self.view.update(cx, |view, _cx| {
                 let selection_changed = view.cached_selection_mouse_mode != mouse_mode
                     || view.cached_selection_range != selection_range_for_cache;
                 if selection_changed {
                     for row_cache in &mut view.row_render_cache {
-                        row_cache.selection_cols = None;
+                        row_cache.selection_spans = None;
                     }
                     view.cached_selection_mouse_mode = mouse_mode;
                     view.cached_selection_range = selection_range_for_cache;
@@ -1250,7 +1292,6 @@ impl Element for TerminalElement {
                 match &view.cached_theme_id {
                     Some(theme_id) if active_theme_id == *theme_id => (
                         std::mem::take(&mut view.row_render_cache),
-                        false,
                         view.flattened_render_cache.clone(),
                         selection_changed,
                     ),
@@ -1260,7 +1301,6 @@ impl Element for TerminalElement {
                         view.flattened_render_cache = FlattenedRenderCache::default();
                         (
                             Vec::new(),
-                            true,
                             FlattenedRenderCache::default(),
                             selection_changed,
                         )
@@ -1280,7 +1320,6 @@ impl Element for TerminalElement {
 
         // Match Ghostty's grid-size-diff behavior: when the grid or text metrics
         // change, row-local shaped text and span caches are no longer valid.
-        let cache_resized = row_caches.len() != viewport_lines;
         if metrics_changed {
             row_caches.clear();
         }
@@ -1289,292 +1328,199 @@ impl Element for TerminalElement {
         let mut dirty_count = 0usize;
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
-        let has_dirty_rows = dirty_rows.iter().any(|dirty| *dirty);
         let hovered_link = self.view.read(cx).hovered_link.clone();
-        let hovered_link_changed = cached_flattened.hovered_link != hovered_link;
 
-        let rebuild_flattened_cache = theme_changed
-            || cache_resized
-            || selection_changed
-            || hovered_link_changed
-            || has_dirty_rows
-            || metrics_changed;
 
-        let flattened_cache = if rebuild_flattened_cache {
-            let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
-            let mut box_cells: Vec<BoxDrawingCell> = Vec::new();
-            let mut background_spans: Vec<BackgroundSpan> = Vec::new();
-            let mut selection_spans: Vec<BackgroundSpan> = Vec::new();
-            // Reuse row ranges produced in `Terminal::update_last_content` to avoid per-frame scans.
-            let terminal = self.terminal.read(cx);
-            let content = terminal.last_content();
-            let content_cells = &content.cells;
-            let row_ranges = &content.row_ranges;
+        // O2：行缓存本身就是渲染数据源（paint 直接逐行遍历），不再有
+        // flattened 拷贝。任何输入变化（主题/resize/选区/悬停/damage/度量）
+        // 只让相应行缓存失效，循环内每行按需重算 —— 单行 dirty 的帧不再
+        // 触发全视口重新聚合。
+        // 借用贯穿行缓存循环（NLL：guard 的最后一次使用在循环内，
+        // 循环后的 `view.update` 不与该借用冲突），零拷贝。
+        let terminal = self.terminal.read(cx);
+        let content = terminal.last_content();
+        let content_cells = &content.cells;
+        let row_ranges = &content.row_ranges;
 
-            #[cfg(debug_assertions)]
-            let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
+        #[cfg(debug_assertions)]
+        let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
 
-            // `row_caches` 在上面已 resize 到 `viewport_lines`，逐行迭代等价于按下标遍历。
-            for (row_idx, row_cache) in row_caches.iter_mut().enumerate() {
-                let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
-                let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx)
-                {
-                    &content_cells[*start..*end]
+        // `row_caches` 在上面已 resize 到 `viewport_lines`，逐行迭代等价于按下标遍历。
+        for (row_idx, row_cache) in row_caches.iter_mut().enumerate() {
+            let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
+            let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx) {
+                &content_cells[*start..*end]
+            } else {
+                &[]
+            };
+            let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
+                if link.row == row_idx {
+                    Some((link.start_col, link.end_col))
                 } else {
-                    &[]
-                };
-                let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
-                    if link.row == row_idx {
-                        Some((link.start_col, link.end_col))
-                    } else {
-                        None
-                    }
-                });
-
-                // Invalidate cached layout when the hovered URL range on this row changes,
-                // so that underline styles are recomputed even if terminal content is clean.
-                if row_cache.hovered_url_cols != hovered_url_cols {
-                    row_cache.layout = None;
-                    row_cache.hovered_url_cols = hovered_url_cols;
+                    None
                 }
+            });
 
-                if is_dirty || row_cache.layout.is_none() {
-                    dirty_count += 1;
-                    let cached_entry = row_cache.layout.clone();
-                    let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
-                    let entry =
-                        if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
-                            if let Some(updated_runs) = Self::try_update_runs_in_range(
-                                row_idx,
-                                &cached_entry.runs,
-                                row_cells,
-                                range,
-                                hovered_url_cols,
-                                window,
-                                &text_style,
-                                font_size,
-                                cell_width,
-                                &terminal_theme,
-                            ) {
-                                partial_run_update_count += 1;
-                                let mut entry = cached_entry;
-                                entry.runs = updated_runs;
-                                entry
-                            } else {
-                                Self::layout_row(
-                                    row_idx,
-                                    row_cells.iter(),
-                                    hovered_url_cols,
-                                    window,
-                                    &text_style,
-                                    font_size,
-                                    cell_width,
-                                    &terminal_theme,
-                                )
-                            }
-                        } else {
-                            Self::layout_row(
-                                row_idx,
-                                row_cells.iter(),
-                                hovered_url_cols,
-                                window,
-                                &text_style,
-                                font_size,
-                                cell_width,
-                                &terminal_theme,
-                            )
-                        };
-                    if rebuild_flattened_cache {
-                        batched_runs.extend_from_slice(&entry.runs);
-                    }
-                    row_cache.layout = Some(entry);
-                } else {
-                    cache_hit_count += 1;
-                    if let Some(cached_entry) = row_cache.layout.as_ref() {
-                        if rebuild_flattened_cache {
-                            batched_runs.extend_from_slice(&cached_entry.runs);
-                        }
-                    }
-                }
+            // Invalidate cached layout when the hovered URL range on this row changes,
+            // so that underline styles are recomputed even if terminal content is clean.
+            if row_cache.hovered_url_cols != hovered_url_cols {
+                row_cache.layout = None;
+                row_cache.hovered_url_cols = hovered_url_cols;
+            }
 
-                if row_cache.box_cells.is_none() {
-                    let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
-                    if rebuild_flattened_cache {
-                        box_cells.extend_from_slice(&row_boxes);
-                    }
-                    row_cache.box_cells = Some(row_boxes);
-                } else if is_dirty {
-                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        // 关键防御：缓存理论上为 Some，异常时全量重算而非 panic。
-                        let row_boxes = match row_cache.box_cells.as_ref() {
-                            Some(cached_row_boxes) => Self::update_box_cells_in_range(
-                                row_idx,
-                                cached_row_boxes,
-                                row_cells,
-                                range,
-                                &terminal_theme,
-                            ),
-                            None => Self::box_cells_for_row(row_idx, row_cells, &terminal_theme),
-                        };
-                        if rebuild_flattened_cache {
-                            box_cells.extend_from_slice(&row_boxes);
-                        }
-                        row_cache.box_cells = Some(row_boxes);
-                    } else {
-                        let row_boxes =
-                            Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
-                        if rebuild_flattened_cache {
-                            box_cells.extend_from_slice(&row_boxes);
-                        }
-                        row_cache.box_cells = Some(row_boxes);
-                    }
-                } else if rebuild_flattened_cache {
-                    // 关键防御：缓存缺失时跳过而非 panic，下帧会重建。
-                    if let Some(cached_row_boxes) = row_cache.box_cells.as_ref() {
-                        box_cells.extend_from_slice(cached_row_boxes);
-                    }
-                }
-
-                if row_cache.background_spans.is_none() {
-                    let backgrounds =
-                        Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
-                    if rebuild_flattened_cache {
-                        background_spans.extend_from_slice(&backgrounds);
-                    }
-                    row_cache.background_spans = Some(backgrounds);
-                } else if is_dirty {
-                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        // 关键防御：缓存缺失时全量重算，保证渲染永不 panic。
-                        let backgrounds = match row_cache.background_spans.as_ref() {
-                            Some(cached_backgrounds) => Self::update_background_spans_in_range(
-                                row_idx,
-                                cached_backgrounds,
-                                row_cells,
-                                range,
-                                &terminal_theme,
-                            ),
-                            None => {
-                                Self::background_spans_for_row(row_idx, row_cells, &terminal_theme)
-                            }
-                        };
-                        if rebuild_flattened_cache {
-                            background_spans.extend_from_slice(&backgrounds);
-                        }
-                        row_cache.background_spans = Some(backgrounds);
-                    } else {
-                        let backgrounds =
-                            Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
-                        if rebuild_flattened_cache {
-                            background_spans.extend_from_slice(&backgrounds);
-                        }
-                        row_cache.background_spans = Some(backgrounds);
-                    }
-                } else if rebuild_flattened_cache {
-                    if let Some(cached_backgrounds) = row_cache.background_spans.as_ref() {
-                        background_spans.extend_from_slice(cached_backgrounds);
-                    }
-                }
-
-                if selection_changed || row_cache.selection_cols.is_none() {
-                    let selected_cols = Self::selected_cols_for_row(row_cells, &selection_range);
-                    if rebuild_flattened_cache {
-                        selection_spans
-                            .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
-                    }
-                    row_cache.selection_cols = Some(selected_cols);
-                } else if is_dirty {
-                    if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
-                        // 关键防御：缓存缺失时全量重算。
-                        let selected_cols = match row_cache.selection_cols.as_ref() {
-                            Some(cached_selected_cols) => Self::update_selected_cols_in_range(
-                                cached_selected_cols,
-                                row_cells,
-                                range,
-                                &selection_range,
-                            ),
-                            None => Self::selected_cols_for_row(row_cells, &selection_range),
-                        };
-                        if rebuild_flattened_cache {
-                            selection_spans
-                                .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
-                        }
-                        row_cache.selection_cols = Some(selected_cols);
-                    } else {
-                        let selected_cols =
-                            Self::selected_cols_for_row(row_cells, &selection_range);
-                        if rebuild_flattened_cache {
-                            selection_spans
-                                .extend(Self::selection_spans_for_cols(row_idx, &selected_cols));
-                        }
-                        row_cache.selection_cols = Some(selected_cols);
-                    }
-                } else if rebuild_flattened_cache {
-                    if let Some(cached_selected_cols) = row_cache.selection_cols.as_ref() {
-                        selection_spans.extend(Self::selection_spans_for_cols(
-                            row_idx,
-                            cached_selected_cols,
-                        ));
-                    }
-                }
-
-                #[cfg(debug_assertions)]
-                if validate_row_cache {
-                    // 调试校验：缓存缺失时跳过校验而非 panic，避免 debug 模式误崩。
-                    if let (
-                        Some(layout),
-                        Some(row_boxes),
-                        Some(row_backgrounds),
-                        Some(row_selection_cols),
-                    ) = (
-                        row_cache.layout.as_ref(),
-                        row_cache.box_cells.as_ref(),
-                        row_cache.background_spans.as_ref(),
-                        row_cache.selection_cols.as_ref(),
+            if is_dirty || row_cache.layout.is_none() {
+                dirty_count += 1;
+                let cached_entry = row_cache.layout.clone();
+                let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
+                let entry = if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
+                    if let Some(updated_runs) = Self::try_update_runs_in_range(
+                        row_idx,
+                        &cached_entry.runs,
+                        row_cells,
+                        range,
+                        hovered_url_cols,
+                        window,
+                        &text_style,
+                        font_size,
+                        cell_width,
+                        &terminal_theme,
                     ) {
-                        Self::assert_row_consistency(
+                        partial_run_update_count += 1;
+                        let mut entry = cached_entry;
+                        entry.runs = updated_runs;
+                        entry
+                    } else {
+                        Self::layout_row(
                             row_idx,
-                            row_cells,
-                            &layout.runs,
-                            row_boxes,
-                            row_backgrounds,
-                            row_selection_cols,
+                            row_cells.iter(),
+                            hovered_url_cols,
                             window,
                             &text_style,
                             font_size,
                             cell_width,
                             &terminal_theme,
-                            &selection_range,
-                        );
+                        )
                     }
+                } else {
+                    Self::layout_row(
+                        row_idx,
+                        row_cells.iter(),
+                        hovered_url_cols,
+                        window,
+                        &text_style,
+                        font_size,
+                        cell_width,
+                        &terminal_theme,
+                    )
+                };
+                row_cache.layout = Some(entry);
+            } else {
+                cache_hit_count += 1;
+            }
+
+            if row_cache.box_cells.is_none() {
+                let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
+                row_cache.box_cells = Some(row_boxes);
+            } else if is_dirty {
+                if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
+                    // 关键防御：缓存理论上为 Some，异常时全量重算而非 panic。
+                    let row_boxes = match row_cache.box_cells.as_ref() {
+                        Some(cached_row_boxes) => Self::update_box_cells_in_range(
+                            row_idx,
+                            cached_row_boxes,
+                            row_cells,
+                            range,
+                            &terminal_theme,
+                        ),
+                        None => Self::box_cells_for_row(row_idx, row_cells, &terminal_theme),
+                    };
+                    row_cache.box_cells = Some(row_boxes);
+                } else {
+                    let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
+                    row_cache.box_cells = Some(row_boxes);
                 }
             }
 
-            let flattened = FlattenedRenderCache {
-                runs: Arc::from(batched_runs),
-                box_cells: Arc::from(box_cells),
-                background_spans: Arc::from(background_spans),
-                selection_spans: Arc::from(selection_spans),
-                metrics: Some(metrics_signature),
-                hovered_link,
-            };
-            // Single write-back: row caches, flattened cache and the returned
-            // scratch buffers (merged so the frame performs one entity update
-            // instead of two).
-            self.view.update(cx, |view, _cx| {
-                view.row_render_cache = row_caches;
-                view.flattened_render_cache = flattened.clone();
-                view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
-                view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
-            });
-            flattened
-        } else {
-            self.view.update(cx, |view, _cx| {
-                view.row_render_cache = row_caches;
-                view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
-                view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
-            });
-            cached_flattened
+            if row_cache.background_spans.is_none() {
+                let backgrounds =
+                    Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                row_cache.background_spans = Some(backgrounds);
+            } else if is_dirty {
+                if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
+                    // 关键防御：缓存缺失时全量重算，保证渲染永不 panic。
+                    let backgrounds = match row_cache.background_spans.as_ref() {
+                        Some(cached_backgrounds) => Self::update_background_spans_in_range(
+                            row_idx,
+                            cached_backgrounds,
+                            row_cells,
+                            range,
+                            &terminal_theme,
+                        ),
+                        None => {
+                            Self::background_spans_for_row(row_idx, row_cells, &terminal_theme)
+                        }
+                    };
+                    row_cache.background_spans = Some(backgrounds);
+                } else {
+                    let backgrounds =
+                        Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                    row_cache.background_spans = Some(backgrounds);
+                }
+            }
+
+            // O1：选区 span 直接以 O(1) 算术区间求交计算（逐格扫描的
+            // 增量更新路径已删除）。重算触发条件：选区变化、行内容
+            // 变化、或缓存缺失；稳态帧直接复用缓存。
+            if selection_changed || is_dirty || row_cache.selection_spans.is_none() {
+                let spans = selection_spans_for_row(row_idx, row_cells, &selection_range);
+                row_cache.selection_spans = Some(spans);
+            }
+
+            #[cfg(debug_assertions)]
+            if validate_row_cache {
+                // 调试校验：缓存缺失时跳过校验而非 panic，避免 debug 模式误崩。
+                if let (
+                    Some(layout),
+                    Some(row_boxes),
+                    Some(row_backgrounds),
+                    Some(row_selection_spans),
+                ) = (
+                    row_cache.layout.as_ref(),
+                    row_cache.box_cells.as_ref(),
+                    row_cache.background_spans.as_ref(),
+                    row_cache.selection_spans.as_ref(),
+                ) {
+                    Self::assert_row_consistency(
+                        row_idx,
+                        row_cells,
+                        &layout.runs,
+                        row_boxes,
+                        row_backgrounds,
+                        row_selection_spans,
+                        window,
+                        &text_style,
+                        font_size,
+                        cell_width,
+                        &terminal_theme,
+                        &selection_range,
+                    );
+                }
+            }
+        }
+
+        let new_signature = FlattenedRenderCache {
+            metrics: Some(metrics_signature),
+            hovered_link,
         };
+        // Single write-back: row caches, signature and the returned scratch
+        // buffers (merged so the frame performs one entity update instead
+        // of two). O2 后行缓存在 paint 结束前始终以局部变量存在，写回
+        // 时机移到 paint 阶段之后由 `PrepaintState` 归还（见 paint 尾部）。
+        self.view.update(cx, |view, _cx| {
+            view.flattened_render_cache = new_signature;
+            view.scratch_dirty_rows = std::mem::take(&mut dirty_rows);
+            view.scratch_dirty_row_bounds = std::mem::take(&mut dirty_row_bounds);
+        });
 
         log::trace!("row cache: {cache_hit_count}/{viewport_lines} hits, {dirty_count} recomputed");
         log::trace!("row run partial updates: {partial_run_update_count}");
@@ -1700,15 +1646,17 @@ impl Element for TerminalElement {
         let input_overlay: Option<LocalOverlayLayout> = if cursor_in_viewport {
             let (builtin_text, ime_text, builtin_cursor) = {
                 let view = self.view.read(cx);
+                // 借用而非拷贝：空 builtin/IME 是绝大多数帧的常态，
+                // `to_string()` 会为两个空串各付一次分配。
                 (
-                    view.builtin_command_text().to_string(),
-                    view.ime_text().to_string(),
+                    view.builtin_command_text(),
+                    view.ime_text(),
                     view.builtin_command_cursor(),
                 )
             };
             self.shape_overlay_layout(
-                &builtin_text,
-                &ime_text,
+                builtin_text,
+                ime_text,
                 builtin_cursor,
                 cursor_display_col,
                 cursor_line_in_viewport,
@@ -1728,10 +1676,7 @@ impl Element for TerminalElement {
         };
 
         (
-            flattened_cache.runs,
-            flattened_cache.box_cells,
-            flattened_cache.background_spans,
-            flattened_cache.selection_spans,
+            row_caches,
             cell_width,
             line_height,
             cursor_point.column.0,
@@ -1755,14 +1700,11 @@ impl Element for TerminalElement {
     ) {
         let terminal_theme = cx.theme().terminal;
         let (
-            batched_runs,
-            box_cells,
-            background_spans,
-            selection_spans,
+            row_caches,
             cell_width,
             line_height,
             cursor_col,
-            cursor_row,
+            _cursor_row,
             _cursor_in_viewport,
             terminal_bounds,
             cursor,
@@ -1772,73 +1714,94 @@ impl Element for TerminalElement {
         let origin = terminal_bounds.bounds.origin;
         window.paint_quad(fill(bounds, terminal_theme.background));
 
-        // Cell background spans are painted *under* the selection so that a
-        // non-default cell background (colored prompt segments, vim splits,
-        // syntax highlighting) can never cover the selection highlight. This
-        // mirrors Zed's terminal element ordering: rects -> selection -> text.
-        for span in background_spans.iter() {
-            let span_origin = point(
-                origin.x + *cell_width * span.start_col as f32,
-                origin.y + *line_height * span.row as f32,
-            );
-            window.paint_quad(fill(
-                Bounds::new(
-                    span_origin,
-                    size(*cell_width * span.width as f32, *line_height),
-                ),
-                span.color,
-            ));
-        }
-
-        for span in selection_spans.iter() {
-            let span_origin = point(
-                origin.x + *cell_width * span.start_col as f32,
-                origin.y + *line_height * span.row as f32,
-            );
-            window.paint_quad(fill(
-                Bounds::new(
-                    span_origin,
-                    size(*cell_width * span.width as f32, *line_height),
-                ),
-                terminal_theme.selection_background,
-            ));
-        }
-
-        // Paint batched text runs (text will appear on top of backgrounds)
-        for batch in batched_runs.iter() {
-            batch.paint(origin, *cell_width, *line_height, window, cx);
-        }
-
-        // 绘制内置盒子绘制字符 / 块元素。
-        // 这些字符在 layout_row 阶段已从文本批次中分离出来，
-        // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
-        // 效果等同于 Alacritty 的 builtin_box_drawing = true：
-        // 相邻格的边框线条精确对齐，不依赖字体字形，不会出现间隙。
-        //
-        // Exception: when the Block cursor overlays a box-drawing cell we skip
-        // the foreground-colored paint here and let `CursorLayout::paint`
-        // redraw that single cell with the inverted color.
-        let skip_cursor_box = cursor
-            .as_ref()
-            .map(|c| c.block_box_drawing.is_some())
-            .unwrap_or(false);
-        for cell in box_cells.iter() {
-            if skip_cursor_box && cell.col == *cursor_col && cell.row == *cursor_row {
-                continue;
+        // O2：paint 直接按行序遍历行缓存，替代先前的 flattened 拷贝。
+        // 同一行内绘制顺序保持 Zed 终端的层级：背景 span → 选区 → 文本
+        // runs → 盒字符；跨行按行序输出（各行区域不重叠，先后无视觉差异）。
+        for (row_idx, row_cache) in row_caches.iter().enumerate() {
+            // Cell background spans are painted *under* the selection so that a
+            // non-default cell background (colored prompt segments, vim splits,
+            // syntax highlighting) can never cover the selection highlight. This
+            // mirrors Zed's terminal element ordering: rects -> selection -> text.
+            if let Some(backgrounds) = row_cache.background_spans.as_ref() {
+                for span in backgrounds {
+                    let span_origin = point(
+                        origin.x + *cell_width * span.start_col as f32,
+                        origin.y + *line_height * row_idx as f32,
+                    );
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            span_origin,
+                            size(*cell_width * span.width as f32, *line_height),
+                        ),
+                        span.color,
+                    ));
+                }
             }
-            let cell_origin = point(
-                origin.x + *cell_width * cell.col as f32,
-                origin.y + *line_height * cell.row as f32,
-            );
-            box_drawing::paint_box_drawing(
-                cell.c,
-                cell_origin,
-                *cell_width,
-                *line_height,
-                cell.color,
-                window,
-            );
+
+            if let Some(selections) = row_cache.selection_spans.as_ref() {
+                for span in selections {
+                    let span_origin = point(
+                        origin.x + *cell_width * span.start_col as f32,
+                        origin.y + *line_height * row_idx as f32,
+                    );
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            span_origin,
+                            size(*cell_width * span.width as f32, *line_height),
+                        ),
+                        terminal_theme.selection_background,
+                    ));
+                }
+            }
+
+            if let Some(layout) = row_cache.layout.as_ref() {
+                for batch in &layout.runs {
+                    batch.paint(origin, *cell_width, *line_height, window, cx);
+                }
+            }
+
+            // 绘制内置盒子绘制字符 / 块元素。
+            // 这些字符在 layout_row 阶段已从文本批次中分离出来，
+            // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
+            // 效果等同于 Alacritty 的 builtin_box_drawing = true。
+            //
+            // Exception: when the Block cursor overlays a box-drawing cell we
+            // skip the foreground-colored paint here and let
+            // `CursorLayout::paint` redraw that single cell inverted.
+            let skip_cursor_box = cursor
+                .as_ref()
+                .map(|c| c.block_box_drawing.is_some())
+                .unwrap_or(false);
+            if let Some(box_cells) = row_cache.box_cells.as_ref() {
+                for cell in box_cells {
+                    if skip_cursor_box
+                        && cell.col == *cursor_col
+                        && cell.row == row_idx
+                    {
+                        continue;
+                    }
+                    let cell_origin = point(
+                        origin.x + *cell_width * cell.col as f32,
+                        origin.y + *line_height * row_idx as f32,
+                    );
+                    box_drawing::paint_box_drawing(
+                        cell.c,
+                        cell_origin,
+                        *cell_width,
+                        *line_height,
+                        cell.color,
+                        window,
+                    );
+                }
+            }
         }
+
+        // 行缓存用完归还给视图（行缓存里 `row` 字段在 O2 遍历下已不参与
+        // 定位，见 `BoxDrawingCell` 注释；span 行号取遍历下标）。
+        let mut row_caches = std::mem::take(row_caches);
+        self.view.update(cx, |view, _cx| {
+            view.row_render_cache = std::mem::take(&mut row_caches);
+        });
 
         // 使用prepaint阶段计算的光标布局进行渲染
         // 如果cursor为None（光标形状为Hidden），则不渲染光标
@@ -2077,6 +2040,86 @@ mod tests {
         assert_eq!(spans[0].width, 2);
         assert_eq!(spans[1].start_col, 4);
         assert_eq!(spans[1].width, 2);
+    }
+
+    // ── O1 选区快速路径平价测试 ─────────────────────────────────────────
+
+    /// 确定性 xorshift64* PRNG（避免为测试引入 rand 依赖）。
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// O1 核心平价：随机网格 × 随机选区（含 block 与非 block、单行与跨行、
+    /// 越界列），算术区间求交的输出必须与逐格 `contains` 扫描完全一致。
+    #[test]
+    fn selection_spans_parity_fast_path_matches_per_cell_scan() {
+        use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use alacritty_terminal::selection::SelectionRange;
+
+        const ROWS_PER_CASE: i32 = 8;
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+
+        for case in 0..600u64 {
+            let cols = 1 + (rng.below(80) as usize).max(1);
+
+            // 网格行 line ∈ [-4, 4]（覆盖 scrollback 负坐标）。
+            let base_line = -(rng.below(5) as i32);
+            let rows: Vec<Vec<IndexedCell>> = (0..ROWS_PER_CASE)
+                .map(|i| {
+                    let line = base_line + i;
+                    (0..cols)
+                        .map(|col| IndexedCell {
+                            point: AlacPoint::new(Line(line), Column(col)),
+                            cell: crate::terminal::terminal::PackedCell::from(
+                                &alacritty_terminal::term::cell::Cell::default(),
+                            ),
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // 随机选区端点（网格坐标，先归一化为 start <= end）。
+            let start = AlacPoint::new(
+                Line(base_line + rng.below(ROWS_PER_CASE as u64) as i32),
+                Column(rng.below(cols as u64 * 2) as usize), // 允许越界列
+            );
+            let end = AlacPoint::new(
+                Line(base_line + rng.below(ROWS_PER_CASE as u64) as i32),
+                Column(rng.below(cols as u64 * 2) as usize),
+            );
+            let (start, end) = if start <= end { (start, end) } else { (end, start) };
+            let is_block = rng.below(2) == 0;
+
+            let range = SelectionRange::new(start, end, is_block);
+            let sel = Some(range);
+
+            for (row_idx, row_cells) in rows.iter().enumerate() {
+                let fast = selection_spans_for_row(row_idx, row_cells, &sel);
+                let reference =
+                    selection_spans_for_row_reference(row_idx, row_cells, &sel);
+                assert_eq!(
+                    fast, reference,
+                    "case {case} row {row_idx} (cols={cols}, block={is_block}) 不平价: fast={fast:?} ref={reference:?}"
+                );
+
+                // 无选区时两者都必须为空。
+                let fast_none = selection_spans_for_row(row_idx, row_cells, &None);
+                assert!(fast_none.is_empty());
+            }
+        }
     }
 
     #[test]

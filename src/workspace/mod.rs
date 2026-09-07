@@ -8,7 +8,7 @@ pub mod tab_bar;
 pub mod transfer_bell;
 pub mod window_manager;
 pub mod workspace;
-pub(crate) use workspace::init;
+pub use workspace::init;
 
 use gpui::actions;
 actions!(workspace_actions, [ToggleSidebar]);

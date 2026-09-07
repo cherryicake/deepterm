@@ -148,7 +148,16 @@ mach2 = "0.4"
 # gpui_macos = { path = "../zed/crates/gpui_macos" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = ["test-support", "bench-support"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# #[gpui::bench] 生成的代码调用 gpui_platform::current_headless_renderer，
+# 需要 bench-support（仅 test/bench 构建参与特性合并，不影响正式产物）。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = [
+    "font-kit",
+    "bench-support",
+] }
 
 [package.metadata.bundle]
 name = "DeepTerm"
@@ -170,7 +179,14 @@ embed-resource = "2"
 [features]
 default = ["tree-sitter-languages"]
 tree-sitter-languages = []
+# 启用 src/utils/alloc_probe（计数分配器 + footprint 探针）。
+# bench target 需要独立启用：dev-dependencies 的 cfg(test) 不作用于其代码。
+alloc-probe = []
 
 [[bin]]
 name = "deepterm"
 path = "src/main.rs"
+
+[[bench]]
+name = "terminal_render"
+harness = false

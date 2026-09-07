@@ -618,9 +618,16 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// scrollback 固定 10000 行（`MAX_SCROLLBACK_LINES` 内）。内存测量
+    /// （见 docs/PERF_*.md）表明这是占用与可用性的默认折中；测试与基准
+    /// 通过 [`Terminal::new_headless`] 参数化覆盖此值。
     fn default_terminal_config() -> Config {
+        Self::terminal_config_with_scrollback(10_000)
+    }
+
+    fn terminal_config_with_scrollback(scrollback_lines: usize) -> Config {
         Config {
-            scrolling_history: 10000.min(MAX_SCROLLBACK_LINES),
+            scrolling_history: scrollback_lines.min(MAX_SCROLLBACK_LINES),
             default_cursor_style: AlacCursorStyle {
                 shape: AlacCursorShape::Block,
                 blinking: false,
@@ -628,6 +635,59 @@ impl Terminal {
             osc52: alacritty_terminal::term::Osc52::CopyPaste,
             ..Config::default()
         }
+    }
+
+    /// 测试 / 基准专用：构造无 PTY、无驱动任务的终端实体。
+    ///
+    /// 内容通过 [`Terminal::handle_remote_data`]（直接驱动 vte 解析器）注入，
+    /// 不产生子进程、不启动事件循环，保证基准与内存探针的输入完全确定。
+    /// 正式代码路径请勿使用：`sender` 为空意味着所有 PTY 相关操作都是 no-op。
+    #[doc(hidden)]
+    pub fn new_headless(cx: &mut App, scrollback_lines: usize) -> Entity<Self> {
+        let (events_tx, _events_rx) = unbounded();
+        let listener = ZedListener(events_tx);
+        let default_bounds = TerminalBounds::default();
+        let config = Self::terminal_config_with_scrollback(scrollback_lines);
+        let term = Arc::new(FairMutex::new(Term::new(config, &default_bounds, listener)));
+
+        cx.new(|_cx| Self {
+            term,
+            child_process_id: None,
+            shell_process_group_id: None,
+            pty_master_fd: None,
+            shell_program: None,
+            remote_shell_ready: false,
+            reported_working_directory: None,
+            remote_os: None,
+            remote_process_name: None,
+            window_title: None,
+            sender: None,
+            last_content: TerminalContent::default(),
+            content_generation: 0,
+            content_dirty: false,
+            dirty_rows: Vec::new(),
+            dirty_row_bounds: Vec::new(),
+            event_loop_task: None,
+            driver_task: None,
+            vte_processor: Processor::<StdSyncHandler>::new(),
+            input_area_start: None,
+            shell_fg_observed: None,
+            pending_osc: Vec::new(),
+            terminal_bounds: default_bounds,
+            selection_phase: SelectionPhase::Ended,
+            mouse_report_active: false,
+            link_hover_active: false,
+            last_mouse_position: None,
+            last_reported_mouse_cell: None,
+            scroll_px: px(0.0),
+            scrollbar_drag_offset: Rc::new(Cell::new(None)),
+            last_scroll_time: Cell::new(Instant::now()),
+            terminal_type: TerminalType::Local,
+            remote_input_callback: None,
+            remote_resize_callback: None,
+            russh_handle: None,
+            focused: true,
+        })
     }
 
     fn build_local_terminal(
@@ -1781,6 +1841,19 @@ impl Terminal {
     }
 
     pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.sync_inner(_cx);
+    }
+
+    /// 测试 / 基准专用：无 Window 的 sync。
+    ///
+    /// [`Terminal::sync`] 不使用 Window 参数，本入口让内存测量测试
+    /// （TestAppContext 无元素绘制）也能驱动完整快照路径。
+    #[doc(hidden)]
+    pub fn sync_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync_inner(cx);
+    }
+
+    fn sync_inner(&mut self, _cx: &mut Context<Self>) {
         if self.content_dirty {
             self.update_last_content(false);
             self.content_dirty = false;

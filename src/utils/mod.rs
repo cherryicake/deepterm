@@ -7,3 +7,8 @@
 pub mod fs_atomic;
 pub mod safe_open;
 pub mod shell;
+
+/// 测试 / 基准专用的内存观测工具（phys_footprint 探针 + 分配计数器）。
+/// 仅被 `#[cfg(test)]` 代码与 bench 引用，不进正式产物的任何逻辑路径。
+#[cfg(any(test, feature = "alloc-probe"))]
+pub mod alloc_probe;

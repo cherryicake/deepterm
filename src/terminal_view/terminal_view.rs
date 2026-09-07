@@ -111,7 +111,7 @@ const SCROLL_VELOCITY_SCALE: f32 = 2000.0;
 
 // Scrollbar thumb animation duration (seconds)
 const SCROLLBAR_ANIMATION_DURATION: f32 = 0.15;
-pub(crate) fn init(cx: &mut App) {
+pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
@@ -496,99 +496,154 @@ impl TerminalView {
         let focus_handle = cx.focus_handle();
 
         cx.new(|cx| {
-            let terminal_clone = terminal.clone();
-
-            // 本地终端只需要处理基本事件，不需要处理 SSH 相关事件
-            let subscription = cx.subscribe(
-                &terminal_clone,
-                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
-                    TerminalEvent::TitleChanged => {
-                        this.update_title(cx);
-                    }
-                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                        this.check_remote_os(terminal.clone(), cx);
-                        this.check_tab_label_changed(cx);
-                        cx.notify();
-                    }
-                    TerminalEvent::WorkingDirectoryChanged(cwd) => {
-                        this.on_working_directory_changed(cwd, cx);
-                    }
-                    TerminalEvent::Bell => {}
-                    TerminalEvent::CloseTerminal => {
-                        cx.emit(Event::CloseTerminal);
-                    }
-                    TerminalEvent::ProcessExited(status) => {
-                        cx.emit(Event::ProcessExited(*status));
-                    }
-                    // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
-                    TerminalEvent::SshAbnormalDisconnect => {}
-                    TerminalEvent::BlinkChanged(blinking) => {
-                        this.on_blink_changed(*blinking, cx);
-                    }
-                },
-            );
-
-            let blink_manager = cx.new(|_| BlinkCursor::new());
-            let blink_subscriptions = vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
-
-            let mut this = Self {
-                terminal: terminal_clone,
-                terminal_subscription: Some(subscription),
+            let mut this = Self::build_with_terminal(
+                cx,
+                terminal,
                 working_directory,
                 ssh_config,
+                initial_title,
                 command,
                 command_args,
                 focus_handle,
-                blink_manager,
-                _blink_subscriptions: blink_subscriptions,
-                blink_setting: TerminalBlink::default(),
-                app_requests_blink: false,
-                was_focused: false,
-                title: initial_title,
-                selecting: false,
-                selection_autoscroll_direction: None,
-                selection_autoscroll_task: None,
-                ime_state: None,
-                builtin_command_manager: BuiltinCommandManager::new(),
-                scp_hosts_cache: None,
-                broadcast_callback: None,
-                broadcast_suppressed: Rc::new(Cell::new(false)),
-                scrollbar_hide_task: None,
-                scrollbar_hide_scheduled_at: None,
-                ssh_connect_view: None,
-                ssh_connect_subscription: None,
-                ssh_connect_hide_task: None,
-                remote_os: None,
-                cached_working_directory: None,
-                process_cwd: ProcessCwdCache::default(),
-                pending_remote_cwd_restore: None,
-                hovered_link: None,
-                link_modifier_held: false,
-                row_render_cache: Vec::new(),
-                flattened_render_cache: FlattenedRenderCache::default(),
-                cached_theme_id: None,
-                cached_selection_range: None,
-                cached_selection_mouse_mode: false,
-                scratch_dirty_rows: Vec::new(),
-                scratch_dirty_row_bounds: Vec::new(),
-                scrollbar_thumb_y: px(0.0),
-                scrollbar_target_y: px(0.0),
-                scrollbar_anim_from_y: px(0.0),
-                scrollbar_anim_start: Instant::now(),
-                scrollbar_animating: false,
-                last_scroll_instant: Instant::now(),
-                recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
-                last_scroll_direction: 0,
-                toast_message: None,
-                toast_hide_task: None,
-                last_tab_label: None,
-                tab_label_debounce_task: None,
-                tab_label_pending: false,
-            };
+            );
             this.update_title(cx);
             this.last_tab_label = Some(this.tab_label(cx));
             this
         })
+    }
+
+    /// 从既有 Terminal 实体构建视图值。
+    ///
+    /// [`Self::create_terminal_view`] 的实体构建体抽出的纯构造部分，
+    /// 供 `replace_root` 式的基准窗口直接调用。
+    ///
+    /// 参数沿用 [`Self::create_terminal_view`] 的原始参数集（clippy 的
+    /// 7 参上限在此放宽：这是纯机械拆分，合并参数会改变公开构造签名）。
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_terminal(
+        cx: &mut Context<Self>,
+        terminal: Entity<Terminal>,
+        working_directory: Option<PathBuf>,
+        ssh_config: Option<SshConnectionConfig>,
+        initial_title: SharedString,
+        command: Option<String>,
+        command_args: Vec<String>,
+        focus_handle: FocusHandle,
+    ) -> Self {
+        let terminal_clone = terminal.clone();
+
+        // 本地终端只需要处理基本事件，不需要处理 SSH 相关事件
+        let subscription = cx.subscribe(
+            &terminal_clone,
+            |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
+                TerminalEvent::TitleChanged => {
+                    this.update_title(cx);
+                }
+                TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                    this.check_remote_os(terminal.clone(), cx);
+                    this.check_tab_label_changed(cx);
+                    cx.notify();
+                }
+                TerminalEvent::WorkingDirectoryChanged(cwd) => {
+                    this.on_working_directory_changed(cwd, cx);
+                }
+                TerminalEvent::Bell => {}
+                TerminalEvent::CloseTerminal => {
+                    cx.emit(Event::CloseTerminal);
+                }
+                TerminalEvent::ProcessExited(status) => {
+                    cx.emit(Event::ProcessExited(*status));
+                }
+                // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
+                TerminalEvent::SshAbnormalDisconnect => {}
+                TerminalEvent::BlinkChanged(blinking) => {
+                    this.on_blink_changed(*blinking, cx);
+                }
+            },
+        );
+
+        let blink_manager = cx.new(|_| BlinkCursor::new());
+        let blink_subscriptions = vec![cx.observe(&blink_manager, |_, _, cx| cx.notify())];
+
+        Self {
+            terminal: terminal_clone,
+            terminal_subscription: Some(subscription),
+            working_directory,
+            ssh_config,
+            command,
+            command_args,
+            focus_handle,
+            blink_manager,
+            _blink_subscriptions: blink_subscriptions,
+            blink_setting: TerminalBlink::default(),
+            app_requests_blink: false,
+            was_focused: false,
+            title: initial_title,
+            selecting: false,
+            selection_autoscroll_direction: None,
+            selection_autoscroll_task: None,
+            ime_state: None,
+            builtin_command_manager: BuiltinCommandManager::new(),
+            scp_hosts_cache: None,
+            broadcast_callback: None,
+            broadcast_suppressed: Rc::new(Cell::new(false)),
+            scrollbar_hide_task: None,
+            scrollbar_hide_scheduled_at: None,
+            ssh_connect_view: None,
+            ssh_connect_subscription: None,
+            ssh_connect_hide_task: None,
+            remote_os: None,
+            cached_working_directory: None,
+            process_cwd: ProcessCwdCache::default(),
+            pending_remote_cwd_restore: None,
+            hovered_link: None,
+            link_modifier_held: false,
+            row_render_cache: Vec::new(),
+            flattened_render_cache: FlattenedRenderCache::default(),
+            cached_theme_id: None,
+            cached_selection_range: None,
+            cached_selection_mouse_mode: false,
+            scratch_dirty_rows: Vec::new(),
+            scratch_dirty_row_bounds: Vec::new(),
+            scrollbar_thumb_y: px(0.0),
+            scrollbar_target_y: px(0.0),
+            scrollbar_anim_from_y: px(0.0),
+            scrollbar_anim_start: Instant::now(),
+            scrollbar_animating: false,
+            last_scroll_instant: Instant::now(),
+            recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
+            last_scroll_direction: 0,
+            toast_message: None,
+            toast_hide_task: None,
+            last_tab_label: None,
+            tab_label_debounce_task: None,
+            tab_label_pending: false,
+        }
+    }
+
+    /// 测试 / 基准专用：从无驱动 Terminal 构建视图（配合 `replace_root` 使用）。
+    #[doc(hidden)]
+    pub fn build_headless(cx: &mut Context<Self>, terminal: Entity<Terminal>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let mut this = Self::build_with_terminal(
+            cx,
+            terminal,
+            None,
+            None,
+            "Terminal".into(),
+            None,
+            Vec::new(),
+            focus_handle,
+        );
+        this.update_title(cx);
+        this.last_tab_label = Some(this.tab_label(cx));
+        this
+    }
+
+    /// 测试 / 基准专用：focus 句柄（构造 TerminalElement 需要）。
+    #[doc(hidden)]
+    pub fn focus_handle_for_test(&self) -> gpui::FocusHandle {
+        self.focus_handle.clone()
     }
 
     /// 创建新的本地终端

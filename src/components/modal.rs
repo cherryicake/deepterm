@@ -138,7 +138,7 @@ fn modal_exit_progress(t: f32) -> (f32, f32) {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```text
 /// // In your Render implementation:
 /// .when(self.show_settings, |this| {
 ///     this.child(

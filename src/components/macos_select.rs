@@ -82,7 +82,7 @@ pub enum SelectPopupPosition {
 ///    - Keyboard navigation supported: ↑/↓ to move, Enter to confirm, Escape to close
 ///
 /// Usage:
-/// ```rust
+/// ```text
 /// let items = vec!["始终显示".into(), "启用时显示".into(), "从不显示".into()];
 /// let select = MacosSelect::new(window, cx, items, "启用时显示");
 /// select.update(cx, |select, cx| {

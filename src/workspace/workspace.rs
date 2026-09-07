@@ -56,7 +56,7 @@ pub enum WorkspaceEvent {
 }
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
-pub(crate) fn init(cx: &mut App) {
+pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     // 使用 None 作为 context，让这些快捷键全局有效
     cx.bind_keys([

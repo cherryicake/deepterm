@@ -1438,14 +1438,16 @@ impl Render for SidebarFileTree {
 }
 
 /// 文件树侧边栏内的子面板
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FileTreePanel {
+    #[default]
     Files,
     Search,
     Git,
 }
 
 /// 文件树面板标签页状态（current/prev）
+#[derive(Default)]
 pub struct FileTreePanelTabs {
     pub current: FileTreePanel,
     pub prev: FileTreePanel,
@@ -1454,11 +1456,7 @@ pub struct FileTreePanelTabs {
 
 impl FileTreePanelTabs {
     pub fn new() -> Self {
-        Self {
-            current: FileTreePanel::Files,
-            prev: FileTreePanel::Files,
-            anim_epoch: 0,
-        }
+        Self::default()
     }
 
     pub fn select(&mut self, panel: FileTreePanel) {

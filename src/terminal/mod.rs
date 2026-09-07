@@ -2,6 +2,10 @@ pub mod link_detector;
 pub mod mappings;
 pub mod terminal;
 
+/// 内存占用测量测试（footprint / 分配抖动证据链，见 docs/PERF_*.md）。
+#[cfg(test)]
+mod terminal_memory_tests;
+
 /// ASCII 控制字符 Ctrl+V（SYN - Synchronous Idle）。
 ///
 /// 粘贴图像时转发该字节让终端应用自行处理（见 `Terminal::paste`）。
