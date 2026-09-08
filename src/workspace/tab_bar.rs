@@ -155,6 +155,9 @@ pub struct TabItem {
     pub is_modified: bool,
     pub is_remote: bool,
     pub is_loading: bool,
+    /// 需要关注（后台 tab 的终端响了铃 / 发了通知）：显示小红点，
+    /// tab 激活时自动清除（见 [`TabBar::set_active_tab`]）。
+    pub needs_attention: bool,
 }
 
 impl TabItem {
@@ -166,6 +169,7 @@ impl TabItem {
             is_modified: false,
             is_remote: false,
             is_loading: false,
+            needs_attention: false,
         }
     }
 
@@ -464,6 +468,14 @@ impl TabBar {
         let changed = self.active_tab_id.as_ref() != Some(&new_id);
         if changed {
             self.active_tab_id = Some(new_id);
+            // 激活即清铃：后台响铃 / 通知产生的小红点，切过来后视为已读。
+            if let Some(tab) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == *self.active_tab_id.as_ref().unwrap())
+            {
+                tab.needs_attention = false;
+            }
             // 溢出时把新激活的标签滚动到可见区域（最小滚动策略）
             if let Some(index) = self
                 .active_tab_id
@@ -1057,7 +1069,7 @@ impl TabBar {
             .into_any_element()
     }
 
-    /// 标签文本（含未保存圆点），非激活时限宽截断
+    /// 标签文本（含未保存 / 需关注圆点），非激活时限宽截断
     fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
         div()
             .relative()
@@ -1078,6 +1090,16 @@ impl TabBar {
                         } else {
                             theme.text_muted.opacity(0.7)
                         }),
+                )
+            })
+            // 需关注（后台铃 / 通知）：更醒目的强调色圆点，激活后清除。
+            .when(tab.needs_attention && !tab.is_modified, |this| {
+                this.child(
+                    div()
+                        .size(px(7.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(theme.error),
                 )
             })
             .child(

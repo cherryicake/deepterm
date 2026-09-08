@@ -1,10 +1,10 @@
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::{
+use gpui::{relative,
     App, Context, CursorStyle, Element, Entity, FocusHandle,
     GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, Style, Styled, Subscription, Window, div, px,
@@ -18,7 +18,10 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, BroadcastMsg)>> 
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-use crate::components::button::Icon as MenuIcon;
+use crate::components::button::{
+    Button, ButtonVariants, Icon as MenuIcon, Sizable, Size as ButtonSize,
+};
+use crate::components::modal::Modal;
 use crate::file_manager::{TransferStatusReporter, TransferTaskState};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
@@ -29,13 +32,31 @@ use crate::workspace::panel::{DraggedPanel, Panel, PanelContent, PanelEvent, Pan
 use crate::workspace::session_state::{
     TabSessionState, TabSessionType, TerminalSessionState, WorkspaceSessionState,
 };
-use crate::workspace::split_manager::{SplitContainer, SplitDirection};
+use crate::workspace::split_manager::{SplitContainer, SplitDirection, SplitNavDirection};
 use crate::workspace::tab_bar::{
     CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
 };
 
 // Define workspace actions
-actions!(workspace, [NewLocalTerminal, CloseSelectedPanel]);
+actions!(
+    workspace,
+    [NewLocalTerminal, CloseSelectedPanel, NewTerminalTab, ReopenClosedTab, NextTab, PreviousTab, FocusSplitLeft, FocusSplitRight, FocusSplitUp, FocusSplitDown]
+);
+
+/// 跳转到第 N 个 tab（0 基）。cmd+9 之外的第十个 tab 用 cmd+0。
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = workspace, no_json)]
+pub struct GotoTab(pub usize);
+
+actions!(
+    workspace,
+    [IncreaseFontSize, DecreaseFontSize, ResetFontSize]
+);
+
+/// 终端字号上下限：cmd +/- 在此范围内调整。
+const FONT_SIZE_MIN: f32 = 6.0;
+const FONT_SIZE_MAX: f32 = 40.0;
+const FONT_SIZE_STEP: f32 = 1.0;
 
 /// 最后一个 tab 关闭时的回调（不需要跨线程，故无 `Send + Sync`）。
 type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App)>;
@@ -65,6 +86,66 @@ pub fn init(cx: &mut App) {
         #[cfg(not(target_os = "windows"))]
         KeyBinding::new("cmd-l", NewLocalTerminal, None),
         KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+        // 新 tab：cmd-t（win/linux 用 ctrl-shift-t，ctrl-t 是 shell 的输出重定向切换）
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-t", NewTerminalTab, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-t", NewTerminalTab, None),
+        // 重开最近关闭的 tab：cmd-shift-t（mac）/ ctrl-alt-t（其他）
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-t", ReopenClosedTab, None),
+        // Tab 轮换：cmd-shift-] / cmd-shift-[（win/linux 用 ctrl-pageup/down）
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-[", PreviousTab, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-pageup", PreviousTab, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-pagedown", NextTab, None),
+        // cmd+1..9 直接切到第 N 个 tab（0 = 第 10 个）
+        KeyBinding::new("cmd-1", GotoTab(0), None),
+        KeyBinding::new("cmd-2", GotoTab(1), None),
+        KeyBinding::new("cmd-3", GotoTab(2), None),
+        KeyBinding::new("cmd-4", GotoTab(3), None),
+        KeyBinding::new("cmd-5", GotoTab(4), None),
+        KeyBinding::new("cmd-6", GotoTab(5), None),
+        KeyBinding::new("cmd-7", GotoTab(6), None),
+        KeyBinding::new("cmd-8", GotoTab(7), None),
+        KeyBinding::new("cmd-9", GotoTab(8), None),
+        // 分屏导航：cmd+alt+方向键（win/linux 用 ctrl+alt+方向键）
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-left", FocusSplitLeft, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-right", FocusSplitRight, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-up", FocusSplitUp, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-down", FocusSplitDown, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-left", FocusSplitLeft, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-right", FocusSplitRight, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-up", FocusSplitUp, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-alt-down", FocusSplitDown, None),
+        // 字号：cmd +/-/0（win/linux 用 ctrl +/-/0）。
+        // 注意 win/linux 下 ctrl+0 / ctrl+plus 不会与浏览器风格冲突。
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-+", IncreaseFontSize, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-", DecreaseFontSize, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-0", ResetFontSize, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-+", IncreaseFontSize, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-", DecreaseFontSize, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-0", ResetFontSize, None),
     ]);
 }
 
@@ -134,7 +215,33 @@ pub struct Workspace {
     pub(crate) next_transfer_id: usize,
     /// 文件传输任务状态
     pub(crate) transfer_tasks: Vec<TransferTaskState>,
+    /// 关闭确认弹窗状态：仅当待关闭终端有存活前台进程时弹出
+    close_confirm: Entity<crate::components::modal::ModalState>,
+    /// 待确认的关闭目标（确认后真正执行）
+    pending_close: Option<PendingClose>,
+    /// 已关闭 tab 的 undo 栈（cmd-shift-t 恢复）；上限 10，逐出时 kill 其终端
+    closed_tabs: VecDeque<ClosedTab>,
 }
+
+/// 关闭确认的目标：整个 tab 或单个 panel（多 panel tab 内 cmd-w 只关选中 panel）
+#[derive(Clone, Debug)]
+enum PendingClose {
+    Tab(String),
+    Panel(String),
+}
+
+/// 被 undo 关闭的 tab 快照：进程与滚动区保留，重开时原样放回
+struct ClosedTab {
+    /// tab 原标签（恢复时沿用；若 label 冲突 Workspace 类型会重新编号，可接受）
+    label: String,
+    tab_type: TabType,
+    container: SplitContainer,
+    /// 恢复时用的 tab id（取关闭时原 id，避免 session 内引用旧 id）
+    tab_id: String,
+}
+
+/// undo 关闭 tab 的栈上限：超过后逐出最旧并 kill 其终端。
+const MAX_CLOSED_TABS: usize = 10;
 
 /// Resize拖拽状态
 #[derive(Clone)]
@@ -317,6 +424,9 @@ impl Workspace {
                 on_last_tab_close: None,
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
+                close_confirm: crate::components::modal::ModalState::entity(cx),
+                pending_close: None,
+                closed_tabs: VecDeque::new(),
             };
 
             // 在创建时完成所有初始化
@@ -485,6 +595,9 @@ impl Workspace {
                 on_last_tab_close: None,
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
+                close_confirm: crate::components::modal::ModalState::entity(cx),
+                pending_close: None,
+                closed_tabs: VecDeque::new(),
             };
 
             workspace.setup_tab_bar_handlers(cx);
@@ -917,6 +1030,17 @@ impl Workspace {
             PanelEvent::SessionChanged => {
                 cx.emit(WorkspaceEvent::SessionChanged);
             }
+            PanelEvent::BellRang { panel_id } => {
+                // 后台铃 / 通知：点亮所属 tab 的红点。当前活动 tab 不点（用户正在看）。
+                if let Some((tab_id, _)) = self.tabs.iter().find(|(tab_id, tab_info)| {
+                    tab_info.container.contains_panel(panel_id, cx) && **tab_id != self.active_tab_id
+                }) {
+                    let tab_id = tab_id.clone();
+                    self.tab_bar.update(cx, |tab_bar, cx| {
+                        tab_bar.modify_tab(&tab_id, |tab| tab.needs_attention = true, cx);
+                    });
+                }
+            }
         }
     }
 
@@ -1157,8 +1281,20 @@ impl Workspace {
         }
     }
 
-    /// 处理关闭panel事件
+    /// 处理关闭panel事件（带确认拦截）
     fn handle_panel_close(&mut self, panel_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // 关闭确认：该终端有存活前台进程时先弹窗
+        if self.panel_needs_confirmation(panel_id, cx) {
+            self.pending_close = Some(PendingClose::Panel(panel_id.to_string()));
+            self.close_confirm.update(cx, |state, cx| state.open(cx));
+            cx.notify();
+            return;
+        }
+        self.do_panel_close(panel_id, window, cx);
+    }
+
+    /// 真正关闭 panel（已过确认）：从其所在 tab 的容器中移除。
+    fn do_panel_close(&mut self, panel_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // 在所有 tab 中搜索包含该 panel 的 tab
         let Some(target_tab_id) = self
             .tabs
@@ -1178,19 +1314,8 @@ impl Workspace {
 
         if panel_count_before <= 1 {
             // 这是 tab 中唯一的 panel，关闭整个 tab
-            self.tabs.remove(&target_tab_id);
-            self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.remove_tab(&target_tab_id, cx);
-            });
-            // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
-            self.renumber_workspace_tabs(cx);
-
-            if self.active_tab_id == target_tab_id {
-                self.activate_next_tab(cx);
-            }
-            cx.emit(WorkspaceEvent::SessionChanged);
-            cx.emit(WorkspaceEvent::TabBarChanged);
-            cx.notify();
+            // （走 do_tab_close：入 undo 栈 + 正确的窗口收尾）
+            self.do_tab_close(&target_tab_id, window, cx);
             return;
         }
 
@@ -1656,6 +1781,64 @@ impl Workspace {
     }
 
     /// 切换到指定tab
+    /// 调整终端字号（cmd +/-）：clamp 到上下限后持久化 + 全窗口刷新。
+    pub fn change_font_size(&mut self, delta: f32, cx: &mut App) {
+        let current = crate::sidebar_view::font_settings::FontState::global(cx)
+            .settings
+            .terminal_font_size;
+        let next = (current + delta).clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
+        // 距离过小（浮点噪声）时跳过，避免无效写入
+        if (next - current).abs() < f32::EPSILON {
+            return;
+        }
+        crate::sidebar_view::font_settings::FontState::update(cx, |settings| {
+            settings.terminal_font_size = next;
+        });
+    }
+
+    /// Tab 轮换：step=1 下一个，step=-1 上一个（wrap-around）。
+    pub fn cycle_tab(&mut self, step: i32, cx: &mut Context<Self>) {
+        let tabs = self.tab_bar.read(cx).tabs.clone();
+        if tabs.len() < 2 {
+            return;
+        }
+        let active = self.active_tab_id.clone();
+        let idx = tabs.iter().position(|t| t.id == active).unwrap_or(0);
+        let next = (idx as i32 + step).rem_euclid(tabs.len() as i32) as usize;
+        let next_id = tabs[next].id.clone();
+        self.switch_to_tab(&next_id, cx);
+    }
+
+    /// 直跳第 N 个 tab（0 基）。越界忽略。
+    pub fn goto_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let tabs = self.tab_bar.read(cx).tabs.clone();
+        if let Some(tab) = tabs.get(index) {
+            let id = tab.id.clone();
+            self.switch_to_tab(&id, cx);
+        }
+    }
+
+    /// 分屏导航：从当前选中 panel 向指定方向找相邻 panel 并聚焦其终端。
+    pub fn focus_split_direction(&mut self, nav: SplitNavDirection, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(&self.active_tab_id) else {
+            return;
+        };
+        let container = tab.container.clone();
+        let Some(selected) = container.get_selected_panel(cx) else {
+            return;
+        };
+        let panel_id = selected.read(cx).panel_id.clone();
+        let Some(target) = container.focus_neighbor(&panel_id, nav, cx) else {
+            return;
+        };
+        // 切选中并聚焦目标终端（复用选中事件流：取消其他 panel 选中 + 聚焦）
+        let target_id = target.read(cx).panel_id.clone();
+        self.handle_panel_selected(&target_id, cx);
+        if let Some(handle) = target.read(cx).active_content_focus_handle(cx) {
+            window.focus(&handle, cx);
+        }
+    }
+
     pub fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.tabs.contains_key(tab_id) {
             self.active_tab_id = tab_id.to_string();
@@ -1817,6 +2000,32 @@ impl Workspace {
 
     /// 处理关闭tab事件
     fn handle_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // 关闭确认：tab 内任一终端有存活前台进程时先弹窗，确认后再真正关闭。
+        if self.tab_needs_confirmation(tab_id, cx) {
+            self.pending_close = Some(PendingClose::Tab(tab_id.to_string()));
+            self.close_confirm.update(cx, |state, cx| state.open(cx));
+            cx.notify();
+            return;
+        }
+        self.do_tab_close(tab_id, window, cx);
+    }
+
+    /// 真正关闭 tab（已过确认）：入 undo 栈 → 移除 → 切换/关窗。
+    fn do_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // undo 栈：仅当还有其他 tab 时可恢复（最后一个 tab 关闭即关窗，进程随窗口销毁）
+        let has_other_tabs = self.tabs.len() > 1;
+        if has_other_tabs {
+            if let Some(tab_info) = self.tabs.get(tab_id) {
+                let closed = ClosedTab {
+                    label: tab_info.label.clone(),
+                    tab_type: tab_info.tab_type.clone(),
+                    container: tab_info.container.clone(),
+                    tab_id: tab_id.to_string(),
+                };
+                self.push_closed_tab(closed, cx);
+            }
+        }
+
         self.tabs.remove(tab_id);
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(tab_id, cx);
@@ -1837,6 +2046,117 @@ impl Workspace {
             }
         }
 
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
+        cx.notify();
+    }
+
+    /// tab 是否需要关闭确认（任一 panel 的终端有存活前台进程）
+    fn tab_needs_confirmation(&self, tab_id: &str, cx: &App) -> bool {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            return false;
+        };
+        tab_info
+            .container
+            .collect_panels_vec()
+            .iter()
+            .any(|panel| {
+                panel
+                    .read(cx)
+                    .content()
+                    .terminal_view()
+                    .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
+            })
+    }
+
+    /// panel 是否需要关闭确认（其终端有存活前台进程）
+    fn panel_needs_confirmation(&self, panel_id: &str, cx: &App) -> bool {
+        self.tabs
+            .values()
+            .any(|tab| tab.container.find_panel(panel_id, cx).is_some_and(|panel| {
+                panel
+                    .read(cx)
+                    .content()
+                    .terminal_view()
+                    .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
+            }))
+    }
+
+    /// 压入 undo 栈；超过上限时逐出最旧的并 kill 其终端（释放进程与滚动区）。
+    fn push_closed_tab(&mut self, closed: ClosedTab, cx: &mut Context<Self>) {
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
+            if let Some(oldest) = self.closed_tabs.pop_front() {
+                for panel in oldest.container.collect_panels_vec() {
+                    if let Some(view) = panel.read(cx).content().terminal_view() {
+                        let terminal = view.read(cx).terminal().clone();
+                        terminal.update(cx, |terminal, _| terminal.kill());
+                    }
+                }
+            }
+        }
+        self.closed_tabs.push_back(closed);
+    }
+
+    /// 确认关闭：执行挂起目标。
+    fn confirm_pending_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_close.take() else {
+            self.close_confirm.update(cx, |state, cx| state.close(cx));
+            return;
+        };
+        self.close_confirm.update(cx, |state, cx| state.close(cx));
+        match pending {
+            PendingClose::Tab(tab_id) => self.do_tab_close(&tab_id, window, cx),
+            PendingClose::Panel(panel_id) => self.do_panel_close(&panel_id, window, cx),
+        }
+    }
+
+    /// 取消关闭：丢弃挂起目标（终端继续运行）。
+    fn cancel_pending_close(&mut self, cx: &mut Context<Self>) {
+        self.pending_close = None;
+        self.close_confirm.update(cx, |state, cx| state.close(cx));
+        cx.notify();
+    }
+
+    /// 重开最近关闭的 tab（undo）：进程与滚动区原样恢复。
+    pub fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(closed) = self.closed_tabs.pop_back() else {
+            return; // 栈空：无操作
+        };
+
+        let tab_id = closed.tab_id.clone();
+        // 若 id 已被新 tab 占用（极端：重开后又建了同名 id —— id 自增，不会冲突，防御处理）
+        if self.tabs.contains_key(&tab_id) {
+            log::warn!("重开 tab 失败：id {} 已存在", tab_id);
+            self.closed_tabs.push_back(closed);
+            return;
+        }
+
+        let is_remote = closed
+            .container
+            .get_first_panel()
+            .and_then(|p| p.read(cx).remote_os.is_some().then_some(true));
+
+        let label = closed.label.clone();
+        self.tabs.insert(
+            tab_id.clone(),
+            TabInfo {
+                id: tab_id.clone(),
+                label: closed.label.clone(),
+                tab_type: closed.tab_type.clone(),
+                container: closed.container.clone(),
+                broadcast_enabled: false,
+            },
+        );
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            let mut item = TabItem::new(tab_id.clone(), label.clone());
+            item.is_remote = is_remote.unwrap_or(false);
+            tab_bar.add_tab(item, cx);
+        });
+        self.renumber_workspace_tabs(cx);
+        // 恢复 panel 事件订阅（关闭时被 retain 清掉）
+        self.subscribe_to_panels(window, cx);
+        self.switch_to_tab(&tab_id, cx);
+        self.focus_active_tab_panel(window, cx);
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.emit(WorkspaceEvent::TabBarChanged);
         cx.notify();
@@ -2166,6 +2486,137 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
                 this.close_selected_panel(window, cx);
             }))
+            // 新 tab：cmd-t / ctrl-shift-t（直接新建本地终端 tab，同 tab 栏 + 按钮行为）
+            .on_action(cx.listener(|this, _: &NewTerminalTab, window, cx| {
+                this.create_local_terminal(window, cx);
+            }))
+            // 重开最近关闭的 tab：从 undo 栈恢复（无则忽略）
+            .on_action(cx.listener(|this, _: &ReopenClosedTab, window, cx| {
+                this.reopen_closed_tab(window, cx);
+            }))
+            // Tab 轮换 / cmd+N 直跳
+            .on_action(cx.listener(|this, _: &NextTab, _window, cx| {
+                this.cycle_tab(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, _window, cx| {
+                this.cycle_tab(-1, cx);
+            }))
+            .on_action(cx.listener(|this, action: &GotoTab, _window, cx| {
+                this.goto_tab(action.0, cx);
+            }))
+            // 分屏导航：结构遍历相邻 panel 后聚焦其终端
+            .on_action(cx.listener(|this, _: &FocusSplitLeft, window, cx| {
+                this.focus_split_direction(SplitNavDirection::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSplitRight, window, cx| {
+                this.focus_split_direction(SplitNavDirection::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSplitUp, window, cx| {
+                this.focus_split_direction(SplitNavDirection::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSplitDown, window, cx| {
+                this.focus_split_direction(SplitNavDirection::Down, window, cx);
+            }))
+            // 字号：经 FontState::update 持久化 + refresh_windows，
+            // terminal element 下一帧自动用新字号重建行布局。
+            .on_action(cx.listener(|this, _: &IncreaseFontSize, _window, cx| {
+                this.change_font_size(FONT_SIZE_STEP, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DecreaseFontSize, _window, cx| {
+                this.change_font_size(-FONT_SIZE_STEP, cx);
+            }))
+            .on_action(cx.listener(|_this, _: &ResetFontSize, _window, cx| {
+                let default_size =
+                    crate::sidebar_view::font_settings::FontSettings::default().terminal_font_size;
+                crate::sidebar_view::font_settings::FontState::update(cx, |settings| {
+                    settings.terminal_font_size = default_size;
+                });
+            }))
+            // 关闭确认弹窗（有存活前台进程时）
+            .when(self.close_confirm.read(cx).is_rendered(), |this| {
+                let state = self.close_confirm.read(cx);
+                // Modal::on_close 是普通闭包（无 listener）：经 WeakEntity 回工作区取消挂起
+                let workspace = cx.entity().downgrade();
+                this.child(
+                    Modal::new("workspace-close-confirm")
+                        .closing(state.is_closing())
+                        .epoch(state.epoch())
+                        .width(px(420.0))
+                        .on_close(move |_window, cx| {
+                            if let Some(workspace) = workspace.upgrade() {
+                                workspace.update(cx, |this, cx| {
+                                    this.cancel_pending_close(cx);
+                                });
+                            }
+                        })
+                        .child(self.render_close_confirm_body(cx)),
+                )
+            })
+    }
+}
+
+impl Workspace {
+    /// 关闭确认弹窗内容：标题 + 正文 + 按钮。
+    fn render_close_confirm_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let target_desc = match &self.pending_close {
+            Some(PendingClose::Panel(_)) => "当前分屏面板",
+            _ => "当前标签页",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("关闭终端？"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .line_height(relative(1.5))
+                            .child(format!(
+                                "{}中仍有前台进程在运行，关闭后进程将被终止。",
+                                target_desc
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .justify_end()
+                    .child(
+                        Button::new("close-confirm-cancel")
+                            .label("取消")
+                            .rounded(px(10.0))
+                            .with_size(ButtonSize::Small)
+                            .px(px(14.0))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.cancel_pending_close(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("close-confirm-ok")
+                            .label("关闭")
+                            .danger()
+                            .rounded(px(10.0))
+                            .with_size(ButtonSize::Small)
+                            .px(px(14.0))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_pending_close(window, cx);
+                            })),
+                    ),
+            )
     }
 }
 

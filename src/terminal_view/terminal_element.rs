@@ -1,7 +1,7 @@
 //! Terminal element for rendering
 
 use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
-use crate::terminal::mappings::colors::convert_alacritty_color;
+use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
 use crate::terminal_view::terminal_view::{HoveredLink, TerminalView};
@@ -48,6 +48,62 @@ fn cursor_thickness(cell_width: Pixels) -> Pixels {
     px((cell_width.as_f32() * CURSOR_THICKNESS_RATIO)
         .round()
         .max(1.0))
+}
+
+/// 绘制自绘下划线装饰（双线 / 点线 / 虚线）。
+///
+/// 底部锚定与 IME 下划线一致（`row_y + line_height - 1px`），
+/// 保证与 GPUI 原生单线 / wavy 下划线视觉对齐。
+fn paint_decoration(
+    dec: &DecorationSpan,
+    origin: Point<Pixels>,
+    row_idx: usize,
+    cell_width: Pixels,
+    line_height: Pixels,
+    window: &mut Window,
+) {
+    let row_y = origin.y + line_height * row_idx as f32;
+    let span_w = cell_width * dec.width as f32;
+    let x0 = origin.x + cell_width * dec.start_col as f32;
+    let mut line = |y: Pixels, x: Pixels, w: Pixels| {
+        window.paint_quad(fill(
+            Bounds::new(point(x, y), size(w, px(1.0))),
+            dec.color,
+        ));
+    };
+
+    match dec.kind {
+        DecorationKind::DoubleUnderline => {
+            let y1 = row_y + line_height - px(2.0);
+            let y2 = row_y + line_height - px(4.0);
+            line(y1, x0, span_w);
+            line(y2, x0, span_w);
+        }
+        DecorationKind::DottedUnderline => {
+            // 2px 点 + 2px 间隔
+            let y = row_y + line_height - px(2.0);
+            let step = 4.0;
+            let total = span_w.as_f32();
+            let end = x0.as_f32() + total;
+            let mut x = x0.as_f32();
+            while x < end {
+                line(y, px(x), px((step / 2.0f32).min(end - x)));
+                x += step;
+            }
+        }
+        DecorationKind::DashedUnderline => {
+            // 4px 段 + 3px 间隔
+            let y = row_y + line_height - px(2.0);
+            let step = 7.0f32;
+            let total = span_w.as_f32();
+            let end = x0.as_f32() + total;
+            let mut x = x0.as_f32();
+            while x < end {
+                line(y, px(x), px((step - 3.0f32).min(end - x)));
+                x += step;
+            }
+        }
+    }
 }
 
 #[inline]
@@ -175,6 +231,9 @@ fn selection_spans_for_cols(row: usize, cols: &[usize]) -> Vec<BackgroundSpan> {
 #[derive(Clone)]
 pub struct RowLayoutEntry {
     pub runs: Vec<BatchedTextRun>,
+    /// 自绘下划线装饰（double / dotted / dashed，SGR 4:3-4:5）。
+    /// 删除线与单线/curly 均由 GPUI TextRun 原生渲染，不在此列。
+    pub decorations: Vec<DecorationSpan>,
 }
 
 #[derive(Clone, Default)]
@@ -445,6 +504,63 @@ impl BatchedTextRun {
     }
 }
 
+/// 下划线装饰种类（由 cell flags 派生，含 URL 悬停）。
+///
+/// - `Single` / `Curly` / `HoverLink` 由 GPUI `TextRun.underline` 直接渲染；
+/// - `Double` / `Dotted` / `Dashed` 需自绘（GPUI 下划线仅支持单线 / wavy），
+///   在 [`TerminalElement::layout_row`] 归集为 [`DecorationSpan`] 后
+///   于 paint 阶段以矩形图元绘制。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnderlineKind {
+    None,
+    Single,
+    Curly,
+    Double,
+    Dotted,
+    Dashed,
+    /// URL 悬停高亮：蓝色单下划线（非 cell flag）。
+    HoverLink,
+}
+
+/// 自绘文本装饰（双下划线 / 点线 / 虚线 / 删除线），
+/// 在行内聚为连续 span 后于 paint 阶段绘制。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecorationSpan {
+    start_col: usize,
+    /// 行内连续 cell 数
+    width: usize,
+    kind: DecorationKind,
+    color: gpui::Hsla,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecorationKind {
+    DoubleUnderline,
+    DottedUnderline,
+    DashedUnderline,
+}
+
+/// 从 cell flags 派生下划线种类（不含 URL 悬停状态）。
+#[inline]
+fn underline_kind_from_flags(
+    flags: &alacritty_terminal::term::cell::Flags,
+) -> UnderlineKind {
+    use alacritty_terminal::term::cell::Flags;
+    if flags.contains(Flags::UNDERLINE) {
+        UnderlineKind::Single
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineKind::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        UnderlineKind::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineKind::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineKind::Dashed
+    } else {
+        UnderlineKind::None
+    }
+}
+
 /// Cheap pre-style key that fully determines every field of the `TextRun`
 /// produced by [`TerminalElement::text_run_for_cell`] for a given cell:
 /// the rendered foreground (after the INVERSE swap) selects `color`, the
@@ -457,36 +573,55 @@ impl BatchedTextRun {
 /// full `TextRun` (including the theme color conversion) is then done once
 /// per batch start instead of once per cell — for typical output (a whole
 /// row sharing one style) this removes ~cols conversions per row.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct BatchStyleKey {
     rendered_fg: alacritty_terminal::vte::ansi::Color,
     raw_fg: alacritty_terminal::vte::ansi::Color,
     bold: bool,
     italic: bool,
-    /// 0 = none, 1 = cell UNDERLINE flag, 2 = hovered URL.
-    underline_kind: u8,
+    /// 下划线种类（none/single/curly/hover-link 与自绘种类）。
+    underline: UnderlineKind,
+    /// 已解析的下划线色（SGR 58 显式色，否则前景色）——与种类一起决定
+    /// 最终下划线绘制，参与批次相等判定。
+    underline_color: gpui::Hsla,
+    /// 删除线（SGR 9）：走 GPUI TextRun.strikethrough。
+    strikethrough: bool,
 }
 
 impl BatchStyleKey {
     #[inline]
-    fn for_cell(cell: &IndexedCell, is_hovered_url: bool) -> Self {
+    fn for_cell(
+        cell: &IndexedCell,
+        is_hovered_url: bool,
+        palette: &TerminalPalette,
+        theme: &TerminalTheme,
+    ) -> Self {
+        use alacritty_terminal::term::cell::Flags;
         let flags = cell.cell.flags;
+        let underline = if is_hovered_url {
+            UnderlineKind::HoverLink
+        } else {
+            underline_kind_from_flags(&flags)
+        };
+        // 下划线色：SGR 58 显式色优先，否则用渲染前景色（xterm 语义）。
+        let rendered_fg = if flags.contains(Flags::INVERSE) {
+            cell.cell.bg
+        } else {
+            cell.cell.fg
+        };
+        let fg_hsla = palette.resolve(&rendered_fg, theme);
+        let underline_color = match cell.cell.underline_color {
+            Some(color) => palette.resolve(&color, theme),
+            None => fg_hsla,
+        };
         Self {
-            rendered_fg: if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
-                cell.cell.bg
-            } else {
-                cell.cell.fg
-            },
+            rendered_fg,
             raw_fg: cell.cell.fg,
-            bold: flags.contains(alacritty_terminal::term::cell::Flags::BOLD),
-            italic: flags.contains(alacritty_terminal::term::cell::Flags::ITALIC),
-            underline_kind: if is_hovered_url {
-                2
-            } else if flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE) {
-                1
-            } else {
-                0
-            },
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+            underline,
+            underline_color,
+            strikethrough: flags.contains(Flags::STRIKEOUT),
         }
     }
 }
@@ -524,63 +659,63 @@ impl TerminalElement {
         }
     }
 
-    fn text_run_for_cell(
-        cell: &IndexedCell,
+    /// 从 BatchStyleKey 构造 GPUI TextRun。装饰性下划线（double/dotted/dashed）
+    /// 不进 TextRun（GPUI 仅支持单线/wavy），由调用方归集 [`DecorationSpan`] 自绘。
+    #[inline]
+    fn text_run_for_key(
+        key: &BatchStyleKey,
+        resolved_fg: gpui::Hsla,
         text_style: &TextStyle,
-        terminal_theme: &TerminalTheme,
-        is_hovered_url: bool,
+        theme: &TerminalTheme,
     ) -> TextRun {
-        let (fg, _bg) = rendered_cell_colors(&cell.cell);
-        let underline = if is_hovered_url {
-            Some(gpui::UnderlineStyle {
+        let underline = match key.underline {
+            UnderlineKind::Single => Some(gpui::UnderlineStyle {
+                color: Some(key.underline_color),
+                thickness: px(1.0),
+                wavy: false,
+            }),
+            UnderlineKind::Curly => Some(gpui::UnderlineStyle {
+                color: Some(key.underline_color),
+                thickness: px(1.0),
+                wavy: true,
+            }),
+            // URL 悬停：主题蓝色单下划线（颜色不取 cell 前景，保持链接语义）
+            UnderlineKind::HoverLink => Some(gpui::UnderlineStyle {
                 color: Some(
-                    terminal_theme.named_color(alacritty_terminal::vte::ansi::NamedColor::Blue),
+                    theme.named_color(alacritty_terminal::vte::ansi::NamedColor::Blue),
                 ),
                 thickness: px(1.0),
                 wavy: false,
-            })
-        } else if cell
-            .cell
-            .flags
-            .contains(alacritty_terminal::term::cell::Flags::UNDERLINE)
-        {
-            Some(gpui::UnderlineStyle {
-                color: Some(convert_alacritty_color(&cell.cell.fg, terminal_theme)),
-                thickness: px(1.0),
-                wavy: false,
-            })
-        } else {
-            None
+            }),
+            // Double/Dotted/Dashed 走自绘；None 无装饰。
+            UnderlineKind::Double | UnderlineKind::Dotted | UnderlineKind::Dashed
+            | UnderlineKind::None => None,
         };
         TextRun {
-            len: cell.cell.c.len_utf8(),
+            // 调用方补 `len`；此处用占位 0，因为构造后立即被覆盖。
+            len: 0,
             font: Font {
-                weight: if cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::BOLD)
-                {
+                weight: if key.bold {
                     FontWeight::BOLD
                 } else {
                     text_style.font_weight
                 },
-                style: if cell
-                    .cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::ITALIC)
-                {
+                style: if key.italic {
                     FontStyle::Italic
                 } else {
                     FontStyle::Normal
                 },
                 ..text_style.font()
             },
-            color: convert_alacritty_color(fg, terminal_theme),
+            color: resolved_fg,
             // Backgrounds are painted separately as spans; keeping this None avoids
             // duplicate background work inside text painting.
             background_color: None,
             underline,
-            strikethrough: None,
+            strikethrough: key.strikethrough.then(|| gpui::StrikethroughStyle {
+                color: Some(resolved_fg),
+                thickness: px(1.0),
+            }),
         }
     }
 
@@ -610,6 +745,7 @@ impl TerminalElement {
         font_size: Pixels,
         cell_width: Pixels,
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
         selection_range: &Option<SelectionRange>,
     ) {
         let full_entry = Self::layout_row(
@@ -621,9 +757,12 @@ impl TerminalElement {
             font_size,
             cell_width,
             terminal_theme,
+            palette,
         );
-        let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme);
-        let full_backgrounds = Self::background_spans_for_row(row_idx, row_cells, terminal_theme);
+        let full_boxes =
+            Self::box_cells_for_row(row_idx, row_cells, terminal_theme, palette);
+        let full_backgrounds =
+            Self::background_spans_for_row(row_idx, row_cells, terminal_theme, palette);
         let full_selection_spans =
             selection_spans_for_row(row_idx, row_cells, selection_range);
 
@@ -668,12 +807,15 @@ impl TerminalElement {
         font_size: Pixels,
         cell_width: Pixels,
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> RowLayoutEntry {
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
         let mut current_batch: Option<(usize, String, TextRun, usize)> = None;
         // Style key of the cell that started `current_batch`. Kept in sync so
         // the per-cell hot path only compares cheap enum/bitfield values.
         let mut current_key: Option<BatchStyleKey> = None;
+        // 自绘下划线装饰（double/dotted/dashed）：同类型且列连续时合并 span。
+        let mut decorations: Vec<DecorationSpan> = Vec::new();
 
         for cell in cells {
             let ch = cell.cell.c;
@@ -692,10 +834,18 @@ impl TerminalElement {
                     cell_width,
                 );
                 current_key = None;
+                // 空格同样参与装饰（下划线拖尾跨越空格是 SGR 的正常语义）。
+                Self::collect_decoration(
+                    &mut decorations,
+                    cell,
+                    is_hovered_url,
+                    palette,
+                    terminal_theme,
+                );
                 continue;
             }
 
-            let key = BatchStyleKey::for_cell(cell, is_hovered_url);
+            let key = BatchStyleKey::for_cell(cell, is_hovered_url, palette, terminal_theme);
             // 关键防御：用 let 链替代 unwrap，逻辑错乱时降级为断开批次而非整帧 panic。
             let batch_extends = match (current_batch.as_ref(), current_key.as_ref()) {
                 (Some((start_col, _, _, cell_count)), Some(cur_key)) => {
@@ -721,11 +871,22 @@ impl TerminalElement {
                     font_size,
                     cell_width,
                 );
-                current_key = Some(key);
-                let cell_style =
-                    Self::text_run_for_cell(cell, text_style, terminal_theme, is_hovered_url);
+                current_key = Some(key.clone());
+                // 前景色在此处一次性解析（调色板覆盖 + 主题回退）。
+                let resolved_fg = palette.resolve(&key.rendered_fg, terminal_theme);
+                let mut cell_style =
+                    Self::text_run_for_key(&key, resolved_fg, text_style, terminal_theme);
+                cell_style.len = ch.len_utf8();
                 current_batch = Some((cell.point.column.0, ch.to_string(), cell_style, 1));
             }
+
+            Self::collect_decoration(
+                &mut decorations,
+                cell,
+                is_hovered_url,
+                palette,
+                terminal_theme,
+            );
         }
 
         Self::flush_text_batch(
@@ -737,13 +898,71 @@ impl TerminalElement {
             cell_width,
         );
 
-        RowLayoutEntry { runs: batched_runs }
+        RowLayoutEntry {
+            runs: batched_runs,
+            decorations,
+        }
+    }
+
+    /// 归集一个 cell 的自绘下划线装饰（double / dotted / dashed）。
+    /// 同类型、同色且列连续时与上一个 span 合并；其余情况开新 span。
+    /// 删除线走 TextRun.strikethrough（见 [`Self::text_run_for_key`]）。
+    #[inline]
+    fn collect_decoration(
+        decorations: &mut Vec<DecorationSpan>,
+        cell: &IndexedCell,
+        is_hovered_url: bool,
+        palette: &TerminalPalette,
+        theme: &TerminalTheme,
+    ) {
+        use alacritty_terminal::term::cell::Flags;
+        let kind = match underline_kind_from_flags(&cell.cell.flags) {
+            UnderlineKind::Double => Some(DecorationKind::DoubleUnderline),
+            UnderlineKind::Dotted => Some(DecorationKind::DottedUnderline),
+            UnderlineKind::Dashed => Some(DecorationKind::DashedUnderline),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            return;
+        };
+        // URL 悬停优先展示链接样式，跳过自绘装饰。
+        if is_hovered_url {
+            return;
+        }
+        let color = match cell.cell.underline_color {
+            Some(color) => palette.resolve(&color, theme),
+            None => palette.resolve(
+                &if cell.cell.flags.contains(Flags::INVERSE) {
+                    cell.cell.bg
+                } else {
+                    cell.cell.fg
+                },
+                theme,
+            ),
+        };
+        let col = cell.point.column.0;
+        match decorations.last_mut() {
+            Some(span)
+                if span.kind == kind
+                    && span.color == color
+                    && span.start_col + span.width == col =>
+            {
+                span.width += 1;
+            }
+            _ => decorations.push(DecorationSpan {
+                start_col: col,
+                width: 1,
+                kind,
+                color,
+            }),
+        }
     }
 
     fn box_cell_for_cell(
         row_idx: usize,
         cell: &IndexedCell,
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Option<BoxDrawingCell> {
         let ch = cell.cell.c;
         if !box_drawing::is_box_drawing_char(ch) {
@@ -754,7 +973,7 @@ impl TerminalElement {
             col: cell.point.column.0,
             row: row_idx,
             c: ch,
-            color: convert_alacritty_color(fg, terminal_theme),
+            color: palette.resolve(fg, terminal_theme),
         })
     }
 
@@ -762,8 +981,11 @@ impl TerminalElement {
         row_idx: usize,
         cells: &[IndexedCell],
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Vec<BackgroundSpan> {
-        Self::background_spans_for_range(row_idx, cells, (0, usize::MAX), terminal_theme)
+        Self::background_spans_for_range(
+            row_idx, cells, (0, usize::MAX), terminal_theme, palette,
+        )
     }
 
     fn background_spans_for_range(
@@ -771,6 +993,7 @@ impl TerminalElement {
         cells: &[IndexedCell],
         range: (usize, usize),
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Vec<BackgroundSpan> {
         let (left, right) = range;
         let mut backgrounds = Vec::new();
@@ -789,7 +1012,7 @@ impl TerminalElement {
                 ) {
                 None
             } else {
-                Some(convert_alacritty_color(bg, terminal_theme))
+                Some(palette.resolve(bg, terminal_theme))
             };
 
             match (current_span.as_mut(), color) {
@@ -898,6 +1121,7 @@ impl TerminalElement {
         cells: &[IndexedCell],
         range: (usize, usize),
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Vec<BackgroundSpan> {
         let mut backgrounds = Self::split_cached_background_spans(cached_spans, range);
         backgrounds.extend(Self::background_spans_for_range(
@@ -905,6 +1129,7 @@ impl TerminalElement {
             cells,
             range,
             terminal_theme,
+            palette,
         ));
         Self::merge_background_spans(&mut backgrounds);
         backgrounds
@@ -914,10 +1139,13 @@ impl TerminalElement {
         row_idx: usize,
         cells: &[IndexedCell],
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Vec<BoxDrawingCell> {
         let mut box_cells = Vec::new();
         for cell in cells {
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme) {
+            if let Some(box_cell) =
+                Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            {
                 box_cells.push(box_cell);
             }
         }
@@ -930,6 +1158,7 @@ impl TerminalElement {
         cells: &[IndexedCell],
         range: (usize, usize),
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Vec<BoxDrawingCell> {
         let (left, right) = range;
         let mut box_cells: Vec<BoxDrawingCell> = cached_box_cells
@@ -943,7 +1172,9 @@ impl TerminalElement {
             if col < left || col > right {
                 continue;
             }
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme) {
+            if let Some(box_cell) =
+                Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            {
                 box_cells.push(box_cell);
             }
         }
@@ -963,6 +1194,7 @@ impl TerminalElement {
         font_size: Pixels,
         cell_width: Pixels,
         terminal_theme: &TerminalTheme,
+        palette: &TerminalPalette,
     ) -> Option<Vec<BatchedTextRun>> {
         let (mut rebuild_left, mut rebuild_right) = range;
 
@@ -1018,6 +1250,7 @@ impl TerminalElement {
             font_size,
             cell_width,
             terminal_theme,
+            palette,
         );
 
         merged_runs.extend(dirty_entry.runs);
@@ -1141,6 +1374,8 @@ impl Element for TerminalElement {
         TerminalBounds,
         Option<CursorLayout>,
         Option<LocalOverlayLayout>,
+        // 末位为搜索命中高亮（视口行映射后的 span，含当前命中配色）
+        Vec<BackgroundSpan>,
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -1239,7 +1474,7 @@ impl Element for TerminalElement {
         // across the many interleaved `cx` calls below (a borrowed slice from
         // the view/terminal cannot survive those), then put them back at the end
         // so the capacity is reused on the next frame.
-        let (mut dirty_rows, mut dirty_row_bounds, mouse_mode, selection_range, cursor_cell) = {
+        let (mut dirty_rows, mut dirty_row_bounds, mouse_mode, selection_range, cursor_cell, palette) = {
             let (mut dirty_rows, mut dirty_row_bounds) = self.view.update(cx, |view, _cx| {
                 (
                     std::mem::take(&mut view.scratch_dirty_rows),
@@ -1252,6 +1487,7 @@ impl Element for TerminalElement {
             dirty_row_bounds.clear();
             dirty_row_bounds.extend_from_slice(terminal_snapshot.dirty_row_bounds());
             let content = terminal_snapshot.last_content();
+            let palette = content.palette;
             let mouse_mode = content
                 .mode
                 .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE);
@@ -1268,6 +1504,7 @@ impl Element for TerminalElement {
                 mouse_mode,
                 selection_range,
                 cursor_cell,
+                palette,
             )
         };
 
@@ -1384,6 +1621,7 @@ impl Element for TerminalElement {
                         font_size,
                         cell_width,
                         &terminal_theme,
+                        &palette,
                     ) {
                         partial_run_update_count += 1;
                         let mut entry = cached_entry;
@@ -1399,6 +1637,7 @@ impl Element for TerminalElement {
                             font_size,
                             cell_width,
                             &terminal_theme,
+                            &palette,
                         )
                     }
                 } else {
@@ -1411,6 +1650,7 @@ impl Element for TerminalElement {
                         font_size,
                         cell_width,
                         &terminal_theme,
+                        &palette,
                     )
                 };
                 row_cache.layout = Some(entry);
@@ -1419,7 +1659,8 @@ impl Element for TerminalElement {
             }
 
             if row_cache.box_cells.is_none() {
-                let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
+                let row_boxes =
+                    Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette);
                 row_cache.box_cells = Some(row_boxes);
             } else if is_dirty {
                 if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
@@ -1431,19 +1672,23 @@ impl Element for TerminalElement {
                             row_cells,
                             range,
                             &terminal_theme,
+                            &palette,
                         ),
-                        None => Self::box_cells_for_row(row_idx, row_cells, &terminal_theme),
+                        None => {
+                            Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette)
+                        }
                     };
                     row_cache.box_cells = Some(row_boxes);
                 } else {
-                    let row_boxes = Self::box_cells_for_row(row_idx, row_cells, &terminal_theme);
+                    let row_boxes =
+                        Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette);
                     row_cache.box_cells = Some(row_boxes);
                 }
             }
 
             if row_cache.background_spans.is_none() {
                 let backgrounds =
-                    Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                    Self::background_spans_for_row(row_idx, row_cells, &terminal_theme, &palette);
                 row_cache.background_spans = Some(backgrounds);
             } else if is_dirty {
                 if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
@@ -1455,15 +1700,23 @@ impl Element for TerminalElement {
                             row_cells,
                             range,
                             &terminal_theme,
+                            &palette,
                         ),
-                        None => {
-                            Self::background_spans_for_row(row_idx, row_cells, &terminal_theme)
-                        }
+                        None => Self::background_spans_for_row(
+                            row_idx,
+                            row_cells,
+                            &terminal_theme,
+                            &palette,
+                        ),
                     };
                     row_cache.background_spans = Some(backgrounds);
                 } else {
-                    let backgrounds =
-                        Self::background_spans_for_row(row_idx, row_cells, &terminal_theme);
+                    let backgrounds = Self::background_spans_for_row(
+                        row_idx,
+                        row_cells,
+                        &terminal_theme,
+                        &palette,
+                    );
                     row_cache.background_spans = Some(backgrounds);
                 }
             }
@@ -1502,6 +1755,7 @@ impl Element for TerminalElement {
                         font_size,
                         cell_width,
                         &terminal_theme,
+                        &palette,
                         &selection_range,
                     );
                 }
@@ -1548,7 +1802,8 @@ impl Element for TerminalElement {
             AlacCursorShape::Hidden => CursorShape::Bar,
         };
 
-        let cursor_color = convert_alacritty_color(
+        // 光标色走调色板（OSC 12 改色 / 主题切换实时生效）。
+        let cursor_color = palette.resolve(
             &alacritty_terminal::vte::ansi::Color::Named(
                 alacritty_terminal::vte::ansi::NamedColor::Cursor,
             ),
@@ -1675,6 +1930,45 @@ impl Element for TerminalElement {
             None
         };
 
+        // ── Search highlight spans ─────────────────────────────────────────────────
+        // 把 grid 坐标命中映射到当前视口行（每帧重算，滚动自然跟随），
+        // 非当前命中用主题 warning 低透明度，当前命中加倍醒目。
+        let search_spans: Vec<BackgroundSpan> = {
+            let view = self.view.read(cx);
+            let search = &view.search;
+            if !search.active || search.matches.is_empty() {
+                Vec::new()
+            } else {
+                let match_color = ui_theme.warning.opacity(0.28);
+                let active_color = ui_theme.warning.opacity(0.55);
+                let mut spans = Vec::with_capacity(search.matches.len());
+                for (idx, m) in search.matches.iter().enumerate() {
+                    // grid Line → 视口顶行索引：line.0 + display_offset
+                    let viewport_row = m.start.line.0 + display_offset as i32;
+                    if viewport_row < 0 {
+                        continue;
+                    }
+                    let viewport_row = viewport_row as usize;
+                    if viewport_row >= viewport_lines {
+                        continue;
+                    }
+                    let start_col = m.start.column.0;
+                    let end_col = m.end.column.0;
+                    spans.push(BackgroundSpan {
+                        start_col,
+                        row: viewport_row,
+                        width: end_col.saturating_sub(start_col),
+                        color: if idx == search.active_index {
+                            active_color
+                        } else {
+                            match_color
+                        },
+                    });
+                }
+                spans
+            }
+        };
+
         (
             row_caches,
             cell_width,
@@ -1685,6 +1979,7 @@ impl Element for TerminalElement {
             terminal_bounds,
             cursor,
             input_overlay,
+            search_spans,
         )
     }
 
@@ -1709,6 +2004,7 @@ impl Element for TerminalElement {
             terminal_bounds,
             cursor,
             input_overlay,
+            search_spans,
         ) = prepaint_state;
 
         let origin = terminal_bounds.bounds.origin;
@@ -1738,6 +2034,22 @@ impl Element for TerminalElement {
                 }
             }
 
+            // 搜索命中高亮：绘制在 cell 背景之上、选区之下（选区拖过命中时
+            // 选区视觉优先，符合编辑器惯例）。
+            for span in search_spans.iter().filter(|span| span.row == row_idx) {
+                let span_origin = point(
+                    origin.x + *cell_width * span.start_col as f32,
+                    origin.y + *line_height * row_idx as f32,
+                );
+                window.paint_quad(fill(
+                    Bounds::new(
+                        span_origin,
+                        size(*cell_width * span.width as f32, *line_height),
+                    ),
+                    span.color,
+                ));
+            }
+
             if let Some(selections) = row_cache.selection_spans.as_ref() {
                 for span in selections {
                     let span_origin = point(
@@ -1757,6 +2069,20 @@ impl Element for TerminalElement {
             if let Some(layout) = row_cache.layout.as_ref() {
                 for batch in &layout.runs {
                     batch.paint(origin, *cell_width, *line_height, window, cx);
+                }
+
+                // 自绘下划线装饰（SGR 4:3 / 4:4 / 4:5：双下划线、点线、虚线）。
+                // GPUI TextRun 仅支持单线 / wavy，这三种在 layout 阶段归集为
+                // DecorationSpan，这里以矩形图元绘制。
+                for dec in &layout.decorations {
+                    paint_decoration(
+                        dec,
+                        origin,
+                        row_idx,
+                        *cell_width,
+                        *line_height,
+                        window,
+                    );
                 }
             }
 

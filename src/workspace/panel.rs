@@ -101,6 +101,10 @@ pub enum PanelEvent {
         panel_id: String,
         label: String,
     },
+    /// 后台铃：所属 tab 点亮需关注红点，切到该 tab 后自动清除。
+    BellRang {
+        panel_id: String,
+    },
 }
 
 /// Panel content type
@@ -289,6 +293,11 @@ impl Panel {
                     if matches!(event, TerminalViewEvent::WorkingDirectoryChanged) {
                         cx.emit(PanelEvent::SessionChanged);
                     }
+                }
+                TerminalViewEvent::BellRangWhileUnfocused => {
+                    cx.emit(PanelEvent::BellRang {
+                        panel_id: close_panel_id.clone(),
+                    });
                 }
             },
         )

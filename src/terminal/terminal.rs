@@ -93,6 +93,11 @@ pub enum Event {
     Wakeup,
     SelectionsChanged,
     WorkingDirectoryChanged(String),
+    /// 终端应用请求的桌面通知（OSC 9 / OSC 777）。
+    NotificationReceived {
+        title: String,
+        body: String,
+    },
     /// 终端应用通过 DEC 私有模式 ?12 或 CSI `Ps SP q` 改变了光标闪烁策略。
     /// `bool` 为 true 表示应用希望光标闪烁。
     BlinkChanged(bool),
@@ -451,6 +456,9 @@ pub struct TerminalContent {
     /// in `update_last_content`. Read by the render hot path so it does not
     /// need to acquire the `FairMutex<Term>` a second time per frame.
     pub selection_range: Option<alacritty_terminal::selection::SelectionRange>,
+    /// 当前生效调色板快照（主题基色 + 应用 OSC 4/10/11/12 改色叠加）。
+    /// 见 [`crate::terminal::mappings::colors::TerminalPalette`]。
+    pub palette: crate::terminal::mappings::colors::TerminalPalette,
 }
 
 impl Default for TerminalContent {
@@ -469,6 +477,7 @@ impl Default for TerminalContent {
             viewport_lines: 24,
             url_ranges: Vec::new(),
             selection_range: None,
+            palette: Default::default(),
         }
     }
 }
@@ -478,16 +487,18 @@ impl Default for TerminalContent {
 ///
 /// `IndexedCell.cell` stores this instead of a full `alacritty_terminal::Cell`
 /// so that the per-frame clone of every visible cell (see `update_last_content`)
-/// copies only `c`/`fg`/`bg`/`flags` and skips the `Option<Arc<CellExtra>>` field
-/// (`zerowidth` / `underline_color` / `hyperlink`), which is unused on the render
-/// path. All four fields are cheap `Copy` types, making the clone effectively
-/// a small stack copy with no heap traffic.
+/// copies only `c`/`fg`/`bg`/`flags`/`underline_color` and skips the rest of the
+/// `Option<Arc<CellExtra>>` payload (`zerowidth` / `hyperlink`). The retained
+/// underline color feeds SGR 58 colored underlines; hyperlink support is pending
+/// (render currently detects URLs via regex, see `link_detector.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedCell {
     pub c: char,
     pub fg: alacritty_terminal::vte::ansi::Color,
     pub bg: alacritty_terminal::vte::ansi::Color,
     pub flags: alacritty_terminal::term::cell::Flags,
+    /// SGR 58 下划线专用色（None = 未设置，渲染时回退前景色）。
+    pub underline_color: Option<alacritty_terminal::vte::ansi::Color>,
 }
 
 impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
@@ -498,6 +509,7 @@ impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
             fg: cell.fg,
             bg: cell.bg,
             flags: cell.flags,
+            underline_color: cell.underline_color(),
         }
     }
 }
@@ -506,6 +518,13 @@ impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
 pub struct IndexedCell {
     pub point: AlacPoint,
     pub cell: PackedCell,
+}
+
+/// 滚动区搜索命中：起点 / 终点为 grid 绝对坐标（同一行内，`end` 为开区间列）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start: AlacPoint,
+    pub end: AlacPoint,
 }
 
 /// 远程终端输入回调类型
@@ -615,6 +634,9 @@ pub struct Terminal {
     russh_handle: Option<RusshTerminal>,
     /// 终端视图是否获得焦点（用于剪辑板操作守卫）
     focused: bool,
+    /// 上一次 Wakeup 时观察到的焦点上报模式（DECSET ?1004）状态。
+    /// 用于检测「应用刚开启焦点上报」的跳变，补发初始 `CSI I`。
+    focus_mode_reported: bool,
 }
 
 impl Terminal {
@@ -633,6 +655,9 @@ impl Terminal {
                 blinking: false,
             },
             osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            // Kitty 键盘协议：vte 负责解析 CSI u 模式栈并应答 CSI ? u 查询，
+            // 键编码由 mappings/keys.rs 的 kitty 分支负责。
+            kitty_keyboard: true,
             ..Config::default()
         }
     }
@@ -687,6 +712,7 @@ impl Terminal {
             remote_resize_callback: None,
             russh_handle: None,
             focused: true,
+            focus_mode_reported: false,
         })
     }
 
@@ -787,6 +813,7 @@ impl Terminal {
                 remote_resize_callback: None,
                 russh_handle: None,
                 focused: true,
+                focus_mode_reported: false,
             }
         })
     }
@@ -918,6 +945,7 @@ impl Terminal {
             remote_resize_callback: None,
             russh_handle: None,
             focused: true,
+            focus_mode_reported: false,
         }
     }
 
@@ -1137,6 +1165,7 @@ impl Terminal {
                 remote_resize_callback: Some(Box::new(resize_handler)),
                 russh_handle,
                 focused: true,
+                focus_mode_reported: false,
             }
         })
     }
@@ -1289,9 +1318,132 @@ impl Terminal {
         self.russh_handle.as_ref()?.error_message()
     }
 
-    /// 更新终端焦点状态
+    /// 按索引解析主题色（用于颜色查询应答的回退）。
+    ///
+    /// 索引含义与 `Term.colors` 一致：0..=15 基础色，16..=255 色立方 / 灰阶，
+    /// 256..=268 命名扩展色（前景 / 背景 / 光标 / 暗 / 亮前景）。
+    /// 越界索引返回黑色（与旧行为一致，防御异常应用）。
+    fn theme_color_for_index(
+        theme: &crate::theme::TerminalTheme,
+        index: usize,
+    ) -> alacritty_terminal::vte::ansi::Rgb {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        // vte 未提供 usize -> NamedColor 的转换；按枚举判别值手工映射。
+        // 判别值序列：0..=15 基础色，256 前景，257 背景，258 光标，
+        // 259..=266 暗色，267 亮前景，268 暗前景。
+        const NAMED_ORDER: [NamedColor; 13] = [
+            NamedColor::Foreground,
+            NamedColor::Background,
+            NamedColor::Cursor,
+            NamedColor::DimBlack,
+            NamedColor::DimRed,
+            NamedColor::DimGreen,
+            NamedColor::DimYellow,
+            NamedColor::DimBlue,
+            NamedColor::DimMagenta,
+            NamedColor::DimCyan,
+            NamedColor::DimWhite,
+            NamedColor::BrightForeground,
+            NamedColor::DimForeground,
+        ];
+        let hsla = if index <= 255 {
+            theme.indexed_color(index as u8)
+        } else {
+            let named = NAMED_ORDER
+                .get(index - 256)
+                .copied()
+                .unwrap_or(NamedColor::Foreground);
+            theme.named_color(named)
+        };
+        crate::terminal::mappings::colors::hsla_to_rgb888(hsla)
+    }
+
+    /// 把当前主题色灌入 alacritty `Term.colors`（初始化与主题切换时调用）。
+    ///
+    /// 这是「颜色查询 / 改色闭环」的基座：
+    /// - OSC 10/11/12/4 的查询应答读 `Term.colors`，灌入后返回主题色而非黑色；
+    /// - 应用改色（OSC 4/10/11/12 SET）写入 `Term.colors`，渲染层通过
+    ///   [`TerminalContent::palette`] 快照读到并立即生效；
+    /// - 重置（OSC 104/110/111）把槽位清空，渲染回退主题色
+    ///   （正是重置语义：回到终端默认色）。
+    ///
+    /// `set_color` 对非光标槽位自动标记全量 damage；光标色变化由末尾的
+    /// 强制刷新兑付。
+    pub fn apply_theme_colors(&mut self, theme: &crate::theme::TerminalTheme) {
+        let overrides = crate::terminal::mappings::colors::theme_color_overrides(theme);
+        {
+            let mut term = self.term.lock();
+            for (index, rgb) in overrides {
+                // vte Handler trait：写入 Term.colors 并标记 damage。
+                term.set_color(index, rgb);
+            }
+        }
+        // 光标槽位不自动 damage，这里强制刷新一次内容快照，
+        // 保证 palette 立刻反映新主题。
+        self.update_last_content(true);
+    }
+
+    /// 更新终端焦点状态。
+    ///
+    /// 应用通过 DECSET `?1004h` 开启焦点上报后，聚焦变化会向 PTY 发送
+    /// `CSI I` / `CSI O`，让 vim/helix 等 TUI 在失焦时正确暂停或刷新。
+    /// 模式关闭或远端通道不可用时只更新内部标志，不产生任何输出。
     pub fn set_focused(&mut self, focused: bool) {
+        if self.focused == focused {
+            return;
+        }
         self.focused = focused;
+        self.report_focus_state();
+    }
+
+    /// 若应用已开启焦点上报，按当前聚焦状态发送一次 `CSI I` / `CSI O`。
+    fn report_focus_state(&mut self) {
+        let mode = {
+            let term = self.term.lock();
+            term.mode().clone()
+        };
+        if mode.contains(TermMode::FOCUS_IN_OUT) {
+            // write_raw：应用应答通道不应维护输入区锚点。
+            let bytes: &[u8] = if self.focused { b"\x1b[I" } else { b"\x1b[O" };
+            self.write_raw(bytes);
+        }
+    }
+
+    /// 判断关闭该终端是否需要用户确认：是否有非 shell 的前台进程仍在运行。
+    ///
+    /// - 本地（unix）：子进程存活且 TTY 前台进程组不是 shell → 有 TUI/长任务
+    ///   在跑，关闭会杀掉它；shell 在提示符时直接关，不阻塞。
+    /// - 远程：SSH 仍连接且远端不在 shell 提示符（OSC 133 标记位）时需要确认。
+    /// - Windows：暂无前台进程组检测手段，不阻塞（后续可补 Job Object）。
+    pub fn needs_close_confirmation(&self) -> bool {
+        if self.is_remote() {
+            self.is_ssh_connected() && !self.is_shell_in_foreground()
+        } else {
+            #[cfg(unix)]
+            {
+                self.pty_master_fd.is_some()
+                    && self.shell_process_group_id.is_some()
+                    && self.local_child_alive()
+                    && !self.is_shell_in_foreground()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+    }
+
+    /// 本地 PTY 子进程是否仍存活（`kill(pid, 0)` 探测，不发送信号）。
+    #[cfg(unix)]
+    fn local_child_alive(&self) -> bool {
+        match self.child_process_id {
+            Some(pid) => {
+                // SAFETY（中文）：`kill(pid, 0)` 仅做存在性探测，信号量为 0
+                // 不产生任何实际信号；pid 为创建时捕获的有效子进程 pid。
+                unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+            }
+            None => false,
+        }
     }
 
     /// 处理 PTY/SSH 原始输出。
@@ -1313,6 +1465,25 @@ impl Terminal {
         // 标记内容已更新
         self.content_dirty = true;
         self.content_generation += 1;
+
+        // 远程路径没有 alacritty EventLoop，也不发 AlacTermEvent::Wakeup，
+        // 在这里比对焦点上报模式位（本地终端的同类检查在 process_event）。
+        self.check_focus_mode_enabled();
+    }
+
+    /// 比较焦点上报模式位与上次快照，捕获应用 DECSET ?1004h 的开启跳变，
+    /// 按需补发当前焦点状态（xterm 约定：开启时立即上报一次基线）。
+    fn check_focus_mode_enabled(&mut self) {
+        let focus_mode_now = {
+            let term = self.term.lock();
+            term.mode().contains(TermMode::FOCUS_IN_OUT)
+        };
+        if focus_mode_now != self.focus_mode_reported {
+            self.focus_mode_reported = focus_mode_now;
+            if focus_mode_now {
+                self.report_focus_state();
+            }
+        }
     }
 
     /// 处理从 SSH 接收的数据
@@ -1454,7 +1625,58 @@ impl Terminal {
             return true;
         }
 
+        // 桌面通知（应用请求）：
+        // - iTerm2 OSC 9;message（单段文本，标题用消息首行或固定为“通知”）
+        // - iTerm2/rxvt 扩展 OSC 9;notify;Title;Body
+        // - rxvt OSC 777;notify;Title;Body
+        if let Some((title, body)) = Self::parse_notification_osc(osc_content) {
+            cx.emit(Event::NotificationReceived { title, body });
+            return true;
+        }
+
         false
+    }
+
+    /// 解析通知类 OSC（9 / 777），返回 (标题, 正文)。
+    /// 空内容返回 None，不消费。
+    fn parse_notification_osc(osc_content: &[u8]) -> Option<(String, String)> {
+        let content = std::str::from_utf8(osc_content).ok()?.trim();
+
+        let (title, body) = if let Some(rest) = content.strip_prefix("9;notify;") {
+            // OSC 9;notify;Title;Body
+            let mut parts = rest.splitn(2, ';');
+            let title = parts.next().unwrap_or("").trim().to_string();
+            let body = parts.next().unwrap_or("").trim().to_string();
+            (title, body)
+        } else if let Some(rest) = content.strip_prefix("777;notify;") {
+            // OSC 777;notify;Title;Body
+            let mut parts = rest.splitn(2, ';');
+            let title = parts.next().unwrap_or("").trim().to_string();
+            let body = parts.next().unwrap_or("").trim().to_string();
+            (title, body)
+        } else if let Some(message) = content.strip_prefix("9;") {
+            // OSC 9;message（iTerm2 兼容形态）：首行作标题，其余作正文。
+            // 排除 OSC 9;4（进度上报，暂不支持，透传给 vte 忽略），
+            // 避免把进度参数误当通知文本。
+            if message.trim_start().starts_with("4;") {
+                return None;
+            }
+            let message = message.trim();
+            if message.is_empty() {
+                return None;
+            }
+            let mut lines = message.splitn(2, '\n');
+            let title = lines.next().unwrap_or("").trim().to_string();
+            let body = lines.next().unwrap_or("").trim().to_string();
+            (title, body)
+        } else {
+            return None;
+        };
+
+        if title.is_empty() && body.is_empty() {
+            return None;
+        }
+        Some((title, body))
     }
 
     fn matches_osc_prefix(osc_content: &[u8], prefix: &str) -> bool {
@@ -1628,6 +1850,10 @@ impl Terminal {
                 self.content_generation += 1;
                 self.content_dirty = true;
                 cx.emit(Event::Wakeup);
+                // 数据刚被 vte 处理：捕获应用 DECSET ?1004h 的开启时机
+                // （本地终端的解析发生在 alacritty EventLoop 线程，远程在
+                // handle_pty_data；两种路径处理完都会到达这里或那里）。
+                self.check_focus_mode_enabled();
             }
             AlacTermEvent::Bell => {
                 cx.emit(Event::Bell);
@@ -1682,14 +1908,17 @@ impl Terminal {
                 cx.emit(Event::TitleChanged);
             }
             AlacTermEvent::ColorRequest(index, format) => {
-                // 响应颜色查询请求
-                let term = self.term.lock();
-                let color = term.colors()[index].unwrap_or(alacritty_terminal::vte::ansi::Rgb {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                });
-                drop(term);
+                // 响应颜色查询（OSC 10/11/12;? 与 OSC 4;idx;?）：
+                // 优先读 `Term.colors`（主题基色已由 apply_theme_colors 灌入，
+                // 应用改色写入其中），未覆盖的槽位（如 16..=255 色立方）
+                // 回退到当前主题的静态色板。
+                let color = {
+                    let term = self.term.lock();
+                    term.colors()[index].unwrap_or_else(|| {
+                        let theme = crate::theme::ThemeState::global(cx).active_theme().terminal;
+                        Self::theme_color_for_index(&theme, index)
+                    })
+                };
                 let response = format(color);
                 self.write_raw(response.as_bytes());
             }
@@ -1811,6 +2040,9 @@ impl Terminal {
         // render path can read it from `last_content` instead of acquiring the
         // term lock a second time per frame.
         self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
+        // 调色板快照：OSC 4/10/11/12 改色 / 重置与主题切换都在此同步到渲染路径。
+        self.last_content.palette =
+            crate::terminal::mappings::colors::TerminalPalette::from_colors(term.colors());
 
         // URL ranges are only consumed by link hover hit-testing. Skip the
         // per-row regex scans while the hover modifier is not held.
@@ -2492,6 +2724,40 @@ impl Terminal {
         }
     }
 
+    // ── Scrollback search ─────────────────────────────────────────────────
+
+    /// 在全部滚动区（scrollback + 屏幕，含 ALT 屏历史）内搜索 needle，
+    /// 返回所有命中（大小写不敏感，单行内匹配，按行序从旧到新）。
+    ///
+    /// 点坐标为 grid 绝对坐标（负 Line 表示 scrollback），供渲染层做行高亮
+    /// 与滚动定位。空 / 纯空白 needle 返回空集。
+    pub fn search_matches(&self, needle: &str) -> Vec<SearchMatch> {
+        let term = self.term.lock();
+        search_matches_in_grid(&term, needle)
+    }
+
+    /// 把滚动位置调整到使 grid 行 `line` 尽量居中显示。
+    ///
+    /// `line` 为 grid 绝对坐标（屏幕顶行 = Line(0)，scrollback 为负）。
+    /// 返回调整是否发生（供调用方决定是否重绘）。
+    pub fn scroll_line_to_center(&mut self, line: Line) -> bool {
+        let (viewport_rows, current_offset, history_size) = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                grid.screen_lines(),
+                grid.display_offset(),
+                grid.history_size(),
+            )
+        };
+        let target = scroll_offset_to_center(viewport_rows, history_size, line);
+        if target == current_offset {
+            return false;
+        }
+        self.scroll_by(AlacScroll::Delta(target as i32 - current_offset as i32));
+        true
+    }
+
     // Copy/Paste
     pub fn copy(&mut self, cx: &mut Context<Self>) {
         let term = self.term.lock();
@@ -2594,12 +2860,248 @@ impl Drop for Terminal {
     }
 }
 
+/// 在 grid 中搜索 `needle`（大小写折叠），返回所有命中的行内区间。
+///
+/// 坐标为 grid 绝对坐标：屏幕顶行 = Line(0)，scrollback 为负。
+/// `end` 列为开区间（下一字符列号或尾字符列+占宽），与选区约定一致。
+/// 每行内重叠命中只取首个（不重复计数同一子串）。
+pub fn search_matches_in_grid<T: EventListener>(term: &Term<T>, needle: &str) -> Vec<SearchMatch> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+
+    let grid = term.grid();
+    let total = grid.total_lines();
+    let cols = grid.columns();
+    let topmost = grid.topmost_line();
+
+    let mut out = Vec::new();
+    for i in 0..total {
+        let line = Line(topmost.0 + i as i32);
+        let row = &grid[line];
+
+        // 按字符流拉出内容及其列号 / 占宽，两类格子跳过：
+        // - 行尾 null cell（稀疏行）：不算内容
+        // - 宽字符占位格（WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER）：
+        //   alacritty 把 CJK 的第二格存成空格占位，检索必须剔除，
+        //   否则"你好"会被拆成 你/空格/好 而永远无法命中。
+        // 占宽用于命中尾部 end_col 的计算（CJK 宽字符占 2 格）。
+        let mut chars: Vec<char> = Vec::with_capacity(cols);
+        let mut cols_of: Vec<usize> = Vec::with_capacity(cols);
+        let mut widths_of: Vec<usize> = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let cell = &row[Column(col)];
+            let c = cell.c;
+            if c == '\0'
+                || cell.flags.intersects(
+                    alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER
+                        | alacritty_terminal::term::cell::Flags::LEADING_WIDE_CHAR_SPACER,
+                )
+            {
+                continue;
+            }
+            let wide = usize::from(
+                cell.flags
+                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR),
+            ) + 1;
+            chars.push(c);
+            cols_of.push(col);
+            widths_of.push(wide);
+        }
+        if chars.len() < needle_chars.len() {
+            continue;
+        }
+
+        // 大小写折叠后逐窗比对：每个字符折叠首个小写字母。
+        // （对多字符折叠的个别 Unicode 情形不完美，可接受。）
+        let folded: Vec<char> = chars
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        let needle_folded: Vec<char> = needle_chars
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        if folded.len() < needle_folded.len() {
+            continue;
+        }
+
+        let window = needle_folded.len();
+        let mut start = 0usize;
+        while start + window <= folded.len() {
+            if folded[start..start + window] == needle_folded[..] {
+                let start_col = cols_of[start];
+                // 结束列：优先用下一个字符的列号（稀疏行会自然跨过空档），
+                // 行尾则用命中尾字符的列 + 占宽。
+                let last = start + window - 1;
+                let end_col = cols_of
+                    .get(last + 1)
+                    .copied()
+                    .unwrap_or(cols_of[last] + widths_of[last]);
+                out.push(SearchMatch {
+                    start: AlacPoint::new(line, Column(start_col)),
+                    end: AlacPoint::new(line, Column(end_col)),
+                });
+                // 重叠匹配跳过，避免同一位置重复命中。
+                start += window;
+            } else {
+                start += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 计算「使 grid 行 `line` 居中显示」所需的 display_offset。
+///
+/// 纯函数（供 [`Terminal::scroll_line_to_center`] 与测试复用）：
+/// 屏幕行索引 = line.0 + display_offset，居中即让该索引落在 rows/2。
+/// 结果 clamp 到 [0, history]，0 = 正常视图、history = 滚到最底 scrollback。
+pub fn scroll_offset_to_center(viewport_rows: usize, history_size: usize, line: Line) -> usize {
+    if viewport_rows == 0 {
+        return 0;
+    }
+    let target = (viewport_rows / 2) as i32 - line.0;
+    target.clamp(0, history_size as i32) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Terminal, TerminalType};
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
     use gpui::{AppContext as _, TestAppContext};
+
+    #[test]
+    fn search_finds_matches_across_scrollback_case_folded() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+
+        // 4 行屏、10k 回滚：写入两行后 linefeed 两次，制造 scrollback。
+        let size = TermSize::new(20, 4);
+        let mut term = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        term.goto(0, 0);
+        for c in "hello".chars() { term.input(c); }
+        term.linefeed();
+        for c in "World".chars() { term.input(c); }
+        // 光标移到屏底再 linefeed：两行内容整体进 scrollback（hello → Line(-1)）
+        term.goto(3, 0);
+        term.linefeed();
+
+        let matches = super::search_matches_in_grid(&term, "HELLO");
+        assert_eq!(matches.len(), 1, "大小写折叠应命中 hello");
+        let m = &matches[0];
+        assert_eq!(m.start.line, Line(-1), "应命中 scrollback 里的 hello");
+        assert_eq!(m.start.column, Column(0));
+        // end 为开区间：命中尾字符列 + 1
+        assert_eq!(m.end.column, Column(5));
+
+        // 多行命中："l" 在两行都有
+        let l_matches = super::search_matches_in_grid(&term, "l");
+        assert_eq!(l_matches.len(), 3, "hello 两个 l + World 一个 l");
+    }
+
+    #[test]
+    fn search_finds_cjk_text() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+
+        // 4 行屏：写入中文 + 英文混合行，验证宽字符检索。
+        let size = TermSize::new(20, 4);
+        let mut term = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        term.goto(0, 0);
+        for c in "你好 deepterm 世界".chars() { term.input(c); }
+
+        let matches = super::search_matches_in_grid(&term, "你好");
+        assert_eq!(matches.len(), 1, "应命中中文词");
+        let m = &matches[0];
+        assert_eq!(m.start.line, Line(0));
+        assert_eq!(m.start.column, Column(0));
+        // 宽字符占 2 格：end 应为列 4（开区间，尾字符列 0+占宽 2、第二个字列 2+占宽 2）
+        assert_eq!(m.end.column, Column(4));
+
+        // 单个中文字 + 英文词
+        assert_eq!(super::search_matches_in_grid(&term, "世界").len(), 1);
+        assert_eq!(super::search_matches_in_grid(&term, "deepterm").len(), 1);
+    }
+
+    #[test]
+    fn search_skips_empty_and_overlapping_hits() {
+        let term = mock_term("aaaa");
+        // "aa" 应命中 2 次（重叠跳过），而不是 3 次（滑动窗口）
+        let matches = super::search_matches_in_grid(&term, "aa");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].start.column, alacritty_terminal::index::Column(0));
+        assert_eq!(matches[1].start.column, alacritty_terminal::index::Column(2));
+        // 空串 / 纯空白无命中
+        assert!(super::search_matches_in_grid(&term, "").is_empty());
+        assert!(super::search_matches_in_grid(&term, "   ").is_empty());
+    }
+
+    #[test]
+    fn scroll_center_clamps_offset_to_history() {
+        // 视口 10 行、scrollback 100 行：
+        // - 屏内行 Line(0)：居中需要 offset = 5 - 0 = 5（屏顶行落在视口第 5 行）
+        assert_eq!(
+            super::scroll_offset_to_center(10, 100, alacritty_terminal::index::Line(0)),
+            5
+        );
+        // - scrollback 行 Line(-50)：offset = 5 + 50 = 55
+        assert_eq!(
+            super::scroll_offset_to_center(10, 100, alacritty_terminal::index::Line(-50)),
+            55
+        );
+        // - 无 scrollback 时屏内行也居不了中：clamp 到 0（正常视图）
+        assert_eq!(
+            super::scroll_offset_to_center(10, 0, alacritty_terminal::index::Line(0)),
+            0
+        );
+        // - 越过历史的行（无 scrollback 时）：clamp 到 history=0
+        assert_eq!(
+            super::scroll_offset_to_center(10, 0, alacritty_terminal::index::Line(-50)),
+            0
+        );
+        // - 零行视口（防御）：0
+        assert_eq!(
+            super::scroll_offset_to_center(0, 100, alacritty_terminal::index::Line(-50)),
+            0
+        );
+    }
+
+    #[test]
+    fn parses_osc_notification_forms() {
+        // iTerm2 OSC 9;notify;Title;Body
+        let (title, body) =
+            Terminal::parse_notification_osc("9;notify;构建失败;请检查日志".as_bytes()).unwrap();
+        assert_eq!(title, "构建失败");
+        assert_eq!(body, "请检查日志");
+        // urxvt OSC 777;notify;Title;Body
+        let (title, body) =
+            Terminal::parse_notification_osc(b"777;notify;Deploy;done").unwrap();
+        assert_eq!(title, "Deploy");
+        assert_eq!(body, "done");
+        // 简化 OSC 9;message：全文作标题，body 为空
+        let (title, body) =
+            Terminal::parse_notification_osc(b"9;hello world").unwrap();
+        assert_eq!(title, "hello world");
+        assert_eq!(body, "");
+        // OSC 9;4 进度上报（ConEmu）不是通知
+        assert!(Terminal::parse_notification_osc(b"9;4;50").is_none());
+        assert!(Terminal::parse_notification_osc(b"9;4;3;50").is_none());
+        // 无效形态
+        assert!(Terminal::parse_notification_osc(b"9;").is_none());
+        assert!(Terminal::parse_notification_osc(b"8;").is_none());
+    }
 
     #[test]
     fn click_count_normalizes_in_cycles_of_three() {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, Entity, EntityInputHandler, EventEmitter, ExternalPaths,
-    FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription, Task,
     UTF16Selection, Window, actions, div, point, px,
 };
@@ -46,6 +46,9 @@ pub enum Event {
     WorkingDirectoryChanged,
     /// 终端标题变化（可能由前台进程设置）
     TitleChanged,
+    /// 后台铃：终端 BEL / 通知到达且本视图未聚焦，
+    /// 面板链路据此点亮 tab 的需关注红点。
+    BellRangWhileUnfocused,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -65,7 +68,9 @@ pub struct ImeState {
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
+use crate::assets::Icon;
 use crate::builtin_commands::{BuiltinCommandManager, resolve_command_line};
+use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
@@ -80,7 +85,10 @@ use crate::theme::ActiveTheme;
 use crate::workspace::session_state::TerminalSessionState;
 
 // Define terminal actions
-actions!(terminal, [Copy, Paste, Clear, SelectAll]);
+actions!(
+    terminal,
+    [Copy, Paste, Clear, SelectAll, StartSearch, DismissSearch]
+);
 const CONTEXT: &str = "Terminal";
 
 /// Cursor blink policy. Mirrors Zed's `TerminalBlink` setting.
@@ -111,6 +119,9 @@ const SCROLL_VELOCITY_SCALE: f32 = 2000.0;
 
 // Scrollbar thumb animation duration (seconds)
 const SCROLLBAR_ANIMATION_DURATION: f32 = 0.15;
+
+/// BEL 视觉闪烁总时长（毫秒）：视区边缘呼吸式高亮，随后自然衰减。
+const BELL_FLASH_MS: u64 = 350;
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     cx.bind_keys([
@@ -126,6 +137,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
         #[cfg(not(target_os = "windows"))]
         KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
+        // 回滚区搜索：macOS 用 cmd-f，其他平台 ctrl-shift-f
+        //（ctrl-f 是 shell 的 forward-char，不能占用）。
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", StartSearch, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-f", StartSearch, Some(CONTEXT)),
+        // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
+        KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
     ]);
 }
 
@@ -197,6 +216,44 @@ pub struct HoveredLink {
     pub row: usize,
     pub start_col: usize,
     pub end_col: usize,
+}
+
+/// 终端滚动区搜索状态（由 Cmd-F / Ctrl-Shift-F 激活）。
+///
+/// - `matches` 为 grid 绝对坐标命中集（`Terminal::search_matches` 产出）；
+/// - 元素在 prepaint 阶段按当前 display_offset 映射到视口行并绘制高亮；
+/// - `revision` 在匹配集 / 当前命中变化时递增，驱动行缓存里的搜索高亮
+///   重算；滚动不递增（视口行映射每帧重算）。
+pub struct TerminalSearchState {
+    /// 搜索浮层是否展开（激活）
+    pub active: bool,
+    /// 搜索词（已去除首尾空白）
+    pub query: String,
+    /// 全部命中（行序从旧到新）
+    pub matches: Vec<crate::terminal::terminal::SearchMatch>,
+    /// 当前命中索引（matches 下标）
+    pub active_index: usize,
+    /// 高亮重算代次：matches / active_index 变化时 +1
+    pub revision: u64,
+}
+
+impl Default for TerminalSearchState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            query: String::new(),
+            matches: Vec::new(),
+            active_index: 0,
+            revision: 0,
+        }
+    }
+}
+
+impl TerminalSearchState {
+    /// 当前命中的 grid 坐标（无命中返回 None）。
+    pub fn active_match(&self) -> Option<&crate::terminal::terminal::SearchMatch> {
+        self.matches.get(self.active_index)
+    }
 }
 
 /// 本地 shell 进程 cwd 的后台刷新缓存。
@@ -277,6 +334,16 @@ pub struct TerminalView {
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
+    /// 滚动区搜索状态（Cmd-F 激活）
+    pub search: TerminalSearchState,
+    /// 搜索输入框实体（打开搜索时创建；None = 从未打开）
+    search_input: Option<Entity<InputState>>,
+    /// 搜索输入 Change 订阅（重算命中集）
+    _search_input_subscription: Option<Subscription>,
+    /// 搜索防抖任务：输入停顿 150ms 后重算命中，避免逐键全量扫描 10k 行
+    search_debounce_task: Option<Task<()>>,
+    /// 搜索自动跳转任务：命中集更新后把当前命中滚动到视口中央
+    search_follow_task: Option<Task<()>>,
     /// Whether the link-hover modifier (Cmd/Ctrl) was held at the last mouse
     /// move. Transitions are forwarded to `Terminal::set_link_hover_active`
     /// so URL detection runs only while links are actually hoverable.
@@ -287,6 +354,8 @@ pub struct TerminalView {
     pub flattened_render_cache: FlattenedRenderCache,
     /// Last theme id used to build row cache.
     pub cached_theme_id: Option<String>,
+    /// 最近一次灌入 Terminal.colors 的主题 id（OSC 颜色查询闭环）。
+    applied_theme_id: Option<String>,
     /// Last selection range used to build row cache.
     pub cached_selection_range: Option<SelectionRange>,
     /// Last mouse mode state used to build row cache.
@@ -320,6 +389,18 @@ pub struct TerminalView {
     toast_message: Option<String>,
     /// Toast 自动隐藏任务
     toast_hide_task: Option<Task<()>>,
+    /// 信息型 Toast（OSC 9/777 通知）：(标题, 正文)，与错误 Toast 分离。
+    info_toast: Option<(String, String)>,
+    /// 信息 Toast 自动隐藏任务
+    info_toast_hide_task: Option<Task<()>>,
+    // ── Bell visual flash ─────────────────────────────────────────────────
+    /// 最近一次 BEL 到达时刻：驱动视区边缘的短促视觉闪烁。
+    /// `None` 或距今超过 [`BELL_FLASH_MS`] 时不绘制。
+    bell_flash_at: Option<Instant>,
+    /// 闪烁自动结束任务（到点清 bell_flash_at 并重绘）
+    bell_flash_task: Option<Task<()>>,
+    /// 上一次 BEL 时刻（限频，防止快速连环铃把闪烁刷成频闪）。
+    last_bell_at: Option<Instant>,
     // ── Tab label tracking ─────────────────────────────────────────────────
     /// 上一次计算出的 tab 标签，用于检测是否需要更新
     last_tab_label: Option<String>,
@@ -547,7 +628,12 @@ impl TerminalView {
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
                     this.on_working_directory_changed(cwd, cx);
                 }
-                TerminalEvent::Bell => {}
+                TerminalEvent::Bell => {
+                    this.on_bell(cx);
+                }
+                TerminalEvent::NotificationReceived { title, body } => {
+                    this.on_notification(title.clone(), body.clone(), cx);
+                }
                 TerminalEvent::CloseTerminal => {
                     cx.emit(Event::CloseTerminal);
                 }
@@ -597,10 +683,16 @@ impl TerminalView {
             process_cwd: ProcessCwdCache::default(),
             pending_remote_cwd_restore: None,
             hovered_link: None,
+            search: TerminalSearchState::default(),
+            search_input: None,
+            _search_input_subscription: None,
+            search_debounce_task: None,
+            search_follow_task: None,
             link_modifier_held: false,
             row_render_cache: Vec::new(),
             flattened_render_cache: FlattenedRenderCache::default(),
             cached_theme_id: None,
+            applied_theme_id: None,
             cached_selection_range: None,
             cached_selection_mouse_mode: false,
             scratch_dirty_rows: Vec::new(),
@@ -615,6 +707,11 @@ impl TerminalView {
             last_scroll_direction: 0,
             toast_message: None,
             toast_hide_task: None,
+            info_toast: None,
+            info_toast_hide_task: None,
+            bell_flash_at: None,
+            bell_flash_task: None,
+            last_bell_at: None,
             last_tab_label: None,
             tab_label_debounce_task: None,
             tab_label_pending: false,
@@ -759,7 +856,12 @@ impl TerminalView {
                     TerminalEvent::WorkingDirectoryChanged(cwd) => {
                         this.on_working_directory_changed(cwd, cx);
                     }
-                    TerminalEvent::Bell => {}
+                    TerminalEvent::Bell => {
+                        this.on_bell(cx);
+                    }
+                    TerminalEvent::NotificationReceived { title, body } => {
+                        this.on_notification(title.clone(), body.clone(), cx);
+                    }
                     TerminalEvent::CloseTerminal => {
                         cx.emit(Event::CloseTerminal);
                     }
@@ -810,10 +912,16 @@ impl TerminalView {
                 process_cwd: ProcessCwdCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
+                search: TerminalSearchState::default(),
+                search_input: None,
+                _search_input_subscription: None,
+                search_debounce_task: None,
+                search_follow_task: None,
                 link_modifier_held: false,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
+                applied_theme_id: None,
                 cached_selection_range: None,
                 cached_selection_mouse_mode: false,
                 scratch_dirty_rows: Vec::new(),
@@ -828,6 +936,11 @@ impl TerminalView {
                 last_scroll_direction: 0,
                 toast_message: None,
                 toast_hide_task: None,
+                info_toast: None,
+                info_toast_hide_task: None,
+                bell_flash_at: None,
+                bell_flash_task: None,
+                last_bell_at: None,
                 last_tab_label: None,
                 tab_label_debounce_task: None,
                 tab_label_pending: false,
@@ -899,7 +1012,12 @@ impl TerminalView {
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
                     this.on_working_directory_changed(cwd, cx);
                 }
-                TerminalEvent::Bell => {}
+                TerminalEvent::Bell => {
+                    this.on_bell(cx);
+                }
+                TerminalEvent::NotificationReceived { title, body } => {
+                    this.on_notification(title.clone(), body.clone(), cx);
+                }
                 TerminalEvent::CloseTerminal => {
                     // 正常退出（用户执行 exit 命令），关闭 panel
                     cx.emit(Event::CloseTerminal);
@@ -2141,6 +2259,338 @@ impl TerminalView {
         .detach();
     }
 
+    // ── Scrollback search ─────────────────────────────────────────────────
+
+    /// 打开搜索浮层：创建（或复用）输入框并聚焦。
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.active {
+            // 已激活：仅重新聚焦输入框
+            if let Some(input) = &self.search_input {
+                input.update(cx, |input, cx| input.focus(window, cx));
+            }
+            return;
+        }
+
+        self.search.active = true;
+        if self.search_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("搜索终端内容...")
+                    .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
+                    .clean_on_escape()
+            });
+            let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                match event {
+                    InputEvent::Change => {
+                        this.schedule_search_recompute(cx);
+                    }
+                    InputEvent::Focus | InputEvent::Blur => {
+                        // 聚焦态变化需要重绘（边框高亮在 render 时直接向 window 查询）
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            });
+            self._search_input_subscription = Some(subscription);
+            self.search_input = Some(input);
+        }
+        if let Some(input) = &self.search_input {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        // 再次打开：输入框里还留着上次的词，立即重算命中。
+        let has_text = self
+            .search_input
+            .as_ref()
+            .is_some_and(|input| !input.read(cx).value().is_empty());
+        if has_text {
+            self.start_search_from_scratch(cx);
+        }
+        cx.notify();
+    }
+
+    /// 关闭搜索浮层：清高亮、还焦点、保留输入词（再次打开时可继续）。
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search.active {
+            return;
+        }
+        self.search.active = false;
+        self.search.matches.clear();
+        self.search.active_index = 0;
+        self.search.revision += 1;
+        self.search_debounce_task = None;
+        self.search_follow_task = None;
+        // 恢复终端焦点（搜索框抢占了 focus handle）
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// 输入变化后重算命中（150ms 防抖，避免逐键全量扫描滚动区）。
+    fn schedule_search_recompute(&mut self, cx: &mut Context<Self>) {
+        self.search_debounce_task = None;
+        let input = self.search_input.clone();
+        self.search_debounce_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            this.update(cx, |this, cx| {
+                let query = input
+                    .as_ref()
+                    .map(|input| input.read(cx).value().to_string())
+                    .unwrap_or_default();
+                this.recompute_search_matches(&query, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// 按当前查询重算命中集并把首个可见命中设为当前命中。
+    fn recompute_search_matches(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search.query = query.trim().to_string();
+        let matches = if self.search.query.is_empty() {
+            Vec::new()
+        } else {
+            self.terminal.read(cx).search_matches(&self.search.query)
+        };
+
+        // 初始命中选择：从视口顶部往下第一个可见之后的命中（ghostty 语义：
+        // 从当前视图附近开始），否则从头。
+        self.search.active_index = 0;
+        if !matches.is_empty() {
+            let offset = self.terminal.read(cx).last_content().display_offset;
+            let viewport_rows = self.terminal.read(cx).last_content().rows as i32;
+            // 视口顶行的 grid Line = -offset；首个完全在视口之下的命中即起点。
+            let top_grid_line = -(offset as i32);
+            let bottom_grid_line = top_grid_line + viewport_rows - 1;
+            if let Some(idx) = matches
+                .iter()
+                .position(|m| m.start.line.0 > bottom_grid_line)
+            {
+                self.search.active_index = idx;
+            }
+        }
+        self.search.matches = matches;
+        self.search.revision += 1;
+
+        // 命中变化后把当前命中滚到视口中央
+        if let Some(m) = self.search.active_match() {
+            let line = m.start.line;
+            self.terminal.update(cx, |terminal, _| {
+                terminal.scroll_line_to_center(line);
+            });
+        }
+        cx.notify();
+    }
+
+    /// 跳到下一个 / 上一个命中（wrap-around），并把该命中滚到视口中央。
+    fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        let len = self.search.matches.len();
+        self.search.active_index = if forward {
+            (self.search.active_index + 1) % len
+        } else {
+            (self.search.active_index + len - 1) % len
+        };
+        self.search.revision += 1;
+        if let Some(m) = self.search.active_match() {
+            let line = m.start.line;
+            self.terminal.update(cx, |terminal, _| {
+                terminal.scroll_line_to_center(line);
+            });
+        }
+        cx.notify();
+    }
+
+    /// 打开搜索浮层时首次计算：
+    pub fn start_search_from_scratch(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        self.recompute_search_matches(&query, cx);
+    }
+
+    /// 渲染搜索 UI：右上角一个小搜索框（无外层浮层背景）。
+    ///
+/// 布局：一个胶囊容器内依次为 搜索图标 → 输入区 → 命中计数 → 关闭钮。
+    /// 输入框本身用 transparent 模式（EditorInput 不自带背景/边框/高度，
+    /// 由胶囊容器统一绘制），整体高度约 24px，宽度自适应内容上限 240px。
+    ///
+    /// 按键：Enter / Down = 下一个命中，Shift-Enter / Up = 上一个，
+    /// Escape 关闭（经 DismissSearch action，仅搜索激活时消费）。
+    /// 这些按键在容器层拦截（on_key_down + stop_propagation），
+    /// 不会下漏到终端输入。
+    fn render_search_bar(&self, is_focused: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().ui;
+        let match_count = self.search.matches.len();
+        let counter: SharedString = if match_count == 0 {
+            "0".into()
+        } else {
+            format!("{}/{}", self.search.active_index + 1, match_count).into()
+        };
+        let input = self
+            .search_input
+            .clone()
+            .expect("search input must exist while search is active");
+        div()
+            .absolute()
+            .top(px(6.0))
+            .right(px(10.0))
+            .id("terminal-search")
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            // 样式对齐侧边栏 Host 面板搜索框：32px 高、圆角 12、
+            // 未聚焦无描边，聚焦时 3px accent 描边（发光式外圈高亮）。
+            .h(px(32.0))
+            .w(px(260.0))
+            .px(px(10.0))
+            .rounded(px(12.0))
+            .bg(theme.tab_hover_background)
+            .when(is_focused, |this| {
+                this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
+            })
+            .on_key_down(cx.listener(
+                |this, event: &gpui::KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    let mods = &event.keystroke.modifiers;
+                    let plain = !mods.control && !mods.platform && !mods.alt;
+                    match key {
+                        // Enter / Down（无修饰）：下一个命中
+                        "enter" | "return" if plain && !mods.shift => {
+                            this.search_step(true, cx);
+                            cx.stop_propagation();
+                        }
+                        // Shift-Enter / Up：上一个
+                        "enter" | "return" if plain && mods.shift => {
+                            this.search_step(false, cx);
+                            cx.stop_propagation();
+                        }
+                        "down" if plain => {
+                            this.search_step(true, cx);
+                            cx.stop_propagation();
+                        }
+                        "up" if plain => {
+                            this.search_step(false, cx);
+                            cx.stop_propagation();
+                        }
+                        "escape" => {
+                            this.close_search(window, cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
+                    }
+                },
+            ))
+            // 搜索图标（灰，仅装饰）
+            .child(
+                gpui::svg()
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted)
+                    .path(Icon::MagnifyingGlass.path()),
+            )
+            // 输入区：transparent EditorInput 占满剩余宽度，无内建背景/高度
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .child(EditorInput::new(&input).small().transparent()),
+            )
+            // 命中计数：紧凑灰字，宽度固定避免输入时跳动
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(28.0))
+                    .text_size(px(11.0))
+                    .text_color(if match_count == 0 {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    })
+                    .text_align(gpui::TextAlign::Right)
+                    .child(counter),
+            )
+            // 关闭按钮：终端 tab 同款 XmarkCircleFill 图标
+            .child(
+                gpui::svg()
+                    .size(px(14.0))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .path(Icon::XmarkCircleFill.path())
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            this.close_search(window, cx);
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// BEL 到达：
+    /// - 视区短促视觉闪烁（限频，防频闪）；
+    /// - 视图未聚焦时点亮所属 tab 的红点（BellRangWhileUnfocused）。
+    fn on_bell(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        // 限频：150ms 内的连环铃只闪一次。
+        if self
+            .last_bell_at
+            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(150))
+        {
+            self.last_bell_at = Some(now);
+            return;
+        }
+        self.last_bell_at = Some(now);
+
+        self.bell_flash_at = Some(now);
+        self.bell_flash_task = None;
+        self.bell_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BELL_FLASH_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                this.bell_flash_at = None;
+                this.bell_flash_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+
+        if !self.was_focused {
+            cx.emit(Event::BellRangWhileUnfocused);
+        }
+    }
+
+    /// OSC 9 / 777 通知到达：信息型 Toast + 未聚焦时点亮 tab 红点。
+    /// 通知不触发 BEL 闪烁（Toast 本身已是视觉反馈）。
+    fn on_notification(&mut self, title: String, body: String, cx: &mut Context<Self>) {
+        self.info_toast = Some((title, body));
+        self.info_toast_hide_task = None;
+        self.info_toast_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(5))
+                .await;
+            this.update(cx, |this, cx| {
+                this.info_toast = None;
+                this.info_toast_hide_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+
+        if !self.was_focused {
+            cx.emit(Event::BellRangWhileUnfocused);
+        }
+    }
+
     /// 显示 Toast 错误通知
     fn show_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         let message = message.into();
@@ -2202,12 +2652,68 @@ impl TerminalView {
             )
     }
 
+    /// 渲染信息型 Toast（OSC 9/777 终端通知）：顶部居中的通知卡片。
+    fn render_info_toast(&self, title: &str, body: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().ui;
+        let is_dark = cx.theme().appearance.is_dark();
+        let title_shared: SharedString = title.to_string().into();
+        let body_shared: SharedString = body.to_string().into();
+        let body_element = if body.is_empty() {
+            None
+        } else {
+            Some(div().text_size(px(12.0)).text_color(theme.text_muted).child(body_shared))
+        };
+
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .max_w(px(400.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.elevated_background.opacity(if is_dark { 0.92 } else { 0.97 }))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                gpui::svg()
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted)
+                                    .path(crate::assets::Icon::Bell.path()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .text_ellipsis()
+                                    .child(title_shared),
+                            ),
+                    )
+                    .when_some(body_element, |this, body| this.child(body)),
+            )
+            .into_any_element()
+    }
+
     /// 结束当前内建命令输入，恢复普通终端输入状态。
     fn finish_builtin_command_input(&mut self, cx: &mut Context<Self>) {
         self.clear_marked_text(cx);
         self.clear_builtin_command(cx);
     }
-
     /// 判断某个按键在内建命令模式下是否应该被本地吞掉。
     ///
     /// 只要这个按键本来会被编码成终端输入，就不应该再透传到 PTY。
@@ -2771,12 +3277,54 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
+/// BEL 视觉闪烁层：视区四周一层强调色描边，透明度随剩余时间线性衰减。
+///
+/// 颜色用终端前景色（跟随主题），不额外引入语义色，深浅主题下均可见。
+fn render_bell_flash(started: Instant, cx: &App) -> gpui::AnyElement {
+    let theme = cx.theme();
+    let terminal_theme = theme.terminal;
+    let progress = (started.elapsed().as_secs_f32()
+        / Duration::from_millis(BELL_FLASH_MS).as_secs_f32())
+        .clamp(0.0, 1.0);
+    let alpha = (1.0 - progress) * 0.55;
+    if alpha <= 0.01 {
+        return div().into_any_element();
+    }
+
+    let color = terminal_theme.foreground.opacity(alpha);
+    div()
+        .absolute()
+        .inset_0()
+        .border_2()
+        .border_color(color)
+        .rounded(px(4.0))
+        .into_any_element()
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let terminal = self.terminal.clone();
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
         let is_focused = focus_handle.is_focused(window);
+
+        // ── 主题色同步（OSC 10/11/12/4 查询闭环）───────────────────────────
+        // 首帧与主题切换时把当前主题灌入 Term.colors：查询应答与渲染回退
+        // 均以此为准（应用改色写入 Term.colors 的实时生效也经由渲染层快照）。
+        {
+            let active_theme_id = crate::theme::ThemeState::global(cx)
+                .active_theme()
+                .id
+                .clone();
+            if self.applied_theme_id.as_ref() != Some(&active_theme_id) {
+                let theme = crate::theme::ThemeState::global(cx).active_theme().terminal;
+                self.terminal.update(cx, |terminal, _| {
+                    terminal.apply_theme_colors(&theme);
+                });
+                self.applied_theme_id = Some(active_theme_id);
+            }
+        }
+
         // React to focus edges so we can start/stop blinking.
         self.on_focus_changed(is_focused, cx);
         let cursor_visible = self.should_show_cursor(is_focused, cx);
@@ -2875,6 +3423,16 @@ impl Render for TerminalView {
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
                 this.select_all(cx);
+            }))
+            .on_action(cx.listener(|this, _: &StartSearch, window, cx| {
+                this.open_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DismissSearch, window, cx| {
+                // 仅在搜索激活时消费 Escape；否则传播给 shell / 输入层。
+                if this.search.active {
+                    this.close_search(window, cx);
+                    cx.stop_propagation();
+                }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
@@ -3153,6 +3711,27 @@ impl Render for TerminalView {
                     .when(self.toast_message.is_some(), |this| {
                         this.child(self.render_toast(cx))
                     })
+                    // OSC 9/777 信息型 Toast（与错误 Toast 分层：通知场景优先展示）
+                    .when_some(self.info_toast.clone(), |this, (title, body)| {
+                        this.child(self.render_info_toast(&title, &body, cx))
+                    })
+                    // 回滚区搜索浮层（右上角）
+                    .when(self.search.active, |this| {
+                        // 直接向 window 查询输入框聚焦态（事件链可能丢帧，这里每次渲染都为准）
+                        let is_focused = self
+                            .search_input
+                            .as_ref()
+                            .is_some_and(|input| {
+                                input.read(cx).focus_handle(cx).is_focused(window)
+                            });
+                        this.child(self.render_search_bar(is_focused, cx))
+                    })
+                    // BEL 视觉闪烁：视区边缘一层随时间衰减的强调色描边。
+                    .when_some(
+                        self.bell_flash_at
+                            .filter(|t| t.elapsed() < Duration::from_millis(BELL_FLASH_MS)),
+                        |this, started| this.child(render_bell_flash(started, cx)),
+                    )
                     // SSH 连接进度视图覆盖层 - 在连接建立期间覆盖终端内容
                     .when_some(self.ssh_connect_view.clone(), |this, connect_view| {
                         this.child(div().absolute().inset_0().child(connect_view))

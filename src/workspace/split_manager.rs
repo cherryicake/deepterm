@@ -220,8 +220,7 @@ impl SplitContainer {
     }
 
     /// 获取选中状态的panel
-    pub fn get_selected_panel(&self, cx: &App) -> Option<Entity<Panel>> {
-        match self {
+    pub fn get_selected_panel(&self, cx: &App) -> Option<Entity<Panel>> {        match self {
             SplitContainer::Panel(panel) => {
                 if panel.read(cx).is_selected {
                     Some(panel.clone())
@@ -448,6 +447,50 @@ impl SplitContainer {
             }
         }
     }
+    /// 从当前选中 panel 出发，向指定方向寻找相邻 panel（分屏导航）。
+    ///
+    /// 纯结构遍历：在每一层，若分割轴与导航方向一致，则取当前子树紧邻的兄弟：
+    /// - 左/上 → 左侧/上方兄弟，并在其子树中取视觉最近的 panel（最右/最下）
+    /// - 右/下 → 右侧/下方兄弟，取其子树最左/最上的 panel
+    /// 若当前层轴不匹配或已到边缘，则向父层继续找。找不到返回 None。
+    pub fn focus_neighbor(
+        &self,
+        from_panel_id: &str,
+        nav: SplitNavDirection,
+        cx: &App,
+    ) -> Option<Entity<Panel>> {
+        let (want_axis, want_before) = match nav {
+            SplitNavDirection::Left => (SplitDirection::Horizontal, true),
+            SplitNavDirection::Right => (SplitDirection::Horizontal, false),
+            SplitNavDirection::Up => (SplitDirection::Vertical, true),
+            SplitNavDirection::Down => (SplitDirection::Vertical, false),
+        };
+
+        let mut path = Vec::new();
+        if !find_path_to_panel(self, from_panel_id, cx, &mut path) {
+            return None;
+        }
+
+        // 从最内层向外：找第一个轴向匹配且有相邻兄弟的层
+        for entry in path.iter().rev() {
+            if entry.axis != want_axis {
+                continue;
+            }
+            let neighbor_index = if want_before {
+                match entry.index.checked_sub(1) {
+                    Some(i) => i,
+                    None => continue, // 已是最左侧兄弟，向父层继续
+                }
+            } else if entry.index + 1 < entry.children.len() {
+                entry.index + 1
+            } else {
+                continue;
+            };
+            let neighbor = &entry.children[neighbor_index];
+            return Some(corner_panel(neighbor, want_before));
+        }
+        None
+    }
 }
 
 impl From<SplitDirection> for SplitSessionDirection {
@@ -455,6 +498,59 @@ impl From<SplitDirection> for SplitSessionDirection {
         match direction {
             SplitDirection::Horizontal => SplitSessionDirection::Horizontal,
             SplitDirection::Vertical => SplitSessionDirection::Vertical,
+        }
+    }
+}
+
+/// 分屏导航方向（与容器分割轴分离：左右/上下均可导航）
+#[derive(Clone, Copy, Debug)]
+pub enum SplitNavDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// find_path 的路径条目：记录父分割的轴、兄弟序列、当前子树的下标
+struct SplitPathEntry<'a> {
+    axis: SplitDirection,
+    children: &'a [SplitContainer],
+    index: usize,
+}
+
+/// 找到 panel 所在的从根到叶的路径（存每一层的兄弟序列与下标）
+fn find_path_to_panel<'a>(
+    container: &'a SplitContainer,
+    panel_id: &str,
+    cx: &App,
+    path: &mut Vec<SplitPathEntry<'a>>,
+) -> bool {
+    match container {
+        SplitContainer::Panel(panel) => panel.read(cx).panel_id == panel_id,
+        SplitContainer::Split { direction, children, .. } => {
+            for (i, _child) in children.iter().enumerate() {
+                path.push(SplitPathEntry {
+                    axis: *direction,
+                    children: children.as_slice(),
+                    index: i,
+                });
+                if find_path_to_panel(&children[i], panel_id, cx, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+    }
+}
+
+/// 取子树中的角 panel：want_last=true 取最后一个（最右/最下），否则第一个（最左/最上）
+fn corner_panel(container: &SplitContainer, want_last: bool) -> Entity<Panel> {
+    match container {
+        SplitContainer::Panel(panel) => panel.clone(),
+        SplitContainer::Split { children, .. } => {
+            let index = if want_last { children.len() - 1 } else { 0 };
+            corner_panel(&children[index], want_last)
         }
     }
 }
