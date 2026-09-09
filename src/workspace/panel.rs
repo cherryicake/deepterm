@@ -72,11 +72,14 @@ pub enum PanelEvent {
         os: Option<RemoteOS>,
         ssh_config_id: Option<String>,
     },
-    /// 打开路径（文件→编辑器，目录→文件树）
+    /// 打开路径（文件→编辑器，目录→文件树 reveal；root 恒等于终端 cwd）
     OpenPath {
         panel_id: String,
         path: String,
+        line: Option<u32>,
+        col: Option<u32>,
         ssh_config: Option<SshConnectionConfig>,
+        terminal_cwd: Option<String>,
     },
     /// 文件传输请求
     TransferRequested {
@@ -244,11 +247,20 @@ impl Panel {
                     // 这里可以添加逻辑来显示退出状态或保持面板打开
                     log::info!("Panel {}: 子进程退出，状态码: {}", close_panel_id, status);
                 }
-                TerminalViewEvent::OpenPath { path, ssh_config } => {
+                TerminalViewEvent::OpenPath {
+                    path,
+                    line,
+                    col,
+                    ssh_config,
+                    terminal_cwd,
+                } => {
                     cx.emit(PanelEvent::OpenPath {
                         panel_id: close_panel_id.clone(),
                         path: path.clone(),
+                        line: *line,
+                        col: *col,
                         ssh_config: ssh_config.clone(),
+                        terminal_cwd: terminal_cwd.clone(),
                     });
                 }
                 TerminalViewEvent::StartTransfer { request } => {

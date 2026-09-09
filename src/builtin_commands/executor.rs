@@ -38,7 +38,11 @@ pub enum CommandResult {
     /// 打开路径：文件→编辑器，目录→文件树
     OpenPath {
         path: String,
+        line: Option<u32>,
+        col: Option<u32>,
         ssh_config: Option<SshConnectionConfig>,
+        /// 发起终端的工作目录：文件树 root 恒等于它（子目录只 reveal）。
+        terminal_cwd: Option<String>,
     },
     /// 启动一次文件传输（由 workspace 层挂接进度/冲突弹窗/任务列表）
     StartTransfer { request: TransferRequest },
@@ -162,7 +166,17 @@ impl CommandHandler for OpenPathHandler {
 
         CommandResult::OpenPath {
             path,
+            line: None,
+            col: None,
             ssh_config: ctx.ssh_config.clone(),
+            terminal_cwd: if ctx.is_remote {
+                ctx.remote_cwd.clone()
+            } else {
+                ctx.process_cwd
+                    .clone()
+                    .or(ctx.working_directory.clone())
+                    .map(|p| p.to_string_lossy().to_string())
+            },
         }
     }
 }
@@ -749,7 +763,9 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenPath { path, ssh_config } => {
+            CommandResult::OpenPath {
+                path, ssh_config, ..
+            } => {
                 assert_eq!(path, "/home/user/project/src/main.rs");
                 assert!(ssh_config.is_none());
             }
@@ -776,7 +792,9 @@ mod tests {
         );
 
         match result {
-            CommandResult::OpenPath { path, ssh_config } => {
+            CommandResult::OpenPath {
+                path, ssh_config, ..
+            } => {
                 assert_eq!(path, "/srv/app/logs/app.log");
                 assert!(ssh_config.is_some());
             }

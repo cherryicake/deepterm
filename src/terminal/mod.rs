@@ -1,3 +1,4 @@
+pub mod file_link_detector;
 pub mod link_detector;
 pub mod mappings;
 pub mod terminal;
@@ -13,7 +14,8 @@ mod terminal_memory_tests;
 /// 的模块环（terminal 域常量属于 terminal 域）。
 pub const CTRL_V: u8 = 0x16;
 
-pub use link_detector::UrlRange;
+pub use file_link_detector::{FileHit, detect_files_in_line};
+pub use link_detector::{HyperlinkRange, UrlRange};
 pub use terminal::{
     DriverEvent, Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent,
     TerminalType,

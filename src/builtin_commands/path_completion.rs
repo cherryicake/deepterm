@@ -201,50 +201,13 @@ impl PathCompletionEngine {
     /// 解析带行号列号的路径（如 "file.txt:4:2"）。
     ///
     /// 返回 `(路径, 行号, 列号)`。行号和列号可能为 None。
+    /// 非数字尾段永不截断：`a:b` 返回 `("a:b", None, None)`。
     pub fn parse_line_column(path: &str) -> (String, Option<u32>, Option<u32>) {
         // 先处理转义
-        let path = Self::unescape_path(path);
-
-        // 从末尾查找 `:line:col` 或 `:line` 模式
-        let mut parts = vec![];
-        let mut current = String::new();
-
-        for c in path.chars() {
-            if c == ':' {
-                if !current.is_empty() {
-                    parts.push(current.clone());
-                    current.clear();
-                }
-            } else {
-                current.push(c);
-            }
-        }
-        if !current.is_empty() {
-            parts.push(current);
-        }
-
-        match parts.len() {
-            0 => (path, None, None),
-            1 => (parts[0].clone(), None, None),
-            2 => {
-                let line = parts[1].parse::<u32>().ok();
-                (parts[0].clone(), line, None)
-            }
-            3 => {
-                let line = parts[parts.len() - 2].parse::<u32>().ok();
-                let col = parts.last().unwrap().parse::<u32>().ok();
-                // 路径部分是除了最后两个数字部分之外的所有内容
-                let file_path = parts[..parts.len() - 2].join(":");
-                (file_path, line, col)
-            }
-            _ => {
-                // 多个冒号：最后两个是行号和列号，其余是路径
-                let line = parts[parts.len() - 2].parse::<u32>().ok();
-                let col = parts.last().unwrap().parse::<u32>().ok();
-                let file_path = parts[..parts.len() - 2].join(":");
-                (file_path, line, col)
-            }
-        }
+        let unescaped = Self::unescape_path(path);
+        let (file_path, line, col) =
+            crate::terminal::file_link_detector::split_line_column(&unescaped);
+        (file_path, line, col)
     }
 }
 

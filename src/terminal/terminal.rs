@@ -45,7 +45,8 @@ use crate::ssh::{
     keychain::{PreferredSshTransport, preferred_ssh_transport},
     platform::RemoteOS,
 };
-use crate::terminal::link_detector::UrlRange;
+use crate::terminal::file_link_detector::{FileHit, detect_files_in_joined_text};
+use crate::terminal::link_detector::{HyperlinkRange, UrlRange};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -452,6 +453,10 @@ pub struct TerminalContent {
     pub viewport_lines: usize,
     /// Per-row URL ranges detected in the current content.
     pub url_ranges: Vec<Vec<UrlRange>>,
+    /// Per-row OSC8 hyperlink ranges (preserved from `CellExtra::hyperlink`).
+    /// Same lazy lifecycle as `url_ranges`: only maintained while the
+    /// link-hover modifier is held. See `set_link_hover_active`.
+    pub hyperlink_ranges: Vec<Vec<HyperlinkRange>>,
     /// Current selection range, resolved while the term lock is already held
     /// in `update_last_content`. Read by the render hot path so it does not
     /// need to acquire the `FairMutex<Term>` a second time per frame.
@@ -476,6 +481,7 @@ impl Default for TerminalContent {
             total_lines: 24,
             viewport_lines: 24,
             url_ranges: Vec::new(),
+            hyperlink_ranges: Vec::new(),
             selection_range: None,
             palette: Default::default(),
         }
@@ -487,10 +493,10 @@ impl Default for TerminalContent {
 ///
 /// `IndexedCell.cell` stores this instead of a full `alacritty_terminal::Cell`
 /// so that the per-frame clone of every visible cell (see `update_last_content`)
-/// copies only `c`/`fg`/`bg`/`flags`/`underline_color` and skips the rest of the
-/// `Option<Arc<CellExtra>>` payload (`zerowidth` / `hyperlink`). The retained
-/// underline color feeds SGR 58 colored underlines; hyperlink support is pending
-/// (render currently detects URLs via regex, see `link_detector.rs`).
+/// copies only `c`/`fg`/`bg`/`flags`/`underline_color`. OSC8 hyperlinks are
+/// preserved separately as an interned `IndexedCell.hyperlink` (`None` for the
+/// vast majority of cells) so hover hit-testing can run without the term lock.
+/// See `link_detector::detect_hyperlinks_in_line`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedCell {
     pub c: char,
@@ -518,6 +524,11 @@ impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
 pub struct IndexedCell {
     pub point: AlacPoint,
     pub cell: PackedCell,
+    /// OSC8 hyperlink for this cell (`None` = no link).
+    /// alacritty's `Hyperlink` is `Arc`-backed, so snapshotting it per cell
+    /// costs one refcount bump and no string allocation; `id`/`uri` strings
+    /// are only materialized when grouping ranges for hover hit-testing.
+    pub hyperlink: Option<alacritty_terminal::term::cell::Hyperlink>,
 }
 
 /// 滚动区搜索命中：起点 / 终点为 grid 绝对坐标（同一行内，`end` 为开区间列）。
@@ -2026,9 +2037,15 @@ impl Terminal {
             cells.reserve(estimated_size);
         }
 
-        cells.extend(content.display_iter.map(|ic| IndexedCell {
-            point: ic.point,
-            cell: PackedCell::from(ic.cell),
+        cells.extend(content.display_iter.map(|ic| {
+            // `hyperlink()` is an `Arc` clone (no string allocation); the
+            // `id`/`uri` strings are only materialized when grouping ranges
+            // for hover hit-testing while the link modifier is held.
+            IndexedCell {
+                point: ic.point,
+                cell: PackedCell::from(ic.cell),
+                hyperlink: ic.cell.hyperlink(),
+            }
         }));
 
         let row_ranges = &mut self.last_content.row_ranges;
@@ -2067,19 +2084,32 @@ impl Terminal {
         self.last_content.palette =
             crate::terminal::mappings::colors::TerminalPalette::from_colors(term.colors());
 
-        // URL ranges are only consumed by link hover hit-testing. Skip the
-        // per-row regex scans while the hover modifier is not held.
-        let rebuild_all_urls = self.link_hover_active
-            && (force_full_damage || self.last_content.url_ranges.len() != row_ranges.len());
+        // URL + OSC8 ranges are only consumed by link hover hit-testing.
+        // Skip the per-row scans while the hover modifier is not held.
+        let rebuild_all_links = self.link_hover_active
+            && (force_full_damage
+                || self.last_content.url_ranges.len() != row_ranges.len()
+                || self.last_content.hyperlink_ranges.len() != row_ranges.len());
         if !self.link_hover_active {
             self.last_content.url_ranges.clear();
-        } else if rebuild_all_urls {
+            self.last_content.hyperlink_ranges.clear();
+        } else if rebuild_all_links {
             self.last_content.url_ranges.clear();
+            self.last_content.hyperlink_ranges.clear();
             self.last_content.url_ranges.reserve(row_ranges.len());
+            self.last_content
+                .hyperlink_ranges
+                .reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
                 let row_cells = &cells[*start..*end];
-                let ranges = crate::terminal::link_detector::detect_urls_in_line(row_cells);
-                self.last_content.url_ranges.push(ranges);
+                self.last_content
+                    .url_ranges
+                    .push(crate::terminal::link_detector::detect_urls_in_line(
+                        row_cells,
+                    ));
+                self.last_content.hyperlink_ranges.push(
+                    crate::terminal::link_detector::detect_hyperlinks_in_line(row_cells),
+                );
             }
         } else {
             for (row_idx, dirty) in self.dirty_rows.iter().copied().enumerate() {
@@ -2089,8 +2119,16 @@ impl Terminal {
                 let Some((start, end)) = row_ranges.get(row_idx).copied() else {
                     continue;
                 };
-                self.last_content.url_ranges[row_idx] =
-                    crate::terminal::link_detector::detect_urls_in_line(&cells[start..end]);
+                if row_idx < self.last_content.url_ranges.len() {
+                    self.last_content.url_ranges[row_idx] =
+                        crate::terminal::link_detector::detect_urls_in_line(&cells[start..end]);
+                }
+                if row_idx < self.last_content.hyperlink_ranges.len() {
+                    self.last_content.hyperlink_ranges[row_idx] =
+                        crate::terminal::link_detector::detect_hyperlinks_in_line(
+                            &cells[start..end],
+                        );
+                }
             }
         }
     }
@@ -2289,17 +2327,17 @@ impl Terminal {
         self.update_last_content(true);
     }
 
-    /// Enable or disable lazy URL-range maintenance.
+    /// Enable or disable lazy link-range maintenance (URL regex + OSC8).
     ///
     /// While enabled (link-hover modifier held), `update_last_content` keeps
-    /// `last_content.url_ranges` fresh for dirty rows. While disabled, all
-    /// URL work is skipped entirely: the ranges are only consumed by hover
-    /// hit-testing (`url_range_at_viewport_position`), so maintaining them on
-    /// every output frame is wasted regex scanning and allocation churn.
+    /// `last_content.url_ranges` / `hyperlink_ranges` fresh for dirty rows.
+    /// While disabled, all link work is skipped entirely: the ranges are only
+    /// consumed by hover hit-testing, so maintaining them on every output
+    /// frame is wasted scanning and allocation churn.
     ///
     /// Turning the flag on rebuilds all rows immediately from the cached
     /// content snapshot — no term lock is needed because `last_content` is
-    /// owned by `Self`.
+    /// owned by `Self` (hyperlinks are preserved per-cell, see `IndexedCell`).
     pub fn set_link_hover_active(&mut self, active: bool) {
         if self.link_hover_active == active {
             return;
@@ -2310,17 +2348,25 @@ impl Terminal {
                 cells,
                 row_ranges,
                 url_ranges,
+                hyperlink_ranges,
                 ..
             } = &mut self.last_content;
             url_ranges.clear();
+            hyperlink_ranges.clear();
             url_ranges.reserve(row_ranges.len());
+            hyperlink_ranges.reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
-                let ranges =
-                    crate::terminal::link_detector::detect_urls_in_line(&cells[*start..*end]);
-                url_ranges.push(ranges);
+                let row_cells = &cells[*start..*end];
+                url_ranges.push(crate::terminal::link_detector::detect_urls_in_line(
+                    row_cells,
+                ));
+                hyperlink_ranges.push(
+                    crate::terminal::link_detector::detect_hyperlinks_in_line(row_cells),
+                );
             }
         } else {
             self.last_content.url_ranges.clear();
+            self.last_content.hyperlink_ranges.clear();
         }
     }
 
@@ -2329,7 +2375,6 @@ impl Terminal {
     }
 
     /// Find a URL at the given viewport position.
-    /// Find a URL range at the given viewport position.
     /// Returns (url, start_col, end_col) if found.
     pub fn url_range_at_viewport_position(
         &self,
@@ -2346,6 +2391,98 @@ impl Terminal {
             }
         }
         None
+    }
+
+    /// Find an OSC8 hyperlink at the given viewport position.
+    /// Returns (uri, id, start_col, end_col) if found. Highest hit-test
+    /// priority: explicit links beat regex-guessed URLs/paths.
+    pub fn hyperlink_range_at_viewport_position(
+        &self,
+        viewport_row: usize,
+        col: usize,
+    ) -> Option<(String, String, usize, usize)> {
+        let content = &self.last_content;
+        if viewport_row >= content.hyperlink_ranges.len() {
+            return None;
+        }
+        for range in &content.hyperlink_ranges[viewport_row] {
+            if col >= range.start_col && col < range.end_col {
+                return Some((
+                    range.uri.clone(),
+                    range.id.clone(),
+                    range.start_col,
+                    range.end_col,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Whether the viewport row is soft-wrapped onto the next row.
+    pub fn viewport_row_wrapped(&self, viewport_row: usize) -> bool {
+        let content = &self.last_content;
+        let Some((start, end)) = content.row_ranges.get(viewport_row).copied() else {
+            return false;
+        };
+        if start >= end {
+            return false;
+        }
+        content.cells[start..end].iter().any(|c| {
+            c.cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WRAPLINE)
+        })
+    }
+
+    /// File-path candidate under a viewport position (for `Cmd+Click`).
+    /// Handles soft-wrapped rows by joining the continuation row, but only
+    /// returns hits overlapping the *clicked* row so hover never highlights
+    /// the next row's text.
+    pub fn file_hit_at_viewport_position(
+        &self,
+        viewport_row: usize,
+        col: usize,
+    ) -> Option<FileHit> {
+        use crate::terminal::file_link_detector::{
+            detect_files_in_line, file_hit_at_col,
+        };
+        let content = &self.last_content;
+        let (start, end) = content.row_ranges.get(viewport_row).copied()?;
+        let row_cells = &content.cells[start..end];
+        // Fast path: no wrap continuation.
+        if !self.viewport_row_wrapped(viewport_row)
+            || viewport_row + 1 >= content.row_ranges.len()
+        {
+            let hits = detect_files_in_line(row_cells);
+            return file_hit_at_col(&hits, col).cloned();
+        }
+        // Wrapped: join current + next row text; column mapping only covers
+        // the first row (detect_files_in_joined_text filters by byte len).
+        let (nstart, nend) = content.row_ranges.get(viewport_row + 1).copied()?;
+        let mut joined = String::new();
+        for cell in row_cells.iter().chain(content.cells[nstart..nend].iter()) {
+            let ch = cell.cell.c;
+            if ch == ' ' {
+                continue;
+            }
+            joined.push(ch);
+        }
+        let mut first_text = String::new();
+        let mut first_map: Vec<usize> = Vec::new();
+        for cell in row_cells {
+            let ch = cell.cell.c;
+            if ch == ' ' {
+                continue;
+            }
+            let c = cell.point.column.0;
+            for _ in 0..ch.len_utf8() {
+                first_map.push(c);
+            }
+            first_text.push(ch);
+        }
+        let first_row_bytes = first_text.len();
+        let hits = detect_files_in_joined_text(&joined, &first_map, first_row_bytes);
+        file_hit_at_col(&hits, col).cloned()
     }
 
     /// Get the total number of lines in the terminal including scrollback history

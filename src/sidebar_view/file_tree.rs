@@ -242,6 +242,103 @@ impl SidebarFileTree {
         &self.root_path
     }
 
+    /// Terminal `Cmd+Click` reveal: expand ancestor chain + select + scroll
+    /// into view **without** switching `root_path`.
+    ///
+    /// Returns `false` when `path` is outside the current root (the file-tree
+    /// root always equals the terminal cwd, so callers keep it as-is; files
+    /// outside the root still open in the editor).
+    /// Missing intermediate directories are loaded asynchronously; the
+    /// selection lands once their listings arrive (via the normal
+    /// `load_directory` completion → `flat_cache` rebuild).
+    pub fn reveal(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        if !path.starts_with(&self.root_path) {
+            return false;
+        }
+        // Expand every ancestor from root down to the parent.
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut cur = path.clone();
+        // Kind of the target as far as the loader knows (`None` = the parent
+        // listing hasn't arrived yet).
+        let target_kind = self
+            .loader
+            .get_cached(path.parent().unwrap_or(&self.root_path))
+            .and_then(|entries| entries.iter().find(|e| e.path == path))
+            .map(|e| e.kind.clone());
+        loop {
+            let Some(parent) = cur.parent().map(Path::to_path_buf) else {
+                break;
+            };
+            if parent.starts_with(&self.root_path) {
+                if parent != cur {
+                    ancestors.push(parent.clone());
+                }
+                if parent == self.root_path {
+                    break;
+                }
+                cur = parent;
+            } else {
+                break;
+            }
+        }
+        ancestors.reverse();
+        // Expand the target itself only when it is known to be a directory,
+        // or when its kind is still unknown (parent listing in flight):
+        // clicking an `ls` directory then expands as soon as it is listed.
+        // Known files (`Makefile`, `LICENSE`, …) are never expanded, so no
+        // doomed `load_directory` warn-spam and no stale `expanded_folders`.
+        if target_kind == Some(FileEntryKind::Directory) || target_kind.is_none() {
+            if path != self.root_path {
+                ancestors.push(path.clone());
+            }
+        }
+        let mut newly_expanded = false;
+        for dir in ancestors {
+            if dir == self.root_path {
+                if !self.root_expanded {
+                    self.root_expanded = true;
+                    newly_expanded = true;
+                }
+                if !self.loader.has_cached(&dir) && !self.loader.is_loading(&dir) {
+                    self.load_directory(dir, cx);
+                }
+                continue;
+            }
+            if !self.expanded_folders.contains(&dir) {
+                self.expanded_folders.insert(dir.clone());
+                newly_expanded = true;
+                if !self.loader.has_cached(&dir) && !self.loader.is_loading(&dir) {
+                    self.load_directory(dir.clone(), cx);
+                }
+                if !self.loader.is_local() && self.watched_paths.insert(dir.clone()) {
+                    cx.watch_remote_path(&dir, self.loader.backend().clone());
+                }
+            }
+        }
+        self.selected_path = Some(path.clone());
+        if newly_expanded {
+            self.invalidate_flat_cache();
+        }
+        // Scroll to the revealed row when the flat list already contains it.
+        // When ancestors are still loading, the row appears after their
+        // completion; selection is already set so the next render highlights
+        // it, and a follow-up `reveal` (or watcher refresh) scrolls to it.
+        let flat: Vec<(FileEntry, usize)> = if let Some(flat) = self.flat_cache.clone() {
+            flat
+        } else {
+            let mut flat = Vec::new();
+            self.build_flat_list(&self.root_path.clone(), 0, &mut flat);
+            self.flat_cache = Some(flat.clone());
+            flat
+        };
+        if let Some(ix) = flat.iter().position(|(e, _)| e.path == path) {
+            self.scroll_handle
+                .scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        }
+        cx.notify();
+        true
+    }
+
     fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
         // 事件按来源后端过滤：多台服务器可能 watch 同一路径（两个终端 tab 连
         // 不同主机、cwd 都是 /root），只应用来自自己后端的事件，否则 A 服务器的

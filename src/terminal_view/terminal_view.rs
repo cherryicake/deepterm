@@ -26,10 +26,15 @@ pub enum Event {
     CloseTerminal,
     /// 子进程退出（带退出状态）
     ProcessExited(i32),
-    /// Open a file or directory in the editor or file tree
+    /// Open a file or directory in the editor or file tree.
+    /// `terminal_cwd` is this terminal's working directory: the file-tree
+    /// root always equals it, clicked subdirectories only reveal inside it.
     OpenPath {
         path: String,
+        line: Option<u32>,
+        col: Option<u32>,
         ssh_config: Option<SshConnectionConfig>,
+        terminal_cwd: Option<String>,
     },
     /// 发起一次文件传输（由 /scp 等内建命令触发）
     StartTransfer {
@@ -220,10 +225,78 @@ enum BuiltinExecMode {
 /// 当前鼠标悬停的可点击链接信息。
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoveredLink {
+    pub kind: HoveredLinkKind,
     pub url: SharedString,
     pub row: usize,
     pub start_col: usize,
     pub end_col: usize,
+    /// Resolved absolute path for file links (local path or remote path).
+    pub resolved_path: Option<String>,
+    pub line: Option<u32>,
+    pub col: Option<u32>,
+    pub ssh_config: Option<SshConnectionConfig>,
+}
+
+/// Hovered link kind. Hit-test priority: `OscHyperlink > Url > FilePath`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoveredLinkKind {
+    /// Regex-detected `http(s)` URL.
+    Url,
+    /// Explicit OSC8 hyperlink (`file://` or `http(s)`).
+    OscHyperlink,
+    /// Inferred file path (`ls` output, `file:line:col`).
+    FilePath,
+}
+
+fn decode_pct_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                && let Ok(v) = u8::from_str_radix(hex, 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract a local absolute path from an OSC8 `file://` URI.
+/// `file:///etc/hosts` / `file://localhost/etc/hosts` → `/etc/hosts`.
+fn parse_file_uri_local_path(uri: &str) -> Option<std::path::PathBuf> {
+    let trimmed = uri.trim();
+    // `get(..7)` 而非 `&trimmed[..7]`：OSC8 内容完全由终端输出控制，
+    // 首部含多字节字符时字节切片会 panic。
+    if !trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+    {
+        return None;
+    }
+    let rest = &trimmed[7..];
+    // Split `host/path`; empty/localhost host means local path.
+    let path = match rest.find('/') {
+        Some(idx) => &rest[idx..],
+        None => return None,
+    };
+    let decoded = decode_pct_path(path);
+    if !decoded.starts_with('/') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(decoded))
+}
+
+/// Extract a remote absolute path from an OSC8 `file://` URI.
+/// The host part is the *remote* host by construction (bytes came from SSH).
+fn parse_file_uri_remote_path(uri: &str) -> Option<String> {
+    parse_file_uri_local_path(uri).map(|p| p.to_string_lossy().to_string())
 }
 
 /// 终端滚动区搜索状态（由 Cmd-F / Ctrl-Shift-F 激活）。
@@ -355,6 +428,10 @@ pub struct TerminalView {
     /// move. Transitions are forwarded to `Terminal::set_link_hover_active`
     /// so URL detection runs only while links are actually hoverable.
     link_modifier_held: bool,
+    /// 文件悬停的存在性校验缓存：`Cmd` 按住划过同一文件时避免每个
+    /// mousemove 都做一次 `metadata` syscall。短 TTL（新建/删除文件后
+    /// 最多延迟片刻即刷新），有界防止无限增长。
+    file_hover_stat_cache: std::collections::HashMap<PathBuf, (bool, Instant)>,
     /// Per-row render cache, indexed by viewport row (0 = top).
     pub row_render_cache: Vec<RowRenderCache>,
     /// Flattened render data reused across frames when nothing changed.
@@ -701,6 +778,7 @@ impl TerminalView {
             search_generation: 0,
             search_last_schedule: None,
             link_modifier_held: false,
+            file_hover_stat_cache: std::collections::HashMap::new(),
             row_render_cache: Vec::new(),
             flattened_render_cache: FlattenedRenderCache::default(),
             cached_theme_id: None,
@@ -932,6 +1010,7 @@ impl TerminalView {
                 search_generation: 0,
                 search_last_schedule: None,
                 link_modifier_held: false,
+                file_hover_stat_cache: std::collections::HashMap::new(),
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
                 cached_theme_id: None,
@@ -1199,6 +1278,342 @@ impl TerminalView {
                     .map(String::from)
             })
             .or_else(|| self.pending_remote_cwd_restore.clone())
+    }
+
+        /// Hover at a view position: ensure link ranges are maintained, map the
+    /// pixels to a grid cell, hit-test, and refresh `hovered_link`.
+    /// Shared by mouse-move hover and mouse-down click (click must not rely
+    /// on a possibly stale/missing hover cache).
+    fn hover_at_position(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<HoveredLink> {
+        if !self.link_modifier_held {
+            self.link_modifier_held = true;
+            self.terminal.update(cx, |terminal, _cx| {
+                terminal.set_link_hover_active(true);
+            });
+        }
+        let (row, col) = {
+            let terminal = self.terminal.read(cx);
+            let rel = position - terminal.terminal_bounds.bounds.origin;
+            if rel.x < px(0.0) || rel.y < px(0.0) {
+                return None;
+            }
+            let cell_width = terminal.terminal_bounds.cell_width;
+            let line_height = terminal.terminal_bounds.line_height;
+            let content = terminal.last_content();
+            let col = (rel.x.as_f32() / cell_width.as_f32()).floor() as usize;
+            let row = (rel.y.as_f32() / line_height.as_f32()).floor() as usize;
+            if col >= content.cols || row >= content.rows {
+                return None;
+            }
+            (row, col)
+        };
+        let link = self.hit_test_link(row, col, cx);
+        if self.hovered_link != link {
+            self.hovered_link = link.clone();
+            cx.notify();
+        }
+        link
+    }
+
+    /// Activate a hovered link. Returns true when the click is consumed
+    /// (opened or deliberately swallowed) and must not start a selection.
+    fn activate_hovered_link(
+        &self,
+        link: &HoveredLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match link.kind {
+            HoveredLinkKind::Url => {
+                // 关键安全：仅 http(s) 经白名单二次校验后外部打开。
+                crate::utils::safe_open::open_url_safely(link.url.as_ref());
+                true
+            }
+            HoveredLinkKind::OscHyperlink => {
+                let lower = link.url.as_ref().to_ascii_lowercase();
+                if lower.starts_with("http://") || lower.starts_with("https://") {
+                    crate::utils::safe_open::open_url_safely(link.url.as_ref());
+                    return true;
+                }
+                // `file://` OSC8: fall through to OpenPath.
+                if let Some(ref resolved) = link.resolved_path {
+                    self.emit_open_path_for_link(
+                        resolved.clone(),
+                        link.line,
+                        link.col,
+                        link.ssh_config.clone(),
+                        window,
+                        cx,
+                    );
+                    return true;
+                }
+                // Unknown scheme: swallow the click so it
+                // never starts a text selection.
+                true
+            }
+            HoveredLinkKind::FilePath => {
+                if let Some(ref resolved) = link.resolved_path {
+                    self.emit_open_path_for_link(
+                        resolved.clone(),
+                        link.line,
+                        link.col,
+                        link.ssh_config.clone(),
+                        window,
+                        cx,
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    /// Hit-test a grid position while the link modifier is held.
+    /// Priority: OSC8 hyperlink > URL regex > inferred file path.
+    /// Each terminal read is scoped so the `&mut self` file-hit below never
+    /// aliases a live borrow.
+    fn hit_test_link(&mut self, row: usize, col: usize, cx: &App) -> Option<HoveredLink> {
+        // 1. Explicit OSC8 hyperlink (highest priority).
+        let osc = self
+            .terminal
+            .read(cx)
+            .hyperlink_range_at_viewport_position(row, col);
+        if let Some((uri, _id, start_col, end_col)) = osc
+            && let Some(link) = self.hovered_for_osc_uri(&uri, row, col, start_col, end_col, cx)
+        {
+            return Some(link);
+        }
+        // Unknown scheme: fall through to URL/file detection on the
+        // display text (the visible filename may still be clickable).
+        // 2. Regex URL.
+        let url = self
+            .terminal
+            .read(cx)
+            .url_range_at_viewport_position(row, col);
+        if let Some((url, start_col, end_col)) = url {
+            return Some(HoveredLink {
+                kind: HoveredLinkKind::Url,
+                url,
+                row,
+                start_col,
+                end_col,
+                resolved_path: None,
+                line: None,
+                col: None,
+                ssh_config: None,
+            });
+        }
+        // 3. Inferred file path.
+        let hit = self
+            .terminal
+            .read(cx)
+            .file_hit_at_viewport_position(row, col)?;
+        self.hovered_for_file_hit(&hit, row, cx)
+    }
+
+    fn hovered_for_osc_uri(
+        &mut self,
+        uri: &str,
+        row: usize,
+        col: usize,
+        start_col: usize,
+        end_col: usize,
+        cx: &App,
+    ) -> Option<HoveredLink> {
+        let trimmed = uri.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Some(HoveredLink {
+                kind: HoveredLinkKind::OscHyperlink,
+                url: trimmed.to_string().into(),
+                row,
+                start_col,
+                end_col,
+                resolved_path: None,
+                line: None,
+                col: None,
+                ssh_config: None,
+            });
+        }
+        if lower.starts_with("file://") {
+            // Display text may carry `:line:col` (e.g. `foo.rs:12` linked to
+            // `file:///abs/foo.rs`); reuse the file detector for the suffix.
+            let (line, col_num) = self
+                .terminal
+                .read(cx)
+                .file_hit_at_viewport_position(row, col)
+                .map(|h| (h.line, h.col))
+                .unwrap_or((None, None));
+            let is_remote = self.ssh_config.is_some();
+            if is_remote {
+                let remote_path = parse_file_uri_remote_path(trimmed)?;
+                return Some(HoveredLink {
+                    kind: HoveredLinkKind::OscHyperlink,
+                    url: trimmed.to_string().into(),
+                    row,
+                    start_col,
+                    end_col,
+                    resolved_path: Some(remote_path),
+                    line,
+                    col: col_num,
+                    ssh_config: self.ssh_config.clone(),
+                });
+            }
+            let local_path = parse_file_uri_local_path(trimmed)?;
+            // Local OSC8 file links point at absolute paths; still verify
+            // existence so stale links never navigate (cached, see hover).
+            if !self.cached_path_exists(&local_path) {
+                return None;
+            }
+            return Some(HoveredLink {
+                kind: HoveredLinkKind::OscHyperlink,
+                url: trimmed.to_string().into(),
+                row,
+                start_col,
+                end_col,
+                resolved_path: Some(local_path.to_string_lossy().to_string()),
+                line,
+                col: col_num,
+                ssh_config: None,
+            });
+        }
+        None
+    }
+
+    fn hovered_for_file_hit(
+        &mut self,
+        hit: &crate::terminal::file_link_detector::FileHit,
+        row: usize,
+        cx: &App,
+    ) -> Option<HoveredLink> {
+        if let Some(ssh_config) = self.ssh_config.clone() {
+            let cwd = self.current_remote_working_directory(cx);
+            let resolved = crate::builtin_commands::PathResolver::resolve_remote(
+                &hit.path,
+                cwd.as_deref(),
+            )?;
+            // Hover shows immediately; existence is validated asynchronously
+            // on click (SFTP round-trip must not block mouse-move).
+            return Some(HoveredLink {
+                kind: HoveredLinkKind::FilePath,
+                url: hit.raw.clone().into(),
+                row,
+                start_col: hit.start_col,
+                end_col: hit.end_col,
+                resolved_path: Some(resolved),
+                line: hit.line,
+                col: hit.col,
+                ssh_config: Some(ssh_config),
+            });
+        }
+        let cwd = self.current_local_working_directory(cx);
+        let ctx = crate::builtin_commands::LocalPathContext {
+            working_directory: cwd.clone(),
+            process_cwd: cwd,
+        };
+        let resolved =
+            crate::builtin_commands::PathResolver::resolve_local(&hit.path, &ctx);
+        // Existence check kills false positives (`ls` prose vs real files).
+        // Both files and directories are clickable. Cached with a short TTL
+        // so sweeping the mouse across one file doesn't stat per mousemove.
+        if !self.cached_path_exists(&resolved) {
+            return None;
+        }
+        Some(HoveredLink {
+            kind: HoveredLinkKind::FilePath,
+            url: hit.raw.clone().into(),
+            row,
+            start_col: hit.start_col,
+            end_col: hit.end_col,
+            resolved_path: Some(resolved.to_string_lossy().to_string()),
+            line: hit.line,
+            col: hit.col,
+            ssh_config: None,
+        })
+    }
+
+    /// Cached `metadata` existence check for link hover (short TTL, bounded).
+    fn cached_path_exists(&mut self, path: &std::path::Path) -> bool {
+        const TTL: Duration = Duration::from_secs(2);
+        const MAX_ENTRIES: usize = 256;
+        if let Some((exists, at)) = self.file_hover_stat_cache.get(path) {
+            if at.elapsed() < TTL {
+                return *exists;
+            }
+        }
+        let exists = std::fs::metadata(path).is_ok();
+        if self.file_hover_stat_cache.len() >= MAX_ENTRIES {
+            self.file_hover_stat_cache.clear();
+        }
+        self.file_hover_stat_cache
+            .insert(path.to_path_buf(), (exists, Instant::now()));
+        exists
+    }
+
+    /// Emit `Event::OpenPath` for a clicked link. Remote paths are validated
+    /// asynchronously (SFTP `metadata`) so a stale hover never opens an
+    /// error tab; local paths were already validated on hover.
+    fn emit_open_path_for_link(
+        &self,
+        resolved: String,
+        line: Option<u32>,
+        col: Option<u32>,
+        ssh_config: Option<SshConnectionConfig>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ssh_config) = ssh_config else {
+            let terminal_cwd = self
+                .current_local_working_directory(cx)
+                .map(|p| p.to_string_lossy().to_string());
+            cx.emit(Event::OpenPath {
+                path: resolved,
+                line,
+                col,
+                ssh_config: None,
+                terminal_cwd,
+            });
+            return;
+        };
+        // Remote: validate existence in the background, then emit.
+        // NOTE: terminal_cwd is read inside the update below (at validation
+        // completion time) so a `cd` during the SFTP round-trip still lands
+        // the tree on the fresh cwd.
+        cx.spawn(async move |this, cx| {
+            let exists = cx
+                .background_executor()
+                .spawn({
+                    let ssh_config = ssh_config.clone();
+                    let resolved = resolved.clone();
+                    async move {
+                        use crate::file_manager::filesystem::FileSystem;
+                        let backend = crate::file_manager::filesystem::RemoteFileSystem::new(
+                            ssh_config,
+                        );
+                        backend
+                            .metadata(&std::path::PathBuf::from(&resolved))
+                            .is_ok()
+                    }
+                })
+                .await;
+            if !exists {
+                log::warn!("Cmd+Click: remote path does not exist: {resolved:?}");
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                cx.emit(Event::OpenPath {
+                    path: resolved,
+                    line,
+                    col,
+                    ssh_config: Some(ssh_config),
+                    terminal_cwd: this.current_remote_working_directory(cx),
+                });
+            });
+        })
+        .detach();
     }
 
     pub fn title(&self) -> SharedString {
@@ -1933,11 +2348,20 @@ impl TerminalView {
         };
 
         match &result {
-            Some(CommandResult::OpenPath { path, ssh_config }) => {
+            Some(CommandResult::OpenPath {
+                path,
+                line,
+                col,
+                ssh_config,
+                terminal_cwd,
+            }) => {
                 // 打开编辑器 / 文件树不是弹窗，广播接收方也按各自上下文打开
                 cx.emit(Event::OpenPath {
                     path: path.clone(),
+                    line: *line,
+                    col: *col,
                     ssh_config: ssh_config.clone(),
+                    terminal_cwd: terminal_cwd.clone(),
                 });
             }
             Some(CommandResult::StartTransfer { request }) => {
@@ -3554,18 +3978,22 @@ impl Render for TerminalView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     #[cfg(target_os = "macos")]
                     let is_cmd = event.modifiers.platform;
                     #[cfg(not(target_os = "macos"))]
                     let is_cmd = event.modifiers.control;
 
                     if is_cmd {
-                        if let Some(ref link) = this.hovered_link {
-                            // 关键安全：终端链接经 link_detector 识别（仅 http/www），
-                            // 此处再经白名单二次校验，防御未来识别器放宽后的风险。
-                            crate::utils::safe_open::open_url_safely(link.url.as_ref());
-                            return;
+                        // 按点击坐标实时重算，不依赖 hover 缓存：
+                        // 按住修饰键后不移动鼠标直接点击、或点击前终端有新输出
+                        // 滚动时，缓存的行列可能为空或已指向别的文本。
+                        if let Some(link) = this.hover_at_position(event.position, cx) {
+                            if this.activate_hovered_link(&link, window, cx) {
+                                return;
+                            }
+                        } else if this.hovered_link.take().is_some() {
+                            cx.notify();
                         }
                     }
 
@@ -3636,48 +4064,16 @@ impl Render for TerminalView {
                 #[cfg(not(target_os = "macos"))]
                 let modifiers_pressed = event.modifiers.control;
 
-                // Forward modifier transitions so the terminal only maintains
-                // URL ranges (regex scan per dirty row per frame) while links
-                // are actually hoverable.
-                if this.link_modifier_held != modifiers_pressed {
-                    this.link_modifier_held = modifiers_pressed;
+                // Link hover detection (only when modifier is held).
+                // Priority: OSC8 hyperlink > URL regex > inferred file path.
+                // `hover_at_position` 负责修饰键按下沿的 ranges 激活与 hover 刷新。
+                if modifiers_pressed {
+                    this.hover_at_position(event.position, cx);
+                } else if this.hovered_link.take().is_some() {
+                    // 修饰键松开：清除悬停（hover_at_position 只负责置位）。
                     this.terminal.update(cx, |terminal, _cx| {
-                        terminal.set_link_hover_active(modifiers_pressed);
+                        terminal.set_link_hover_active(false);
                     });
-                }
-
-                // URL hover detection (only when modifier is held)
-                let link = if modifiers_pressed {
-                    this.terminal.update(cx, |terminal, _cx| {
-                        let position = event.position - terminal.terminal_bounds.bounds.origin;
-                        let cell_width = terminal.terminal_bounds.cell_width;
-                        let line_height = terminal.terminal_bounds.line_height;
-                        let content = terminal.last_content();
-
-                        if position.x < px(0.0) || position.y < px(0.0) {
-                            return None;
-                        }
-                        let col = (position.x.as_f32() / cell_width.as_f32()).floor() as usize;
-                        let row = (position.y.as_f32() / line_height.as_f32()).floor() as usize;
-                        if col >= content.cols || row >= content.rows {
-                            return None;
-                        }
-                        terminal.url_range_at_viewport_position(row, col).map(
-                            |(url, start_col, end_col)| HoveredLink {
-                                url,
-                                row,
-                                start_col,
-                                end_col,
-                            },
-                        )
-                    })
-                } else {
-                    None
-                };
-
-                let link_changed = this.hovered_link != link;
-                this.hovered_link = link;
-                if link_changed {
                     cx.notify();
                 }
 

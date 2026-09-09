@@ -19,6 +19,64 @@ pub struct UrlRange {
     pub url: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HyperlinkRange {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub uri: String,
+    pub id: String,
+}
+
+/// Group contiguous cells carrying the same OSC8 hyperlink (`id` + `uri`)
+/// into per-row ranges. Built from the `IndexedCell.hyperlink` snapshot so
+/// `set_link_hover_active` can rebuild without holding the term lock.
+pub fn detect_hyperlinks_in_line(cells: &[IndexedCell]) -> Vec<HyperlinkRange> {
+    fn flush(
+        current: &mut Option<(String, String, usize, usize)>,
+        ranges: &mut Vec<HyperlinkRange>,
+    ) {
+        if let Some((id, uri, start, end)) = current.take() {
+            ranges.push(HyperlinkRange {
+                start_col: start,
+                end_col: end,
+                uri,
+                id,
+            });
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut current: Option<(String, String, usize, usize)> = None;
+
+    for cell in cells {
+        let col = cell.point.column.0;
+        let Some(link) = cell.hyperlink.as_ref().filter(|l| !l.uri().is_empty()) else {
+            flush(&mut current, &mut ranges);
+            continue;
+        };
+        // Extend only when the same link continues in the very next column;
+        // any gap or link change closes the run so hit-test columns stay exact.
+        let continues = matches!(&current,
+            Some((cur_id, cur_uri, _, cur_end))
+                if cur_id == link.id() && cur_uri == link.uri() && col == *cur_end);
+        if continues {
+            if let Some((_, _, _, cur_end)) = current.as_mut() {
+                *cur_end = col + 1;
+            }
+            continue;
+        }
+        flush(&mut current, &mut ranges);
+        current = Some((
+            link.id().to_owned(),
+            link.uri().to_owned(),
+            col,
+            col + 1,
+        ));
+    }
+    flush(&mut current, &mut ranges);
+    ranges
+}
+
 pub fn detect_urls_in_line(cells: &[IndexedCell]) -> Vec<UrlRange> {
     let mut text = String::new();
     // byte_offset -> column mapping: for each byte in text, which column it belongs to

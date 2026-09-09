@@ -271,6 +271,8 @@ pub struct Editor {
     editor_state_subscriptions: HashMap<SharedString, Subscription>,
     /// tab_id -> in-flight load generation (supersedes stale tasks after tab-group swap).
     loading_gens: HashMap<String, u64>,
+    /// tab_id -> pending `Cmd+Click` line/col jump (applied after async load).
+    pending_jumps: HashMap<String, (u32, Option<u32>)>,
     /// 跳转到行面板（cmd-l / ctrl-g 切换）。
     goto_line_panel: Option<Entity<goto_line::GotoLinePanel>>,
     /// 语言选择弹出菜单（状态栏语言 chip 点击时创建）。
@@ -313,6 +315,7 @@ impl Editor {
             remote_watcher_subscription: None,
             editor_state_subscriptions: HashMap::new(),
             loading_gens: HashMap::new(),
+            pending_jumps: HashMap::new(),
             goto_line_panel: None,
             language_menu: None,
             _language_menu_subscription: None,
@@ -1281,6 +1284,83 @@ impl Editor {
         self.open_local_file(path, window, cx, false);
     }
 
+    /// Terminal `Cmd+Click`: open local file and jump to `line:col`.
+    pub fn open_file_at_line_col_no_notify(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        col: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_local_file_at(path, window, cx, false, line, col);
+    }
+
+    /// Terminal `Cmd+Click`: open remote file and jump to `line:col`.
+    pub fn open_remote_file_at_line_col_no_notify(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        line: Option<u32>,
+        col: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote_file_at(path, ssh_config, window, cx, false, line, col);
+    }
+
+    /// Apply a `line:col` jump to an already-open tab. No-op when `line` is
+    /// `None` or the tab is still loading (caller should use `pending_jumps`).
+    pub fn jump_to_line_col(
+        &mut self,
+        tab_id: &str,
+        line: u32,
+        col: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::input::RopeExt;
+        let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) else {
+            return;
+        };
+        // 图片/二进制预览没有文本行概念：只切换、不跳转。
+        if crate::editor::image_viewer::is_image_file(Path::new(&file.path)) {
+            self.switch_to_file(tab_id, cx);
+            return;
+        }
+        if file.is_loading {
+            self.pending_jumps
+                .insert(tab_id.to_string(), (line, col));
+            self.switch_to_file(tab_id, cx);
+            return;
+        }
+        let editor_state = file.editor_state.clone();
+        editor_state.update(cx, |state, cx| {
+            let total = state.text().lines_len().max(1);
+            let line = (line as usize).clamp(1, total);
+            let col = col.unwrap_or(1).max(1) as usize;
+            let row = line - 1;
+            let line_start = state.text().line_start_offset(row);
+            let line_end = state.text().line_content_end_offset(row);
+            let mut offset = line_start;
+            let mut remaining = col - 1;
+            for ch in state.text().slice(line_start..line_end).chars() {
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                offset += ch.len_utf8();
+            }
+            state.selected_range = (offset..offset).into();
+            state.scroll_to_center(offset, cx);
+            cx.notify();
+        });
+        self.switch_to_file(tab_id, cx);
+    }
+
+    fn take_pending_jump(&mut self, tab_id: &str) -> Option<(u32, Option<u32>)> {
+        self.pending_jumps.remove(tab_id)
+    }
+
     /// Opens the diff tab instantly; content loads in the background.
     pub fn open_diff_file_loading(
         &mut self,
@@ -1375,6 +1455,42 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
     ) {
+        self.open_local_file_inner(path, window, cx, notify_app, false);
+    }
+
+    fn open_local_file_at(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) {
+        let path_str = path.to_string_lossy().to_string();
+        let tab_id = format!("editor-{}", path_str);
+        // Already open (or loading): switch + jump (or defer via pending).
+        if self.open_files.iter().any(|f| f.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            if let Some(line) = line {
+                self.jump_to_line_col(&tab_id, line, col, cx);
+            }
+            return;
+        }
+        if self.loading_gens.contains_key(&tab_id) {
+            if let Some(line) = line {
+                self.pending_jumps.insert(tab_id, (line, col));
+            }
+            return;
+        }
+        // 图片走 ImageViewer，没有行列概念：不记录 pending，避免泄漏后误跳。
+        if line.is_some() && crate::editor::image_viewer::is_image_file(&path) {
+            self.open_local_file_inner(path, window, cx, notify_app, false);
+            return;
+        }
+        if let Some(line) = line {
+            self.pending_jumps.insert(tab_id.clone(), (line, col));
+        }
         self.open_local_file_inner(path, window, cx, notify_app, false);
     }
 
@@ -1514,6 +1630,11 @@ impl Editor {
                                 // 后台计算 Git 行变更标记（行号区色条）
                                 this.refresh_git_marks(&tab_id, cx);
                             }
+                            // Terminal Cmd+Click deferred jump: content just
+                            // arrived, apply line:col now (clamped to total).
+                            if let Some((line, col)) = this.take_pending_jump(&tab_id) {
+                                this.jump_to_line_col(&tab_id, line, col, cx);
+                            }
                             let file_path = this
                                 .open_files
                                 .iter()
@@ -1595,6 +1716,57 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.open_remote_file_inner(path, ssh_config, window, cx, false, false);
+    }
+
+    fn open_remote_file_at(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        notify_app: bool,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) {
+        let tab_id = format!("editor-remote-{}", path);
+        if self.open_files.iter().any(|f| f.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            if let Some(line) = line {
+                self.jump_to_line_col(&tab_id, line, col, cx);
+            }
+            return;
+        }
+        if self.loading_gens.contains_key(&tab_id) {
+            if let Some(line) = line {
+                self.pending_jumps.insert(tab_id, (line, col));
+            }
+            return;
+        }
+        // 图片走 ImageViewer，没有行列概念：不记录 pending，避免泄漏后误跳。
+        if line.is_some()
+            && crate::editor::image_viewer::is_image_file(std::path::Path::new(&path))
+        {
+            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false);
+            return;
+        }
+        if let Some(line) = line {
+            self.pending_jumps.insert(tab_id.clone(), (line, col));
+        }
+        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false);
+        // Cached remote files open synchronously (`is_loading=false`):
+        // apply the pending jump immediately instead of waiting for a load.
+        if let Some((line, col)) = self.take_pending_jump(&tab_id) {
+            let still_loading = self
+                .open_files
+                .iter()
+                .find(|f| f.id.as_ref() == tab_id.as_str())
+                .is_some_and(|f| f.is_loading);
+            if still_loading {
+                self.pending_jumps.insert(tab_id.clone(), (line, col));
+            } else {
+                self.jump_to_line_col(&tab_id, line, col, cx);
+            }
+        }
     }
 
     /// 在 Markdown 预览中双击：以纯编辑模式（代码编辑器）在新 tab 中打开同一远程文件。
@@ -1864,6 +2036,8 @@ impl Editor {
                                 return;
                             }
                             this.loading_gens.remove(&tab_id);
+                            // 图片没有行列概念：丢弃可能残留的 Cmd+Click pending 跳转。
+                            this.pending_jumps.remove(&tab_id);
                             if let Some(file) = this.open_files.iter_mut().find(|f| f.id == tab_id)
                             {
                                 file.is_loading = false;
@@ -2355,6 +2529,7 @@ impl Editor {
     /// - 文件加载失败后关闭（加载失败的文件保持 disabled，不可能有未保存内容）。
     fn close_file_direct(&mut self, id: &str, cx: &mut Context<Self>) {
         self.loading_gens.remove(id);
+        self.pending_jumps.remove(id);
         self.editor_state_subscriptions.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {

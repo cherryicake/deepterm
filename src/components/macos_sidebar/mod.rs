@@ -415,6 +415,11 @@ impl MacosSidebar {
         self.file_tree_terminal_view.clone()
     }
 
+    /// Current file-tree view, if any (for terminal `Cmd+Click` reveal).
+    pub fn file_tree_view(&self) -> Option<Entity<SidebarFileTree>> {
+        self.file_tree_view.clone()
+    }
+
     /// 设置字体设置视图
     pub fn set_font_view(&mut self, view: Entity<FontSettingsView>) {
         self.font_view = Some(view);

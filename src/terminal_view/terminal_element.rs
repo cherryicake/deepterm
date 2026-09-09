@@ -2433,6 +2433,7 @@ mod tests {
                             cell: crate::terminal::terminal::PackedCell::from(
                                 &alacritty_terminal::term::cell::Cell::default(),
                             ),
+                            hyperlink: None,
                         })
                         .collect()
                 })

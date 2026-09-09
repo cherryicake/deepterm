@@ -72,7 +72,10 @@ pub enum WorkspaceEvent {
     TabBarChanged,
     OpenPath {
         path: String,
+        line: Option<u32>,
+        col: Option<u32>,
         ssh_config: Option<Box<SshConnectionConfig>>,
+        terminal_cwd: Option<String>,
     },
 }
 
@@ -979,12 +982,18 @@ impl Workspace {
             PanelEvent::OpenPath {
                 panel_id,
                 path,
+                line,
+                col,
                 ssh_config,
+                terminal_cwd,
             } => {
                 // 判断路径是文件还是目录
                 cx.emit(WorkspaceEvent::OpenPath {
                     path: path.clone(),
+                    line: *line,
+                    col: *col,
                     ssh_config: ssh_config.as_ref().map(|c| Box::new(c.clone())),
+                    terminal_cwd: terminal_cwd.clone(),
                 });
                 // 聚焦原 panel
                 if let Some(panel) = self.find_panel(panel_id, cx) {

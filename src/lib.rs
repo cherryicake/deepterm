@@ -544,12 +544,21 @@ impl AppWindow {
                         });
                     });
                 }
-                WorkspaceEvent::OpenPath { path, ssh_config } => {
+                WorkspaceEvent::OpenPath {
+                    path,
+                    line,
+                    col,
+                    ssh_config,
+                    terminal_cwd,
+                } => {
                     crate::sidebar_view::open_path::handle_open_path(
                         this.editor.clone(),
                         this.sidebar.clone(),
                         path.clone(),
+                        *line,
+                        *col,
                         ssh_config.as_deref().cloned(),
+                        terminal_cwd.clone(),
                         window,
                         cx,
                     );
