@@ -727,148 +727,17 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTagEnd::Image => {
                     if let Some(img_state) = self.image_state.take() {
-                        let alt = if img_state.alt.is_empty() {
-                            img_state.url.clone()
-                        } else {
-                            img_state.alt.clone()
-                        };
-                        // 尝试构造一个 Notion 风格的图片卡片：圆角 8 + 细边框 + 失败占位
-                        let border = cx.theme().ui.border.opacity(0.18);
-                        let url_for_click = img_state.url.clone();
-                        let url_for_id = SharedString::from(img_state.url.clone());
-                        // alt 文本用已收集的 runs 保留加粗/斜体（若有）
-                        let alt_text = if img_state.alt.is_empty() {
-                            String::new()
-                        } else {
-                            img_state.alt.clone()
-                        };
                         let alt_runs = if img_state.runs.is_empty() {
                             None
                         } else {
                             Some(img_state.runs.clone())
                         };
-                        let maybe_image = Self::load_local_image(&img_state.url);
-                        let image_card: AnyElement = {
-                            // 外壳统一样式，内部按是否加载成功分支
-                            let shell = div()
-                                .id(url_for_id.clone())
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .my_4()
-                                .w_full()
-                                .rounded(px(8.))
-                                .border(px(1.))
-                                .border_color(border)
-                                .overflow_hidden()
-                                .bg(cx.theme().ui.panel_background)
-                                .cursor_pointer()
-                                .on_click({
-                                    let url = url_for_click.clone();
-                                    move |_: &ClickEvent, _, _cx| {
-                                        // 关键安全：图片点击同样走白名单，防止 file:// 泄露。
-                                        crate::utils::safe_open::open_url_safely(&url);
-                                    }
-                                });
-                            if let Some((img_arc, (w, h))) = maybe_image {
-                                let max_w = 640.0;
-                                let scale = (max_w / w as f32).min(1.0);
-                                shell
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .justify_center()
-                                            .bg(cx.theme().ui.elevated_background)
-                                            .child(
-                                                gpui::img(img_arc.clone())
-                                                    .w(px(w as f32 * scale))
-                                                    .h(px(h as f32 * scale))
-                                                    .object_fit(gpui::ObjectFit::Contain),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .px_3()
-                                            .py_2()
-                                            .text_size(px(11.))
-                                            .text_color(cx.theme().ui.text_muted)
-                                            .text_center()
-                                            .child(if alt.is_empty() {
-                                                img_state.url.clone()
-                                            } else {
-                                                alt.clone()
-                                            }),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                shell
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .px_4()
-                                            .py_6()
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_2()
-                                            .bg(cx.theme().ui.elevated_background)
-                                            .child(div().text_size(px(18.)).child("🖼"))
-                                            .child({
-                                                let txt = alt.clone();
-                                                let mut t = div()
-                                                    .text_size(px(13.))
-                                                    .text_color(cx.theme().ui.text);
-                                                if let Some(runs) = alt_runs.clone() {
-                                                    t = t.child(
-                                                        StyledText::new(txt).with_runs(runs),
-                                                    );
-                                                } else {
-                                                    t = t.child(txt);
-                                                }
-                                                t
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.))
-                                                    .text_color(cx.theme().ui.text_muted)
-                                                    .child(img_state.url.clone()),
-                                            ),
-                                    )
-                                    .into_any_element()
-                            }
-                        };
-                        // 若有 alt 标题单独一行 caption
-                        let caption = if alt_text.is_empty() || alt_text == img_state.url {
-                            None
-                        } else {
-                            Some(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().ui.text_muted)
-                                    .child(alt_text.clone())
-                                    .into_any_element(),
-                            )
-                        };
-                        let card: AnyElement = image_card;
-                        // caption 放在卡片下方外部，保持 Notion 图注风格
-                        if let Some(cap) = caption {
-                            // 将卡片与 caption 包一层
-                            let wrapper = div()
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .child(card)
-                                .child(cap)
-                                .into_any_element();
-                            self.append_child(wrapper);
-                        } else {
-                            self.append_child(card);
-                        }
+                        self.append_child(Self::image_card(
+                            &img_state.url,
+                            &img_state.alt,
+                            alt_runs,
+                            cx,
+                        ));
                     }
                 }
             },
@@ -1205,6 +1074,141 @@ impl MarkdownElementBuilder {
 
         for child in children {
             self.append_child(child);
+        }
+    }
+
+    /// Notion 风格的图片卡片（含 caption）：预览与实时编辑共用，保证两处样式一致。
+    /// `alt` 为空时回退显示 url；`alt_runs` 保留 alt 文本的加粗/斜体（若有）。
+    pub(crate) fn image_card(
+        url: &str,
+        alt_text: &str,
+        alt_runs: Option<Vec<TextRun>>,
+        cx: &mut gpui::App,
+    ) -> AnyElement {
+        let alt = if alt_text.is_empty() {
+            url.to_string()
+        } else {
+            alt_text.to_string()
+        };
+        // 尝试构造一个 Notion 风格的图片卡片：圆角 8 + 细边框 + 失败占位
+        let border = cx.theme().ui.border.opacity(0.18);
+        let url_for_click = url.to_string();
+        let url_for_id = SharedString::from(url.to_string());
+        let maybe_image = Self::load_local_image(url);
+        let image_card: AnyElement = {
+            // 外壳统一样式，内部按是否加载成功分支
+            let shell = div()
+                .id(url_for_id.clone())
+                .flex()
+                .flex_col()
+                .items_center()
+                .my_4()
+                .w_full()
+                .rounded(px(8.))
+                .border(px(1.))
+                .border_color(border)
+                .overflow_hidden()
+                .bg(cx.theme().ui.panel_background)
+                .cursor_pointer()
+                .on_click({
+                    let url = url_for_click.clone();
+                    move |_: &ClickEvent, _, _cx| {
+                        // 关键安全：图片点击同样走白名单，防止 file:// 泄露。
+                        crate::utils::safe_open::open_url_safely(&url);
+                    }
+                });
+            if let Some((img_arc, (w, h))) = maybe_image {
+                let max_w = 640.0;
+                let scale = (max_w / w as f32).min(1.0);
+                shell
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .bg(cx.theme().ui.elevated_background)
+                            .child(
+                                gpui::img(img_arc.clone())
+                                    .w(px(w as f32 * scale))
+                                    .h(px(h as f32 * scale))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .text_size(px(11.))
+                            .text_color(cx.theme().ui.text_muted)
+                            .text_center()
+                            .child(alt.clone()),
+                    )
+                    .into_any_element()
+            } else {
+                shell
+                    .child(
+                        div()
+                            .w_full()
+                            .px_4()
+                            .py_6()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .bg(cx.theme().ui.elevated_background)
+                            .child(div().text_size(px(18.)).child("🖼"))
+                            .child({
+                                let txt = alt.clone();
+                                let mut t = div()
+                                    .text_size(px(13.))
+                                    .text_color(cx.theme().ui.text);
+                                if let Some(runs) = alt_runs.clone() {
+                                    t = t.child(StyledText::new(txt).with_runs(runs));
+                                } else {
+                                    t = t.child(txt);
+                                }
+                                t
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().ui.text_muted)
+                                    .child(url.to_string()),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        };
+        // 若有 alt 标题单独一行 caption
+        let caption =
+            if alt_text.is_empty() || alt_text == url {
+                None
+            } else {
+                Some(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().ui.text_muted)
+                        .child(alt_text.to_string())
+                        .into_any_element(),
+                )
+            };
+        let card: AnyElement = image_card;
+        // caption 放在卡片下方外部，保持 Notion 图注风格
+        if let Some(cap) = caption {
+            // 将卡片与 caption 包一层
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(card)
+                .child(cap)
+                .into_any_element()
+        } else {
+            card
         }
     }
 

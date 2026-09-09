@@ -9,6 +9,7 @@ pub mod goto_line;
 pub mod image_viewer;
 pub mod markdown;
 pub mod markdown_element;
+pub mod markdown_live;
 pub mod markdown_parser;
 pub mod markdown_selectable;
 pub mod syntax;

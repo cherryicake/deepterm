@@ -53,6 +53,13 @@ actions!(
 
 pub fn init(cx: &mut App) {
     crate::editor::markdown::Markdown::init(cx);
+    // 实时 markdown 与只读预览共用复制/全选语义，仅上下文不同。
+    cx.bind_keys([
+        KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+        KeyBinding::new("ctrl-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+        KeyBinding::new("cmd-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
+        KeyBinding::new("ctrl-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
+    ]);
     cx.bind_keys([
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
@@ -97,6 +104,8 @@ struct EditorFile {
     /// 当前标签页是否显示未保存标记。
     dirty: bool,
     markdown: Option<Entity<crate::editor::markdown::Markdown>>,
+    /// 同屏实时 markdown 编辑器（`#live` tab）：持有文档唯一真相源。
+    live: Option<Entity<crate::editor::markdown_live::LiveMarkdownView>>,
     image: Option<Entity<crate::editor::image_viewer::ImageViewer>>,
     diff: Option<Entity<crate::editor::diff_view::DiffView>>,
 }
@@ -285,6 +294,8 @@ pub struct Editor {
 impl Editor {
     /// Markdown 编辑模式 tab 的 id 后缀：预览中双击后新开的纯编辑 tab。
     const MARKDOWN_EDIT_SUFFIX: &str = "#edit";
+    /// Markdown 实时预览编辑 tab 的 id 后缀：同屏所见即所得，直接编辑渲染后的文档。
+    const MARKDOWN_LIVE_SUFFIX: &str = "#live";
 
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tab_bar = TabBar::new("editor-tab-bar", cx);
@@ -503,10 +514,20 @@ impl Editor {
             .clone()
             .unwrap_or_else(|| content.clone());
         let is_dirty = content.as_str() != original_content.as_str();
+        let is_live = file_info.id.as_ref().ends_with(Self::MARKDOWN_LIVE_SUFFIX);
         let is_markdown = path_str.ends_with(".md")
-            && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX);
+            && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX)
+            && !is_live;
         let markdown = if is_markdown {
             Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content.clone(), cx)))
+        } else {
+            None
+        };
+        let live = if is_live {
+            let content_clone = content.clone();
+            Some(cx.new(|cx| {
+                crate::editor::markdown_live::LiveMarkdownView::with_text(&content_clone, cx)
+            }))
         } else {
             None
         };
@@ -514,9 +535,41 @@ impl Editor {
         // Re-render the Editor when the restored editor's InputState changes
         // (hover popup / completion menu / search matches).
         let restored_tab_id = file_info.id.clone();
-        self.editor_state_subscriptions.insert(
-            restored_tab_id.clone(),
-            cx.observe(&editor_state, move |this, state_entity, cx| {
+        if let Some(live) = live.clone() {
+            // Live tab：脏标记由 LiveMarkdownView 的 Change 事件驱动。
+            let live_tab_id = restored_tab_id.clone();
+            self.editor_state_subscriptions.insert(
+                restored_tab_id.clone(),
+                cx.subscribe(
+                    &live,
+                    move |this, live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                        if !matches!(
+                            event,
+                            crate::editor::markdown_live::LiveViewEvent::Change(_)
+                        ) {
+                            return;
+                        }
+                        let idx =
+                            this.open_files.iter().position(|f| f.id == live_tab_id);
+                        if let Some(idx) = idx {
+                            // 影子 InputState 与 live 同步：文件树切换时缓存的是
+                            // InputState，保证未保存内容不丢失；脏检查/保存沿用旧路径。
+                            let text = live_entity.read(cx).text();
+                            this.open_files[idx].editor_state.update(cx, |st, cx| {
+                                st.set_text(text, cx);
+                            });
+                            let dirty = this.file_is_dirty(&this.open_files[idx], cx);
+                            this.open_files[idx].dirty = dirty;
+                            this.sync_tab_modified(&live_tab_id, dirty, cx);
+                        }
+                        cx.notify();
+                    },
+                ),
+            );
+        } else {
+            self.editor_state_subscriptions.insert(
+                restored_tab_id.clone(),
+                cx.observe(&editor_state, move |this, state_entity, cx| {
                 // 与 open_file_with_content 相同的脏检查逻辑，恢复后同样需要维护未保存标记。
                 let text_version = state_entity.read(cx).text_version;
                 let idx = this.open_files.iter().position(|f| f.id == restored_tab_id);
@@ -533,6 +586,7 @@ impl Editor {
                 cx.notify();
             }),
         );
+        }
 
         let file = EditorFile {
             id: file_info.id.clone(),
@@ -553,6 +607,7 @@ impl Editor {
             last_checked_text_version: 0,
             dirty: is_dirty,
             markdown,
+            live: None,
             image: None,
             diff: None,
         };
@@ -805,6 +860,11 @@ impl Editor {
                             renderer.set_text(content.clone(), cx);
                         });
                     }
+                    if let Some(ref live) = self.open_files[file_ix].live {
+                        live.update(cx, |view, cx| {
+                            view.set_text(&content, cx);
+                        });
+                    }
                 }
                 let tab_id = id.clone();
                 self.tab_bar.update(cx, |tab_bar, cx| {
@@ -892,6 +952,11 @@ impl Editor {
                         if let Some(ref markdown) = this.open_files[file_ix].markdown {
                             markdown.update(cx, |renderer, cx| {
                                 renderer.set_text(prompt_content.clone(), cx);
+                            });
+                        }
+                        if let Some(ref live) = this.open_files[file_ix].live {
+                            live.update(cx, |view, cx| {
+                                view.set_text(&prompt_content, cx);
                             });
                         }
                         if let Some(ref ssh_config) = this.open_files[file_ix].ssh_config {
@@ -1055,11 +1120,15 @@ impl Editor {
         cx.notify();
     }
 
-    /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览返回 None）。
+    /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览/实时返回 None）。
     fn active_text_editor(&self, _cx: &App) -> Option<Entity<InputState>> {
         let active_id = self.active_file_id.as_ref()?;
         let file = self.open_files.iter().find(|f| f.id == *active_id)?;
-        if file.diff.is_some() || file.image.is_some() || file.markdown.is_some() {
+        if file.diff.is_some()
+            || file.image.is_some()
+            || file.markdown.is_some()
+            || file.live.is_some()
+        {
             return None;
         }
         Some(file.editor_state.clone())
@@ -1423,6 +1492,7 @@ impl Editor {
             last_checked_text_version: 0,
             dirty: false,
             markdown: None,
+            live: None,
             image: None,
             diff: Some(diff_view),
         });
@@ -1445,7 +1515,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_local_file_inner(path, window, cx, true, true);
+        self.open_local_file_inner(path, window, cx, true, true, false);
+    }
+
+    /// 在 Markdown 预览中双击：以同屏实时模式在新 tab 中打开同一文件。
+    pub fn open_file_in_live_mode(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_local_file_inner(path, window, cx, true, false, true);
     }
 
     fn open_local_file(
@@ -1455,7 +1535,7 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
     ) {
-        self.open_local_file_inner(path, window, cx, notify_app, false);
+        self.open_local_file_inner(path, window, cx, notify_app, false, false);
     }
 
     fn open_local_file_at(
@@ -1485,15 +1565,16 @@ impl Editor {
         }
         // 图片走 ImageViewer，没有行列概念：不记录 pending，避免泄漏后误跳。
         if line.is_some() && crate::editor::image_viewer::is_image_file(&path) {
-            self.open_local_file_inner(path, window, cx, notify_app, false);
+            self.open_local_file_inner(path, window, cx, notify_app, false, false);
             return;
         }
         if let Some(line) = line {
             self.pending_jumps.insert(tab_id.clone(), (line, col));
         }
-        self.open_local_file_inner(path, window, cx, notify_app, false);
+        self.open_local_file_inner(path, window, cx, notify_app, false, false);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_local_file_inner(
         &mut self,
         path: PathBuf,
@@ -1501,9 +1582,12 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
         edit_mode: bool,
+        live_mode: bool,
     ) {
         let path_str = path.to_string_lossy().to_string();
-        let tab_id = if edit_mode {
+        let tab_id = if live_mode {
+            format!("editor-{}{}", path_str, Self::MARKDOWN_LIVE_SUFFIX)
+        } else if edit_mode {
             format!("editor-{}{}", path_str, Self::MARKDOWN_EDIT_SUFFIX)
         } else {
             format!("editor-{}", path_str)
@@ -1541,6 +1625,7 @@ impl Editor {
             notify_app,
             true,
             edit_mode,
+            live_mode,
         );
 
         self.spawn_file_load(
@@ -1613,6 +1698,11 @@ impl Editor {
                                 if let Some(ref markdown) = file.markdown {
                                     markdown.update(cx, |renderer, cx| {
                                         renderer.set_text(loaded.text.clone(), cx);
+                                    });
+                                }
+                                if let Some(ref live) = file.live {
+                                    live.update(cx, |view, cx| {
+                                        view.set_text(&loaded.text, cx);
                                     });
                                 }
                                 // 缓存远程文件内容到 RemoteFileTreeCache
@@ -1705,7 +1795,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, false);
     }
 
     pub fn open_remote_file_no_notify(
@@ -1715,7 +1805,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, false, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, false, false, false);
     }
 
     fn open_remote_file_at(
@@ -1746,13 +1836,13 @@ impl Editor {
         if line.is_some()
             && crate::editor::image_viewer::is_image_file(std::path::Path::new(&path))
         {
-            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false);
+            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false);
             return;
         }
         if let Some(line) = line {
             self.pending_jumps.insert(tab_id.clone(), (line, col));
         }
-        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false);
         // Cached remote files open synchronously (`is_loading=false`):
         // apply the pending jump immediately instead of waiting for a load.
         if let Some((line, col)) = self.take_pending_jump(&tab_id) {
@@ -1777,9 +1867,21 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true, true);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, true, false);
     }
 
+    /// 远程 Markdown 预览中双击：以同屏实时模式在新 tab 中打开同一文件。
+    pub fn open_remote_file_in_live_mode(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn open_remote_file_inner(
         &mut self,
         path: String,
@@ -1788,8 +1890,11 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
         edit_mode: bool,
+        live_mode: bool,
     ) {
-        let tab_id = if edit_mode {
+        let tab_id = if live_mode {
+            format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
+        } else if edit_mode {
             format!("editor-remote-{}{}", path, Self::MARKDOWN_EDIT_SUFFIX)
         } else {
             format!("editor-remote-{}", path)
@@ -1841,6 +1946,7 @@ impl Editor {
                 notify_app,
                 false, // is_loading = false，因为有缓存内容
                 edit_mode,
+                live_mode,
             );
             if !is_fresh {
                 let ssh_config = ssh_config.clone();
@@ -1887,6 +1993,9 @@ impl Editor {
                             if let Some(md) = &file.markdown {
                                 md.update(cx, |r, cx| r.set_text(fresh_text.clone(), cx));
                             }
+                            if let Some(live) = &file.live {
+                                live.update(cx, |v, cx| v.set_text(&fresh_text, cx));
+                            }
                             cx.notify();
                         }
                         crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
@@ -1924,6 +2033,7 @@ impl Editor {
             notify_app,
             true,
             edit_mode,
+            live_mode,
         );
 
         self.spawn_file_load(
@@ -1948,6 +2058,7 @@ impl Editor {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_image_file(
         &mut self,
         tab_id: String,
@@ -1973,6 +2084,7 @@ impl Editor {
             notify_app,
             true,
             false, // 图片没有编辑模式
+            false,
         );
 
         let load_image: ImageLoader = if let Some(config) = ssh_config {
@@ -2119,6 +2231,7 @@ impl Editor {
         _notify_app: bool,
         is_loading: bool,
         edit_mode: bool,
+        live_mode: bool,
     ) {
         let label = path
             .file_name()
@@ -2126,7 +2239,9 @@ impl Editor {
             .unwrap_or(&path_str)
             .to_string();
         // 编辑模式 tab 与预览 tab 区分标识，避免两个同名 tab 混淆
-        let label = if edit_mode {
+        let label = if live_mode {
+            format!("{} (实时)", label)
+        } else if edit_mode {
             format!("{} (编辑)", label)
         } else {
             label
@@ -2143,11 +2258,56 @@ impl Editor {
             state
         });
 
+        let is_live_file = live_mode
+            && !is_image
+            && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let live = if is_live_file {
+            let content_clone = content.clone();
+            Some(cx.new(|cx| {
+                crate::editor::markdown_live::LiveMarkdownView::with_text(&content_clone, cx)
+                    .read_only(read_only)
+            }))
+        } else {
+            None
+        };
+
         // Re-render the Editor when this editor's InputState changes
         // (search matches / cursor): the popups are rendered by EditorInput,
         // which only re-renders when the Editor does.
         let sync_path = path_str.clone();
         let sync_tab_id = tab_id.clone();
+        if let Some(live) = live.clone() {
+            // Live tab：脏标记 + 影子 InputState 同步由 Change 事件驱动。
+            let live_tab_id = sync_tab_id.clone();
+            self.editor_state_subscriptions.insert(
+                sync_tab_id.clone().into(),
+                cx.subscribe(
+                    &live,
+                    move |this, live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                        if !matches!(
+                            event,
+                            crate::editor::markdown_live::LiveViewEvent::Change(_)
+                        ) {
+                            return;
+                        }
+                        let idx = this
+                            .open_files
+                            .iter()
+                            .position(|f| f.id.as_ref() == live_tab_id.as_str());
+                        if let Some(idx) = idx {
+                            let text = live_entity.read(cx).text();
+                            this.open_files[idx].editor_state.update(cx, |st, cx| {
+                                st.set_text(text, cx);
+                            });
+                            let dirty = this.file_is_dirty(&this.open_files[idx], cx);
+                            this.open_files[idx].dirty = dirty;
+                            this.sync_tab_modified(&live_tab_id, dirty, cx);
+                        }
+                        cx.notify();
+                    },
+                ),
+            );
+        } else {
         self.editor_state_subscriptions.insert(
             sync_tab_id.clone().into(),
             cx.observe(&editor_state, move |this, state_entity, cx| {
@@ -2197,9 +2357,12 @@ impl Editor {
                 cx.notify();
             }),
         );
+        }
 
-        let is_markdown =
-            !is_image && !edit_mode && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_markdown = !is_image
+            && !edit_mode
+            && !live_mode
+            && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
             let content_clone = content.clone();
             Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content_clone, cx)))
@@ -2233,6 +2396,7 @@ impl Editor {
             last_checked_text_version: 0,
             dirty: false,
             markdown,
+            live,
             image,
             diff: None,
         });
@@ -2428,6 +2592,9 @@ impl Editor {
                             // 会走「无变化重载」路径，不会覆盖编辑器内容。
                             file.original_content = written.clone();
                             file.dirty = false;
+                            if let Some(live) = &file.live {
+                                live.update(cx, |view, _cx| view.mark_saved());
+                            }
                             if let Some(config) = &file.ssh_config {
                                 crate::file_manager::file_tree_cache::RemoteFileTreeCache::global()
                                     .lock()
@@ -2781,6 +2948,19 @@ impl Render for Editor {
                             .pb(px(self.content_bottom_padding))
                             .child(image.clone())
                             .into_any_element()
+                    } else if let Some(live) = &file.live {
+                        div()
+                            .id("md-live")
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .bg(gpui::transparent_black())
+                            .px(px(6.0))
+                            .pl(px(self.content_left_padding + 6.0))
+                            .pb(px(self.content_bottom_padding))
+                            .child(live.clone())
+                            .into_any_element()
                     } else if let Some(markdown) = &file.markdown {
                         let path = file.path.clone();
                         let ssh_config = file.ssh_config.clone();
@@ -2798,17 +2978,17 @@ impl Render for Editor {
                                 gpui::MouseButton::Left,
                                 cx.listener(
                                     move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                        // 双击预览区域：新开 tab 进入 md 编辑模式
+                                        // 双击预览区域：新开 tab 进入 md 实时模式
                                         if event.click_count == 2 {
                                             if let Some(config) = &ssh_config {
-                                                this.open_remote_file_in_edit_mode(
+                                                this.open_remote_file_in_live_mode(
                                                     path.clone(),
                                                     config.clone(),
                                                     window,
                                                     cx,
                                                 );
                                             } else {
-                                                this.open_file_in_edit_mode(
+                                                this.open_file_in_live_mode(
                                                     PathBuf::from(&path),
                                                     window,
                                                     cx,
