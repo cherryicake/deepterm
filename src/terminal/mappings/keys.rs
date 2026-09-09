@@ -27,12 +27,11 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, _vi_mode: bool) -> Opt
 /// - GPUI `key` 即基础布局字符（≈ alacritty 的 `key_without_modifiers`），
 ///   `key_char` 为实际产出文本（含 shift / alt 组合）。
 fn kitty_sequence_for(keystroke: &Keystroke, mode: &TermMode) -> Option<Vec<u8>> {
-    let kitty_seq = mode.intersects(
-        TermMode::DISAMBIGUATE_ESC_CODES
-            | TermMode::REPORT_ALL_KEYS_AS_ESC
-            | TermMode::REPORT_EVENT_TYPES,
-    );
-    if !kitty_seq {
+    // 只有「消歧转义」与「全键上报」切换编码。
+    // `REPORT_EVENT_TYPES`（flag 8）单独开启时，协议要求保持 legacy 编码并追加
+    // 事件类型后缀；DeepTerm 不上报事件类型，因此该位不能参与判定——否则会把
+    // 普通按键错误地编成 CSI u，让只开了事件类型的应用收不到正确按键。
+    if !mode.intersects(TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALL_KEYS_AS_ESC) {
         return None;
     }
     let encode_all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);

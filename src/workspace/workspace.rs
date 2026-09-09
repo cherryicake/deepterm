@@ -43,7 +43,7 @@ actions!(
     [NewLocalTerminal, CloseSelectedPanel, NewTerminalTab, ReopenClosedTab, NextTab, PreviousTab, FocusSplitLeft, FocusSplitRight, FocusSplitUp, FocusSplitDown]
 );
 
-/// 跳转到第 N 个 tab（0 基）。cmd+9 之外的第十个 tab 用 cmd+0。
+/// 跳转到第 N 个 tab（0 基）：cmd-1..9 为前 9 个，cmd-0 为第 10 个。
 #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
 #[action(namespace = workspace, no_json)]
 pub struct GotoTab(pub usize);
@@ -115,6 +115,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-7", GotoTab(6), None),
         KeyBinding::new("cmd-8", GotoTab(7), None),
         KeyBinding::new("cmd-9", GotoTab(8), None),
+        // cmd-0 是第 10 个 tab（与 cmd-1..9 同源），字号复位让位给 cmd-shift-0
+        KeyBinding::new("cmd-0", GotoTab(9), None),
         // 分屏导航：cmd+alt+方向键（win/linux 用 ctrl+alt+方向键）
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-alt-left", FocusSplitLeft, None),
@@ -139,13 +141,13 @@ pub fn init(cx: &mut App) {
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-", DecreaseFontSize, None),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-0", ResetFontSize, None),
+        KeyBinding::new("cmd-shift-0", ResetFontSize, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-+", IncreaseFontSize, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-", DecreaseFontSize, None),
         #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-0", ResetFontSize, None),
+        KeyBinding::new("ctrl-shift-0", ResetFontSize, None),
     ]);
 }
 
@@ -238,6 +240,8 @@ struct ClosedTab {
     container: SplitContainer,
     /// 恢复时用的 tab id（取关闭时原 id，避免 session 内引用旧 id）
     tab_id: String,
+    /// 关闭时的广播状态（重开后原样恢复，而不是一律关掉）
+    broadcast_enabled: bool,
 }
 
 /// undo 关闭 tab 的栈上限：超过后逐出最旧并 kill 其终端。
@@ -2012,15 +2016,17 @@ impl Workspace {
 
     /// 真正关闭 tab（已过确认）：入 undo 栈 → 移除 → 切换/关窗。
     fn do_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // undo 栈：仅当还有其他 tab 时可恢复（最后一个 tab 关闭即关窗，进程随窗口销毁）
+        // undo 栈：有其他 tab 可切回，且终端还在跑才值得恢复
+        // （最后一个 tab 关闭即关窗，进程随窗口销毁；已 exit 的终端重开是死壳）
         let has_other_tabs = self.tabs.len() > 1;
-        if has_other_tabs {
+        if has_other_tabs && self.tab_has_live_terminal(tab_id, cx) {
             if let Some(tab_info) = self.tabs.get(tab_id) {
                 let closed = ClosedTab {
                     label: tab_info.label.clone(),
                     tab_type: tab_info.tab_type.clone(),
                     container: tab_info.container.clone(),
                     tab_id: tab_id.to_string(),
+                    broadcast_enabled: tab_info.broadcast_enabled,
                 };
                 self.push_closed_tab(closed, cx);
             }
@@ -2067,6 +2073,25 @@ impl Workspace {
                     .terminal_view()
                     .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
             })
+    }
+
+    /// tab 内是否存在仍在运行的终端。
+    ///
+    /// 执行 `exit` 正常退出的 tab 不该进 undo 栈——重开只会得到一个已经结束的
+    /// 死终端（iTerm2 / ghostty 同样只对「被用户关掉的活终端」提供恢复）。
+    fn tab_has_live_terminal(&self, tab_id: &str, cx: &App) -> bool {
+        self.tabs
+            .get(tab_id)
+            .map(|tab_info| {
+                tab_info.container.collect_panels_vec().iter().any(|panel| {
+                    panel
+                        .read(cx)
+                        .content()
+                        .terminal_view()
+                        .is_some_and(|view| view.read(cx).terminal().read(cx).process_alive())
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// panel 是否需要关闭确认（其终端有存活前台进程）
@@ -2134,7 +2159,7 @@ impl Workspace {
         let is_remote = closed
             .container
             .get_first_panel()
-            .and_then(|p| p.read(cx).remote_os.is_some().then_some(true));
+            .is_some_and(|p| p.read(cx).remote_os.is_some());
 
         let label = closed.label.clone();
         self.tabs.insert(
@@ -2144,12 +2169,12 @@ impl Workspace {
                 label: closed.label.clone(),
                 tab_type: closed.tab_type.clone(),
                 container: closed.container.clone(),
-                broadcast_enabled: false,
+                broadcast_enabled: closed.broadcast_enabled,
             },
         );
         self.tab_bar.update(cx, |tab_bar, cx| {
             let mut item = TabItem::new(tab_id.clone(), label.clone());
-            item.is_remote = is_remote.unwrap_or(false);
+            item.is_remote = is_remote;
             tab_bar.add_tab(item, cx);
         });
         self.renumber_workspace_tabs(cx);

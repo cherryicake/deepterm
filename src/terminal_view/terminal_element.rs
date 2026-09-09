@@ -80,11 +80,11 @@ fn paint_decoration(
             line(y2, x0, span_w);
         }
         DecorationKind::DottedUnderline => {
-            // 2px 点 + 2px 间隔
+            // 点 + 间隔按字符格宽缩放（半个 cell 一个周期），
+            // 否则小字号下糊成实线、大字号下散成稀点。
             let y = row_y + line_height - px(2.0);
-            let step = 4.0;
-            let total = span_w.as_f32();
-            let end = x0.as_f32() + total;
+            let step = (cell_width * 0.5).max(px(2.0)).as_f32();
+            let end = (x0 + span_w).as_f32();
             let mut x = x0.as_f32();
             while x < end {
                 line(y, px(x), px((step / 2.0f32).min(end - x)));
@@ -92,14 +92,14 @@ fn paint_decoration(
             }
         }
         DecorationKind::DashedUnderline => {
-            // 4px 段 + 3px 间隔
+            // 段长约占 0.9 个 cell，间隔 0.4 个 cell
             let y = row_y + line_height - px(2.0);
-            let step = 7.0f32;
-            let total = span_w.as_f32();
-            let end = x0.as_f32() + total;
+            let step = (cell_width * 0.9).max(px(4.0)).as_f32();
+            let dash = step * 0.6;
+            let end = (x0 + span_w).as_f32();
             let mut x = x0.as_f32();
             while x < end {
-                line(y, px(x), px((step - 3.0f32).min(end - x)));
+                line(y, px(x), px(dash.min(end - x)));
                 x += step;
             }
         }
@@ -1183,6 +1183,12 @@ impl TerminalElement {
         box_cells
     }
 
+    /// 增量重算脏区间的文本 run 与自绘下划线装饰。
+    ///
+    /// 返回 `(rebuild_left, rebuild_right, runs, decorations)`：
+    /// 前两项是**扩展后**的实际重建区间（函数内部会把区间拓到完整 run 段），
+    /// 调用方据此丢弃该区间内的旧装饰 span——只回写 runs 会让装饰停留在旧状态
+    /// （新增下划线画不出、撤掉的还在画）。
     fn try_update_runs_in_range(
         row_idx: usize,
         cached_runs: &[BatchedTextRun],
@@ -1195,7 +1201,7 @@ impl TerminalElement {
         cell_width: Pixels,
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
-    ) -> Option<Vec<BatchedTextRun>> {
+    ) -> Option<(usize, usize, Vec<BatchedTextRun>, Vec<DecorationSpan>)> {
         let (mut rebuild_left, mut rebuild_right) = range;
 
         // Expand the rebuild window to cover the whole contiguous cached run segment
@@ -1255,7 +1261,12 @@ impl TerminalElement {
 
         merged_runs.extend(dirty_entry.runs);
         merged_runs.sort_by_key(|run| run.start_col);
-        Some(merged_runs)
+        Some((
+            rebuild_left,
+            rebuild_right,
+            merged_runs,
+            dirty_entry.decorations,
+        ))
     }
 
     /// 将 builtin / IME 文本经过 wrap + 切段后逐段 shape，得到 GPUI 渲染所需的多行布局。
@@ -1610,22 +1621,32 @@ impl Element for TerminalElement {
                 let cached_entry = row_cache.layout.clone();
                 let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
                 let entry = if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
-                    if let Some(updated_runs) = Self::try_update_runs_in_range(
-                        row_idx,
-                        &cached_entry.runs,
-                        row_cells,
-                        range,
-                        hovered_url_cols,
-                        window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                        &palette,
-                    ) {
+                    if let Some((rebuilt_left, rebuilt_right, updated_runs, updated_decorations)) =
+                        Self::try_update_runs_in_range(
+                            row_idx,
+                            &cached_entry.runs,
+                            row_cells,
+                            range,
+                            hovered_url_cols,
+                            window,
+                            &text_style,
+                            font_size,
+                            cell_width,
+                            &terminal_theme,
+                            &palette,
+                        )
+                    {
                         partial_run_update_count += 1;
                         let mut entry = cached_entry;
                         entry.runs = updated_runs;
+                        // 装饰与文本 run 必须一起增量刷新：丢弃落在重建区间内的旧 span
+                        // （区间已扩展到完整 run 段），再并入新 span 并按列排序。
+                        entry.decorations.retain(|span| {
+                            span.start_col + span.width <= rebuilt_left
+                                || span.start_col > rebuilt_right
+                        });
+                        entry.decorations.extend(updated_decorations);
+                        entry.decorations.sort_by_key(|span| span.start_col);
                         entry
                     } else {
                         Self::layout_row(

@@ -220,7 +220,8 @@ impl SplitContainer {
     }
 
     /// 获取选中状态的panel
-    pub fn get_selected_panel(&self, cx: &App) -> Option<Entity<Panel>> {        match self {
+    pub fn get_selected_panel(&self, cx: &App) -> Option<Entity<Panel>> {
+        match self {
             SplitContainer::Panel(panel) => {
                 if panel.read(cx).is_selected {
                     Some(panel.clone())
@@ -487,7 +488,7 @@ impl SplitContainer {
                 continue;
             };
             let neighbor = &entry.children[neighbor_index];
-            return Some(corner_panel(neighbor, want_before));
+            return corner_panel(neighbor, want_before);
         }
         None
     }
@@ -527,7 +528,11 @@ fn find_path_to_panel<'a>(
 ) -> bool {
     match container {
         SplitContainer::Panel(panel) => panel.read(cx).panel_id == panel_id,
-        SplitContainer::Split { direction, children, .. } => {
+        SplitContainer::Split {
+            direction,
+            children,
+            ..
+        } => {
             for (i, _child) in children.iter().enumerate() {
                 path.push(SplitPathEntry {
                     axis: *direction,
@@ -544,13 +549,20 @@ fn find_path_to_panel<'a>(
     }
 }
 
-/// 取子树中的角 panel：want_last=true 取最后一个（最右/最下），否则第一个（最左/最上）
-fn corner_panel(container: &SplitContainer, want_last: bool) -> Entity<Panel> {
+/// 取子树中的角 panel：want_last=true 取最后一个（最右/最下），否则第一个（最左/最上）。
+///
+/// 空 `Split`（理论上不应出现，但外部构造或反序列化失误时可能发生）返回 `None`，
+/// 而不是 `children.len() - 1` 下溢 panic。
+fn corner_panel(container: &SplitContainer, want_last: bool) -> Option<Entity<Panel>> {
     match container {
-        SplitContainer::Panel(panel) => panel.clone(),
+        SplitContainer::Panel(panel) => Some(panel.clone()),
         SplitContainer::Split { children, .. } => {
-            let index = if want_last { children.len() - 1 } else { 0 };
-            corner_panel(&children[index], want_last)
+            let next = if want_last {
+                children.last()
+            } else {
+                children.first()
+            }?;
+            corner_panel(next, want_last)
         }
     }
 }

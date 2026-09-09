@@ -122,6 +122,14 @@ const SCROLLBAR_ANIMATION_DURATION: f32 = 0.15;
 
 /// BEL 视觉闪烁总时长（毫秒）：视区边缘呼吸式高亮，随后自然衰减。
 const BELL_FLASH_MS: u64 = 350;
+
+/// 搜索防抖窗口（毫秒）：输入停顿 / 终端停止输出后才重算命中集。
+const SEARCH_DEBOUNCE_MS: u64 = 150;
+
+/// 内容漂移触发重算的节流窗口（毫秒）。持续输出时最坏每此间隔重算一次，
+/// 避免每帧调度堆积出几十个后台扫描任务（Task drop 不会取消已排队的任务）。
+const SEARCH_DRIFT_THROTTLE_MS: u64 = 400;
+
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     cx.bind_keys([
@@ -220,10 +228,12 @@ pub struct HoveredLink {
 
 /// 终端滚动区搜索状态（由 Cmd-F / Ctrl-Shift-F 激活）。
 ///
-/// - `matches` 为 grid 绝对坐标命中集（`Terminal::search_matches` 产出）；
-/// - 元素在 prepaint 阶段按当前 display_offset 映射到视口行并绘制高亮；
-/// - `revision` 在匹配集 / 当前命中变化时递增，驱动行缓存里的搜索高亮
-///   重算；滚动不递增（视口行映射每帧重算）。
+/// - `matches` 为 grid 绝对坐标命中集（后台线程比对产出）；
+/// - 元素在 prepaint 阶段按当前 display_offset 映射到视口行并绘制高亮，
+///   因此滚动无需重算（视口行映射每帧重算）；
+/// - 命中集是**快照**：终端继续输出会让 grid 绝对坐标整体漂移，
+///   由 `TerminalView::search_generation` 比对内容代次后触发重算。
+#[derive(Default)]
 pub struct TerminalSearchState {
     /// 搜索浮层是否展开（激活）
     pub active: bool,
@@ -233,20 +243,6 @@ pub struct TerminalSearchState {
     pub matches: Vec<crate::terminal::terminal::SearchMatch>,
     /// 当前命中索引（matches 下标）
     pub active_index: usize,
-    /// 高亮重算代次：matches / active_index 变化时 +1
-    pub revision: u64,
-}
-
-impl Default for TerminalSearchState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            query: String::new(),
-            matches: Vec::new(),
-            active_index: 0,
-            revision: 0,
-        }
-    }
 }
 
 impl TerminalSearchState {
@@ -340,10 +336,21 @@ pub struct TerminalView {
     search_input: Option<Entity<InputState>>,
     /// 搜索输入 Change 订阅（重算命中集）
     _search_input_subscription: Option<Subscription>,
-    /// 搜索防抖任务：输入停顿 150ms 后重算命中，避免逐键全量扫描 10k 行
-    search_debounce_task: Option<Task<()>>,
-    /// 搜索自动跳转任务：命中集更新后把当前命中滚动到视口中央
-    search_follow_task: Option<Task<()>>,
+    /// 搜索任务：150ms 防抖 → 主线程抓快照 → 后台线程比对 → 回主线程落地。
+    /// 只保留最新一个（旧任务的回写会因 request id 过期被丢弃）。
+    search_task: Option<Task<()>>,
+    /// 后台搜索请求序号：每次调度 +1，回写时校验，丢弃过期结果
+    /// （GPUI 的 Task 被 drop 只是 detach，旧任务仍会跑完）。
+    search_request_id: u64,
+    /// 上次重算命中集时的终端内容代次。内容变化（终端有输出 / scrollback
+    /// 滚动）会让命中集的 grid 绝对坐标整体漂移，据此触发重算。
+    search_generation: u64,
+    /// 上次因「内容变化」而调度重算的时刻。
+    ///
+    /// GPUI 的 `Task` 被 drop 只是 detach（旧任务仍会跑完），持续输出时若每帧
+    /// 都调度，会堆积出几十个全量扫描任务。这里对内容变化路径做节流：
+    /// 用户改词则立即调度（见 `schedule_search_recompute` 的调用处重置）。
+    search_last_schedule: Option<Instant>,
     /// Whether the link-hover modifier (Cmd/Ctrl) was held at the last mouse
     /// move. Transitions are forwarded to `Terminal::set_link_hover_active`
     /// so URL detection runs only while links are actually hoverable.
@@ -353,6 +360,9 @@ pub struct TerminalView {
     /// Flattened render data reused across frames when nothing changed.
     pub flattened_render_cache: FlattenedRenderCache,
     /// Last theme id used to build row cache.
+    ///
+    /// 字号 / 行高 / 列数等度量变化不在此列：`TerminalElement::prepaint` 另有
+    /// `RenderMetricsSignature` 比对，度量一变就整体清空行缓存。
     pub cached_theme_id: Option<String>,
     /// 最近一次灌入 Terminal.colors 的主题 id（OSC 颜色查询闭环）。
     applied_theme_id: Option<String>,
@@ -686,8 +696,10 @@ impl TerminalView {
             search: TerminalSearchState::default(),
             search_input: None,
             _search_input_subscription: None,
-            search_debounce_task: None,
-            search_follow_task: None,
+            search_task: None,
+            search_request_id: 0,
+            search_generation: 0,
+            search_last_schedule: None,
             link_modifier_held: false,
             row_render_cache: Vec::new(),
             flattened_render_cache: FlattenedRenderCache::default(),
@@ -915,8 +927,10 @@ impl TerminalView {
                 search: TerminalSearchState::default(),
                 search_input: None,
                 _search_input_subscription: None,
-                search_debounce_task: None,
-                search_follow_task: None,
+                search_task: None,
+                search_request_id: 0,
+                search_generation: 0,
+                search_last_schedule: None,
                 link_modifier_held: false,
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
@@ -2317,60 +2331,142 @@ impl TerminalView {
         self.search.active = false;
         self.search.matches.clear();
         self.search.active_index = 0;
-        self.search.revision += 1;
-        self.search_debounce_task = None;
-        self.search_follow_task = None;
+        // 作废在飞的后台任务：Task drop 只是 detach，回写靠 request id 失效。
+        self.invalidate_search_request();
+        self.search_task = None;
         // 恢复终端焦点（搜索框抢占了 focus handle）
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
-    /// 输入变化后重算命中（150ms 防抖，避免逐键全量扫描滚动区）。
+    /// 终端内容变了就重算命中集（render 每帧调用一次）。
+    ///
+    /// 命中存的是 grid 绝对坐标，新输出 / scrollback 环形滚动会让它们整体漂移，
+    /// 不重算则高亮画在错行、跳转也错行。持续输出时这里会被节流到
+    /// [`SEARCH_DRIFT_THROTTLE_MS`]，效果等于「停手 150ms（防抖）后才算一次」。
+    fn maybe_schedule_search_for_content_change(&mut self, cx: &mut Context<Self>) {
+        if !self.search.active || self.search.query.is_empty() {
+            return;
+        }
+        let generation = self.terminal.read(cx).content_generation;
+        let throttled = self
+            .search_last_schedule
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(SEARCH_DRIFT_THROTTLE_MS));
+        if generation != self.search_generation && !throttled {
+            self.search_last_schedule = Some(Instant::now());
+            self.schedule_search_recompute(cx);
+        }
+    }
+
+    /// 自增搜索请求序号，使已发出的后台任务在回写时被判定为过期。
+    fn invalidate_search_request(&mut self) {
+        self.search_request_id = self.search_request_id.wrapping_add(1);
+    }
+
+    /// 调度一次命中重算（150ms 防抖）：
+    /// 主线程抓 grid 快照 → **后台线程**比对 → 回主线程落地。
+    ///
+    /// 两个触发点：
+    /// - 输入框内容变化（`InputEvent::Change`）；
+    /// - 终端内容代次变化：新输出 / scrollback 环形滚动会让命中集里的
+    ///   grid 绝对坐标整体漂移，不重算就会高亮错行、跳转错行。
+    ///
+    /// 持续输出时每帧都会重调度，等效于「停手 150ms 后才算一次」。
     fn schedule_search_recompute(&mut self, cx: &mut Context<Self>) {
-        self.search_debounce_task = None;
-        let input = self.search_input.clone();
-        self.search_debounce_task = Some(cx.spawn(async move |this, cx| {
+        let query = self
+            .search_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+
+        // 空词：直接清空，无需惊动后台线程
+        if query.trim().is_empty() {
+            self.invalidate_search_request();
+            self.search_task = None;
+            self.search.query.clear();
+            self.search.matches.clear();
+            self.search.active_index = 0;
+            self.search_generation = self.terminal.read(cx).content_generation;
+            cx.notify();
+            return;
+        }
+
+        self.invalidate_search_request();
+        let request_id = self.search_request_id;
+        let query_for_apply = query.clone();
+        let terminal = self.terminal.clone();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(150))
+                .timer(Duration::from_millis(SEARCH_DEBOUNCE_MS))
                 .await;
+
+            // 让位给更新的请求：旧任务被 drop 只是 detach，仍会跑到这里，
+            // 先确认自己还是「最新一个」再干活，避免重复全量扫描。
+            let still_current = this
+                .update(cx, |this, _| this.search_request_id == request_id)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            // 快照必须在主线程抓（要持 term 锁），代价是一次 O(字符数) 拷贝；
+            // 代次也要在抓快照的同一时刻读，才能准确反映「这批命中对应哪一版内容」。
+            let Ok((snapshot, snapshot_generation)) = this.update(cx, |_, cx| {
+                let terminal = terminal.read(cx);
+                (terminal.search_snapshot(), terminal.content_generation)
+            }) else {
+                return;
+            };
+
+            // 折叠 + 滑动窗口比对是整段扫描里最贵的部分，放后台线程。
+            let matches = cx
+                .background_spawn(async move {
+                    crate::terminal::terminal::search_matches_in_snapshot(&snapshot, &query)
+                })
+                .await;
+
             this.update(cx, |this, cx| {
-                let query = input
-                    .as_ref()
-                    .map(|input| input.read(cx).value().to_string())
-                    .unwrap_or_default();
-                this.recompute_search_matches(&query, cx);
+                // 过期结果（期间又有新请求 / 搜索已关闭）直接丢弃。
+                if this.search_request_id != request_id {
+                    return;
+                }
+                this.apply_search_matches(query_for_apply, matches, snapshot_generation, cx);
             })
             .ok();
         }));
     }
 
-    /// 按当前查询重算命中集并把首个可见命中设为当前命中。
-    fn recompute_search_matches(&mut self, query: &str, cx: &mut Context<Self>) {
+    /// 落地后台算出的命中集：尽量保持当前命中的相对位置，并把它滚到视口中央。
+    fn apply_search_matches(
+        &mut self,
+        query: String,
+        matches: Vec<crate::terminal::terminal::SearchMatch>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
         self.search.query = query.trim().to_string();
-        let matches = if self.search.query.is_empty() {
-            Vec::new()
-        } else {
-            self.terminal.read(cx).search_matches(&self.search.query)
-        };
-
-        // 初始命中选择：从视口顶部往下第一个可见之后的命中（ghostty 语义：
-        // 从当前视图附近开始），否则从头。
-        self.search.active_index = 0;
-        if !matches.is_empty() {
-            let offset = self.terminal.read(cx).last_content().display_offset;
-            let viewport_rows = self.terminal.read(cx).last_content().rows as i32;
-            // 视口顶行的 grid Line = -offset；首个完全在视口之下的命中即起点。
-            let top_grid_line = -(offset as i32);
-            let bottom_grid_line = top_grid_line + viewport_rows - 1;
-            if let Some(idx) = matches
-                .iter()
-                .position(|m| m.start.line.0 > bottom_grid_line)
-            {
-                self.search.active_index = idx;
-            }
-        }
+        let previous = self.search.active_match().copied();
         self.search.matches = matches;
-        self.search.revision += 1;
+        self.search.active_index = match previous {
+            // 重算（终端输出导致坐标漂移）：按「同列优先、行号最近」找回旧命中，
+            // 否则用户正在看的命中会被拽到别处。
+            Some(prev) => self
+                .search
+                .matches
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, m)| {
+                    (
+                        m.start.column.0.abs_diff(prev.start.column.0),
+                        (m.start.line.0 - prev.start.line.0).abs(),
+                    )
+                })
+                .map(|(idx, _)| idx)
+                .unwrap_or(0),
+            // 首次搜索：从当前视口附近开始
+            None => self.pick_initial_match_index(cx),
+        };
+        self.search_generation = generation;
 
         // 命中变化后把当前命中滚到视口中央
         if let Some(m) = self.search.active_match() {
@@ -2380,6 +2476,25 @@ impl TerminalView {
             });
         }
         cx.notify();
+    }
+
+    /// 首次命中的选择：视口内第一个 → 视口下方最近 → （全在上方时）上方最近。
+    ///
+    /// 早先实现在没有「视口下方命中」时退回 index 0（最旧的一条），会把视图
+    /// 一路滚回几千行之前；这里改为就近优先。
+    fn pick_initial_match_index(&self, cx: &App) -> usize {
+        let matches = &self.search.matches;
+        if matches.is_empty() {
+            return 0;
+        }
+        let content = self.terminal.read(cx).last_content();
+        let top = -(content.display_offset as i32);
+        let bottom = top + content.rows as i32 - 1;
+        matches
+            .iter()
+            .position(|m| (top..=bottom).contains(&m.start.line.0))
+            .or_else(|| matches.iter().position(|m| m.start.line.0 > bottom))
+            .unwrap_or(matches.len() - 1)
     }
 
     /// 跳到下一个 / 上一个命中（wrap-around），并把该命中滚到视口中央。
@@ -2393,7 +2508,6 @@ impl TerminalView {
         } else {
             (self.search.active_index + len - 1) % len
         };
-        self.search.revision += 1;
         if let Some(m) = self.search.active_match() {
             let line = m.start.line;
             self.terminal.update(cx, |terminal, _| {
@@ -2403,20 +2517,15 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// 打开搜索浮层时首次计算：
+    /// 打开搜索浮层时，用输入框里的既有词算一次（走同一条防抖 + 后台链路）。
     pub fn start_search_from_scratch(&mut self, cx: &mut Context<Self>) {
-        let query = self.search_input
-            .as_ref()
-            .map(|input| input.read(cx).value().to_string())
-            .unwrap_or_default();
-        self.recompute_search_matches(&query, cx);
+        self.schedule_search_recompute(cx);
     }
 
-    /// 渲染搜索 UI：右上角一个小搜索框（无外层浮层背景）。
+    /// 渲染搜索 UI：右上角搜索框（无外层浮层背景）。
     ///
-/// 布局：一个胶囊容器内依次为 搜索图标 → 输入区 → 命中计数 → 关闭钮。
-    /// 输入框本身用 transparent 模式（EditorInput 不自带背景/边框/高度，
-    /// 由胶囊容器统一绘制），整体高度约 24px，宽度自适应内容上限 240px。
+    /// 样式对齐侧边栏 Host 面板的搜索框：32px 高、圆角 12、聚焦 3px accent 发光描边。
+    /// 布局：搜索图标 → 输入区（transparent EditorInput）→ 命中计数 → 关闭钮。
     ///
     /// 按键：Enter / Down = 下一个命中，Shift-Enter / Up = 上一个，
     /// Escape 关闭（经 DismissSearch action，仅搜索激活时消费）。
@@ -3325,6 +3434,12 @@ impl Render for TerminalView {
             }
         }
 
+        // ── 搜索命中集跟随内容变化 ──────────────────────────────────────────
+        // 命中存的是 grid 绝对坐标，终端一输出（新行进入 scrollback）就会整体
+        // 漂移，不重算则高亮画在错行、跳转也错行。持续输出时这里会反复重调度，
+        // 效果等于「停手 150ms 后才真正算一次」。
+        self.maybe_schedule_search_for_content_change(cx);
+
         // React to focus edges so we can start/stop blinking.
         self.on_focus_changed(is_focused, cx);
         let cursor_visible = self.should_show_cursor(is_focused, cx);
@@ -3737,5 +3852,97 @@ impl Render for TerminalView {
                         this.child(div().absolute().inset_0().child(connect_view))
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::Terminal;
+    use crate::terminal::terminal::TerminalBounds;
+    use gpui::{TestAppContext, size};
+
+    /// 搜索全链路（输入 → 后台比对 → 回写 → 内容漂移后重算）。
+    ///
+    /// 覆盖点：
+    /// - 命中集在**后台线程**算出并正确回写（而不是卡在主线程同步扫描）；
+    /// - 终端继续输出导致 grid 坐标漂移后，重算能把命中带到新的行号上
+    ///   （这是命中集必须跟随内容代次重算的原因）。
+    #[gpui::test]
+    fn search_runs_in_background_and_follows_content_drift(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        // headless 默认 bounds 行数列数不直观，显式指定 40×10 便于推算漂移。
+        let bounds = TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(360.0), px(160.0))),
+        );
+        // 灌入内容：先填满一屏（10 行）把 hello 挤进 scrollback，
+        // 否则内容不滚动，坐标也就无从漂移。
+        let mut boot = String::new();
+        for i in 0..60 {
+            boot.push_str(&format!("filler line {i}\r\n"));
+        }
+        boot.push_str("hello world\r\n");
+        let boot = boot.into_bytes();
+
+        // 灌入内容 + 打开搜索浮层 + 填入查询词
+        view.downgrade()
+            .update_in(cx, |view, window, cx| {
+                view.terminal.update(cx, |terminal, cx| {
+                    terminal.resize(bounds, cx);
+                    terminal.handle_remote_data(&boot, cx);
+                });
+                view.open_search(window, cx);
+                let input = view.search_input.clone().expect("搜索输入框应已创建");
+                input.update(cx, |input, cx| input.set_value("hello", window, cx));
+                view.start_search_from_scratch(cx);
+            })
+            .unwrap();
+
+        // 防抖 + 后台比对 + 回写：推进时钟直到任务全部落地
+        cx.background_executor
+            .advance_clock(Duration::from_millis(SEARCH_DEBOUNCE_MS * 2));
+        cx.run_until_parked();
+
+        let first = view.read_with(cx, |view, _| {
+            (view.search.query.clone(), view.search.matches.clone())
+        });
+        assert_eq!(first.0, "hello");
+        assert_eq!(first.1.len(), 1, "后台比对应命中 1 处");
+        let initial_line = first.1[0].start.line;
+
+        // 追加 3 行输出：旧内容整体上移，坐标必须跟着漂移
+        view.downgrade()
+            .update_in(cx, |view, _window, cx| {
+                view.terminal.update(cx, |terminal, cx| {
+                    for _ in 0..3 {
+                        terminal.handle_remote_data(b"more output\r\n", cx);
+                    }
+                });
+                // 模拟 render 每帧的代次检查（清掉节流标记以便立即调度）
+                view.search_last_schedule = None;
+                view.maybe_schedule_search_for_content_change(cx);
+            })
+            .unwrap();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(SEARCH_DEBOUNCE_MS * 2));
+        cx.run_until_parked();
+
+        let recomputed = view.read_with(cx, |view, _| view.search.matches.clone());
+        assert_eq!(recomputed.len(), 1, "重算后仍应命中 1 处");
+        assert_ne!(
+            recomputed[0].start.line, initial_line,
+            "内容漂移后命中必须落到新的 grid 行，否则高亮会画错行"
+        );
     }
 }

@@ -1433,6 +1433,29 @@ impl Terminal {
         }
     }
 
+    /// 终端承载的进程是否仍在运行。
+    ///
+    /// - 本地：看 PTY 子进程是否还活着；
+    /// - 远程：看 SSH 通道是否还连着；
+    /// - Windows：无进程存活探测手段，退化为 true（保守视为「可能还活着」）。
+    ///
+    /// 用于区分「用户主动关闭一个还在跑的终端」与「shell 已正常 exit 退出」——
+    /// 后者不该进 undo 关闭栈，否则 `cmd-shift-t` 会恢复出一个死终端。
+    pub fn process_alive(&self) -> bool {
+        if self.is_remote() {
+            self.is_ssh_connected()
+        } else {
+            #[cfg(unix)]
+            {
+                self.local_child_alive()
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+    }
+
     /// 本地 PTY 子进程是否仍存活（`kill(pid, 0)` 探测，不发送信号）。
     #[cfg(unix)]
     fn local_child_alive(&self) -> bool {
@@ -2726,14 +2749,24 @@ impl Terminal {
 
     // ── Scrollback search ─────────────────────────────────────────────────
 
-    /// 在全部滚动区（scrollback + 屏幕，含 ALT 屏历史）内搜索 needle，
-    /// 返回所有命中（大小写不敏感，单行内匹配，按行序从旧到新）。
+    /// 在全部滚动区（scrollback + 屏幕）内搜索 needle（**同步，阻塞调用线程**）。
     ///
-    /// 点坐标为 grid 绝对坐标（负 Line 表示 scrollback），供渲染层做行高亮
-    /// 与滚动定位。空 / 纯空白 needle 返回空集。
+    /// 大滚动区（数千行）下的全量扫描较重，UI 路径请改用
+    /// [`Self::search_snapshot`] + [`search_matches_in_snapshot`] 把比对放到后台线程。
+    /// 本方法保留给测试与一次性同步查询。
+    ///
+    /// 点坐标为 grid 绝对坐标（负 Line 表示 scrollback），空 / 纯空白 needle 返回空集。
     pub fn search_matches(&self, needle: &str) -> Vec<SearchMatch> {
+        let snapshot = self.search_snapshot();
+        search_matches_in_snapshot(&snapshot, needle)
+    }
+
+    /// 抓取当前 grid 的搜索快照（持 term 锁，成本为 O(可见字符数) 的一次拷贝）。
+    ///
+    /// 快照与 grid 解耦后可安全 move 到后台线程做比对，避免逐键全量扫描卡住 UI。
+    pub fn search_snapshot(&self) -> SearchSnapshot {
         let term = self.term.lock();
-        search_matches_in_grid(&term, needle)
+        grid_search_snapshot(&term)
     }
 
     /// 把滚动位置调整到使 grid 行 `line` 尽量居中显示。
@@ -2860,89 +2893,121 @@ impl Drop for Terminal {
     }
 }
 
-/// 在 grid 中搜索 `needle`（大小写折叠），返回所有命中的行内区间。
+/// 单行的搜索快照：紧凑字符流 + 每个字符的列号与占宽。
 ///
-/// 坐标为 grid 绝对坐标：屏幕顶行 = Line(0)，scrollback 为负。
-/// `end` 列为开区间（下一字符列号或尾字符列+占宽），与选区约定一致。
-/// 每行内重叠命中只取首个（不重复计数同一子串）。
-pub fn search_matches_in_grid<T: EventListener>(term: &Term<T>, needle: &str) -> Vec<SearchMatch> {
-    let needle = needle.trim();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let needle_chars: Vec<char> = needle.chars().collect();
+/// 与 grid 解耦后可整体 move 到后台线程，比对过程无需再持 `FairMutex<Term>`。
+#[derive(Clone, Debug, Default)]
+pub struct LineSnapshot {
+    /// 剔除宽字符占位格与行尾 null 后的字符流。
+    pub text: String,
+    /// `text` 中每个字符对应的 grid 列号（下标与字符一一对应）。
+    pub cols: Vec<u32>,
+    /// 每个字符占的 cell 宽（1 或 2）。
+    pub widths: Vec<u8>,
+}
 
+/// 整个滚动区（scrollback + 屏幕）的搜索快照。
+#[derive(Clone, Debug, Default)]
+pub struct SearchSnapshot {
+    /// `lines[0]` 对应的 grid 行号（最旧一行，通常为负）。
+    pub topmost_line: i32,
+    pub lines: Vec<LineSnapshot>,
+}
+
+/// 从 grid 抓取搜索快照（调用方需已持有 term 锁）。
+///
+/// 两类格子跳过：
+/// - 行尾 null cell（稀疏行）：不算内容
+/// - 宽字符占位格（WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER）：
+///   alacritty 把 CJK 的第二格存成空格占位，检索必须剔除，
+///   否则"你好"会被拆成 你/空格/好 而永远无法命中。
+///
+/// 占宽用于命中尾部 end_col 的计算（CJK 宽字符占 2 格）。
+pub fn grid_search_snapshot<T: EventListener>(term: &Term<T>) -> SearchSnapshot {
     let grid = term.grid();
     let total = grid.total_lines();
     let cols = grid.columns();
     let topmost = grid.topmost_line();
 
-    let mut out = Vec::new();
+    let mut lines = Vec::with_capacity(total);
     for i in 0..total {
         let line = Line(topmost.0 + i as i32);
         let row = &grid[line];
 
-        // 按字符流拉出内容及其列号 / 占宽，两类格子跳过：
-        // - 行尾 null cell（稀疏行）：不算内容
-        // - 宽字符占位格（WIDE_CHAR_SPACER / LEADING_WIDE_CHAR_SPACER）：
-        //   alacritty 把 CJK 的第二格存成空格占位，检索必须剔除，
-        //   否则"你好"会被拆成 你/空格/好 而永远无法命中。
-        // 占宽用于命中尾部 end_col 的计算（CJK 宽字符占 2 格）。
-        let mut chars: Vec<char> = Vec::with_capacity(cols);
-        let mut cols_of: Vec<usize> = Vec::with_capacity(cols);
-        let mut widths_of: Vec<usize> = Vec::with_capacity(cols);
+        let mut text = String::with_capacity(cols);
+        let mut cols_of = Vec::with_capacity(cols);
+        let mut widths_of = Vec::with_capacity(cols);
         for col in 0..cols {
             let cell = &row[Column(col)];
-            let c = cell.c;
-            if c == '\0'
-                || cell.flags.intersects(
-                    alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER
-                        | alacritty_terminal::term::cell::Flags::LEADING_WIDE_CHAR_SPACER,
-                )
-            {
+            let spacer_flags = alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER
+                | alacritty_terminal::term::cell::Flags::LEADING_WIDE_CHAR_SPACER;
+            if cell.c == '\0' || cell.flags.intersects(spacer_flags) {
                 continue;
             }
-            let wide = usize::from(
-                cell.flags
-                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR),
-            ) + 1;
-            chars.push(c);
-            cols_of.push(col);
+            let wide = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            text.push(cell.c);
+            cols_of.push(col as u32);
             widths_of.push(wide);
         }
-        if chars.len() < needle_chars.len() {
+        lines.push(LineSnapshot {
+            text,
+            cols: cols_of,
+            widths: widths_of,
+        });
+    }
+
+    SearchSnapshot {
+        topmost_line: topmost.0,
+        lines,
+    }
+}
+
+/// 在快照中搜索 `needle`（大小写折叠），返回所有命中的行内区间。
+///
+/// 纯CPU、无锁、可在后台线程执行。坐标规则与 grid 一致：屏幕顶行 = Line(0)，
+/// scrollback 为负；`end` 列为开区间（下一字符列号或尾字符列+占宽）。
+/// 每行内重叠命中只取首个（不重复计数同一子串）。
+pub fn search_matches_in_snapshot(snapshot: &SearchSnapshot, needle: &str) -> Vec<SearchMatch> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    // 大小写折叠：每个字符取首个小写字母。
+    // （对多字符折叠的个别 Unicode 情形不完美，可接受。）
+    let needle_folded: Vec<char> = fold_chars(needle.chars());
+    let window = needle_folded.len();
+    if window == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (row_index, line) in snapshot.lines.iter().enumerate() {
+        // 大小写折叠是逐字符 1:1 映射，折叠后长度与原文一致，直接比窗口即可。
+        let folded = fold_chars(line.text.chars());
+        if folded.len() < window {
             continue;
         }
 
-        // 大小写折叠后逐窗比对：每个字符折叠首个小写字母。
-        // （对多字符折叠的个别 Unicode 情形不完美，可接受。）
-        let folded: Vec<char> = chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        let needle_folded: Vec<char> = needle_chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        if folded.len() < needle_folded.len() {
-            continue;
-        }
-
-        let window = needle_folded.len();
+        let grid_line = Line(snapshot.topmost_line + row_index as i32);
         let mut start = 0usize;
         while start + window <= folded.len() {
             if folded[start..start + window] == needle_folded[..] {
-                let start_col = cols_of[start];
+                let start_col = line.cols[start] as usize;
                 // 结束列：优先用下一个字符的列号（稀疏行会自然跨过空档），
                 // 行尾则用命中尾字符的列 + 占宽。
                 let last = start + window - 1;
-                let end_col = cols_of
+                let end_col = line
+                    .cols
                     .get(last + 1)
-                    .copied()
-                    .unwrap_or(cols_of[last] + widths_of[last]);
+                    .map(|c| *c as usize)
+                    .unwrap_or(line.cols[last] as usize + line.widths[last] as usize);
                 out.push(SearchMatch {
-                    start: AlacPoint::new(line, Column(start_col)),
-                    end: AlacPoint::new(line, Column(end_col)),
+                    start: AlacPoint::new(grid_line, Column(start_col)),
+                    end: AlacPoint::new(grid_line, Column(end_col)),
                 });
                 // 重叠匹配跳过，避免同一位置重复命中。
                 start += window;
@@ -2952,6 +3017,21 @@ pub fn search_matches_in_grid<T: EventListener>(term: &Term<T>, needle: &str) ->
         }
     }
     out
+}
+
+/// 逐字符大小写折叠（取首个小写字母）。
+#[inline]
+fn fold_chars(iter: impl Iterator<Item = char>) -> Vec<char> {
+    iter.map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+}
+
+/// 在 grid 中搜索 `needle`（大小写折叠），返回所有命中的行内区间。
+///
+/// 供测试与同步路径使用；UI 路径请用 [`grid_search_snapshot`] +
+/// [`search_matches_in_snapshot`] 以避开主线程的全量扫描。
+pub fn search_matches_in_grid<T: EventListener>(term: &Term<T>, needle: &str) -> Vec<SearchMatch> {
+    let snapshot = grid_search_snapshot(term);
+    search_matches_in_snapshot(&snapshot, needle)
 }
 
 /// 计算「使 grid 行 `line` 居中显示」所需的 display_offset。
@@ -3046,6 +3126,48 @@ mod tests {
         // 空串 / 纯空白无命中
         assert!(super::search_matches_in_grid(&term, "").is_empty());
         assert!(super::search_matches_in_grid(&term, "   ").is_empty());
+    }
+
+    #[test]
+    fn search_snapshot_matches_sync_scan_and_follows_grid_drift() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+        use super::AlacPoint;
+
+        let size = TermSize::new(20, 4);
+        let mut term = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        term.goto(0, 0);
+        for c in "hello".chars() {
+            term.input(c);
+        }
+        term.linefeed();
+        for c in "world".chars() {
+            term.input(c);
+        }
+
+        // 后台搜索走快照路径，必须与同步扫描结果完全一致。
+        let snapshot = super::grid_search_snapshot(&term);
+        assert_eq!(snapshot.lines.len(), term.grid().total_lines());
+        let via_snapshot = super::search_matches_in_snapshot(&snapshot, "HELLO");
+        let via_grid = super::search_matches_in_grid(&term, "HELLO");
+        assert_eq!(via_snapshot, via_grid, "快照路径与同步路径必须一致");
+        assert_eq!(via_snapshot[0].start, AlacPoint::new(Line(0), Column(0)));
+
+        // 继续输出 3 行：旧内容整体上移，grid 绝对坐标随之漂移。
+        // 这正是命中集必须跟随内容代次重算的原因——沿用旧坐标会高亮到错行。
+        for _ in 0..3 {
+            term.goto(3, 0);
+            term.linefeed();
+        }
+        let shifted = super::search_matches_in_grid(&term, "hello");
+        assert_eq!(shifted.len(), 1);
+        assert_eq!(shifted[0].start.line, Line(-3), "重算后应指向内容当前所在行");
+        assert_ne!(shifted[0].start.line, via_snapshot[0].start.line);
     }
 
     #[test]
