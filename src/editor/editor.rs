@@ -533,8 +533,10 @@ impl Editor {
             let content_clone = content.clone();
             // 图片粘贴/拖拽落盘需要文档位置（Typora `<stem>.assets/` 布局）。
             let live_doc_path = path_str.clone();
+            let live_read_only = file_info.read_only;
             Some(cx.new(|cx| {
                 crate::editor::markdown_live::LiveMarkdownView::with_text(&content_clone, cx)
+                    .read_only(live_read_only)
                     .doc_path(std::path::Path::new(&live_doc_path))
             }))
         } else {
@@ -1716,8 +1718,10 @@ impl Editor {
                                     });
                                 }
                                 if let Some(ref live) = file.live {
+                                    let live_read_only = loaded.read_only;
                                     live.update(cx, |view, cx| {
                                         view.set_text(&loaded.text, cx);
+                                        view.set_read_only(live_read_only, cx);
                                     });
                                 }
                                 // 缓存远程文件内容到 RemoteFileTreeCache
@@ -2286,9 +2290,11 @@ impl Editor {
             && path.extension().and_then(|e| e.to_str()) == Some("md");
         let live = if is_live_file {
             let content_clone = content.clone();
+            let live_doc_path = path.clone();
             Some(cx.new(|cx| {
                 crate::editor::markdown_live::LiveMarkdownView::with_text(&content_clone, cx)
                     .read_only(read_only)
+                    .doc_path(&live_doc_path)
             }))
         } else {
             None

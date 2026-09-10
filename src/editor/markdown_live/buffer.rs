@@ -132,11 +132,13 @@ impl LiveBuffer {
     }
 
     /// Mutate through the model; bumps the version iff the text changed.
-    /// Returns the mutation's return value.
+    /// Returns the mutation's return value. Uses the model's O(1) text
+    /// revision instead of joining the full document twice, so pure cursor
+    /// moves never allocate.
     pub fn edit<R>(&mut self, f: impl FnOnce(&mut EditorModel) -> R) -> R {
-        let before = self.model.text();
+        let before = self.model.text_version();
         let out = f(&mut self.model);
-        if self.model.text() != before {
+        if self.model.text_version() != before {
             self.bump();
         }
         out

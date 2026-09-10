@@ -49,6 +49,10 @@ pub struct EditorModel {
   coalescing: bool,
   /// Spaces per tab stop for [`tab`](Self::tab).
   tab_size: usize,
+  /// Monotonic text revision, bumped only by mutations of `lines`.
+  /// Lets `LiveBuffer::edit` detect text changes in O(1) without joining
+  /// the full document on every keystroke / cursor move.
+  text_version: u64,
 }
 
 impl Default for EditorModel {
@@ -79,6 +83,7 @@ impl EditorModel {
       redo: Vec::new(),
       coalescing: false,
       tab_size: 4,
+      text_version: 0,
     }
   }
 
@@ -86,6 +91,15 @@ impl EditorModel {
 
   pub fn text(&self) -> String {
     self.lines.join("\n")
+  }
+
+  /// O(1) text revision for cheap edit detection (`LiveBuffer::edit`).
+  pub fn text_version(&self) -> u64 {
+    self.text_version
+  }
+
+  fn bump_text(&mut self) {
+    self.text_version = self.text_version.wrapping_add(1);
   }
 
   /// Replace the whole document, resetting cursor, selection, and history.
@@ -97,6 +111,7 @@ impl EditorModel {
     self.undo.clear();
     self.redo.clear();
     self.coalescing = false;
+    self.bump_text();
   }
 
   pub fn is_empty(&self) -> bool {
@@ -604,6 +619,7 @@ impl EditorModel {
     let Some(snap) = self.undo.pop() else {
       return false;
     };
+    self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     self.redo.push(Snapshot {
       lines,
@@ -621,6 +637,7 @@ impl EditorModel {
     let Some(snap) = self.redo.pop() else {
       return false;
     };
+    self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     self.undo.push(Snapshot {
       lines,
@@ -718,6 +735,12 @@ impl EditorModel {
 
   /// Remove `start..end` (document order), leaving the cursor at `start`.
   fn remove_range(&mut self, start: Pos, end: Pos) {
+    if start == end {
+      self.cursor = start;
+      self.anchor = None;
+      return;
+    }
+    self.bump_text();
     if start.line == end.line {
       let line = &mut self.lines[start.line];
       let a = byte_idx(line, start.col);
@@ -740,6 +763,7 @@ impl EditorModel {
     if s.is_empty() {
       return;
     }
+    self.bump_text();
     let Pos { line, col } = self.cursor;
     let at = byte_idx(&self.lines[line], col);
     if !s.contains('\n') {

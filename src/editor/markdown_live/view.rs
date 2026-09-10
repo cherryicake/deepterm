@@ -104,14 +104,18 @@ pub struct LiveMarkdownView {
     _subscriptions: Vec<Subscription>,
     /// 行虚拟化（大文档）：每帧只建视口内 group 的元素，其余以占位撑高。
     /// group 粒度保证代码卡片/引用/表格不被拦腰截断；小文档走全量老路。
-    /// 上一帧实测的 group 高（`scroll.child_bounds` 回填；文本变化即清空，
-    /// group 序号会移位），缺失时用行数估算，绘制后逐帧自我修正。
+    /// 上一帧实测的 group 高（`scroll.bounds_for_item` 回填；跨帧保留，
+    /// 缺失时用实测均值校准后的行数估算，绘制后逐帧自我修正）。
     group_heights: std::collections::HashMap<usize, f32>,
     heights_version: u64,
     /// 上一帧视口宽：换行随宽度变化，变宽即清空 `group_heights`。
     last_vp_width: f32,
     /// 上一帧渲染的 group 窗口（含占位映射），供本帧回填实测高度。
     last_window: Option<(usize, usize)>,
+    /// 上一帧窗口内每个 group 产生的滚动子项数（通常 1；源码态表格为行数）。
+    /// 回填实测高度时按此切分 `bounds_for_item`，避免把高度记到错位的 group 上
+    /// （错位会导致 prefix 跳变，是底部回滚上下抖动的主因之一）。
+    last_window_counts: Vec<usize>,
     /// 本帧虚拟化几何（点击映射用；非虚拟化时为空）：前缀和、每 group
     /// 首末源码行、窗口下界、顶部占位占用的 child 序号偏移。
     virt_prefix: Vec<f32>,
@@ -122,6 +126,9 @@ pub struct LiveMarkdownView {
     /// 状态条字数缓存 `(text_version, selection, chars, lines, sel_chars)`：
     /// 全文档字符统计每帧 O(n)，命中缓存后为 O(1)。
     stat_cache: Option<(u64, Option<(Pos, Pos)>, usize, usize, Option<usize>)>,
+    /// 已发出的 `Change` 对应的 `text_version`：`edit` 不再直接发射，
+    /// 统一由 `after_edit`/`set_text` 按版本去重后发射，避免每键两次同步。
+    emitted_version: u64,
     /// 测试探针：上帧 `(groups_total, groups_rendered, virtualized)`。
     #[cfg(test)]
     last_render_stats: (usize, usize, bool),
@@ -170,12 +177,14 @@ impl LiveMarkdownView {
             heights_version: u64::MAX,
             last_vp_width: 0.0,
             last_window: None,
+            last_window_counts: Vec::new(),
             virt_prefix: Vec::new(),
             virt_group_lines: Vec::new(),
             virt_lo: 0,
             virt_hi: 0,
             virt_top_off: 0,
             stat_cache: None,
+            emitted_version: 0,
             #[cfg(test)]
             last_render_stats: (0, 0, false),
         }
@@ -205,6 +214,23 @@ impl LiveMarkdownView {
         self
     }
 
+    /// 异步加载完成后同步只读态（`Editor::spawn_file_load`）：仅影子
+    /// `InputState::disabled` 不足以锁住 live 视图自身编辑。
+    pub fn set_read_only(&mut self, ro: bool, cx: &mut Context<Self>) {
+        if self.read_only != ro {
+            self.read_only = ro;
+            cx.notify();
+        }
+    }
+
+    /// 更新文档落盘路径（预留：重命名/另存后同步 assets 定位）。
+    pub fn set_doc_path(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        if !path.as_os_str().is_empty() {
+            self.doc_path = Some(path.to_path_buf());
+        }
+    }
+
     pub fn text(&self) -> String {
         self.buffer.text()
     }
@@ -215,6 +241,11 @@ impl LiveMarkdownView {
         self.hl.clear();
         self.copied_code_blocks.clear();
         self.scroll_to_cursor = true;
+        self.emitted_version = self.buffer.text_version();
+        if let Some(panel) = self.search_panel.clone() {
+            let text = Rope::from(self.buffer.text());
+            panel.update(cx, |p, _| p.sync_text(&text));
+        }
         cx.emit(LiveViewEvent::Change(self.buffer.text()));
         cx.notify();
     }
@@ -492,15 +523,14 @@ impl LiveMarkdownView {
             .insert(line, RowLayoutInfo { layout, text_len });
     }
 
-    /// Mutate with change-event + rerender (the `edit` transaction).
+    /// Mutate + rerender (the `edit` transaction). Never emits `Change`
+    /// itself: every text mutation is followed by `after_edit`, which emits
+    /// once per transaction (deduped by `emitted_version`). Emitting here
+    /// as well doubled shadow-`InputState` sync + `buffer.text()` clones.
     pub fn edit<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> R) -> R {
-        let before = self.buffer.text();
         self.scroll_to_cursor = true;
         self.pause_caret(cx);
         let out = self.buffer.edit(f);
-        if self.buffer.text() != before {
-            cx.emit(LiveViewEvent::Change(self.buffer.text()));
-        }
         cx.notify();
         out
     }
@@ -572,12 +602,16 @@ impl LiveMarkdownView {
         // `after_move`, which preserves it); the query itself re-derives
         // from the buffer each frame.
         self.slash_index = 0;
-        // 查找面板的匹配跟随文档（`InputState::update_search` parity）。
-        if let Some(panel) = self.search_panel.clone() {
-            let text = Rope::from(self.buffer.text());
-            panel.update(cx, |p, _| p.sync_text(&text));
+        let version = self.buffer.text_version();
+        if version != self.emitted_version {
+            self.emitted_version = version;
+            // 查找面板的匹配跟随文档（`InputState::update_search` parity）。
+            if let Some(panel) = self.search_panel.clone() {
+                let text = Rope::from(self.buffer.text());
+                panel.update(cx, |p, _| p.sync_text(&text));
+            }
+            cx.emit(LiveViewEvent::Change(self.buffer.text()));
         }
-        cx.emit(LiveViewEvent::Change(self.buffer.text()));
         cx.notify();
         cx.stop_propagation();
     }
@@ -1806,10 +1840,16 @@ pub(crate) struct RowLayoutInfo {
 /// 上下各多建一点 cover 滚动）。
 const VIRTUALIZE_GROUPS: usize = 200;
 const OVERSCAN_GROUPS: usize = 12;
+/// 窗口迟滞：视口移动不足该 group 数时复用上帧窗口，避免 1-group 步进
+/// 带动顶部占位逐帧跳变（底部回滚上下抖动的直接观感）。
+const WIN_HYST_GROUPS: usize = 6;
 /// 首帧视口未知时预建的 group 数（滚动后按真实视口修正）。
 const FIRST_WINDOW_GROUPS: usize = 80;
 /// 未实测 group 的高度估算：单行高 + 各容器 chrome。
 const EST_LINE_H: f32 = 26.0;
+/// Pitch 回填时代的默认行高：含组间 margin（标题 pitch 62.5、空白 38~58、
+/// 段落 40 左右），只在尚无任一实测样本的首帧使用。
+const EST_PITCH_H: f32 = 40.0;
 
 /// A render group: consecutive rows sharing one chrome container.
 enum Group {
@@ -1838,15 +1878,35 @@ impl Group {
         }
     }
 
-    /// Chrome padding beyond `row_count * EST_LINE_H` (card margins,
-    /// paddings, headers); refined by measured heights after paint.
-    fn chrome(&self) -> f32 {
+    /// Calibration bucket (20): estimate = rows x rate[bucket], with the
+    /// container chrome amortized into the rate. Learning chrome
+    /// separately proved unidentifiable (para chrome guessed 20 vs true
+    /// ~2 pushed the rate into its clamp floor and biased every unmeasured
+    /// para +6px); mixing headings (46px) with blanks (26px) in one bucket
+    /// swung the total whenever the window mix changed (bottom-up jitter).
+    /// Blanks are bimodal by neighbour (38 after heading vs 58 after para
+    /// in the pitch model, margins included), so bucket 9 is split by
+    /// predecessor: 10 + prev_base (11 = after blank/unknown-first, ...).
+    /// Each sub-bucket is unimodal; median then resists the margin-less
+    /// trailing 26px outliers.
+    fn cal_bucket(&self, rows: &[PlannedRow]) -> u8 {
         match self {
-            Group::One(_) => 0.0,
-            Group::Fence { .. } => 64.0,
-            Group::Table(_) => 48.0,
-            Group::Quote(_) => 24.0,
-            Group::Para(_) => 20.0,
+            Group::Para(_) => 1,
+            Group::Quote(_) => 3,
+            Group::Table(_) => 6,
+            Group::Fence { .. } => 4,
+            Group::One(pi) => match rows.get(*pi).map(|r| &r.plan.kind) {
+                Some(RowKind::Heading(_)) => 0,
+                Some(RowKind::Paragraph) => 1,
+                Some(RowKind::Bullet { .. } | RowKind::Ordered { .. } | RowKind::Task { .. }) => 2,
+                Some(RowKind::Quote { .. }) => 3,
+                Some(RowKind::Fence { .. } | RowKind::Code { .. }) => 4,
+                Some(RowKind::Rule) => 5,
+                Some(RowKind::Table) => 6,
+                Some(RowKind::Math | RowKind::MathDelim { .. }) => 7,
+                Some(RowKind::Setext | RowKind::FrontMatter) => 8,
+                Some(RowKind::Blank) | None => 9,
+            },
         }
     }
 
@@ -1895,7 +1955,7 @@ impl LiveMarkdownView {
     /// `group_heights`, estimates cover the rest.
     fn virtual_window(
         &mut self,
-        ginfo: &[(usize, f32, (usize, usize))],
+        ginfo: &[(usize, u8, (usize, usize))],
         cursor_line: usize,
         text_version: u64,
         want_caret: bool,
@@ -1908,14 +1968,24 @@ impl LiveMarkdownView {
             self.virt_hi = 0;
             self.virt_top_off = 0;
             self.last_window = None;
+            self.last_window_counts.clear();
             return None;
         }
-        // Text edits shift group indices: drop measured heights for one
-        // frame of estimates (steady blink/scroll frames stay exact).
-        if text_version != self.heights_version {
-            self.group_heights.clear();
+        // Text edits shift group indices, but measured heights are kept:
+        // dropping the whole map on every keystroke reverts to estimates
+        // for a frame (scroll-height flicker + re-measure churn). Stale
+        // entries self-correct below via measured child bounds; only a
+        // viewport-width change (rewrap) needs a full clear.
+        // `heights_version` still tracks the last text revision for tests.
+        let text_changed = text_version != self.heights_version;
+        if text_changed {
             self.heights_version = text_version;
         }
+        // 上帧几何快照（锚定补偿用）：prefix 逐帧重算会漂，`lo` 越大顶部占位
+        // 跳变越大；用同一 anchor 的新旧差修正 scroll offset，视口内容不动。
+        let old_prefix = self.virt_prefix.clone();
+        let old_window = self.last_window;
+        let old_same_shape = old_prefix.len() == g + 1;
         // Wrapping follows viewport width: re-measure after resize.
         let vp = self.scroll.bounds();
         let vp_w = f32::from(vp.size.width);
@@ -1923,43 +1993,172 @@ impl LiveMarkdownView {
             self.group_heights.clear();
         }
         self.last_vp_width = vp_w;
-        // Feed back last frame's measured heights (mapping is unambiguous:
-        // top spacer? + window groups + bottom spacer?).
+        // Feed back last frame's measured heights. Children are
+        // [top spacer?] + window groups (each 1 child, except revealed
+        // tables which expand to N row children) + [bottom spacer?].
+        // The old code assumed 1 group = 1 child, so a revealed table
+        // shifted every later group's height onto the wrong index and the
+        // prefix/total jumped each frame (bottom-up scroll抖动).
         if let Some((plo, phi)) = self.last_window
             && phi < g
+            && self.last_window_counts.len() == phi - plo + 1
         {
+            let counts = self.last_window_counts.clone();
             let top_off = usize::from(plo > 0);
             let bot_off = usize::from(phi + 1 < g);
-            let expected = (phi - plo + 1) + top_off + bot_off;
+            let expected: usize = counts.iter().sum::<usize>() + top_off + bot_off;
             let mut count = 0usize;
             while count < expected && self.scroll.bounds_for_item(count).is_some() {
                 count += 1;
             }
             if count == expected {
-                for k in 0..=(phi - plo) {
-                    if let Some(b) = self.scroll.bounds_for_item(k + top_off) {
-                        self.group_heights.insert(plo + k, f32::from(b.size.height));
+                // Pitch-based measurement: group height = distance from its
+                // first child's top to the next child's top. Unlike
+                // border-box sums this captures the inter-element margins
+                // the flex column adds between rows/cards; missing them
+                // underestimated the total by hundreds of px and the
+                // scrollbar thumb lied about position/size.
+                let mut tops: Vec<f32> = Vec::with_capacity(expected + 1);
+                for ix in 0..expected {
+                    // Guaranteed `Some` by the count check above.
+                    match self.scroll.bounds_for_item(ix) {
+                        Some(b) => tops.push(f32::from(b.origin.y)),
+                        None => break,
+                    }
+                }
+                if tops.len() == expected {
+                    let last_bottom = self
+                        .scroll
+                        .bounds_for_item(expected - 1)
+                        .map(|b| f32::from(b.origin.y) + f32::from(b.size.height));
+                    let mut first_of = top_off;
+                    for (k, c) in counts.iter().enumerate() {
+                        let h = if k + 1 < counts.len() || bot_off == 1 {
+                            // Next top exists: a group child or the bottom
+                            // spacer (its top is the content end, so the
+                            // last group's trailing margin is included).
+                            tops[first_of + c] - tops[first_of]
+                        } else if let Some(bb) = last_bottom {
+                            // At the very end: no bottom spacer, and the
+                            // trailing margin sits outside content_size
+                            // (matches scrollbar max semantics).
+                            bb - tops[first_of]
+                        } else {
+                            first_of += *c;
+                            continue;
+                        };
+                        if h > 0.0 {
+                            self.group_heights.insert(plo + k, h);
+                        }
+                        first_of += *c;
                     }
                 }
             }
         }
-        // Prefix sums over measured heights, estimates for the rest.
+        // Prefix sums over measured heights, per-row-kind calibrated
+        // estimates for the rest (see `Group::cal_bucket`). Rates are
+        // derived from the currently measured groups every frame, so no
+        // persistent state can drift; unknown buckets fall back to the
+        // global mean, then `EST_LINE_H`.
+        // Per-bucket median pitch: each measured group contributes one
+        // sample `v = h / rows`. The mean proved fragile: two trailing
+        // margin-less blank groups (pitch 26) dragged the blank-bucket mean
+        // 48.0 -> 46.9, swinging the total by ~600px on next measure.
+        // Median over >=4 groups is immune to those outliers and to the
+        // 38/58 blank phase mix (median ~= 48, errors cancel in total).
+        fn median(vals: &mut [f32]) -> f32 {
+            vals.sort_by(|a, b| a.total_cmp(b));
+            let n = vals.len();
+            if n % 2 == 1 {
+                vals[n / 2]
+            } else {
+                (vals[n / 2 - 1] + vals[n / 2]) * 0.5
+            }
+        }
+        let mut kind_vals: Vec<Vec<f32>> = vec![Vec::new(); 20];
+        let mut all_vals: Vec<f32> = Vec::new();
+        for (i, (r, b, _)) in ginfo.iter().enumerate() {
+            if let Some(h) = self.group_heights.get(&i) {
+                // The last group is measured border-box (no next top, no
+                // trailing margin) and trailing blanks collapse their
+                // margins (26 vs 58 mid-doc): neither is a pitch sample,
+                // feeding them in would bias the shared rates.
+                if i + 1 >= g && g > 1 {
+                    continue;
+                }
+                let v = (*h / (*r as f32).max(1.0)).clamp(8.0, 96.0);
+                kind_vals[*b as usize].push(v);
+                all_vals.push(v);
+            }
+        }
+        // Fallback chain: bucket median -> global median -> pitch default.
+        // `EST_LINE_H` is the border-box-era row height and no longer a
+        // valid pitch fallback (it misses ~12px of margins per group).
+        let global_rate = if all_vals.is_empty() {
+            EST_PITCH_H
+        } else {
+            median(&mut all_vals.clone()).clamp(8.0, 96.0)
+        };
+        let mut kind_rate = [global_rate; 20];
+        for k in 0..20 {
+            if kind_vals[k].len() >= 4 {
+                kind_rate[k] = median(&mut kind_vals[k]).clamp(8.0, 96.0);
+            }
+        }
+        // Trailing-blank prior: the last two groups' blanks render
+        // without block margins (measured 26 = line height vs 38/58
+        // mid-doc pitch). Estimating them at pitch rates injects ~32px
+        // per group of one-time settling jump on first bottom arrival.
+        let is_trailing_blank = |i: usize| -> bool {
+            if i + 2 < g {
+                return false;
+            }
+            matches!(
+                ginfo.get(i).map(|(_, b, _)| *b),
+                Some(10..=19)
+            )
+        };
         let mut prefix = Vec::with_capacity(g + 1);
         prefix.push(0.0f32);
-        for (i, (rows, chrome, _)) in ginfo.iter().enumerate() {
-            let h = self
-                .group_heights
-                .get(&i)
-                .copied()
-                .unwrap_or((*rows as f32) * EST_LINE_H + chrome);
+        for (i, (rows, b, _)) in ginfo.iter().enumerate() {
+            let h = self.group_heights.get(&i).copied().unwrap_or_else(|| {
+                if is_trailing_blank(i) {
+                    (*rows as f32) * EST_LINE_H
+                } else {
+                    (*rows as f32) * kind_rate[*b as usize]
+                }
+            });
             prefix.push(prefix[i] + h);
         }
-        // Viewport window in content pixels.
+        // Viewport window in content pixels (scroll-anchored).
         let vp_h = f32::from(vp.size.height);
+        let mut off_y = -f32::from(self.scroll.offset().y);
+        // 锚定补偿：锚点取旧空间下视口顶部 group（不是窗口顶部，也不是
+        // 内容末端——两者都会把锚点下方新实测 group 的修正漏成视口位移），
+        // 组内按比例跟随；视口下方（含底部）的修正由底部占位吸收，视口内容
+        // 保持不动，用户滚轮位移被完整保留。
+        if !text_changed && !want_caret && vp_h > 0.0 && old_same_shape {
+            let mut a = g - 1;
+            for i in 0..g {
+                if old_prefix[i + 1] > off_y {
+                    a = i;
+                    break;
+                }
+                a = i;
+            }
+            let h_old = (old_prefix[a + 1] - old_prefix[a]).max(1.0);
+            let frac = ((off_y - old_prefix[a]) / h_old).clamp(0.0, 1.0);
+            let h_new = (prefix[a + 1] - prefix[a]).max(1.0);
+            let want = prefix[a] + frac * h_new;
+            if (want - off_y).abs() > 0.01 && (want - off_y).abs() < 4000.0 {
+                let cur = self.scroll.offset();
+                self.scroll.set_offset(gpui::point(cur.x, -px(want)));
+                off_y = want;
+            }
+        }
         let (mut lo, mut hi) = if vp_h <= 0.0 {
             (0, FIRST_WINDOW_GROUPS.min(g - 1))
         } else {
-            let off_y = -f32::from(self.scroll.offset().y);
             let mut lo0 = 0;
             for i in 0..g {
                 if prefix[i + 1] > off_y {
@@ -1981,6 +2180,21 @@ impl LiveMarkdownView {
                 (hi0 + OVERSCAN_GROUPS).min(g - 1),
             )
         };
+        // 窗口迟滞：小幅滚动复用上帧窗口（overscan 覆盖视口），避免 lo/hi
+        // 逐 group 步进带动顶部占位跳变；该跳变是底部回滚上下抖动的直接观感。
+        if !text_changed && !want_caret && old_same_shape {
+            if let Some((olo, ohi)) = old_window
+                && ohi < g
+                && olo <= ohi
+                && lo.abs_diff(olo) <= WIN_HYST_GROUPS
+                && hi.abs_diff(ohi) <= WIN_HYST_GROUPS
+                && prefix[olo] <= off_y + 1.0
+                && off_y + vp_h <= prefix[ohi + 1] + 1.0
+            {
+                lo = olo;
+                hi = ohi;
+            }
+        }
         // Caret edits/moves must land inside the window (scroll_to_item
         // consumes the mapped child index in the same frame's prepaint).
         if want_caret {
@@ -2059,6 +2273,150 @@ impl Render for LiveMarkdownView {
         let last_line = rows.len().saturating_sub(1);
         let entity = cx.entity();
 
+        // ---- grouping (before paint: virtualization window must gate
+        // per-row work, otherwise blink ticks stay O(rows)) -----------------
+        let mut groups: Vec<Group> = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            match &rows[i].block {
+                Block::Fence { open: true, lang } => {
+                    let lang = lang.clone();
+                    let open = i;
+                    i += 1;
+                    let mut code = Vec::new();
+                    while i < rows.len() && matches!(rows[i].block, Block::CodeLine) {
+                        code.push(i);
+                        i += 1;
+                    }
+                    let close = if i < rows.len()
+                        && matches!(rows[i].block, Block::Fence { open: false, .. })
+                    {
+                        let c = Some(i);
+                        i += 1;
+                        c
+                    } else {
+                        None
+                    };
+                    groups.push(Group::Fence {
+                        open,
+                        code,
+                        close,
+                        lang,
+                    });
+                }
+                Block::Quote { depth, .. } => {
+                    let depth = *depth;
+                    let mut v = vec![i];
+                    i += 1;
+                    while i < rows.len()
+                        && matches!(rows[i].block, Block::Quote { depth: d, .. } if d == depth)
+                    {
+                        v.push(i);
+                        i += 1;
+                    }
+                    groups.push(Group::Quote(v));
+                }
+                Block::Paragraph => {
+                    let mut v = vec![i];
+                    i += 1;
+                    while i < rows.len() && matches!(rows[i].block, Block::Paragraph) {
+                        v.push(i);
+                        i += 1;
+                    }
+                    groups.push(Group::Para(v));
+                }
+                Block::Table => {
+                    let mut v = vec![i];
+                    i += 1;
+                    while i < rows.len() && matches!(rows[i].block, Block::Table) {
+                        v.push(i);
+                        i += 1;
+                    }
+                    groups.push(Group::Table(v));
+                }
+                _ => {
+                    groups.push(Group::One(i));
+                    i += 1;
+                }
+            }
+        }
+
+        // Row virtualization window, computed BEFORE per-row paint so
+        // `code_runs` / `find_marks` / `paints` / `display_numbers` only pay
+        // for the viewport (+ overscan). Small docs render everything.
+        let mut ginfo: Vec<(usize, u8, (usize, usize))> = Vec::with_capacity(groups.len());
+        let mut prev_base: u8 = 9;
+        for gr in groups.iter() {
+            let base = gr.cal_bucket(&rows);
+            let b = if base == 9 {
+                10 + prev_base.min(9)
+            } else {
+                base
+            };
+            ginfo.push((gr.row_count(), b, gr.line_range(&rows)));
+            prev_base = base;
+        }
+        let text_version = self.buffer.text_version();
+        let want_caret = self.scroll_to_cursor;
+        let vw = self.virtual_window(&ginfo, cursor.line, text_version, want_caret);
+        let virtualized = vw.is_some();
+        let (v_lo, v_hi, v_top_px, v_bot_px) =
+            vw.unwrap_or((0, groups.len().saturating_sub(1), 0.0, 0.0));
+        // Visible row indices for this frame (`None` = everything).
+        let visible: Option<Vec<bool>> = if virtualized {
+            let mut vis = vec![false; rows.len()];
+            for gi in v_lo..=v_hi {
+                if let Some(gr) = groups.get(gi) {
+                    match gr {
+                        Group::One(pi) => {
+                            if *pi < vis.len() {
+                                vis[*pi] = true;
+                            }
+                        }
+                        Group::Fence { open, code, close, .. } => {
+                            if *open < vis.len() {
+                                vis[*open] = true;
+                            }
+                            for pi in code {
+                                if *pi < vis.len() {
+                                    vis[*pi] = true;
+                                }
+                            }
+                            if let Some(c) = close {
+                                if *c < vis.len() {
+                                    vis[*c] = true;
+                                }
+                            }
+                        }
+                        Group::Para(v) | Group::Quote(v) | Group::Table(v) => {
+                            for pi in v {
+                                if *pi < vis.len() {
+                                    vis[*pi] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Caret row must paint even at window edges (scroll_to_item
+            // target + caret height).
+            if let Some(pi) = rows.iter().position(|r| r.line == cursor.line) {
+                if pi < vis.len() {
+                    vis[pi] = true;
+                }
+            }
+            Some(vis)
+        } else {
+            None
+        };
+        let is_visible = |pi: usize| -> bool {
+            match &visible {
+                None => true,
+                Some(v) => *v.get(pi).unwrap_or(&false),
+            }
+        };
+
+
         // ---- per-row paint (runs + selection + caret) --------------------
         // (`row.plan` already carries callout tag-stripping from
         // `planned_rows`, shared with hit-testing.)
@@ -2090,6 +2448,11 @@ impl Render for LiveMarkdownView {
                 if code.is_empty() {
                     continue;
                 }
+                // Virtualized: skip highlight (tree-sitter + clones) for
+                // fences fully outside the viewport window.
+                if virtualized && !(start..i).any(|pi| is_visible(pi)) {
+                    continue;
+                }
                 let base = row_base_style(&rows[code.start].plan, &style);
                 let src_lines: Vec<&str> = code
                     .clone()
@@ -2097,7 +2460,11 @@ impl Render for LiveMarkdownView {
                     .collect();
                 let per_line = self.hl.runs_for_block(&lang, &src_lines, &base, &theme);
                 for (pi, runs) in code.zip(per_line) {
-                    code_runs.insert(rows[pi].line, runs);
+                    // Only window rows are painted; off-screen runs would
+                    // just bloat the map with per-line clones.
+                    if is_visible(pi) {
+                        code_runs.insert(rows[pi].line, runs);
+                    }
                 }
             }
         }
@@ -2115,8 +2482,12 @@ impl Render for LiveMarkdownView {
                 })
                 .unwrap_or_default();
             if !match_ranges.is_empty() {
-                let row_by_line: HashMap<usize, usize> =
-                    rows.iter().enumerate().map(|(pi, r)| (r.line, pi)).collect();
+                let row_by_line: HashMap<usize, usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(pi, _)| is_visible(*pi))
+                    .map(|(pi, r)| (r.line, pi))
+                    .collect();
                 let lines = self.buffer.lines();
                 for (ix, range) in match_ranges.iter().enumerate() {
                     let start = pos_of_offset(lines, range.start);
@@ -2141,6 +2512,9 @@ impl Render for LiveMarkdownView {
                         let Some(pi) = row_by_line.get(&line) else {
                             continue;
                         };
+                        if virtualized && !is_visible(*pi) {
+                            continue;
+                        }
                         let segs = &rows[*pi].plan.segs;
                         let (vs, ve) = (vis_for_src(segs, bs), vis_for_src(segs, be));
                         if vs < ve {
@@ -2151,8 +2525,13 @@ impl Render for LiveMarkdownView {
             }
             marks
         };
-        let mut paints: Vec<RowPaint> = Vec::with_capacity(rows.len());
-        for row in &rows {
+        // Only viewport rows pay for runs/selection/caret shaping;
+        // off-screen rows are skipped entirely (no per-row clones).
+        let mut paints: HashMap<usize, RowPaint> = HashMap::new();
+        for (pi, row) in rows.iter().enumerate() {
+            if virtualized && !is_visible(pi) {
+                continue;
+            }
             let plan = &row.plan;
             let base = row_base_style(plan, &style);
             let mut runs = if let Some(block_runs) = code_runs.get(&row.line) {
@@ -2221,91 +2600,50 @@ impl Render for LiveMarkdownView {
             } else {
                 (CURSOR_WIDTH, None)
             };
-            // Stash paint for the grouping pass below.
-            paints.push(RowPaint {
-                runs,
-                caret_vis,
-                caret_h,
-                caret_block_width,
-                caret_block_text,
-            });
+            // Stash paint for the windowed grouping pass below.
+            paints.insert(
+                pi,
+                RowPaint {
+                    runs,
+                    caret_vis,
+                    caret_h,
+                    caret_block_width,
+                    caret_block_text,
+                },
+            );
         }
-        // ---- grouping ------------------------------------------------------
-        let mut groups: Vec<Group> = Vec::new();
-        let mut i = 0;
-        while i < rows.len() {
-            match &rows[i].block {
-                Block::Fence { open: true, lang } => {
-                    let lang = lang.clone();
-                    let open = i;
-                    i += 1;
-                    let mut code = Vec::new();
-                    while i < rows.len() && matches!(rows[i].block, Block::CodeLine) {
-                        code.push(i);
-                        i += 1;
-                    }
-                    let close = if i < rows.len()
-                        && matches!(rows[i].block, Block::Fence { open: false, .. })
-                    {
-                        let c = Some(i);
-                        i += 1;
-                        c
-                    } else {
-                        None
-                    };
-                    groups.push(Group::Fence {
-                        open,
-                        code,
-                        close,
-                        lang,
-                    });
-                }
-                Block::Quote { depth, .. } => {
-                    let depth = *depth;
-                    let mut v = vec![i];
-                    i += 1;
-                    while i < rows.len()
-                        && matches!(rows[i].block, Block::Quote { depth: d, .. } if d == depth)
-                    {
-                        v.push(i);
-                        i += 1;
-                    }
-                    groups.push(Group::Quote(v));
-                }
-                Block::Paragraph => {
-                    let mut v = vec![i];
-                    i += 1;
-                    while i < rows.len() && matches!(rows[i].block, Block::Paragraph) {
-                        v.push(i);
-                        i += 1;
-                    }
-                    groups.push(Group::Para(v));
-                }
-                Block::Table => {
-                    let mut v = vec![i];
-                    i += 1;
-                    while i < rows.len() && matches!(rows[i].block, Block::Table) {
-                        v.push(i);
-                        i += 1;
-                    }
-                    groups.push(Group::Table(v));
-                }
-                _ => {
-                    groups.push(Group::One(i));
-                    i += 1;
-                }
-            }
-        }
-
         // ---- render helpers (per-row LiveLine) ------------------------------
         // Ordered display numbers per nesting depth (preview parity: see
-        // `OrderedCounter`). Computed over ALL rows in document order so
-        // grouped paragraphs still reset the counters between lists.
-        let mut ordered = OrderedCounter::new();
-        let display_numbers: Vec<Option<u64>> = rows
-            .iter()
-            .map(|row| ordered.visit(&row.plan.kind, list_cols(&row.plan.kind)))
-            .collect();
+        // `OrderedCounter`). Counters depend on document order, so scan
+        // from the top to the window end but only retain window rows:
+        // top-window frames avoid the O(rows) tail entirely.
+        let display_numbers: HashMap<usize, Option<u64>> = {
+            let mut ordered = OrderedCounter::new();
+            let mut map: HashMap<usize, Option<u64>> = HashMap::new();
+            let scan_end = if virtualized {
+                let mut max_pi = 0usize;
+                if let Some(vis) = &visible {
+                    for (pi, on) in vis.iter().enumerate() {
+                        if *on {
+                            max_pi = max_pi.max(pi);
+                        }
+                    }
+                }
+                max_pi.min(rows.len().saturating_sub(1))
+            } else {
+                rows.len().saturating_sub(1)
+            };
+            for (pi, row) in rows.iter().enumerate() {
+                if pi > scan_end {
+                    break;
+                }
+                let n = ordered.visit(&row.plan.kind, list_cols(&row.plan.kind));
+                if is_visible(pi) && n.is_some() {
+                    map.insert(pi, n);
+                }
+            }
+            map
+        };
         // row_els index of the element containing the caret's source line,
         // for `scroll_to_item` (the rows column registers every direct
         // child's bounds with the scroll handle).
@@ -2318,13 +2656,13 @@ impl Render for LiveMarkdownView {
         // `render_line` needs lots of context: build rows inline via closure.
         let cursor_shape = self.cursor_shape;
         let mut live_line = |pi: usize,
-                             paints: &[RowPaint],
+                             paints: &HashMap<usize, RowPaint>,
                              entity: &Entity<Self>,
                              colors: &LiveColors|
          -> LiveLine {
             let drag_fallback = first_row_el;
             first_row_el = false;
-            let paint = &paints[pi];
+            let paint = paints.get(&pi).expect("visible row must have paint");
             let plan = &rows[pi].plan;
             LiveLine::new(
                 ("live-line", rows[pi].line),
@@ -2343,19 +2681,6 @@ impl Render for LiveMarkdownView {
             .with_caret_block(paint.caret_block_width, paint.caret_block_text.clone())
         };
 
-        // Row virtualization window (large docs only; small docs render
-        // everything exactly as before). `ginfo` is owned so the `&mut`
-        // window computation below doesn't fight the `rows` borrow.
-        let ginfo: Vec<(usize, f32, (usize, usize))> = groups
-            .iter()
-            .map(|gr| (gr.row_count(), gr.chrome(), gr.line_range(&rows)))
-            .collect();
-        let text_version = self.buffer.text_version();
-        let want_caret = self.scroll_to_cursor;
-        let vw = self.virtual_window(&ginfo, cursor.line, text_version, want_caret);
-        let virtualized = vw.is_some();
-        let (v_lo, v_hi, v_top_px, v_bot_px) =
-            vw.unwrap_or((0, groups.len().saturating_sub(1), 0.0, 0.0));
         if virtualized && v_top_px > 0.0 {
             row_els.push(
                 div()
@@ -2366,10 +2691,12 @@ impl Render for LiveMarkdownView {
             );
         }
 
+        let mut window_counts: Vec<usize> = Vec::new();
         for (gi, group) in groups.iter().enumerate() {
             if virtualized && (gi < v_lo || gi > v_hi) {
                 continue;
             }
+            let els_before = row_els.len();
             match group {
                 Group::One(pi) => {
                     let pi = *pi;
@@ -2377,8 +2704,8 @@ impl Render for LiveMarkdownView {
                     let is_first = row.line == 0;
                     let is_last = row.line == last_line;
                     // Ordered display numbers sequence like the preview
-                    // (precomputed over all rows; see display_numbers).
-                    let display_number = display_numbers[pi];
+                    // (windowed; see display_numbers).
+                    let display_number = display_numbers.get(&pi).copied().flatten();
                     let el: gpui::AnyElement = match &row.plan.kind {
                         RowKind::Blank => {
                             // Blanks have no text hitbox: explicit click moves
@@ -2408,7 +2735,7 @@ impl Render for LiveMarkdownView {
                                         cx.stop_propagation();
                                     }),
                                 );
-                            if paints[pi].caret_vis.is_some() {
+                            if paints.get(&pi).is_some_and(|p| p.caret_vis.is_some()) {
                                 blank
                                     .child(live_line(pi, &paints, &entity, &colors))
                                     .into_any_element()
@@ -2755,6 +3082,7 @@ impl Render for LiveMarkdownView {
                         let last_idx = *idxs.last().unwrap();
                         self.row_targets.push((rows[*open].line, rows[last_idx].line));
                         row_els.push(src.into_any_element());
+                        window_counts.push(row_els.len() - els_before);
                         continue;
                     }
                     // Preview-parity code card (fences hidden, like preview).
@@ -3048,6 +3376,7 @@ impl Render for LiveMarkdownView {
                                     .into_any_element(),
                             );
                         }
+                        window_counts.push(row_els.len() - els_before);
                         continue;
                     }
                     // Preview-parity grid.
@@ -3149,7 +3478,13 @@ impl Render for LiveMarkdownView {
                     row_els.push(outer.into_any_element());
                 }
             }
+            window_counts.push(row_els.len() - els_before);
         }
+        self.last_window_counts = if virtualized {
+            window_counts
+        } else {
+            Vec::new()
+        };
 
         if virtualized && v_bot_px > 0.0 {
             row_els.push(
@@ -3163,18 +3498,6 @@ impl Render for LiveMarkdownView {
         #[cfg(test)]
         {
             self.last_render_stats = (groups.len(), v_hi - v_lo + 1, virtualized);
-        }
-
-        // Scroll-to-caret: the rows column (`live-markdown-content`) tracks
-        // every direct child with the scroll handle, so `scroll_to_item`
-        // scrolls the minimal amount to bring the caret's element into view
-        // (guise `ensure_cursor_visible` parity). Consumed by the column's
-        // prepaint in this same frame.
-        if self.scroll_to_cursor {
-            self.scroll_to_cursor = false;
-            if let Some(ix) = caret_el_ix {
-                self.scroll.scroll_to_item(ix);
-            }
         }
 
         if rows.is_empty() || self.buffer.is_empty() {
@@ -3236,13 +3559,21 @@ impl Render for LiveMarkdownView {
             }
         }
 
+
         // Outline (Typora Outline parity) + current section highlight.
-        let outline = outline_entries(&rows);
-        let current_section = outline
-            .iter()
-            .filter(|(line, _, _)| *line <= cursor.line)
-            .last()
-            .map(|(line, _, _)| *line);
+        // Hidden panel: skip the O(rows) scan entirely (large docs pay it
+        // per frame otherwise).
+        let (outline, current_section) = if self.show_outline {
+            let outline = outline_entries(&rows);
+            let current = outline
+                .iter()
+                .filter(|(line, _, _)| *line <= cursor.line)
+                .last()
+                .map(|(line, _, _)| *line);
+            (outline, current)
+        } else {
+            (Vec::new(), None)
+        };
 
         // Status strip (Typora status-bar parity): cursor + counts + outline toggle.
         // Full-document char counting is O(n) per frame: cache on
@@ -4570,6 +4901,132 @@ mod scroll_to_caret_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod scroll_stability_tests {
+    use super::*;
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.0.clone()
+        }
+    }
+
+    struct Snap {
+        /// Viewport-relative position of two fixed groups (one near the
+        /// bottom window, one far above it): group_top_in_content -
+        /// scroll_distance. With no input these must be bit-stable, else
+        /// the user sees content jump (bottom-up jitter).
+        pos_a: f32,
+        pos_b: f32,
+    }
+
+    /// Diagnostic: scroll to bottom, then step upward like wheel events.
+    /// No-input frames must keep every content point glued; scroll steps
+    /// must move content by exactly the input delta.
+    #[gpui::test]
+    fn bottom_scroll_up_diagnostic(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let mut doc = String::new();
+        for i in 0..300 {
+            doc.push_str(&format!("# Heading {i}\n\npara {i} text here\n\n"));
+        }
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(400.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        // Fixed probe groups: A near the bottom window, B far above it.
+        let (ga, gb) = (1190usize, 600usize);
+        let snap = |view: &gpui::Entity<LiveMarkdownView>, vc: &mut gpui::VisualTestContext| -> Snap {
+            view.read_with(vc, |v, _| {
+                let off = f32::from(v.scroll.offset().y);
+                Snap {
+                    pos_a: v.virt_prefix.get(ga).copied().unwrap_or(-99999.0) + off,
+                    pos_b: v.virt_prefix.get(gb).copied().unwrap_or(-99999.0) + off,
+                }
+            })
+        };
+        let force_frame = |view: &gpui::Entity<LiveMarkdownView>, vc: &mut gpui::VisualTestContext| {
+            view.update(vc, |_, cx| cx.notify());
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        };
+        let assert_glued = |prev: &Snap, s: &Snap, ctx: &str| {
+            assert!(
+                (s.pos_a - prev.pos_a).abs() <= 1.0 && (s.pos_b - prev.pos_b).abs() <= 1.0,
+                "content jumped with no input at {ctx}: posA {:.1}->{:.1} posB {:.1}->{:.1}",
+                prev.pos_a, s.pos_a, prev.pos_b, s.pos_b
+            );
+        };
+        // Settle onto the true bottom: `max_offset` lags layout by a
+        // frame, so a single set-to-max can land above the bottom when the
+        // total is still converging. Repeat until the offset reaches max.
+        for _ in 0..6 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            let done = view.read_with(&vc, |v, _| {
+                let o = v.scroll.offset();
+                let m = v.scroll.max_offset();
+                (f32::from(o.y) + f32::from(m.y)).abs() <= 1.0
+            });
+            view.update(&mut vc, |v, _| {
+                let m = v.scroll.max_offset();
+                v.scroll.set_offset(gpui::point(px(0.), -m.y));
+            });
+            if done {
+                break;
+            }
+        }
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        let mut prev = snap(&view, &mut vc);
+        view.read_with(&vc, |v, _| {
+            let o = f32::from(v.scroll.offset().y);
+            let m = f32::from(v.scroll.max_offset().y);
+            assert!(
+                (o + m).abs() <= 1.0,
+                "test setup never reached bottom: off {o:.1} max {m:.1}"
+            );
+        });
+        for k in 0..4 {
+            force_frame(&view, &mut vc);
+            let s = snap(&view, &mut vc);
+            assert_glued(&prev, &s, &format!("bottom+f{k}"));
+            prev = s;
+        }
+        for step in 0..12 {
+            view.update(&mut vc, |v, _| {
+                let o = v.scroll.offset();
+                v.scroll.set_offset(gpui::point(o.x, o.y + px(80.)));
+            });
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            let s = snap(&view, &mut vc);
+            // Scroll-up adds +80 to offset.y, so each group's
+            // viewport-relative position must grow by exactly +80 (not jump).
+            let d = s.pos_a - prev.pos_a;
+            assert!(
+                (d - 80.0).abs() <= 25.0,
+                "step {step}: content moved {d:.1}px for 80px input (jump?)"
+            );
+            prev = s;
+            for k in 0..2 {
+                force_frame(&view, &mut vc);
+                let f = snap(&view, &mut vc);
+                assert_glued(&prev, &f, &format!("up{step}+f{k}"));
+                prev = f;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

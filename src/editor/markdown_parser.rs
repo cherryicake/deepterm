@@ -420,12 +420,9 @@ fn convert_tag_end(tag_end: TagEnd) -> MarkdownTagEnd {
         TagEnd::DefinitionList => MarkdownTagEnd::Paragraph,
         TagEnd::DefinitionListTitle => MarkdownTagEnd::DefTerm,
         TagEnd::DefinitionListDefinition => MarkdownTagEnd::DefItem,
-        TagEnd::HtmlBlock
-        | TagEnd::FootnoteDefinition
-        | TagEnd::DefinitionList
-        | TagEnd::DefinitionListTitle
-        | TagEnd::DefinitionListDefinition
-        | TagEnd::MetadataBlock(_) => MarkdownTagEnd::Paragraph,
+        TagEnd::HtmlBlock | TagEnd::FootnoteDefinition | TagEnd::MetadataBlock(_) => {
+            MarkdownTagEnd::Paragraph
+        }
     }
 }
 
