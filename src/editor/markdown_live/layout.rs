@@ -9,6 +9,7 @@
 //! draws bullets, numbers, and checkboxes as decorations in the hanging
 //! indent, which is what keeps wrapped items aligned.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use super::block::{indent_cols, Block};
@@ -140,7 +141,18 @@ pub fn metrics(kind: &RowKind) -> RowMetrics {
 /// `block` is [`Block::CodeLine`]; `reveal` shows syntax instead of hiding it
 /// (the cursor/selection lines of a focused editor).
 pub fn plan(line: &str, block: &Block, code_lang: Option<&str>, reveal: bool) -> RowPlan {
-  let mut b = Builder::new(line, reveal);
+  plan_with_refs(line, block, code_lang, reveal, &HashMap::new())
+}
+
+/// [`plan`] with a document-wide reference table ([`inline::collect_refdefs`]).
+pub fn plan_with_refs(
+  line: &str,
+  block: &Block,
+  code_lang: Option<&str>,
+  reveal: bool,
+  refs: &HashMap<String, String>,
+) -> RowPlan {
+  let mut b = Builder::new(line, reveal, refs);
   let kind = match *block {
     Block::Blank => {
       b.hide(0..line.len());
@@ -233,6 +245,7 @@ pub fn plan(line: &str, block: &Block, code_lang: Option<&str>, reveal: bool) ->
 struct Builder<'a> {
   line: &'a str,
   reveal: bool,
+  refs: &'a HashMap<String, String>,
   visible: String,
   runs: Vec<RunAttrs>,
   segs: Vec<Seg>,
@@ -240,10 +253,11 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-  fn new(line: &'a str, reveal: bool) -> Self {
+  fn new(line: &'a str, reveal: bool, refs: &'a HashMap<String, String>) -> Self {
     Builder {
       line,
       reveal,
+      refs,
       visible: String::new(),
       runs: Vec::new(),
       segs: Vec::new(),
@@ -326,7 +340,7 @@ impl<'a> Builder<'a> {
   /// Parse and emit the line's content from `at`, with inline markup.
   fn inline(&mut self, at: usize, dim: bool) {
     let content = &self.line[at..];
-    let inline = inline::parse(content);
+    let inline = inline::parse_with_refs(content, self.refs);
     for span in &inline.spans {
       let src = at + span.range.start..at + span.range.end;
       if span.marker && !self.reveal {

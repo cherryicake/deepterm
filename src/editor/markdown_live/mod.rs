@@ -13,6 +13,7 @@
 pub mod block;
 pub mod buffer;
 pub mod element;
+pub mod emoji;
 pub mod highlight;
 pub mod images;
 pub mod inline;

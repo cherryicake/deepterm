@@ -529,6 +529,20 @@ impl MarkdownElementBuilder {
                         ..Default::default()
                     });
                 }
+                // 上标/下标：gpui 单行单字号无基线升降，用主题色区分
+                //（与 live `runs_for_row` 同色，见 `inline::mark_sup_sub`）。
+                MarkdownTag::Sup => {
+                    self.push_text_style(TextStyleRefinement {
+                        color: Some(cx.theme().ui.accent),
+                        ..Default::default()
+                    });
+                }
+                MarkdownTag::Sub => {
+                    self.push_text_style(TextStyleRefinement {
+                        color: Some(cx.theme().ui.accent.opacity(0.7)),
+                        ..Default::default()
+                    });
+                }
                 MarkdownTag::Strikethrough => {
                     self.push_text_style(TextStyleRefinement {
                         strikethrough: Some(gpui::StrikethroughStyle {
@@ -690,7 +704,9 @@ impl MarkdownElementBuilder {
                 }
                 MarkdownTagEnd::Emphasis
                 | MarkdownTagEnd::Strong
-                | MarkdownTagEnd::Strikethrough => {
+                | MarkdownTagEnd::Strikethrough
+                | MarkdownTagEnd::Sup
+                | MarkdownTagEnd::Sub => {
                     self.pop_text_style();
                 }
                 MarkdownTagEnd::Link => {
@@ -809,7 +825,16 @@ impl MarkdownElementBuilder {
             }
             MarkdownEvent::Code(code) => {
                 self.push_text_style(self.style.inline_code.clone());
-                self.push_text(&code, &range, cx);
+                self.push_text_raw(&code, &range, cx);
+                self.pop_text_style();
+            }
+            // 脚注引用：主题色芯片（Typora 上标样式近似；定义行按普通段落渲染）。
+            MarkdownEvent::FootnoteRef(label) => {
+                self.push_text_style(TextStyleRefinement {
+                    color: Some(cx.theme().ui.accent),
+                    ..Default::default()
+                });
+                self.push_text(&format!("[{label}]"), &range, cx);
                 self.pop_text_style();
             }
             MarkdownEvent::Html(_) => {}
@@ -840,7 +865,7 @@ impl MarkdownElementBuilder {
                     font_style: Some(gpui::FontStyle::Italic),
                     ..Default::default()
                 });
-                self.push_text(&math, &range, cx);
+                self.push_text_raw(&math, &range, cx);
                 self.pop_text_style();
             }
             MarkdownEvent::DisplayMath(math) => {
@@ -861,7 +886,7 @@ impl MarkdownElementBuilder {
                     font_size: Some(px(16.).into()),
                     ..Default::default()
                 });
-                self.push_text(&math, &range, cx);
+                self.push_text_raw(&math, &range, cx);
                 self.pop_text_style();
                 self.pop_div();
             }
@@ -884,7 +909,18 @@ impl MarkdownElementBuilder {
         style
     }
 
+    /// Push text with `:shortcode:` emoji swapped for glyphs (Typora).
+    /// Code spans/blocks and formulas use [`Self::push_text_raw`] instead.
     fn push_text(&mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
+        if !text.contains(':') {
+            self.push_text_raw(text, range, cx);
+            return;
+        }
+        let replaced = replace_shortcodes(text);
+        self.push_text_raw(&replaced, range, cx);
+    }
+
+    fn push_text_raw(&mut self, text: &str, range: &Range<usize>, cx: &mut gpui::App) {
         if self.image_state.is_some() {
             let run = self.text_style().to_run(text.len());
             if let Some(img) = self.image_state.as_mut() {
@@ -1323,3 +1359,31 @@ impl MarkdownElementBuilder {
         None
     }
 }
+
+/// Swap `:shortcode:` tokens for emoji glyphs (preview only; the live
+/// editor styles tokens instead to keep its byte mapping exact).
+fn replace_shortcodes(text: &str) -> String {
+    use crate::editor::markdown_live::emoji::find_shortcode;
+    if !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0usize;
+    while at < text.len() {
+        let Some(rel) = text[at..].find(':') else {
+            break;
+        };
+        let pos = at + rel;
+        if let Some((range, glyph)) = find_shortcode(text, pos) {
+            out.push_str(&text[at..range.start]);
+            out.push_str(glyph);
+            at = range.end;
+        } else {
+            out.push_str(&text[at..=pos]);
+            at = pos + 1;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
+}
+

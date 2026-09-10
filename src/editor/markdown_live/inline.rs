@@ -11,7 +11,59 @@
 //! emphasis uses simplified flanking rules (`_` never matches inside words),
 //! and unmatched delimiters stay literal text.
 
+use std::collections::HashMap;
 use std::ops::Range;
+
+/// Normalize a reference label (CommonMark: case-insensitive, inner
+/// whitespace runs collapse to a single space).
+pub fn norm_label(label: &str) -> String {
+  label
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+/// Collect `[label]: destination` definitions over whole lines: reference
+/// links resolve document-wide (pulldown parity for the preview).
+/// `skip(i)` shields fenced-code/frontmatter/table lines from registering.
+pub fn collect_refdefs(lines: &[String], skip: &dyn Fn(usize) -> bool) -> HashMap<String, String> {
+  let mut defs = HashMap::new();
+  for (i, line) in lines.iter().enumerate() {
+    if skip(i) {
+      continue;
+    }
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+      continue;
+    }
+    let rest = &line[indent..];
+    if !rest.starts_with('[') || rest.starts_with("[^") {
+      continue;
+    }
+    let Some(end) = rest.find(']') else {
+      continue;
+    };
+    let label = norm_label(&rest[1..end]);
+    if label.is_empty() {
+      continue;
+    }
+    let after = rest[end + 1..].trim_start();
+    let Some(dest) = after.strip_prefix(':') else {
+      continue;
+    };
+    let dest = dest.trim_start();
+    let url = match dest.strip_prefix('<') {
+      Some(t) => t.split('>').next().unwrap_or("").to_string(),
+      None => dest.split_whitespace().next().unwrap_or("").to_string(),
+    };
+    if !url.is_empty() {
+      // First definition wins (CommonMark).
+      defs.entry(label).or_insert(url);
+    }
+  }
+  defs
+}
 
 /// Style flags accumulated on a span. `link` marks clickable link text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -24,6 +76,14 @@ pub struct InlineStyle {
   pub link: bool,
   /// `$...$` / `$$...$$` formula content (rendered italic, KaTeX approx).
   pub math: bool,
+  /// `^sup^` content (accent, delimiters hidden).
+  pub sup: bool,
+  /// `~sub~` content (soft accent, delimiters hidden).
+  pub sub: bool,
+  /// `:shortcode:` emoji token (accent, kept verbatim for byte mapping).
+  pub emoji: bool,
+  /// `[^label]` footnote reference (accent, brackets hidden).
+  pub footnote: bool,
 }
 
 /// One run of bytes sharing a style. `marker` bytes are markdown syntax;
@@ -73,10 +133,20 @@ struct Attrs {
   link_text: Vec<bool>,
   /// Link target index for the whole construct.
   link_idx: Vec<usize>,
+  sup: Vec<bool>,
+  sub: Vec<bool>,
+  emoji: Vec<bool>,
+  footnote: Vec<bool>,
 }
 
-/// Parse one line's inline markup.
+/// Parse one line's inline markup (no reference definitions: `[t][r]`
+/// and `[t]` shortcuts stay literal without a doc-wide table).
 pub fn parse(text: &str) -> Inline {
+  parse_with_refs(text, &HashMap::new())
+}
+
+/// Parse with a document-wide reference table from [`collect_refdefs`].
+pub fn parse_with_refs(text: &str, refs: &HashMap<String, String>) -> Inline {
   let n = text.len();
   let mut a = Attrs {
     marker: vec![false; n],
@@ -89,12 +159,21 @@ pub fn parse(text: &str) -> Inline {
     escaped: vec![false; n],
     link_text: vec![false; n],
     link_idx: vec![NO_LINK; n],
+    sup: vec![false; n],
+    sub: vec![false; n],
+    emoji: vec![false; n],
+    footnote: vec![false; n],
   };
   let mut links = Vec::new();
 
   mark_escapes(text, &mut a);
   mark_code_spans(text, &mut a);
   mark_links(text, &mut a, &mut links);
+  mark_reflinks(text, &mut a, &mut links, refs);
+  mark_autolinks(text, &mut a, &mut links);
+  mark_footnotes(text, &mut a);
+  mark_sup_sub(text, &mut a);
+  mark_emoji(text, &mut a);
   mark_math(text, &mut a);
   mark_emphasis(text, &mut a);
 
@@ -109,6 +188,10 @@ pub fn parse(text: &str) -> Inline {
       highlight: a.highlight[i],
       link: a.link_text[i],
       math: a.math[i],
+      sup: a.sup[i],
+      sub: a.sub[i],
+      emoji: a.emoji[i],
+      footnote: a.footnote[i],
     };
     let link = (a.link_idx[i] != NO_LINK).then_some(a.link_idx[i]);
     match spans.last_mut() {
@@ -246,6 +329,366 @@ fn mark_links(text: &str, a: &mut Attrs, links: &mut Vec<String>) {
       .iter_mut()
       .for_each(|l| *l = idx);
     i = url_end + 1;
+  }
+}
+
+/// `[text][ref]`, `[text][]`, `[text]` shortcuts and `![alt][ref]`
+/// (CommonMark reference links, resolved via `refs`). Runs after
+/// `mark_links`, so `[text](url)` constructs are already claimed.
+/// Brackets of resolved constructs become markers (hidden in preview);
+/// unresolved stays literal. `[^..]` is left for the footnote pass.
+fn mark_reflinks(
+  text: &str,
+  a: &mut Attrs,
+  links: &mut Vec<String>,
+  refs: &HashMap<String, String>,
+) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if a.code[i] || a.escaped[i] || a.marker[i] || a.link_idx[i] != NO_LINK {
+      i += 1;
+      continue;
+    }
+    let is_image = bytes[i] == b'!';
+    if is_image && bytes.get(i + 1) != Some(&b'[') {
+      i += 1;
+      continue;
+    }
+    if !is_image && bytes[i] != b'[' {
+      i += 1;
+      continue;
+    }
+    let start = i;
+    let bracket = if is_image { i + 1 } else { i };
+    // Wikilinks and footnotes belong to other passes.
+    if !is_image && bytes.get(bracket + 1) == Some(&b'[') {
+      i += 1;
+      continue;
+    }
+    if bytes.get(bracket + 1) == Some(&b'^') {
+      i = bracket + 1;
+      continue;
+    }
+    let Some(text_end) = find_outside_code(text, a, bracket + 1, "]") else {
+      i = bracket + 1;
+      continue;
+    };
+    // `[text](url)` claimed or broken: leave to `mark_links`.
+    if bytes.get(text_end + 1) == Some(&b'(') {
+      i = bracket + 1;
+      continue;
+    }
+    let label_here = &text[bracket + 1..text_end];
+    // Full `[text][ref]` / collapsed `[text][]`.
+    let mut ref_end = text_end;
+    let lookup: Option<String> = match bytes.get(text_end + 1) {
+      Some(b'[') => {
+        let Some(close) = find_outside_code(text, a, text_end + 2, "]") else {
+          i = bracket + 1;
+          continue;
+        };
+        ref_end = close;
+        let inner = &text[text_end + 2..close];
+        Some(if inner.is_empty() {
+          norm_label(label_here)
+        } else {
+          norm_label(inner)
+        })
+      }
+      // Shortcut `[text]`: the text itself is the label.
+      _ => Some(norm_label(label_here)),
+    };
+    let Some(label) = lookup else {
+      i = bracket + 1;
+      continue;
+    };
+    if label.is_empty() {
+      i = bracket + 1;
+      continue;
+    }
+    let Some(url) = refs.get(&label) else {
+      i = bracket + 1;
+      continue;
+    };
+    let idx = links.len();
+    links.push(url.clone());
+    set(&mut a.marker, start..bracket + 1);
+    set(&mut a.marker, text_end..ref_end + 1);
+    set(&mut a.link_text, bracket + 1..text_end);
+    a.link_idx[start..ref_end + 1]
+      .iter_mut()
+      .for_each(|l| *l = idx);
+    i = ref_end + 1;
+  }
+}
+
+/// `<https://..>` / `<mail@..>` autolinks plus bare `http(s)://` and `www.`
+/// URLs (Typora linkifies both). Angle brackets become markers; bare URLs
+/// keep their text with link style. Interiors are shielded from emphasis
+/// and math so URL punctuation never triggers markup.
+fn mark_autolinks(text: &str, a: &mut Attrs, links: &mut Vec<String>) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if a.code[i] || a.escaped[i] || a.marker[i] || a.link_idx[i] != NO_LINK {
+      i += 1;
+      continue;
+    }
+    if bytes[i] == b'<' {
+      if let Some((range, url)) = angle_autolink(text, i) {
+        if range.start > i || a.code[range.start..range.end].iter().any(|&c| c) {
+          i += 1;
+          continue;
+        }
+        let idx = links.len();
+        links.push(url);
+        set(&mut a.marker, range.start..range.start + 1);
+        set(&mut a.marker, range.end - 1..range.end);
+        set(&mut a.link_text, range.start + 1..range.end - 1);
+        set(&mut a.escaped, range.start + 1..range.end - 1);
+        a.link_idx[range.clone()].iter_mut().for_each(|l| *l = idx);
+        i = range.end;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if is_bare_url_start(bytes, i) {
+      if let Some((range, url)) = find_bare_url(text, i)
+        && range.start == i
+      {
+        let idx = links.len();
+        links.push(url);
+        set(&mut a.link_text, range.clone());
+        set(&mut a.escaped, range.clone());
+        a.link_idx[range.clone()]
+          .iter_mut()
+          .for_each(|l| *l = idx);
+        i = range.end;
+        continue;
+      }
+    }
+    i += 1;
+  }
+}
+
+/// `<scheme:...>` or `<user@host.tld>` at byte `from` (must be `<`).
+/// Returns the full `<>` range plus the link destination (`mailto:` is
+/// added for bare emails, matching pulldown).
+pub fn angle_autolink(text: &str, from: usize) -> Option<(Range<usize>, String)> {
+  if text.as_bytes().get(from) != Some(&b'<') {
+    return None;
+  }
+  let rest = &text[from + 1..];
+  let close = rest.find('>')?;
+  let inner = &rest[..close];
+  if inner.is_empty() || inner.contains(['<', ' ', '\t', '\n']) {
+    return None;
+  }
+  let url = if let Some((scheme, _)) = inner.split_once(':') {
+    if scheme.len() < 2
+      || scheme.len() > 32
+      || !scheme
+        .bytes()
+        .enumerate()
+        .all(|(k, b)| b.is_ascii_alphanumeric() || (k > 0 && matches!(b, b'+' | b'-' | b'.')))
+      || !scheme.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+    {
+      return None;
+    }
+    inner.to_string()
+  } else {
+    // Bare email: user@host.tld minimum.
+    let (user, host) = inner.split_once('@')?;
+    if user.is_empty() || !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+      return None;
+    }
+    format!("mailto:{inner}")
+  };
+  Some((from..from + 1 + close + 1, url))
+}
+
+/// True when a bare URL may start at `i` (scheme or `www.` prefix).
+fn is_bare_url_start(bytes: &[u8], i: usize) -> bool {
+  let rest = &bytes[i..];
+  (rest.starts_with(b"http://") || rest.starts_with(b"https://") || rest.starts_with(b"www."))
+    && (i == 0 || {
+      let prev = bytes[i - 1];
+      !(prev.is_ascii_alphanumeric() || prev == b'/' || prev == b'@')
+    })
+}
+
+/// Bare URL anchored at byte `from` (must satisfy [`is_bare_url_start`]).
+/// Returns the trimmed range plus destination (`https://` prepended for
+/// `www.`). Trailing punctuation is trimmed and `)` balanced, GFM-style.
+pub fn find_bare_url(text: &str, from: usize) -> Option<(Range<usize>, String)> {
+  if !is_bare_url_start(text.as_bytes(), from) {
+    return None;
+  }
+  let mut end = from;
+  for (off, c) in text[from..].char_indices() {
+    if c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`') {
+      break;
+    }
+    end = from + off + c.len_utf8();
+  }
+  let mut url = &text[from..end];
+  // Trim trailing punctuation runs.
+  loop {
+    let t = url.trim_end_matches(['?', '!', '.', ',', ';', ':', '*', '_', '~', '\'', '"', ']', '}']);
+    if t.len() == url.len() {
+      break;
+    }
+    url = t;
+  }
+  // Balance parentheses: drop surplus closers from the right.
+  let (mut open, mut close) = (0, 0);
+  for c in url.chars() {
+    match c {
+      '(' => open += 1,
+      ')' => close += 1,
+      _ => {}
+    }
+  }
+  while close > open && url.ends_with(')') {
+    url = &url[..url.len() - 1];
+    close -= 1;
+  }
+  if url.is_empty() || url == "http://" || url == "https://" || url == "www." {
+    return None;
+  }
+  let end = from + url.len();
+  let dest = if url.starts_with("www.") {
+    format!("https://{url}")
+  } else {
+    url.to_string()
+  };
+  Some((from..end, dest))
+}
+
+/// `[^label]` footnote references (Typora renders them as superscript
+/// chips; here the brackets hide and the label takes the footnote style).
+/// Definitions (`[^label]: ...`) are left alone. No click target: unlike
+/// links there is nowhere external to open.
+fn mark_footnotes(text: &str, a: &mut Attrs) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if a.code[i] || a.escaped[i] || a.marker[i] || a.link_idx[i] != NO_LINK {
+      i += 1;
+      continue;
+    }
+    if bytes[i] != b'[' || bytes.get(i + 1) != Some(&b'^') {
+      i += 1;
+      continue;
+    }
+    let Some(end) = find_outside_code(text, a, i + 2, "]") else {
+      i += 2;
+      continue;
+    };
+    if end == i + 2 || bytes.get(end + 1) == Some(&b':') {
+      i += 2;
+      continue;
+    }
+    set(&mut a.marker, i..i + 2);
+    set(&mut a.marker, end..end + 1);
+    set(&mut a.footnote, i + 2..end);
+    i = end + 1;
+  }
+}
+
+/// `^sup^` / `~sub~` (Typora): single delimiters with non-space-adjacent,
+/// non-empty content become markers and the content takes the sup/sub
+/// style. `^^`, `~~` (strike), code spans and URLs are never claimed.
+fn mark_sup_sub(text: &str, a: &mut Attrs) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if b != b'^' && b != b'~' {
+      i += 1;
+      continue;
+    }
+    if a.code[i] || a.escaped[i] || a.marker[i] {
+      i += 1;
+      continue;
+    }
+    if let Some((full, content)) = find_sup_sub(text, i) {
+      if a.code[full.clone()].iter().any(|&c| c)
+        || a.escaped[full.clone()].iter().any(|&c| c)
+        || a.marker[full.clone()].iter().any(|&c| c)
+      {
+        i += 1;
+        continue;
+      }
+      let flags = if b == b'^' { &mut a.sup } else { &mut a.sub };
+      set(&mut a.marker, full.start..content.start);
+      set(&mut a.marker, content.end..full.end);
+      set(flags, content.clone());
+      i = full.end;
+      continue;
+    }
+    i += 1;
+  }
+}
+
+/// Single-delimiter `^..^` / `~..~` anchored at byte `from` (must be the
+/// delimiter). Returns the full range plus the content range. Shared with
+/// the preview's event splitter so both renderers agree.
+pub fn find_sup_sub(text: &str, from: usize) -> Option<(Range<usize>, Range<usize>)> {
+  let bytes = text.as_bytes();
+  let b = *bytes.get(from)?;
+  if b != b'^' && b != b'~' {
+    return None;
+  }
+  // Singles only: `^^` / `~~` belong to other constructs.
+  if bytes.get(from + 1) == Some(&b) || (from > 0 && bytes[from - 1] == b) {
+    return None;
+  }
+  let after_open = from + 1;
+  if text[after_open..].chars().next().is_none_or(|c| c.is_whitespace()) {
+    return None;
+  }
+  let mut j = after_open;
+  while j < bytes.len() {
+    if bytes[j] == b
+      && bytes.get(j + 1) != Some(&b)
+      && (j == 0 || bytes[j - 1] != b)
+      && !text[after_open..j].trim().is_empty()
+      && !text[..j].chars().next_back().is_some_and(|c| c.is_whitespace())
+    {
+      return Some((from..j + 1, after_open..j));
+    }
+    j += 1;
+  }
+  None
+}
+
+/// `:shortcode:` emoji tokens (Typora swaps the glyph; the live editor
+/// styles the token since its mapping is byte-exact). Unknown or malformed
+/// codes stay literal text.
+fn mark_emoji(text: &str, a: &mut Attrs) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] != b':' || a.code[i] || a.escaped[i] || a.marker[i] {
+      i += 1;
+      continue;
+    }
+    if let Some((range, _)) = super::emoji::find_shortcode(text, i) {
+      if a.code[range.clone()].iter().any(|&c| c)
+        || a.escaped[range.clone()].iter().any(|&c| c)
+        || a.marker[range.clone()].iter().any(|&c| c)
+      {
+        i += 1;
+        continue;
+      }
+      set(&mut a.emoji, range.clone());
+      i = range.end;
+      continue;
+    }
+    i += 1;
   }
 }
 
@@ -563,6 +1006,107 @@ mod tests {
     let inline = parse(text);
     assert_eq!(inline.links, vec!["img.png".to_string()]);
     assert_eq!(frags(text)[0], ("![".into(), true));
+  }
+
+  fn parse_refs(text: &str) -> Inline {
+    let lines = vec![text.to_string(), "[docs]: https://x.dev".to_string()];
+    let refs = collect_refdefs(&lines, &|_| false);
+    parse_with_refs(text, &refs)
+  }
+
+  #[test]
+  fn refdefs_collect_first_wins() {
+    let lines = vec![
+      "[a]: /one".to_string(),
+      "   [A]: /two".to_string(),
+      "[^fn]: /note".to_string(),
+      "    [code]: /indented".to_string(),
+      "[empty]:".to_string(),
+    ];
+    let refs = collect_refdefs(&lines, &|i| i == 3);
+    assert_eq!(refs.get("a").map(String::as_str), Some("/one"));
+    assert!(refs.get("code").is_none());
+    assert!(refs.get("empty").is_none());
+    assert!(refs.get("fn").is_none());
+  }
+
+  #[test]
+  fn reference_links_resolve() {
+    let inline = parse_refs("see [docs] and [Docs][] and [d][docs] end");
+    assert_eq!(
+      inline.links,
+      vec![
+        "https://x.dev".to_string(),
+        "https://x.dev".to_string(),
+        "https://x.dev".to_string()
+      ]
+    );
+    // Without the table the same text stays literal.
+    assert!(parse("see [docs] end").links.is_empty());
+    // Unresolved labels stay literal even with a table present.
+    assert!(parse_refs("see [nope] end").links.is_empty());
+  }
+
+  #[test]
+  fn autolinks_and_bare_urls() {
+    let text = "go <https://x.dev/a> or https://y.dev/b! or www.z.dev/c.";
+    let inline = parse(text);
+    assert_eq!(
+      inline.links,
+      vec![
+        "https://x.dev/a".to_string(),
+        "https://y.dev/b".to_string(),
+        "https://www.z.dev/c".to_string()
+      ]
+    );
+    assert_eq!(inline.links.len(), 3);
+    // Trailing punctuation is trimmed; dest of www. gets a scheme.
+    assert_eq!(find_bare_url("see https://y.dev/b! ok", 4).unwrap().1, "https://y.dev/b");
+    assert!(find_bare_url("xhttp://y.dev", 1).is_none());
+    // Email autolinks gain mailto:.
+    let (range, url) = angle_autolink("<a@b.cc>", 0).unwrap();
+    assert_eq!(url, "mailto:a@b.cc");
+    assert_eq!(range, 0..8);
+    assert!(angle_autolink("<not a link>", 0).is_none());
+  }
+
+  #[test]
+  fn sup_sub_markers_hide_content_flagged() {
+    let inline = parse("E=mc^2^ and H~2~O");
+    assert!(style_of("E=mc^2^ and H~2~O", "2^").sup || style_of("E=mc^2^", "2").sup);
+    assert!(style_of("H~2~O", "2").sub);
+    // Delimiters are markers (hidden in preview).
+    let frags_mc = frags("E=mc^2^");
+    assert!(frags_mc.iter().any(|(t, m)| t == "^" && *m));
+    // Doubles belong to other constructs: strike still wins.
+    let strike = parse("~~gone~~");
+    assert!(style_of("~~gone~~", "gone").strike);
+    assert!(!strike.spans.iter().any(|sp| sp.style.sub));
+    // Spaced or empty content stays literal.
+    assert!(!parse("a ^ b ^ c").spans.iter().any(|sp| sp.style.sup));
+    assert!(!parse("x^^y").spans.iter().any(|sp| sp.style.sup));
+  }
+
+  #[test]
+  fn emoji_tokens_flagged_not_replaced() {
+    let text = "party :tada: now";
+    let inline = parse(text);
+    assert!(style_of(text, ":tada:").emoji);
+    // Byte-exact: visible keeps the shortcode (mapping invariant).
+    let total: usize = inline.spans.iter().map(|sp| sp.range.len()).sum();
+    assert_eq!(total, text.len());
+    assert!(parse("a :nope: b").spans.iter().all(|sp| !sp.style.emoji));
+    assert!(parse("` :tada: `").spans.iter().all(|sp| !sp.style.emoji));
+  }
+
+  #[test]
+  fn footnote_refs_flagged_defs_untouched() {
+    let inline = parse("see [^note] here");
+    assert!(style_of("see [^note] here", "note").footnote);
+    assert!(inline.links.is_empty());
+    // Definitions and empty labels stay literal.
+    assert!(parse("[^note]: text").spans.iter().all(|sp| !sp.style.footnote));
+    assert!(parse("[^]: x").spans.iter().all(|sp| !sp.style.footnote));
   }
 
   #[test]

@@ -15,7 +15,8 @@
 use std::collections::BTreeSet;
 
 use crate::editor::markdown_live::block::{classify_with_next, Block, DocState};
-use crate::editor::markdown_live::layout::{plan, RowPlan, RunAttrs, Seg};
+use crate::editor::markdown_live::inline::collect_refdefs;
+use crate::editor::markdown_live::layout::{plan_with_refs, RowPlan, RunAttrs, Seg};
 use crate::editor::markdown_live::model::Pos;
 
 /// Five callout kinds (matches the existing read-only preview).
@@ -186,6 +187,19 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
     flush(run_start.take(), lines.len(), &mut revealed);
 
     // 3. Plan each line + track callout cards across quote runs.
+    // Reference definitions resolve document-wide (code/fence/table/math
+    // lines never register: their `[x]: y` text is literal content).
+    let refdefs = collect_refdefs(lines, &|i| {
+        matches!(
+            blocks[i],
+            Block::CodeLine
+                | Block::Fence { .. }
+                | Block::FrontMatter
+                | Block::Table
+                | Block::Math { .. }
+                | Block::MathDelim { .. }
+        )
+    });
     let mut rows = Vec::with_capacity(lines.len());
     let mut callout_kind: Option<CalloutKind> = None;
     let mut prev_was_quote = false;
@@ -229,7 +243,7 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
             Block::CodeLine => lang_before[i].as_deref(),
             _ => None,
         };
-        let row_plan = plan(line, block, lang, revealed.contains(&i));
+        let row_plan = plan_with_refs(line, block, lang, revealed.contains(&i), &refdefs);
         rows.push(PlannedRow {
             line: i,
             block: block.clone(),

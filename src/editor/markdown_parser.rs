@@ -15,6 +15,8 @@ pub enum MarkdownEvent {
     TaskListMarker(bool),
     InlineMath(String),
     DisplayMath(String),
+    /// `[^label]` footnote reference (preview renders an accent chip).
+    FootnoteRef(String),
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +36,10 @@ pub enum MarkdownTag {
     Strikethrough,
     Link { dest_url: String },
     Image { dest_url: String },
+    /// `^sup^` content (accent; delimiters consumed).
+    Sup,
+    /// `~sub~` content (soft accent; delimiters consumed).
+    Sub,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +83,8 @@ pub enum MarkdownTagEnd {
     Strikethrough,
     Link,
     Image,
+    Sup,
+    Sub,
 }
 
 pub fn parse_markdown(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
@@ -89,10 +97,150 @@ pub fn parse_markdown(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
     options.insert(Options::ENABLE_MATH);
 
-    Parser::new_ext(source, options)
+    let events: Vec<(Range<usize>, MarkdownEvent)> = Parser::new_ext(source, options)
         .into_offset_iter()
         .map(|(event, range)| (range, convert_event(event)))
-        .collect()
+        .collect();
+    split_sup_sub(linkify_bare_urls(events))
+}
+
+/// Split `^sup^` / `~sub~` out of text runs into synthetic style events
+/// (same [`inline::find_sup_sub`](crate::editor::markdown_live::inline::find_sup_sub)
+/// rules as the live editor, so both renderers agree).
+fn split_sup_sub(
+    events: Vec<(Range<usize>, MarkdownEvent)>,
+) -> Vec<(Range<usize>, MarkdownEvent)> {
+    use crate::editor::markdown_live::inline::find_sup_sub;
+    let mut out = Vec::with_capacity(events.len());
+    let mut depth = 0usize;
+    for (range, event) in events {
+        match &event {
+            MarkdownEvent::Start(MarkdownTag::Link { .. } | MarkdownTag::Image { .. }) => {
+                depth += 1;
+            }
+            MarkdownEvent::End(MarkdownTagEnd::Link | MarkdownTagEnd::Image) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if depth == 0
+            && let MarkdownEvent::Text(text) = &event
+        {
+            let bytes = text.as_bytes();
+            let mut at = 0usize;
+            let mut pushed = false;
+            while at < bytes.len() {
+                let rel = bytes[at..].iter().position(|&b| b == b'^' || b == b'~');
+                let Some(off) = rel else { break };
+                let pos = at + off;
+                let Some((full, content)) = find_sup_sub(text, pos) else {
+                    at = pos + 1;
+                    continue;
+                };
+                let (tag, end) = if text.as_bytes()[pos] == b'^' {
+                    (MarkdownTag::Sup, MarkdownTagEnd::Sup)
+                } else {
+                    (MarkdownTag::Sub, MarkdownTagEnd::Sub)
+                };
+                if full.start > at {
+                    out.push((
+                        range.start + at..range.start + full.start,
+                        MarkdownEvent::Text(text[at..full.start].to_string()),
+                    ));
+                }
+                let base = range.start + full.start;
+                out.push((base..base + full.len(), MarkdownEvent::Start(tag)));
+                out.push((
+                    range.start + content.start..range.start + content.end,
+                    MarkdownEvent::Text(text[content.clone()].to_string()),
+                ));
+                out.push((base..base + full.len(), MarkdownEvent::End(end)));
+                at = full.end;
+                pushed = true;
+            }
+            if pushed {
+                if at < text.len() {
+                    out.push((
+                        range.start + at..range.end,
+                        MarkdownEvent::Text(text[at..].to_string()),
+                    ));
+                }
+                continue;
+            }
+        }
+        out.push((range, event));
+    }
+    out
+}
+
+/// Split bare `http(s)://` / `www.` URLs out of text runs into synthetic
+/// link events (Typora linkifies them; pulldown only handles `<..>`
+/// autolinks). Runs inside links/images stay untouched.
+fn linkify_bare_urls(
+    events: Vec<(Range<usize>, MarkdownEvent)>,
+) -> Vec<(Range<usize>, MarkdownEvent)> {
+    use crate::editor::markdown_live::inline::find_bare_url;
+    let mut out = Vec::with_capacity(events.len());
+    let mut depth = 0usize;
+    for (range, event) in events {
+        match &event {
+            MarkdownEvent::Start(MarkdownTag::Link { .. } | MarkdownTag::Image { .. }) => {
+                depth += 1;
+            }
+            MarkdownEvent::End(MarkdownTagEnd::Link | MarkdownTagEnd::Image) => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if depth == 0
+            && let MarkdownEvent::Text(text) = &event
+        {
+            let mut at = 0usize;
+            let mut pushed = false;
+            while at < text.len() {
+                let Some(rel) = text[at..].find("http").or_else(|| text[at..].find("www.")) else {
+                    break;
+                };
+                let abs = at + rel;
+                let Some((span, url)) = find_bare_url(text, abs) else {
+                    at = abs + 1;
+                    continue;
+                };
+                if span.start > at {
+                    out.push((
+                        range.start + at..range.start + span.start,
+                        MarkdownEvent::Text(text[at..span.start].to_string()),
+                    ));
+                }
+                let base = range.start + span.start;
+                out.push((
+                    base..base + span.len(),
+                    MarkdownEvent::Start(MarkdownTag::Link { dest_url: url.clone() }),
+                ));
+                out.push((
+                    base..base + span.len(),
+                    MarkdownEvent::Text(text[span.clone()].to_string()),
+                ));
+                out.push((
+                    base..base + span.len(),
+                    MarkdownEvent::End(MarkdownTagEnd::Link),
+                ));
+                at = span.end;
+                pushed = true;
+            }
+            if pushed {
+                if at < text.len() {
+                    out.push((
+                        range.start + at..range.end,
+                        MarkdownEvent::Text(text[at..].to_string()),
+                    ));
+                }
+                continue;
+            }
+        }
+        out.push((range, event));
+    }
+    out
 }
 
 fn convert_event(event: Event<'_>) -> MarkdownEvent {
@@ -108,6 +256,7 @@ fn convert_event(event: Event<'_>) -> MarkdownEvent {
         Event::TaskListMarker(b) => MarkdownEvent::TaskListMarker(b),
         Event::InlineMath(m) => MarkdownEvent::InlineMath(m.to_string()),
         Event::DisplayMath(m) => MarkdownEvent::DisplayMath(m.to_string()),
+        Event::FootnoteReference(name) => MarkdownEvent::FootnoteRef(name.to_string()),
         _ => MarkdownEvent::SoftBreak,
     }
 }
@@ -189,6 +338,73 @@ mod tests {
         assert!(has_math("质能方程 $E = mc^2$ 展示"));
         assert!(has_math("$$E = mc^2$$"));
         assert!(has_math("$$\nE = mc^2\n$$"));
+    }
+
+    fn link_urls(source: &str) -> Vec<String> {
+        parse_markdown(source)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Start(MarkdownTag::Link { dest_url }) => Some(dest_url),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bare_urls_linkify_outside_links() {
+        assert_eq!(
+            link_urls("go https://x.dev/a! end"),
+            vec!["https://x.dev/a".to_string()]
+        );
+        assert_eq!(
+            link_urls("go www.x.dev/a. end"),
+            vec!["https://www.x.dev/a".to_string()]
+        );
+        // Link text is not re-split; autolinks still produce one link.
+        assert_eq!(
+            link_urls("go [https://x.dev](https://y.dev) end"),
+            vec!["https://y.dev".to_string()]
+        );
+        assert_eq!(
+            link_urls("go <https://x.dev> end"),
+            vec!["https://x.dev".to_string()]
+        );
+    }
+
+    #[test]
+    fn sup_sub_split_into_style_events() {
+        let tags: Vec<String> = parse_markdown("E=mc^2^ and H~2~O")
+            .into_iter()
+            .map(|(_, e)| format!("{e:?}"))
+            .collect();
+        assert!(tags.iter().any(|t| t == "Start(Sup)"));
+        assert!(tags.iter().any(|t| t == "Start(Sub)"));
+        let texts: Vec<String> = parse_markdown("E=mc^2^")
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["E=mc".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn footnote_refs_become_events() {
+        let refs: Vec<String> = parse_markdown("see [^note]\n\n[^note]: text\n")
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::FootnoteRef(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs, vec!["note".to_string()]);
+    }
+
+    #[test]
+    fn reference_links_resolve_in_preview() {
+        let src = "see [docs][]\n\n[docs]: https://x.dev\n";
+        assert_eq!(link_urls(src), vec!["https://x.dev".to_string()]);
     }
 
     #[test]

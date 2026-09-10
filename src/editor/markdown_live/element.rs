@@ -184,6 +184,20 @@ pub fn runs_for_row(
                 ..Default::default()
             });
         }
+        // 上标/下标/emoji/脚注引用：同尺寸主题色区分（gpui 单行单字号，
+        // 真实基线升降不可行；分隔符已隐藏，见 `inline::mark_sup_sub`）。
+        if st.sup || st.emoji || st.footnote {
+            s.refine(&TextStyleRefinement {
+                color: Some(colors.accent),
+                ..Default::default()
+            });
+        }
+        if st.sub {
+            s.refine(&TextStyleRefinement {
+                color: Some(colors.accent.opacity(0.7)),
+                ..Default::default()
+            });
+        }
         runs.push(s.to_run(r.len));
         at += r.len;
     }
@@ -255,6 +269,18 @@ pub fn inline_cell_runs(
         if st.italic {
             s.refine(&TextStyleRefinement {
                 font_style: Some(gpui::FontStyle::Italic),
+                ..Default::default()
+            });
+        }
+        if st.sup || st.emoji || st.footnote {
+            s.refine(&TextStyleRefinement {
+                color: Some(colors.accent),
+                ..Default::default()
+            });
+        }
+        if st.sub {
+            s.refine(&TextStyleRefinement {
+                color: Some(colors.accent.opacity(0.7)),
                 ..Default::default()
             });
         }
