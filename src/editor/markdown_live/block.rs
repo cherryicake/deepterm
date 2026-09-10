@@ -34,6 +34,11 @@ pub enum Block {
   /// A ``` or ~~~ fence line. `open` is whether it starts a block;
   /// `lang` is the info string on openers (lowercased).
   Fence { open: bool, lang: Option<String> },
+  /// A `$$` delimiter line of a display-math block (Typora math).
+  MathDelim { open: bool },
+  /// Display math: a single-line `$$...$$` formula, or a line inside a
+  /// `$$` block; `start`/`end` bound the formula bytes within the line.
+  Math { start: usize, end: usize },
   /// A line inside a fenced code block.
   CodeLine,
   /// `---` / `***` / `___` thematic break.
@@ -62,6 +67,8 @@ pub struct DocState {
   frontmatter: bool,
   /// Open fence: (fence char, marker run length, info string).
   fence: Option<(u8, usize, Option<String>)>,
+  /// Inside a `$$` display-math block.
+  math: bool,
   /// The previous line was a paragraph: a GFM table can never open on a
   /// lazy continuation line (CommonMark: the table is part of a new block).
   prev_paragraph: bool,
@@ -162,6 +169,23 @@ fn classify_inner(line: &str, next: Option<&str>, state: &mut DocState) -> Block
   if let Some((ch, len, lang)) = fence_marker(line, state.max_fence_indent()) {
     state.fence = Some((ch, len, lang.clone()));
     return Block::Fence { open: true, lang };
+  }
+
+  // Display math (`$$`, Typora parity): after fence handling so `$$` inside
+  // a code fence stays literal, before Blank so empty lines inside a math
+  // block keep the block contiguous (pulldown folds them into DisplayMath).
+  if state.math {
+    if line.trim() == "$$" {
+      state.math = false;
+      return Block::MathDelim { open: false };
+    }
+    return Block::Math {
+      start: 0,
+      end: line.len(),
+    };
+  }
+  if let Some(block) = math_line(line, state) {
+    return block;
   }
 
   if line.trim().is_empty() {
@@ -305,6 +329,37 @@ pub fn indent_cols(line: &str) -> usize {
     .take_while(|c| c.is_whitespace())
     .map(|c| if c == '\t' { 4 } else { 1 })
     .sum()
+}
+
+/// A `$$` display-math line: bare `$$` opens a block, `$$...$$` with a
+/// non-empty formula and nothing but whitespace after the closer is one
+/// inline block line. Returns the block (opening sets `state.math`).
+/// Anything else (e.g. `$$x$$ trailing text`) is not math.
+fn math_line(line: &str, state: &mut DocState) -> Option<Block> {
+  let trimmed = line.trim();
+  if !trimmed.starts_with("$$") {
+    return None;
+  }
+  let indent = line.len() - line.trim_start().len();
+  let after_open = &trimmed[2..];
+  let Some(close) = after_open.find("$$") else {
+    if after_open.trim().is_empty() {
+      state.math = true;
+      return Some(Block::MathDelim { open: true });
+    }
+    return None;
+  };
+  if !after_open[close + 2..].trim().is_empty() {
+    return None;
+  }
+  if after_open[..close].trim().is_empty() {
+    state.math = true;
+    return Some(Block::MathDelim { open: true });
+  }
+  Some(Block::Math {
+    start: indent + 2,
+    end: indent + 2 + close,
+  })
 }
 
 /// A ``` / ~~~ opener: (fence char, run length, info).
@@ -836,6 +891,44 @@ mod tests {
     assert_eq!(blocks[4], Block::Fence { open: false, lang: None });
     // Leaving the list resets the limit: 4 spaces alone is not a fence.
     assert_eq!(blocks[5], Block::Paragraph);
+  }
+
+  #[test]
+  fn display_math_block_classifies() {
+    let mut state = DocState::default();
+    assert_eq!(classify("$$", &mut state), Block::MathDelim { open: true });
+    assert_eq!(
+      classify("E = mc^2", &mut state),
+      Block::Math { start: 0, end: 8 }
+    );
+    assert_eq!(classify("", &mut state), Block::Math { start: 0, end: 0 });
+    assert_eq!(classify("$$", &mut state), Block::MathDelim { open: false });
+    assert_eq!(classify("after", &mut state), Block::Paragraph);
+  }
+
+  #[test]
+  fn single_line_display_math() {
+    let mut state = DocState::default();
+    assert_eq!(
+      classify("$$x + y$$", &mut state),
+      Block::Math { start: 2, end: 7 }
+    );
+    // No swallowing: still paragraph context afterwards.
+    assert_eq!(classify("text", &mut state), Block::Paragraph);
+    // Trailing text after the closer is not math.
+    let mut state = DocState::default();
+    assert_eq!(classify("$$x$$ trailing", &mut state), Block::Paragraph);
+    // Unclosed single-line `$$x` is not math either.
+    let mut state = DocState::default();
+    assert_eq!(classify("$$x", &mut state), Block::Paragraph);
+  }
+
+  #[test]
+  fn math_delim_inside_fence_stays_code() {
+    let mut state = DocState::default();
+    classify("```", &mut state);
+    assert_eq!(classify("$$", &mut state), Block::CodeLine);
+    assert_eq!(classify("x", &mut state), Block::CodeLine);
   }
 
   #[test]

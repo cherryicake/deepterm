@@ -173,7 +173,8 @@ pub fn runs_for_row(
                 ..Default::default()
             });
         }
-        if st.italic {
+        // 斜体与公式内容同为斜体（KaTeX 近似；公式分隔符已隐藏/弱化）。
+        if st.italic || st.math {
             s.refine(&TextStyleRefinement {
                 font_style: Some(gpui::FontStyle::Italic),
                 ..Default::default()

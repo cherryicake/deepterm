@@ -834,6 +834,37 @@ impl MarkdownElementBuilder {
             MarkdownEvent::TaskListMarker(checked) => {
                 self.pending_task = Some((checked, range));
             }
+            MarkdownEvent::InlineMath(math) => {
+                // KaTeX 近似：斜体行内容，分隔符已由 parser 剥离。
+                self.push_text_style(TextStyleRefinement {
+                    font_style: Some(gpui::FontStyle::Italic),
+                    ..Default::default()
+                });
+                self.push_text(&math, &range, cx);
+                self.pop_text_style();
+            }
+            MarkdownEvent::DisplayMath(math) => {
+                // 独立行公式：居中 + 16px 斜体 + 上下留白。
+                self.flush_text();
+                self.push_div(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .my_4()
+                        .line_height(rems(1.75)),
+                    &range,
+                    markdown_end,
+                );
+                self.push_text_style(TextStyleRefinement {
+                    font_style: Some(gpui::FontStyle::Italic),
+                    font_size: Some(px(16.).into()),
+                    ..Default::default()
+                });
+                self.push_text(&math, &range, cx);
+                self.pop_text_style();
+                self.pop_div();
+            }
         }
     }
 

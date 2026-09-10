@@ -1,5 +1,5 @@
 //! Inline markdown span parsing: emphasis, code, strikethrough, highlight,
-//! links, and wikilinks over one line (or the content part of one).
+//! math, links, and wikilinks over one line (or the content part of one).
 //!
 //! [`parse`] returns contiguous [`InlineSpan`]s covering the input exactly.
 //! Marker bytes (the `**`, backticks, `[[`, url parts, …) are flagged so a
@@ -22,6 +22,8 @@ pub struct InlineStyle {
   pub strike: bool,
   pub highlight: bool,
   pub link: bool,
+  /// `$...$` / `$$...$$` formula content (rendered italic, KaTeX approx).
+  pub math: bool,
 }
 
 /// One run of bytes sharing a style. `marker` bytes are markdown syntax;
@@ -63,6 +65,7 @@ struct Attrs {
   italic: Vec<bool>,
   strike: Vec<bool>,
   highlight: Vec<bool>,
+  math: Vec<bool>,
   /// Byte shielded by a preceding backslash escape (`\*`): invisible to all
   /// later passes, rendered as literal text.
   escaped: Vec<bool>,
@@ -82,6 +85,7 @@ pub fn parse(text: &str) -> Inline {
     italic: vec![false; n],
     strike: vec![false; n],
     highlight: vec![false; n],
+    math: vec![false; n],
     escaped: vec![false; n],
     link_text: vec![false; n],
     link_idx: vec![NO_LINK; n],
@@ -91,6 +95,7 @@ pub fn parse(text: &str) -> Inline {
   mark_escapes(text, &mut a);
   mark_code_spans(text, &mut a);
   mark_links(text, &mut a, &mut links);
+  mark_math(text, &mut a);
   mark_emphasis(text, &mut a);
 
   // Coalesce per-byte attributes into spans.
@@ -103,6 +108,7 @@ pub fn parse(text: &str) -> Inline {
       strike: a.strike[i],
       highlight: a.highlight[i],
       link: a.link_text[i],
+      math: a.math[i],
     };
     let link = (a.link_idx[i] != NO_LINK).then_some(a.link_idx[i]);
     match spans.last_mut() {
@@ -243,6 +249,71 @@ fn mark_links(text: &str, a: &mut Attrs, links: &mut Vec<String>) {
   }
 }
 
+/// `$...$` / `$$...$$` formulas (Typora math): delimiters become markers,
+/// content gets the math style. Runs after code/escapes so `$` inside code
+/// spans stays literal. Delimiter rules (pandoc-like, avoids `$5 and $10`
+/// misfires): the opener must be followed by a non-space, the closer must
+/// be preceded by a non-space and followed by a non-alphanumeric, and the
+/// content must contain a non-space. Unmatched `$` stays literal.
+fn mark_math(text: &str, a: &mut Attrs) {
+  let bytes = text.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] != b'$' || a.code[i] || a.escaped[i] {
+      i += 1;
+      continue;
+    }
+    let double = bytes.get(i + 1) == Some(&b'$');
+    let open_end = if double { i + 2 } else { i + 1 };
+    let next = bytes.get(open_end);
+    if next.is_none_or(|b| b.is_ascii_whitespace()) {
+      i = open_end;
+      continue;
+    }
+    // Find the closer on the same line.
+    let mut j = open_end;
+    let mut close: Option<usize> = None;
+    while j < bytes.len() {
+      if bytes[j] == b'$' && !a.code[j] && !a.escaped[j] {
+        if double {
+          if bytes.get(j + 1) == Some(&b'$') {
+            close = Some(j);
+            break;
+          }
+          j += 1;
+          continue;
+        }
+        // A `$` starting a `$$` pair is not a single closer.
+        if bytes.get(j + 1) == Some(&b'$') {
+          j += 2;
+          continue;
+        }
+        close = Some(j);
+        break;
+      }
+      j += 1;
+    }
+    let Some(c) = close else {
+      i = open_end;
+      continue;
+    };
+    let prev_ok = c > open_end && !bytes[c - 1].is_ascii_whitespace();
+    let after = if double { c + 2 } else { c + 1 };
+    let next_ok = bytes
+      .get(after)
+      .is_none_or(|b| !b.is_ascii_alphanumeric());
+    let content_ok = text[open_end..c].bytes().any(|b| !b.is_ascii_whitespace());
+    if !prev_ok || !next_ok || !content_ok {
+      i = open_end;
+      continue;
+    }
+    set(&mut a.marker, i..open_end);
+    set(&mut a.marker, c..after);
+    set(&mut a.math, open_end..c);
+    i = after;
+  }
+}
+
 /// `**bold**`, `*italic*`, `***both***` (and the `_` forms), `~~strike~~`,
 /// `==highlight==`. Unmatched delimiters stay literal.
 fn mark_emphasis(text: &str, a: &mut Attrs) {
@@ -376,6 +447,29 @@ mod tests {
       }
       assert_eq!(at, text.len());
     }
+  }
+
+  #[test]
+  fn math_delimiters_hidden_content_flagged() {
+    // `$...$`: delimiters are markers, content carries math.
+    assert_eq!(
+      frags("$x + y$"),
+      vec![("$".into(), true), ("x + y".into(), false), ("$".into(), true)]
+    );
+    assert!(style_of("$x + y$", "x + y").math);
+    // `$$...$$` display form works inline too.
+    assert!(style_of("before $$x$$ after", "x").math);
+    // Unmatched `$` stays literal text.
+    assert!(!style_of("price $5", "$5").math);
+    // Currency-like `$5 and $10` must not parse as math.
+    let inline = parse("$5 and $10");
+    assert!(inline.spans.iter().all(|s| !s.style.math));
+    // `$` inside code spans stays literal.
+    let inline = parse("`$x$`");
+    assert!(inline.spans.iter().all(|s| !s.style.math));
+    // Escaped `\\$` stays literal: `\\$x$` has no math spans.
+    let inline = parse("\\$x$");
+    assert!(inline.spans.iter().all(|s| !s.style.math));
   }
 
   #[test]

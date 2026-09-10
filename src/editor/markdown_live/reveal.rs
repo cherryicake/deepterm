@@ -162,8 +162,8 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
 
     // 2. Line reveal set, then block expansion over source-only runs.
     let mut revealed = reveal.line_set(lines.len());
-    // Expand over contiguous Table/FrontMatter runs (code/fence rows are
-    // reveal-invariant and keep the rendered card while editing).
+    // Expand over contiguous Table/FrontMatter/math runs (code/fence rows
+    // are reveal-invariant and keep the rendered card while editing).
     let mut run_start: Option<usize> = None;
     let flush = |start: Option<usize>, end: usize, revealed: &mut BTreeSet<usize>| {
         if let Some(s) = start {
@@ -173,7 +173,10 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
         }
     };
     for (i, b) in blocks.iter().enumerate() {
-        let in_run = matches!(b, Block::Table | Block::FrontMatter);
+        let in_run = matches!(
+            b,
+            Block::Table | Block::FrontMatter | Block::Math { .. } | Block::MathDelim { .. }
+        );
         if in_run && run_start.is_none() {
             run_start = Some(i);
         } else if !in_run && run_start.is_some() {

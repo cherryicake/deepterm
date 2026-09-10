@@ -42,6 +42,10 @@ pub enum RowKind {
   },
   Rule,
   Table,
+  /// Display-math formula line (`$$...$$` or inside a `$$` block).
+  Math,
+  /// A `$$` delimiter line: hidden in preview, dimmed marker when revealed.
+  MathDelim { open: bool },
   /// A setext heading underline (`===`/`---`): hidden in preview (consumed
   /// into the heading), dimmed marker text when revealed.
   Setext,
@@ -126,6 +130,8 @@ pub fn metrics(kind: &RowKind) -> RowMetrics {
     RowKind::Code { .. } | RowKind::Fence { .. } | RowKind::FrontMatter | RowKind::Table => {
       m(0.88, 1.55, 0.0, 0.0)
     }
+    // Display math reads slightly larger, with breathing room (Typora).
+    RowKind::Math => m(1.12, 1.6, 0.25, 0.25),
     _ => m(1.0, 1.6, 0.0, 0.0),
   }
 }
@@ -155,6 +161,18 @@ pub fn plan(line: &str, block: &Block, code_lang: Option<&str>, reveal: bool) ->
     Block::SetextUnderline { .. } => {
       b.syntax(0..line.len());
       RowKind::Setext
+    }
+    Block::MathDelim { open } => {
+      b.syntax(0..line.len());
+      RowKind::MathDelim { open }
+    }
+    Block::Math { start, end } => {
+      // `$$` markers hide in preview (dim when revealed); the formula
+      // itself stays visible in both modes.
+      b.syntax(0..start);
+      b.math(start..end);
+      b.syntax(end..line.len());
+      RowKind::Math
     }
     Block::Fence { open, .. } => {
       b.mono_dim(0..line.len());
@@ -282,6 +300,15 @@ impl<'a> Builder<'a> {
   fn mono(&mut self, src: Range<usize>) {
     let style = InlineStyle {
       code: true,
+      ..InlineStyle::default()
+    };
+    self.emit(src, false, false, style);
+  }
+
+  /// Display-math formula: verbatim content with the math style.
+  fn math(&mut self, src: Range<usize>) {
+    let style = InlineStyle {
+      math: true,
       ..InlineStyle::default()
     };
     self.emit(src, false, false, style);
@@ -453,6 +480,30 @@ mod tests {
     assert_eq!(p.visible, "done deal");
     assert!(p.runs.iter().all(|r| r.dim));
     covers(&p, line);
+  }
+
+  #[test]
+  fn display_math_hides_delims_keeps_formula() {
+    let p = plan_line("$$E = mc^2$$", false);
+    assert_eq!(p.kind, RowKind::Math);
+    assert_eq!(p.visible, "E = mc^2");
+    assert!(p.runs.iter().all(|r| r.style.math));
+    covers(&p, "$$E = mc^2$$");
+    // Revealed: delimiters come back dimmed as markers.
+    let p = plan_line("$$E = mc^2$$", true);
+    assert_eq!(p.visible, "$$E = mc^2$$");
+    assert!(p.runs.iter().any(|r| r.marker && !r.style.math));
+  }
+
+  #[test]
+  fn math_delim_vanishes_in_preview() {
+    let mut st = DocState::default();
+    let block = classify("$$", &mut st);
+    let p = plan("$$", &block, None, false);
+    assert_eq!(p.kind, RowKind::MathDelim { open: true });
+    assert_eq!(p.visible, "");
+    let p = plan("$$", &block, None, true);
+    assert_eq!(p.visible, "$$");
   }
 
   #[test]

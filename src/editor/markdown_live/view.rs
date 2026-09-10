@@ -1736,6 +1736,49 @@ impl Render for LiveMarkdownView {
                                     .into_any_element()
                             }
                         }
+                        RowKind::Math => {
+                            // Display formula: centered italic line
+                            // (Typora-style; KaTeX approx, no TeX engine).
+                            div()
+                                .w_full()
+                                .flex_shrink_0()
+                                .flex()
+                                .justify_center()
+                                .my_2()
+                                .line_height(rems(1.75))
+                                .child(live_line(pi, &paints, &entity, &colors))
+                                .into_any_element()
+                        }
+                        RowKind::MathDelim { .. } => {
+                            // A hidden `$$` delimiter: revealed it shows the
+                            // raw marker; otherwise a small click gap
+                            // (Setext parity) that targets the line.
+                            if row.plan.revealed {
+                                div()
+                                    .flex_shrink_0()
+                                    .child(live_line(pi, &paints, &entity, &colors))
+                                    .into_any_element()
+                            } else {
+                                let line = row.line;
+                                div()
+                                    .id(("live-math", line))
+                                    .flex_shrink_0()
+                                    .w_full()
+                                    .h(px(8.))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _e, window, cx| {
+                                            window.focus(&this.focus, cx);
+                                            this.edit(cx, |m| {
+                                                m.move_to(line, usize::MAX, false)
+                                            });
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .into_any_element()
+                            }
+                        }
                         RowKind::Code { .. }
                         | RowKind::Fence { .. }
                         | RowKind::Table

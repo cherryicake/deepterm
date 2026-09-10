@@ -13,6 +13,8 @@ pub enum MarkdownEvent {
     HardBreak,
     Rule,
     TaskListMarker(bool),
+    InlineMath(String),
+    DisplayMath(String),
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +87,7 @@ pub fn parse_markdown(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    options.insert(Options::ENABLE_MATH);
 
     Parser::new_ext(source, options)
         .into_offset_iter()
@@ -103,6 +106,8 @@ fn convert_event(event: Event<'_>) -> MarkdownEvent {
         Event::HardBreak => MarkdownEvent::HardBreak,
         Event::Rule => MarkdownEvent::Rule,
         Event::TaskListMarker(b) => MarkdownEvent::TaskListMarker(b),
+        Event::InlineMath(m) => MarkdownEvent::InlineMath(m.to_string()),
+        Event::DisplayMath(m) => MarkdownEvent::DisplayMath(m.to_string()),
         _ => MarkdownEvent::SoftBreak,
     }
 }
@@ -163,5 +168,33 @@ fn convert_tag_end(tag_end: TagEnd) -> MarkdownTagEnd {
         | TagEnd::DefinitionListTitle
         | TagEnd::DefinitionListDefinition
         | TagEnd::MetadataBlock(_) => MarkdownTagEnd::Paragraph,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn has_math(source: &str) -> bool {
+        parse_markdown(source).iter().any(|(_, e)| {
+            matches!(
+                e,
+                MarkdownEvent::InlineMath(_) | MarkdownEvent::DisplayMath(_)
+            )
+        })
+    }
+
+    #[test]
+    fn math_events_parsed() {
+        assert!(has_math("质能方程 $E = mc^2$ 展示"));
+        assert!(has_math("$$E = mc^2$$"));
+        assert!(has_math("$$\nE = mc^2\n$$"));
+    }
+
+    #[test]
+    fn currency_is_not_math() {
+        // 与 live `mark_math` 的 pandoc 式规则对齐：货币写法保持原文。
+        assert!(!has_math("price $5"));
+        assert!(!has_math("$5 and $10"));
     }
 }

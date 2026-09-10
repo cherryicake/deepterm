@@ -240,7 +240,27 @@ let very_long_line = "This is a very long line that should trigger horizontal sc
 
 ---
 
-## 12. 尾声 · 验证清单
+## 13. 公式 Math（Typora 风格）
+
+> 行内 `$...$` 斜体显示、分隔符隐藏；独占行 `$$...$$` 居中并放大 `1.12` 倍；多行 `$$` 块每行居中。光标点进公式行时整块切回源码态（`$$` 分隔符现身），点别处恢复渲染。KaTeX 级真排版（如 `\frac` 分数展开）暂为近似渲染：内容斜体居中，不做 TeX 展开。
+
+行内公式：质能方程 $E = mc^2$ 就该长这样，勾股定理 $a^2 + b^2 = c^2$ 也是。货币 $5 和 $10 不会被误判为公式，`$x$` 写在代码里保持原样，\$转义后同样是普通字符。
+
+单行块公式：
+
+$$E = mc^2$$
+
+多行块公式（`$$` 独占一行开合）：
+
+$$
+\sum_{i=1}^n i = \frac{n(n+1)}{2}
+\int_0^\infty e^{-x} dx = 1
+\sqrt{a^2 + b^2} = c
+$$
+
+---
+
+## 14. 尾声 · 验证清单
 
 > 若平滑滚动至此且所有色块、间距、圆角在亮/暗主题下保持一致，说明 Typora/Notion 风格的 Tier 1 + Tier 2 美化已生效。
 
@@ -253,6 +273,7 @@ let very_long_line = "This is a very long line that should trigger horizontal sc
 5. 表格：横向滚动、斑马纹、单元格 `14px`
 6. 链接：外链 `↗` 仅对 https/http 出现
 7. 图片：本地 `icon.png` 真图、远程占位、点击外部打开
-8. 切换亮/暗主题（`macos26-light / macos26-dark`）对比底色，窗口缩窄观察 780px 居中
+8. 公式：行内斜体、`$$` 居中块、货币 `$5` 不误判、点进公式切源码
+9. 切换亮/暗主题（`macos26-light / macos26-dark`）对比底色，窗口缩窄观察 780px 居中
 
 *—— End of Showcase v2 —*
