@@ -28,6 +28,7 @@ use crate::editor::markdown_live::element::{
 use crate::editor::markdown_live::highlight::HighlightCache;
 use crate::editor::markdown_live::interactions::{
     backspace_marker, classify_alone, insert_link, line_selection, list_cols, on_enter, on_tab,
+    word_stats,
     toggle_task, toggle_wrap, OrderedCounter,
 };
 use crate::editor::markdown_live::layout::{
@@ -81,6 +82,8 @@ pub struct LiveMarkdownView {
     cursor_shape: CursorShape,
     cursor_blink: bool,
     blink_on: bool,
+    /// Typora 风格大纲侧栏是否展开（`Cmd+Shift+O` / 状态条切换）。
+    show_outline: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -116,6 +119,7 @@ impl LiveMarkdownView {
             cursor_shape: CursorShape::Bar,
             cursor_blink: true,
             blink_on: false,
+            show_outline: false,
             _subscriptions,
         }
     }
@@ -1014,6 +1018,13 @@ impl LiveMarkdownView {
                 }
                 return;
             }
+            "o" if platform && shift => {
+                // Typora 大纲侧栏显隐（与状态条按钮同一开关）。
+                self.show_outline = !self.show_outline;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             _ => {}
         }
         // Printable input.
@@ -1102,6 +1113,33 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
         CalloutKind::Important => gpui::rgb(0x8250DF).into(),
         CalloutKind::Warning => ui.warning,
         CalloutKind::Caution => ui.error,
+    }
+}
+
+/// Outline entries `(source line, level, title)` in document order.
+fn outline_entries(rows: &[PlannedRow]) -> Vec<(usize, u8, String)> {
+    rows
+        .iter()
+        .filter_map(|r| match &r.block {
+            Block::Heading { level, .. } => Some((r.line, *level, outline_title(&r.plan.visible))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Outline display title: single line, max 42 chars.
+fn outline_title(visible: &str) -> String {
+    let one = visible
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one.is_empty() {
+        return "(空标题)".to_string();
+    }
+    if one.chars().count() > 42 {
+        format!("{}…", one.chars().take(42).collect::<String>())
+    } else {
+        one
     }
 }
 
@@ -2285,6 +2323,147 @@ impl Render for LiveMarkdownView {
             }
         }
 
+        // Outline (Typora Outline parity) + current section highlight.
+        let outline = outline_entries(&rows);
+        let current_section = outline
+            .iter()
+            .filter(|(line, _, _)| *line <= cursor.line)
+            .last()
+            .map(|(line, _, _)| *line);
+
+        // Status strip (Typora status-bar parity): cursor + counts + outline toggle.
+        let mut stat_chars = 0usize;
+        for line in self.buffer.lines() {
+            stat_chars += line.chars().filter(|c| !c.is_whitespace()).count();
+        }
+        let stat_lines = self.buffer.lines().len();
+        let sel_chars = self
+            .selected_source_text()
+            .map(|t| t.chars().filter(|c| !c.is_whitespace()).count());
+        let show_outline = self.show_outline;
+        let status = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .mt(px(2.))
+            .pt(px(6.))
+            .border_t_1()
+            .border_color(ui.border.opacity(0.4))
+            .text_size(px(11.))
+            .text_color(ui.text_muted)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(format!("行 {}, 列 {}", cursor.line + 1, cursor.col + 1))
+                    .child(format!("共 {stat_chars} 字 · {stat_lines} 行"))
+                    .when_some(sel_chars, |this, n| {
+                        this.child(
+                            div()
+                                .text_color(ui.text_muted.opacity(0.8))
+                                .child(format!("已选 {n} 字")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("live-outline-toggle")
+                    .cursor_pointer()
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .text_color(if show_outline {
+                        ui.accent
+                    } else {
+                        ui.text_muted
+                    })
+                    .hover(|this| this.bg(ui.tab_hover_background))
+                    .child(if show_outline { "大纲 ✓" } else { "大纲" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e, window, cx| {
+                            window.focus(&this.focus, cx);
+                            this.show_outline = !this.show_outline;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+
+        // Toggleable outline side panel: click jumps (focus kept).
+        let outline_panel = show_outline.then(|| {
+            div()
+                .id("live-outline")
+                .w(px(230.))
+                .h_full()
+                .flex_shrink_0()
+                .border_l_1()
+                .border_color(ui.border.opacity(0.5))
+                .bg(ui.panel_background)
+                .flex()
+                .flex_col()
+                .py_4()
+                .child(
+                    div()
+                        .px(px(12.))
+                        .mb_2()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight(600.))
+                        .text_color(ui.text_muted)
+                        .child("大纲"),
+                )
+                .child(if outline.is_empty() {
+                    div()
+                        .px(px(12.))
+                        .text_size(px(12.))
+                        .text_color(ui.text_muted.opacity(0.6))
+                        .child("暂无标题")
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("live-outline-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px(px(6.))
+                        .children(outline.iter().map(|(line, level, title)| {
+                            let line = *line;
+                            let current = Some(line) == current_section;
+                            div()
+                                .id(("live-outline-item", line))
+                                .pl(px(6. + (*level as f32 - 1.) * 12.))
+                                .pr(px(6.))
+                                .py(px(3.))
+                                .rounded(px(6.))
+                                .text_size(px(12.))
+                                .whitespace_nowrap()
+                                .truncate()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .text_color(if current { ui.accent } else { ui.text })
+                                .when(current, |this| this.bg(ui.accent.opacity(0.12)))
+                                .hover(|this| this.bg(ui.tab_hover_background))
+                                .child(title.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _e, window, cx| {
+                                        window.focus(&this.focus, cx);
+                                        this.edit(cx, |m| m.move_to(line, 0, false));
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .into_any_element()
+                        }))
+                        .into_any_element()
+                })
+        });
+
         // Preview-parity container: centered 780px column, no editor chrome.
         div()
             .id("live-markdown")
@@ -2313,8 +2492,7 @@ impl Render for LiveMarkdownView {
                 cx.notify();
             }))
             .flex()
-            .flex_col()
-            .items_center()
+            .justify_center()
             .size_full()
             .overflow_hidden()
             .bg(ui.app_background)
@@ -2322,25 +2500,39 @@ impl Render for LiveMarkdownView {
                 div()
                     .flex()
                     .flex_col()
-                    .w_full()
-                    .max_w(px(780.))
-                    .px_8()
-                    .py_8()
-                    .size_full()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .items_center()
                     .overflow_hidden()
                     .child(
                         div()
-                            .id("live-markdown-content")
-                            .debug_selector(|| "live-markdown-content".into())
                             .flex()
                             .flex_col()
                             .w_full()
+                            .max_w(px(780.))
+                            .px_8()
+                            .pt_8()
+                            .pb_2()
                             .h_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .children(row_els),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("live-markdown-content")
+                                    .debug_selector(|| "live-markdown-content".into())
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .children(row_els),
+                            )
+                            .child(status),
                     ),
             )
+            .when_some(outline_panel, |this, panel| this.child(panel))
     }
 }
 
@@ -2872,6 +3064,36 @@ mod live_showcase_tests {
     /// turns into a code card / table grid must be classified the same way
     /// by the live classifier, or the two renderers drift apart again —
     /// which is exactly how `:---` tables and list-nested fences were lost.
+    #[test]
+    fn outline_collects_headings_in_order() {
+        let doc = "# A\n\ntext\n\n## B\n\n### C\n\n## D\n";
+        let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+        let rows = plan_document(
+            &lines,
+            Reveal {
+                cursor: Pos::new(0, 0),
+                selection: None,
+                focused: false,
+                read_only: false,
+            },
+        );
+        let outline = outline_entries(&rows);
+        assert_eq!(
+            outline
+                .iter()
+                .map(|(l, v, t)| (*l, *v, t.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, "A".to_string()),
+                (4, 2, "B".to_string()),
+                (6, 3, "C".to_string()),
+                (8, 2, "D".to_string()),
+            ]
+        );
+        assert_eq!(outline_title("  a  b  "), "a b");
+        assert_eq!(outline_title(""), "(空标题)");
+    }
+
     #[test]
     fn live_blocks_match_preview_blocks() {
         for (name, doc) in [

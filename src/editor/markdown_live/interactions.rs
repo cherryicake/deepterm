@@ -304,6 +304,14 @@ pub fn insert_link(model: &mut EditorModel) -> bool {
 
 /// The selected char-column range on `line` for normalized `(start, end)`,
 /// or `None` on a miss. Bool = continues past this line's end.
+/// 文档字数统计（Typora 状态栏 parity）：非空白字符数 + 行数。
+/// 空文档计 1 行；中英文统一按字符计（`共 N 字`）。
+pub fn word_stats(text: &str) -> (usize, usize) {
+    let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+    let lines = if text.is_empty() { 1 } else { text.lines().count() };
+    (chars, lines)
+}
+
 pub fn line_selection(
     start: Pos,
     end: Pos,
@@ -407,6 +415,14 @@ mod tests {
         assert_eq!(m.text(), "    - item");
         on_tab(&mut m, "    - item", true, 4);
         assert_eq!(m.text(), "- item");
+    }
+
+    #[test]
+    fn word_stats_counts_chars_and_lines() {
+        assert_eq!(word_stats(""), (0, 1));
+        assert_eq!(word_stats("hello world"), (10, 1));
+        assert_eq!(word_stats("你好世界"), (4, 1));
+        assert_eq!(word_stats("hi 你好\n\nbye"), (7, 3));
     }
 
     #[test]
