@@ -429,7 +429,7 @@ impl MarkdownElementBuilder {
                             .flex_shrink_0()
                             .text_size(px(22.))
                             .child(bullet)
-                            .text_color(cx.theme().ui.text)
+                            .text_color(cx.theme().ui.accent)
                             .into()
                     } else {
                         // 有序列表数字：右对齐，缩短与正文距离

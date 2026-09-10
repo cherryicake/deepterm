@@ -1675,7 +1675,7 @@ impl Render for LiveMarkdownView {
                                     .flex_shrink_0()
                                     .text_size(px(22.))
                                     .child("•")
-                                    .text_color(ui.text)
+                                    .text_color(ui.accent)
                                     .into_any_element(),
                             };
                             let mut item = div()
