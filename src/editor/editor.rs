@@ -616,7 +616,7 @@ impl Editor {
             last_checked_text_version: 0,
             dirty: is_dirty,
             markdown,
-            live: None,
+            live,
             image: None,
             diff: None,
         };
@@ -3533,6 +3533,60 @@ impl IntoElement for EditorResizeElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：标签页组切换后 `#live` 的 md 文件必须保持实时渲染。
+    /// `restore_file_from_cache` 曾构造了 `LiveMarkdownView` 却以 `live: None`
+    /// 存入 `EditorFile`，导致切组回来后退化为纯文本编辑态。
+    #[gpui::test]
+    fn restore_live_tab_from_cache_keeps_live_view(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            EditorHost(cx.new(|cx| Editor::new(window, cx)))
+        });
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+        let info = EditorOpenFileInfo {
+            id: "notes.md#live".into(),
+            path: "notes.md".into(),
+            label: "notes.md".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("# hi\n".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+        };
+        cx.update(|window, cx| {
+            let cached = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("# hi\n", window, cx);
+                state
+            });
+            editor.update(cx, |editor, cx| {
+                editor.restore_file_from_cache(&info, cached, window, cx);
+            });
+            let live_ok = editor.read(cx).open_files.iter().any(|f| {
+                f.id.as_ref() == "notes.md#live"
+                    && f.live.is_some()
+                    && f.live.as_ref().is_some_and(|live| {
+                        live.read(cx).text() == "# hi\n"
+                    })
+            });
+            assert!(live_ok, "live tab must keep its LiveMarkdownView after restore");
+        });
+    }
 
     #[test]
     fn detect_line_ending_lf() {
