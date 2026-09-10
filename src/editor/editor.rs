@@ -531,8 +531,11 @@ impl Editor {
         };
         let live = if is_live {
             let content_clone = content.clone();
+            // 图片粘贴/拖拽落盘需要文档位置（Typora `<stem>.assets/` 布局）。
+            let live_doc_path = path_str.clone();
             Some(cx.new(|cx| {
                 crate::editor::markdown_live::LiveMarkdownView::with_text(&content_clone, cx)
+                    .doc_path(std::path::Path::new(&live_doc_path))
             }))
         } else {
             None

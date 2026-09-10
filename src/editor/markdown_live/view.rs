@@ -6,14 +6,16 @@
 //! guise `markdown/editor.rs` (`on_key`/`on_mouse_down`/checkbox/link).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, Subscription, TextRun, Window, div, px, rems, svg,
+    App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle, ShapedLine, SharedString,
+    StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun, Window, div, px, rems,
+    svg,
 };
 
 use crate::assets::Icon;
@@ -26,6 +28,9 @@ use crate::editor::markdown_live::element::{
     runs_for_row, LiveColors, LiveLine,
 };
 use crate::editor::markdown_live::highlight::HighlightCache;
+use crate::editor::markdown_live::images::{
+    MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
+};
 use crate::editor::markdown_live::interactions::{
     backspace_marker, classify_alone, find_jump_target, insert_link, line_selection, list_cols,
     on_enter, on_tab, pos_of_offset, table_insert_row_below, table_nav, toggle_task, toggle_wrap,
@@ -88,6 +93,8 @@ pub struct LiveMarkdownView {
     blink_on: bool,
     /// Typora 风格大纲侧栏是否展开（`Cmd+Shift+O` / 状态条切换）。
     show_outline: bool,
+    /// 本文档路径（编辑器传入）：图片粘贴/拖拽按 Typora 存入 `<stem>.assets/`。
+    doc_path: Option<PathBuf>,
     /// Typora 风格内嵌查找/替换条（`Cmd+F` 打开，复用 `SearchMatcher`
     /// 做 Aho-Corasick/正则匹配；输入框懒创建，`Change` 事件触发重搜）。
     find_open: bool,
@@ -136,6 +143,7 @@ impl LiveMarkdownView {
             cursor_blink: true,
             blink_on: false,
             show_outline: false,
+            doc_path: None,
             find_open: false,
             find_query: None,
             find_replace: None,
@@ -162,6 +170,15 @@ impl LiveMarkdownView {
 
     pub fn read_only(mut self, ro: bool) -> Self {
         self.read_only = ro;
+        self
+    }
+
+    /// 文档落盘路径：图片粘贴/拖拽以此定位 `<stem>.assets/`（Typora 布局）。
+    pub fn doc_path(mut self, path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref();
+        if !path.as_os_str().is_empty() {
+            self.doc_path = Some(path.to_path_buf());
+        }
         self
     }
 
@@ -222,6 +239,114 @@ impl LiveMarkdownView {
             && self.focus.is_focused(window)
             && window.is_window_active()
             && self.blink.read(cx).visible()
+    }
+
+    // ---- image paste / drop (Typora parity) -----------------------------
+    // 剪贴板图片字节 / 拖拽或 Finder 拷贝的图片文件落盘到 `<stem>.assets/`，
+    // 正文插入 `![](相对路径)`（图片独占行时渲染为图片卡片）。
+
+    /// 图片字节落盘，返回文档相对引用名（无文档路径时用临时目录绝对路径）。
+    fn save_image_bytes(&self, bytes: &[u8], ext: &str) -> Option<String> {
+        if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return None;
+        }
+        let (dir, relative) = match self.doc_path.as_deref() {
+            Some(doc) => (assets_dir(doc), true),
+            None => (
+                std::env::temp_dir().join("deepterm-md-images"),
+                false,
+            ),
+        };
+        std::fs::create_dir_all(&dir).ok()?;
+        let name = unique_file_name(&dir, "image", ext);
+        std::fs::write(dir.join(&name), bytes).ok()?;
+        if relative {
+            Some(format!(
+                "{}/{name}",
+                dir.file_name()?.to_str()?
+            ))
+        } else {
+            Some(dir.join(name).to_string_lossy().to_string())
+        }
+    }
+
+    /// 单个图片文件导入 assets（拖拽 / Finder 拷贝），返回引用名。
+    fn import_image_file(&self, src: &Path) -> Option<String> {
+        if !is_image_file(src) {
+            return None;
+        }
+        let ext = src
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase();
+        let bytes = std::fs::read(src).ok()?;
+        self.save_image_bytes(&bytes, &ext)
+    }
+
+    /// 引用名插入正文：空行直接插入，非空行另起一行（Typora 图片独占段落）。
+    fn insert_image_refs(&mut self, refs: &[String], cx: &mut Context<Self>) {
+        if refs.is_empty() {
+            return;
+        }
+        let md: String = refs
+            .iter()
+            .map(|r| format!("![]({r})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cur = self.buffer.cursor();
+        let blank = self
+            .buffer
+            .line(cur.line)
+            .is_some_and(|l| l.trim().is_empty());
+        self.edit(cx, |m| {
+            if blank {
+                m.insert(&md);
+            } else {
+                m.insert(&format!("\n{md}"));
+            }
+        });
+    }
+
+    /// 剪贴板图片粘贴：无文本但有图片/图片路径时落盘插入。
+    /// 有图片条目即视为消费（返回 true），调用方直接 `after_edit`。
+    fn paste_images(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let mut saw_image = false;
+        let mut refs = Vec::new();
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(img) => {
+                    saw_image = true;
+                    if let Some(r) = self.save_image_bytes(&img.bytes, format_extension(img.format))
+                    {
+                        refs.push(r);
+                    }
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.paths() {
+                        if !is_image_file(path) {
+                            continue;
+                        }
+                        saw_image = true;
+                        if let Some(r) = self.import_image_file(path) {
+                            refs.push(r);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.insert_image_refs(&refs, cx);
+        saw_image
+    }
+
+    /// 图片文件拖拽投放（`on_drop::<ExternalPaths>`）：导入并插入。
+    fn drop_image_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        let refs: Vec<String> = paths.iter().filter_map(|p| self.import_image_file(p)).collect();
+        if refs.is_empty() {
+            return false;
+        }
+        self.insert_image_refs(&refs, cx);
+        true
     }
 
     // ---- find / replace (Typora Cmd+F parity) ---------------------------
@@ -1284,14 +1409,19 @@ impl LiveMarkdownView {
                     cx.stop_propagation();
                     return;
                 }
-                if let Some(item) = cx.read_from_clipboard()
-                    && let Some(text) = item.text()
-                {
-                    let text = text.replace('\r', "");
-                    if !text.is_empty() {
-                        self.edit(cx, |m| m.insert(&text));
+                if let Some(item) = cx.read_from_clipboard() {
+                    // 图片优先：截图/图片字节或 Finder 拷贝的图片文件落盘插入。
+                    if self.paste_images(&item, cx) {
                         self.after_edit(cx);
                         return;
+                    }
+                    if let Some(text) = item.text() {
+                        let text = text.replace('\r', "");
+                        if !text.is_empty() {
+                            self.edit(cx, |m| m.insert(&text));
+                            self.after_edit(cx);
+                            return;
+                        }
                     }
                 }
                 cx.stop_propagation();
@@ -3038,6 +3168,15 @@ impl Render for LiveMarkdownView {
                     this.on_fallback_mouse_down(event, window, cx);
                 }),
             )
+            // OS 文件拖拽投放：图片文件导入 assets 并插入引用（Typora parity）。
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                if this.read_only {
+                    return;
+                }
+                if this.drop_image_files(paths.paths(), cx) {
+                    this.after_edit(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 if let Some(t) = this.selected_source_text() {
                     cx.write_to_clipboard(ClipboardItem::new_string(t));
@@ -3432,6 +3571,61 @@ mod live_frame_tests {
             table.is_some_and(|b| b.size.height > px(0.) && b.size.width > px(0.)),
             "showcase table grid missing: {table:?}"
         );
+    }
+
+    /// Image paste/drop (Typora parity): files land in `<stem>.assets/`
+    /// with Typora-layout refs, clipboard bytes get unique names.
+    #[gpui::test]
+    fn live_image_drop_imports_into_assets(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let dir = std::env::temp_dir().join(format!("deepterm-live-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("shot.PNG");
+        std::fs::write(&src, b"fake-png-bytes").unwrap();
+        let doc = dir.join("notes.md");
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| {
+                LiveMarkdownView::with_text("hello\n", cx).doc_path(doc.clone())
+            }))
+        });
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        // 1. Drop an image file → copied into notes.assets, ref inserted.
+        view.update(cx, |v, cx| {
+            assert!(v.drop_image_files(std::slice::from_ref(&src), cx));
+        });
+        let text = view.read_with(cx, |v, _| v.text());
+        assert!(
+            text.contains("![](notes.assets/image.png)"),
+            "drop ref missing: {text:?}"
+        );
+        assert!(dir.join("notes.assets/image.png").exists());
+        // 2. Non-image drops are ignored (fall through to text paste).
+        let txt = dir.join("data.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        view.update(cx, |v, cx| {
+            assert!(!v.drop_image_files(std::slice::from_ref(&txt), cx));
+        });
+        // 3. Clipboard image bytes → unique name alongside the first.
+        use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat};
+        let item = ClipboardItem {
+            entries: vec![ClipboardEntry::Image(Image {
+                format: ImageFormat::Png,
+                bytes: b"more-bytes".to_vec(),
+                id: 7,
+            })],
+        };
+        view.update(cx, |v, cx| {
+            assert!(v.paste_images(&item, cx));
+        });
+        let text = view.read_with(cx, |v, _| v.text());
+        assert!(
+            text.contains("![](notes.assets/image-1.png)"),
+            "pasted ref missing: {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Real repo docs: every fenced block / table in the file must come out
