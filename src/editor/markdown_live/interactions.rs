@@ -5,7 +5,7 @@
 //! against [`crate::editor::markdown_live::model::EditorModel`]. The view
 //! layer (`view.rs`) wraps these in `buffer.edit(...)` transactions.
 
-use crate::editor::markdown_live::block::{classify, Block, DocState};
+use crate::editor::markdown_live::block::{classify, table_delimiter_cols, Block, DocState};
 use crate::editor::markdown_live::layout::RowKind;
 use crate::editor::markdown_live::model::{EditorModel, Pos};
 
@@ -312,6 +312,148 @@ pub fn word_stats(text: &str) -> (usize, usize) {
     (chars, lines)
 }
 
+/// Cell spans of a table source row as byte ranges (Typora grid nav).
+///
+/// Splits on `|` outside code spans, honoring `\\|` escapes; the outer
+/// pipes may be absent (GFM pipeless rows) — each segment still counts.
+pub fn table_cell_bounds(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut bounds = Vec::new();
+    let mut start = 0usize;
+    let mut in_code = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Skip the escaped char (overshoot at EOL safely ends the loop;
+            // mid-UTF8 bytes never match ASCII below, so bounds stay valid).
+            b'\\' => i += 2,
+            b'`' => {
+                in_code = !in_code;
+                i += 1;
+            }
+            b'|' if !in_code => {
+                bounds.push((start, i));
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    bounds.push((start, bytes.len()));
+    // Outer pipes produce zero-width edge cells (`| a |` scans as
+    // `(0,0),(1,4),(5,5)`): drop them so the count matches GFM columns.
+    if line.trim_start().starts_with('|')
+        && matches!(bounds.first(), Some((a, b)) if a == b)
+    {
+        bounds.remove(0);
+    }
+    if line.trim_end().ends_with('|')
+        && matches!(bounds.last(), Some((a, b)) if a == b)
+    {
+        bounds.pop();
+    }
+    if bounds.is_empty() {
+        bounds.push((0, line.len()));
+    }
+    bounds
+}
+
+/// Char column of `byte` in `line` (interior offsets round down).
+fn char_col(line: &str, byte: usize) -> usize {
+    line.get(..byte.min(line.len()))
+        .unwrap_or("")
+        .chars()
+        .count()
+}
+
+/// Content char-cols `(start, end)` of each cell: trimmed of padding, so
+/// the caret lands on text (empty cells land just before the right pipe).
+fn table_cell_contents(line: &str) -> Vec<(usize, usize)> {
+    table_cell_bounds(line)
+        .iter()
+        .map(|(s, e)| {
+            let cell = &line[*s..*e];
+            let lead = cell.len() - cell.trim_start().len();
+            let trail = cell.len() - cell.trim_end().len();
+            let cs = char_col(line, s + lead);
+            // Empty cells (`|  |`) would invert: clamp to the start.
+            (cs, char_col(line, e - trail).max(cs))
+        })
+        .collect()
+}
+
+/// Move the cursor to the next (`forward`) / previous table cell, spanning
+/// the whole grid via `is_table`. Past the last cell a fresh empty row is
+/// appended (Typora); before the first cell the cursor goes to line start.
+/// Returns true when handled (the caller owns selection clearing, if any).
+pub fn table_nav(model: &mut EditorModel, forward: bool, is_table: &dyn Fn(usize) -> bool) -> bool {
+    let cur = model.cursor();
+    let Some(line_text) = model.line(cur.line).map(str::to_string) else {
+        return false;
+    };
+    let cells = table_cell_contents(&line_text);
+    if cells.is_empty() {
+        return false;
+    }
+    // Cell stops are content starts: forward takes the first stop past
+    // the cursor, backward the last stop before it (strict on both sides,
+    // so Tab/Shift+Tab never get stuck inside one cell).
+    if forward {
+        if let Some((cs, _)) = cells.iter().find(|(cs, _)| *cs > cur.col).copied() {
+            model.move_to(cur.line, cs, false);
+            return true;
+        }
+        let next = cur.line + 1;
+        if is_table(next) {
+            let text = model.line(next).map(str::to_string).unwrap_or_default();
+            let (cs, _) = table_cell_contents(&text).first().copied().unwrap_or((0, 0));
+            model.move_to(next, cs, false);
+            return true;
+        }
+        return table_insert_row_below(model);
+    }
+    if let Some((cs, _)) = cells.iter().rev().find(|(cs, _)| *cs < cur.col).copied() {
+        model.move_to(cur.line, cs, false);
+        return true;
+    }
+    if cur.line > 0 && is_table(cur.line - 1) {
+        let prev = cur.line - 1;
+        let text = model.line(prev).map(str::to_string).unwrap_or_default();
+        let span = table_cell_contents(&text).last().copied().unwrap_or((0, 0));
+        model.move_to(prev, span.0, false);
+        return true;
+    }
+    model.move_to(cur.line, 0, false);
+    true
+}
+
+/// Insert an empty table row below the cursor row and land in its first
+/// cell (Typora Enter). When the next line is the delimiter row, the new
+/// row goes below it so header + delimiter stay glued.
+pub fn table_insert_row_below(model: &mut EditorModel) -> bool {
+    let cur = model.cursor();
+    let Some(line_text) = model.line(cur.line).map(str::to_string) else {
+        return false;
+    };
+    let cols = table_cell_bounds(&line_text).len();
+    if cols == 0 {
+        return false;
+    }
+    let mut target = cur.line;
+    if let Some(next) = model.line(cur.line + 1).map(str::to_string)
+        && table_delimiter_cols(&next) == Some(cols)
+    {
+        target = cur.line + 1;
+    }
+    model.move_to(target, usize::MAX, false);
+    model.newline();
+    model.insert(&format!("|{}", "  |".repeat(cols)));
+    let fresh = model.line(target + 1).map(str::to_string).unwrap_or_default();
+    let (cs, _) = table_cell_contents(&fresh).first().copied().unwrap_or((0, 0));
+    model.move_to(target + 1, cs, false);
+    true
+}
+
 pub fn line_selection(
     start: Pos,
     end: Pos,
@@ -415,6 +557,49 @@ mod tests {
         assert_eq!(m.text(), "    - item");
         on_tab(&mut m, "    - item", true, 4);
         assert_eq!(m.text(), "- item");
+    }
+
+    #[test]
+    fn table_cells_split_on_pipes() {
+        assert_eq!(table_cell_bounds("| a | b |"), vec![(1, 4), (5, 8)]);
+        assert_eq!(table_cell_bounds("a | b"), vec![(0, 2), (3, 5)]);
+        // `\\|` is not a boundary; code spans shield pipes.
+        assert_eq!(table_cell_bounds("| a\\|b | c |").len(), 2);
+        assert_eq!(table_cell_bounds("| `a|b` | c |").len(), 2);
+    }
+
+    #[test]
+    fn table_nav_moves_across_cells_and_rows() {
+        let mut m = EditorModel::new("| a | b |\n| 1 | 2 |");
+        let is_table = |l: usize| l < 2;
+        m.move_to(0, 0, false);
+        assert!(table_nav(&mut m, true, &is_table));
+        assert_eq!(m.cursor(), Pos::new(0, 2));
+        assert!(table_nav(&mut m, true, &is_table));
+        assert_eq!(m.cursor(), Pos::new(0, 6));
+        assert!(table_nav(&mut m, true, &is_table));
+        assert_eq!(m.cursor(), Pos::new(1, 2));
+        assert!(table_nav(&mut m, false, &is_table));
+        assert_eq!(m.cursor(), Pos::new(0, 6));
+    }
+
+    #[test]
+    fn table_nav_appends_row_past_the_end() {
+        let mut m = EditorModel::new("| a |\n| 1 |");
+        let is_table = |l: usize| l < 2;
+        m.move_to(1, 2, false);
+        assert!(table_nav(&mut m, true, &is_table));
+        assert_eq!(m.text(), "| a |\n| 1 |\n|  |");
+        assert_eq!(m.cursor(), Pos::new(2, 3));
+    }
+
+    #[test]
+    fn table_insert_row_below_keeps_delimiter_glued() {
+        let mut m = EditorModel::new("| a | b |\n|---|---|");
+        m.move_to(0, 3, false);
+        assert!(table_insert_row_below(&mut m));
+        assert_eq!(m.text(), "| a | b |\n|---|---|\n|  |  |");
+        assert_eq!(m.cursor(), Pos::new(2, 3));
     }
 
     #[test]

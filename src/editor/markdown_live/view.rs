@@ -28,7 +28,7 @@ use crate::editor::markdown_live::element::{
 use crate::editor::markdown_live::highlight::HighlightCache;
 use crate::editor::markdown_live::interactions::{
     backspace_marker, classify_alone, insert_link, line_selection, list_cols, on_enter, on_tab,
-    word_stats,
+    table_insert_row_below, table_nav, word_stats,
     toggle_task, toggle_wrap, OrderedCounter,
 };
 use crate::editor::markdown_live::layout::{
@@ -863,16 +863,23 @@ impl LiveMarkdownView {
                 }
                 let cur = self.buffer.cursor();
                 let text = self.buffer.line(cur.line).map(str::to_string).unwrap_or_default();
-                let in_code = self
+                let planned_block = self
                     .planned
                     .iter()
                     .find(|r| r.line == cur.line)
-                    .is_some_and(|r| {
-                        matches!(
-                            r.block,
-                            Block::CodeLine | Block::Fence { .. } | Block::FrontMatter
-                        )
-                    });
+                    .map(|r| r.block.clone());
+                // Typora Enter inside a table: empty row below (no selection).
+                if self.buffer.selection().is_none()
+                    && matches!(planned_block, Some(Block::Table))
+                    && self.edit(cx, table_insert_row_below)
+                {
+                    self.after_edit(cx);
+                    return;
+                }
+                let in_code = matches!(
+                    planned_block,
+                    Some(Block::CodeLine | Block::Fence { .. } | Block::FrontMatter)
+                );
                 self.edit(cx, |m| {
                     on_enter(m, &text, in_code);
                 });
@@ -886,10 +893,31 @@ impl LiveMarkdownView {
                 let cur = self.buffer.cursor();
                 let text = self.buffer.line(cur.line).map(str::to_string).unwrap_or_default();
                 let tab_size = self.tab_size;
-                // Tables keep literal tabs (cell navigation is a later step).
+                // Typora Tab inside a table: grid navigation (no selection).
+                if self.buffer.selection().is_none()
+                    && self
+                        .planned
+                        .iter()
+                        .find(|r| r.line == cur.line)
+                        .is_some_and(|r| matches!(r.block, Block::Table))
+                {
+                    let grid: HashSet<usize> = self
+                        .planned
+                        .iter()
+                        .filter(|r| matches!(r.block, Block::Table))
+                        .map(|r| r.line)
+                        .collect();
+                    let forward = !shift;
+                    self.edit(cx, |m| {
+                        table_nav(m, forward, &|l| grid.contains(&l));
+                    });
+                    self.after_edit(cx);
+                    return;
+                }
+                // Code/fence/frontmatter keep literal tabs.
                 if !matches!(
                     classify_alone(&text),
-                    Block::Table | Block::CodeLine | Block::Fence { .. } | Block::FrontMatter
+                    Block::CodeLine | Block::Fence { .. } | Block::FrontMatter
                 ) {
                     self.edit(cx, |m| on_tab(m, &text, shift, tab_size));
                     self.after_edit(cx);
