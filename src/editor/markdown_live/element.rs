@@ -34,6 +34,8 @@ pub struct LiveColors {
     pub accent: Hsla,
     pub caret: Hsla,
     pub selection: Hsla,
+    pub find_bg: Hsla,
+    pub find_current: Hsla,
     pub code_bg: Hsla,
     pub highlight_bg: Hsla,
     pub rule: Hsla,
@@ -63,6 +65,8 @@ impl LiveColors {
             accent: ui.accent,
             caret: ui.accent,
             selection,
+            find_bg: ui.warning.opacity(if is_dark { 0.35 } else { 0.28 }),
+            find_current: ui.accent.opacity(if is_dark { 0.50 } else { 0.40 }),
             code_bg: theme.editor_background(),
             highlight_bg: ui.warning.opacity(if is_dark { 0.30 } else { 0.22 }),
             rule: style.rule_color,
@@ -263,6 +267,75 @@ pub fn inline_cell_runs(
         runs.push(base.to_run(text.len()));
     }
     runs
+}
+
+/// Overlay find-match ranges (visible bytes) onto runs: each mark is
+/// `(start, end, current)`; the current match gets `current_bg`, the rest
+/// `bg`. Single pass over sorted cut points (same template walk as
+/// [`apply_selection`]).
+pub fn apply_find_marks(
+    runs: Vec<TextRun>,
+    visible_len: usize,
+    marks: &[(usize, usize, bool)],
+    bg: Hsla,
+    current_bg: Hsla,
+) -> Vec<TextRun> {
+    let mut cuts = vec![0, visible_len];
+    for (s, e, _) in marks.iter().copied() {
+        let (s, e) = (s.min(visible_len), e.min(visible_len));
+        if s < e {
+            cuts.push(s);
+            cuts.push(e);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.len() <= 2 || runs.is_empty() {
+        return runs;
+    }
+    let mut result: Vec<TextRun> = Vec::new();
+    let mut templates = runs.into_iter();
+    let mut tpl = templates.next();
+    let mut t_left = tpl.as_ref().map(|r| r.len).unwrap_or(0);
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let mark_bg = marks
+            .iter()
+            .find(|(s, e, _)| a >= *s && b <= *e)
+            .map(|(_, _, current)| if *current { current_bg } else { bg });
+        let mut rest = b - a;
+        while rest > 0 {
+            let tpl_ref = tpl.as_ref().expect("runs must cover visible");
+            let take = rest.min(t_left);
+            let mut run = tpl_ref.clone();
+            run.len = take;
+            if let Some(color) = mark_bg {
+                run.background_color = Some(color);
+            }
+            match result.last_mut() {
+                Some(last)
+                    if last.background_color == run.background_color
+                        && last.color == run.color
+                        && last.font == run.font
+                        && last.underline == run.underline
+                        && last.strikethrough == run.strikethrough =>
+                {
+                    last.len += take;
+                }
+                _ => result.push(run),
+            }
+            rest -= take;
+            t_left -= take;
+            if t_left == 0 {
+                tpl = templates.next();
+                t_left = tpl.as_ref().map(|r| r.len).unwrap_or(0);
+            }
+        }
+    }
+    result
 }
 
 /// Overlay a visible-byte selection range onto runs (splits runs, tints the
@@ -637,5 +710,27 @@ mod tests {
         // Empty range → untouched.
         let runs = vec![mk(4)];
         assert_eq!(apply_selection(runs, 4, Some((2, 2)), sel).len(), 1);
+    }
+
+    #[test]
+    fn find_marks_tint_current_differently() {
+        let mk = |len: usize| TextRun {
+            len,
+            ..Default::default()
+        };
+        let bg = Hsla::default();
+        let current_bg = Hsla {
+            l: 0.5,
+            ..Default::default()
+        };
+        let out = apply_find_marks(vec![mk(10)], 10, &[(2, 4, false), (6, 8, true)], bg, current_bg);
+        let total: usize = out.iter().map(|r| r.len).sum();
+        assert_eq!(total, 10);
+        let colored: Vec<_> = out.iter().filter(|r| r.background_color.is_some()).collect();
+        assert_eq!(colored.len(), 2);
+        assert_eq!(colored[0].background_color, Some(bg));
+        assert_eq!(colored[1].background_color, Some(current_bg));
+        // Empty marks → untouched.
+        assert_eq!(apply_find_marks(vec![mk(4)], 4, &[], bg, current_bg).len(), 1);
     }
 }

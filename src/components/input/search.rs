@@ -254,6 +254,36 @@ impl SearchMatcher {
         self.matched_ranges.len()
     }
 
+    /// Byte ranges of the current matches, in document order.
+    ///
+    /// Live-markdown find parity: the live editor matches its own text
+    /// through a Rope snapshot and maps ranges back to source lines.
+    pub fn match_ranges(&self) -> &[Range<usize>] {
+        &self.matched_ranges
+    }
+
+    /// Number of current matches.
+    pub fn match_count(&self) -> usize {
+        self.matched_ranges.len()
+    }
+
+    /// Index of the current match.
+    pub fn current_ix(&self) -> usize {
+        self.current_match_ix
+    }
+
+    /// Move the current-match index (clamped, no-op when empty).
+    pub fn set_current_ix(&mut self, ix: usize) {
+        if !self.matched_ranges.is_empty() {
+            self.current_match_ix = ix.min(self.matched_ranges.len() - 1);
+        }
+    }
+
+    /// True when a non-empty query produced no matcher (invalid regex).
+    pub fn query_failed(&self, query: &str) -> bool {
+        !query.is_empty() && self.query.is_none()
+    }
+
     fn peek(&self) -> Option<Range<usize>> {
         let next_match_ix = self.next_ix()?;
         self.matched_ranges.get(next_match_ix).cloned()

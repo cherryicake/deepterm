@@ -453,6 +453,36 @@ impl EditorModel {
 
   // ---- history ----
 
+  /// Replace `start..end` with `text` as ONE undo step (find/replace
+  /// parity with the code editor's silent replace). Cursor lands after
+  /// the inserted text.
+  pub fn replace_range(&mut self, start: Pos, end: Pos, text: &str) {
+    self.replace_ranges(&[(start, end)], text);
+  }
+
+  /// Replace every range with `text` as ONE undo step. Ranges must be
+  /// non-overlapping; applied back-to-front so earlier offsets stay valid.
+  /// The cursor lands after the first replacement.
+  pub fn replace_ranges(&mut self, ranges: &[(Pos, Pos)], text: &str) {
+    if ranges.is_empty() {
+      return;
+    }
+    let text = text.replace('\r', "");
+    let mut order: Vec<(Pos, Pos)> = ranges
+      .iter()
+      .map(|(s, e)| if e < s { (*e, *s) } else { (*s, *e) })
+      .collect();
+    order.sort_by(|a, b| b.0.cmp(&a.0));
+    self.push_undo(false);
+    self.anchor = None;
+    for (s, e) in order {
+      self.remove_range(s, e);
+      self.cursor = s;
+      self.insert_at_cursor(&text);
+    }
+    self.goal_col = None;
+  }
+
   pub fn can_undo(&self) -> bool {
     !self.undo.is_empty()
   }
@@ -1162,6 +1192,23 @@ mod tests {
     m.move_down(false);
     assert_eq!(m.cursor(), at(1, 3));
     assert_eq!(m.pos_for_click(0, 99), at(0, 3));
+  }
+
+  #[test]
+  fn replace_ranges_single_undo_step() {
+    let mut m = EditorModel::new("foo bar foo");
+    m.replace_ranges(&[(at(0, 0), at(0, 3)), (at(0, 8), at(0, 11))], "baz");
+    assert_eq!(m.text(), "baz bar baz");
+    assert!(m.can_undo());
+    assert!(m.undo());
+    assert_eq!(m.text(), "foo bar foo");
+  }
+
+  #[test]
+  fn replace_range_normalizes_reversed() {
+    let mut m = EditorModel::new("hello");
+    m.replace_range(at(0, 5), at(0, 0), "hi");
+    assert_eq!(m.text(), "hi");
   }
 
   #[test]
