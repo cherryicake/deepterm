@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rems, svg, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseDownEvent, MouseButton,
-    ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, TextRun, Window,
+    App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, Subscription, TextRun, Window, div, px, rems, svg,
 };
 
 use crate::assets::Icon;
@@ -36,6 +36,10 @@ use crate::editor::markdown_live::layout::{
 use crate::editor::markdown_live::model::Pos;
 use crate::editor::markdown_live::reveal::{
     plan_document, strip_plan_prefix, CalloutKind, PlannedRow, Reveal,
+};
+use crate::components::input::{
+    blink_cursor::{BlinkCursor, CURSOR_WIDTH},
+    cursor::CursorShape,
 };
 use crate::theme::ActiveTheme;
 
@@ -73,6 +77,11 @@ pub struct LiveMarkdownView {
     /// Fingerprint of the style inputs that bake colors into the highlight
     /// cache; a change (theme switch) clears it.
     hl_style_key: u64,
+    blink: Entity<BlinkCursor>,
+    cursor_shape: CursorShape,
+    cursor_blink: bool,
+    blink_on: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<LiveViewEvent> for LiveMarkdownView {}
@@ -83,7 +92,8 @@ impl LiveMarkdownView {
     }
 
     pub fn with_text(text: &str, cx: &mut Context<Self>) -> Self {
-        let _ = cx;
+        let blink = cx.new(|_| BlinkCursor::new());
+        let _subscriptions = vec![cx.observe(&blink, |_, _, cx| cx.notify())];
         Self {
             buffer: LiveBuffer::new(text),
             focus: cx.focus_handle(),
@@ -102,6 +112,11 @@ impl LiveMarkdownView {
             row_targets: Vec::new(),
             row_layouts: std::collections::HashMap::new(),
             hl_style_key: 0,
+            blink,
+            cursor_shape: CursorShape::Bar,
+            cursor_blink: true,
+            blink_on: false,
+            _subscriptions,
         }
     }
 
@@ -126,6 +141,7 @@ impl LiveMarkdownView {
 
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.buffer.set_text(text);
+        self.pause_caret(cx);
         self.hl.clear();
         self.copied_code_blocks.clear();
         self.scroll_to_cursor = true;
@@ -147,6 +163,89 @@ impl LiveMarkdownView {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
+    }
+
+    pub fn set_cursor_shape(&mut self, shape: CursorShape, cx: &mut Context<Self>) {
+        if self.cursor_shape != shape {
+            self.cursor_shape = shape;
+            self.blink.update(cx, |b, cx| b.show_cursor(cx));
+            cx.notify();
+        }
+    }
+
+    pub fn set_cursor_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        if self.cursor_blink != blink {
+            self.cursor_blink = blink;
+            self.blink.update(cx, |b, cx| b.set_blink_enabled(blink, cx));
+            cx.notify();
+        }
+    }
+
+    fn pause_caret(&mut self, cx: &mut Context<Self>) {
+        if self.blink_on {
+            self.blink.update(cx, |b, cx| b.pause_blinking(cx));
+        }
+    }
+
+    fn show_caret(&self, window: &Window, cx: &App) -> bool {
+        !self.read_only
+            && self.focus.is_focused(window)
+            && window.is_window_active()
+            && self.blink.read(cx).visible()
+    }
+
+    fn caret_block_for(
+        shape: CursorShape,
+        ch: Option<char>,
+        base: &gpui::TextStyle,
+        font_size: Pixels,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Pixels, Option<ShapedLine>) {
+        if !matches!(
+            shape,
+            CursorShape::Block | CursorShape::Hollow | CursorShape::Underline
+        ) {
+            return (CURSOR_WIDTH, None);
+        }
+        let fallback = (line_height * 0.6).max(CURSOR_WIDTH);
+        let Some(ch) = ch else {
+            return (fallback, None);
+        };
+        if ch == '\n' || ch == '\r' {
+            return (fallback, None);
+        }
+        let editor_bg = cx.theme().editor_background();
+        let text_color = if editor_bg.a < 0.75 {
+            if cx.theme().appearance.is_dark() {
+                gpui::black()
+            } else {
+                gpui::white()
+            }
+        } else {
+            editor_bg
+        };
+        let s: SharedString = ch.to_string().into();
+        let shaped = window.text_system().shape_line(
+            s.clone(),
+            font_size,
+            &[TextRun {
+                len: s.len(),
+                font: base.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        let width = if ch.is_ascii_whitespace() {
+            fallback
+        } else {
+            fallback.max(shaped.width)
+        };
+        (width, Some(shaped))
     }
 
     /// Current vertical scroll offset (0 at top, negative when scrolled
@@ -171,6 +270,7 @@ impl LiveMarkdownView {
     pub fn edit<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> R) -> R {
         let before = self.buffer.text();
         self.scroll_to_cursor = true;
+        self.pause_caret(cx);
         let out = self.buffer.edit(f);
         if self.buffer.text() != before {
             cx.emit(LiveViewEvent::Change(self.buffer.text()));
@@ -1053,6 +1153,8 @@ struct RowPaint {
     /// Caret height matching this row's real line height (C4: was
     /// hardcoded per kind and drifted from the rendered metrics).
     caret_h: Pixels,
+    caret_block_width: Pixels,
+    caret_block_text: Option<ShapedLine>,
 }
 
 /// A source line's last-frame text layout, recorded by `LiveLine::paint`.
@@ -1103,6 +1205,20 @@ impl Render for LiveMarkdownView {
             self.hl.clear();
         }
 
+        // Blink management (Zed BlinkManager parity): enable on focus+active,
+        // disable otherwise. `enable` is idempotent; `disable` is guarded by
+        // `blink_on` so unfocused frames don't notify-loop.
+        let window_active = window.is_window_active();
+        let want_blink = focused && window_active && !self.read_only;
+        if want_blink && !self.blink_on {
+            self.blink.update(cx, |b, cx| b.enable(cx));
+            self.blink_on = true;
+        } else if !want_blink && self.blink_on {
+            self.blink.update(cx, |b, cx| b.disable(cx));
+            self.blink_on = false;
+        }
+        let show_caret = self.show_caret(window, cx);
+
         // Fresh per-frame hit geometry (LiveLine::paint repopulates).
         self.row_layouts.clear();
         self.row_targets.clear();
@@ -1111,7 +1227,6 @@ impl Render for LiveMarkdownView {
         let rows: Vec<PlannedRow> = self.planned_rows(focused).to_vec();
         let last_line = rows.len().saturating_sub(1);
         let entity = cx.entity();
-        let show_caret = focused && !self.read_only;
 
         // ---- per-row paint (runs + selection + caret) --------------------
         // (`row.plan` already carries callout tag-stripping from
@@ -1184,7 +1299,7 @@ impl Render for LiveMarkdownView {
                 ))
             });
             runs = apply_selection(runs, plan.visible.len(), vsel, colors.selection);
-            let caret_vis = if show_caret && cursor.line == row.line && selection.is_none() {
+            let caret_vis = if show_caret && cursor.line == row.line {
                 let src_line = self.buffer.line(row.line).unwrap_or("");
                 Some(vis_for_src(
                     &plan.segs,
@@ -1201,11 +1316,28 @@ impl Render for LiveMarkdownView {
                 base.line_height
                     .to_pixels(font_size.into(), window.rem_size()),
             );
+            let (caret_block_width, caret_block_text) = if caret_vis.is_some() {
+                let src_line = self.buffer.line(row.line).unwrap_or("");
+                let ch = src_line.chars().nth(cursor.col);
+                Self::caret_block_for(
+                    self.cursor_shape,
+                    ch,
+                    &base,
+                    font_size,
+                    caret_h,
+                    window,
+                    cx,
+                )
+            } else {
+                (CURSOR_WIDTH, None)
+            };
             // Stash paint for the grouping pass below.
             paints.push(RowPaint {
                 runs,
                 caret_vis,
                 caret_h,
+                caret_block_width,
+                caret_block_text,
             });
         }
         // ---- grouping ------------------------------------------------------
@@ -1294,6 +1426,7 @@ impl Render for LiveMarkdownView {
         // the flag so call sites stay unchanged.
         let mut first_row_el = true;
         // `render_line` needs lots of context: build rows inline via closure.
+        let cursor_shape = self.cursor_shape;
         let mut live_line = |pi: usize,
                              paints: &[RowPaint],
                              entity: &Entity<Self>,
@@ -1312,10 +1445,12 @@ impl Render for LiveMarkdownView {
                 matches!(rows[pi].plan.kind, RowKind::Task { .. }),
                 paint.caret_vis,
                 colors.caret,
-                px(2.),
+                CURSOR_WIDTH,
                 paint.caret_h,
             )
             .with_drag_fallback(drag_fallback)
+            .with_caret_shape(cursor_shape)
+            .with_caret_block(paint.caret_block_width, paint.caret_block_text.clone())
         };
 
         for group in &groups {
@@ -2075,18 +2210,21 @@ impl Render for LiveMarkdownView {
                 row_els.push(
                     div()
                         .flex_1()
-                        .child(LiveLine::new(
-                            ("live-line", 0usize),
-                            SharedString::from(""),
-                            vec![],
-                            0,
-                            ent,
-                            false,
-                            show_caret.then_some(0),
-                            colors.caret,
-                            px(2.),
-                            px(26.),
-                        ))
+                        .child(
+                            LiveLine::new(
+                                ("live-line", 0usize),
+                                SharedString::from(""),
+                                vec![],
+                                0,
+                                ent,
+                                false,
+                                show_caret.then_some(0),
+                                colors.caret,
+                                CURSOR_WIDTH,
+                                px(26.),
+                            )
+                            .with_caret_shape(self.cursor_shape),
+                        )
                         .into_any_element(),
                 );
             }

@@ -11,8 +11,12 @@ use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
-    components::button::Size as ButtonSize,
-    components::input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
+    components::input::{
+        RopeExt as _,
+        blink_cursor::CURSOR_WIDTH,
+        cursor::{CursorLayout, CursorShape},
+        display_map::LineLayout,
+    },
     theme::ActiveTheme as _,
 };
 
@@ -315,9 +319,9 @@ impl TextElement {
         last_layout: &LastLayout,
         fold_placeholders: &[FoldPlaceholder],
         bounds: &mut Bounds<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
-    ) -> (Option<Bounds<Pixels>>, Point<Pixels>, Option<usize>) {
+    ) -> (Option<CursorLayout>, Point<Pixels>, Option<usize>) {
         let state = self.state.read(cx);
 
         let line_height = last_layout.line_height;
@@ -532,36 +536,120 @@ impl TextElement {
                 }
             }
 
-            // cursor bounds
-            let cursor_height = match state.size {
-                ButtonSize::Large => 1.,
-                ButtonSize::Small => 0.75,
-                _ => 0.85,
-            } * line_height;
-
-            cursor_bounds = Some(Bounds::new(
-                point(
-                    bounds.left() + cursor_pos.x + line_number_width + scroll_offset.x,
-                    bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
-                ),
-                size(CURSOR_WIDTH, cursor_height),
+            let shape = state.effective_cursor_shape();
+            let masked = state.masked;
+            let font_size_opt = state.font_size;
+            let cursor_char: Option<char> = if masked {
+                Some(MASK_CHAR)
+            } else if cursor < state.text.len() {
+                state.text.char_at(cursor)
+            } else {
+                None
+            };
+            let deferred = state.deferred_scroll_offset;
+            let mapped_row =
+                current_row.map(|row| state.display_map.fold_header_for_row(row).unwrap_or(row));
+            if let Some(deferred_offset) = deferred {
+                scroll_offset = deferred_offset;
+            }
+            current_row = mapped_row;
+            let cursor_origin = point(
+                bounds.left() + cursor_pos.x + line_number_width + scroll_offset.x,
+                bounds.top() + cursor_pos.y,
+            );
+            // `state` borrow ends here (NLL); block shaping uses `window`/`cx` mutably.
+            let (block_width, block_text) = Self::cursor_block_layout_static(
+                shape,
+                cursor_char,
+                font_size_opt,
+                line_height,
+                window,
+                cx,
+            );
+            let cursor_color = cx.theme().accent;
+            cursor_bounds = Some(CursorLayout::new(
+                cursor_origin,
+                block_width,
+                line_height,
+                cursor_color,
+                shape,
+                block_text,
             ));
+        } else {
+            if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
+                scroll_offset = deferred_scroll_offset;
+            }
+            // zed tracks the "active row" in display space: when the cursor sits
+            // on a row hidden by a fold (e.g. at the fold end, on the closing
+            // bracket row), the fold's header row is the active one — it receives
+            // the active-line highlight and shows the fold disclosure icon.
+            current_row =
+                current_row.map(|row| state.display_map.fold_header_for_row(row).unwrap_or(row));
         }
 
-        if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
-            scroll_offset = deferred_scroll_offset;
-        }
-
-        // zed tracks the "active row" in display space: when the cursor sits
-        // on a row hidden by a fold (e.g. at the fold end, on the closing
-        // bracket row), the fold's header row is the active one — it receives
-        // the active-line highlight and shows the fold disclosure icon.
-        let current_row =
-            current_row.map(|row| state.display_map.fold_header_for_row(row).unwrap_or(row));
+        // Non-cursor path already handled fold mapping above; cursor path did it
+        // before shaping to end the `state` borrow (see NLL comment).
 
         bounds.origin += scroll_offset;
 
         (cursor_bounds, scroll_offset, current_row)
+    }
+
+    fn cursor_block_layout_static(
+        shape: CursorShape,
+        cursor_char: Option<char>,
+        font_size_opt: Option<Pixels>,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Pixels, Option<ShapedLine>) {
+        if !matches!(
+            shape,
+            CursorShape::Block | CursorShape::Hollow | CursorShape::Underline
+        ) {
+            return (CURSOR_WIDTH, None);
+        }
+        let fallback = (line_height * 0.6).max(CURSOR_WIDTH);
+        let Some(ch) = cursor_char else {
+            return (fallback, None);
+        };
+        if ch == '\n' || ch == '\r' {
+            return (fallback, None);
+        }
+        let style = window.text_style();
+        let font_size =
+            font_size_opt.unwrap_or_else(|| style.font_size.to_pixels(window.rem_size()));
+        let editor_bg = cx.theme().editor_background();
+        let text_color = if editor_bg.a < 0.75 {
+            if cx.theme().appearance.is_dark() {
+                gpui::black()
+            } else {
+                gpui::white()
+            }
+        } else {
+            editor_bg
+        };
+        let s: SharedString = ch.to_string().into();
+        let shaped = window.text_system().shape_line(
+            s.clone(),
+            font_size,
+            &[TextRun {
+                len: s.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        let is_whitespace = ch.is_ascii_whitespace();
+        let width = if is_whitespace {
+            fallback
+        } else {
+            fallback.max(shaped.width)
+        };
+        (width, Some(shaped))
     }
 
     /// Layout the match range to a Path.
@@ -2029,7 +2117,7 @@ pub(crate) struct PrepaintState {
     line_numbers: Option<Vec<SmallVec<[ShapedLine; 1]>>>,
     /// Size of the scrollable area by entire lines.
     scroll_size: Size<Pixels>,
-    cursor_bounds: Option<Bounds<Pixels>>,
+    cursor_bounds: Option<CursorLayout>,
     cursor_scroll_offset: Point<Pixels>,
     /// row index (zero based), no wrap, same line as the cursor.
     current_row: Option<usize>,
@@ -2051,11 +2139,11 @@ pub(crate) struct PrepaintState {
 }
 
 impl PrepaintState {
-    /// Returns cursor bounds adjusted for scroll offset, if available.
-    fn cursor_bounds_with_scroll(&self) -> Option<Bounds<Pixels>> {
-        self.cursor_bounds.map(|mut bounds| {
-            bounds.origin.y += self.cursor_scroll_offset.y;
-            bounds
+    /// Returns cursor layout adjusted for scroll offset, if available.
+    fn cursor_bounds_with_scroll(&self) -> Option<CursorLayout> {
+        self.cursor_bounds.clone().map(|mut layout| {
+            layout.shift_y(self.cursor_scroll_offset.y);
+            layout
         })
     }
 }
@@ -2406,7 +2494,7 @@ impl Element for TextElement {
 
         let (cursor_bounds, cursor_scroll_offset, current_row) =
             self.layout_cursor(&last_layout, &fold_placeholders, &mut bounds, window, cx);
-        last_layout.cursor_bounds = cursor_bounds;
+        last_layout.cursor_bounds = cursor_bounds.clone().map(|layout| layout.bounding_rect());
 
         // Pills are positioned where the header lines are painted, so this
         // must run after the cursor layout has scrolled `bounds`.
@@ -3051,10 +3139,10 @@ impl Element for TextElement {
             }
         }
 
-        // Paint blinking cursor
+        // Paint blinking cursor (Zed `CursorLayout::paint` + VSCode cursorStyle).
         if focused && show_cursor {
-            if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
-                window.paint_quad(fill(cursor_bounds, cx.theme().accent));
+            if let Some(mut cursor_layout) = prepaint.cursor_bounds_with_scroll() {
+                cursor_layout.paint(window, cx);
             }
         }
 

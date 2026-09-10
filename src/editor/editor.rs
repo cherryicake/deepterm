@@ -297,6 +297,12 @@ impl Editor {
     /// Markdown 实时预览编辑 tab 的 id 后缀：同屏所见即所得，直接编辑渲染后的文档。
     const MARKDOWN_LIVE_SUFFIX: &str = "#live";
 
+    /// md 文档默认走实时渲染：与 `open_file_with_content` 的 live 门控保持一致（仅 `.md`）。
+    /// 显式指定的 `edit_mode` 不会被劫持；`live_mode` 已为 true 时直接透传。
+    fn default_live_mode(path: &std::path::Path, edit_mode: bool, live_mode: bool) -> bool {
+        live_mode || (!edit_mode && path.extension().and_then(|e| e.to_str()) == Some("md"))
+    }
+
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tab_bar = TabBar::new("editor-tab-bar", cx);
         tab_bar.update(cx, |bar, cx| {
@@ -1548,7 +1554,12 @@ impl Editor {
         col: Option<u32>,
     ) {
         let path_str = path.to_string_lossy().to_string();
-        let tab_id = format!("editor-{}", path_str);
+        let live_mode = Self::default_live_mode(&path, false, false);
+        let tab_id = if live_mode {
+            format!("editor-{}{}", path_str, Self::MARKDOWN_LIVE_SUFFIX)
+        } else {
+            format!("editor-{}", path_str)
+        };
         // Already open (or loading): switch + jump (or defer via pending).
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
@@ -1584,6 +1595,7 @@ impl Editor {
         edit_mode: bool,
         live_mode: bool,
     ) {
+        let live_mode = Self::default_live_mode(&path, edit_mode, live_mode);
         let path_str = path.to_string_lossy().to_string();
         let tab_id = if live_mode {
             format!("editor-{}{}", path_str, Self::MARKDOWN_LIVE_SUFFIX)
@@ -1818,7 +1830,13 @@ impl Editor {
         line: Option<u32>,
         col: Option<u32>,
     ) {
-        let tab_id = format!("editor-remote-{}", path);
+        let live_mode =
+            Self::default_live_mode(std::path::Path::new(&path), false, false);
+        let tab_id = if live_mode {
+            format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
+        } else {
+            format!("editor-remote-{}", path)
+        };
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
             if let Some(line) = line {
@@ -1892,6 +1910,8 @@ impl Editor {
         edit_mode: bool,
         live_mode: bool,
     ) {
+        let live_mode =
+            Self::default_live_mode(std::path::Path::new(&path), edit_mode, live_mode);
         let tab_id = if live_mode {
             format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
         } else if edit_mode {

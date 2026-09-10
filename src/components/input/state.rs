@@ -30,7 +30,9 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
-use super::{Crease, DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, mode::InputMode};
+use super::{
+    Crease, DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, cursor::CursorShape, mode::InputMode,
+};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -534,6 +536,8 @@ pub struct InputState {
     pub(crate) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
+    pub(crate) cursor_shape: CursorShape,
+    pub(crate) cursor_blink: bool,
     pub(crate) pattern: Option<regex::Regex>,
     pub(crate) validate: Option<ValidateFn>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -682,6 +686,8 @@ impl InputState {
             _subscriptions,
             _pending_update: false,
             cursor_line_end_affinity: false,
+            cursor_shape: CursorShape::default(),
+            cursor_blink: true,
             diff_line_colors: std::collections::HashMap::new(),
             diff_range_colors: Vec::new(),
             diff_line_labels: None,
@@ -3760,6 +3766,37 @@ impl InputState {
             && !self.disabled
             && self.blink_cursor.read(cx).visible()
             && window.is_window_active()
+    }
+
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.effective_cursor_shape()
+    }
+
+    pub(crate) fn effective_cursor_shape(&self) -> CursorShape {
+        if self.masked || self.ime_marked_range.is_some() {
+            return CursorShape::Bar;
+        }
+        self.cursor_shape
+    }
+
+    pub fn set_cursor_shape(&mut self, shape: CursorShape, cx: &mut Context<Self>) {
+        if self.cursor_shape != shape {
+            self.cursor_shape = shape;
+            self.blink_cursor.update(cx, |cursor, cx| {
+                cursor.show_cursor(cx);
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn set_cursor_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        if self.cursor_blink != blink {
+            self.cursor_blink = blink;
+            self.blink_cursor.update(cx, |cursor, cx| {
+                cursor.set_blink_enabled(blink, cx);
+            });
+            cx.notify();
+        }
     }
 
     fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {

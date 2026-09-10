@@ -9,9 +9,11 @@ use gpui::prelude::*;
 use gpui::{
     App, Bounds, DispatchPhase, Element, ElementId, Entity, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, SharedString, StyledText, TextRun, TextStyle,
+    MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, StyledText, TextRun, TextStyle,
     TextStyleRefinement, Window,
 };
+
+use crate::components::input::cursor::{CursorLayout, CursorShape};
 
 use crate::editor::markdown::MarkdownStyle;
 use crate::editor::markdown_live::highlight::HighlightCache;
@@ -354,6 +356,9 @@ pub struct LiveLine {
     pub caret_vis: Option<usize>,
     pub caret_color: Hsla,
     pub caret_width: Pixels,
+    pub caret_shape: CursorShape,
+    pub caret_block_width: Pixels,
+    pub caret_block_text: Option<ShapedLine>,
     pub line_height: Pixels,
     /// Set on the first rendered row only: its drag handler also covers
     /// positions outside every row's band (blank rows, margins), extending
@@ -376,6 +381,9 @@ impl LiveLine {
         line_height: Pixels,
     ) -> Self {
         Self {
+            caret_shape: CursorShape::Bar,
+            caret_block_width: caret_width,
+            caret_block_text: None,
             id: id.into(),
             text,
             runs,
@@ -393,6 +401,21 @@ impl LiveLine {
     /// Enable the dead-zone drag fallback for this row (see field docs).
     pub fn with_drag_fallback(mut self, on: bool) -> Self {
         self.drag_fallback = on;
+        self
+    }
+
+    pub fn with_caret_shape(mut self, shape: CursorShape) -> Self {
+        self.caret_shape = shape;
+        self
+    }
+
+    pub fn with_caret_block(
+        mut self,
+        block_width: Pixels,
+        block_text: Option<ShapedLine>,
+    ) -> Self {
+        self.caret_block_width = block_width;
+        self.caret_block_text = block_text;
         self
     }
 }
@@ -472,10 +495,20 @@ impl Element for LiveLine {
                 // Empty text has no glyphs to resolve: caret sits at origin.
                 .or_else(|| (text_len == 0).then_some(bounds.origin));
             if let Some(pos) = pos {
-                window.paint_quad(gpui::fill(
-                    Bounds::new(pos, gpui::size(self.caret_width, self.line_height)),
+                let block_width = if matches!(self.caret_shape, CursorShape::Bar) {
+                    self.caret_width
+                } else {
+                    self.caret_block_width.max(self.caret_width)
+                };
+                let mut caret = CursorLayout::new(
+                    pos,
+                    block_width,
+                    self.line_height,
                     self.caret_color,
-                ));
+                    self.caret_shape,
+                    self.caret_block_text.clone(),
+                );
+                caret.paint(window, cx);
             }
         }
 
