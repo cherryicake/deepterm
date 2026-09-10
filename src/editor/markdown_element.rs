@@ -543,6 +543,37 @@ impl MarkdownElementBuilder {
                         ..Default::default()
                     });
                 }
+                // 定义列表术语：加粗段落；释义见 DefItem。
+                MarkdownTag::DefTerm => {
+                    self.push_div(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .my_3()
+                            .line_height(rems(1.75)),
+                        &range,
+                        markdown_end,
+                    );
+                    self.push_text_style(TextStyleRefinement {
+                        font_weight: Some(gpui::FontWeight::BOLD),
+                        ..Default::default()
+                    });
+                }
+                // 定义列表释义：首行缩进的普通段落。
+                MarkdownTag::DefItem => {
+                    self.push_div(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .my_3()
+                            .ml_6()
+                            .line_height(rems(1.75)),
+                        &range,
+                        markdown_end,
+                    );
+                }
                 MarkdownTag::Strikethrough => {
                     self.push_text_style(TextStyleRefinement {
                         strikethrough: Some(gpui::StrikethroughStyle {
@@ -709,6 +740,13 @@ impl MarkdownElementBuilder {
                 | MarkdownTagEnd::Sub => {
                     self.pop_text_style();
                 }
+                MarkdownTagEnd::DefTerm => {
+                    self.pop_text_style();
+                    self.pop_div();
+                }
+                MarkdownTagEnd::DefItem => {
+                    self.pop_div();
+                }
                 MarkdownTagEnd::Link => {
                     self.pop_text_style();
                     if let Some(link) = self.link_state.take() {
@@ -837,7 +875,12 @@ impl MarkdownElementBuilder {
                 self.push_text(&format!("[{label}]"), &range, cx);
                 self.pop_text_style();
             }
-            MarkdownEvent::Html(_) => {}
+            // HTML 块钝化显示（Typora 灰底源码）：不执行，只读展示。
+            MarkdownEvent::Html(html) => {
+                self.push_text_style(self.style.inline_code.clone());
+                self.push_text_raw(&html, &range, cx);
+                self.pop_text_style();
+            }
             MarkdownEvent::SoftBreak => {
                 self.push_text(" ", &range, cx);
             }

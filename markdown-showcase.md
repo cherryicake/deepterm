@@ -344,6 +344,29 @@ www.example.com 自动补全协议。
 
 ---
 
+## 21. 块语法（实时编辑器与预览测试点）
+
+> `[TOC]` 独占段落在预览展开为标题大纲（live 用右侧大纲栏交互）；HTML 块钝化展示源码；4 空格缩进代码两端一致；`冒号` 定义列表术语加粗、释义缩进。
+
+[TOC]
+
+<div class="note">
+这段 HTML 只读展示不执行
+</div>
+
+    缩进代码块在 live 显示为等宽行
+
+Term A
+: Definition of A goes here
+
+Term B
+: First definition of B
+: Second definition of B
+
+> 测试步骤：预览检查目录含本节标题且释义缩进；live 中 `: Definition` 行隐藏冒号、`    缩进代码` 为等宽、`[TOC]` 行保持原文（用大纲栏导航）。
+
+---
+
 ## 14. 尾声 · 验证清单
 
 > 若平滑滚动至此且所有色块、间距、圆角在亮/暗主题下保持一致，说明 Typora/Notion 风格的 Tier 1 + Tier 2 美化已生效。
@@ -364,6 +387,7 @@ www.example.com 自动补全协议。
 12. 图片粘贴拖拽（live 模式）：截图粘贴落盘、拖拽导入、重名顺延、图片卡片渲染
 13. 链接增强：尖括号自动链接、裸链补协议、三式引用链接、标点剥离
 14. 行内标记：上下标主题色、emoji 短码、脚注引用芯片
+15. 块语法：TOC 大纲、HTML 钝化、缩进代码、定义列表
 11. 切换亮/暗主题（`macos26-light / macos26-dark`）对比底色，窗口缩窄观察 780px 居中
 
 *—— End of Showcase v2 —*

@@ -39,8 +39,10 @@ pub enum Block {
   /// Display math: a single-line `$$...$$` formula, or a line inside a
   /// `$$` block; `start`/`end` bound the formula bytes within the line.
   Math { start: usize, end: usize },
-  /// A line inside a fenced code block.
+  /// A line inside a fenced code block (or 4-space indented code).
   CodeLine,
+  /// `: definition` line of a definition list; `content` skips the marker.
+  Definition { content: usize },
   /// `---` / `***` / `___` thematic break.
   Rule,
   /// A `|`-leading table line.
@@ -230,6 +232,21 @@ fn classify_inner(line: &str, next: Option<&str>, state: &mut DocState) -> Block
       indent,
       number,
       content: indent + content,
+    };
+  }
+  // Indented code (4+ spaces, preview parity): cannot interrupt a
+  // paragraph, and never steals list continuations (the item's content
+  // column wins over the document-level 4-space rule).
+  if indent >= 4
+    && !state.prev_paragraph
+    && state.list_content.is_none_or(|col| indent < col)
+  {
+    return Block::CodeLine;
+  }
+  // Definition-list definition (`: def`, up to 3 leading spaces).
+  if indent <= 3 && (rest == ":" || rest.starts_with(": ")) {
+    return Block::Definition {
+      content: (indent + 2).min(line.len()),
     };
   }
   // Continuation rows of a table that drops the outer pipes: no marker of
@@ -495,6 +512,47 @@ mod tests {
       ..Default::default()
     };
     classify(line, &mut state)
+  }
+
+  fn doc(lines: &[&str]) -> Vec<Block> {
+    let mut state = DocState::default();
+    lines
+      .iter()
+      .enumerate()
+      .map(|(i, l)| {
+        let next = lines.get(i + 1).copied();
+        classify_with_next(l, next, &mut state)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn indented_code_needs_blank_before() {
+    // After a blank line / heading: code.
+    let blocks = doc(&["# h", "", "    code();"]);
+    assert!(matches!(blocks[2], Block::CodeLine));
+    // Directly after paragraph text: lazy continuation, not code.
+    let blocks = doc(&["para", "    cont();"]);
+    assert!(matches!(blocks[1], Block::Paragraph));
+    // List continuation keeps its paragraph even at 4 spaces.
+    let blocks = doc(&["- item", "    cont"]);
+    assert!(matches!(blocks[1], Block::Paragraph));
+  }
+
+  #[test]
+  fn definition_lines_classify() {
+    assert!(matches!(
+      one(": def"),
+      Block::Definition { content: 2 }
+    ));
+    assert!(matches!(
+      one("   : def"),
+      Block::Definition { content: 5 }
+    ));
+    // 4-space indent is code, not a definition.
+    assert!(matches!(one("    : def"), Block::CodeLine));
+    // `:smile:` is an emoji token, not a definition marker.
+    assert!(matches!(one(":smile:"), Block::Paragraph));
   }
 
   #[test]

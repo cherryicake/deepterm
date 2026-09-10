@@ -237,6 +237,14 @@ pub fn plan_with_refs(
       b.inline(0, false);
       RowKind::Paragraph
     }
+    // Definition-list definition: the `: ` marker hides like a list
+    // bullet; the body plans as an ordinary paragraph (preview parity:
+    // pulldown strips the marker too).
+    Block::Definition { content } => {
+      b.hide(0..content);
+      b.inline(content, false);
+      RowKind::Paragraph
+    }
   };
   b.finish(kind)
 }

@@ -36,6 +36,10 @@ pub enum MarkdownTag {
     Strikethrough,
     Link { dest_url: String },
     Image { dest_url: String },
+    /// Definition-list term (bold paragraph).
+    DefTerm,
+    /// Definition-list definition (indented paragraph).
+    DefItem,
     /// `^sup^` content (accent; delimiters consumed).
     Sup,
     /// `~sub~` content (soft accent; delimiters consumed).
@@ -83,6 +87,8 @@ pub enum MarkdownTagEnd {
     Strikethrough,
     Link,
     Image,
+    DefTerm,
+    DefItem,
     Sup,
     Sub,
 }
@@ -96,12 +102,13 @@ pub fn parse_markdown(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
     options.insert(Options::ENABLE_MATH);
+    options.insert(Options::ENABLE_DEFINITION_LIST);
 
     let events: Vec<(Range<usize>, MarkdownEvent)> = Parser::new_ext(source, options)
         .into_offset_iter()
         .map(|(event, range)| (range, convert_event(event)))
         .collect();
-    split_sup_sub(linkify_bare_urls(events))
+    split_sup_sub(linkify_bare_urls(expand_toc(events, source)))
 }
 
 /// Split `^sup^` / `~sub~` out of text runs into synthetic style events
@@ -169,6 +176,102 @@ fn split_sup_sub(
             }
         }
         out.push((range, event));
+    }
+    out
+}
+
+/// Headings of the document for `[TOC]` expansion: `(level, plain title)`.
+fn document_headings(source: &str) -> Vec<(u8, String)> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    let mut out = Vec::new();
+    let mut cur: Option<(u8, String)> = None;
+    for ev in Parser::new_ext(source, opts) {
+        match ev {
+            Event::Start(Tag::Heading { level, .. }) => {
+                cur = Some((level as u8, String::new()));
+            }
+            Event::End(TagEnd::Heading { .. }) => {
+                if let Some((level, title)) = cur.take() {
+                    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !title.is_empty() {
+                        out.push((level, title));
+                    }
+                }
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, title)) = cur.as_mut() {
+                    title.push_str(&t);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// End index of a `[TOC]`-only paragraph starting at `i` (pulldown splits
+/// `[TOC]` into `[` / `TOC` / `]` text events, so concatenate first).
+fn toc_paragraph_end(events: &[(Range<usize>, MarkdownEvent)], i: usize) -> Option<usize> {
+    if !matches!(
+        events.get(i),
+        Some((_, MarkdownEvent::Start(MarkdownTag::Paragraph)))
+    ) {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut buf = String::new();
+    while let Some((_, MarkdownEvent::Text(t))) = events.get(j) {
+        buf.push_str(t);
+        j += 1;
+    }
+    if !buf.trim().eq_ignore_ascii_case("[toc]") {
+        return None;
+    }
+    matches!(
+        events.get(j),
+        Some((_, MarkdownEvent::End(MarkdownTagEnd::Paragraph)))
+    )
+    .then_some(j)
+}
+
+/// Replace `[TOC]`-only paragraphs with a static heading outline (Typora
+/// inserts a live TOC; the preview renders the same list statically while
+/// the live editor's outline sidebar covers the interactive side).
+/// Entries reuse the Sup accent style with per-level indent.
+fn expand_toc(
+    events: Vec<(Range<usize>, MarkdownEvent)>,
+    source: &str,
+) -> Vec<(Range<usize>, MarkdownEvent)> {
+    if !source.to_ascii_lowercase().contains("[toc]") {
+        return events;
+    }
+    let headings = document_headings(source);
+    if headings.is_empty() {
+        return events;
+    }
+    let mut out = Vec::with_capacity(events.len());
+    let mut i = 0;
+    while i < events.len() {
+        let Some(toc_end) = toc_paragraph_end(&events, i) else {
+            out.push(events[i].clone());
+            i += 1;
+            continue;
+        };
+        let (range, _) = events[i].clone();
+        out.push((range.clone(), MarkdownEvent::Start(MarkdownTag::Paragraph)));
+        for (n, (level, title)) in headings.iter().enumerate() {
+            let indent = "  ".repeat((level - 1).min(5) as usize);
+            let label = format!("{indent}{title}");
+            out.push((range.clone(), MarkdownEvent::Start(MarkdownTag::Sup)));
+            out.push((range.clone(), MarkdownEvent::Text(label)));
+            out.push((range.clone(), MarkdownEvent::End(MarkdownTagEnd::Sup)));
+            if n + 1 < headings.len() {
+                out.push((range.clone(), MarkdownEvent::HardBreak));
+            }
+        }
+        out.push((range, MarkdownEvent::End(MarkdownTagEnd::Paragraph)));
+        i = toc_end + 1;
     }
     out
 }
@@ -290,6 +393,9 @@ fn convert_tag(tag: Tag<'_>) -> MarkdownTag {
         Tag::Image { dest_url, .. } => MarkdownTag::Image {
             dest_url: dest_url.to_string(),
         },
+        Tag::DefinitionList => MarkdownTag::Paragraph,
+        Tag::DefinitionListTitle => MarkdownTag::DefTerm,
+        Tag::DefinitionListDefinition => MarkdownTag::DefItem,
         _ => MarkdownTag::Paragraph,
     }
 }
@@ -311,6 +417,9 @@ fn convert_tag_end(tag_end: TagEnd) -> MarkdownTagEnd {
         TagEnd::Strikethrough => MarkdownTagEnd::Strikethrough,
         TagEnd::Link => MarkdownTagEnd::Link,
         TagEnd::Image => MarkdownTagEnd::Image,
+        TagEnd::DefinitionList => MarkdownTagEnd::Paragraph,
+        TagEnd::DefinitionListTitle => MarkdownTagEnd::DefTerm,
+        TagEnd::DefinitionListDefinition => MarkdownTagEnd::DefItem,
         TagEnd::HtmlBlock
         | TagEnd::FootnoteDefinition
         | TagEnd::DefinitionList
@@ -332,6 +441,7 @@ mod tests {
             )
         })
     }
+
 
     #[test]
     fn math_events_parsed() {
@@ -387,6 +497,62 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["E=mc".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn definition_lists_structure() {
+        let tags: Vec<String> = parse_markdown("Term\n:  Def\n")
+            .into_iter()
+            .map(|(_, e)| format!("{e:?}"))
+            .collect();
+        assert!(tags.iter().any(|t| t == "Start(DefTerm)"));
+        assert!(tags.iter().any(|t| t == "Start(DefItem)"));
+        let texts: Vec<String> = parse_markdown("Term\n:  Def\n")
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        // The `: ` marker is consumed by pulldown on both sides.
+        assert_eq!(texts, vec!["Term".to_string(), "Def".to_string()]);
+    }
+
+    #[test]
+    fn toc_expands_to_heading_outline() {
+        let src = "# A\n\ntext\n\n[TOC]\n\n## B\n";
+        let texts: Vec<String> = parse_markdown(src)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t == "A"));
+        assert!(texts.iter().any(|t| t == "  B"));
+        assert!(!texts.iter().any(|t| t == "[TOC]"));
+        // No headings: left alone.
+        let texts: Vec<String> = parse_markdown("[TOC]\n")
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["[".to_string(), "TOC".to_string(), "]".to_string()]);
+    }
+
+    #[test]
+    fn html_blocks_survive_as_events() {
+        let html: Vec<String> = parse_markdown("<div>\nhi\n</div>\n")
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                MarkdownEvent::Html(h) => Some(h),
+                _ => None,
+            })
+            .collect();
+        assert!(!html.is_empty());
+        assert!(html.concat().contains("hi"));
     }
 
     #[test]
