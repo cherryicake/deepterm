@@ -5,7 +5,7 @@
 //! Rewritten for deepterm's GPUI fork; interaction semantics ported from
 //! guise `markdown/editor.rs` (`on_key`/`on_mouse_down`/checkbox/link).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,8 +33,8 @@ use crate::editor::markdown_live::images::{
 };
 use crate::editor::markdown_live::interactions::{
     backspace_marker, classify_alone, find_jump_target, insert_link, line_selection, list_cols,
-    on_enter, on_tab, pos_of_offset, table_insert_row_below, table_nav, toggle_task, toggle_wrap,
-    OrderedCounter,
+    on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_insert_row_below,
+    table_nav, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
 };
 use crate::editor::markdown_live::layout::{
     byte_for_col, col_for_byte, src_for_vis, vis_for_src, RowKind,
@@ -70,7 +70,7 @@ pub struct LiveMarkdownView {
     selecting: bool,
     goal_x: Option<f32>,
     planned_version: u64,
-    planned_key: (Pos, Option<(Pos, Pos)>, bool, bool),
+    planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool, u64),
     planned: Vec<PlannedRow>,
     copied_code_blocks: HashSet<usize>,
     /// Bring the caret's row into view on the next render (set by every
@@ -95,6 +95,15 @@ pub struct LiveMarkdownView {
     show_outline: bool,
     /// 本文档路径（编辑器传入）：图片粘贴/拖拽按 Typora 存入 `<stem>.assets/`。
     doc_path: Option<PathBuf>,
+    /// 源码模式（`Cmd+/` / 状态条切换）：全文档显示源码标记（Typora 源码模式）。
+    show_source: bool,
+    /// 已折叠的标题行（源码行号）：其下属章节行不渲染（Typora 大纲折叠）。
+    folded: BTreeSet<usize>,
+    /// 折叠集合版本：进 `planned_key`，切换折叠即重排。
+    fold_version: u64,
+    /// Slash 菜单高亮项；`slash_suppress` 为 Esc 忽略中的查询（内容变化即恢复）。
+    slash_index: usize,
+    slash_suppress: Option<String>,
     /// Typora 风格内嵌查找/替换条（`Cmd+F` 打开，复用 `SearchMatcher`
     /// 做 Aho-Corasick/正则匹配；输入框懒创建，`Change` 事件触发重搜）。
     find_open: bool,
@@ -131,7 +140,7 @@ impl LiveMarkdownView {
             selecting: false,
             goal_x: None,
             planned_version: u64::MAX,
-            planned_key: (Pos::default(), None, false, false),
+            planned_key: (Pos::default(), None, false, false, false, 0),
             planned: Vec::new(),
             copied_code_blocks: HashSet::new(),
             scroll_to_cursor: false,
@@ -144,6 +153,11 @@ impl LiveMarkdownView {
             blink_on: false,
             show_outline: false,
             doc_path: None,
+            show_source: false,
+            folded: BTreeSet::new(),
+            fold_version: 0,
+            slash_index: 0,
+            slash_suppress: None,
             find_open: false,
             find_query: None,
             find_replace: None,
@@ -654,11 +668,24 @@ impl LiveMarkdownView {
             self.buffer.selection(),
             focused,
             self.read_only,
+            self.show_source,
+            self.fold_version,
         );
         if self.planned_version != self.buffer.text_version() || self.planned_key != key {
+            // 源码模式：用覆盖全文档的选区迫使 `line_set` 揭示每一行
+            //（`Reveal` 不变，所有调用点零改动）。
+            let last = self.buffer.lines().len().saturating_sub(1);
+            let (cursor, selection) = if self.show_source {
+                (
+                    self.buffer.cursor(),
+                    Some((Pos::new(0, 0), Pos::new(last, usize::MAX))),
+                )
+            } else {
+                (self.buffer.cursor(), self.buffer.selection())
+            };
             let reveal = Reveal {
-                cursor: self.buffer.cursor(),
-                selection: self.buffer.selection(),
+                cursor,
+                selection,
                 focused,
                 read_only: self.read_only,
             };
@@ -691,6 +718,22 @@ impl LiveMarkdownView {
                     row.plan = strip_plan_prefix(&row.plan, after_tag, src_off);
                 }
             }
+            // Typora 大纲折叠：藏起已折叠标题的下属行（源码模式忽略
+            // 折叠，全部揭示）。光标落进折叠区时自动展开祖先章节。
+            if !self.show_source && !self.folded.is_empty() {
+                let lines = self.buffer.lines();
+                let cursor_line = cursor.line;
+                if fold_hidden_lines(lines, &self.folded).contains(&cursor_line) {
+                    self.folded.retain(|f| {
+                        !fold_hidden_range(lines, *f).is_some_and(|r| r.contains(&cursor_line))
+                    });
+                    self.fold_version += 1;
+                }
+                let hidden = fold_hidden_lines(lines, &self.folded);
+                if !hidden.is_empty() {
+                    planned.retain(|r| !hidden.contains(&r.line));
+                }
+            }
             self.planned = planned;
             self.planned_version = self.buffer.text_version();
             self.planned_key = key;
@@ -699,6 +742,10 @@ impl LiveMarkdownView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        // Slash menu highlight resets on every edit (Up/Down move through
+        // `after_move`, which preserves it); the query itself re-derives
+        // from the buffer each frame.
+        self.slash_index = 0;
         cx.emit(LiveViewEvent::Change(self.buffer.text()));
         cx.notify();
         cx.stop_propagation();
@@ -719,6 +766,131 @@ impl LiveMarkdownView {
             .iter()
             .find(|r| r.line == line)
             .is_some_and(|r| crate::editor::markdown_live::interactions::is_source_only(&r.block))
+    }
+
+    /// Toggle Typora-style outline folding at heading `line`: its section
+    /// (until the next same-or-higher heading) hides from the plan.
+    /// Non-headings and childless headings are no-ops.
+    fn toggle_fold(&mut self, line: usize, cx: &mut Context<Self>) {
+        if fold_hidden_range(self.buffer.lines(), line).is_none() {
+            return;
+        }
+        if !self.folded.remove(&line) {
+            self.folded.insert(line);
+        }
+        self.fold_version += 1;
+        cx.notify();
+    }
+
+    /// Open slash-command menu `(query, SLASH_COMMANDS indices)` when the
+    /// cursor sits in a `<=3 spaces + /query` trigger with no selection
+    /// and the query isn't Esc-suppressed. Typora/Notion `/` parity.
+    fn slash_menu(&self) -> Option<(String, Vec<usize>)> {
+        if self.read_only || self.buffer.selection().is_some() {
+            return None;
+        }
+        let cur = self.buffer.cursor();
+        let line_text = self.buffer.line(cur.line)?;
+        let query = slash_query_for(line_text, cur.col, false)?;
+        if self.slash_suppress.as_deref() == Some(query.as_str()) {
+            return None;
+        }
+        let items = slash_items(&query);
+        if items.is_empty() {
+            return None;
+        }
+        Some((query, items))
+    }
+
+    /// Apply slash command `cmd_ix`: replace the `/query` before the
+    /// cursor with the snippet. Fenced code parks the cursor inside the
+    /// block; links park it between the parens.
+    fn apply_slash(&mut self, cmd_ix: usize, cx: &mut Context<Self>) {
+        let Some(cmd) = SLASH_COMMANDS.get(cmd_ix) else {
+            return;
+        };
+        let (insert, back, middle) = (cmd.insert, cmd.back, cmd.middle);
+        let cur = self.buffer.cursor();
+        let line_text = self
+            .buffer
+            .line(cur.line)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let col = cur.col.min(line_text.chars().count());
+        let end_byte = byte_for_col(&line_text, col);
+        let indent = line_text
+            .bytes()
+            .take_while(|&b| b == b' ')
+            .count()
+            .min(end_byte);
+        let start = Pos::new(cur.line, col_for_byte(&line_text, indent));
+        let end = Pos::new(cur.line, col);
+        self.edit(cx, |m| m.replace_range(start, end, insert));
+        if middle {
+            self.edit(cx, |m| m.move_to(cur.line + 1, usize::MAX, false));
+        } else {
+            for _ in 0..back {
+                self.edit(cx, |m| m.move_left(false));
+            }
+        }
+        self.slash_index = 0;
+        self.after_edit(cx);
+    }
+
+    /// Auto-pair brackets/quotes (Typora parity): closers skip over an
+    /// identical char ahead, opens wrap the selection or insert a pair
+    /// with the cursor inside. Quotes pair only at word boundaries so
+    /// `don't` stays literal; a backtick after a backtick stays literal
+    /// so triple-backtick fences type naturally. True when handled.
+    fn try_autopair(&mut self, ch: char, cx: &mut Context<Self>) -> bool {
+        const OPENS: [(char, char); 6] = [
+            ('(', ')'),
+            ('[', ']'),
+            ('{', '}'),
+            ('"', '"'),
+            ('\'', '\''),
+            ('`', '`'),
+        ];
+        const CLOSERS: [char; 3] = [')', ']', '}'];
+        if self.buffer.selection().is_some() {
+            if let Some((open, close)) = OPENS.iter().find(|(o, _)| *o == ch).copied() {
+                self.edit(cx, |m| {
+                    m.wrap_selection(open, close);
+                });
+                return true;
+            }
+            return false;
+        }
+        if CLOSERS.contains(&ch) {
+            self.edit(cx, |m| {
+                m.insert_closer(ch);
+            });
+            return true;
+        }
+        let Some((open, close)) = OPENS.iter().find(|(o, _)| *o == ch).copied() else {
+            return false;
+        };
+        if open != close {
+            self.edit(cx, |m| m.insert_pair(open, close));
+            return true;
+        }
+        // Symmetric quote/backtick.
+        let cur = self.buffer.cursor();
+        let src = self.buffer.line(cur.line).unwrap_or("");
+        let chars: Vec<char> = src.chars().collect();
+        let ahead = chars.get(cur.col.min(chars.len())).copied();
+        let behind = cur.col.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if ahead == Some(ch) {
+            self.edit(cx, |m| m.move_right(false));
+        } else if ch == '`' && behind == Some('`') {
+            self.edit(cx, |m| m.insert(&ch.to_string()));
+        } else if word(behind) || word(ahead) {
+            self.edit(cx, |m| m.insert(&ch.to_string()));
+        } else {
+            self.edit(cx, |m| m.insert_pair(open, close));
+        }
+        true
     }
 
     // ---- dead-zone hit fallback (B4/B5) ---------------------------------
@@ -1090,6 +1262,41 @@ impl LiveMarkdownView {
             return;
         }
 
+        // Slash `/` command menu (Typora/Notion parity): plain Up/Down
+        // cycle, Enter/Tab apply, Esc suppresses until the query changes.
+        // Anything else falls through so typing filters the menu live.
+        if !platform && !control && !alt
+            && self.buffer.selection().is_none()
+            && let Some((query, items)) = self.slash_menu()
+        {
+            match key {
+                "up" => {
+                    self.slash_index =
+                        (self.slash_index + items.len() - 1) % items.len();
+                    self.after_move(cx);
+                    return;
+                }
+                "down" => {
+                    self.slash_index = (self.slash_index + 1) % items.len();
+                    self.after_move(cx);
+                    return;
+                }
+                "enter" | "tab" => {
+                    let ix = self.slash_index.min(items.len() - 1);
+                    self.apply_slash(items[ix], cx);
+                    return;
+                }
+                "escape" => {
+                    self.slash_suppress = Some(query);
+                    self.slash_index = 0;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key {
             "left" => {
                 self.edit(cx, |m| {
@@ -1165,6 +1372,11 @@ impl LiveMarkdownView {
                 let cur = self.buffer.cursor();
                 let sel_none = self.buffer.selection().is_none();
                 if sel_none && !platform && !alt {
+                    let paired = self.edit(cx, |m| m.delete_pair());
+                    if paired {
+                        self.after_edit(cx);
+                        return;
+                    }
                     if let Some(text) = self.buffer.line(cur.line).map(str::to_string) {
                         let stripped = self.edit(cx, |m| backspace_marker(m, &text));
                         if stripped {
@@ -1464,6 +1676,13 @@ impl LiveMarkdownView {
                 cx.stop_propagation();
                 return;
             }
+            "/" if platform => {
+                // Typora 源码模式切换（与状态条"源码"芯片同一开关）。
+                self.show_source = !self.show_source;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             "o" if platform && shift => {
                 // Typora 大纲侧栏显隐（与状态条按钮同一开关）。
                 self.show_outline = !self.show_outline;
@@ -1480,6 +1699,13 @@ impl LiveMarkdownView {
             && !self.find_input_focused(window, cx)
             && let Some(text) = ks.key_char.as_deref().filter(|t| !t.is_empty())
         {
+            let mut cs = text.chars();
+            if let (Some(ch), None) = (cs.next(), cs.next())
+                && self.try_autopair(ch, cx)
+            {
+                self.after_edit(cx);
+                return;
+            }
             self.edit(cx, |m| {
                 m.insert(text);
             });
@@ -1561,6 +1787,49 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
         CalloutKind::Warning => ui.warning,
         CalloutKind::Caution => ui.error,
     }
+}
+
+/// ATX heading level of a source line (`#`..`######` followed by
+/// whitespace/EOL), if any. Drives outline folding (Typora parity);
+/// setext headings are rare and stay unfolded.
+fn heading_level_of(line: &str) -> Option<u8> {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    match line.as_bytes().get(hashes) {
+        None | Some(b' ') | Some(b'\t') => Some(hashes as u8),
+        _ => None,
+    }
+}
+
+/// Hidden source-line range for folded heading `line`: subsequent lines
+/// until the next same-or-higher heading. `None` for non-headings and
+/// childless (leaf) headings, which are no-ops to fold.
+fn fold_hidden_range(lines: &[String], line: usize) -> Option<std::ops::Range<usize>> {
+    let level = heading_level_of(lines.get(line)?)?;
+    let mut end = line + 1;
+    while end < lines.len() {
+        match heading_level_of(&lines[end]) {
+            Some(lv) if lv <= level => break,
+            _ => end += 1,
+        }
+    }
+    if end == line + 1 {
+        return None;
+    }
+    Some(line + 1..end)
+}
+
+/// Union of hidden lines for every folded heading.
+fn fold_hidden_lines(lines: &[String], folded: &BTreeSet<usize>) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    for &f in folded {
+        if let Some(range) = fold_hidden_range(lines, f) {
+            out.extend(range);
+        }
+    }
+    out
 }
 
 /// Outline entries `(source line, level, title)` in document order.
@@ -2083,6 +2352,44 @@ impl Render for LiveMarkdownView {
                         }
                         RowKind::Heading(level) => {
                             let level = *level;
+                            // Outline folding chevron (Typora parity): only
+                            // headings with a foldable section get one; a
+                            // folded heading shows how many lines are hidden.
+                            let fold_range = fold_hidden_range(self.buffer.lines(), row.line);
+                            let fold_line = row.line;
+                            let fold_chevron: Option<gpui::AnyElement> = fold_range.as_ref().map(|range| {
+                                let hidden_n = range.len();
+                                let folded = self.folded.contains(&fold_line);
+                                let mut chev = div()
+                                    .id(("live-fold", fold_line))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .mt(px(2.))
+                                    .text_size(px(12.))
+                                    .text_color(ui.text_muted.opacity(0.6))
+                                    .cursor_pointer()
+                                    .child(if folded { "▸" } else { "▾" })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _e, window, cx| {
+                                            window.focus(&this.focus, cx);
+                                            this.toggle_fold(fold_line, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    );
+                                if folded {
+                                    chev = chev.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(ui.text_muted.opacity(0.55))
+                                            .child(format!("{hidden_n}")),
+                                    );
+                                }
+                                chev.into_any_element()
+                            });
                             let mut head = match level {
                                 1 => div().mt_8().mb_4().pb_2(),
                                 2 => div().mt_7().mb_3().pb_2(),
@@ -2129,6 +2436,9 @@ impl Render for LiveMarkdownView {
                                 .group_hover("heading", |s| s.visible())
                                 .child("#")
                                 .into_any_element();
+                            if let Some(chev) = fold_chevron {
+                                head = head.child(chev);
+                            }
                             head.child(
                                 div()
                                     .flex_1()
@@ -2490,6 +2800,19 @@ impl Render for LiveMarkdownView {
                             .child(copy_btn)
                             .into_any_element(),
                     );
+                    // Mermaid has no render engine here: say so in a dim
+                    // footer instead of silently showing a code card.
+                    if lang.as_deref() == Some("mermaid") {
+                        card = card.child(
+                            div()
+                                .px(px(12.))
+                                .py(px(6.))
+                                .text_size(px(11.))
+                                .text_color(ui.text_muted.opacity(0.7))
+                                .child("Mermaid 图暂以源码卡片展示，可直接编辑源码行")
+                                .into_any_element(),
+                        );
+                    }
                     let group_last_line = close
                         .map(|c| rows[c].line)
                         .unwrap_or_else(|| rows[*code.last().unwrap()].line);
@@ -2852,6 +3175,7 @@ impl Render for LiveMarkdownView {
             .selected_source_text()
             .map(|t| t.chars().filter(|c| !c.is_whitespace()).count());
         let show_outline = self.show_outline;
+        let show_source = self.show_source;
         let status = div()
             .flex_shrink_0()
             .flex()
@@ -2883,26 +3207,57 @@ impl Render for LiveMarkdownView {
             )
             .child(
                 div()
-                    .id("live-outline-toggle")
-                    .cursor_pointer()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(6.))
-                    .text_color(if show_outline {
-                        ui.accent
-                    } else {
-                        ui.text_muted
-                    })
-                    .hover(|this| this.bg(ui.tab_hover_background))
-                    .child(if show_outline { "大纲 ✓" } else { "大纲" })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _e, window, cx| {
-                            window.focus(&this.focus, cx);
-                            this.show_outline = !this.show_outline;
-                            cx.notify();
-                            cx.stop_propagation();
-                        }),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id("live-source-toggle")
+                            .cursor_pointer()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(6.))
+                            .text_color(if show_source {
+                                ui.accent
+                            } else {
+                                ui.text_muted
+                            })
+                            .hover(|this| this.bg(ui.tab_hover_background))
+                            .child(if show_source { "源码 ✓" } else { "源码" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    this.show_source = !this.show_source;
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("live-outline-toggle")
+                            .cursor_pointer()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(6.))
+                            .text_color(if show_outline {
+                                ui.accent
+                            } else {
+                                ui.text_muted
+                            })
+                            .hover(|this| this.bg(ui.tab_hover_background))
+                            .child(if show_outline { "大纲 ✓" } else { "大纲" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    this.show_outline = !this.show_outline;
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     ),
             );
 
@@ -3158,6 +3513,67 @@ impl Render for LiveMarkdownView {
             bar.into_any_element()
         });
 
+        // Slash `/` menu (Typora/Notion parity): an in-flow bar above the
+        // status strip listing the filtered block commands. It derives from
+        // the buffer every frame, so no open/close state is stored.
+        let slash_bar: Option<gpui::AnyElement> = self
+            .slash_menu()
+            .filter(|_| focused)
+            .map(|(_, items)| {
+                let sel = self.slash_index.min(items.len() - 1);
+                let mut bar = div()
+                    .flex_shrink_0()
+                    .w_full()
+                    .mt(px(6.))
+                    .p(px(4.))
+                    .rounded(px(8.))
+                    .bg(ui.panel_background)
+                    .border_1()
+                    .border_color(ui.border.opacity(0.5));
+                for (i, cmd_ix) in items.iter().copied().enumerate() {
+                    let cmd = &SLASH_COMMANDS[cmd_ix];
+                    let (title, hint) = (cmd.title, cmd.hint);
+                    let active = i == sel;
+                    bar = bar.child(
+                        div()
+                            .id(("live-slash", cmd_ix))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .w_full()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .when(active, |this| this.bg(ui.accent.opacity(0.12)))
+                            .hover(|this| this.bg(ui.tab_hover_background))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(if active { ui.accent } else { ui.text })
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(ui.text_muted.opacity(0.7))
+                                    .child(hint),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _e, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    this.slash_index = i;
+                                    this.apply_slash(cmd_ix, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    );
+                }
+                bar.into_any_element()
+            });
+
         // Preview-parity container: centered 780px column, no editor chrome.
         div()
             .id("live-markdown")
@@ -3233,6 +3649,7 @@ impl Render for LiveMarkdownView {
                                     .track_scroll(&self.scroll)
                                     .children(row_els),
                             )
+                            .when_some(slash_bar, |this, bar| this.child(bar))
                             .child(status),
                     ),
             )
@@ -3851,6 +4268,29 @@ mod live_showcase_tests {
         );
         assert_eq!(outline_title("  a  b  "), "a b");
         assert_eq!(outline_title(""), "(空标题)");
+    }
+
+    #[test]
+    fn fold_ranges_stop_at_same_or_higher_heading() {
+        let doc = "# A\n\na1\n\n## B\n\nb1\n\n## C\n\nc1\n\n# D";
+        let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+        assert_eq!(heading_level_of("# A"), Some(1));
+        assert_eq!(heading_level_of("###deep"), None);
+        assert_eq!(heading_level_of("####### x"), None);
+        assert_eq!(heading_level_of("a1"), None);
+        // `# A` hides everything up to (not including) `# D`.
+        let range = fold_hidden_range(&lines, 0).unwrap();
+        assert_eq!(range, 1..12);
+        // `## B` stops at `## C`.
+        assert_eq!(fold_hidden_range(&lines, 4).unwrap(), 5..8);
+        // `# D` is childless: not foldable.
+        assert!(fold_hidden_range(&lines, 12).is_none());
+        // Plain lines are not foldable.
+        assert!(fold_hidden_range(&lines, 2).is_none());
+        let mut folded = BTreeSet::new();
+        folded.insert(4);
+        let hidden = fold_hidden_lines(&lines, &folded);
+        assert_eq!(hidden, BTreeSet::from([5, 6, 7]));
     }
 
     #[test]

@@ -57,6 +57,16 @@ impl Default for EditorModel {
   }
 }
 
+/// Empty-pair table shared by `insert_pair`/`delete_pair`.
+const PAIRS: [(char, char); 6] = [
+  ('(', ')'),
+  ('[', ']'),
+  ('{', '}'),
+  ('"', '"'),
+  ('\'', '\''),
+  ('`', '`'),
+];
+
 impl EditorModel {
   /// Start editing `text` with the cursor at the document start.
   pub fn new(text: &str) -> Self {
@@ -456,6 +466,78 @@ impl EditorModel {
   /// Replace `start..end` with `text` as ONE undo step (find/replace
   /// parity with the code editor's silent replace). Cursor lands after
   /// the inserted text.
+  /// Auto-pair: insert `open` + `close` with the cursor between them
+  /// (single undo step; Typora parity for `([{` quotes backticks).
+  pub fn insert_pair(&mut self, open: char, close: char) {
+    let mut s = String::new();
+    s.push(open);
+    s.push(close);
+    self.push_undo(false);
+    self.anchor = None;
+    self.insert_at_cursor(&s);
+    self.move_left(false);
+    self.goal_col = None;
+  }
+
+  /// Closer key: skip over an identical char ahead, else insert it.
+  /// Returns true when it skipped (nothing inserted).
+  pub fn insert_closer(&mut self, close: char) -> bool {
+    let ahead = self
+      .line(self.cursor.line)
+      .and_then(|l| l.chars().nth(self.cursor.col))
+      == Some(close);
+    if ahead {
+      self.move_right(false);
+      true
+    } else {
+      self.insert(&close.to_string());
+      false
+    }
+  }
+
+  /// Wrap the selection with `open`/`close` (single undo step).
+  /// The cursor lands after the pair; returns false without a selection.
+  pub fn wrap_selection(&mut self, open: char, close: char) -> bool {
+    let Some(text) = self.selected_text() else {
+      return false;
+    };
+    self.push_undo(false);
+    self.remove_selection();
+    let mut s = String::new();
+    s.push(open);
+    s.push_str(&text);
+    s.push(close);
+    self.insert_at_cursor(&s);
+    self.goal_col = None;
+    true
+  }
+
+  /// Backspace inside an empty pair (`()`, `[]`, `{}`, `""`, `''`,
+  /// ` `` `): delete both chars as ONE undo step (Typora parity).
+  /// Returns false when the cursor doesn't sit inside an empty pair.
+  pub fn delete_pair(&mut self) -> bool {
+    if self.selection().is_some() || self.cursor.col == 0 {
+      return false;
+    }
+    let Some(line) = self.line(self.cursor.line) else {
+      return false;
+    };
+    let chars: Vec<char> = line.chars().collect();
+    let pair = match (chars.get(self.cursor.col - 1), chars.get(self.cursor.col)) {
+      (Some(o), Some(c)) => PAIRS.contains(&(*o, *c)),
+      _ => false,
+    };
+    if !pair {
+      return false;
+    }
+    self.push_undo(false);
+    let start = self.prev_pos(self.cursor);
+    let end = self.next_pos(self.cursor);
+    self.remove_range(start, end);
+    self.goal_col = None;
+    true
+  }
+
   pub fn replace_range(&mut self, start: Pos, end: Pos, text: &str) {
     self.replace_ranges(&[(start, end)], text);
   }
@@ -1192,6 +1274,57 @@ mod tests {
     m.move_down(false);
     assert_eq!(m.cursor(), at(1, 3));
     assert_eq!(m.pos_for_click(0, 99), at(0, 3));
+  }
+
+  #[test]
+  fn delete_pair_removes_both_as_one_undo() {
+    let mut m = EditorModel::new("(a)");
+    m.move_to(0, 1, false);
+    m.insert_pair('[', ']');
+    assert_eq!(m.text(), "([]a)");
+    assert!(m.delete_pair());
+    assert_eq!(m.text(), "(a)");
+    assert_eq!(m.cursor(), at(0, 1));
+    // One undo restores the just-deleted pair (not the pre-insert state).
+    assert!(m.undo());
+    assert_eq!(m.text(), "([]a)");
+    assert!(m.undo());
+    assert_eq!(m.text(), "(a)");
+    // Not inside a pair: no-op.
+    m.move_to(0, 2, false);
+    assert!(!m.delete_pair());
+    assert_eq!(m.text(), "(a)");
+  }
+
+  #[test]
+  fn pair_insert_and_closer_skip() {
+    let mut m = EditorModel::new("()");
+    m.move_to(0, 0, false);
+    m.insert_pair('(', ')');
+    assert_eq!(m.text(), "()()");
+    assert_eq!(m.cursor(), at(0, 1));
+    assert!(m.undo());
+    assert_eq!(m.text(), "()");
+    // Closer skips over the identical char ahead.
+    m.move_to(0, 1, false);
+    assert!(m.insert_closer(')'));
+    assert_eq!(m.cursor(), at(0, 2));
+    // …but inserts when the next char differs.
+    m.move_to(0, 0, false);
+    assert!(!m.insert_closer(']'));
+    assert_eq!(m.text(), "]()");
+  }
+
+  #[test]
+  fn wrap_selection_single_undo() {
+    let mut m = EditorModel::new("hello");
+    m.move_to(0, 0, false);
+    m.move_to(0, 5, true);
+    assert!(m.wrap_selection('*', '*'));
+    assert_eq!(m.text(), "*hello*");
+    assert!(m.undo());
+    assert_eq!(m.text(), "hello");
+    assert!(!m.wrap_selection('(', ')'));
   }
 
   #[test]
