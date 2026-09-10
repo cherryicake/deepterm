@@ -36,7 +36,7 @@ actions!(input, [Tab]);
 ///
 /// 注意：跳转后选区落在匹配起点上，因此「上一个」不能用
 /// 「start < caret」判断是否在匹配内，否则会永远选中同一个匹配。
-fn jump_target(ranges: &[Range<usize>], caret: usize, dir: i32) -> Option<usize> {
+pub(crate) fn jump_target(ranges: &[Range<usize>], caret: usize, dir: i32) -> Option<usize> {
     let len = ranges.len();
     if len == 0 {
         return None;
@@ -348,8 +348,55 @@ impl DoubleEndedIterator for SearchMatcher {
     }
 }
 
-pub(crate) struct SearchPanel {
-    editor: Entity<InputState>,
+/// `SearchPanel` 能挂载的文档（代码编辑器与 md 实时编辑器共用同一套
+/// 查找/替换面板，不再各自实现一遍）。
+///
+/// - `InputState`（代码编辑器）：`Rope` 直驱，视口顶部锚定。
+/// - `LiveMarkdownView`（md 实时编辑）：行列缓冲经字节偏移映射，锚定光标。
+pub(crate) trait SearchTarget: 'static + Sized {
+    /// 全文（匹配器输入）。
+    fn search_text(&self) -> Rope;
+    /// 查询框预填（通常取选区首行）。
+    fn search_prefill(&self) -> Rope;
+    /// 光标字节偏移（跳转锚点）。
+    fn search_caret(&self) -> usize;
+    /// `show` 的初始锚点（代码编辑器取视口顶部，live 取光标）；
+    /// `None` 则从第 0 个匹配开始。
+    fn anchor_offset(&self) -> Option<usize>;
+    /// 选中一个匹配并滚入视野（不抢焦点）。
+    fn reveal_match(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>);
+    /// 替换一个匹配（单步 undo）。
+    fn replace_match(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    /// 按 `(byte range, 替换串)` 逐个替换当前全部匹配（单步 undo；
+    /// 替换串已逐匹配做好大小写保持）。
+    fn replace_all_matches(
+        &mut self,
+        pairs: &[(Range<usize>, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    /// 替换后滚动（代码编辑器滚向下一匹配，live 滚向编辑处）。
+    fn scroll_to_offset(
+        &mut self,
+        offset: usize,
+        direction: Option<MoveDirection>,
+        cx: &mut Context<Self>,
+    );
+    /// 是否允许替换（只读宿主隐藏替换行）。
+    fn search_replaceable(&self) -> bool;
+    /// 文档焦点（面板关闭 / Tab 时聚焦回去；返回 owned handle 以便
+    /// 调用方先结束 `editor.read` 借用再聚焦）。
+    fn target_focus_handle(&self, cx: &App) -> FocusHandle;
+}
+
+pub(crate) struct SearchPanel<T: SearchTarget = InputState> {
+    editor: Entity<T>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     case_insensitive: bool,
@@ -411,7 +458,82 @@ impl InputState {
     // （焦点在搜索面板内时派发）。这里不需要重复实现。
 }
 
-impl SearchPanel {
+impl SearchTarget for InputState {
+    fn search_text(&self) -> Rope {
+        self.text.clone()
+    }
+
+    fn search_prefill(&self) -> Rope {
+        Rope::from(self.selected_text())
+    }
+
+    fn search_caret(&self) -> usize {
+        self.selected_range.start
+    }
+
+    fn anchor_offset(&self) -> Option<usize> {
+        self.last_layout
+            .as_ref()
+            .map(|l| l.visible_range_offset.start)
+    }
+
+    fn reveal_match(&mut self, range: Range<usize>, _window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_range = range.clone().into();
+        self.scroll_to_center(range.start, cx);
+    }
+
+    fn replace_match(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range_utf16 = self.range_to_utf16(&range);
+        self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
+    }
+
+    fn replace_all_matches(
+        &mut self,
+        pairs: &[(Range<usize>, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 逐个匹配拼接替换结果（逐匹配保留大小写已由调用方算好）。
+        let content = self.text.clone();
+        let mut out = String::new();
+        let mut last = 0usize;
+        for (range, replacement) in pairs {
+            out.push_str(&content.slice(last..range.start).to_string());
+            out.push_str(replacement);
+            last = range.end;
+        }
+        out.push_str(&content.slice(last..).to_string());
+
+        let full_range_utf16 = 0..self.offset_to_utf16(self.text.len());
+        self.replace_text_in_range_silent(Some(full_range_utf16), out.as_str(), window, cx);
+        self.scroll_to(0, Some(MoveDirection::Down), cx);
+    }
+
+    fn scroll_to_offset(
+        &mut self,
+        offset: usize,
+        direction: Option<MoveDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_to(offset, direction, cx);
+    }
+
+    fn search_replaceable(&self) -> bool {
+        self.replaceable
+    }
+
+    fn target_focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl<T: SearchTarget> SearchPanel<T> {
     fn next_scroll_direction(
         previous_match_ix: usize,
         current_match_ix: usize,
@@ -425,7 +547,7 @@ impl SearchPanel {
 
     // 没有「替换并跳到上一个」的入口，`prev_scroll_direction` 因此没有调用点。
 
-    pub fn new(editor: Entity<InputState>, window: &mut Window, cx: &mut App) -> Entity<Self> {
+    pub fn new(editor: Entity<T>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换"));
 
@@ -475,17 +597,13 @@ impl SearchPanel {
             this.select_all(&super::SelectAll, window, cx);
         });
 
-        // 打开时定位到视口顶部之后的第一个匹配并选中。
+        // 打开时定位到锚点（视口顶部 / 光标）之后的第一个匹配并选中。
         // 注意：on_action_search 发生在编辑器 InputState 自身的 update 借用内，
         // 此处不能同步 read/update 编辑器（重入借用会 panic），必须延迟执行。
         let editor = self.editor.clone();
-        cx.defer_in(window, move |this, _window, cx| {
-            let visible_start = editor
-                .read(cx)
-                .last_layout
-                .as_ref()
-                .map(|l| l.visible_range_offset.start);
-            if let Some(start) = visible_start {
+        cx.defer_in(window, move |this, window, cx| {
+            let start = editor.read(cx).anchor_offset();
+            if let Some(start) = start {
                 this.matcher.update_cursor_by_offset(start);
             } else {
                 this.matcher.current_match_ix = 0;
@@ -497,8 +615,7 @@ impl SearchPanel {
                 .cloned()
             {
                 editor.update(cx, |state, cx| {
-                    state.selected_range = range.clone().into();
-                    state.scroll_to_center(range.start, cx);
+                    state.reveal_match(range, window, cx);
                 });
             }
         });
@@ -506,12 +623,7 @@ impl SearchPanel {
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().to_string();
-        let visible_range_offset = self
-            .editor
-            .read(cx)
-            .last_layout
-            .as_ref()
-            .map(|l| l.visible_range_offset.clone());
+        let visible_range_offset = self.editor.read(cx).anchor_offset();
 
         self.matcher.update_query_ext(
             &query,
@@ -522,9 +634,8 @@ impl SearchPanel {
         // 非法正则：query 被置空，标记错误状态供 UI 提示
         self.query_invalid = !query.is_empty() && self.matcher.query.is_none();
 
-        if let Some(visible_range_offset) = visible_range_offset {
-            self.matcher
-                .update_cursor_by_offset(visible_range_offset.start);
+        if let Some(start) = visible_range_offset {
+            self.matcher.update_cursor_by_offset(start);
         }
         cx.notify();
     }
@@ -538,7 +649,7 @@ impl SearchPanel {
     /// 同步执行：调用方（‹/› 按钮、Enter/Shift+Enter 动作）都在事件分发
     /// 阶段运行，不存在编辑器 update 借用；延迟一帧反而让跳转看起来迟钝。
     /// （Cmd+F 打开路径的首次定位在 show() 自身的 defer 中处理。）
-    fn reveal_current_match(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn reveal_current_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(range) = self
             .matcher
             .matched_ranges
@@ -549,30 +660,45 @@ impl SearchPanel {
         };
         let editor = self.editor.clone();
         editor.update(cx, |state, cx| {
-            state.selected_range = range.clone().into();
-            // 跳转目标行对齐视口中部，避免匹配项贴在视口边缘。
-            state.scroll_to_center(range.start, cx);
+            state.reveal_match(range, window, cx);
         });
     }
 
     /// 按 dir（+1 下一个 / -1 上一个）跳转：以编辑器光标为锚点对齐当前索引后 ±1（循环）。
-    fn jump(&mut self, dir: i32, _window: &mut Window, cx: &mut Context<Self>) {
-        let caret = self.editor.read(cx).selected_range.start;
+    pub(crate) fn jump(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let caret = self.editor.read(cx).search_caret();
         if let Some(target) = jump_target(&self.matcher.matched_ranges, caret, dir) {
             self.matcher.current_match_ix = target;
-            self.reveal_current_match(_window, cx);
+            self.reveal_current_match(window, cx);
             cx.notify();
         }
     }
 
+    /// 文档变化时同步全文（宿主每次编辑后调用，`InputState::update_search` parity）。
+    pub(crate) fn sync_text(&mut self, text: &Rope) {
+        self.matcher.update(text);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// 查找/替换输入框是否持有焦点（此时宿主回车等快捷键应让行）。
+    pub(crate) fn input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.open
+            && [&self.search_input, &self.replace_input]
+                .into_iter()
+                .any(|input| input.read(cx).focus_handle.is_focused(window))
+    }
+
     fn replaceable(&self, cx: &App) -> bool {
-        let editor = self.editor.read(cx);
-        editor.replaceable
+        self.editor.read(cx).search_replaceable()
     }
 
     pub(crate) fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
-        self.editor.read(cx).focus_handle.clone().focus(window, cx);
+        let handle = self.editor.read(cx).target_focus_handle(cx);
+        handle.focus(window, cx);
         cx.notify();
     }
 
@@ -594,7 +720,8 @@ impl SearchPanel {
     }
 
     fn on_action_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.focus_handle(cx).focus(window, cx);
+        let handle = self.editor.read(cx).target_focus_handle(cx);
+        handle.focus(window, cx);
     }
 
     // prev/next 已由 jump(±1) 统一实现（见 on_action_enter / 按钮回调）
@@ -624,6 +751,9 @@ impl SearchPanel {
             .get(self.matcher.current_match_ix)
             .cloned()
         {
+            let content = self.editor.read(cx).search_text();
+            let matched = content.slice(range.clone()).to_string();
+            let replacement = apply_case_preservation(&new_text, &matched, preserve_case);
             let text_state = self.editor.clone();
             let next_match_ix = self.matcher.next_ix().unwrap_or(previous_match_ix);
             let next_range = self.matcher.peek().unwrap_or(range.clone());
@@ -632,17 +762,8 @@ impl SearchPanel {
             cx.spawn_in(window, async move |_, cx| {
                 cx.update(|window, cx| {
                     text_state.update(cx, |state, cx| {
-                        let range_utf16 = state.range_to_utf16(&range);
-                        let matched = state.text.slice(range.clone()).to_string();
-                        let replacement =
-                            apply_case_preservation(&new_text, &matched, preserve_case);
-                        state.scroll_to(next_range.end, direction, cx);
-                        state.replace_text_in_range_silent(
-                            Some(range_utf16),
-                            replacement.as_str(),
-                            window,
-                            cx,
-                        );
+                        state.replace_match(range, replacement.as_str(), window, cx);
+                        state.scroll_to_offset(next_range.end, direction, cx);
                     });
                 })
             })
@@ -664,31 +785,24 @@ impl SearchPanel {
         if ranges.is_empty() {
             return;
         }
+        // 逐匹配算好替换串（含保留大小写），宿主只做一次批量替换。
+        let content = self.editor.read(cx).search_text();
+        let pairs: Vec<(Range<usize>, String)> = ranges
+            .iter()
+            .map(|range| {
+                let matched = content.slice(range.clone()).to_string();
+                (
+                    range.clone(),
+                    apply_case_preservation(&new_text, &matched, preserve_case),
+                )
+            })
+            .collect();
 
         let editor = self.editor.clone();
         cx.spawn_in(window, async move |_, cx| {
             cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
-                    // 逐个匹配拼接替换结果（支持逐匹配保留大小写）。
-                    let content = state.text.clone();
-                    let mut out = String::new();
-                    let mut last = 0usize;
-                    for range in ranges.iter() {
-                        out.push_str(&content.slice(last..range.start).to_string());
-                        let matched = content.slice(range.clone()).to_string();
-                        out.push_str(&apply_case_preservation(&new_text, &matched, preserve_case));
-                        last = range.end;
-                    }
-                    out.push_str(&content.slice(last..).to_string());
-
-                    let full_range_utf16 = 0..state.offset_to_utf16(state.text.len());
-                    state.replace_text_in_range_silent(
-                        Some(full_range_utf16),
-                        out.as_str(),
-                        window,
-                        cx,
-                    );
-                    state.scroll_to(0, Some(MoveDirection::Down), cx);
+                    state.replace_all_matches(&pairs, window, cx);
                 });
             })
         })
@@ -696,13 +810,13 @@ impl SearchPanel {
     }
 }
 
-impl Focusable for SearchPanel {
+impl<T: SearchTarget> Focusable for SearchPanel<T> {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_input.read(cx).focus_handle.clone()
     }
 }
 
-impl Render for SearchPanel {
+impl<T: SearchTarget> Render for SearchPanel<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return div().into_any_element();

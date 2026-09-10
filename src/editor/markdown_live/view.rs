@@ -5,7 +5,7 @@
 //! Rewritten for deepterm's GPUI fork; interaction semantics ported from
 //! guise `markdown/editor.rs` (`on_key`/`on_mouse_down`/checkbox/link).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
 };
 use crate::editor::markdown_live::interactions::{
-    backspace_marker, classify_alone, find_jump_target, insert_link, line_selection, list_cols,
+    backspace_marker, classify_alone, insert_link, line_selection, list_cols,
     on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_insert_row_below,
     table_nav, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
 };
@@ -46,9 +46,7 @@ use crate::editor::markdown_live::reveal::{
 use crate::components::input::{
     blink_cursor::{BlinkCursor, CURSOR_WIDTH},
     cursor::CursorShape,
-    search::SearchMatcher,
-    state::SelectAll as InputSelectAll,
-    EditorInput, InputEvent, InputState,
+    search::{SearchPanel, SearchTarget},
 };
 use crate::theme::ActiveTheme;
 use ropey::Rope;
@@ -70,7 +68,7 @@ pub struct LiveMarkdownView {
     selecting: bool,
     goal_x: Option<f32>,
     planned_version: u64,
-    planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool, u64),
+    planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool),
     planned: Vec<PlannedRow>,
     copied_code_blocks: HashSet<usize>,
     /// Bring the caret's row into view on the next render (set by every
@@ -97,25 +95,12 @@ pub struct LiveMarkdownView {
     doc_path: Option<PathBuf>,
     /// 源码模式（`Cmd+/` / 状态条切换）：全文档显示源码标记（Typora 源码模式）。
     show_source: bool,
-    /// 已折叠的标题行（源码行号）：其下属章节行不渲染（Typora 大纲折叠）。
-    folded: BTreeSet<usize>,
-    /// 折叠集合版本：进 `planned_key`，切换折叠即重排。
-    fold_version: u64,
     /// Slash 菜单高亮项；`slash_suppress` 为 Esc 忽略中的查询（内容变化即恢复）。
     slash_index: usize,
     slash_suppress: Option<String>,
-    /// Typora 风格内嵌查找/替换条（`Cmd+F` 打开，复用 `SearchMatcher`
-    /// 做 Aho-Corasick/正则匹配；输入框懒创建，`Change` 事件触发重搜）。
-    find_open: bool,
-    find_query: Option<Entity<InputState>>,
-    find_replace: Option<Entity<InputState>>,
-    find_matcher: SearchMatcher,
-    find_case_insensitive: bool,
-    find_use_regex: bool,
-    find_whole_word: bool,
-    find_query_invalid: bool,
-    find_replace_mode: bool,
-    find_sync_key: Option<(String, bool, bool, bool, u64)>,
+    /// 代码编辑器同款 `SearchPanel`（`Cmd+F` 懒建）：匹配引擎、面板 UI、
+    /// 跳转与替换逻辑全部复用，不再自实现（`SearchTarget` 桥接行列缓冲）。
+    search_panel: Option<Entity<SearchPanel<LiveMarkdownView>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -140,7 +125,7 @@ impl LiveMarkdownView {
             selecting: false,
             goal_x: None,
             planned_version: u64::MAX,
-            planned_key: (Pos::default(), None, false, false, false, 0),
+            planned_key: (Pos::default(), None, false, false, false),
             planned: Vec::new(),
             copied_code_blocks: HashSet::new(),
             scroll_to_cursor: false,
@@ -154,20 +139,9 @@ impl LiveMarkdownView {
             show_outline: false,
             doc_path: None,
             show_source: false,
-            folded: BTreeSet::new(),
-            fold_version: 0,
             slash_index: 0,
             slash_suppress: None,
-            find_open: false,
-            find_query: None,
-            find_replace: None,
-            find_matcher: SearchMatcher::new(),
-            find_case_insensitive: true,
-            find_use_regex: false,
-            find_whole_word: false,
-            find_query_invalid: false,
-            find_replace_mode: false,
-            find_sync_key: None,
+            search_panel: None,
             _subscriptions,
         }
     }
@@ -363,125 +337,36 @@ impl LiveMarkdownView {
         true
     }
 
-    // ---- find / replace (Typora Cmd+F parity) ---------------------------
-    // 复用代码编辑器 `SearchMatcher`（Aho-Corasick 字面量 / 正则），命中
-    // 以字节偏移映射回源码行列，再经 `vis_for_src` 落到可见文本做高亮。
+    // ---- find / replace: 代码编辑器同款 `SearchPanel` -------------------
+    // 经 `SearchTarget` 桥接行列缓冲：匹配引擎、面板 UI、跳转与替换逻辑
+    // 全部复用 `components::input::search`，此处只做字节偏移↔行列映射。
 
-    /// 打开查找条：懒建输入框并订阅 `Change`，预填当前选区首行。
-    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.find_query.is_none() {
-            let query = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("查找")
+    /// 打开 `SearchPanel`（`Cmd+F`，只读也允许查找）：懒建面板、同步全文、
+    /// 预填选区首行、聚焦输入框并定位到光标后首个命中（`show` 内完成）。
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_panel.is_none() {
+            self.search_panel = Some(SearchPanel::new(cx.entity(), window, cx));
+        }
+        let text = Rope::from(self.buffer.text());
+        let prefill = self.search_prefill();
+        if let Some(panel) = self.search_panel.clone() {
+            panel.update(cx, |p, cx| {
+                p.sync_text(&text);
+                p.show(&prefill, window, cx);
             });
-            let replace = cx.new(|cx| InputState::new(window, cx).placeholder("替换"));
-            let sub_q = cx.subscribe(
-                &query,
-                |this: &mut Self, _, ev: &InputEvent, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        this.resync_find(cx);
-                        cx.notify();
-                    }
-                },
-            );
-            self._subscriptions.push(sub_q);
-            self.find_query = Some(query);
-            self.find_replace = Some(replace);
+            cx.notify();
         }
-        if let Some(selected) = self.selected_source_text() {
-            let first: String = selected.lines().next().unwrap_or("").chars().take(200).collect();
-            if !first.is_empty()
-                && let Some(q) = self.find_query.clone()
-            {
-                q.update(cx, |input, cx| {
-                    input.set_value(first, window, cx);
-                    input.select_all(&InputSelectAll, window, cx);
-                });
-            }
-        }
-        self.find_open = true;
-        self.resync_find(cx);
-        if let Some(q) = self.find_query.clone() {
-            let handle = q.read(cx).focus_handle.clone();
-            window.focus(&handle, cx);
-        }
-        // 打开即定位到光标后的首个命中并选中（`SearchPanel::show` parity）。
-        self.find_goto(1, cx);
-        cx.notify();
     }
 
-    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.find_open = false;
-        window.focus(&self.focus, cx);
-        cx.notify();
-    }
-
-    fn find_query_text(&self, cx: &App) -> String {
-        self.find_query
+    /// 查找/替换输入框是否持有焦点（此时回车走面板跳转而非正文换行）。
+    fn search_panel_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search_panel
             .as_ref()
-            .map(|q| q.read(cx).value().to_string())
-            .unwrap_or_default()
+            .is_some_and(|p| p.read(cx).input_focused(window, cx))
     }
 
-    fn find_replace_text(&self, cx: &App) -> String {
-        self.find_replace
-            .as_ref()
-            .map(|q| q.read(cx).value().to_string())
-            .unwrap_or_default()
-    }
-
-    /// 查找/替换输入框是否持有焦点（此时回车走跳转而非正文换行）。
-    fn find_input_focused(&self, window: &Window, cx: &App) -> bool {
-        self.find_open
-            && [self.find_query.as_ref(), self.find_replace.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|input| input.read(cx).focus_handle.is_focused(window))
-    }
-
-    /// 把焦点放回查找 (`replace=false`) / 替换 (`replace=true`) 输入框。
-    fn focus_find_input(&self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let input = if replace {
-            self.find_replace.clone()
-        } else {
-            self.find_query.clone()
-        };
-        if let Some(input) = input {
-            let handle = input.read(cx).focus_handle.clone();
-            window.focus(&handle, cx);
-        }
-    }
-
-    /// 文档变化 / 查询变化时重跑匹配，并把 current 锚到光标之后首个命中。
-    fn resync_find(&mut self, cx: &mut Context<Self>) {
-        if !self.find_open {
-            return;
-        }
-        let query = self.find_query_text(cx);
-        let key = (
-            query.clone(),
-            self.find_case_insensitive,
-            self.find_use_regex,
-            self.find_whole_word,
-            self.buffer.text_version(),
-        );
-        if self.find_sync_key.as_ref() == Some(&key) {
-            return;
-        }
-        self.find_sync_key = Some(key);
-        let text = self.buffer.text();
-        self.find_matcher.update(&Rope::from(text));
-        self.find_matcher.update_query_ext(
-            &query,
-            self.find_case_insensitive,
-            self.find_use_regex,
-            self.find_whole_word,
-        );
-        self.find_query_invalid = self.find_matcher.query_failed(&query);
-        self.anchor_find_to_caret();
-    }
-
-    /// 光标的全文字节偏移（`find_jump_target` 的锚点）。
-    fn find_caret_offset(&self) -> usize {
+    /// 光标的全文字节偏移（`SearchTarget::search_caret` / `anchor_offset`）。
+    fn search_caret_offset(&self) -> usize {
         let cur = self.buffer.cursor();
         let mut off = 0usize;
         for (i, line) in self.buffer.lines().iter().enumerate() {
@@ -493,89 +378,6 @@ impl LiveMarkdownView {
         off
     }
 
-    /// current 指向光标之后（含光标所在）的首个命中，无则归零。
-    fn anchor_find_to_caret(&mut self) {
-        let ranges = self.find_matcher.match_ranges();
-        if ranges.is_empty() {
-            return;
-        }
-        let caret = self.find_caret_offset();
-        let ix = ranges
-            .iter()
-            .position(|r| r.end > caret)
-            .unwrap_or(0);
-        self.find_matcher.set_current_ix(ix);
-    }
-
-    /// 跳到上一个 (`dir=-1`) / 下一个 (`dir=1`) 命中并选中它。
-    fn find_goto(&mut self, dir: i32, cx: &mut Context<Self>) {
-        self.resync_find(cx);
-        if self.find_matcher.match_count() == 0 {
-            return;
-        }
-        let caret = self.find_caret_offset();
-        let ix = find_jump_target(self.find_matcher.match_ranges(), caret, dir).unwrap_or(0);
-        self.find_matcher.set_current_ix(ix);
-        let range = self.find_matcher.match_ranges().get(ix).cloned();
-        if let Some(range) = range {
-            let lines = self.buffer.lines().to_vec();
-            let s = pos_of_offset(&lines, range.start);
-            let e = pos_of_offset(&lines, range.end);
-            self.edit(cx, |m| {
-                m.move_to(s.line, s.col, false);
-                m.move_to(e.line, e.col, true);
-            });
-            self.scroll_to_cursor = true;
-        }
-        cx.notify();
-    }
-
-    /// 替换当前命中后锚到下一个（单步 undo，`replace_range` parity）。
-    fn find_replace_current(&mut self, cx: &mut Context<Self>) {
-        if self.read_only {
-            return;
-        }
-        self.resync_find(cx);
-        let ix = self.find_matcher.current_ix();
-        let range = self.find_matcher.match_ranges().get(ix).cloned();
-        let Some(range) = range else { return };
-        let lines = self.buffer.lines().to_vec();
-        let s = pos_of_offset(&lines, range.start);
-        let e = pos_of_offset(&lines, range.end);
-        let replacement = self.find_replace_text(cx);
-        self.edit(cx, |m| m.replace_range(s, e, &replacement));
-        self.find_sync_key = None;
-        self.resync_find(cx);
-        cx.notify();
-    }
-
-    /// 全部替换（单步 undo，`replace_ranges` parity）。
-    fn find_replace_all(&mut self, cx: &mut Context<Self>) {
-        if self.read_only {
-            return;
-        }
-        self.resync_find(cx);
-        let lines = self.buffer.lines().to_vec();
-        let ranges: Vec<(Pos, Pos)> = self
-            .find_matcher
-            .match_ranges()
-            .iter()
-            .map(|r| {
-                (
-                    pos_of_offset(&lines, r.start),
-                    pos_of_offset(&lines, r.end),
-                )
-            })
-            .collect();
-        if ranges.is_empty() {
-            return;
-        }
-        let replacement = self.find_replace_text(cx);
-        self.edit(cx, |m| m.replace_ranges(&ranges, &replacement));
-        self.find_sync_key = None;
-        self.resync_find(cx);
-        cx.notify();
-    }
 
     fn caret_block_for(
         shape: CursorShape,
@@ -669,7 +471,6 @@ impl LiveMarkdownView {
             focused,
             self.read_only,
             self.show_source,
-            self.fold_version,
         );
         if self.planned_version != self.buffer.text_version() || self.planned_key != key {
             // 源码模式：用覆盖全文档的选区迫使 `line_set` 揭示每一行
@@ -718,22 +519,6 @@ impl LiveMarkdownView {
                     row.plan = strip_plan_prefix(&row.plan, after_tag, src_off);
                 }
             }
-            // Typora 大纲折叠：藏起已折叠标题的下属行（源码模式忽略
-            // 折叠，全部揭示）。光标落进折叠区时自动展开祖先章节。
-            if !self.show_source && !self.folded.is_empty() {
-                let lines = self.buffer.lines();
-                let cursor_line = cursor.line;
-                if fold_hidden_lines(lines, &self.folded).contains(&cursor_line) {
-                    self.folded.retain(|f| {
-                        !fold_hidden_range(lines, *f).is_some_and(|r| r.contains(&cursor_line))
-                    });
-                    self.fold_version += 1;
-                }
-                let hidden = fold_hidden_lines(lines, &self.folded);
-                if !hidden.is_empty() {
-                    planned.retain(|r| !hidden.contains(&r.line));
-                }
-            }
             self.planned = planned;
             self.planned_version = self.buffer.text_version();
             self.planned_key = key;
@@ -746,6 +531,11 @@ impl LiveMarkdownView {
         // `after_move`, which preserves it); the query itself re-derives
         // from the buffer each frame.
         self.slash_index = 0;
+        // 查找面板的匹配跟随文档（`InputState::update_search` parity）。
+        if let Some(panel) = self.search_panel.clone() {
+            let text = Rope::from(self.buffer.text());
+            panel.update(cx, |p, _| p.sync_text(&text));
+        }
         cx.emit(LiveViewEvent::Change(self.buffer.text()));
         cx.notify();
         cx.stop_propagation();
@@ -766,20 +556,6 @@ impl LiveMarkdownView {
             .iter()
             .find(|r| r.line == line)
             .is_some_and(|r| crate::editor::markdown_live::interactions::is_source_only(&r.block))
-    }
-
-    /// Toggle Typora-style outline folding at heading `line`: its section
-    /// (until the next same-or-higher heading) hides from the plan.
-    /// Non-headings and childless headings are no-ops.
-    fn toggle_fold(&mut self, line: usize, cx: &mut Context<Self>) {
-        if fold_hidden_range(self.buffer.lines(), line).is_none() {
-            return;
-        }
-        if !self.folded.remove(&line) {
-            self.folded.insert(line);
-        }
-        self.fold_version += 1;
-        cx.notify();
     }
 
     /// Open slash-command menu `(query, SLASH_COMMANDS indices)` when the
@@ -1253,11 +1029,11 @@ impl LiveMarkdownView {
         let platform = ks.modifiers.platform;
         let control = ks.modifiers.control;
         let alt = ks.modifiers.alt;
-        // 查找框聚焦时正文快捷键全部让行（Typora parity），仅保留查找
-        // 自己的 Cmd+F / Cmd+G / Esc / 回车（输入框不消费它们，会冒泡上来）。
-        if self.find_input_focused(window, cx) && !matches!(
+        // 查找面板输入框聚焦时正文快捷键全部让行（`SearchPanel` 自带
+        // Enter/Escape/Tab action），仅保留 Cmd+F / Cmd+G / Esc。
+        if self.search_panel_focused(window, cx) && !matches!(
             (key, platform),
-            ("f", true) | ("g", true) | ("escape", _) | ("enter", _)
+            ("f", true) | ("g", true) | ("escape", _)
         ) {
             return;
         }
@@ -1267,6 +1043,7 @@ impl LiveMarkdownView {
         // Anything else falls through so typing filters the menu live.
         if !platform && !control && !alt
             && self.buffer.selection().is_none()
+            && !self.search_panel_focused(window, cx)
             && let Some((query, items)) = self.slash_menu()
         {
             match key {
@@ -1430,23 +1207,6 @@ impl LiveMarkdownView {
                 return;
             }
             "enter" => {
-                if self.find_input_focused(window, cx) {
-                    if self.read_only {
-                        cx.stop_propagation();
-                        return;
-                    }
-                    let replace_focused = self.find_replace.as_ref().is_some_and(|r| {
-                        r.read(cx).focus_handle.is_focused(window)
-                    });
-                    if replace_focused {
-                        self.find_replace_current(cx);
-                        self.find_goto(1, cx);
-                    } else {
-                        self.find_goto(if shift { -1 } else { 1 }, cx);
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
                 if platform {
                     if self.read_only {
                         return;
@@ -1532,8 +1292,10 @@ impl LiveMarkdownView {
                 return;
             }
             "escape" => {
-                if self.find_open {
-                    self.close_find(window, cx);
+                if let Some(panel) = self.search_panel.clone()
+                    && panel.read(cx).is_open()
+                {
+                    panel.update(cx, |p, cx| p.hide(window, cx));
                     cx.stop_propagation();
                     return;
                 }
@@ -1659,19 +1421,21 @@ impl LiveMarkdownView {
                 return;
             }
             "f" if platform => {
-                // Typora 查找条（只读也允许查找，替换行自动隐藏）。
-                self.open_find(window, cx);
+                // 代码编辑器同款查找面板（只读也允许查找，替换行自动隐藏）。
+                self.open_search(window, cx);
                 cx.stop_propagation();
                 return;
             }
             "g" if platform => {
-                if !self.find_open {
-                    self.open_find(window, cx);
-                    if shift {
-                        self.find_goto(-1, cx);
+                if self.search_panel.is_none() {
+                    self.open_search(window, cx);
+                    if shift
+                        && let Some(panel) = self.search_panel.clone()
+                    {
+                        panel.update(cx, |p, cx| p.jump(-1, window, cx));
                     }
-                } else {
-                    self.find_goto(if shift { -1 } else { 1 }, cx);
+                } else if let Some(panel) = self.search_panel.clone() {
+                    panel.update(cx, |p, cx| p.jump(if shift { -1 } else { 1 }, window, cx));
                 }
                 cx.stop_propagation();
                 return;
@@ -1696,7 +1460,7 @@ impl LiveMarkdownView {
         if !self.read_only
             && !platform
             && !control
-            && !self.find_input_focused(window, cx)
+            && !self.search_panel_focused(window, cx)
             && let Some(text) = ks.key_char.as_deref().filter(|t| !t.is_empty())
         {
             let mut cs = text.chars();
@@ -1789,49 +1553,6 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
     }
 }
 
-/// ATX heading level of a source line (`#`..`######` followed by
-/// whitespace/EOL), if any. Drives outline folding (Typora parity);
-/// setext headings are rare and stay unfolded.
-fn heading_level_of(line: &str) -> Option<u8> {
-    let hashes = line.bytes().take_while(|&b| b == b'#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    match line.as_bytes().get(hashes) {
-        None | Some(b' ') | Some(b'\t') => Some(hashes as u8),
-        _ => None,
-    }
-}
-
-/// Hidden source-line range for folded heading `line`: subsequent lines
-/// until the next same-or-higher heading. `None` for non-headings and
-/// childless (leaf) headings, which are no-ops to fold.
-fn fold_hidden_range(lines: &[String], line: usize) -> Option<std::ops::Range<usize>> {
-    let level = heading_level_of(lines.get(line)?)?;
-    let mut end = line + 1;
-    while end < lines.len() {
-        match heading_level_of(&lines[end]) {
-            Some(lv) if lv <= level => break,
-            _ => end += 1,
-        }
-    }
-    if end == line + 1 {
-        return None;
-    }
-    Some(line + 1..end)
-}
-
-/// Union of hidden lines for every folded heading.
-fn fold_hidden_lines(lines: &[String], folded: &BTreeSet<usize>) -> BTreeSet<usize> {
-    let mut out = BTreeSet::new();
-    for &f in folded {
-        if let Some(range) = fold_hidden_range(lines, f) {
-            out.extend(range);
-        }
-    }
-    out
-}
-
 /// Outline entries `(source line, level, title)` in document order.
 fn outline_entries(rows: &[PlannedRow]) -> Vec<(usize, u8, String)> {
     rows
@@ -1891,6 +1612,105 @@ fn align_of(cell: &str) -> CellAlign {
         (true, false) => CellAlign::Left,
         (false, true) => CellAlign::Right,
         _ => CellAlign::None,
+    }
+}
+
+impl SearchTarget for LiveMarkdownView {
+    fn search_text(&self) -> Rope {
+        Rope::from(self.buffer.text())
+    }
+
+    fn search_prefill(&self) -> Rope {
+        let first: String = self
+            .selected_source_text()
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
+        Rope::from(first)
+    }
+
+    fn search_caret(&self) -> usize {
+        self.search_caret_offset()
+    }
+
+    fn anchor_offset(&self) -> Option<usize> {
+        Some(self.search_caret_offset())
+    }
+
+    fn reveal_match(&mut self, range: std::ops::Range<usize>, _w: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.buffer.lines().to_vec();
+        let s = pos_of_offset(&lines, range.start);
+        let e = pos_of_offset(&lines, range.end);
+        self.edit(cx, |m| {
+            m.move_to(s.line, s.col, false);
+            m.move_to(e.line, e.col, true);
+        });
+    }
+
+    fn replace_match(
+        &mut self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let lines = self.buffer.lines().to_vec();
+        let s = pos_of_offset(&lines, range.start);
+        let e = pos_of_offset(&lines, range.end);
+        self.edit(cx, |m| m.replace_range(s, e, text));
+        self.after_edit(cx);
+    }
+
+    fn replace_all_matches(
+        &mut self,
+        pairs: &[(std::ops::Range<usize>, String)],
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        let lines = self.buffer.lines().to_vec();
+        let ranges: Vec<(Pos, Pos, String)> = pairs
+            .iter()
+            .map(|(r, t)| {
+                (
+                    pos_of_offset(&lines, r.start),
+                    pos_of_offset(&lines, r.end),
+                    t.clone(),
+                )
+            })
+            .collect();
+        if ranges.is_empty() {
+            return;
+        }
+        self.edit(cx, |m| m.replace_ranges_each(&ranges));
+        self.after_edit(cx);
+    }
+
+    fn scroll_to_offset(
+        &mut self,
+        _offset: usize,
+        _direction: Option<crate::components::input::movement::MoveDirection>,
+        _cx: &mut Context<Self>,
+    ) {
+        // `edit` 已置 `scroll_to_cursor`（光标落在替换处），与旧自实现行为一致。
+    }
+
+    fn search_replaceable(&self) -> bool {
+        !self.read_only
+    }
+
+    fn target_focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
@@ -1972,8 +1792,6 @@ impl Render for LiveMarkdownView {
             self.blink_on = false;
         }
         let show_caret = self.show_caret(window, cx);
-        // 查找条打开时每帧对齐查询/文本/选项（`SearchMatcher` 只在变化时重跑）。
-        self.resync_find(cx);
 
         // Fresh per-frame hit geometry (LiveLine::paint repopulates).
         self.row_layouts.clear();
@@ -2030,15 +1848,20 @@ impl Render for LiveMarkdownView {
         // (multi-line matches split per row, hidden-marker spans dropped).
         let find_marks: HashMap<usize, Vec<(usize, usize, bool)>> = {
             let mut marks: HashMap<usize, Vec<(usize, usize, bool)>> = HashMap::new();
-            if self.find_open
-                && !self.find_query_invalid
-                && self.find_matcher.match_count() > 0
-            {
-                let current = self.find_matcher.current_ix();
+            let (match_ranges, current) = self
+                .search_panel
+                .as_ref()
+                .and_then(|p| {
+                    p.read(cx)
+                        .matcher()
+                        .map(|m| (m.match_ranges().to_vec(), m.current_ix()))
+                })
+                .unwrap_or_default();
+            if !match_ranges.is_empty() {
                 let row_by_line: HashMap<usize, usize> =
                     rows.iter().enumerate().map(|(pi, r)| (r.line, pi)).collect();
                 let lines = self.buffer.lines();
-                for (ix, range) in self.find_matcher.match_ranges().iter().enumerate() {
+                for (ix, range) in match_ranges.iter().enumerate() {
                     let start = pos_of_offset(lines, range.start);
                     let end = pos_of_offset(lines, range.end);
                     for line in start.line..=end.line {
@@ -2352,44 +2175,6 @@ impl Render for LiveMarkdownView {
                         }
                         RowKind::Heading(level) => {
                             let level = *level;
-                            // Outline folding chevron (Typora parity): only
-                            // headings with a foldable section get one; a
-                            // folded heading shows how many lines are hidden.
-                            let fold_range = fold_hidden_range(self.buffer.lines(), row.line);
-                            let fold_line = row.line;
-                            let fold_chevron: Option<gpui::AnyElement> = fold_range.as_ref().map(|range| {
-                                let hidden_n = range.len();
-                                let folded = self.folded.contains(&fold_line);
-                                let mut chev = div()
-                                    .id(("live-fold", fold_line))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(2.))
-                                    .mt(px(2.))
-                                    .text_size(px(12.))
-                                    .text_color(ui.text_muted.opacity(0.6))
-                                    .cursor_pointer()
-                                    .child(if folded { "▸" } else { "▾" })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _e, window, cx| {
-                                            window.focus(&this.focus, cx);
-                                            this.toggle_fold(fold_line, cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    );
-                                if folded {
-                                    chev = chev.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(ui.text_muted.opacity(0.55))
-                                            .child(format!("{hidden_n}")),
-                                    );
-                                }
-                                chev.into_any_element()
-                            });
                             let mut head = match level {
                                 1 => div().mt_8().mb_4().pb_2(),
                                 2 => div().mt_7().mb_3().pb_2(),
@@ -2436,9 +2221,6 @@ impl Render for LiveMarkdownView {
                                 .group_hover("heading", |s| s.visible())
                                 .child("#")
                                 .into_any_element();
-                            if let Some(chev) = fold_chevron {
-                                head = head.child(chev);
-                            }
                             head.child(
                                 div()
                                     .flex_1()
@@ -3332,187 +3114,6 @@ impl Render for LiveMarkdownView {
 
         // Find bar (Typora Cmd+F parity): query + count + prev/next/close,
         // option chips, collapsible replace row. Fixed above the content.
-        let find_bar: Option<gpui::AnyElement> = self.find_open.then(|| {
-            let query = self.find_query.clone().expect("find query input");
-            let replace = self.find_replace.clone().expect("find replace input");
-            let query_focused = query.read(cx).focus_handle.is_focused(window);
-            let replace_focused = replace.read(cx).focus_handle.is_focused(window);
-            let count = self.find_matcher.match_count();
-            let current = self.find_matcher.current_ix();
-            let query_text = self.find_query_text(cx);
-            let (counter_text, counter_color) = if self.find_query_invalid && !query_text.is_empty()
-            {
-                ("正则无效".to_string(), theme.ui.error)
-            } else if query_text.is_empty() {
-                (String::new(), ui.text_muted)
-            } else if count == 0 {
-                ("无结果".to_string(), ui.text_muted)
-            } else {
-                (format!("{}/{}", current + 1, count), ui.text_muted)
-            };
-            let can_replace = !self.read_only;
-            let replace_visible = self.find_replace_mode && can_replace;
-            let field_bg = theme.editor_background();
-            // 小尺寸可点击文本按钮（与大纲切换同风格，不引入 Button 依赖）。
-            let chip = |id: &'static str, label: &'static str, active: bool| {
-                div()
-                    .id(id)
-                    .cursor_pointer()
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(6.))
-                    .text_size(px(11.))
-                    .whitespace_nowrap()
-                    .text_color(if active { ui.accent } else { ui.text_muted })
-                    .when(active, |this| this.bg(ui.accent.opacity(0.12)))
-                    .hover(|this| this.bg(ui.tab_hover_background))
-                    .child(label)
-            };
-            let query_field = div()
-                .flex_1()
-                .min_w(px(60.))
-                .h(px(26.))
-                .px(px(8.))
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .bg(field_bg)
-                .border_1()
-                .border_color(if query_focused {
-                    ui.accent
-                } else {
-                    ui.border.opacity(0.6)
-                })
-                .child(EditorInput::new(&query).transparent().small());
-            let find_row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .w_full()
-                .gap(px(4.))
-                .child(query_field)
-                .child(
-                    div()
-                        .min_w(px(40.))
-                        .text_size(px(11.))
-                        .whitespace_nowrap()
-                        .text_color(counter_color)
-                        .child(counter_text),
-                )
-                .child(
-                    chip("live-find-case", "Aa", !self.find_case_insensitive).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.find_case_insensitive = !this.find_case_insensitive;
-                            this.resync_find(cx);
-                            this.focus_find_input(false, window, cx);
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    chip("live-find-word", "ab", self.find_whole_word).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.find_whole_word = !this.find_whole_word;
-                            this.resync_find(cx);
-                            this.focus_find_input(false, window, cx);
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    chip("live-find-regex", ".*", self.find_use_regex).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.find_use_regex = !this.find_use_regex;
-                            this.resync_find(cx);
-                            this.focus_find_input(false, window, cx);
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(chip("live-find-prev", "\u{2039}", false).on_click(
-                    cx.listener(|this, _, window, cx| {
-                        this.find_goto(-1, cx);
-                        this.focus_find_input(false, window, cx);
-                    }),
-                ))
-                .child(chip("live-find-next", "\u{203A}", false).on_click(
-                    cx.listener(|this, _, window, cx| {
-                        this.find_goto(1, cx);
-                        this.focus_find_input(false, window, cx);
-                    }),
-                ))
-                .when(can_replace, |this| {
-                    this.child(
-                        chip("live-find-replace-toggle", "替换", self.find_replace_mode).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.find_replace_mode = !this.find_replace_mode;
-                                this.focus_find_input(this.find_replace_mode, window, cx);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                })
-                .child(chip("live-find-close", "\u{00D7}", false).on_click(
-                    cx.listener(|this, _, window, cx| {
-                        this.close_find(window, cx);
-                    }),
-                ));
-            let mut bar = div()
-                .flex_shrink_0()
-                .w_full()
-                .mb(px(6.))
-                .p(px(6.))
-                .rounded(px(8.))
-                .bg(ui.panel_background)
-                .border_1()
-                .border_color(ui.border.opacity(0.5))
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(find_row);
-            if replace_visible {
-                let replace_field = div()
-                    .flex_1()
-                    .min_w(px(60.))
-                    .h(px(26.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .bg(field_bg)
-                    .border_1()
-                    .border_color(if replace_focused {
-                        ui.accent
-                    } else {
-                        ui.border.opacity(0.6)
-                    })
-                    .child(EditorInput::new(&replace).transparent().small());
-                bar = bar.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .w_full()
-                        .gap(px(4.))
-                        .child(replace_field)
-                        .child(chip("live-replace-one", "替换", false).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.find_replace_current(cx);
-                                this.find_goto(1, cx);
-                                this.focus_find_input(true, window, cx);
-                            }),
-                        ))
-                        .child(chip("live-replace-all", "全部", false).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.find_replace_all(cx);
-                                this.focus_find_input(true, window, cx);
-                            }),
-                        )),
-                );
-            }
-            bar.into_any_element()
-        });
-
         // Slash `/` menu (Typora/Notion parity): an in-flow bar above the
         // status strip listing the filtered block commands. It derives from
         // the buffer every frame, so no open/close state is stored.
@@ -3635,7 +3236,9 @@ impl Render for LiveMarkdownView {
                             .pb_2()
                             .h_full()
                             .overflow_hidden()
-                            .when_some(find_bar, |this, bar| this.child(bar))
+                            .when_some(self.search_panel.clone(), |this, panel| {
+                                this.child(panel)
+                            })
                             .child(
                                 div()
                                     .id("live-markdown-content")
@@ -4268,29 +3871,6 @@ mod live_showcase_tests {
         );
         assert_eq!(outline_title("  a  b  "), "a b");
         assert_eq!(outline_title(""), "(空标题)");
-    }
-
-    #[test]
-    fn fold_ranges_stop_at_same_or_higher_heading() {
-        let doc = "# A\n\na1\n\n## B\n\nb1\n\n## C\n\nc1\n\n# D";
-        let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
-        assert_eq!(heading_level_of("# A"), Some(1));
-        assert_eq!(heading_level_of("###deep"), None);
-        assert_eq!(heading_level_of("####### x"), None);
-        assert_eq!(heading_level_of("a1"), None);
-        // `# A` hides everything up to (not including) `# D`.
-        let range = fold_hidden_range(&lines, 0).unwrap();
-        assert_eq!(range, 1..12);
-        // `## B` stops at `## C`.
-        assert_eq!(fold_hidden_range(&lines, 4).unwrap(), 5..8);
-        // `# D` is childless: not foldable.
-        assert!(fold_hidden_range(&lines, 12).is_none());
-        // Plain lines are not foldable.
-        assert!(fold_hidden_range(&lines, 2).is_none());
-        let mut folded = BTreeSet::new();
-        folded.insert(4);
-        let hidden = fold_hidden_lines(&lines, &folded);
-        assert_eq!(hidden, BTreeSet::from([5, 6, 7]));
     }
 
     #[test]

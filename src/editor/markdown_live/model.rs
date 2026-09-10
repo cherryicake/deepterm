@@ -565,6 +565,31 @@ impl EditorModel {
     self.goal_col = None;
   }
 
+  /// Replace every range with its own text as ONE undo step (bulk
+  /// replace with per-match case preservation). Ranges must be
+  /// non-overlapping; applied back-to-front so earlier offsets stay valid.
+  pub fn replace_ranges_each(&mut self, ranges: &[(Pos, Pos, String)]) {
+    if ranges.is_empty() {
+      return;
+    }
+    let mut order: Vec<(Pos, Pos, String)> = ranges
+      .iter()
+      .map(|(s, e, t)| {
+        let (s, e) = if e < s { (*e, *s) } else { (*s, *e) };
+        (s, e, t.replace('\r', ""))
+      })
+      .collect();
+    order.sort_by(|a, b| b.0.cmp(&a.0));
+    self.push_undo(false);
+    self.anchor = None;
+    for (s, e, text) in order {
+      self.remove_range(s, e);
+      self.cursor = s;
+      self.insert_at_cursor(&text);
+    }
+    self.goal_col = None;
+  }
+
   pub fn can_undo(&self) -> bool {
     !self.undo.is_empty()
   }
@@ -1333,6 +1358,18 @@ mod tests {
     m.replace_ranges(&[(at(0, 0), at(0, 3)), (at(0, 8), at(0, 11))], "baz");
     assert_eq!(m.text(), "baz bar baz");
     assert!(m.can_undo());
+    assert!(m.undo());
+    assert_eq!(m.text(), "foo bar foo");
+  }
+
+  #[test]
+  fn replace_ranges_each_single_undo_step() {
+    let mut m = EditorModel::new("foo bar foo");
+    m.replace_ranges_each(&[
+      (at(0, 0), at(0, 3), "BAZ".to_string()),
+      (at(0, 8), at(0, 11), "qux".to_string()),
+    ]);
+    assert_eq!(m.text(), "BAZ bar qux");
     assert!(m.undo());
     assert_eq!(m.text(), "foo bar foo");
   }

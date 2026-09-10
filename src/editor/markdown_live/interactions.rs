@@ -6,7 +6,6 @@
 //! layer (`view.rs`) wraps these in `buffer.edit(...)` transactions.
 
 use crate::editor::markdown_live::block::{classify, table_delimiter_cols, Block, DocState};
-use std::ops::Range;
 
 use crate::editor::markdown_live::layout::{byte_for_col, col_for_byte, RowKind};
 use crate::editor::markdown_live::model::{EditorModel, Pos};
@@ -472,39 +471,6 @@ pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {
     )
 }
 
-/// Next/prev match index from a caret byte offset (mirrors the code
-/// editor's `jump_target`): next is the first match at/after the caret, or
-/// the one after when the caret sits inside a match (wraps); prev mirrors
-/// it. After a jump the selection covers the match, so `start < caret`
-/// alone would re-pick the same match for "prev" — the inside-match arms
-/// guard exactly that.
-pub fn find_jump_target(ranges: &[Range<usize>], caret: usize, dir: i32) -> Option<usize> {
-    let len = ranges.len();
-    if len == 0 {
-        return None;
-    }
-    if dir >= 0 {
-        for (ix, r) in ranges.iter().enumerate() {
-            if caret < r.start {
-                return Some(ix);
-            }
-            if caret < r.end {
-                return Some((ix + 1) % len);
-            }
-        }
-        return Some(0);
-    }
-    for (ix, r) in ranges.iter().enumerate().rev() {
-        if r.start < caret {
-            if caret <= r.end {
-                return Some((ix + len - 1) % len);
-            }
-            return Some(ix);
-        }
-    }
-    Some(len - 1)
-}
-
 /// A `/` block command (Typora/Notion slash menu): `title` shows in the
 /// menu, `hint` shows the marker preview, `filter` matches the query,
 /// `insert` replaces the `/query`, `back` retreats the cursor afterwards,
@@ -622,20 +588,6 @@ mod tests {
         assert_eq!(pos_of_offset(&lines, 6), Pos::new(1, 3));
         assert_eq!(pos_of_offset(&lines, 7), Pos::new(2, 0));
         assert_eq!(pos_of_offset(&lines, 999), Pos::new(2, 0));
-    }
-
-    #[test]
-    fn find_jump_target_next_prev_wrap() {
-        let ranges = vec![2..4, 10..12, 20..22];
-        assert_eq!(find_jump_target(&ranges, 0, 1), Some(0));
-        assert_eq!(find_jump_target(&ranges, 3, 1), Some(1));
-        assert_eq!(find_jump_target(&ranges, 12, 1), Some(2));
-        assert_eq!(find_jump_target(&ranges, 99, 1), Some(0));
-        assert_eq!(find_jump_target(&ranges, 99, -1), Some(2));
-        assert_eq!(find_jump_target(&ranges, 11, -1), Some(0));
-        assert_eq!(find_jump_target(&ranges, 10, -1), Some(0));
-        assert_eq!(find_jump_target(&ranges, 0, -1), Some(2));
-        assert!(find_jump_target(&[], 5, 1).is_none());
     }
 
   #[test]
