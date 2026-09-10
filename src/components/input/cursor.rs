@@ -102,7 +102,9 @@ impl CursorLayout {
             fill(bounds, self.color)
         };
         window.paint_quad(quad);
-        if let Some(block_text) = &self.block_text {
+        if matches!(self.shape, CursorShape::Block)
+            && let Some(block_text) = &self.block_text
+        {
             let _ = block_text.paint(
                 self.origin,
                 self.line_height,

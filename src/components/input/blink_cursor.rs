@@ -76,6 +76,7 @@ impl BlinkCursor {
         if !enabled {
             self.show_cursor(cx);
         } else if self.enabled {
+            self.visible = false;
             self.blink_cursors(self.epoch, cx);
         }
     }

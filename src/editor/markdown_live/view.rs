@@ -2807,7 +2807,15 @@ impl Render for LiveMarkdownView {
                                 CURSOR_WIDTH,
                                 px(26.),
                             )
-                            .with_caret_shape(self.cursor_shape),
+                            .with_caret_shape(self.cursor_shape)
+                            .with_caret_block(
+                                if self.cursor_shape.is_block_like() {
+                                    (px(26.) * 0.6).max(CURSOR_WIDTH)
+                                } else {
+                                    CURSOR_WIDTH
+                                },
+                                None,
+                            ),
                         )
                         .into_any_element(),
                 );
