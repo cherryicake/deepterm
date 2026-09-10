@@ -102,6 +102,29 @@ pub struct LiveMarkdownView {
     /// 跳转与替换逻辑全部复用，不再自实现（`SearchTarget` 桥接行列缓冲）。
     search_panel: Option<Entity<SearchPanel<LiveMarkdownView>>>,
     _subscriptions: Vec<Subscription>,
+    /// 行虚拟化（大文档）：每帧只建视口内 group 的元素，其余以占位撑高。
+    /// group 粒度保证代码卡片/引用/表格不被拦腰截断；小文档走全量老路。
+    /// 上一帧实测的 group 高（`scroll.child_bounds` 回填；文本变化即清空，
+    /// group 序号会移位），缺失时用行数估算，绘制后逐帧自我修正。
+    group_heights: std::collections::HashMap<usize, f32>,
+    heights_version: u64,
+    /// 上一帧视口宽：换行随宽度变化，变宽即清空 `group_heights`。
+    last_vp_width: f32,
+    /// 上一帧渲染的 group 窗口（含占位映射），供本帧回填实测高度。
+    last_window: Option<(usize, usize)>,
+    /// 本帧虚拟化几何（点击映射用；非虚拟化时为空）：前缀和、每 group
+    /// 首末源码行、窗口下界、顶部占位占用的 child 序号偏移。
+    virt_prefix: Vec<f32>,
+    virt_group_lines: Vec<(usize, usize)>,
+    virt_lo: usize,
+    virt_hi: usize,
+    virt_top_off: usize,
+    /// 状态条字数缓存 `(text_version, selection, chars, lines, sel_chars)`：
+    /// 全文档字符统计每帧 O(n)，命中缓存后为 O(1)。
+    stat_cache: Option<(u64, Option<(Pos, Pos)>, usize, usize, Option<usize>)>,
+    /// 测试探针：上帧 `(groups_total, groups_rendered, virtualized)`。
+    #[cfg(test)]
+    last_render_stats: (usize, usize, bool),
 }
 
 impl EventEmitter<LiveViewEvent> for LiveMarkdownView {}
@@ -143,6 +166,18 @@ impl LiveMarkdownView {
             slash_suppress: None,
             search_panel: None,
             _subscriptions,
+            group_heights: std::collections::HashMap::new(),
+            heights_version: u64::MAX,
+            last_vp_width: 0.0,
+            last_window: None,
+            virt_prefix: Vec::new(),
+            virt_group_lines: Vec::new(),
+            virt_lo: 0,
+            virt_hi: 0,
+            virt_top_off: 0,
+            stat_cache: None,
+            #[cfg(test)]
+            last_render_stats: (0, 0, false),
         }
     }
 
@@ -194,6 +229,12 @@ impl LiveMarkdownView {
 
     pub fn text_version(&self) -> u64 {
         self.buffer.text_version()
+    }
+
+    /// 测试探针：上帧 `(groups_total, groups_rendered, virtualized)`。
+    #[cfg(test)]
+    pub fn last_virtualization_stats(&self) -> (usize, usize, bool) {
+        self.last_render_stats
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -680,9 +721,32 @@ impl LiveMarkdownView {
             return None;
         }
         let doc_y = f32::from(y) - f32::from(self.scroll.offset().y);
+        // Virtualized: clicks landing on spacers (unrendered territory)
+        // map through prefix sums to the group under the cursor instead of
+        // snapping to the nearest *rendered* row.
+        if !self.virt_prefix.is_empty() && !self.virt_group_lines.is_empty() {
+            let g = self.virt_group_lines.len();
+            let rendered_top = self.virt_prefix[self.virt_lo.min(g)];
+            let rendered_bot = self.virt_prefix[(self.virt_hi + 1).min(g)];
+            if doc_y < rendered_top || doc_y > rendered_bot {
+                let total = self.virt_prefix[g];
+                let y = doc_y.clamp(0.0, total);
+                let mut gi = g - 1;
+                for (i, w) in self.virt_prefix.windows(2).enumerate() {
+                    if y < w[1] || i == g - 1 {
+                        gi = i;
+                        break;
+                    }
+                }
+                return Some(self.virt_group_lines[gi.min(g - 1)]);
+            }
+        }
+        // Rendered rows live after the top spacer (if any) in the scroll
+        // column's child list.
+        let base = self.virt_top_off;
         let mut best: Option<(usize, f32)> = None;
         for ix in 0..n {
-            let Some(b) = self.scroll.bounds_for_item(ix) else {
+            let Some(b) = self.scroll.bounds_for_item(ix + base) else {
                 continue;
             };
             let (top, bottom) = (f32::from(b.top()), f32::from(b.bottom()));
@@ -1738,6 +1802,15 @@ pub(crate) struct RowLayoutInfo {
     pub text_len: usize,
 }
 
+/// 行虚拟化调参：超过该 group 数即只建视口内元素（`OVERSCAN_GROUPS`
+/// 上下各多建一点 cover 滚动）。
+const VIRTUALIZE_GROUPS: usize = 200;
+const OVERSCAN_GROUPS: usize = 12;
+/// 首帧视口未知时预建的 group 数（滚动后按真实视口修正）。
+const FIRST_WINDOW_GROUPS: usize = 80;
+/// 未实测 group 的高度估算：单行高 + 各容器 chrome。
+const EST_LINE_H: f32 = 26.0;
+
 /// A render group: consecutive rows sharing one chrome container.
 enum Group {
     One(usize),
@@ -1753,6 +1826,190 @@ enum Group {
     Para(Vec<usize>),
     Quote(Vec<usize>),
     Table(Vec<usize>),
+}
+
+impl Group {
+    /// Source-row count (height-estimate input for virtualization).
+    fn row_count(&self) -> usize {
+        match self {
+            Group::One(_) => 1,
+            Group::Fence { code, .. } => code.len() + 2,
+            Group::Para(v) | Group::Quote(v) | Group::Table(v) => v.len(),
+        }
+    }
+
+    /// Chrome padding beyond `row_count * EST_LINE_H` (card margins,
+    /// paddings, headers); refined by measured heights after paint.
+    fn chrome(&self) -> f32 {
+        match self {
+            Group::One(_) => 0.0,
+            Group::Fence { .. } => 64.0,
+            Group::Table(_) => 48.0,
+            Group::Quote(_) => 24.0,
+            Group::Para(_) => 20.0,
+        }
+    }
+
+    /// (first, last) source line covered (click mapping for virtualization).
+    fn line_range(&self, rows: &[PlannedRow]) -> (usize, usize) {
+        match self {
+            Group::One(pi) => {
+                let l = rows.get(*pi).map(|r| r.line).unwrap_or(0);
+                (l, l)
+            }
+            Group::Fence {
+                open, code, close, ..
+            } => {
+                let a = rows.get(*open).map(|r| r.line).unwrap_or(0);
+                let last_pi = close.or_else(|| code.last().copied()).unwrap_or(*open);
+                let b = rows.get(last_pi).map(|r| r.line).unwrap_or(a);
+                (a, b)
+            }
+            Group::Para(v) | Group::Quote(v) | Group::Table(v) => {
+                let a = v
+                    .first()
+                    .and_then(|pi| rows.get(*pi))
+                    .map(|r| r.line)
+                    .unwrap_or(0);
+                let b = v
+                    .last()
+                    .and_then(|pi| rows.get(*pi))
+                    .map(|r| r.line)
+                    .unwrap_or(a);
+                (a, b)
+            }
+        }
+    }
+}
+
+impl LiveMarkdownView {
+    /// This frame's group window for row virtualization (`None` = small doc,
+    /// render everything on the legacy path).
+    ///
+    /// Large markdown docs build thousands of row elements per frame; each
+    /// costs layout + paint on the UI thread (~0.1ms/row in debug), so every
+    /// blink tick / cursor move / theme refresh freezes the app. Only the
+    /// viewport window (+ overscan) becomes elements; spacers preserve total
+    /// scroll height. Group granularity keeps code cards, quotes and tables
+    /// whole. Heights self-correct: measured child bounds feed back into
+    /// `group_heights`, estimates cover the rest.
+    fn virtual_window(
+        &mut self,
+        ginfo: &[(usize, f32, (usize, usize))],
+        cursor_line: usize,
+        text_version: u64,
+        want_caret: bool,
+    ) -> Option<(usize, usize, f32, f32)> {
+        let g = ginfo.len();
+        if g <= VIRTUALIZE_GROUPS || g == 0 {
+            self.virt_prefix.clear();
+            self.virt_group_lines.clear();
+            self.virt_lo = 0;
+            self.virt_hi = 0;
+            self.virt_top_off = 0;
+            self.last_window = None;
+            return None;
+        }
+        // Text edits shift group indices: drop measured heights for one
+        // frame of estimates (steady blink/scroll frames stay exact).
+        if text_version != self.heights_version {
+            self.group_heights.clear();
+            self.heights_version = text_version;
+        }
+        // Wrapping follows viewport width: re-measure after resize.
+        let vp = self.scroll.bounds();
+        let vp_w = f32::from(vp.size.width);
+        if vp_w > 0.0 && (self.last_vp_width - vp_w).abs() > 1.0 {
+            self.group_heights.clear();
+        }
+        self.last_vp_width = vp_w;
+        // Feed back last frame's measured heights (mapping is unambiguous:
+        // top spacer? + window groups + bottom spacer?).
+        if let Some((plo, phi)) = self.last_window
+            && phi < g
+        {
+            let top_off = usize::from(plo > 0);
+            let bot_off = usize::from(phi + 1 < g);
+            let expected = (phi - plo + 1) + top_off + bot_off;
+            let mut count = 0usize;
+            while count < expected && self.scroll.bounds_for_item(count).is_some() {
+                count += 1;
+            }
+            if count == expected {
+                for k in 0..=(phi - plo) {
+                    if let Some(b) = self.scroll.bounds_for_item(k + top_off) {
+                        self.group_heights.insert(plo + k, f32::from(b.size.height));
+                    }
+                }
+            }
+        }
+        // Prefix sums over measured heights, estimates for the rest.
+        let mut prefix = Vec::with_capacity(g + 1);
+        prefix.push(0.0f32);
+        for (i, (rows, chrome, _)) in ginfo.iter().enumerate() {
+            let h = self
+                .group_heights
+                .get(&i)
+                .copied()
+                .unwrap_or((*rows as f32) * EST_LINE_H + chrome);
+            prefix.push(prefix[i] + h);
+        }
+        // Viewport window in content pixels.
+        let vp_h = f32::from(vp.size.height);
+        let (mut lo, mut hi) = if vp_h <= 0.0 {
+            (0, FIRST_WINDOW_GROUPS.min(g - 1))
+        } else {
+            let off_y = -f32::from(self.scroll.offset().y);
+            let mut lo0 = 0;
+            for i in 0..g {
+                if prefix[i + 1] > off_y {
+                    lo0 = i;
+                    break;
+                }
+                lo0 = i;
+            }
+            let mut hi0 = g - 1;
+            for i in (0..g).rev() {
+                if prefix[i] < off_y + vp_h {
+                    hi0 = i;
+                    break;
+                }
+                hi0 = i;
+            }
+            (
+                lo0.saturating_sub(OVERSCAN_GROUPS),
+                (hi0 + OVERSCAN_GROUPS).min(g - 1),
+            )
+        };
+        // Caret edits/moves must land inside the window (scroll_to_item
+        // consumes the mapped child index in the same frame's prepaint).
+        if want_caret {
+            let mut gc = g - 1;
+            for (i, (_, _, (a, b))) in ginfo.iter().enumerate() {
+                if *a <= cursor_line && cursor_line <= *b {
+                    gc = i;
+                    break;
+                }
+            }
+            if gc < lo || gc > hi {
+                lo = gc.saturating_sub(OVERSCAN_GROUPS);
+                hi = (gc + OVERSCAN_GROUPS + 64).min(g - 1);
+            }
+        }
+        self.virt_prefix = prefix;
+        self.virt_group_lines = ginfo.iter().map(|(_, _, lr)| *lr).collect();
+        self.virt_lo = lo;
+        self.virt_hi = hi;
+        self.virt_top_off = usize::from(lo > 0);
+        self.last_window = Some((lo, hi));
+        let total = self.virt_prefix[g];
+        Some((
+            lo,
+            hi,
+            self.virt_prefix[lo],
+            total - self.virt_prefix[hi + 1],
+        ))
+    }
 }
 
 impl Render for LiveMarkdownView {
@@ -2086,7 +2343,33 @@ impl Render for LiveMarkdownView {
             .with_caret_block(paint.caret_block_width, paint.caret_block_text.clone())
         };
 
-        for group in &groups {
+        // Row virtualization window (large docs only; small docs render
+        // everything exactly as before). `ginfo` is owned so the `&mut`
+        // window computation below doesn't fight the `rows` borrow.
+        let ginfo: Vec<(usize, f32, (usize, usize))> = groups
+            .iter()
+            .map(|gr| (gr.row_count(), gr.chrome(), gr.line_range(&rows)))
+            .collect();
+        let text_version = self.buffer.text_version();
+        let want_caret = self.scroll_to_cursor;
+        let vw = self.virtual_window(&ginfo, cursor.line, text_version, want_caret);
+        let virtualized = vw.is_some();
+        let (v_lo, v_hi, v_top_px, v_bot_px) =
+            vw.unwrap_or((0, groups.len().saturating_sub(1), 0.0, 0.0));
+        if virtualized && v_top_px > 0.0 {
+            row_els.push(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .h(px(v_top_px))
+                    .into_any_element(),
+            );
+        }
+
+        for (gi, group) in groups.iter().enumerate() {
+            if virtualized && (gi < v_lo || gi > v_hi) {
+                continue;
+            }
             match group {
                 Group::One(pi) => {
                     let pi = *pi;
@@ -2868,6 +3151,20 @@ impl Render for LiveMarkdownView {
             }
         }
 
+        if virtualized && v_bot_px > 0.0 {
+            row_els.push(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .h(px(v_bot_px))
+                    .into_any_element(),
+            );
+        }
+        #[cfg(test)]
+        {
+            self.last_render_stats = (groups.len(), v_hi - v_lo + 1, virtualized);
+        }
+
         // Scroll-to-caret: the rows column (`live-markdown-content`) tracks
         // every direct child with the scroll handle, so `scroll_to_item`
         // scrolls the minimal amount to bring the caret's element into view
@@ -2948,14 +3245,27 @@ impl Render for LiveMarkdownView {
             .map(|(line, _, _)| *line);
 
         // Status strip (Typora status-bar parity): cursor + counts + outline toggle.
-        let mut stat_chars = 0usize;
-        for line in self.buffer.lines() {
-            stat_chars += line.chars().filter(|c| !c.is_whitespace()).count();
-        }
-        let stat_lines = self.buffer.lines().len();
-        let sel_chars = self
-            .selected_source_text()
-            .map(|t| t.chars().filter(|c| !c.is_whitespace()).count());
+        // Full-document char counting is O(n) per frame: cache on
+        // (text_version, selection), recompute only when either changes.
+        let stat_version = self.buffer.text_version();
+        let stat_sel = self.buffer.selection();
+        let (stat_chars, stat_lines, sel_chars) = match &self.stat_cache {
+            Some((v, sel, chars, lines, sel_chars)) if *v == stat_version && *sel == stat_sel => {
+                (*chars, *lines, *sel_chars)
+            }
+            _ => {
+                let mut chars = 0usize;
+                for line in self.buffer.lines() {
+                    chars += line.chars().filter(|c| !c.is_whitespace()).count();
+                }
+                let lines = self.buffer.lines().len();
+                let sel_chars = self
+                    .selected_source_text()
+                    .map(|t| t.chars().filter(|c| !c.is_whitespace()).count());
+                self.stat_cache = Some((stat_version, stat_sel, chars, lines, sel_chars));
+                (chars, lines, sel_chars)
+            }
+        };
         let show_outline = self.show_outline;
         let show_source = self.show_source;
         let status = div()
@@ -3574,6 +3884,9 @@ mod live_frame_tests {
     /// and table grids must all be in the render tree with real boxes.
     /// Guards the `:---` delimiter regression (left-aligned columns used to
     /// fail, so every grid fell back to raw source lines).
+    /// Large docs virtualize rows: jump the cursor onto each block first so
+    /// its group enters the rendered window, then assert (this also covers
+    /// virtualized scrolling to far blocks).
     #[gpui::test]
     fn live_showcase_frame_renders_code_and_tables(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -3584,20 +3897,57 @@ mod live_frame_tests {
         let (host, cx) = cx.add_window_view(|_, cx| {
             Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx)))
         });
-        let _view = host.read_with(cx, |h, _| h.0.clone());
-        cx.refresh().unwrap();
-        cx.run_until_parked();
-        let code = cx.debug_bounds("live-code-inner");
-        let table = cx.debug_bounds("live-table-outer");
-        eprintln!("SHOWCASE CODE: {code:?}");
-        eprintln!("SHOWCASE TABLE: {table:?}");
-        assert!(
-            code.is_some_and(|b| b.size.height > px(0.) && b.size.width > px(0.)),
-            "showcase code card missing: {code:?}"
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        let lines: Vec<String> = DOC.split('\n').map(str::to_string).collect();
+        let rows = plan_document(
+            &lines,
+            Reveal {
+                cursor: Pos::new(0, 0),
+                selection: None,
+                focused: false,
+                read_only: false,
+            },
         );
+        // Code lines (not fences: the cursor on a fence flips the card to
+        // source mode) and table rows to jump onto.
+        let code_line = rows
+            .iter()
+            .find(|r| matches!(r.plan.kind, RowKind::Code { .. }))
+            .map(|r| r.line);
+        let table_line = rows
+            .iter()
+            .find(|r| matches!(r.plan.kind, RowKind::Table))
+            .map(|r| r.line);
+        let jump_to = |cx: &mut gpui::VisualTestContext, line: usize| {
+            cx.update(|_, cx| {
+                view.update(cx, |v, cx| {
+                    v.edit(cx, |m| m.move_to(line, 0, false));
+                });
+            });
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        };
+        if let Some(line) = code_line {
+            jump_to(cx, line);
+            let code = cx.debug_bounds("live-code-inner");
+            eprintln!("SHOWCASE CODE: {code:?}");
+            assert!(
+                code.is_some_and(|b| b.size.height > px(0.) && b.size.width > px(0.)),
+                "showcase code card missing: {code:?}"
+            );
+        }
+        if let Some(line) = table_line {
+            jump_to(cx, line);
+            let table = cx.debug_bounds("live-table-outer");
+            eprintln!("SHOWCASE TABLE: {table:?}");
+            assert!(
+                table.is_some_and(|b| b.size.height > px(0.) && b.size.width > px(0.)),
+                "showcase table grid missing: {table:?}"
+            );
+        }
         assert!(
-            table.is_some_and(|b| b.size.height > px(0.) && b.size.width > px(0.)),
-            "showcase table grid missing: {table:?}"
+            code_line.is_some() && table_line.is_some(),
+            "showcase must contain code + table rows for this guard"
         );
     }
 
@@ -3687,23 +4037,66 @@ mod live_frame_tests {
             let (host, cx) = cx.add_window_view(|_, cx| {
                 Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx)))
             });
-            let _view = host.read_with(cx, |h, _| h.0.clone());
-            cx.refresh().unwrap();
-            cx.run_until_parked();
-            let code = cx.debug_bounds("live-code-inner");
-            let table = cx.debug_bounds("live-table-outer");
+            let view = host.read_with(cx, |h, _| h.0.clone());
+            // Large docs virtualize rows: presence must be checked with the
+            // block scrolled into the rendered window (jump the cursor onto
+            // it); absence is decided at classification level (a grid/card
+            // cannot render for rows that were never classified as such).
+            let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+            let rows = plan_document(
+                &lines,
+                Reveal {
+                    cursor: Pos::new(0, 0),
+                    selection: None,
+                    focused: false,
+                    read_only: false,
+                },
+            );
+            let jump_to = |cx: &mut gpui::VisualTestContext, line: usize| {
+                cx.update(|_, cx| {
+                    view.update(cx, |v, cx| {
+                        v.edit(cx, |m| m.move_to(line, 0, false));
+                    });
+                });
+                cx.refresh().unwrap();
+                cx.run_until_parked();
+            };
+            let code_line = rows
+                .iter()
+                .find(|r| matches!(r.plan.kind, RowKind::Code { .. }))
+                .map(|r| r.line);
+            let table_line = rows
+                .iter()
+                .find(|r| matches!(r.plan.kind, RowKind::Table))
+                .map(|r| r.line);
             assert_eq!(
-                code.is_some_and(|b| b.size.height > px(0.)),
+                code_line.is_some(),
                 want_code,
-                "{name}: code card present={} expected={want_code}",
-                code.is_some()
+                "{name}: doc classifies code={} expected={want_code}",
+                code_line.is_some()
             );
             assert_eq!(
-                table.is_some_and(|b| b.size.height > px(0.)),
+                table_line.is_some(),
                 want_table,
-                "{name}: table grid present={} expected={want_table}",
-                table.is_some()
+                "{name}: doc classifies table={} expected={want_table}",
+                table_line.is_some()
             );
+            if let Some(line) = code_line {
+                jump_to(cx, line);
+                let code = cx.debug_bounds("live-code-inner");
+                assert!(
+                    code.is_some_and(|b| b.size.height > px(0.)),
+                    "{name}: code card missing after scroll: {code:?}"
+                );
+            }
+            if let Some(line) = table_line {
+                jump_to(cx, line);
+                let table = cx.debug_bounds("live-table-outer");
+                assert!(
+                    table.is_some_and(|b| b.size.height > px(0.)),
+                    "{name}: table grid missing after scroll: {table:?}"
+                );
+            }
         }
     }
 
@@ -4126,6 +4519,57 @@ mod scroll_to_caret_tests {
             "caret back at doc start must scroll up (offset {offset2})"
         );
     }
+
+    /// 大文档行虚拟化：只建视口内 group 的元素（blink/主题刷新不再
+    /// 全量布局绘制，主线程不再被大文档卡死）；caret 跳转仍把 caret 组
+    /// 纳入窗口并滚动到位。
+    #[gpui::test]
+    fn large_doc_virtualizes_row_elements(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let mut doc = String::new();
+        for i in 0..300 {
+            doc.push_str(&format!("# Heading {i}\n\npara {i} text here\n\n"));
+        }
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(400.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        let (total, rendered, virtualized) =
+            view.read_with(&vc, |v, _| v.last_virtualization_stats());
+        assert!(virtualized, "300-heading doc must virtualize");
+        assert!(total > 200, "expected hundreds of groups, got {total}");
+        assert!(
+            rendered < total,
+            "only the viewport window may render ({rendered}/{total})"
+        );
+        assert!(rendered > 0, "viewport must render something");
+        // Caret 跳到文末：caret 组必须进窗口，视图随之滚动。
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.doc_end(false));
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        let (total2, rendered2, virtualized2) =
+            view.read_with(&vc, |v, _| v.last_virtualization_stats());
+        assert!(virtualized2, "must stay virtualized after caret jump");
+        assert_eq!(total2, total, "group count must be stable");
+        assert!(rendered2 < total2);
+        let offset = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        assert!(
+            offset < -50.0,
+            "caret at doc end must scroll down (offset {offset})"
+        );
+    }
+
 }
 
 #[cfg(test)]

@@ -28,10 +28,54 @@ pub struct InjectionLayer {
     pub text: Rope,
 }
 
+/// Process-wide cache of compiled tree-sitter queries, keyed by language
+/// name. Compiling a query from `.scm` costs 15–70ms (rust/javascript) and
+/// `SimpleHighlighter::new` runs on the UI thread on every theme switch
+/// (live markdown clears its highlight cache), every code-file open and
+/// every fence edit — sharing the compiled queries drops construction to
+/// microseconds. `tree_sitter::Query` is `Send + Sync`, so sharing via
+/// `Arc` is sound; parsers/trees stay per-instance (mutable parse state).
+/// Only successful compilations are cached (failures keep today's
+/// retry-on-next-`new` behavior).
+static COMPILED_QUERIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Query>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Number of compiled queries currently shared process-wide (tests).
+#[cfg(test)]
+pub fn compiled_query_cache_len() -> usize {
+    COMPILED_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+/// Get-or-compile a tree-sitter query for `lang` (cache key), compiling
+/// `source` with `language` on first use.
+fn compiled_query(
+    lang: &str,
+    language: &tree_sitter::Language,
+    source: &str,
+) -> Option<std::sync::Arc<Query>> {
+    if let Some(hit) = COMPILED_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(lang)
+    {
+        return Some(hit.clone());
+    }
+    let compiled = std::sync::Arc::new(Query::new(language, source).ok()?);
+    COMPILED_QUERIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(lang.to_string(), compiled.clone());
+    Some(compiled)
+}
+
 pub struct SimpleHighlighter {
     _language: String,
     parser: Parser,
-    query: Option<Query>,
+    query: Option<std::sync::Arc<Query>>,
     injections_query: Option<std::sync::Arc<Query>>,
     tree: Option<Tree>,
     injection_layers: Vec<InjectionLayer>,
@@ -83,118 +127,145 @@ impl SimpleHighlighter {
                 &mut parser,
                 tree_sitter_rust::LANGUAGE.into(),
                 include_str!("languages/rust/highlights.scm"),
+                "rust",
             ),
             "javascript" | "js" => Self::setup_language(
                 &mut parser,
                 tree_sitter_javascript::LANGUAGE.into(),
                 include_str!("languages/javascript/highlights.scm"),
+                "javascript",
             ),
             "typescript" | "ts" => Self::setup_language(
                 &mut parser,
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 include_str!("languages/typescript/highlights.scm"),
+                "typescript",
             ),
             "python" | "py" => Self::setup_language(
                 &mut parser,
                 tree_sitter_python::LANGUAGE.into(),
                 include_str!("languages/python/highlights.scm"),
+                "python",
             ),
             "json" => Self::setup_language(
                 &mut parser,
                 tree_sitter_json::LANGUAGE.into(),
                 include_str!("languages/json/highlights.scm"),
+                "json",
             ),
             "go" => Self::setup_language(
                 &mut parser,
                 tree_sitter_go::LANGUAGE.into(),
                 include_str!("languages/go/highlights.scm"),
+                "go",
             ),
             "html" => Self::setup_language(
                 &mut parser,
                 tree_sitter_html::LANGUAGE.into(),
                 include_str!("languages/html/highlights.scm"),
+                "html",
             ),
             "css" | "scss" => Self::setup_language(
                 &mut parser,
                 tree_sitter_css::LANGUAGE.into(),
                 tree_sitter_css::HIGHLIGHTS_QUERY,
+                "css",
             ),
             "c" => Self::setup_language(
                 &mut parser,
                 tree_sitter_c::LANGUAGE.into(),
                 include_str!("languages/c/highlights.scm"),
+                "c",
             ),
             "cpp" | "c++" => Self::setup_language(
                 &mut parser,
                 tree_sitter_cpp::LANGUAGE.into(),
                 tree_sitter_cpp::HIGHLIGHT_QUERY,
+                "cpp",
             ),
             "bash" | "sh" => Self::setup_language(
                 &mut parser,
                 tree_sitter_bash::LANGUAGE.into(),
                 tree_sitter_bash::HIGHLIGHT_QUERY,
+                "bash",
             ),
             "markdown" | "md" => Self::setup_language(
                 &mut parser,
                 tree_sitter_md::LANGUAGE.into(),
                 include_str!("languages/markdown/highlights.scm"),
+                "markdown",
             ),
             "markdown_inline" | "markdown-inline" => Self::setup_language(
                 &mut parser,
                 tree_sitter_md::INLINE_LANGUAGE.into(),
                 include_str!("languages/markdown_inline/highlights.scm"),
+                "markdown_inline",
             ),
             "toml" => Self::setup_language(
                 &mut parser,
                 tree_sitter_toml_ng::LANGUAGE.into(),
                 tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+                "toml",
             ),
             "tsx" => Self::setup_language(
                 &mut parser,
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
                 include_str!("languages/tsx/highlights.scm"),
+                "tsx",
             ),
             "lua" => Self::setup_language(
                 &mut parser,
                 tree_sitter_lua::LANGUAGE.into(),
                 include_str!("languages/lua/highlights.scm"),
+                "lua",
             ),
             "kotlin" | "kt" => Self::setup_language(
                 &mut parser,
                 tree_sitter_kotlin_ng::LANGUAGE.into(),
                 include_str!("languages/kotlin/highlights.scm"),
+                "kotlin",
             ),
             "make" | "makefile" | "mk" => Self::setup_language(
                 &mut parser,
                 tree_sitter_make::LANGUAGE.into(),
                 include_str!("languages/makefile/highlights.scm"),
+                "make",
             ),
             "zig" => Self::setup_language(
                 &mut parser,
                 tree_sitter_zig::LANGUAGE.into(),
                 include_str!("languages/zig/highlights.scm"),
+                "zig",
             ),
             "java" => Self::setup_language(
                 &mut parser,
                 tree_sitter_java::LANGUAGE.into(),
                 tree_sitter_java::HIGHLIGHTS_QUERY,
+                "java",
             ),
             "xml" => Self::setup_language(
                 &mut parser,
                 tree_sitter_xml::LANGUAGE_XML.into(),
                 tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+                "xml",
             ),
             "yaml" => Self::setup_language(
                 &mut parser,
                 tree_sitter_yaml::LANGUAGE.into(),
                 tree_sitter_yaml::HIGHLIGHTS_QUERY,
+                "yaml",
             ),
             _ => None,
         };
         let injections_query = crate::editor::syntax::LanguageRegistry::singleton()
             .language(lang)
-            .and_then(|config| Query::new(&config.language, &config.injections).ok())
-            .map(std::sync::Arc::new);
+            .and_then(|config| {
+                compiled_query(
+                    &("injections:".to_string() + lang),
+                    &config.language,
+                    &config.injections,
+                )
+            });
 
         Self {
             _language: lang.to_string(),
@@ -212,9 +283,10 @@ impl SimpleHighlighter {
         parser: &mut Parser,
         language: tree_sitter::Language,
         query: &str,
-    ) -> Option<Query> {
+        cache_lang: &str,
+    ) -> Option<std::sync::Arc<Query>> {
         parser.set_language(&language).ok()?;
-        Query::new(&language, query).ok()
+        compiled_query(cache_lang, &language, query)
     }
 
     pub fn update(
@@ -970,6 +1042,37 @@ mod tests {
     /// failing `Query::new` silently disables highlighting, which is how two
     /// regressions went unnoticed before (kotlin query written for a
     /// different grammar; tsx wired to the TS-additions-only query).
+    /// 回归：主题切换/打开代码文件时 `SimpleHighlighter::new` 不得重复
+    /// 编译 tree-sitter 查询（曾每次 15–70ms，主线程同步执行导致卡死）。
+    /// 编译好的查询进程内共享：同一语言只编译一次，且共享结果一致。
+    #[test]
+    fn compiled_queries_are_shared() {
+        // 注：测试进程内并行共享同一缓存，不可断言增长量，只断言
+        // “重复构造不再新增编译”（复用）+ 结果一致。
+        let mut a = SimpleHighlighter::new("rust");
+        let mut b = SimpleHighlighter::new("rust");
+        assert!(
+            a.query_loaded() && b.query_loaded(),
+            "rust highlight query must compile"
+        );
+        let cached = super::compiled_query_cache_len();
+        assert!(cached >= 1, "rust query must be in the shared cache");
+        let _ = SimpleHighlighter::new("rust");
+        assert_eq!(
+            super::compiled_query_cache_len(),
+            cached,
+            "repeat construction must reuse the cache, not recompile"
+        );
+        let code = "fn main() {\n    let x = 1;\n}\n";
+        let theme = test_theme();
+        let styles_of = |h: &mut SimpleHighlighter| {
+            let rope = Rope::from_str(code);
+            h.update(None, &rope, None);
+            h.styles(&(0..code.len()), &theme)
+        };
+        assert_eq!(styles_of(&mut a), styles_of(&mut b));
+    }
+
     #[test]
     fn test_all_languages_load_queries() {
         let languages_with_injections = [
