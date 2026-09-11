@@ -523,6 +523,14 @@ impl LiveMarkdownView {
             .insert(line, RowLayoutInfo { layout, text_len });
     }
 
+    /// 内容视口（`#live-markdown-content`）的矩形范围。`LiveLine` 的
+    /// 鼠标监听是窗口级全局的（不受命中测试约束），用它判断点击是否真的
+    /// 落在本视图横向范围内 —— 右侧终端等兄弟面板的点击超出此范围，必须
+    /// 放行，否则会被当成“行尾空白”认领并抢走焦点。
+    pub(crate) fn content_viewport_bounds(&self) -> gpui::Bounds<Pixels> {
+        self.scroll.bounds()
+    }
+
     /// Mutate + rerender (the `edit` transaction). Never emits `Change`
     /// itself: every text mutation is followed by `after_edit`, which emits
     /// once per transaction (deduped by `emitted_version`). Emitting here
@@ -5234,6 +5242,90 @@ mod interaction_fallback_tests {
             "two lines of text: {para:?}"
         );
         let _ = view;
+    }
+
+    /// 回归：点击实时编辑器内容视口之外的右侧兄弟面板（如终端）时，
+    /// `LiveLine` 的窗口级全局鼠标监听不得认领该点击 —— 否则会
+    /// `window.focus` 把焦点抢回 live 编辑器并 `stop_propagation`，
+    /// 导致点击终端无法把焦点切过去。
+    #[gpui::test]
+    fn click_outside_content_viewport_keeps_sibling_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        struct RightPane {
+            focus: gpui::FocusHandle,
+        }
+        impl RightPane {
+            fn new(cx: &mut Context<Self>) -> Self {
+                Self {
+                    focus: cx.focus_handle(),
+                }
+            }
+        }
+        impl gpui::Render for RightPane {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .track_focus(&self.focus)
+                    .debug_selector(|| "right-pane".into())
+            }
+        }
+
+        struct SplitHost {
+            live: gpui::Entity<LiveMarkdownView>,
+            right: gpui::Entity<RightPane>,
+        }
+        impl gpui::Render for SplitHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(gpui::div().w(px(600.)).h_full().child(self.live.clone()))
+                    .child(gpui::div().flex_1().h_full().child(self.right.clone()))
+            }
+        }
+
+        let (host, vc) = cx.add_window_view(|_, cx| {
+            let live = cx.new(|cx| LiveMarkdownView::with_text(DOC, cx));
+            let right = cx.new(RightPane::new);
+            SplitHost { live, right }
+        });
+        let live = host.read_with(vc, |h, _| h.live.clone());
+        let right_focus = host.read_with(vc, |h, cx| h.right.read(cx).focus.clone());
+        vc.update(|window, cx| {
+            window.focus(&live.read(cx).focus_handle(), cx);
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+
+        let para = vc.debug_bounds("live-para").expect("para group");
+        let right = vc.debug_bounds("right-pane").expect("right pane");
+        // 点击右侧面板：x 在 live 内容视口之外，y 落在首行带内 —— 修复前
+        // LiveLine 的全局监听会把它当成“行尾空白”认领并抢走焦点。
+        vc.simulate_mouse_down(
+            point(right.left() + px(20.), para.top() + px(13.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vc.run_until_parked();
+        vc.update(|window, _| {
+            assert!(
+                right_focus.is_focused(window),
+                "点击兄弟面板必须把焦点切过去，live 编辑器不得抢回"
+            );
+        });
     }
 }
 

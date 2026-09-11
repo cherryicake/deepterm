@@ -620,6 +620,14 @@ impl Element for LiveLine {
             if phase != DispatchPhase::Bubble || event.button != gpui::MouseButton::Left {
                 return;
             }
+            // 本监听是窗口级全局的、不受命中测试约束：先要求点击落在实时
+            // 编辑器内容视口的横向范围内。否则右侧终端面板的点击会命中下面
+            // 的 y 判定，被当成“行尾空白”认领 —— window.focus 会把焦点抢回
+            // live 编辑器并 stop_propagation，终端永远拿不到焦点。
+            let vp = view.read(cx).content_viewport_bounds();
+            if event.position.x < vp.left() || event.position.x > vp.right() {
+                return;
+            }
             // Claim clicks anywhere on this row's horizontal band so the
             // cursor can land past end-of-line on short lines — not just on
             // glyphs. Left of the text maps to line start, except on task
@@ -658,6 +666,12 @@ impl Element for LiveLine {
                 return;
             }
             if !matches!(event.pressed_button, Some(gpui::MouseButton::Left)) {
+                return;
+            }
+            // 同上：只认领落在内容视口横向范围内的拖拽，避免在终端面板上
+            // 拖动时被 live 的选择逻辑接管。
+            let vp = view.read(cx).content_viewport_bounds();
+            if event.position.x < vp.left() || event.position.x > vp.right() {
                 return;
             }
             if bounds.top() > event.position.y || event.position.y > bounds.bottom() {
