@@ -3967,10 +3967,15 @@ impl Render for TerminalView {
                 this.open_search(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DismissSearch, window, cx| {
-                // 仅在搜索激活时消费 Escape；否则传播给 shell / 输入层。
+                // 仅在搜索激活时消费 Escape；否则显式 propagate，
+                // 让按键继续走 on_key_down → to_esc_str → PTY。
+                // GPUI 的 action 在 bubble 阶段默认不再传播，
+                // 不调 propagate() 会吞掉 ESC，TUI 应用永远收不到 \x1b。
                 if this.search.active {
                     this.close_search(window, cx);
                     cx.stop_propagation();
+                } else {
+                    cx.propagate();
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
