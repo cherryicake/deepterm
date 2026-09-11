@@ -83,6 +83,20 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// 路径前缀替换：`from` 自身 → `to`，`from` 的后代 → `to` 下的同层级路径。
+/// 与文件树 `rekey_path` 同语义，供已打开标签跟随目录重命名。
+fn rekey_open_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    if path == from {
+        return Some(to.to_path_buf());
+    }
+    path.strip_prefix(from).ok().map(|rest| to.join(rest))
+}
+
+/// `path` 是否等于 `ancestor` 或位于其下。
+fn path_is_under(path: &Path, ancestor: &Path) -> bool {
+    path == ancestor || path.starts_with(ancestor)
+}
+
 struct EditorFile {
     id: SharedString,
     path: String,
@@ -2930,6 +2944,68 @@ impl Editor {
             }
         }
         cx.notify();
+    }
+
+    /// 外部重命名后同步已打开的标签（文件树发起的重命名）。
+    ///
+    /// `from` 可能是目录：其下所有已打开的后代都要跟着改路径，否则保存时会
+    /// 把内容写回旧路径、把刚删掉的旧文件又「复活」出来。
+    pub fn rename_open_path(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        ssh_config: Option<&SshConnectionConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut renamed = 0usize;
+        for file in &mut self.open_files {
+            // 后端必须匹配：两台主机上可能有同名路径的文件。
+            if file.ssh_config.as_ref() != ssh_config {
+                continue;
+            }
+            let Some(new_path) = rekey_open_path(Path::new(&file.path), from, to) else {
+                continue;
+            };
+            file.path = new_path.to_string_lossy().to_string();
+            file.label = new_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.path.clone());
+            let id = file.id.to_string();
+            let label = file.label.clone();
+            self.tab_bar.update(cx, |tab_bar, cx| {
+                tab_bar.modify_tab(&id, |tab| tab.label = label.clone().into(), cx);
+            });
+            renamed += 1;
+        }
+        if renamed > 0 {
+            log::info!("重命名后同步了 {renamed} 个已打开的标签");
+            cx.notify();
+        }
+    }
+
+    /// 外部删除后关闭对应的标签（文件树发起的删除）。
+    ///
+    /// 直接关闭、不弹「未保存」确认：文件已经不存在了，留着只会在保存时
+    /// 把它重新写回磁盘。
+    pub fn close_open_path(
+        &mut self,
+        removed: &Path,
+        ssh_config: Option<&SshConnectionConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: Vec<String> = self
+            .open_files
+            .iter()
+            // 同上：只关同一后端的标签
+            .filter(|f| {
+                f.ssh_config.as_ref() == ssh_config && path_is_under(Path::new(&f.path), removed)
+            })
+            .map(|f| f.id.to_string())
+            .collect();
+        for id in ids {
+            self.close_file_direct(&id, cx);
+        }
     }
 
     fn close_other_tabs(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {

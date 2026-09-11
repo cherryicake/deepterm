@@ -36,6 +36,50 @@ impl FileEndpoint {
         }
     }
 
+    /// endpoint 的路径（远端按原样转成 `PathBuf`，便于与文件树的路径比较）。
+    pub fn path_buf(&self) -> PathBuf {
+        match self {
+            Self::Local { path } => path.clone(),
+            Self::Remote { path, .. } => PathBuf::from(path),
+        }
+    }
+
+    /// 该 endpoint 是否位于 `is_local` / `ssh_config` 描述的同一个文件系统上。
+    /// 用于「传输完成后刷新目录」时筛掉与当前视图无关的那一端。
+    pub fn matches_fs(&self, is_local: bool, ssh_config: Option<&SshConnectionConfig>) -> bool {
+        match self {
+            Self::Local { .. } => is_local,
+            Self::Remote {
+                ssh_config: config, ..
+            } => !is_local && ssh_config == Some(config),
+        }
+    }
+
+    /// 取所在目录：Local 用 `parent()`，远端按 `/` 截断最后一段。
+    pub fn parent_dir(&self) -> Option<FileEndpoint> {
+        match self {
+            Self::Local { path } => path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| FileEndpoint::Local {
+                    path: p.to_path_buf(),
+                }),
+            Self::Remote { ssh_config, path } => {
+                let trimmed = path.trim_end_matches('/');
+                let parent = trimmed.rsplit_once('/').map(|(head, _)| head);
+                let parent = match parent {
+                    Some("") => "/",
+                    Some(p) => p,
+                    None => return None,
+                };
+                Some(FileEndpoint::Remote {
+                    ssh_config: ssh_config.clone(),
+                    path: parent.to_string(),
+                })
+            }
+        }
+    }
+
     pub fn is_same_device(&self, other: &FileEndpoint) -> bool {
         match (self, other) {
             (Self::Local { .. }, Self::Local { .. }) => true,

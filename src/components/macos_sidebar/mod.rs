@@ -137,6 +137,22 @@ pub enum SidebarEvent {
         path: PathBuf,
         ssh_config: Option<Box<SshConnectionConfig>>,
     },
+    /// 发起一次文件传输（文件树下载/拖拽上传），交给 workspace 传输协调器执行。
+    /// `TransferRequest` 较大，装箱保持事件枚举小体积。
+    StartTransfer {
+        request: Box<crate::file_manager::TransferRequest>,
+    },
+    /// 文件树内重命名完成：编辑器同步已打开标签的路径。
+    PathRenamed {
+        from: PathBuf,
+        to: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
+    /// 文件树内删除完成：编辑器关闭对应标签。
+    PathRemoved {
+        path: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
     /// Instant open; content loads asynchronously in DiffView.
     OpenDiffLoading {
         path: String,
@@ -154,6 +170,16 @@ impl std::fmt::Debug for SidebarEvent {
         match self {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
+            Self::StartTransfer { .. } => write!(f, "StartTransfer"),
+            Self::PathRenamed { from, to, .. } => f
+                .debug_struct("PathRenamed")
+                .field("from", from)
+                .field("to", to)
+                .finish(),
+            Self::PathRemoved { path, .. } => f
+                .debug_struct("PathRemoved")
+                .field("path", path)
+                .finish(),
             Self::OpenDiffLoading { path, .. } => f
                 .debug_struct("OpenDiffLoading")
                 .field("path", path)

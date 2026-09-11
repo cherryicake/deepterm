@@ -1,4 +1,5 @@
 pub mod file_tree;
+pub mod file_tree_context_menu;
 pub mod file_tree_panel_tabs;
 pub mod folder_dialog;
 pub mod font_settings;

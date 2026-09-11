@@ -191,6 +191,17 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 创建单层目录（非递归）：父目录必须已存在，目标已存在时由服务器返回错误。
+    /// 与 `std::fs::create_dir` 语义对齐，供「新建文件夹」这类不应隐式补父链的场景使用。
+    pub fn create_dir(&mut self, path: &str) -> anyhow::Result<()> {
+        sftp_block_on!({
+            self.sftp
+                .create_dir(path)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
     pub fn create_dir_all(&mut self, path: &str) -> anyhow::Result<()> {
         if path.is_empty() || path == "/" {
             return Ok(());

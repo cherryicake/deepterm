@@ -2,7 +2,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Context, FocusHandle, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton, ParentElement,
-    Pixels, Point, Render, Stateful, Styled, Subscription, Task, UniformListDecoration,
+    Pixels, Point, Render, Styled, Subscription, Task, UniformListDecoration,
     UniformListScrollHandle, Window, div, point, px, size, svg, uniform_list,
 };
 use smallvec::SmallVec;
@@ -24,6 +24,8 @@ use crate::ssh::SshConnectionConfig;
 use crate::theme::ActiveTheme;
 use crate::theme::UiTheme;
 
+use super::file_tree_context_menu::{DraggedTreeEntry, TreeEditMode, TreeEditing};
+
 impl gpui::EventEmitter<crate::file_manager::file_tree_event::FileTreeEvent> for SidebarFileTree {}
 
 fn entry_icon(entry: &FileEntry) -> Icon {
@@ -35,8 +37,8 @@ fn entry_icon(entry: &FileEntry) -> Icon {
     }
 }
 
-const LIST_ROW_HEIGHT: f32 = 24.0;
-const INDENT_SIZE: f32 = 14.0;
+pub(crate) const LIST_ROW_HEIGHT: f32 = 24.0;
+pub(crate) const INDENT_SIZE: f32 = 14.0;
 const MAX_TREE_DEPTH: usize = 20;
 /// watcher 事件触发目录刷新的防抖间隔，避免事件风暴（如 npm install / git checkout）
 const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
@@ -58,25 +60,33 @@ struct StickyAnchor {
 ///
 /// View 层：只负责渲染和用户交互，所有文件操作委托给 `FileTreeLoader`。
 pub struct SidebarFileTree {
-    focus_handle: FocusHandle,
-    root_path: PathBuf,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) root_path: PathBuf,
     /// root 切换代际，用于丢弃过期的异步结果（如 home_dir 解析）
-    root_epoch: u32,
-    selected_path: Option<PathBuf>,
+    pub(crate) root_epoch: u32,
+    pub(crate) selected_path: Option<PathBuf>,
     /// 所有文件操作都委托给 loader
-    loader: FileTreeLoader,
-    expanded_folders: HashSet<PathBuf>,
-    root_expanded: bool,
-    hovered_path: Option<PathBuf>,
-    flat_cache: Option<Vec<(FileEntry, usize)>>,
+    pub(crate) loader: FileTreeLoader,
+    pub(crate) expanded_folders: HashSet<PathBuf>,
+    pub(crate) root_expanded: bool,
+    pub(crate) hovered_path: Option<PathBuf>,
+    pub(crate) flat_cache: Option<Vec<(FileEntry, usize)>>,
     watcher_subscription: Option<Subscription>,
-    watched_paths: HashSet<PathBuf>,
+    pub(crate) watched_paths: HashSet<PathBuf>,
     scroll_handle: UniformListScrollHandle,
     /// 防抖中的目录刷新任务（按路径去重）
     refresh_debounce: HashMap<PathBuf, Task<()>>,
     /// P1 预取任务（hover 预取，去重）
     prefetch_tasks: HashMap<PathBuf, Task<()>>,
     resolving_home: bool,
+    /// 行内编辑状态（新建 / 重命名）：同一时刻最多一行处于编辑中
+    pub(super) editing: Option<TreeEditing>,
+    /// 右键菜单（手动模式：行 / 根 / 空白区各构建不同菜单，避免嵌套双开）
+    pub(super) context_menu: Option<gpui::Entity<crate::components::menu::PopupMenu>>,
+    pub(super) context_menu_position: Option<gpui::Point<gpui::Pixels>>,
+    pub(super) context_menu_subscription: Option<Subscription>,
+    /// 打开菜单时的窗口句柄：菜单结束后要把焦点还回来时用。
+    pub(super) context_menu_window: Option<gpui::AnyWindowHandle>,
 }
 
 impl SidebarFileTree {
@@ -129,6 +139,11 @@ impl SidebarFileTree {
             refresh_debounce: HashMap::new(),
             prefetch_tasks: HashMap::new(),
             resolving_home,
+            editing: None,
+            context_menu: None,
+            context_menu_position: None,
+            context_menu_subscription: None,
+            context_menu_window: None,
         };
 
         if is_local {
@@ -219,6 +234,8 @@ impl SidebarFileTree {
         self.flat_cache = None;
         self.selected_path = None;
         self.hovered_path = None;
+        self.cancel_editing(cx);
+        self.close_context_menu(cx);
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
         self.prefetch_tasks.clear();
@@ -415,7 +432,7 @@ impl SidebarFileTree {
     }
 
     /// 防抖地刷新目录：短时间内的大量 watcher 事件只触发一次真实读取。
-    fn schedule_refresh(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn schedule_refresh(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.refresh_debounce.contains_key(&path) {
             return;
         }
@@ -446,6 +463,8 @@ impl SidebarFileTree {
             self.watched_paths.clear();
         }
         self.watcher_subscription.take();
+        self.cancel_editing(cx);
+        self.close_context_menu(cx);
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
         self.prefetch_tasks.clear();
@@ -506,7 +525,7 @@ impl SidebarFileTree {
         self.root_path == path && self.loader.backend().matches(is_local, ssh_config)
     }
 
-    fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn load_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // 委托给 loader；若已在加载中则跳过，避免重复任务
         if !self.loader.begin_load(&path) {
             return;
@@ -566,7 +585,29 @@ impl SidebarFileTree {
         .detach();
     }
 
-    fn refresh_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// 传输完成后刷新受影响的目录（由 `WorkspaceEvent::TransferFinished` 驱动）。
+    ///
+    /// 只刷新与本树同一文件系统的目录，且限定在根之内 —— 否则本地树会因为一次
+    /// 远端传输去读本地路径（或反之），既无意义又会触发无谓的远端 IO。
+    pub(crate) fn refresh_affected_dirs(
+        &mut self,
+        dirs: &[crate::file_manager::FileEndpoint],
+        cx: &mut Context<Self>,
+    ) {
+        let is_local = self.loader.is_local();
+        let ssh_config = self.loader.ssh_config().cloned();
+        for dir in dirs {
+            if !dir.matches_fs(is_local, ssh_config.as_ref()) {
+                continue;
+            }
+            let path = dir.path_buf();
+            if path.starts_with(&self.root_path) {
+                self.refresh_directory(path, cx);
+            }
+        }
+    }
+
+    pub(crate) fn refresh_directory(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // 委托给 loader；若正在加载则标记 pending，加载完成后补一次刷新
         if !self.loader.request_refresh(&path) {
             return;
@@ -665,7 +706,7 @@ impl SidebarFileTree {
             .spawn(async move { backend.read_dir(&path) })
     }
 
-    fn invalidate_flat_cache(&mut self) {
+    pub(crate) fn invalidate_flat_cache(&mut self) {
         self.flat_cache = None;
     }
 
@@ -677,6 +718,28 @@ impl SidebarFileTree {
     ) {
         if depth > MAX_TREE_DEPTH {
             return;
+        }
+        // 行内「新建」：在目标目录顶部注入合成行（不依赖目录是否已缓存，
+        // 父目录加载失败/未加载时输入行依然可见，避免编辑状态卡死）
+        if let Some(editing) = &self.editing {
+            if let TreeEditMode::Create {
+                parent,
+                kind,
+                proposed,
+            } = &editing.mode
+            {
+                if parent == directory {
+                    result.push((
+                        FileEntry {
+                            name: proposed.clone(),
+                            path: parent.join(proposed),
+                            kind: kind.clone(),
+                            size: 0,
+                        },
+                        depth,
+                    ));
+                }
+            }
         }
         if let Some(entries) = self.loader.get_cached(directory) {
             for entry in entries {
@@ -690,7 +753,16 @@ impl SidebarFileTree {
         }
     }
 
-    fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// 折叠全部文件夹（VSCode Collapse Folders：保留根目录展开）。
+    pub(super) fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.cancel_editing(cx);
+        self.expanded_folders.clear();
+        self.root_expanded = true;
+        self.invalidate_flat_cache();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
             // 清除 pending refresh 与防抖任务
@@ -876,7 +948,7 @@ impl SidebarFileTree {
         self.prefetch_tasks.insert(path, task);
     }
 
-    fn render_root_row(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+    fn render_root_row(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let root_path = self.root_path.clone();
         let is_expanded = self.root_expanded;
         let is_hovered = self.hovered_path.as_ref() == Some(&root_path);
@@ -894,6 +966,8 @@ impl SidebarFileTree {
         };
 
         let hover_path = root_path.clone();
+        let drop_root = root_path.clone();
+        let move_root = root_path.clone();
         let row = div()
             .id("sidebar-file-tree-root")
             .w_full()
@@ -911,9 +985,40 @@ impl SidebarFileTree {
                     this.invalidate_flat_cache();
                     cx.notify();
                 }),
+            )
+            // 右键：根目录菜单（新建 / 折叠全部；根不可重命名 / 删除）
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_context_menu_for_root(event.position, window, cx);
+                }),
+            )
+            // 拖放目标：OS 文件拖入（上传）与树内条目拖入（移动）都落到根目录
+            .drag_over::<gpui::ExternalPaths>(|style, _paths, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, _window, cx| {
+                    this.drop_external_paths(paths.paths(), &drop_root, cx);
+                }),
+            )
+            .drag_over::<DraggedTreeEntry>(|style, _dragged, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedTreeEntry, _window, cx| {
+                    this.drop_tree_entry(dragged, &move_root, cx);
+                }),
             );
 
-        row.child(
+        let row = row.child(
             div()
                 .w_full()
                 .h_full()
@@ -957,7 +1062,8 @@ impl SidebarFileTree {
                         .text_color(theme.text)
                         .child(display_name),
                 ),
-        )
+        );
+        row.into_any_element()
     }
 
     fn render_sticky_folders(
@@ -1104,8 +1210,17 @@ impl SidebarFileTree {
         entry: &FileEntry,
         depth: usize,
         cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
+    ) -> gpui::AnyElement {
         let path = entry.path.clone();
+        // 行内编辑（新建合成行 / 重命名行）：输入框替换条目名
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.editing_path() == path)
+        {
+            return self.render_editing_row(depth, cx);
+        }
+
         let is_selected = self.selected_path.as_ref() == Some(&path);
         let is_directory = entry.kind == FileEntryKind::Directory;
         let is_expanded = is_directory && self.expanded_folders.contains(&path);
@@ -1129,6 +1244,8 @@ impl SidebarFileTree {
         };
 
         let click_path = path.clone();
+        let right_click_path = path.clone();
+        let right_click_entry = entry.clone();
         let hover_path = path.clone();
         let indent = px(depth as f32 * INDENT_SIZE);
 
@@ -1159,9 +1276,68 @@ impl SidebarFileTree {
                         });
                     }
                 }),
+            )
+            // 右键：选中该行 + 按目标类型（文件 / 文件夹）弹菜单（VSCode 同款区分）
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.select_path(right_click_path.clone(), cx);
+                    this.open_context_menu_for_entry(
+                        &right_click_entry,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            // 内部拖拽：拖动行移动文件 / 文件夹（拖到文件夹行 = 移入该目录）
+            .on_drag(
+                DraggedTreeEntry {
+                    path: path.clone(),
+                    name: name.clone(),
+                    is_dir: is_directory,
+                },
+                |entry, _offset, _window, cx| {
+                    cx.new(|_| DraggedTreeEntry {
+                        path: entry.path.clone(),
+                        name: entry.name.clone(),
+                        is_dir: entry.is_dir,
+                    })
+                },
             );
 
-        row.child(
+        // 拖放目标：目录行同时接受 OS 文件拖入（上传）与树内条目拖入（移动）
+        let row = if is_directory {
+            let drop_target = path.clone();
+            let move_target = path.clone();
+            row.drag_over::<gpui::ExternalPaths>(|style, _paths, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, _window, cx| {
+                    this.drop_external_paths(paths.paths(), &drop_target, cx);
+                }),
+            )
+            .drag_over::<DraggedTreeEntry>(|style, _dragged, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(cx.listener(
+                move |this, dragged: &DraggedTreeEntry, _window, cx| {
+                    this.drop_tree_entry(dragged, &move_target, cx);
+                },
+            ))
+        } else {
+            row
+        };
+
+        let row = row.child(
             div()
                 .w_full()
                 .h_full()
@@ -1220,7 +1396,10 @@ impl SidebarFileTree {
                         .text_color(row_text)
                         .child(name),
                 ),
-        )
+        );
+
+        // 右键菜单 / 内部拖拽：由 on_mouse_down(Right) / on_drag 处理（见上）
+        row.into_any_element()
     }
 }
 
@@ -1442,6 +1621,8 @@ impl Render for SidebarFileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         let directory = self.root_path.clone();
+        let root_drop_target = self.root_path.clone();
+        let root_move_target = self.root_path.clone();
 
         // Build flat cache if needed
         let flat_count = if let Some(ref flat) = self.flat_cache {
@@ -1524,12 +1705,47 @@ impl Render for SidebarFileTree {
                 .into_any_element()
         };
 
+        // 右键菜单浮层（手动模式：deferred + anchored，随窗口边缘自适应）
+        let menu_overlay = self.render_context_menu_overlay();
+
         div()
             .flex_1()
             .h_full()
             .overflow_hidden()
             .flex()
             .flex_col()
+            // 兑底拖放 / 右键：树的空白区域 → 根目录（VSCode 行为：新建 / 折叠）
+            // drag_over 给空白区也加上高亮，否则拖到行间隙时没有任何落点反馈。
+            .drag_over::<gpui::ExternalPaths>(|style, _paths, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, _window, cx| {
+                    this.drop_external_paths(paths.paths(), &root_drop_target, cx);
+                }),
+            )
+            .drag_over::<DraggedTreeEntry>(|style, _dragged, _window, cx| {
+                style
+                    .bg(cx.theme().ui.drop_target)
+                    .border_1()
+                    .border_color(cx.theme().ui.drop_target_border)
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedTreeEntry, _window, cx| {
+                    this.drop_tree_entry(dragged, &root_move_target, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_context_menu_for_empty_area(event.position, window, cx);
+                }),
+            )
+            .when_some(menu_overlay, |this, overlay| this.child(overlay))
             .child(rows_element)
     }
 }

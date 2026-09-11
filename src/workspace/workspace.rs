@@ -22,7 +22,7 @@ use crate::components::button::{
     Button, ButtonVariants, Icon as MenuIcon, Sizable, Size as ButtonSize,
 };
 use crate::components::modal::Modal;
-use crate::file_manager::{TransferStatusReporter, TransferTaskState};
+use crate::file_manager::{FileEndpoint, TransferStatusReporter, TransferTaskState};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::platform::{RemoteOS, guess_os_from_text};
 use crate::ssh_view::picker::SshPicker;
@@ -76,6 +76,12 @@ pub enum WorkspaceEvent {
         col: Option<u32>,
         ssh_config: Option<Box<SshConnectionConfig>>,
         terminal_cwd: Option<String>,
+    },
+    /// 一次传输任务到达终态（完成 / 跳过 / 取消 / 失败）。
+    /// `dirs` 是受影响的目录（目标目录，Move 时再带上源所在目录），
+    /// 供文件树等在**传输结束后**刷新 —— 之前只能在发起时刷新，等于空转。
+    TransferFinished {
+        dirs: Vec<FileEndpoint>,
     },
 }
 

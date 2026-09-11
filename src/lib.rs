@@ -442,6 +442,53 @@ impl AppWindow {
                         }
                     });
                 }
+                SidebarEvent::StartTransfer { request } => {
+                    // 文件树发起的传输（右键下载 / 拖拽上传）：交给当前激活 workspace
+                    // 的传输协调器，复用统一的进度 / 冲突 / 取消链路。
+                    let workspace = _this.workspace.clone();
+                    let request = (**request).clone();
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |ws, cx| {
+                            ws.start_transfer_request(
+                                "sidebar".to_string(),
+                                request,
+                                window.window_handle(),
+                                cx,
+                            );
+                        });
+                    });
+                }
+                SidebarEvent::PathRenamed {
+                    from,
+                    to,
+                    ssh_config,
+                } => {
+                    // 文件树里改了名：已打开的标签必须跟着改，否则保存时会把内容
+                    // 写回旧路径、把刚删掉的旧文件又复活出来。
+                    let editor = editor_for_open.clone();
+                    let (from, to) = (from.clone(), to.clone());
+                    let config = ssh_config.as_deref().cloned();
+                    window.defer(cx, move |_window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                e.rename_open_path(&from, &to, config.as_ref(), cx);
+                            });
+                        }
+                    });
+                }
+                SidebarEvent::PathRemoved { path, ssh_config } => {
+                    // 文件树里删掉了：关掉对应标签（不弹未保存确认，文件已不存在）。
+                    let editor = editor_for_open.clone();
+                    let path = path.clone();
+                    let config = ssh_config.as_deref().cloned();
+                    window.defer(cx, move |_window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                e.close_open_path(&path, config.as_ref(), cx);
+                            });
+                        }
+                    });
+                }
                 SidebarEvent::OpenDiffLoading { path, repo } => {
                     let editor = editor_for_open.clone();
                     let (path, repo) = (path.clone(), repo.clone());
@@ -566,6 +613,17 @@ impl AppWindow {
                         window,
                         cx,
                     );
+                }
+                WorkspaceEvent::TransferFinished { dirs } => {
+                    // 传输真正结束后再刷新文件树（远端没有 watcher，只能靠这条链路）。
+                    let sidebar = this.sidebar.clone();
+                    let dirs = dirs.clone();
+                    window.defer(cx, move |_window, cx| {
+                        let Some(tree) = sidebar.read(cx).file_tree_view() else {
+                            return;
+                        };
+                        tree.update(cx, |tree, cx| tree.refresh_affected_dirs(&dirs, cx));
+                    });
                 }
             },
         );

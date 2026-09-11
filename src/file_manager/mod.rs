@@ -22,10 +22,12 @@ pub use conflict::{
 };
 pub use cross_remote::{NoopReporter, TransferStatusReporter};
 pub use endpoint::FileEndpoint;
-pub use filesystem::{FileMetadata, FileSystem, LocalFileSystem, RemoteFileSystem};
+pub use filesystem::{
+    FileMetadata, FileOpError, FileSystem, LocalFileSystem, RemoteFileSystem,
+};
 pub use manager::{TransferManager, TransferRun};
 pub use request::{ConflictPolicy, TransferOperation, TransferRequest};
-pub use utils::{TRANSFER_CANCELLED_MSG, TransferSummary};
+pub use utils::{TRANSFER_CANCELLED_MSG, TransferSummary, validate_rename_to};
 pub use view::{
     TransferHoverAction, TransferTaskHandler, TransferTaskState, TransferTaskStatus,
     endpoint_label, quick_total_size, render_transfer_panel, transfer_item_name, transfer_label,

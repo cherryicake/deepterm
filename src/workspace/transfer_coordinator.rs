@@ -11,12 +11,26 @@ use gpui::prelude::*;
 use gpui::{AnyWindowHandle, Context};
 
 use crate::file_manager::{
-    ConflictPrompt, ConflictResolution, ConflictResolver, SharedConflictResolver,
-    TRANSFER_CANCELLED_MSG, TransferManager, TransferRequest, TransferSummary,
+    ConflictPrompt, ConflictResolution, ConflictResolver, FileEndpoint, SharedConflictResolver,
+    TRANSFER_CANCELLED_MSG, TransferManager, TransferOperation, TransferRequest, TransferSummary,
     TransferTaskHandler, TransferTaskState, TransferTaskStatus, quick_total_size,
     transfer_item_name, transfer_label,
 };
-use crate::workspace::workspace::{TaskStatusReporter, Workspace};
+use crate::workspace::workspace::{TaskStatusReporter, Workspace, WorkspaceEvent};
+
+/// 一次传输会影响到的目录：目标目录，外加 Move 时源所在的目录。
+/// 传输**结束**后据此刷新文件树（发起时刷新等于空转，远端没有 watcher 兜底）。
+fn affected_dirs(request: &TransferRequest) -> Vec<FileEndpoint> {
+    let mut dirs = vec![request.destination.clone()];
+    if request.operation == TransferOperation::Move {
+        for source in &request.sources {
+            if let Some(parent) = source.parent_dir() {
+                dirs.push(parent);
+            }
+        }
+    }
+    dirs
+}
 
 impl Workspace {
     pub(crate) fn start_transfer_request(
@@ -38,6 +52,8 @@ impl Workspace {
             return;
         }
 
+        // 受影响的目录要在 request 被移进后台任务之前算好。
+        let dirs_for_finish = affected_dirs(&request);
         let transfer_id = self.next_transfer_id;
         self.next_transfer_id += 1;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -230,7 +246,7 @@ impl Workspace {
             let result = task.await;
             if let Some(entity) = weak2.upgrade() {
                 entity.update(cx, |this, cx| {
-                    this.finish_transfer_task(transfer_id, result, cx);
+                    this.finish_transfer_task(transfer_id, result, dirs_for_finish, cx);
                 });
             }
         })
@@ -266,6 +282,7 @@ impl Workspace {
         &mut self,
         transfer_id: usize,
         result: anyhow::Result<TransferSummary>,
+        dirs: Vec<FileEndpoint>,
         cx: &mut Context<Self>,
     ) {
         let Some(task) = self
@@ -280,8 +297,6 @@ impl Workspace {
             Ok(summary) if summary.files_transferred == 0 && summary.bytes_transferred == 0 => {
                 // 空操作（如拖拽到同一文件夹），标记为已跳过
                 task.status = TransferTaskStatus::Skipped;
-                cx.notify();
-                return;
             }
             Ok(summary) => {
                 log::info!(
@@ -316,6 +331,10 @@ impl Workspace {
             }
         }
         cx.notify();
+
+        // 传输结束后才通知视图刷新：取消 / 失败也可能已经拷进了一部分文件，
+        // 因此所有终态都刷新（刷新本身走防抖 + loader 去重，代价很低）。
+        cx.emit(WorkspaceEvent::TransferFinished { dirs });
 
         // 已完成/失败/取消的任务保留在列表中，仅通过用户点击"清除"或"×"手动移除。
         let _ = transfer_id;

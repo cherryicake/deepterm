@@ -307,6 +307,10 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                             shared_state.open = true;
                         }
 
+                        // 菜单已在此元素打开：吞掉右键事件，阻止外层嵌套的
+                        // ContextMenu / 其他右键监听器再开一个菜单（嵌套双开 bug）。
+                        cx.stop_propagation();
+
                         // Use defer to build the menu in the next frame, avoiding race conditions
                         window.defer(cx, {
                             let shared_state = shared_state.clone();

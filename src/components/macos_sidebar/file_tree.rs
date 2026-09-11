@@ -54,6 +54,28 @@ impl MacosSidebar {
                         ssh_config: ssh_config.clone(),
                     });
                 }
+                FileTreeEvent::StartTransfer { request } => {
+                    cx.emit(SidebarEvent::StartTransfer {
+                        request: Box::new((**request).clone()),
+                    });
+                }
+                FileTreeEvent::PathRenamed {
+                    from,
+                    to,
+                    ssh_config,
+                } => {
+                    cx.emit(SidebarEvent::PathRenamed {
+                        from: from.clone(),
+                        to: to.clone(),
+                        ssh_config: ssh_config.clone(),
+                    });
+                }
+                FileTreeEvent::PathRemoved { path, ssh_config } => {
+                    cx.emit(SidebarEvent::PathRemoved {
+                        path: path.clone(),
+                        ssh_config: ssh_config.clone(),
+                    });
+                }
                 FileTreeEvent::RootChanged => {
                     this.ensure_git_panel(cx);
                 }
