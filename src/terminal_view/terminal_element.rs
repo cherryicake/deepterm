@@ -1454,23 +1454,24 @@ impl Element for TerminalElement {
             .unwrap_or(px(9.0));
 
         let content_bounds = terminal_content_bounds(bounds);
-        let terminal_bounds = TerminalBounds::new(line_height, cell_width, content_bounds);
 
-        // Sync terminal and handle resize
-        let (display_offset, cursor_point, cursor_shape) =
+        // 每帧上报请求的 bounds；内部合并器决定何时把「网格 reflow + PTY/SSH
+        // 通知」原子应用。渲染始终使用已应用的 `terminal_bounds`，保证内容
+        // 与网格尺寸一致、不会把 TUI 内容装进它没画过尺寸的网格而割裂。
+        let requested = TerminalBounds::new(line_height, cell_width, content_bounds);
+
+        let (terminal_bounds, display_offset, cursor_point, cursor_shape) =
             self.terminal.update(cx, |terminal, cx| {
                 terminal.sync(window, cx);
-
-                let current_bounds = terminal.terminal_bounds;
-                if current_bounds.num_columns() != terminal_bounds.num_columns()
-                    || current_bounds.num_lines() != terminal_bounds.num_lines()
-                {
-                    terminal.resize(terminal_bounds, cx);
-                }
-                terminal.set_terminal_bounds(terminal_bounds);
+                terminal.resize(requested, cx);
 
                 let content = terminal.last_content();
-                (content.display_offset, content.cursor, content.cursor_shape)
+                (
+                    terminal.terminal_bounds,
+                    content.display_offset,
+                    content.cursor,
+                    content.cursor_shape,
+                )
             });
 
         // Get viewport info for cursor calculation

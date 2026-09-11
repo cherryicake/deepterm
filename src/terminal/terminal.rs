@@ -12,7 +12,7 @@ use std::{
     rc::Rc,
     sync::Arc,
     sync::OnceLock,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -55,6 +55,13 @@ use crate::terminal::mappings::mouse::{
 
 /// 最大滚动缓冲区行数限制
 const MAX_SCROLLBACK_LINES: usize = 100000;
+
+/// resize 合并间隔（1:1 移植 ghostty `termio/Thread.zig` 的 `Coalesce.min_ms = 25`）。
+///
+/// ghostty 语义：定时器活动期间只更新最新值、**不重置定时器**（节流而非防抖），
+/// 持续拖动期间以稳定 ~40Hz 应用；应用时 pty、网格、渲染尺寸三者一次到位，
+/// 渲染层在两次应用之间始终使用「已应用」的尺寸。
+const RESIZE_COALESCE_DELAY: Duration = Duration::from_millis(25);
 
 /// 终端类型 - 区分本地和远程终端
 #[derive(Clone, Debug, PartialEq)]
@@ -585,6 +592,13 @@ pub struct Terminal {
     /// 远程驱动任务（保持任务存活，防止被drop）
     #[allow(dead_code)]
     driver_task: Option<Task<()>>,
+    /// 最新待应用的窗口尺寸（合并器只保留最新值；网格与 PTY/SSH 一起原子应用）。
+    pending_resize: Option<TerminalBounds>,
+    /// resize 合并任务句柄（ghostty 式 25ms 非重置节流）；drop 即取消。
+    resize_task: Option<Task<()>>,
+    /// 是否已完成首次 resize。deepterm 特有：PTY 以默认 55×18 启动，首帧需立即
+    /// 校正（ghostty spawn 时就用 surface 实际尺寸创建 PTY，无此问题）。
+    resize_primed: bool,
     /// VTE 解析器状态（跨数据块保持，避免转义序列在 chunk 边界处被截断导致乱码）
     vte_processor: Processor<StdSyncHandler>,
     /// 输入区起点锚点（OSC 133;B 标记处 / 无集成 shell 时的回显锚点）。
@@ -705,6 +719,9 @@ impl Terminal {
             dirty_row_bounds: Vec::new(),
             event_loop_task: None,
             driver_task: None,
+            pending_resize: None,
+            resize_task: None,
+            resize_primed: false,
             vte_processor: Processor::<StdSyncHandler>::new(),
             input_area_start: None,
             shell_fg_observed: None,
@@ -806,6 +823,9 @@ impl Terminal {
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 driver_task: None,
+                pending_resize: None,
+                resize_task: None,
+                resize_primed: false,
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 input_area_start: None,
                 shell_fg_observed: None,
@@ -938,6 +958,9 @@ impl Terminal {
             dirty_row_bounds: Vec::new(),
             event_loop_task: None,
             driver_task: None,
+            pending_resize: None,
+            resize_task: None,
+            resize_primed: false,
             vte_processor: Processor::<StdSyncHandler>::new(),
             input_area_start: None,
             shell_fg_observed: None,
@@ -1154,6 +1177,9 @@ impl Terminal {
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 driver_task: Some(driver_task),
+                pending_resize: None,
+                resize_task: None,
+                resize_primed: false,
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 input_area_start: None,
                 shell_fg_observed: None,
@@ -2281,9 +2307,7 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, bounds: TerminalBounds, _cx: &mut Context<Self>) {
-        let previous_cols = self.terminal_bounds.num_columns();
-        let previous_rows = self.terminal_bounds.num_lines();
+    pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
         let cols = bounds.num_columns();
         let rows = bounds.num_lines();
 
@@ -2293,38 +2317,102 @@ impl Terminal {
             return;
         }
 
-        self.terminal_bounds = bounds;
+        // 对应 ghostty `Surface.resize`：主线程立即更新像素几何（原点），
+        // 网格与 PTY 走合并通道，渲染层在两次应用之间始终用「已应用」尺寸。
+        self.terminal_bounds.bounds.origin = bounds.bounds.origin;
 
-        if cols == previous_cols && rows == previous_rows {
+        // 对应 ghostty `Terminal.resize` 的 cols/rows 未变早退。
+        let applied_cols = self.terminal_bounds.num_columns();
+        let applied_rows = self.terminal_bounds.num_lines();
+        if cols == applied_cols && rows == applied_rows {
+            // 尺寸已与应用一致（可能拖回了旧尺寸）：撤销待应用的中间值。
+            self.pending_resize = None;
+            self.resize_task = None;
             return;
         }
 
-        let cols_u16 = cols as u16;
-        let rows_u16 = rows as u16;
+        // 对应 ghostty `Surface.resize` → IO mailbox `.resize`（最新值覆盖）。
+        self.pending_resize = Some(bounds);
+
+        // deepterm 特有：PTY 以默认 55×18 启动，首帧需立即校正
+        // （ghostty spawn 时就用 surface 实际尺寸创建 PTY，无此问题）。
+        if !self.resize_primed {
+            self.resize_primed = true;
+            self.apply_pending_resize(false, cx);
+            return;
+        }
+
+        // deepterm 特有：headless / 错误终端没有子进程可同步，立即应用以保持
+        // 测试与基准确定性（ghostty 无此形态）。
+        if self.sender.is_none() && self.remote_resize_callback.is_none() {
+            self.apply_pending_resize(false, cx);
+            return;
+        }
+
+        // 1:1 对应 ghostty `termio/Thread.handleResize`：合并定时器活动期间
+        // 只更新最新值、不重置定时器 —— 25ms 节流，持续拖动期间稳定 ~40Hz。
+        if self.resize_task.is_some() {
+            return;
+        }
+        self.resize_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(RESIZE_COALESCE_DELAY)
+                .await;
+            let _ = this.update(cx, |terminal, cx| {
+                terminal.resize_task = None;
+                terminal.apply_pending_resize(true, cx);
+            });
+        }));
+    }
+
+    /// 1:1 对应 ghostty `Termio.resize`：pty、网格、渲染尺寸三者一次到位。
+    ///
+    /// 顺序与 ghostty 相反（先网格后 PTY），原因：ghostty 的 pty resize 与
+    /// 网格 reflow 在同一线程顺序执行，子进程的重绘输出必然落在 reflow 之后；
+    /// deepterm 的网格在主线程、输出解析在 IO 线程，若先发 SIGWINCH，子进程
+    /// 的快速响应可能在网格 reflow 前被解析进旧网格。先 reflow 可保证新尺寸
+    /// 的输出永远落在新网格上。
+    fn apply_pending_resize(&mut self, wake: bool, cx: &mut Context<Self>) {
+        self.resize_task = None;
+
+        let Some(bounds) = self.pending_resize.take() else {
+            return;
+        };
+        let cols = bounds.num_columns();
+        let rows = bounds.num_lines();
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let applied_cols = self.terminal_bounds.num_columns();
+        let applied_rows = self.terminal_bounds.num_lines();
+
+        // 全量应用新 bounds（尺寸 + 度量 + 原点）—— 渲染层由此拿到新尺寸。
+        self.terminal_bounds = bounds;
+        if cols == applied_cols && rows == applied_rows {
+            return;
+        }
+
+        {
+            let mut term = self.term.lock();
+            term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
+        }
+        // 对应 ghostty `Terminal.resize` 尾部的 `flags.dirty.clear = true`：
+        // resize 后强制渲染层全量重绘，行缓存不留任何旧尺寸的残留。
+        self.input_area_start = None;
+        self.update_last_content(true);
 
         // 本地终端：通过 sender 发送 resize 消息
         if let Some(ref sender) = self.sender {
-            let window_size: WindowSize = bounds.into();
-            let _ = sender.send(Msg::Resize(window_size));
+            let _ = sender.send(Msg::Resize(bounds.into()));
         }
-
         // 远程终端：通过回调通知 SSH 通道调整窗口大小
         if let Some(ref callback) = self.remote_resize_callback {
-            callback(cols_u16, rows_u16);
+            callback(cols as u16, rows as u16);
         }
-
-        let mut term = self.term.lock();
-        term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
-
-        drop(term);
-        // reflow 会改变行的折行与坐标，旧锚点必然过期；
-        // shell 收到 SIGWINCH 后重绘提示符时会重新发 133;B，
-        // 本地终端则由下一次输入重新捕获。
-        self.input_area_start = None;
-        // Alacritty does not mark resize as full damage. Treat the new grid as
-        // a full renderer invalidation so stale row caches never survive a wrap
-        // or viewport-size change.
-        self.update_last_content(true);
+        // 对应 ghostty `renderer_mailbox.push(.resize)` + `renderer_wakeup`。
+        if wake {
+            cx.emit(Event::Wakeup);
+        }
     }
 
     /// Enable or disable lazy link-range maintenance (URL regex + OSC8).
@@ -2495,10 +2583,6 @@ impl Terminal {
     pub fn viewport_lines(&self) -> usize {
         let term = self.term.lock();
         term.screen_lines()
-    }
-
-    pub fn set_terminal_bounds(&mut self, bounds: TerminalBounds) {
-        self.terminal_bounds = bounds;
     }
 
     // Mouse handling
@@ -3186,10 +3270,12 @@ pub fn scroll_offset_to_center(viewport_rows: usize, history_size: usize, line: 
 
 #[cfg(test)]
 mod tests {
-    use super::{Terminal, TerminalType};
+    use super::{RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalType};
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn search_finds_matches_across_scrollback_case_folded() {
@@ -3613,6 +3699,147 @@ mod tests {
             t.write(b"x");
             let anchor = t.input_area_start.expect("fg 转换后应重新捕获锚点");
             assert_eq!(anchor, t.current_cursor_point());
+        });
+    }
+
+    // ===== resize 通知合并器测试 =====
+
+    /// 构造 `cols×rows` 的 `TerminalBounds`（line_height=16、cell_width=9）。
+    fn bounds_for(cols: usize, rows: usize) -> TerminalBounds {
+        TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(9.0 * cols as f32), px(16.0 * rows as f32)),
+            ),
+        )
+    }
+
+    /// 构造一个无 PTY、但带记录型 `remote_resize_callback` 的终端，
+    /// 以便观察「窗口尺寸通知」的下发次数与内容。
+    fn resize_test_terminal(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Terminal>, Arc<Mutex<Vec<(u16, u16)>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let terminal = cx.new(move |_| {
+            let mut t = Terminal::create_error_terminal();
+            t.remote_resize_callback = Some(Box::new(move |cols, rows| {
+                sink.lock().unwrap().push((cols, rows));
+            }));
+            t
+        });
+        (terminal, calls)
+    }
+
+    fn grid_size(t: &Terminal) -> (usize, usize) {
+        let c = t.last_content();
+        (c.cols, c.rows)
+    }
+
+    /// ghostty 语义：25ms 非重置节流（定时器活动期间只更新最新值），
+    /// 到点一次性原子应用「网格 reflow + PTY/SSH 通知」，只应用最新尺寸。
+    #[gpui::test]
+    fn resize_throttles_like_ghostty(cx: &mut TestAppContext) {
+        let (terminal, calls) = resize_test_terminal(cx);
+
+        // 首帧立即校正（deepterm 特有：PTY 以默认 55×18 启动）。
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(30, 10), cx);
+            assert_eq!(grid_size(t), (30, 10));
+        });
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10)]);
+
+        // 合并窗口内网格保持旧尺寸，只保留最新 pending。
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(40, 14), cx);
+            assert_eq!(grid_size(t), (30, 10), "合并窗口内网格不应变化");
+        });
+        assert_eq!(calls.lock().unwrap().len(), 1, "合并窗口内不应通知");
+
+        // 定时器活动期间后续事件不重置定时器（ghostty handleResize 语义）。
+        cx.background_executor.advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        terminal.update(cx, |t, cx| t.resize(bounds_for(50, 15), cx));
+        cx.background_executor.advance_clock(Duration::from_millis(15));
+        cx.run_until_parked();
+        terminal.read_with(cx, |t, _| {
+            assert_eq!(grid_size(t), (50, 15), "25ms 到点应应用最新尺寸");
+        });
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(30, 10), (50, 15)],
+            "只通知最新尺寸"
+        );
+    }
+
+    /// 零尺寸（cols=0）不应用、不通知；恢复后能再次应用。
+    #[gpui::test]
+    fn resize_zero_bounds_does_not_apply(cx: &mut TestAppContext) {
+        let (terminal, calls) = resize_test_terminal(cx);
+        terminal.update(cx, |t, cx| t.resize(bounds_for(40, 10), cx));
+        let before = calls.lock().unwrap().len();
+
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(0, 10), cx);
+            assert_eq!(grid_size(t), (40, 10), "零尺寸不应改变网格");
+        });
+        assert_eq!(calls.lock().unwrap().len(), before, "零尺寸不应通知");
+
+        // 恢复有效尺寸：走合并窗口后应用。
+        terminal.update(cx, |t, cx| t.resize(bounds_for(41, 10), cx));
+        cx.background_executor.advance_clock(RESIZE_COALESCE_DELAY);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().last().copied(),
+            Some((41, 10)),
+            "恢复尺寸后应应用最新尺寸"
+        );
+    }
+
+    /// 尺寸拖回已应用值时撤销 pending 并取消合并任务，不多发一次通知。
+    #[gpui::test]
+    fn resize_dedupes_when_returning_to_applied_size(cx: &mut TestAppContext) {
+        let (terminal, calls) = resize_test_terminal(cx);
+        terminal.update(cx, |t, cx| t.resize(bounds_for(30, 10), cx)); // prime
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10)]);
+
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(40, 14), cx); // 武装合并定时器
+            t.resize(bounds_for(30, 10), cx); // 拖回已应用尺寸
+        });
+        cx.background_executor.advance_clock(RESIZE_COALESCE_DELAY);
+        cx.run_until_parked();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(30, 10)],
+            "拖回原尺寸不应产生多余通知"
+        );
+    }
+
+    /// 护栏：任何时刻 `last_content` 的网格尺寸都必须与 `terminal_bounds` 一致
+    /// （两者只在 apply 时一起变化），防止渲染/命中错位。
+    #[gpui::test]
+    fn resize_snapshot_stays_in_sync_with_grid(cx: &mut TestAppContext) {
+        let (terminal, _calls) = resize_test_terminal(cx);
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(30, 10), cx); // prime
+
+            // 合并窗口内两者都不变，不变量成立
+            t.resize(bounds_for(80, 35), cx);
+            let c = t.last_content();
+            assert_eq!(c.cols, t.terminal_bounds.num_columns());
+            assert_eq!(c.rows, t.terminal_bounds.num_lines());
+            assert_eq!((c.cols, c.rows), (30, 10));
+        });
+        cx.background_executor.advance_clock(RESIZE_COALESCE_DELAY);
+        cx.run_until_parked();
+        terminal.read_with(cx, |t, _| {
+            let c = t.last_content();
+            assert_eq!(c.cols, t.terminal_bounds.num_columns());
+            assert_eq!(c.rows, t.terminal_bounds.num_lines());
+            assert_eq!((c.cols, c.rows), (80, 35));
         });
     }
 }
