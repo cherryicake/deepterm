@@ -223,20 +223,67 @@ pub fn apply_task_done(mut runs: Vec<TextRun>, dim: Hsla, strike_color: Hsla) ->
     runs
 }
 
-/// Inline-styled runs for a table cell's raw text (no markers/dim: cells
-/// render links, code capsules, emphasis like the preview's grid).
+/// Rendered text + runs for a table cell's raw source text.
+///
+/// The grid is preview-only (clicking it jumps into the block source), so
+/// markers hide exactly like the read-only preview: `**bold**` shows `bold`
+/// in bold, `` `code` `` shows `code` in a capsule, `[t](u)` shows `t` as a
+/// link. The old version kept every marker visible, so no inline syntax
+/// ever looked rendered inside tables.
+///
+/// Returns the rendered string alongside runs covering it exactly (emoji
+/// shortcodes swap for glyphs, footnotes render as `[label]`, both matching
+/// `markdown_element.rs`).
 pub fn inline_cell_runs(
     text: &str,
     base: &TextStyle,
     colors: &LiveColors,
     style: &MarkdownStyle,
-) -> Vec<TextRun> {
-    use crate::editor::markdown_live::inline::parse as parse_inline;
-    let inline = parse_inline(text);
+) -> (String, Vec<TextRun>) {
+    inline_cell_runs_with_refs(text, base, colors, style, &std::collections::HashMap::new())
+}
+
+/// [`inline_cell_runs`] with a document-wide reference table for
+/// `[text][ref]` / `[text]` shortcuts (pulldown resolves these inside table
+/// cells too; callers collect via `inline::collect_refdefs` with the same
+/// code/table/math skip as `reveal::plan_document`).
+pub fn inline_cell_runs_with_refs(
+    text: &str,
+    base: &TextStyle,
+    colors: &LiveColors,
+    style: &MarkdownStyle,
+    refs: &std::collections::HashMap<String, String>,
+) -> (String, Vec<TextRun>) {
+    use crate::editor::markdown_live::inline::parse_with_refs as parse_inline;
+    let inline = parse_inline(text, refs);
+    let mut out = String::with_capacity(text.len());
     let mut runs = Vec::new();
+    // 上一段的解析后样式：用来判断能否并入前一个 run（标记符被吃掉后，
+    // `**a** **b**` 中间只剩一个空格，两段样式相同 → 合成一个 run）。
+    // 直接整体比较 `TextStyle`，而不是手工挑几个字段 —— 后者一旦 `TextRun`
+    // 新增字段就会静默漏判。
+    let mut last_style: Option<TextStyle> = None;
+    let push = |piece: &str,
+                s: TextStyle,
+                out: &mut String,
+                runs: &mut Vec<TextRun>,
+                last: &mut Option<TextStyle>| {
+        if piece.is_empty() {
+            return;
+        }
+        out.push_str(piece);
+        let run = s.to_run(piece.len());
+        if last.as_ref() == Some(&s) {
+            runs.last_mut().expect("last 为 Some 时必已有 run").len += run.len;
+        } else {
+            runs.push(run);
+            *last = Some(s);
+        }
+    };
     for span in &inline.spans {
-        // Markers stay visible inside table source cells (tables edit as
-        // source when revealed; the grid shows rendered text).
+        if span.marker {
+            continue;
+        }
         let mut s = base.clone();
         let st = &span.style;
         if st.link {
@@ -266,13 +313,13 @@ pub fn inline_cell_runs(
                 ..Default::default()
             });
         }
-        if st.italic {
+        if st.italic || st.math {
             s.refine(&TextStyleRefinement {
                 font_style: Some(gpui::FontStyle::Italic),
                 ..Default::default()
             });
         }
-        if st.sup || st.emoji || st.footnote {
+        if st.sup || st.footnote {
             s.refine(&TextStyleRefinement {
                 color: Some(colors.accent),
                 ..Default::default()
@@ -284,15 +331,23 @@ pub fn inline_cell_runs(
                 ..Default::default()
             });
         }
-        let len = span.range.len();
-        if len > 0 {
-            runs.push(s.to_run(len));
+        // Emoji swaps for the glyph like the preview (`replace_shortcodes`);
+        // the accent is a source-token style and must not tint the glyph.
+        // Footnotes render as `[label]` (preview `FootnoteRef` parity).
+        if st.emoji {
+            let raw = &text[span.range.clone()];
+            let glyph = super::emoji::find_shortcode(text, span.range.start)
+                .map(|(_, g)| g)
+                .unwrap_or(raw);
+            push(glyph, s, &mut out, &mut runs, &mut last_style);
+        } else if st.footnote {
+            let label = &text[span.range.clone()];
+            push(&format!("[{label}]"), s, &mut out, &mut runs, &mut last_style);
+        } else {
+            push(&text[span.range.clone()], s, &mut out, &mut runs, &mut last_style);
         }
     }
-    if runs.is_empty() && !text.is_empty() {
-        runs.push(base.to_run(text.len()));
-    }
-    runs
+    (out, runs)
 }
 
 /// Overlay find-match ranges (visible bytes) onto runs: each mark is
@@ -750,6 +805,87 @@ mod tests {
         // Empty range → untouched.
         let runs = vec![mk(4)];
         assert_eq!(apply_selection(runs, 4, Some((2, 2)), sel).len(), 1);
+    }
+
+    fn cell_fixtures() -> (TextStyle, LiveColors, MarkdownStyle) {
+        let base = TextStyle::default();
+        let colors = LiveColors {
+            text: Hsla::default(),
+            marker: Hsla::default(),
+            dim: Hsla::default(),
+            accent: Hsla::default(),
+            caret: Hsla::default(),
+            selection: Hsla::default(),
+            find_bg: Hsla::default(),
+            find_current: Hsla::default(),
+            code_bg: Hsla::default(),
+            highlight_bg: Hsla::default(),
+            rule: Hsla::default(),
+            quote_bar: Hsla::default(),
+            code_border: Hsla::default(),
+            success: Hsla::default(),
+            elevated_bg: Hsla::default(),
+            panel_bg: Hsla::default(),
+            table_border: Hsla::default(),
+        };
+        let style = MarkdownStyle {
+            base_text_style: base.clone(),
+            container_style: Default::default(),
+            code_block: Default::default(),
+            inline_code: Default::default(),
+            block_quote: Default::default(),
+            link: Default::default(),
+            rule_color: Hsla::default(),
+            block_quote_border_color: Hsla::default(),
+            heading: Default::default(),
+            heading_level_styles: [None, None, None, None, None, None],
+            heading_border_color: None,
+        };
+        (base, colors, style)
+    }
+
+    fn rendered(cell: &str) -> String {
+        let (base, colors, style) = cell_fixtures();
+        let (text, runs) = inline_cell_runs(cell, &base, &colors, &style);
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, text.len(), "runs must cover rendered text for {cell:?}");
+        text
+    }
+
+    #[test]
+    fn table_cells_hide_markers_like_preview() {
+        assert_eq!(rendered("**bold**"), "bold");
+        assert_eq!(rendered("*italic*"), "italic");
+        assert_eq!(rendered("`code`"), "code");
+        assert_eq!(rendered("~~gone~~"), "gone");
+        assert_eq!(rendered("==note=="), "note");
+        assert_eq!(rendered("[docs](https://x.dev)"), "docs");
+        assert_eq!(rendered("$x + y$"), "x + y");
+        assert_eq!(rendered("E=mc^2^"), "E=mc2");
+        assert_eq!(rendered("H~2~O"), "H2O");
+        assert_eq!(rendered("plain"), "plain");
+        // Escapes render literally (`\\*` -> `*`).
+        assert_eq!(rendered("\\*x\\*"), "*x*");
+    }
+
+    #[test]
+    fn table_cells_swap_emoji_and_bracket_footnotes() {
+        assert_eq!(rendered(":tada: party"), "\u{1f389} party");
+        assert_eq!(rendered("[^note]"), "[note]");
+    }
+
+    #[test]
+    fn table_cells_resolve_reference_links() {
+        use std::collections::HashMap;
+        let (base, colors, style) = cell_fixtures();
+        let mut refs = HashMap::new();
+        refs.insert("docs".to_string(), "https://x.dev".to_string());
+        let (text, runs) =
+            inline_cell_runs_with_refs("[docs]", &base, &colors, &style, &refs);
+        assert_eq!(text, "docs");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        // Without the table the shortcut stays literal.
+        assert_eq!(rendered("[docs]"), "[docs]");
     }
 
     #[test]

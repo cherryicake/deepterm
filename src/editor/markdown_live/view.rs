@@ -24,9 +24,10 @@ use crate::editor::markdown_element::MarkdownElementBuilder;
 use crate::editor::markdown_live::block::{split_table_row, table_delimiter_cols, Block};
 use crate::editor::markdown_live::buffer::LiveBuffer;
 use crate::editor::markdown_live::element::{
-    apply_find_marks, apply_selection, apply_task_done, inline_cell_runs, row_base_style,
-    runs_for_row, LiveColors, LiveLine,
+    apply_find_marks, apply_selection, apply_task_done, inline_cell_runs_with_refs,
+    row_base_style, runs_for_row, LiveColors, LiveLine,
 };
+use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::highlight::HighlightCache;
 use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
@@ -70,6 +71,11 @@ pub struct LiveMarkdownView {
     planned_version: u64,
     planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool),
     planned: Vec<PlannedRow>,
+    /// 表格单元格用的文档级参考链接表（`[t][ref]`）。全文档扫描得来的，
+    /// 按「文本版本 + 规划键」缓存，避免每帧重扫一遍整篇文档。
+    table_refs: std::collections::HashMap<String, String>,
+    /// `table_refs` 对应的缓存键；`None` 表示还没算过。
+    table_refs_key: Option<(u64, (Pos, Option<(Pos, Pos)>, bool, bool, bool))>,
     copied_code_blocks: HashSet<usize>,
     /// Bring the caret's row into view on the next render (set by every
     /// edit/move; consumed by `scroll_to_item` on the rows column).
@@ -157,6 +163,8 @@ impl LiveMarkdownView {
             planned_version: u64::MAX,
             planned_key: (Pos::default(), None, false, false, false),
             planned: Vec::new(),
+            table_refs: std::collections::HashMap::new(),
+            table_refs_key: None,
             copied_code_blocks: HashSet::new(),
             scroll_to_cursor: false,
             row_targets: Vec::new(),
@@ -2699,6 +2707,43 @@ impl Render for LiveMarkdownView {
             );
         }
 
+        // Reference definitions for table cells (`[t][r]` inside the grid
+        // resolves document-wide like the preview). 只在真的有表格渲染时才收集，
+        // 并且跨帧缓存：这次扫描要遍历整篇文档，边打字边每帧重扫纯属浪费。
+        // 跳过规则与 `reveal::plan_document` 一致，源码块里的定义不会生效。
+        let table_refs = if groups.iter().any(|g| matches!(g, Group::Table(_))) {
+            // 规划键决定每行的 block（进而决定跳过哪些行），所以要一起进缓存键。
+            let key = (
+                self.buffer.text_version(),
+                (
+                    self.buffer.cursor(),
+                    self.buffer.selection(),
+                    focused,
+                    self.read_only,
+                    self.show_source,
+                ),
+            );
+            if self.table_refs_key != Some(key) {
+                let buf_lines = self.buffer.lines();
+                self.table_refs = collect_refdefs(buf_lines, &|i| {
+                    rows.get(i).is_some_and(|r| {
+                        matches!(
+                            r.block,
+                            Block::CodeLine
+                                | Block::Fence { .. }
+                                | Block::FrontMatter
+                                | Block::Table
+                                | Block::Math { .. }
+                                | Block::MathDelim { .. }
+                        )
+                    })
+                });
+                self.table_refs_key = Some(key);
+            }
+            self.table_refs.clone()
+        } else {
+            std::collections::HashMap::new()
+        };
         let mut window_counts: Vec<usize> = Vec::new();
         for (gi, group) in groups.iter().enumerate() {
             if virtualized && (gi < v_lo || gi > v_hi) {
@@ -3466,10 +3511,16 @@ impl Render for LiveMarkdownView {
                                 CellAlign::Right => cell_div = cell_div.justify_end(),
                                 CellAlign::None => {}
                             }
-                            let cell_runs =
-                                inline_cell_runs(cell_text, &base, &colors, &style);
+                            let (cell_rendered, cell_runs) =
+                                inline_cell_runs_with_refs(
+                                    cell_text,
+                                    &base,
+                                    &colors,
+                                    &style,
+                                    &table_refs,
+                                );
                             cell_div = cell_div.child(
-                                StyledText::new(SharedString::from(cell_text.to_string()))
+                                StyledText::new(SharedString::from(cell_rendered))
                                     .with_runs(cell_runs),
                             );
                             grid = grid.child(cell_div.into_any_element());
