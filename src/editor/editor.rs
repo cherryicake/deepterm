@@ -1324,7 +1324,9 @@ impl Editor {
             .flex_row()
             .items_center()
             .justify_between()
-            .w_full()
+            // 两端各收进 12px：父容器为 flex_col（default stretch），
+            // 依赖 stretch 减去外边距后铺满，不能再用 w_full（会叠加溢出）
+            .mx(px(12.0))
             .mt(px(2.0))
             .pt(px(6.0))
             // 与 Markdown 实时渲染编辑器一致：仅用一条分割线与内容区隔开

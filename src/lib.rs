@@ -1340,7 +1340,9 @@ impl Render for AppWindow {
                 editor.set_paddings(0.0, 0.0, cx);
             });
         } else {
-            let content_left = if sidebar_visible { 0.0 } else { 12.0 };
+            // 左 padding 不随侧边栏显隐变化：内容区与面板边框的间距需保持一致
+            //（侧边栏开关按钮只悬浮在 TabBar 区域，由 tab_pad_target 单独补偿）。
+            let content_left = 0.0;
             let content_bottom = 8.0;
             self.editor.update(cx, |editor, cx| {
                 editor.set_paddings(content_left, content_bottom, cx);
