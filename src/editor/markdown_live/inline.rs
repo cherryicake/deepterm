@@ -1072,7 +1072,6 @@ mod tests {
 
   #[test]
   fn sup_sub_markers_hide_content_flagged() {
-    let inline = parse("E=mc^2^ and H~2~O");
     assert!(style_of("E=mc^2^ and H~2~O", "2^").sup || style_of("E=mc^2^", "2").sup);
     assert!(style_of("H~2~O", "2").sub);
     // Delimiters are markers (hidden in preview).

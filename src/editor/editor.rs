@@ -28,6 +28,9 @@ use crate::workspace::tab_bar::{DraggedTab, TabBar, TabItem};
 
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
+/// 窗口拉宽/窄时编辑器吃掉的增量比例：0.5 与主区（终端）平分，
+/// 1.0 则编辑器独占（终端宽度只随内部分屏变化）。
+const EDITOR_WINDOW_FOLLOW_RATIO: f32 = 0.5;
 
 /// 图片解码任务：从本地磁盘或远端 SFTP 读取字节并解码，返回 `(图片, 像素尺寸)`。
 /// 用 `Arc` 包装以便在后台执行器与 UI 线程之间共享。
@@ -108,6 +111,9 @@ struct EditorFile {
     live: Option<Entity<crate::editor::markdown_live::LiveMarkdownView>>,
     image: Option<Entity<crate::editor::image_viewer::ImageViewer>>,
     diff: Option<Entity<crate::editor::diff_view::DiffView>>,
+    /// diff tab 的仓库（含 root + local/remote 后端）：`path` 存的是仓库相对路径，
+    /// 切标签页组后重建 `DiffView` 需要它（后台重新 `diff_file_contents`）。
+    diff_repo: Option<crate::editor::git_repository::GitRepository>,
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -125,6 +131,9 @@ pub struct EditorOpenFileInfo {
     pub encoding: FileEncoding,
     /// 只读文件标记。
     pub read_only: bool,
+    /// diff tab 的仓库快照（仅 `diff-` tab 为 Some）：恢复时后台重载 diff，
+    /// 而不是走纯文本 `restore_file_from_cache`（否则页面空白）。
+    pub diff_repo: Option<crate::editor::git_repository::GitRepository>,
 }
 
 /// 后台加载得到的文件内容：解码后的文本 + 检测到的编码 + 只读标记。
@@ -244,6 +253,8 @@ impl FileTreeKey {
 pub struct FileTreeEditorState {
     pub open_files_info: Vec<EditorOpenFileInfo>,
     pub cached_editor_states: HashMap<SharedString, Entity<InputState>>,
+    /// diff tab 的视图缓存：切组时整实体保留，未保存的右侧编辑、滚动、折叠状态不丢。
+    pub cached_diff_views: HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
     pub active_file_id: Option<SharedString>,
 }
 
@@ -253,6 +264,12 @@ pub struct Editor {
     active_file_id: Option<SharedString>,
     width: f32,
     resize_drag_x: Option<Pixels>,
+    /// 上帧窗口宽：`render` 用它算窗口增量并按比例跟随（`width` 保持
+    /// 固定 px，拖拽/最小宽度语义不变）。0 表示尚未记录（首帧只记不跟）。
+    last_window_width: f32,
+    /// 窗口跟随的宽度上限：由 AppWindow 每帧下发（窗口宽 − 侧边栏占位 −
+    /// 主区最小宽）。`f32::INFINITY` 表示未下发（如单测），不设上限。
+    window_follow_limit: f32,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     /// 主窗口句柄：fs 事件回调中没有 Window，弹窗时用它取回窗口。
     window_handle: Option<gpui::AnyWindowHandle>,
@@ -316,6 +333,8 @@ impl Editor {
             active_file_id: None,
             width: EDITOR_DEFAULT_WIDTH,
             resize_drag_x: None,
+            last_window_width: 0.0,
+            window_follow_limit: f32::INFINITY,
             app_window: None,
             window_handle: Some(_window.window_handle()),
             tab_bar_pad_epoch: 0,
@@ -397,6 +416,7 @@ impl Editor {
                 },
                 encoding: f.encoding,
                 read_only: f.read_only,
+                diff_repo: f.diff_repo.clone(),
             })
             .collect()
     }
@@ -408,7 +428,9 @@ impl Editor {
         for file in &mut self.open_files {
             // 缓存所有非加载中的文件，避免本地文件切换时重复从磁盘读取。
             // 图片文件不走文本 InputState 恢复，无需缓存。
-            if !file.is_loading && file.image.is_none() {
+            // diff tab 的 InputState 只是占位的空 disabled state，内容由 DiffView
+            // 后台从 git 重载：不缓存，避免恢复时走纯文本路径导致空白。
+            if !file.is_loading && file.image.is_none() && file.diff.is_none() {
                 let state = file.editor_state.clone();
                 cached_states.insert(file.id.clone(), state);
             }
@@ -416,10 +438,24 @@ impl Editor {
         cached_states
     }
 
+    /// 取出 diff tab 的 DiffView 实体，用于标签页组切换时整实体保留。
+    fn take_cached_diff_views(
+        &mut self,
+    ) -> HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>> {
+        let mut cached = HashMap::new();
+        for file in &mut self.open_files {
+            if let Some(diff) = file.diff.clone() {
+                cached.insert(file.id.clone(), diff);
+            }
+        }
+        cached
+    }
+
     /// 保存当前编辑器状态到文件树状态
     pub fn save_to_file_tree_state(&mut self, cx: &mut Context<Self>) -> FileTreeEditorState {
         let open_files_info = self.get_open_files_info();
         let cached_editor_states = self.take_cached_editor_states();
+        let cached_diff_views = self.take_cached_diff_views();
         let active_file_id = self.active_file_id.clone();
 
         // 清空编辑器
@@ -428,6 +464,7 @@ impl Editor {
         FileTreeEditorState {
             open_files_info,
             cached_editor_states,
+            cached_diff_views,
             active_file_id,
         }
     }
@@ -443,6 +480,7 @@ impl Editor {
             state.open_files_info,
             state.active_file_id,
             &state.cached_editor_states,
+            &state.cached_diff_views,
             window,
             cx,
         );
@@ -454,6 +492,7 @@ impl Editor {
         files_info: Vec<EditorOpenFileInfo>,
         active_file_id: Option<SharedString>,
         cached_states: &HashMap<SharedString, Entity<InputState>>,
+        cached_diffs: &HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -461,6 +500,31 @@ impl Editor {
         // 恢复期间不播放展开动画（编辑器宽度保持原值，标题栏 padding 同步保持瞬时）
         self.suppress_open_animation = true;
         for file_info in &files_info {
+            // diff tab：优先复用缓存的 DiffView 实体（保留未保存编辑/滚动/折叠），
+            // 无缓存时用保存的仓库后台重载；走纯文本恢复会得到空白页。
+            if let Some(cached_diff) = cached_diffs.get(&file_info.id) {
+                let diff_repo = file_info.diff_repo.clone();
+                self.push_existing_diff_tab(
+                    file_info.id.to_string(),
+                    file_info.path.clone(),
+                    file_info.label.clone(),
+                    cached_diff.clone(),
+                    diff_repo,
+                    window,
+                    cx,
+                );
+                continue;
+            }
+            if let Some(ref diff_repo) = file_info.diff_repo {
+                self.open_diff_file_loading(file_info.path.clone(), diff_repo.clone(), window, cx);
+                continue;
+            }
+            // 兼容旧缓存：id 是 `diff-` 前缀但没有仓库快照时跳过建空白 tab，
+            // 避免切组回来留下一个空白的只读编辑器。
+            if file_info.id.as_ref().starts_with("diff-") {
+                log::warn!("skip restoring diff tab without repo snapshot: {}", file_info.id.as_ref());
+                continue;
+            }
             let is_image = crate::editor::image_viewer::is_image_file(Path::new(&file_info.path));
 
             // 图片文件不能从文本 InputState 缓存恢复，必须重新加载二进制
@@ -621,6 +685,7 @@ impl Editor {
             live,
             image: None,
             diff: None,
+            diff_repo: None,
         };
 
         // 只读文件：恢复后同样置为禁用，避免可编辑后保存才报错。
@@ -1083,13 +1148,38 @@ impl Editor {
     pub fn update_resize(&mut self, pos: Pixels) {
         if let Some(start) = self.resize_drag_x {
             let delta: f32 = (pos - start).into();
-            self.width = (self.width + delta).max(EDITOR_MIN_WIDTH);
+            // 上限与窗口跟随一致：拖拽也不能把主区挤出窗口（固定 px 为硬约束）。
+            let max_w = self.window_follow_limit.max(EDITOR_MIN_WIDTH);
+            self.width = (self.width + delta).clamp(EDITOR_MIN_WIDTH, max_w);
             self.resize_drag_x = Some(pos);
         }
     }
 
     pub fn end_resize(&mut self) {
         self.resize_drag_x = None;
+    }
+
+    /// 窗口宽度跟随：窗口每变化 1px，编辑器跟 `EDITOR_WINDOW_FOLLOW_RATIO`。
+    /// 调用方保证非拖拽态（拖拽中分割线必须与鼠标 1:1，窗口增量只更新基线，
+    /// 松手不结算，避免弹跳）。首帧（基线为 0）只记录不跟随。
+    /// 上限 `window_follow_limit`（窗口宽 − 侧边栏占位 − 主区最小宽）保证
+    /// 跟随不会把主区挤出窗口。
+    fn apply_window_follow(&mut self, win_w: f32) {
+        if self.last_window_width > 0.0 {
+            let dw = win_w - self.last_window_width;
+            if dw.abs() > 0.5 {
+                let max_w = self.window_follow_limit.max(EDITOR_MIN_WIDTH);
+                self.width = (self.width + dw * EDITOR_WINDOW_FOLLOW_RATIO)
+                    .clamp(EDITOR_MIN_WIDTH, max_w);
+            }
+        }
+        self.last_window_width = win_w;
+    }
+
+    /// 由 AppWindow 每帧下发窗口跟随的宽度上限（窗口宽 − 侧边栏占位 −
+    /// 主区最小宽）。仅用于钳制窗口跟随，不影响拖拽/最小宽度语义。
+    pub fn set_window_follow_limit(&mut self, limit: f32) {
+        self.window_follow_limit = limit;
     }
 
     pub fn set_paddings(&mut self, content_left: f32, content_bottom: f32, cx: &mut Context<Self>) {
@@ -1462,6 +1552,7 @@ impl Editor {
             state
         });
         let editor_weak = cx.entity().downgrade();
+        let diff_repo = repo.clone();
         let diff_view = cx.new(|cx| {
             crate::editor::diff_view::DiffView::new_loading(
                 path.clone(),
@@ -1471,7 +1562,7 @@ impl Editor {
                 cx,
             )
         });
-        self.push_diff_tab(tab_id, path, label, editor_state, diff_view, cx);
+        self.push_diff_tab(tab_id, path, label, editor_state, diff_view, diff_repo, cx);
     }
 
     fn push_diff_tab(
@@ -1481,6 +1572,7 @@ impl Editor {
         label: String,
         editor_state: Entity<InputState>,
         diff_view: Entity<crate::editor::diff_view::DiffView>,
+        diff_repo: crate::editor::git_repository::GitRepository,
         cx: &mut Context<Self>,
     ) {
         if self.open_files.is_empty() {
@@ -1506,6 +1598,7 @@ impl Editor {
             live: None,
             image: None,
             diff: Some(diff_view),
+            diff_repo: Some(diff_repo),
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1515,6 +1608,61 @@ impl Editor {
             );
         });
 
+        self.switch_to_file(&tab_id, cx);
+        cx.notify();
+    }
+
+    /// 复用切组前缓存的 DiffView 实体：保留未保存编辑/滚动/折叠，后台内容无需重载。
+    fn push_existing_diff_tab(
+        &mut self,
+        tab_id: String,
+        path: String,
+        label: String,
+        diff_view: Entity<crate::editor::diff_view::DiffView>,
+        diff_repo: Option<crate::editor::git_repository::GitRepository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_files.iter().any(|file| file.id == tab_id) {
+            self.switch_to_file(&tab_id, cx);
+            return;
+        }
+        if self.open_files.is_empty() {
+            self.begin_open_animation();
+        }
+        let editor_state = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).multi_line(true);
+            state.disabled = true;
+            state
+        });
+        self.open_files.push(EditorFile {
+            id: tab_id.clone().into(),
+            path: path.clone(),
+            label,
+            ssh_config: None,
+            editor_state,
+            original_content: String::new(),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            pending_reload: false,
+            reload_prompt_pending: false,
+            is_loading: false,
+            saving: false,
+            close_prompt_pending: false,
+            last_checked_text_version: 0,
+            dirty: false,
+            markdown: None,
+            live: None,
+            image: None,
+            diff: Some(diff_view),
+            diff_repo,
+        });
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.add_tab(
+                TabItem::new(&tab_id, format!("Diff: {}", path)).with_icon(Some(Icon::Git)),
+                cx,
+            );
+        });
         self.switch_to_file(&tab_id, cx);
         cx.notify();
     }
@@ -2428,6 +2576,7 @@ impl Editor {
             live,
             image,
             diff: None,
+            diff_repo: None,
         });
 
         let is_local = self
@@ -2908,7 +3057,16 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 窗口跟随只吃“变化量”：拖拽中仅更新基线（松手不结算、无弹跳）。
+        // 空编辑器不参与布局（宽度目标为 0），此时不累积窗口增量、只追踪基线，
+        // 避免关闭期间改窗口大小导致之后打开文件时宽度突变。
+        let win_w: f32 = window.viewport_size().width.into();
         let is_empty = self.open_files.is_empty();
+        if self.resize_drag_x.is_some() || is_empty {
+            self.last_window_width = win_w;
+        } else {
+            self.apply_window_follow(win_w);
+        }
         let theme = cx.theme().ui;
 
         let inner = self.tab_bar.clone();
@@ -2923,7 +3081,7 @@ impl Render for Editor {
         } else {
             let base = div()
                 .h(px(30.0))
-                .w(px((self.width - 8.0).max(0.0)))
+                .w_full()
                 .px(px(6.0))
                 .child(inner);
             let epoch = self.tab_bar_pad_epoch;
@@ -3107,7 +3265,6 @@ impl Render for Editor {
         let (anim_start, anim_end) = (self.open_anim_start, self.open_anim_end);
         let target_width = if is_empty { 0.0 } else { self.width };
         let animating = anim_epoch > 0 && (anim_end - target_width).abs() <= 0.5;
-        let display_width = if animating { anim_start } else { target_width };
 
         let with_panel_actions = |panel: gpui::Div| {
             panel
@@ -3254,9 +3411,19 @@ impl Render for Editor {
             .into_any_element()
         };
 
+        // wrapper 保持固定 px：拖拽 1:1 跟手、最小宽度钳制精确。
+        // 窗口级跟随另见 render 开头的 `apply_window_follow`（按比例吃掉
+        // 窗口宽度增量），不经过 flex，避免 basis/渲染 1:2 脱节和
+        // “basis 已触底、渲染还很宽”的假最小宽度问题。
+        let display_width = if animating { anim_start } else { target_width };
         let wrapper = div()
+            .id("editor-panel-width")
+            .debug_selector(|| "editor-panel-width".into())
             .w(px(display_width))
             .h_full()
+            // 固定 px 必须是硬约束：GPUI 默认 flex_shrink=1，否则面板过宽时
+            // 会被 flex 收缩，实际渲染宽度与 `self.width` 脱节，破坏拖拽基准。
+            .flex_shrink_0()
             .overflow_hidden()
             .child(root);
         if animating {
@@ -3573,6 +3740,7 @@ mod tests {
             original_content: Some("# hi\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            diff_repo: None,
         };
         cx.update(|window, cx| {
             let cached = cx.new(|cx| {
@@ -3591,6 +3759,215 @@ mod tests {
                     })
             });
             assert!(live_ok, "live tab must keep its LiveMarkdownView after restore");
+        });
+    }
+
+    /// 回归：标签页组切换后 git diff tab 必须重建 DiffView，而不是空白纯文本页。
+    /// `restore_file_from_cache` 曾以 `diff: None` 存入，导致切组回来后空白。
+    #[gpui::test]
+    fn restore_diff_tab_from_cache_rebuilds_diff_view(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            EditorHost(cx.new(|cx| Editor::new(window, cx)))
+        });
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+        // 用临时 git 仓库构造可恢复的 diff 上下文：DiffView 后台加载即可，
+        // 断言只关心 tab 重建后 `diff.is_some()`（非空白纯文本）。
+        let tmp = std::env::temp_dir().join(format!("deepterm-diff-restore-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _ = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&tmp)
+            .output();
+        let repo = crate::editor::git_repository::GitRepository::find(&tmp, true, None)
+            .expect("find repo")
+            .expect("should find temp repo");
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_diff_file_loading("test.txt".to_string(), repo, window, cx);
+            });
+        });
+        let state = editor.update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+        assert_eq!(state.open_files_info.len(), 1);
+        assert!(
+            state.open_files_info[0].diff_repo.is_some(),
+            "diff tab must carry its repo for reload"
+        );
+        let diff_key: SharedString = "diff-test.txt".into();
+        assert!(
+            !state.cached_editor_states.contains_key(&diff_key),
+            "diff placeholder state must not be cached as text"
+        );
+        // 路径一：整实体复用（保留未保存编辑），走真实切组路径。
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.restore_from_file_tree_state(state, window, cx);
+            });
+            let diff_ok = editor
+                .read(cx)
+                .open_files
+                .iter()
+                .any(|f| f.id.as_ref() == "diff-test.txt" && f.diff.is_some());
+            assert!(diff_ok, "diff tab must reuse its DiffView after restore");
+        });
+        // 路径二：无实体缓存时后台重载（兜底），同样不能是空白纯文本页。
+        let state2 = editor.update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                let infos = state2.open_files_info.clone();
+                let active = state2.active_file_id.clone();
+                let empty_text: std::collections::HashMap<SharedString, Entity<InputState>> =
+                    std::collections::HashMap::new();
+                let empty_diff: std::collections::HashMap<
+                    SharedString,
+                    Entity<crate::editor::diff_view::DiffView>,
+                > = std::collections::HashMap::new();
+                editor.restore_from_info(infos, active, &empty_text, &empty_diff, window, cx);
+            });
+            let diff_ok = editor
+                .read(cx)
+                .open_files
+                .iter()
+                .any(|f| f.id.as_ref() == "diff-test.txt" && f.diff.is_some());
+            assert!(diff_ok, "diff tab must rebuild its DiffView after restore");
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归：窗口拉宽时编辑器必须按比例跟着变宽（而不是钉死在拖拽宽度上），
+    /// 且拖拽/最小宽度语义保持精确（固定 px，不经过 flex）。
+    #[gpui::test]
+    fn editor_width_follows_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct WidthHost {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for WidthHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(self.editor.clone())
+                    .child(gpui::div().flex_1())
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(window, cx));
+            editor.update(cx, |e, _| e.suppress_open_animation = true);
+            WidthHost { editor }
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+        let info = EditorOpenFileInfo {
+            id: "a.txt".into(),
+            path: "a.txt".into(),
+            label: "a.txt".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("hello\n".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            diff_repo: None,
+        };
+        cx.update(|window, cx| {
+            let cached = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("hello\n", window, cx);
+                state
+            });
+            editor.update(cx, |editor, cx| {
+                editor.restore_file_from_cache(&info, cached, window, cx);
+            });
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let w0: f32 = cx.update(|window, _| window.viewport_size().width.into());
+        let w1 = cx
+            .debug_bounds("editor-panel-width")
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(-1.0);
+        assert!((w1 - 680.0).abs() <= 1.0, "default width, got {w1:.1}");
+        // 窗口跟随吃“变化量”（测试 harness 的 viewport 固定 1920，
+        // resize 测不出，直接调 `apply_window_follow` 验证数学）。
+        // 窗口 1200 -> 1600（+400）：编辑器吃掉一半增量。
+        editor.update(cx, |e, _| {
+            e.last_window_width = w0;
+            e.apply_window_follow(w0 + 400.0);
+            assert!(
+                (e.width - 880.0).abs() <= 0.5,
+                "editor must take half the window growth, width={:.1}",
+                e.width
+            );
+            // 同一宽度重复调不漂移。
+            e.apply_window_follow(w0 + 400.0);
+            assert!((e.width - 880.0).abs() <= 0.5, "no drift, width={:.1}", e.width);
+            // 窗口骤窄：按比例收缩，钳在最小宽度。
+            e.apply_window_follow(200.0);
+            assert!(
+                (e.width - EDITOR_MIN_WIDTH).abs() <= 0.5,
+                "shrinks with floor, width={:.1}",
+                e.width
+            );
+            // 上限：已到 limit 时窗口继续变宽也不增长，避免把主区挤出窗口。
+            e.width = 480.0;
+            e.window_follow_limit = 500.0;
+            e.apply_window_follow(600.0); // last=200 → dw=400
+            assert!(
+                (e.width - 500.0).abs() <= 0.5,
+                "follow must respect limit, width={:.1}",
+                e.width
+            );
+            e.window_follow_limit = f32::INFINITY;
+        });
+        let w2 = 880.0;
+        // 拖拽 1:1 且最小宽度钳制精确（247px 上限内直接算，不依赖鼠标事件）。
+        editor.update(cx, |e, _| {
+            e.width = w2;
+            e.start_resize(gpui::px(1000.0));
+            e.update_resize(gpui::px(900.0));
+            assert!(
+                (e.width - (w2 - 100.0)).abs() <= 0.5,
+                "drag must track 1:1, width={:.1} base={w2:.1}",
+                e.width
+            );
+            e.update_resize(gpui::px(-10000.0));
+            assert!(
+                (e.width - EDITOR_MIN_WIDTH).abs() <= 0.5,
+                "min width clamp must be exact, width={:.1}",
+                e.width
+            );
+            // 上限：拖拽同样不能超过 limit（固定 px 是硬约束，不交给 flex 收缩）。
+            e.window_follow_limit = 500.0;
+            e.update_resize(gpui::px(20000.0));
+            assert!(
+                (e.width - 500.0).abs() <= 0.5,
+                "drag must respect limit, width={:.1}",
+                e.width
+            );
+            e.window_follow_limit = f32::INFINITY;
+            e.end_resize();
         });
     }
 

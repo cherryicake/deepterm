@@ -51,6 +51,10 @@ actions!(app, [Quit, NewWindow]);
 
 const CONTEXT: &str = "AppWindow";
 
+/// 编辑器「窗口跟随」时为主区（终端）保留的最小宽度：窗口变窄时编辑器
+/// 按此上限收缩，避免吃掉全部增量把主区挤出窗口。
+const MAIN_AREA_MIN_WIDTH: f32 = 320.0;
+
 /// 顶部标签页组下拉在标签页组之后追加的一级菜单（用分割线隔开），
 /// 让二级页可以直接切换而无需先返回一级菜单。(菜单 id, 显示名)
 const SIDEBAR_QUICK_MENUS: &[(&str, &str)] = &[
@@ -1317,6 +1321,19 @@ impl Render for AppWindow {
 
         let sidebar_visible = self.sidebar.read(cx).is_visible();
         let editor_is_empty = self.editor.read(cx).is_empty();
+
+        // 编辑器「窗口跟随」的宽度上限：窗口宽 − 侧边栏占位 − 主区最小宽。
+        // 每帧下发，保证窗口缩窄时编辑器让位，不会把主区挤出窗口。
+        let sidebar_occ = if sidebar_visible {
+            self.sidebar.read(cx).width() + 8.0
+        } else {
+            0.0
+        };
+        let win_w: f32 = window.viewport_size().width.into();
+        let editor_limit = (win_w - sidebar_occ - MAIN_AREA_MIN_WIDTH).max(0.0);
+        self.editor.update(cx, |editor, _cx| {
+            editor.set_window_follow_limit(editor_limit);
+        });
 
         if editor_is_empty {
             self.editor.update(cx, |editor, cx| {
