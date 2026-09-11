@@ -117,16 +117,17 @@ fn detect_callout_open(line: &str, content: usize) -> Option<(CalloutKind, Strin
     Some((kind, rest))
 }
 
-/// Plan the whole document: classify in order (fence/frontmatter state),
-/// expand reveal over source-only blocks, detect callouts, then `plan` each
-/// line. Pure function of (lines, reveal) — cached by the view on
-/// `(text_version, reveal_lines, wrap-independent)` since `RowPlan` itself
-/// has no wrap dependence.
-pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    // 1. Classify in document order (DocState threads fence/frontmatter).
+/// The text-only half of planning: document-order block classification
+/// (fence/frontmatter state threading) plus the setext backward restyle.
+/// Depends only on `lines`, **not** on the cursor/reveal — so the view can
+/// cache it and skip these two O(n) passes on cursor-only moves (P1).
+pub struct Classified {
+    pub blocks: Vec<Block>,
+    pub lang_before: Vec<Option<String>>,
+}
+
+/// Classify every line in document order (P1 text-only half).
+pub fn classify_document(lines: &[String]) -> Classified {
     let mut state = DocState::default();
     let mut lang_before: Vec<Option<String>> = Vec::with_capacity(lines.len());
     let mut blocks: Vec<Block> = Vec::with_capacity(lines.len());
@@ -161,6 +162,60 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
         }
     }
 
+    Classified { blocks, lang_before }
+}
+
+/// Plan every row from a precomputed classification + a (cursor-dependent)
+/// reveal. The heavy reveal-set / refdefs / per-line passes still run here,
+/// but the two O(n) classification passes are skipped when `classify_document`
+/// was cached (P1).
+pub fn plan_rows(lines: &[String], classified: &Classified, reveal: Reveal) -> Vec<PlannedRow> {
+    plan_rows_with_refs(
+        lines,
+        classified,
+        &refdefs_for_lines(lines, &classified.blocks),
+        reveal,
+    )
+}
+
+/// Whether a block's lines are exempt from registering reference definitions
+/// (`[label]: dest`); their text is literal content.
+pub(crate) fn is_refdef_skipped(b: &Block) -> bool {
+    matches!(
+        b,
+        Block::CodeLine
+            | Block::Fence { .. }
+            | Block::FrontMatter
+            | Block::Table
+            | Block::Math { .. }
+            | Block::MathDelim { .. }
+    )
+}
+
+/// Reference definitions (`[label]: dest`) for document-wide link resolution.
+/// A pure function of (`lines`, `blocks`) — both text-only — so the view caches
+/// it and skips this O(n) scan on cursor-only moves (P1).
+pub fn refdefs_for_lines(
+    lines: &[String],
+    blocks: &[Block],
+) -> std::collections::HashMap<String, String> {
+    collect_refdefs(lines, &|i| blocks.get(i).is_some_and(is_refdef_skipped))
+}
+
+/// Plan every row from a precomputed classification + reveal, using the given
+/// (possibly cached) reference definitions. This is the variant the view uses
+/// so it can reuse `refdefs_for_lines` across cursor-only moves.
+pub fn plan_rows_with_refs(
+    lines: &[String],
+    classified: &Classified,
+    refdefs: &std::collections::HashMap<String, String>,
+    reveal: Reveal,
+) -> Vec<PlannedRow> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let blocks = &classified.blocks;
+
     // 2. Line reveal set, then block expansion over source-only runs.
     let mut revealed = reveal.line_set(lines.len());
     // Expand over contiguous Table/FrontMatter/math runs (code/fence rows
@@ -187,19 +242,6 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
     flush(run_start.take(), lines.len(), &mut revealed);
 
     // 3. Plan each line + track callout cards across quote runs.
-    // Reference definitions resolve document-wide (code/fence/table/math
-    // lines never register: their `[x]: y` text is literal content).
-    let refdefs = collect_refdefs(lines, &|i| {
-        matches!(
-            blocks[i],
-            Block::CodeLine
-                | Block::Fence { .. }
-                | Block::FrontMatter
-                | Block::Table
-                | Block::Math { .. }
-                | Block::MathDelim { .. }
-        )
-    });
     let mut rows = Vec::with_capacity(lines.len());
     let mut callout_kind: Option<CalloutKind> = None;
     let mut prev_was_quote = false;
@@ -240,7 +282,7 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
         prev_was_quote = is_quote;
 
         let lang = match block {
-            Block::CodeLine => lang_before[i].as_deref(),
+            Block::CodeLine => classified.lang_before[i].as_deref(),
             _ => None,
         };
         let row_plan = plan_with_refs(line, block, lang, revealed.contains(&i), &refdefs);
@@ -252,6 +294,14 @@ pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
         });
     }
     rows
+}
+
+/// Plan the whole document: classify then plan rows. Pure function of
+/// (lines, reveal). Backwards-compatible wrapper: call sites that don't need
+/// the P1 classification cache keep using this. The view routes cursor-only
+/// moves through `plan_rows` with a cached `classify_document` result.
+pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
+    plan_rows(lines, &classify_document(lines), reveal)
 }
 
 #[cfg(test)]
@@ -548,6 +598,47 @@ mod showcase_tests {
             assert_eq!(rows.len(), lines.len());
             for (row, line) in rows.iter().zip(lines.iter()) {
                 check_row(line, &row.plan);
+            }
+        }
+    }
+
+    /// P1: the aggregate `plan_document` must equal classification-then-plan
+    /// (`plan_rows(classify_document(...))`), which is how the view reuses the
+    /// classification across cursor-only moves. If they ever diverge, the
+    /// classification cache feeds back different rows than a fresh full plan.
+    #[test]
+    fn plan_document_equals_classify_then_plan_rows() {
+        let doc = "# Heading\n\npara **bold**\n\n```rust\nfn f() {}\n```\n\n- item\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+        let ls: Vec<String> = doc.split('\n').map(str::to_string).collect();
+        let classified = classify_document(&ls);
+        let refs = refdefs_for_lines(&ls, &classified.blocks);
+        let n = ls.len();
+        for line in 0..n {
+            let reveal = Reveal {
+                cursor: Pos::new(line, 0),
+                selection: None,
+                focused: true,
+                read_only: false,
+            };
+            let merged = plan_document(&ls, reveal);
+            let split = plan_rows(&ls, &classified, reveal);
+            // P1 cached path: reuse the precomputed classification + refs.
+            let split_cached =
+                plan_rows_with_refs(&ls, &classified, &refs, reveal);
+            assert_eq!(merged.len(), split.len());
+            assert_eq!(merged.len(), split_cached.len());
+            for (a, b) in merged.iter().zip(split.iter()) {
+                assert_eq!(a.line, b.line);
+                assert_eq!(a.block, b.block);
+                assert_eq!(a.plan.visible, b.plan.visible);
+                assert_eq!(a.plan.revealed, b.plan.revealed);
+            }
+            // Cached refs must produce identical rows to the fresh full plan.
+            for (a, b) in merged.iter().zip(split_cached.iter()) {
+                assert_eq!(a.line, b.line);
+                assert_eq!(a.block, b.block);
+                assert_eq!(a.plan.visible, b.plan.visible);
+                assert_eq!(a.plan.revealed, b.plan.revealed);
             }
         }
     }

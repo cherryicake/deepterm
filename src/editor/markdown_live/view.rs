@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -42,7 +43,8 @@ use crate::editor::markdown_live::layout::{
 };
 use crate::editor::markdown_live::model::Pos;
 use crate::editor::markdown_live::reveal::{
-    plan_document, strip_plan_prefix, CalloutKind, PlannedRow, Reveal,
+    classify_document, plan_rows_with_refs, refdefs_for_lines, strip_plan_prefix, CalloutKind,
+    Classified, PlannedRow, Reveal,
 };
 use crate::components::input::{
     blink_cursor::{BlinkCursor, CURSOR_WIDTH},
@@ -71,9 +73,20 @@ pub struct LiveMarkdownView {
     planned_version: u64,
     planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool),
     planned: Vec<PlannedRow>,
+    /// P1: 按 text_version 缓存的文档分类结果（块类型 + 前置语法语言）。
+    /// 只有文本变更才重算，纯光标移动时被 `plan_rows` 复用 —— 跳过两个
+    /// O(n) 的分类/setext pass。
+    planned_classified: Classified,
+    planned_classified_version: u64,
+    /// P1: 按 text_version 缓存的引用定义（`[label]: dest`）。同样是纯文本相关
+    /// 且依赖 `planned_classified.blocks`，光标移动时复用 —— 跳过第三个 O(n)
+    /// 的全文扫描。`Rc` 共享避免每次复用拷贝整表。
+    planned_refs: Rc<HashMap<String, String>>,
+    planned_refs_version: u64,
     /// 表格单元格用的文档级参考链接表（`[t][ref]`）。全文档扫描得来的，
     /// 按「文本版本 + 规划键」缓存，避免每帧重扫一遍整篇文档。
-    table_refs: std::collections::HashMap<String, String>,
+    /// 用 `Rc` 共享：每帧只需自增引用计数而不是整表克隆（见 P4）。
+    table_refs: Rc<HashMap<String, String>>,
     /// `table_refs` 对应的缓存键；`None` 表示还没算过。
     table_refs_key: Option<(u64, (Pos, Option<(Pos, Pos)>, bool, bool, bool))>,
     copied_code_blocks: HashSet<usize>,
@@ -163,7 +176,14 @@ impl LiveMarkdownView {
             planned_version: u64::MAX,
             planned_key: (Pos::default(), None, false, false, false),
             planned: Vec::new(),
-            table_refs: std::collections::HashMap::new(),
+            planned_classified: Classified {
+                blocks: Vec::new(),
+                lang_before: Vec::new(),
+            },
+            planned_classified_version: u64::MAX,
+            planned_refs: Rc::new(HashMap::new()),
+            planned_refs_version: u64::MAX,
+            table_refs: Rc::new(HashMap::new()),
             table_refs_key: None,
             copied_code_blocks: HashSet::new(),
             scroll_to_cursor: false,
@@ -560,6 +580,23 @@ impl LiveMarkdownView {
             self.show_source,
         );
         if self.planned_version != self.buffer.text_version() || self.planned_key != key {
+            // P1: 只有文本变更才重新分类；仅光标/选区移动时直接复用缓存，
+            // 跳过两个 O(n) 的分类（classify）+ setext 反向 pass。
+            // 分类结果按文本版本刷新（见 P1）。
+            if self.planned_classified_version != self.buffer.text_version() {
+                let classified = classify_document(self.buffer.lines());
+                self.planned_classified = classified;
+                self.planned_classified_version = self.buffer.text_version();
+            }
+            // 引用定义按文本版本刷新（依赖分类结果，同样纯文本相关，见 P1）。
+            if self.planned_refs_version != self.buffer.text_version() {
+                let refs = Rc::new(refdefs_for_lines(
+                    self.buffer.lines(),
+                    &self.planned_classified.blocks,
+                ));
+                self.planned_refs = refs;
+                self.planned_refs_version = self.buffer.text_version();
+            }
             // 源码模式：用覆盖全文档的选区迫使 `line_set` 揭示每一行
             //（`Reveal` 不变，所有调用点零改动）。
             let last = self.buffer.lines().len().saturating_sub(1);
@@ -577,7 +614,12 @@ impl LiveMarkdownView {
                 focused,
                 read_only: self.read_only,
             };
-            let mut planned = plan_document(self.buffer.lines(), reveal);
+            let mut planned = plan_rows_with_refs(
+                self.buffer.lines(),
+                &self.planned_classified,
+                &self.planned_refs,
+                reveal,
+            );
             // Callout openers hide their `[!TAG] ` prefix when not revealed,
             // matching the preview which consumes the tag. Stripped here so
             // paint and hit-testing share one mapping.
@@ -1861,6 +1903,10 @@ const OVERSCAN_GROUPS: usize = 12;
 const WIN_HYST_GROUPS: usize = 6;
 /// 首帧视口未知时预建的 group 数（滚动后按真实视口修正）。
 const FIRST_WINDOW_GROUPS: usize = 80;
+/// `group_heights` 每帧只保留当前窗口 ± 该余量的 group，超出即淘汰。
+/// 保证跨滚动滚过大量 group 时缓存大小恒定（与文档规模无关）；淘汰的项
+/// 读取时回退到估算并由下一帧实测自修正，因此是安全的（见 M3）。
+const GROUP_HEIGHT_KEEP_MARGIN: usize = 128;
 /// 未实测 group 的高度估算：单行高 + 各容器 chrome。
 const EST_LINE_H: f32 = 26.0;
 /// Pitch 回填时代的默认行高：含组间 margin（标题 pitch 62.5、空白 38~58、
@@ -2232,6 +2278,7 @@ impl LiveMarkdownView {
         self.virt_hi = hi;
         self.virt_top_off = usize::from(lo > 0);
         self.last_window = Some((lo, hi));
+        self.prune_group_heights(lo, hi);
         let total = self.virt_prefix[g];
         Some((
             lo,
@@ -2239,6 +2286,18 @@ impl LiveMarkdownView {
             self.virt_prefix[lo],
             total - self.virt_prefix[hi + 1],
         ))
+    }
+
+    /// 滚动窗口化：只保留当前窗口 `lo..=hi` ± 余量内的实测高度，其余淘汰。
+    /// 淘汰的 group 读取时回退到估算（`prefix` 与速率采样都用 `unwrap_or_else`
+    /// 估算兜底），下一帧进入窗口时实测自修正；因此保留内存从「随滚动遍历
+    /// 整个大文档持续增长」变为与文档规模无关的常数窗口（M3）。
+    fn prune_group_heights(&mut self, lo: usize, hi: usize) {
+        self.group_heights.retain(|&gi, _| {
+            hi < lo
+                || (gi >= lo.saturating_sub(GROUP_HEIGHT_KEEP_MARGIN)
+                    && gi <= hi + GROUP_HEIGHT_KEEP_MARGIN)
+        });
     }
 }
 
@@ -2725,7 +2784,7 @@ impl Render for LiveMarkdownView {
             );
             if self.table_refs_key != Some(key) {
                 let buf_lines = self.buffer.lines();
-                self.table_refs = collect_refdefs(buf_lines, &|i| {
+                self.table_refs = Rc::new(collect_refdefs(buf_lines, &|i| {
                     rows.get(i).is_some_and(|r| {
                         matches!(
                             r.block,
@@ -2737,12 +2796,12 @@ impl Render for LiveMarkdownView {
                                 | Block::MathDelim { .. }
                         )
                     })
-                });
+                }));
                 self.table_refs_key = Some(key);
             }
             self.table_refs.clone()
         } else {
-            std::collections::HashMap::new()
+            Rc::new(HashMap::new())
         };
         let mut window_counts: Vec<usize> = Vec::new();
         for (gi, group) in groups.iter().enumerate() {
@@ -3963,6 +4022,7 @@ impl Render for LiveMarkdownView {
 #[cfg(test)]
 mod live_render_tests {
     use super::*;
+    use crate::editor::markdown_live::reveal::plan_document;
     use gpui::{point, size};
 
     const SAMPLE: &str = "# Title\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\npara text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
@@ -4060,6 +4120,45 @@ mod live_render_tests {
         }
     }
 
+    /// M3: the measured-height cache stays a constant rolling window, not a
+    /// map that grows with how far you scroll. After seeding a large range and
+    /// pruning for a mid-document window, only the window ± margin survives
+    /// and the out-of-window entries are gone (they were estimators-only).
+    #[gpui::test]
+    fn group_heights_pruned_to_rolling_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx)))
+        });
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        view.update(cx, |v, _| {
+            // Simulate having measured every group of a very large doc as we
+            // scrolled through it (index 0..50_000).
+            for gi in 0..50_000usize {
+                v.group_heights.insert(gi, 40.0);
+            }
+            assert!(v.group_heights.len() >= 50_000);
+            // Now "the viewport is" around group 30_000..30_100.
+            let lo = 30_000usize;
+            let hi = 30_100usize;
+            v.prune_group_heights(lo, hi);
+            // Bounded to the window + margins, regardless of the doc size.
+            assert!(v.group_heights.len() <= hi - lo + 1 + 2 * GROUP_HEIGHT_KEEP_MARGIN);
+            // In-window entries survived.
+            for gi in lo..=hi {
+                assert!(v.group_heights.contains_key(&gi));
+            }
+            // Far-out entries were dropped.
+            assert!(!v.group_heights.contains_key(&0));
+            assert!(!v.group_heights.contains_key(&(hi + GROUP_HEIGHT_KEEP_MARGIN + 1)));
+            // Margin neighbors survive.
+            assert!(v.group_heights.contains_key(&lo.saturating_sub(GROUP_HEIGHT_KEEP_MARGIN)));
+        });
+    }
+
     /// Showcase repro: shape every row of the real showcase doc and dump
     /// heights per kind. Code rows must not collapse.
     #[gpui::test]
@@ -4145,6 +4244,7 @@ mod live_render_tests {
 #[cfg(test)]
 mod live_frame_tests {
     use super::*;
+    use crate::editor::markdown_live::reveal::plan_document;
 
     const SAMPLE: &str = "# Title\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\npara text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
 
@@ -4570,6 +4670,7 @@ mod live_frame_tests {
 #[cfg(test)]
 mod live_showcase_tests {
     use super::*;
+    use crate::editor::markdown_live::reveal::plan_document;
 
     const SHOWCASE: &str = include_str!("../../../markdown-showcase.md");
 
@@ -5383,6 +5484,7 @@ mod interaction_fallback_tests {
 #[cfg(test)]
 mod setext_parity_tests {
     use super::*;
+    use crate::editor::markdown_live::reveal::plan_document;
     use crate::editor::markdown_live::reveal::Reveal;
 
     /// Live setext classification must match pulldown-cmark (the read-only

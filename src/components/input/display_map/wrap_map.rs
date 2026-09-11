@@ -138,8 +138,8 @@ impl WrapMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        self.wrapper.update(changed_text, range, new_text, cx);
-        self.rebuild_cache();
+        let dirty_from = self.wrapper.update(changed_text, range, new_text, cx);
+        self.rebuild_cache_from(dirty_from);
     }
 
     /// Update layout parameters (wrap width or font).
@@ -177,8 +177,28 @@ impl WrapMap {
         self.rebuild_cache();
     }
 
-    /// Rebuild the prefix sum cache: buffer_line_starts
+    /// Rebuild the prefix sum cache: buffer_line_starts.
+    ///
+    /// Full rebuild from row 0. Used when every line may have changed (text
+    /// replaced wholesale, font / wrap-width / first-prepare changes).
     fn rebuild_cache(&mut self) {
+        self.rebuild_cache_from(0);
+    }
+
+    /// Rebuild the prefix sum cache from buffer row `from` onward, leaving
+    /// `buffer_line_starts[0..from]` untouched.
+    ///
+    /// `buffer_line_starts[i]` is the wrap row where buffer line `i` starts
+    /// (= the prefix sum of each earlier line's wrap count). When an edit
+    /// replaces lines starting at `from`, every line before `from` keeps its
+    /// content, identity and wrap count, so its prefix entry is unchanged.
+    /// Only the tail needs rewriting — strictly less work than the old
+    /// all-lines rebuild, and identical output (preserves correctness).
+    ///
+    /// `from` is the dirty start row reported by the wrapper's incremental
+    /// update. It is clamped into range and never below 0; `from == 0` falls
+    /// back to a full rebuild (the common case before this change).
+    fn rebuild_cache_from(&mut self, from: usize) {
         let line_count = self.wrapper.lines.len();
         let wrap_row_count = self.wrapper.len();
 
@@ -192,12 +212,27 @@ impl WrapMap {
             return;
         }
 
-        self.buffer_line_starts.clear();
+        let from = from.min(line_count);
 
-        let mut wrap_row = 0;
-        for line_item in &self.wrapper.lines {
-            self.buffer_line_starts.push(wrap_row);
-            wrap_row += line_item.lines_len();
+        // Empty document: no rows exist, prefix is empty.
+        if line_count == 0 {
+            self.buffer_line_starts.clear();
+            self.cached_line_count = line_count;
+            self.cached_wrap_row_count = wrap_row_count;
+            return;
+        }
+
+        // Keep the clean prefix, resize to the new line count.
+        if self.buffer_line_starts.len() != line_count {
+            self.buffer_line_starts.resize(line_count, 0);
+        }
+
+        // `buffer_line_starts[from]` is the prefix *before* row `from`, which
+        // the edit leaves intact. Accumulate onward from it.
+        let mut acc = self.buffer_line_starts[from.min(line_count.saturating_sub(1))];
+        for (i, line_item) in self.wrapper.lines.iter().enumerate().skip(from) {
+            self.buffer_line_starts[i] = acc;
+            acc += line_item.lines_len();
         }
 
         self.cached_line_count = line_count;
@@ -226,4 +261,77 @@ impl WrapMap {
             .filter(|&wr| fold_map.wrap_row_to_display_row(wr).is_some())
             .count()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::px;
+
+    /// Render host used only to open a window (so a real text system exists)
+    /// and run the parity check. Renders nothing.
+    struct ParityHost;
+
+    impl gpui::Render for ParityHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    fn run_parity(cx: &mut gpui::App) {
+        let font = gpui::Font::default();
+        let width = px(90.);
+        let mut incr = WrapMap::new(font.clone(), px(13.), Some(width));
+        let mut full = WrapMap::new(font, px(13.), Some(width));
+
+        let mut text = Rope::from(INITIAL);
+        incr.set_text(&text, cx);
+        full.set_text(&text, cx);
+
+        // Deterministic edit script: mid-text single-char insert (wrap-count
+        // change), a multi-line block insert (line-count change), a delete
+        // across a wrapped line, a top-of-file insert (the worst case for
+        // incremental — dirty row 0) and an end-of-buffer append.
+        let edits: [(std::ops::Range<usize>, &str); 5] = [
+            (7..7, "INSERT "),
+            (14..16, "xx\nnew line yy\nzz"),
+            (40..46, ""),
+            (0..0, "PREFIX\n"),
+            (INITIAL.len()..INITIAL.len(), "\nEnd text"),
+        ];
+
+        for (range, new) in edits {
+            text.replace(range.clone(), new);
+            let new_rope = Rope::from(new);
+            incr.on_text_changed(&text, &range, &new_rope, cx);
+            full.on_text_changed(&text, &range, &new_rope, cx);
+            // Force a full rebuild on the second instance.
+            full.rebuild_cache();
+            assert_eq!(
+                incr.buffer_line_starts,
+                full.buffer_line_starts,
+                "buffer_line_starts diverged after edit at {:?}",
+                range
+            );
+        }
+    }
+
+    /// The incremental prefix-sum rebuild must produce the *same*
+    /// `buffer_line_starts` as a full rebuild for identical edits. We drive
+    /// both strategies over the same deterministic edit sequence and compare
+    /// every step.
+    #[gpui::test]
+    fn incremental_prefix_matches_full(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::theme::init(cx));
+        let _handle = cx.open_window(gpui::size(px(1200.), px(800.)), |_, cx| {
+            run_parity(cx);
+            ParityHost
+        });
+    }
+
+    const INITIAL: &str = "The quick brown fox jumps over the lazy dog while the whole world watches.\nshort\n\nAnother fairly long line that should wrap around more than once if the width is small.\nlast";
 }

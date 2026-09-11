@@ -151,13 +151,17 @@ impl TextWrapper {
     /// - `new_text`: The inserted text.
     /// - `force`: Whether to force the update, if false, the update will be skipped if the text is the same.
     /// - `cx`: The application context.
+    ///
+    /// Returns the buffer row at which the edit begins (the start of the
+    /// affected `lines` range), so callers can rebuild downstream derived
+    /// data (e.g. `WrapMap`'s prefix-sum cache) incrementally from there.
     pub(crate) fn update(
         &mut self,
         changed_text: &Rope,
         range: &Range<usize>,
         new_text: &Rope,
         cx: &mut App,
-    ) {
+    ) -> usize {
         let mut line_wrapper = cx
             .text_system()
             .line_wrapper(self.font.clone(), self.font_size);
@@ -170,7 +174,7 @@ impl TextWrapper {
                     .wrap_line(&[LineFragment::text(line_str)], wrap_width)
                     .collect()
             },
-        );
+        )
     }
 
     fn _update<F>(
@@ -179,7 +183,8 @@ impl TextWrapper {
         range: &Range<usize>,
         new_text: &Rope,
         wrap_line: &mut F,
-    ) where
+    ) -> usize
+    where
         F: FnMut(&str, Pixels) -> Vec<gpui::Boundary>,
     {
         // Remove the old changed lines.
@@ -267,7 +272,8 @@ impl TextWrapper {
         self.longest_row = LongestRow {
             row: longest_row_ix,
             len: longest_row_len,
-        }
+        };
+        start_row
     }
 
     /// Update the text wrapper and recalculate the wrapped lines.

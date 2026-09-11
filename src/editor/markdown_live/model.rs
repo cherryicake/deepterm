@@ -7,6 +7,7 @@
 //! char-index cursor and word-boundary semantics, plus selections and history.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 
 /// A position in the document: `line` index plus `col` as a **char** index
 /// (not bytes) in `0..=line_len`. Ordering is document order.
@@ -29,6 +30,13 @@ struct Snapshot {
   cursor: Pos,
 }
 
+/// Bounds `undo`/`redo` retention. Each snapshot is a full copy of the
+/// document, so unbounded retention makes large-document editing accumulate
+/// `steps × document` memory. Capping the history bounds that to a fixed
+/// multiple of the document size (dropping the oldest step is O(1) on a
+/// `VecDeque`), with no effect on undo semantics for the retained steps.
+const MAX_UNDO_STEPS: usize = 200;
+
 /// A multiline editing model with cursor, selection, and undo history.
 ///
 /// The document is a `Vec<String>` of lines (no trailing `\n` stored); an
@@ -43,8 +51,8 @@ pub struct EditorModel {
   anchor: Option<Pos>,
   /// Sticky column for vertical movement through short lines.
   goal_col: Option<usize>,
-  undo: Vec<Snapshot>,
-  redo: Vec<Snapshot>,
+  undo: VecDeque<Snapshot>,
+  redo: VecDeque<Snapshot>,
   /// Whether the last edit was a coalescable single-char insert.
   coalescing: bool,
   /// Spaces per tab stop for [`tab`](Self::tab).
@@ -79,8 +87,8 @@ impl EditorModel {
       cursor: Pos::default(),
       anchor: None,
       goal_col: None,
-      undo: Vec::new(),
-      redo: Vec::new(),
+      undo: VecDeque::new(),
+      redo: VecDeque::new(),
       coalescing: false,
       tab_size: 4,
       text_version: 0,
@@ -616,15 +624,13 @@ impl EditorModel {
   /// Revert the last edit (a coalesced typing run counts as one). Returns
   /// whether anything changed.
   pub fn undo(&mut self) -> bool {
-    let Some(snap) = self.undo.pop() else {
+    let Some(snap) = self.undo.pop_back() else {
       return false;
     };
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
-    self.redo.push(Snapshot {
-      lines,
-      cursor: self.cursor,
-    });
+    let cursor = self.cursor;
+    Self::push_step_bounded(&mut self.redo, Snapshot { lines, cursor });
     self.cursor = snap.cursor;
     self.anchor = None;
     self.goal_col = None;
@@ -634,15 +640,13 @@ impl EditorModel {
 
   /// Re-apply the last undone edit. Returns whether anything changed.
   pub fn redo(&mut self) -> bool {
-    let Some(snap) = self.redo.pop() else {
+    let Some(snap) = self.redo.pop_back() else {
       return false;
     };
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
-    self.undo.push(Snapshot {
-      lines,
-      cursor: self.cursor,
-    });
+    let cursor = self.cursor;
+    Self::push_step_bounded(&mut self.undo, Snapshot { lines, cursor });
     self.cursor = snap.cursor;
     self.anchor = None;
     self.goal_col = None;
@@ -716,13 +720,22 @@ impl EditorModel {
   /// single-char insert. Any edit invalidates the redo stack.
   fn push_undo(&mut self, coalesce: bool) {
     if !(coalesce && self.coalescing) {
-      self.undo.push(Snapshot {
-        lines: self.lines.clone(),
-        cursor: self.cursor,
-      });
+      let lines = self.lines.clone();
+      let cursor = self.cursor;
+      Self::push_step_bounded(&mut self.undo, Snapshot { lines, cursor });
     }
     self.coalescing = coalesce;
     self.redo.clear();
+  }
+
+  /// Push a history step onto `stack` (the undo or redo deque), dropping the
+  /// oldest step first once the capacity is reached. Bounding is what keeps
+  /// `MAX_UNDO_STEPS × document` as a hard ceiling on history memory.
+  fn push_step_bounded(stack: &mut VecDeque<Snapshot>, snap: Snapshot) {
+    if stack.len() >= MAX_UNDO_STEPS {
+      stack.pop_front();
+    }
+    stack.push_back(snap);
   }
 
   /// Remove the selected range if any, leaving the cursor at its start.
@@ -1416,5 +1429,44 @@ mod tests {
     m.move_to(0, 8, false);
     m.select_word();
     assert_eq!(m.selected_text().as_deref(), Some("café"));
+  }
+
+  /// The undo history is size-bounded: beyond `MAX_UNDO_STEPS` distinct edits
+  /// the oldest steps are dropped, so `undo().len()` never exceeds the cap.
+  /// This is the memory optimization of M1 — a hard bound on how much full
+  /// document history is retained, at the cost of losing the most ancient
+  /// undo steps (a deliberate product trade-off).
+  #[test]
+  fn undo_history_is_bounded_and_drops_oldest() {
+    let mut m = EditorModel::new("");
+    // Volume far above the cap on purpose: the retained depth must stay flat
+    // (memory ≤ cap × doc) no matter how many edits accumulate.
+    let n = MAX_UNDO_STEPS + 2000;
+    for _ in 0..n {
+      // `insert_pair` always records a fresh non-coalesced undo step.
+      m.insert_pair('x', 'x');
+    }
+    // Only the most recent MAX steps are retained.
+    let mut undone = 0usize;
+    while m.undo() {
+      undone += 1;
+    }
+    assert_eq!(
+      undone, MAX_UNDO_STEPS,
+      "must retain exactly the most recent {MAX_UNDO_STEPS} steps"
+    );
+    // Nothing older remains: the oldest 30 edits were dropped.
+    assert!(!m.undo());
+    // The document after undoing all retained steps equals the state right
+    // after edit #30 (i.e. `n - MAX_UNDO_STEPS` edits of "xx").
+    assert_eq!(m.text(), "xx".repeat(n - MAX_UNDO_STEPS));
+    // Redo is bounded the same way (it inherits the retained undo depth).
+    let mut redone = 0usize;
+    while m.redo() {
+      redone += 1;
+    }
+    assert_eq!(redone, MAX_UNDO_STEPS);
+    assert!(!m.redo());
+    assert_eq!(m.text(), "xx".repeat(n));
   }
 }
