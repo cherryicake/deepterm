@@ -1317,74 +1317,69 @@ impl Editor {
             })
             .unwrap_or_else(|| "纯文本".to_string());
 
-        let chip = |label: String| {
-            div()
-                .px(px(8.0))
-                .py(px(2.0))
-                .rounded(px(8.0))
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(label)
-        };
-
         div()
             .id("editor-status-bar")
+            .flex_shrink_0()
             .flex()
+            .flex_row()
             .items_center()
             .justify_between()
-            .mx(px(10.0))
-            .mb(px(6.0))
+            .w_full()
             .mt(px(2.0))
-            .px(px(10.0))
-            .py(px(3.0))
-            .rounded(px(12.0))
-            // 液态玻璃：半透明底 + 细边 + 柔和阴影
-            .bg(theme.panel_background.opacity(0.72))
-            .border_1()
-            .border_color(theme.border.opacity(0.7))
-            .shadow_sm()
+            .pt(px(6.0))
+            // 与 Markdown 实时渲染编辑器一致：仅用一条分割线与内容区隔开
+            .border_t_1()
+            .border_color(theme.border.opacity(0.4))
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
             .child(
                 div()
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .gap(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(div().child(format!(
+                    .gap(px(8.0))
+                    .child(format!(
                         "行 {}, 列 {}",
                         position.line + 1,
                         position.character + 1
-                    )))
+                    ))
                     .when(selected_len > 0, |this| {
                         this.child(
                             div()
                                 .text_color(theme.text_muted.opacity(0.8))
-                                .child(format!("（已选 {selected_len} 字符）")),
+                                .child(format!("已选 {selected_len} 字")),
                         )
                     })
-                    .child(
-                        div()
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(format!("共 {total} 行")),
-                    ),
+                    .child(format!("共 {total} 行")),
             )
             .child(
                 div()
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .gap(px(2.0))
-                    .child(chip("缩进: Tab".to_string()))
-                    .child(chip(encoding_label.to_string()))
-                    // 语言 chip：点击弹出语言菜单
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .child("缩进: Tab"),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .child(encoding_label),
+                    )
+                    // 语言：点击弹出语言菜单
                     .child(
                         div()
                             .id("language-chip")
                             .cursor_pointer()
                             .px(px(8.0))
                             .py(px(2.0))
-                            .rounded(px(8.0))
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
+                            .rounded(px(6.0))
                             .hover(|this| this.bg(theme.tab_hover_background))
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
