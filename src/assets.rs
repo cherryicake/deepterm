@@ -64,6 +64,12 @@ pub enum Icon {
     ChevronRight,
     ChevronUpDown,
     ChevronLeft,
+    // Git panel variants (stroke-weight redesigns; the plain ones are shared
+    // elsewhere and keep their original look).
+    ChevronDownThick,
+    ChevronRightThick,
+    ChevronUpThick,      // Diff collapse band (expand up)
+    ChevronUpDownThick,  // Diff collapse band (expand both ways)
     Eye,
     EyeOff,
     Loader,
@@ -97,6 +103,15 @@ pub enum Icon {
     SquarePlus,  // Added
     SquareMinus, // Deleted
     Warning,     // Conflicted
+    Trash,       // Discard changes
+    Refresh,     // Refresh git status / diff
+    Minus,       // Unstage (VSCode style plain minus)
+    MinusThick,  // Git panel unstage (stroke-weight minus, pairs with PlusThick)
+    PlusThick,   // Git panel stage (stroke-weight plus; plain Plus is shared elsewhere)
+    Discard,     // VSCode SCM discard (curved left arrow, NOT trash)
+    DiscardThick,   // Git panel discard (stroke-outlined, bolder)
+    RefreshThick,   // Git panel refresh (bolder stroke; plain Refresh shared)
+    GoToFile,    // VSCode SCM "Open File" (file with arrow)
     /// Dynamic file icon loaded by extension/name (e.g., language icons from Seti UI).
     FileIcon(&'static str),
 }
@@ -165,6 +180,19 @@ impl Icon {
             Icon::SquarePlus => SharedString::new_static("icons/square_plus.svg"),
             Icon::SquareMinus => SharedString::new_static("icons/square_minus.svg"),
             Icon::Warning => SharedString::new_static("icons/warning.svg"),
+            Icon::Trash => SharedString::new_static("icons/trash.svg"),
+            Icon::Refresh => SharedString::new_static("icons/arrow.clockwise.svg"),
+            Icon::Minus => SharedString::new_static("icons/minus.svg"),
+            Icon::MinusThick => SharedString::new_static("icons/minus.thick.svg"),
+            Icon::PlusThick => SharedString::new_static("icons/plus.thick.svg"),
+            Icon::Discard => SharedString::new_static("icons/discard.svg"),
+            Icon::GoToFile => SharedString::new_static("icons/go.to.file.svg"),
+            Icon::ChevronDownThick => SharedString::new_static("icons/chevron.down.thick.svg"),
+            Icon::ChevronRightThick => SharedString::new_static("icons/chevron.right.thick.svg"),
+            Icon::ChevronUpThick => SharedString::new_static("icons/chevron.up.thick.svg"),
+            Icon::ChevronUpDownThick => SharedString::new_static("icons/chevron.updown.thick.svg"),
+            Icon::DiscardThick => SharedString::new_static("icons/discard.thick.svg"),
+            Icon::RefreshThick => SharedString::new_static("icons/arrow.clockwise.thick.svg"),
             Icon::FileIcon(path) => SharedString::new_static(path),
         }
     }

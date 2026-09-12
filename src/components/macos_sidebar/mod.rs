@@ -157,12 +157,19 @@ pub enum SidebarEvent {
     OpenDiffLoading {
         path: String,
         repo: crate::editor::git_repository::GitRepository,
+        staged: bool,
     },
     /// A file's staging state changed (staged or unstaged by the Git panel).
     /// The HEAD → worktree diff for that path must be recomputed.
     GitIndexChanged {
         path: String,
     },
+    /// Git 写操作失败：弹错误提示。
+    GitOperationFailed {
+        message: String,
+    },
+    /// Git 提交成功：弹成功提示并刷新 diff 页（HEAD 已变）。
+    GitCommitDone,
 }
 
 impl std::fmt::Debug for SidebarEvent {
@@ -180,14 +187,20 @@ impl std::fmt::Debug for SidebarEvent {
                 .debug_struct("PathRemoved")
                 .field("path", path)
                 .finish(),
-            Self::OpenDiffLoading { path, .. } => f
+            Self::OpenDiffLoading { path, staged, .. } => f
                 .debug_struct("OpenDiffLoading")
                 .field("path", path)
+                .field("staged", staged)
                 .finish(),
             Self::GitIndexChanged { path } => f
                 .debug_struct("GitIndexChanged")
                 .field("path", path)
                 .finish(),
+            Self::GitOperationFailed { message } => f
+                .debug_struct("GitOperationFailed")
+                .field("message", message)
+                .finish(),
+            Self::GitCommitDone => write!(f, "GitCommitDone"),
         }
     }
 }

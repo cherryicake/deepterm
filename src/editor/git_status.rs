@@ -186,22 +186,83 @@ impl FileStatus {
             },
         }
     }
+
+    /// 右侧单字母徽标（VSCode 风格）：M 修改 / A 新增 / D 删除 / U 冲突 / R 改名 / T 类型变更。
+    pub fn badge_letter(&self) -> char {
+        match self {
+            FileStatus::Untracked => 'U',
+            FileStatus::Ignored => 'I',
+            FileStatus::Unmerged { .. } => 'C',
+            FileStatus::Tracked(t) => {
+                // 优先展示工作区状态（未暂存的更需要引起注意），全已暂存时展示暂存区状态。
+                let code = if t.worktree_status != StatusCode::Unmodified {
+                    t.worktree_status
+                } else {
+                    t.index_status
+                };
+                match code {
+                    StatusCode::Modified => 'M',
+                    StatusCode::Added => 'A',
+                    StatusCode::Deleted => 'D',
+                    StatusCode::Renamed => 'R',
+                    StatusCode::Copied => 'C',
+                    StatusCode::TypeChanged => 'T',
+                    StatusCode::Unmodified => 'M',
+                }
+            }
+        }
+    }
+
+    /// 该文件是否还有可暂存的工作区改动（含未跟踪文件）。
+    pub fn has_unstaged_changes(&self) -> bool {
+        match self {
+            FileStatus::Untracked => true,
+            FileStatus::Ignored | FileStatus::Unmerged { .. } => false,
+            FileStatus::Tracked(t) => t.worktree_status != StatusCode::Unmodified,
+        }
+    }
+
+    /// 该文件是否有已暂存的改动。
+    pub fn has_staged_changes(&self) -> bool {
+        match self {
+            FileStatus::Tracked(t) => t.index_status != StatusCode::Unmodified,
+            _ => false,
+        }
+    }
 }
 
-/// Section for grouping files in the git panel
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Section for grouping files in the git panel (VSCode 模型)。
+/// 排序：合并冲突 < 已暂存 < 更改 < 未跟踪。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     Conflict,
-    Tracked,
+    Staged,
+    Changes,
     New,
+    /// 兼容旧分组：完全未暂存的跟踪文件曾归入 `Tracked`。
+    /// 新代码不再产生该变体，仅保留以兼容旧缓存/旧排序。
+    Tracked,
 }
 
 impl Section {
     pub fn title(&self) -> &'static str {
         match self {
-            Section::Conflict => "Conflicts",
-            Section::Tracked => "Tracked",
-            Section::New => "Untracked",
+            Section::Conflict => "合并更改",
+            Section::Staged => "已暂存的更改",
+            Section::Changes => "更改",
+            Section::New => "更改",
+            Section::Tracked => "更改",
+        }
+    }
+
+    /// 分组排序键（VSCode 顺序）。
+    pub fn order(&self) -> u8 {
+        match self {
+            Section::Conflict => 0,
+            Section::Staged => 1,
+            Section::Changes => 2,
+            Section::New => 3,
+            Section::Tracked => 2,
         }
     }
 }
@@ -299,10 +360,16 @@ impl GitStatus {
 fn classify_section(status: &FileStatus) -> Section {
     if status.is_conflicted() {
         Section::Conflict
-    } else if status.is_created() {
-        Section::New
     } else {
-        Section::Tracked
+        // VSCode 模型：未跟踪文件同样归入“更改”（U 徽标区分），
+        // 不再单独分组。
+        match status.staging() {
+            StageStatus::Staged => Section::Staged,
+            // 部分暂存（MM/AM 等）同时有已暂存与未暂存改动：
+            // 列表中只出现一次，归入“更改”，避免同一文件在两组重复出现
+            // 导致暂存/取消暂存按钮语义混乱。
+            StageStatus::Unstaged | StageStatus::PartiallyStaged => Section::Changes,
+        }
     }
 }
 
@@ -342,10 +409,26 @@ mod tests {
         assert_eq!(status.entries.len(), 2);
         assert_eq!(status.entries[0].path, "src/main.rs");
         assert!(status.entries[0].status.is_modified());
-        assert_eq!(status.entries[0].section, Section::Tracked);
+        // "M " = 仅暂存区有改动 → 已暂存组
+        assert_eq!(status.entries[0].section, Section::Staged);
         assert_eq!(status.entries[1].path, "src/new_file.rs");
         assert!(status.entries[1].status.is_untracked());
-        assert_eq!(status.entries[1].section, Section::New);
+        // 未跟踪文件归入“更改”（VSCode 模型，U 徽标区分）。
+        assert_eq!(status.entries[1].section, Section::Changes);
+    }
+
+    #[test]
+    fn test_parse_status_sections() {
+        //  M = 仅工作区修改 → 更改；MM = 部分暂存 → 更改；A  = 新增已暂存 → 已暂存
+        let input = " M a.rs\0MM b.rs\0A  c.rs\0";
+        let status = GitStatus::parse(input);
+        assert_eq!(status.entries[0].section, Section::Changes);
+        assert_eq!(status.entries[1].section, Section::Changes);
+        assert_eq!(status.entries[2].section, Section::Staged);
+        assert_eq!(status.entries[0].status.badge_letter(), 'M');
+        assert_eq!(status.entries[2].status.badge_letter(), 'A');
+        assert!(status.entries[0].status.has_unstaged_changes());
+        assert!(status.entries[2].status.has_staged_changes());
     }
 
     #[test]

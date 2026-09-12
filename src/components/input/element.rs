@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 
 use crate::{
     components::input::{
+        DiffLineKind,
         RopeExt as _,
         blink_cursor::CURSOR_WIDTH,
         cursor::{CursorLayout, CursorShape},
@@ -2530,6 +2531,23 @@ impl Element for TextElement {
                 underline: None,
                 strikethrough: None,
             }];
+            // Diff 行号着色（参考 diff UI：新增行绿号、删除行红号）。
+            let diff_added_runs = vec![TextRun {
+                len: line_number_len,
+                font: style.font(),
+                color: cx.theme().status_added,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            let diff_deleted_runs = vec![TextRun {
+                len: line_number_len,
+                font: style.font(),
+                color: cx.theme().status_deleted,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
 
             // build line numbers
             for (line, &buffer_line) in last_layout
@@ -2549,7 +2567,15 @@ impl Element for TextElement {
                 let runs = if current_row == Some(buffer_line) {
                     &current_line_runs
                 } else {
-                    &other_line_runs
+                    match state.diff_line_colors.get(&(buffer_line as u32)) {
+                        Some((_, crate::components::input::DiffLineKind::Added)) => {
+                            &diff_added_runs
+                        }
+                        Some((_, crate::components::input::DiffLineKind::Deleted)) => {
+                            &diff_deleted_runs
+                        }
+                        _ => &other_line_runs,
+                    }
                 };
 
                 let mut sub_lines: SmallVec<[ShapedLine; 1]> = SmallVec::new();
@@ -2635,6 +2661,40 @@ impl Element for TextElement {
         let invisible_top_padding = prepaint.last_layout.visible_top;
         let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
 
+        // Diff rows (git diff views only): opaque deeper versions of the
+        // added/deleted tints, composited over the editor background. Used
+        // for the active row and for rows covered by the selection, so the
+        // active-line gray / selection blue never hide the row's hue.
+        // Owned values only: the `state` read guard must not stay alive
+        // across the `&mut cx` paint calls below.
+        let (deep_added, deep_deleted) = if !state.diff_line_colors.is_empty() {
+            let deep = |status: Hsla| {
+                // 两倍于普通行 tint（0.14）的不透明度：肉眼明显加深，且不透明
+                // 合成后盖在选区/激活行底色上不会透出原色。
+                Hsla::from(
+                    gpui::Rgba::from(cx.theme().editor_background())
+                        .blend(gpui::Rgba::from(status.opacity(0.28))),
+                )
+            };
+            (
+                deep(cx.theme().status_added),
+                deep(cx.theme().status_deleted),
+            )
+        } else {
+            (Hsla::default(), Hsla::default())
+        };
+        let selected_byte_range = if window.is_window_active()
+            && !state.masked
+            && !selected_range.is_empty()
+        {
+            Some(
+                selected_range.start.min(selected_range.end)
+                    ..selected_range.start.max(selected_range.end),
+            )
+        } else {
+            None
+        };
+
         // Geometry of every visible line: (buffer row, y offset, height).
         //
         // Derived from the layout rather than from `line_numbers`, so the
@@ -2670,18 +2730,23 @@ impl Element for TextElement {
         //   会形成一块色差明显的矩形，导致输入区背景色不一致。
         let single_line = !state.mode.is_multi_line();
         if focused && !single_line && selected_range.is_empty() {
-            if let Some(bg_color) = active_line_color {
-                if let Some(&(_, y, height)) = line_geometry
-                    .iter()
-                    .find(|(buffer_line, _, _)| prepaint.current_row == Some(*buffer_line))
-                {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(input_bounds.origin.x, origin.y + y),
-                            size(bounds.size.width, height),
-                        ),
-                        bg_color,
-                    ));
+            if let Some(&(buffer_line, y, height)) = line_geometry
+                .iter()
+                .find(|(buffer_line, _, _)| prepaint.current_row == Some(*buffer_line))
+            {
+                // diff 行的激活底色（加深红/绿）由下方 diff 行背景循环统一
+                // 绘制，这里只处理普通行 —— 同一行不能先后叠两种底色，
+                // 否则激活 diff 行的行首（gutter）与正文深浅不一致。
+                if !state.diff_line_colors.contains_key(&(buffer_line as u32)) {
+                    if let Some(bg_color) = active_line_color {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(input_bounds.origin.x, origin.y + y),
+                                size(bounds.size.width, height),
+                            ),
+                            bg_color,
+                        ));
+                    }
                 }
             }
         }
@@ -2703,11 +2768,31 @@ impl Element for TextElement {
             // `line_geometry`, so the height comes from the geometry above.
             for (&(buffer_line, y, height), _) in line_geometry.iter().zip(line_numbers) {
                 let p = point(input_bounds.origin.x, origin.y + y);
-                // Paint diff line background (added/deleted) below everything else
-                if let Some(bg_color) = diff_line_colors.get(&(buffer_line as u32)) {
+                // Paint diff line background (added/deleted) below everything
+                // else. Selected/active rows use the deep tint — the same rule
+                // as the gutter cell below, so one row is one uniform color.
+                if let Some((bg_color, line_kind)) = diff_line_colors.get(&(buffer_line as u32)) {
+                    let row_deep = (focused
+                        && !single_line
+                        && selected_range.is_empty()
+                        && prepaint.current_row == Some(buffer_line))
+                        || selected_byte_range.as_ref().is_some_and(|sel| {
+                            let state = self.state.read(cx);
+                            let row_start = state.text.line_start_offset(buffer_line);
+                            let row_end = state.text.line_start_offset(buffer_line + 1);
+                            row_start < sel.end && sel.start < row_end
+                        });
+                    let bg = if row_deep {
+                        match line_kind {
+                            DiffLineKind::Added => deep_added,
+                            DiffLineKind::Deleted => deep_deleted,
+                        }
+                    } else {
+                        *bg_color
+                    };
                     window.paint_quad(fill(
                         Bounds::new(p, size(bounds.size.width, height)),
-                        *bg_color,
+                        bg,
                     ));
                 }
                 // Paint git gutter marks：新增绿 / 修改蓝 / 删除红（顶部小短条）
@@ -2746,6 +2831,31 @@ impl Element for TextElement {
         if window.is_window_active() {
             if let Some(path) = prepaint.selection_path.take() {
                 window.paint_path(path, cx.theme().selection);
+            }
+        }
+
+        // Selected diff rows keep their identity: overpaint the selection
+        // with the deeper diff tint instead of letting the selection blue
+        // cover the added/deleted row background.
+        if let Some(sel) = selected_byte_range.as_ref() {
+            for (buffer_line, y, height) in &line_geometry {
+                if let Some((_, kind)) = state.diff_line_colors.get(&(*buffer_line as u32)) {
+                    let row_start = state.text.line_start_offset(*buffer_line);
+                    let row_end = state.text.line_start_offset(*buffer_line + 1);
+                    if row_start < sel.end && sel.start < row_end {
+                        let bg = match kind {
+                            DiffLineKind::Added => deep_added,
+                            DiffLineKind::Deleted => deep_deleted,
+                        };
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(input_bounds.origin.x, origin.y + *y),
+                                size(bounds.size.width, *height),
+                            ),
+                            bg,
+                        ));
+                    }
+                }
             }
         }
 
@@ -3171,13 +3281,74 @@ impl Element for TextElement {
                 let is_active = prepaint.current_row == Some(buffer_line);
 
                 let height = line_height * lines.len() as f32;
-                // paint active line number background
-                if is_active && selected_range.is_empty() {
-                    if let Some(bg_color) = active_line_color {
-                        window.paint_quad(fill(
-                            Bounds::new(p, size(prepaint.last_layout.line_number_width, height)),
-                            bg_color,
-                        ));
+                // Gutter cell background: diff rows always carry their tint —
+                // deepened when the row is selected or active, so the
+                // active-line gray / selection never hide the hue — and the
+                // kind bar paints last, on top of it all.
+                let diff_entry = self
+                    .state
+                    .read(cx)
+                    .diff_line_colors
+                    .get(&(buffer_line as u32))
+                    .copied();
+                let row_selected = selected_byte_range.as_ref().is_some_and(|sel| {
+                    let state = self.state.read(cx);
+                    let row_start = state.text.line_start_offset(buffer_line);
+                    let row_end = state.text.line_start_offset(buffer_line + 1);
+                    row_start < sel.end && sel.start < row_end
+                });
+                // 与上方正文区激活行同一组条件（含焦点）：保证 gutter 与
+                // 正文要么都画加深色、要么都不画。
+                let active_plain =
+                    focused && !single_line && is_active && selected_range.is_empty();
+                let cell_bg = match diff_entry {
+                    Some((tint, kind)) => {
+                        let bg = if row_selected || active_plain {
+                            match kind {
+                                DiffLineKind::Added => deep_added,
+                                DiffLineKind::Deleted => deep_deleted,
+                            }
+                        } else {
+                            tint
+                        };
+                        Some(bg)
+                    }
+                    None => active_plain.then_some(active_line_color).flatten(),
+                };
+                if let Some(bg) = cell_bg {
+                    let gutter_w =
+                        prepaint.last_layout.line_number_width - LINE_NUMBER_RIGHT_MARGIN;
+                    window.paint_quad(fill(Bounds::new(p, size(gutter_w, height)), bg));
+                }
+                if let Some((_, line_kind)) = diff_entry {
+                    let edge_color = match line_kind {
+                        crate::components::input::DiffLineKind::Added => cx.theme().status_added,
+                        crate::components::input::DiffLineKind::Deleted => {
+                            cx.theme().status_deleted
+                        }
+                    };
+                    match line_kind {
+                        crate::components::input::DiffLineKind::Added => {
+                            window.paint_quad(fill(
+                                Bounds::new(p, size(px(3.), height)),
+                                edge_color,
+                            ));
+                        }
+                        crate::components::input::DiffLineKind::Deleted => {
+                            // 条纹短划（2px 划 + 2px 空）铺满行高，参考 diff UI
+                            // 用纹理区分"此行在另一侧不存在"。
+                            let (bar_w, dash, gap) = (px(3.), px(2.), px(2.));
+                            let end = p.y + height;
+                            let mut dash_y = p.y;
+                            while dash_y < end {
+                                let h = (end - dash_y).min(dash);
+                                window.paint_quad(fill(
+                                    Bounds::new(point(p.x, dash_y), size(bar_w, h)),
+                                    edge_color,
+                                ));
+                                dash_y += dash + gap;
+                            }
+                        }
                     }
                 }
 

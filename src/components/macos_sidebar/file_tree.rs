@@ -155,22 +155,50 @@ impl MacosSidebar {
         let sub = cx.subscribe(
             git_panel,
             |_this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
-                crate::sidebar_view::git_panel::GitPanelEvent::OpenDiffLoading { path, repo } => {
+                crate::sidebar_view::git_panel::GitPanelEvent::OpenDiffLoading {
+                    path,
+                    repo,
+                    staged,
+                } => {
                     // Forward instantly; DiffView fetches content in background.
                     cx.emit(SidebarEvent::OpenDiffLoading {
                         path: path.clone(),
                         repo: repo.clone(),
+                        staged: *staged,
+                    });
+                }
+                crate::sidebar_view::git_panel::GitPanelEvent::OpenFile { path, ssh_config } => {
+                    cx.emit(SidebarEvent::OpenFile {
+                        path: path.clone(),
+                        ssh_config: ssh_config.clone().map(Box::new),
                     });
                 }
                 crate::sidebar_view::git_panel::GitPanelEvent::StageFile { path }
-                | crate::sidebar_view::git_panel::GitPanelEvent::UnstageFile { path } => {
+                | crate::sidebar_view::git_panel::GitPanelEvent::UnstageFile { path }
+                | crate::sidebar_view::git_panel::GitPanelEvent::DiscardFile { path } => {
                     // 暂存区变了：该文件的 HEAD → 工作区 diff 需要重算，
                     // 正在编辑该文件的标签页要刷新行标记。
                     cx.emit(SidebarEvent::GitIndexChanged { path: path.clone() });
                 }
+                crate::sidebar_view::git_panel::GitPanelEvent::CommitDone => {
+                    cx.emit(SidebarEvent::GitCommitDone);
+                }
+                crate::sidebar_view::git_panel::GitPanelEvent::OperationFailed { message } => {
+                    cx.emit(SidebarEvent::GitOperationFailed {
+                        message: message.clone(),
+                    });
+                }
             },
         );
         self.git_panel_subscription = Some(sub);
+    }
+
+    /// 懒创建 Git 提交输入框（需要 Window；在 Git Tab 选中等有窗口的回调中调用）。
+    pub fn ensure_git_commit_editor(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.ensure_git_panel(cx);
+        if let Some(ref panel) = self.git_panel {
+            panel.update(cx, |p, cx| p.ensure_commit_editor(window, cx));
+        }
     }
 
     /// 将文件树切换到指定终端。路径+后端相同时复用现有树（仅切换订阅），否则重建。
@@ -431,13 +459,15 @@ impl MacosSidebar {
             let btn = file_tree_panel_tabs::build_tab_button(item, is_active, &theme)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
-                    cx.listener(move |this, _, _window, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         let old = this.file_tree_panel_tabs.current.clone();
                         if old != panel_clone {
                             this.file_tree_panel_tabs.select(panel_clone.clone());
-                            // 切到 Git 标签时确保面板已创建并初始化（订阅文件监视）
+                            // 切到 Git 标签时确保面板已创建并初始化（订阅文件监视），
+                            // 同时懒创建提交输入框（需要 Window）。
                             if panel_clone == FileTreePanel::Git {
                                 this.ensure_git_panel(cx);
+                                this.ensure_git_commit_editor(window, cx);
                             }
                             cx.notify();
                             this.notify_app_window(cx);

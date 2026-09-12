@@ -489,28 +489,54 @@ impl AppWindow {
                         }
                     });
                 }
-                SidebarEvent::OpenDiffLoading { path, repo } => {
+                SidebarEvent::OpenDiffLoading { path, repo, staged } => {
                     let editor = editor_for_open.clone();
                     let (path, repo) = (path.clone(), repo.clone());
+                    let staged = *staged;
                     window.defer(cx, move |window, cx| {
                         if let Some(editor) = editor.upgrade() {
                             editor.update(cx, |e, cx| {
-                                e.open_diff_file_loading(path, repo, window, cx)
+                                e.open_diff_file_loading(path, repo, staged, window, cx)
                             });
                         }
                     });
                 }
                 SidebarEvent::GitIndexChanged { path } => {
-                    // Git 面板已经自行刷新列表，这里只需让编辑器重算行标记。
+                    // Git 面板已经自行刷新列表，这里让编辑器重算行标记；
+                    // 放弃更改还会改变工作区内容，已打开的 diff 页一并刷新。
                     let editor = editor_for_open.clone();
                     let path = path.clone();
                     window.defer(cx, move |_, cx| {
                         if let Some(editor) = editor.upgrade() {
                             editor.update(cx, |e, cx| {
                                 e.refresh_git_marks_for_path(&path, cx);
+                                e.refresh_diff_for_path(&path, cx);
                             });
                         }
                     });
+                }
+                SidebarEvent::GitOperationFailed { message } => {
+                    _this.show_notification(
+                        message.clone(),
+                        crate::components::notification::NotificationKind::Error,
+                        cx,
+                    );
+                }
+                SidebarEvent::GitCommitDone => {
+                    let editor = editor_for_open.clone();
+                    window.defer(cx, move |_, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                // HEAD 前移：所有 diff 页的左栏与 hunk 全部过期。
+                                e.refresh_all_diff_views(cx);
+                            });
+                        }
+                    });
+                    _this.show_notification(
+                        "提交成功",
+                        crate::components::notification::NotificationKind::Success,
+                        cx,
+                    );
                 }
             },
         );

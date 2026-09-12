@@ -3,10 +3,10 @@ use crate::components::button::button_icon::{ButtonIcon, Disableable, Selectable
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Corners, Div, Edges, ElementId, Hsla,
-    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels, Render,
+    AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla,
+    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels,
     RenderOnce, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, px,
-    relative, transparent_black,
+    transparent_black,
 };
 use std::rc::Rc;
 
@@ -539,12 +539,7 @@ impl RenderOnce for Button {
                 this.shadow(vec![Self::focus_ring_style(&cx.theme().ui)])
             })
             .when_some(self.tooltip.filter(|_| !is_disabled), |this, tooltip| {
-                this.tooltip(move |_window, cx| {
-                    cx.new(|_| ButtonTooltip {
-                        label: tooltip.clone(),
-                    })
-                    .into()
-                })
+                this.tooltip(crate::components::tooltip::Tooltip::text(tooltip))
             })
             .child({
                 div()
@@ -574,37 +569,6 @@ impl RenderOnce for Button {
                     .border_color(normal_style.border.opacity(0.8))
                     .text_color(normal_style.fg.opacity(0.8))
             })
-    }
-}
-
-/// 按钮悬停提示气泡，与标签栏 Tooltip 的样式保持一致。
-struct ButtonTooltip {
-    label: SharedString,
-}
-
-impl Render for ButtonTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
-        div()
-            .id("button-tooltip")
-            .max_w(px(320.0))
-            .px_2()
-            .py_1()
-            .rounded(px(6.0))
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .shadow(vec![gpui::BoxShadow {
-                color: theme.shadow,
-                offset: gpui::point(px(0.0), px(4.0)),
-                blur_radius: px(12.0),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
-            .text_size(px(12.0))
-            .text_color(theme.text)
-            .line_height(relative(1.3))
-            .child(self.label.clone())
     }
 }
 

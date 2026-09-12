@@ -326,8 +326,18 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                 // Set up the subscription for dismiss handling
                                 let _subscription = window.subscribe(&menu, cx, {
                                     let shared_state = shared_state.clone();
-                                    move |_, _: &DismissEvent, window, _cx| {
-                                        shared_state.borrow_mut().open = false;
+                                    move |_, _: &DismissEvent, window, cx| {
+                                        // 打破 Rc 环（shared_state ↔ subscription）：菜单关闭后
+                                        // 释放 menu 实体与订阅，否则每次右键都永久泄漏
+                                        // 一个 PopupMenu。defer 中释放，避免在派发
+                                        // 回调内 drop 正在执行的订阅。
+                                        let shared_state = shared_state.clone();
+                                        window.defer(cx, move |_, _| {
+                                            let mut state = shared_state.borrow_mut();
+                                            state.open = false;
+                                            state.menu_view = None;
+                                            state._subscription.take();
+                                        });
                                         window.refresh();
                                     }
                                 });

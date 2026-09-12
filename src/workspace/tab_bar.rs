@@ -68,7 +68,6 @@ const TAB_RADIUS_PX: f32 = 8.0;
 const ICON_SIZE_PX: f32 = 16.0;
 const FILE_ICON_SIZE_PX: f32 = 22.0;
 const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
-const TAB_TOOLTIP_MAX_WIDTH_PX: f32 = 480.0;
 
 /// 拖拽预览视图
 pub struct DragPreview {
@@ -426,6 +425,11 @@ impl TabBar {
     /// 获取右键菜单的目标标签 ID
     pub fn context_menu_tab_id(&self) -> Option<SharedString> {
         self.context_menu_tab_id.clone()
+    }
+
+    /// 记录本次右键菜单归属的 tab（由菜单构建闭包调用，见 render_tab）。
+    pub(crate) fn set_context_menu_tab(&mut self, tab_id: SharedString) {
+        self.context_menu_tab_id = Some(tab_id);
     }
 
     pub fn add_tab(&mut self, tab: TabItem, cx: &mut Context<Self>) {
@@ -926,30 +930,20 @@ impl TabBar {
                     }
                 }),
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener({
-                    let tab_id = tab_id.clone();
-                    move |this, _, _, cx| {
-                        this.context_menu_tab_id = Some(tab_id.clone());
-                        cx.notify();
-                    }
-                }),
-            )
-            // 完整标题 tooltip（标签宽度受限被截断时尤其有用）
-            .tooltip({
-                let label = label.clone();
-                move |_window, cx| {
-                    cx.new(|_| TabTooltip {
-                        label: label.clone(),
-                    })
-                    .into()
-                }
-            })
+            // 注意：这里曾经有个手动 Right 监听器负责记录被右键的 tab，
+            // 但 ContextMenu 包装器在 window 层先收到右键并 stop_propagation，
+            // 行内监听器永远收不到——记录点已搬进下方构建闭包（自带 tab_id）。
             .context_menu(format!("tab-menu-{}", tab_id), {
                 let tab_id = tab_id.clone();
                 let on_context_menu = self.on_context_menu.clone();
+                // 注意：ContextMenu 包装器在 window 层先收到右键并 stop_propagation，
+                // 上面的行内 Right 监听器收不到事件——这里是唯一可靠的记录点：
+                // 构建闭包自带本次右键的 tab_id（defer 一帧后执行，无竞态）。
+                let tabs = cx.entity();
                 move |menu: PopupMenu, window, cx| {
+                    tabs.update(cx, |bar, _| {
+                        bar.context_menu_tab_id = Some(tab_id.clone());
+                    });
                     if let Some(ref cb) = on_context_menu {
                         cb(tab_id.clone(), menu, window, cx)
                     } else {
@@ -1259,28 +1253,6 @@ impl Render for TabBar {
     }
 }
 
-/// 标签完整标题的悬停提示
-struct TabTooltip {
-    label: SharedString,
-}
-
-impl Render for TabTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
-        div()
-            .max_w(px(TAB_TOOLTIP_MAX_WIDTH_PX))
-            .px_2()
-            .py_1()
-            .rounded(px(TAB_RADIUS_PX))
-            .bg(theme.elevated_background)
-            .border_1()
-            .border_color(theme.border)
-            .text_sm()
-            .text_color(theme.text)
-            .child(self.label.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,5 +1377,100 @@ mod tests {
         // 无移动：全部为 0
         assert_eq!(reorder_offset(1, 1, 0, 10.0), 0.0);
         assert_eq!(reorder_offset(1, 1, 1, 10.0), 0.0);
+    }
+
+    /// 右键 tab → 构建出右键菜单；菜单项 Action 派发必须到达 TabBar 的
+    /// on_action 处理器（终端标签：拷贝地址/复制标签页/重新连接）。
+    ///
+    /// 回归测试：右键链路涉及三段接力（手动 Right 记录 tab id → ContextMenu
+    /// 浮层开菜单 → Action 派发到 TabBar 根），任一段断裂菜单即“不起作用”。
+    struct MenuProbeHost {
+        bar: Entity<TabBar>,
+    }
+
+    impl Render for MenuProbeHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            // 固定 400x30 顶左布局：首个 tab 落在 (0..~150, 0..30)。
+            div().w(px(400.)).h(px(30.)).child(self.bar.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn tab_right_click_opens_menu_and_action_reaches_handler(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| crate::theme::init(cx));
+
+        let menu_built = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let action_tab = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+
+        let bar = cx.update(|cx| {
+            TabBar::new_with_tabs(
+                "test-tab-bar",
+                cx,
+                vec![
+                    TabItem::new("t1", "Terminal 1"),
+                    TabItem::new("t2", "Terminal 2"),
+                ],
+            )
+        });
+        bar.update(cx, |bar, _| {
+            let built = menu_built.clone();
+            bar.on_context_menu(move |tab_id, menu, _window, _cx| {
+                *built.lock().unwrap() = true;
+                menu.menu(format!("probe-{tab_id}"), Box::new(CopyTabAddress))
+            });
+            let fired = action_tab.clone();
+            bar.on_tab_copy_address(move |tab_id, _window, _cx| {
+                *fired.lock().unwrap() = Some(tab_id.to_string());
+            });
+        });
+
+        let window = cx.open_window(gpui::size(px(400.), px(30.)), {
+            let bar = bar.clone();
+            move |_, _| MenuProbeHost { bar: bar.clone() }
+        });
+        let handle: gpui::AnyWindowHandle = window.into();
+        let cx = &mut gpui::VisualTestContext::from_window(handle, cx);
+        cx.run_until_parked();
+
+        // 首个 tab 内右键单击。
+        let pos = point(px(30.), px(15.));
+        cx.simulate_mouse_down(pos, MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(pos, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            *menu_built.lock().unwrap(),
+            "tab 右键必须构建出右键菜单（开菜单链路断裂）"
+        );
+        // 右键必须同时记下 tab id，供菜单动作回调使用。
+        let recorded = bar.update(cx, |bar, _| bar.context_menu_tab_id());
+        assert_eq!(
+            recorded.as_deref(),
+            Some("t1"),
+            "右键必须记下被点的 tab id"
+        );
+
+        // 菜单项派发 Action：必须到达 TabBar 根的 on_action 处理器。
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(CopyTabAddress), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            action_tab.lock().unwrap().as_deref(),
+            Some("t1"),
+            "菜单 Action 派发必须到达 TabBar 处理器"
+        );
+
+        // 收尾：点空白处关闭菜单，否则 PopupMenu 实体泄漏（测试会报 leaked handles）。
+        let outside = point(px(350.), px(15.));
+        cx.simulate_mouse_down(outside, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
     }
 }

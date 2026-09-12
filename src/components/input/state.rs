@@ -144,6 +144,15 @@ pub enum GitLineMark {
     Deleted,
 }
 
+/// Diff 行种类（unified / split 视图的行底色装饰）。
+/// 决定 gutter 与行号的配套装饰：新增行用实色条＋着色行号，
+/// 删除行用虚线条＋着色行号（参考 diff UI）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiffLineKind {
+    Added,
+    Deleted,
+}
+
 /// 同词高亮缓存。
 pub(crate) struct OccurrenceCache {
     pub(crate) text_version: u64,
@@ -562,7 +571,9 @@ pub struct InputState {
     pub(crate) preferred_column: Option<(Pixels, usize)>,
     /// Diff decorations: per-buffer-line background colors (e.g. added /
     /// deleted lines in a diff view), painted full-width behind the text.
-    pub(crate) diff_line_colors: std::collections::HashMap<u32, gpui::Hsla>,
+    /// The kind drives gutter/number decorations (solid bar + tinted number
+    /// for added rows, dotted bar + tinted number for deleted rows).
+    pub(crate) diff_line_colors: std::collections::HashMap<u32, (gpui::Hsla, DiffLineKind)>,
     /// Diff decorations: word-level background colors over byte ranges.
     pub(crate) diff_range_colors: Vec<(Range<usize>, gpui::Hsla)>,
     /// Diff decorations: per-buffer-line line-number label override.
@@ -716,11 +727,14 @@ impl InputState {
     /// word highlights on top of the regular editor rendering.
     pub fn set_diff_decorations(
         &mut self,
-        line_colors: Vec<(u32, gpui::Hsla)>,
+        line_colors: Vec<(u32, gpui::Hsla, DiffLineKind)>,
         range_colors: Vec<(Range<usize>, gpui::Hsla)>,
         cx: &mut Context<Self>,
     ) {
-        self.diff_line_colors = line_colors.into_iter().collect();
+        self.diff_line_colors = line_colors
+            .into_iter()
+            .map(|(row, color, kind)| (row, (color, kind)))
+            .collect();
         self.diff_range_colors = range_colors;
         cx.notify();
     }
@@ -1164,6 +1178,10 @@ impl InputState {
         // loads / tab switches, where a fresh document must start unfolded.
         self.display_map.clear_folds();
         self.display_map.set_text(&self.text, cx);
+        // 程序化替换后行数也要跟上内容（否则 auto_grow 输入框在 set_text
+        // 后高度不变——如提交成功清空后盒子一直撑着）。普通编辑走编辑
+        // 路径已各自更新，这里只补 set_text 这一条程序化路径。
+        self.mode.update_auto_grow(&self.display_map);
         if self.mode.is_code_editor() {
             self.reset_highlighter(cx);
             self._pending_update = true;

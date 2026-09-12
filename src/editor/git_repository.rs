@@ -469,7 +469,31 @@ impl GitRepository {
             .insert(self.root.clone(), (Instant::now(), result.clone()));
         result
     }
+}
 
+/// Diff 三元内容：HEAD、暂存区、工作区。
+/// VSCode 语义：工作区 diff 的左侧基线是暂存区（部分暂存时）否则是 HEAD；
+/// 已暂存 diff 是 HEAD↔暂存区。
+#[derive(Clone, Debug)]
+pub struct DiffBaseContents {
+    pub head: String,
+    pub staged: String,
+    pub worktree: String,
+    pub has_staged: bool,
+}
+
+impl DiffBaseContents {
+    /// 工作区 diff 的左侧基线（暂存区优先，否则 HEAD）。
+    pub fn worktree_base(&self) -> &str {
+        if self.has_staged {
+            &self.staged
+        } else {
+            &self.head
+        }
+    }
+}
+
+impl GitRepository {
     /// 探测工作区文件的磁盘编码。
     ///
     /// 保存时必须按原编码写回：读取侧会剥离 BOM、并把 GBK / UTF-16 统一解码
@@ -606,6 +630,9 @@ impl GitRepository {
 
     /// Stage files
     pub fn stage(&self, paths: &[&str]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
         let mut args = Vec::with_capacity(1 + paths.len());
         args.push("add");
         args.extend(paths.iter().copied());
@@ -619,6 +646,9 @@ impl GitRepository {
 
     /// Unstage files
     pub fn unstage(&self, paths: &[&str]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
         let mut args = Vec::with_capacity(2 + paths.len());
         args.push("reset");
         args.push("HEAD");
@@ -630,6 +660,323 @@ impl GitRepository {
             invalidate_remote_diff_cache(&self.root, p);
         }
         Ok(())
+    }
+
+    /// 放弃工作区改动：跟踪文件回到 HEAD，未跟踪文件保持不动（由调用方经文件系统删除并二次确认）。
+    pub fn discard(&self, paths: &[&str]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // `git restore` 在旧版 git 不存在，优先 restore、失败回退到 checkout。
+        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+        args.extend(paths.iter().copied());
+        if self.run_git(&args).is_err() {
+            let mut fallback = vec!["checkout", "HEAD", "--"];
+            fallback.extend(paths.iter().copied());
+            self.run_git(&fallback)?;
+        }
+        self.invalidate_status_cache();
+        for p in paths {
+            invalidate_remote_diff_cache(&self.root, p);
+        }
+        Ok(())
+    }
+
+    /// 暂存全部（含未跟踪与删除，即 `git add -A`）。
+    /// VSCode 智能提交在无已暂存内容时走此路径。
+    pub fn stage_all(&self) -> Result<(), String> {
+        self.run_git(&["add", "-A"])?;
+        self.invalidate_status_cache();
+        Ok(())
+    }
+
+    /// 提交已暂存改动。空消息直接返回错误，避免产生空提交。
+    pub fn commit(&self, message: &str) -> Result<(), String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("提交信息不能为空".to_string());
+        }
+        self.run_git(&["commit", "-m", message])?;
+        self.invalidate_status_cache();
+        // HEAD 变了，所有远端 diff 缓存都可能过期；状态缓存已清，diff 缓存按需失效
+        //（此处不清全量，仅靠 head_commit 指纹在下次读取时自然失效）。
+        Ok(())
+    }
+
+    /// 修正上次提交（`--amend`），保留原提交的作者与时间戳语义。
+    pub fn commit_amend(&self, message: &str) -> Result<(), String> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err("提交信息不能为空".to_string());
+        }
+        self.run_git(&["commit", "--amend", "-m", message])?;
+        self.invalidate_status_cache();
+        Ok(())
+    }
+
+    /// 在指定目录初始化仓库（VSCode 空态“初始化仓库”按钮）。
+    pub fn init(path: &str, ssh_config: Option<&SshConnectionConfig>) -> Result<(), String> {
+        match ssh_config {
+            None => execute_local_git(&["init"], path).map(|_| ()),
+            Some(config) => {
+                let command = format!("cd {} && git init", shell_quote(path));
+                let result = sftp_fs::with_cached_session(config, |session| {
+                    session.execute_command(&command, REMOTE_GIT_TIMEOUT)
+                })
+                .map_err(|e| format!("初始化仓库失败：{e}"))?;
+                if result.success() {
+                    Ok(())
+                } else {
+                    Err(format!("初始化仓库失败：{}", result.stderr.trim()))
+                }
+            }
+        }
+    }
+
+    /// 当前分支名。detached HEAD 时回退到短 commit id；无 HEAD 时返回 None。
+    pub fn branch_name(&self) -> Option<String> {
+        if let Ok(name) = self.run_git(&["branch", "--show-current"]) {
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        // 旧版 git / detached：用 abbrev-ref，仍为 HEAD 则取短 id。
+        if let Ok(name) = self.run_git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+            let name = name.trim().to_string();
+            if !name.is_empty() && name != "HEAD" {
+                return Some(name);
+            }
+        }
+        self.run_git(&["rev-parse", "--short", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 暂存区（index）中的文件内容。用于“已暂存” diff 视图与 hunk 暂存。
+    /// 未暂存的新文件 / 无 HEAD 时返回空串。
+    pub fn staged_text(&self, path: &str) -> String {
+        let staged_ref = format!(":{path}");
+        let Ok(bytes) = self.backend.execute_bytes(&["show", &staged_ref], &self.root) else {
+            return String::new();
+        };
+        if bytes.is_empty() || sftp_fs::is_binary_bytes(&bytes) {
+            return String::new();
+        }
+        encoding::decode_bytes(&bytes).text
+    }
+
+    /// 单个路径是否有已暂存改动（`git status --porcelain` 限定路径）。
+    /// 用于判断工作区 diff 的左侧基线：部分暂存时基线是暂存区（VSCode 行为），
+    /// 否则是 HEAD。注意已暂存删除的路径：index 无 blob，`staged_text` 为空
+    /// 串但此时空串是有意义的基线，不能回退到 HEAD。
+    fn path_has_staged(&self, path: &str) -> bool {
+        let output = self
+            .run_git(&["status", "--porcelain=v1", "--no-renames", "-z", "--", path])
+            .unwrap_or_default();
+        GitStatus::parse(&output)
+            .entries
+            .iter()
+            .any(|e| e.status.has_staged_changes())
+    }
+
+    /// 一次取齐 diff 三元组（HEAD、暂存区、工作区 + 是否有已暂存改动）。
+    ///
+    /// VSCode 语义由调用方经 [`DiffBaseContents::worktree_base`] 落实。
+    /// 远端四路并行（HEAD / 暂存区 / 工作区 / 单路径状态），(HEAD, 工作区)
+    /// 命中缓存时只补拉暂存区与状态。
+    pub fn diff_base_contents(&self, path: &str) -> Result<DiffBaseContents, String> {
+        fn worktree_string(content: DiffSideContent, path: &str) -> String {
+            match content {
+                DiffSideContent::Text(text) => text,
+                DiffSideContent::Missing => String::new(),
+                DiffSideContent::Unsupported(reason) => {
+                    log::debug!("git diff: {path} 无法按文本展示: {reason}");
+                    format!("<{reason}，无法显示文本差异>")
+                }
+            }
+        }
+
+        match &self.backend {
+            GitBackend::Local => {
+                let head_ref = format!("HEAD:{path}");
+                let head = self.head_text(&head_ref);
+                let staged = self.staged_text(path);
+                let has_staged = self.path_has_staged(path);
+                let worktree = worktree_string(self.read_file_content(path)?, path);
+                Ok(DiffBaseContents {
+                    head,
+                    staged,
+                    worktree,
+                    has_staged,
+                })
+            }
+            GitBackend::Remote { config } => {
+                let remote_path = sftp_fs::join_remote_path(&self.root, path);
+                let (head_commit, meta_res) = std::thread::scope(|scope| {
+                    let head =
+                        scope.spawn(|| self.head_commit().unwrap_or_else(|| "no-head".into()));
+                    let stat = scope.spawn(|| sftp_fs::metadata(config, &remote_path));
+                    let head_commit = head.join().unwrap_or_else(|_| {
+                        log::warn!("git远端HEAD查询线程异常，降级为no-head");
+                        "no-head".to_string()
+                    });
+                    let meta_res = stat.join().unwrap_or_else(|_| {
+                        log::warn!("git远端stat线程异常，降级为空元数据");
+                        Err(anyhow::anyhow!("stat线程异常"))
+                    });
+                    (head_commit, meta_res)
+                });
+                let (size, mtime) = meta_res
+                    .map(|meta| (meta.size, meta.modified_at))
+                    .unwrap_or((u64::MAX, None));
+                let cache_key = format!("{}\u{0}{}", self.root, path);
+
+                // 编辑器文件缓存（30s 新鲜度）命中则省一次 SFTP 读。
+                let file_cache_hit = {
+                    let cache =
+                        crate::file_manager::file_tree_cache::RemoteFileTreeCache::global().lock();
+                    let path_ref = std::path::Path::new(&remote_path);
+                    if cache.is_file_fresh(config, path_ref) {
+                        cache
+                            .get_file_content(config, path_ref)
+                            .map(|(content, _)| content)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(cached) = remote_diff_cache_get(&cache_key, &head_commit, size, mtime)
+                {
+                    // 缓存命中：并行补拉暂存区与单路径状态即可。
+                    let (staged, has_staged) = std::thread::scope(|s| {
+                        let h_staged = s.spawn(|| self.staged_text(path));
+                        let h_status = s.spawn(|| self.path_has_staged(path));
+                        (
+                            h_staged.join().unwrap_or_default(),
+                            h_status.join().unwrap_or(false),
+                        )
+                    });
+                    return Ok(DiffBaseContents {
+                        head: cached.0,
+                        staged,
+                        worktree: cached.1,
+                        has_staged,
+                    });
+                }
+
+                let head_ref = format!("HEAD:{path}");
+                let (head, staged, has_staged, worktree) = std::thread::scope(|s| {
+                    let h_head = s.spawn(|| self.head_text(&head_ref));
+                    let h_staged = s.spawn(|| self.staged_text(path));
+                    let h_status = s.spawn(|| self.path_has_staged(path));
+                    let h_new = s.spawn(|| {
+                        if let Some(cached_new) = file_cache_hit {
+                            return cached_new;
+                        }
+                        let is_large = size != u64::MAX && size > 512 * 1024;
+                        let content = if is_large {
+                            sftp_fs::read_file_bytes(config, &remote_path)
+                                .ok()
+                                .flatten()
+                                .map(|bytes| classify_bytes(&bytes))
+                                .unwrap_or(DiffSideContent::Missing)
+                        } else {
+                            self.read_file_content(path)
+                                .unwrap_or(DiffSideContent::Missing)
+                        };
+                        worktree_string(content, path)
+                    });
+                    (
+                        h_head.join().unwrap_or_default(),
+                        h_staged.join().unwrap_or_default(),
+                        h_status.join().unwrap_or(false),
+                        h_new.join().unwrap_or_default(),
+                    )
+                });
+                remote_diff_cache_insert(
+                    cache_key,
+                    head_commit,
+                    size,
+                    mtime,
+                    (head.clone(), worktree.clone()),
+                );
+                Ok(DiffBaseContents {
+                    head,
+                    staged,
+                    worktree,
+                    has_staged,
+                })
+            }
+        }
+    }
+
+    /// 暂存一个 hunk：将单 hunk 补丁经 `git apply --cached` 写入 index。
+    /// 调用方需保证 `patch` 为合法 unified diff（含 `---/+++` 头）。
+    pub fn stage_hunk_patch(&self, patch: &str) -> Result<(), String> {
+        use std::io::Write;
+        match &self.backend {
+            GitBackend::Local => {
+                let mut child = Command::new("git")
+                    .args(["apply", "--cached", "--unidiff-zero", "-"])
+                    .current_dir(&self.root)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("暂存失败：{e}"))?;
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin
+                        .write_all(patch.as_bytes())
+                        .map_err(|e| format!("暂存失败：{e}"))?;
+                }
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| format!("暂存失败：{e}"))?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("暂存该块失败：{}", stderr.trim()));
+                }
+                self.invalidate_status_cache();
+                Ok(())
+            }
+            GitBackend::Remote { config } => {
+                // 远端会话不支持 stdin：补丁先写 /tmp 临时文件，再让 git apply 读取。
+                let tmp = format!(
+                    "/tmp/deepterm-hunk-{}-{}.patch",
+                    std::process::id(),
+                    patch.len()
+                );
+                sftp_fs::write_file_string(config, &tmp, patch)
+                    .map_err(|e| format!("暂存失败：{e}"))?;
+                let command = format!(
+                    "cd {} && git apply --cached --unidiff-zero {} && rm -f {}",
+                    shell_quote(&self.root),
+                    shell_quote(&tmp),
+                    shell_quote(&tmp)
+                );
+                let result = sftp_fs::with_cached_session(config, |session| {
+                    session.execute_command(&command, REMOTE_GIT_TIMEOUT)
+                });
+                // 失败也尽力清理临时文件。
+                if result.is_err() {
+                    let _ = sftp_fs::with_cached_session(config, |session| {
+                        session.remove_file(&tmp)
+                    });
+                }
+                result
+                    .map_err(|e| format!("暂存失败：{e}"))
+                    .and_then(|r| {
+                        if r.success() {
+                            self.invalidate_status_cache();
+                            Ok(())
+                        } else {
+                            Err(format!("暂存该块失败：{}", r.stderr.trim()))
+                        }
+                    })
+            }
+        }
     }
 }
 
@@ -903,6 +1250,188 @@ mod tests {
         assert!(diff.contains("new content"));
         assert!(diff.contains("second line"));
         assert!(diff.contains("new file mode"));
+
+        cleanup(&temp);
+    }
+
+    /// hunk 补丁回环：改两处，只暂存第一块，暂存区与工作区应各自正确。
+    #[test]
+    fn test_stage_hunk_patch_roundtrip() {
+        let temp = temp_dir("deepterm-git-hunk");
+        init_repo(&temp);
+
+        std::fs::write(temp.join("a.txt"), "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        std::fs::write(temp.join("a.txt"), "ONE\ntwo\nthree\nfour\nfive\nSIX\n").unwrap();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+        let (old, new) = repo.diff_file_contents("a.txt").unwrap();
+        let hunks = crate::editor::diff_model::compute_hunks(&old, &new);
+        assert_eq!(hunks.len(), 2);
+
+        let patch = crate::editor::diff_model::build_hunk_patch("a.txt", &old, &new, &hunks[0]);
+        repo.stage_hunk_patch(&patch).unwrap();
+
+        // 暂存区只有第一块，工作区两块都在。
+        let staged = repo.staged_text("a.txt");
+        assert!(staged.contains("ONE\n"), "staged should contain first hunk: {staged:?}");
+        assert!(
+            staged.contains("five\nsix\n"),
+            "staged should keep old tail: {staged:?}"
+        );
+        let status = repo.status().unwrap();
+        let entry = status.iter().find(|e| e.path == "a.txt").expect("a.txt in status");
+        // 部分暂存：既有已暂存也有未暂存。
+        assert!(entry.status.has_staged_changes());
+        assert!(entry.status.has_unstaged_changes());
+
+        cleanup(&temp);
+    }
+
+    #[test]
+    fn test_commit_and_branch_and_discard() {
+        let temp = temp_dir("deepterm-git-commit");
+        init_repo(&temp);
+
+        std::fs::write(temp.join("f.txt"), "v1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "f.txt"])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+        // 空消息拒绝提交。
+        assert!(repo.commit("   ").is_err());
+
+        std::fs::write(temp.join("f.txt"), "v2\n").unwrap();
+        repo.stage(&["f.txt"]).unwrap();
+        repo.commit("second").unwrap();
+        let (old, new) = repo.diff_file_contents("f.txt").unwrap();
+        assert_eq!(old, new, "提交后 HEAD 与工作区应一致");
+
+        // 分支名非空（新仓库默认分支）。
+        assert!(repo.branch_name().is_some());
+
+        // 放弃更改回到 HEAD。
+        std::fs::write(temp.join("f.txt"), "v3-dirty\n").unwrap();
+        repo.discard(&["f.txt"]).unwrap();
+        let content = std::fs::read_to_string(temp.join("f.txt")).unwrap();
+        assert_eq!(content, "v2\n");
+
+        cleanup(&temp);
+    }
+
+    /// 智能提交（stage_all）+ amend 回环。
+    #[test]
+    fn test_stage_all_and_amend() {
+        let temp = temp_dir("deepterm-git-smart");
+        init_repo(&temp);
+
+        std::fs::write(temp.join("a.txt"), "a1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+
+        // 未跟踪 + 修改混合：stage_all 应全部收进暂存区。
+        std::fs::write(temp.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(temp.join("b.txt"), "b1\n").unwrap();
+        repo.stage_all().unwrap();
+        let status = repo.status().unwrap();
+        assert!(
+            status
+                .iter()
+                .all(|e| e.status.has_staged_changes()),
+            "stage_all 后所有条目都应有已暂存改动"
+        );
+
+        repo.commit("smart").unwrap();
+        assert!(repo.status().unwrap().is_empty());
+
+        // amend：空消息拒绝；正常 amend 改写 HEAD 内容。
+        assert!(repo.commit_amend("  ").is_err());
+        std::fs::write(temp.join("a.txt"), "a3\n").unwrap();
+        repo.stage(&["a.txt"]).unwrap();
+        repo.commit_amend("amended").unwrap();
+        let (old, new) = repo.diff_file_contents("a.txt").unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("a3\n", "a3\n"));
+
+        cleanup(&temp);
+    }
+
+    /// 三元组基线语义：部分暂存时工作区基线是暂存区；无暂存时是 HEAD；
+    /// 已暂存删除的路径 has_staged 为 true（空基线有意义）。
+    #[test]
+    fn test_diff_base_contents() {
+        let temp = temp_dir("deepterm-git-base");
+        init_repo(&temp);
+
+        std::fs::write(temp.join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(temp.join("g.txt"), "g1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&temp)
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&temp)
+            .output();
+
+        let repo = GitRepository::find(&temp, true, None)
+            .unwrap()
+            .expect("should find repo");
+
+        // 纯未暂存修改：基线 = HEAD。
+        std::fs::write(temp.join("g.txt"), "g2\n").unwrap();
+        let base = repo.diff_base_contents("g.txt").unwrap();
+        assert!(!base.has_staged);
+        assert_eq!(base.worktree_base(), "g1\n");
+        assert_eq!(base.worktree, "g2\n");
+
+        // 部分暂存：第一行改动暂存，第二行改动留在工作区。
+        std::fs::write(temp.join("f.txt"), "ONE\ntwo\nthree\n").unwrap();
+        repo.stage(&["f.txt"]).unwrap();
+        std::fs::write(temp.join("f.txt"), "ONE\nTWO\nthree\n").unwrap();
+        let base = repo.diff_base_contents("f.txt").unwrap();
+        assert!(base.has_staged);
+        assert_eq!(base.worktree_base(), "ONE\ntwo\nthree\n");
+        assert_eq!(base.worktree, "ONE\nTWO\nthree\n");
+        assert_eq!(base.head, "one\ntwo\nthree\n");
+
+        // 已暂存删除：has_staged 为 true，基线为空。
+        //（先还原 g.txt 的未暂存修改，否则 git rm 会拒绝执行。）
+        repo.discard(&["g.txt"]).unwrap();
+        let _ = Command::new("git")
+            .args(["rm", "--quiet", "g.txt"])
+            .current_dir(&temp)
+            .output();
+        let base = repo.diff_base_contents("g.txt").unwrap();
+        assert!(base.has_staged);
+        assert_eq!(base.worktree_base(), "");
 
         cleanup(&temp);
     }

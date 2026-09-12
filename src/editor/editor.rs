@@ -530,7 +530,7 @@ impl Editor {
                 continue;
             }
             if let Some(ref diff_repo) = file_info.diff_repo {
-                self.open_diff_file_loading(file_info.path.clone(), diff_repo.clone(), window, cx);
+                self.open_diff_file_loading(file_info.path.clone(), diff_repo.clone(), false, window, cx);
                 continue;
             }
             // 兼容旧缓存：id 是 `diff-` 前缀但没有仓库快照时跳过建空白 tab，
@@ -1543,20 +1543,30 @@ impl Editor {
     }
 
     /// Opens the diff tab instantly; content loads in the background.
+    /// 同一文件只有一个 diff tab（VSCode 行为）：已存在则切换并按需切换
+    /// 工作区/已暂存内容；`staged` 为 true 打开已暂存 diff（HEAD↔暂存区）。
     pub fn open_diff_file_loading(
         &mut self,
         path: String,
         repo: crate::editor::git_repository::GitRepository,
+        staged: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let tab_id = format!("diff-{path}");
-        if self.open_files.iter().any(|file| file.id == tab_id) {
+        if let Some(file) = self.open_files.iter().find(|file| file.id == tab_id) {
+            if let Some(view) = file.diff.clone() {
+                view.update(cx, |v, cx| v.set_kind(staged, cx));
+            }
             self.switch_to_file(&tab_id, cx);
             return;
         }
 
-        let label = format!("Diff: {path}");
+        // VSCode 风格：tab 只显示文件名。
+        let label = match path.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => path.clone(),
+        };
         let editor_state = cx.new(|cx| {
             let mut state = InputState::new(window, cx).multi_line(true);
             state.disabled = true;
@@ -1568,6 +1578,7 @@ impl Editor {
             crate::editor::diff_view::DiffView::new_loading(
                 path.clone(),
                 repo,
+                staged,
                 editor_weak,
                 window,
                 cx,
@@ -1613,8 +1624,14 @@ impl Editor {
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
+            let tab_label = self
+                .open_files
+                .iter()
+                .find(|f| f.id.as_ref() == tab_id)
+                .map(|f| f.label.to_string())
+                .unwrap_or_else(|| tab_id.clone());
             tab_bar.add_tab(
-                TabItem::new(&tab_id, format!("Diff: {}", path)).with_icon(Some(Icon::Git)),
+                TabItem::new(&tab_id, tab_label).with_icon(Some(Icon::Git)),
                 cx,
             );
         });
@@ -2692,15 +2709,42 @@ impl Editor {
     ///
     /// 供外部通知使用：Git 面板 stage / unstage 会改变暂存区，从而使
     /// HEAD → 工作区的 diff 结果变化，已打开文件的行标记需要重算。
+    ///
+    /// 注意路径形态：Git 面板发的是仓库相对路径（如 `src/main.rs`），
+    /// 而普通编辑标签存的是绝对路径——后缀匹配才能命中；diff 标签存的
+    /// 恰好是相对路径，用精确匹配。
     pub fn refresh_git_marks_for_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let suffix = format!("/{path}");
         let ids: Vec<gpui::SharedString> = self
             .open_files
             .iter()
-            .filter(|f| f.path == path)
+            .filter(|f| f.path == path || f.path.ends_with(suffix.as_str()))
             .map(|f| f.id.clone())
             .collect();
         for id in ids {
             self.refresh_git_marks(&id, cx);
+        }
+    }
+
+    /// 刷新指定仓库相对路径的 diff 页（放弃更改/提交后 HEAD 或工作区已变）。
+    pub fn refresh_diff_for_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let tab_id = format!("diff-{path}");
+        if let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) {
+            if let Some(view) = file.diff.clone() {
+                view.update(cx, |v, cx| v.refresh(cx));
+            }
+        }
+    }
+
+    /// 刷新所有已打开的 diff 页（提交后 HEAD 整体前移）。
+    pub fn refresh_all_diff_views(&mut self, cx: &mut Context<Self>) {
+        let views: Vec<Entity<crate::editor::diff_view::DiffView>> = self
+            .open_files
+            .iter()
+            .filter_map(|f| f.diff.clone())
+            .collect();
+        for view in views {
+            view.update(cx, |v, cx| v.refresh(cx));
         }
     }
 
@@ -3116,7 +3160,14 @@ impl Editor {
             });
 
             tab_bar.on_context_menu({
-                move |_tab_id, menu, _window, _cx| {
+                let tabs = self.tab_bar.clone();
+                move |tab_id, menu, _window, _cx| {
+                    // 记录本次右键的 tab：ContextMenu 包装器在 window 层先收到
+                    // 右键并 stop_propagation，行内 Right 监听器收不到事件，
+                    // 构建闭包是唯一可靠的记录点（defer 一帧后执行，无竞态）。
+                    tabs.update(_cx, |bar, _| {
+                        bar.set_context_menu_tab(tab_id.clone());
+                    });
                     menu.menu("关闭", Box::new(CloseTab))
                         .menu("关闭其他标签页", Box::new(CloseOtherTabs))
                         .menu("关闭左侧标签页", Box::new(CloseLeftTabs))
@@ -3871,7 +3922,7 @@ mod tests {
             .expect("should find temp repo");
         cx.update(|window, cx| {
             editor.update(cx, |editor, cx| {
-                editor.open_diff_file_loading("test.txt".to_string(), repo, window, cx);
+                editor.open_diff_file_loading("test.txt".to_string(), repo, false, window, cx);
             });
         });
         let state = editor.update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
