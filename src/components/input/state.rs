@@ -33,6 +33,7 @@ use unicode_segmentation::*;
 use super::{
     Crease, DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, cursor::CursorShape, mode::InputMode,
 };
+use super::display_map::{GitInsertion, GitInsertedLine};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -142,6 +143,46 @@ pub enum GitLineMark {
     Modified,
     /// 该行上方有被删除的行（红色小三角/色条画在行顶部）。
     Deleted,
+}
+
+/// 展开区显示的一条被删除旧行（只读虚拟行）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitDeletedLine {
+    /// 旧文件行号（1 起，对齐 git diff 的旧侧行号）。
+    pub old_lineno: u32,
+    /// 行内容（不含换行符）。
+    pub text: String,
+}
+
+/// 一个 git diff hunk（HEAD→工作区），供行首色条点击就地展开。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHunkInfo {
+    /// 被删除行显示在该 buffer 行（0 起）之前：Modified/Added hunk 为
+    /// 首个新行，纯删除 hunk 为删除点之后第一行（与行标记锚点一致）。
+    pub before_line: u32,
+    /// hunk 覆盖的新行（0 起半开区间）；纯删除 hunk 为空。
+    pub new_rows: std::ops::Range<u32>,
+    /// 被删除的旧行（按原顺序）；为空表示纯新增，无可展开内容。
+    pub deleted: Vec<GitDeletedLine>,
+}
+
+impl GitHunkInfo {
+    /// 该 hunk 是否可展开（有被删除的旧行可显示）。
+    pub fn expandable(&self) -> bool {
+        !self.deleted.is_empty()
+    }
+
+    /// 该 buffer 行（0 起）是否落在此 hunk 内（含纯删除锚点行）。
+    pub fn contains_line(&self, line: u32) -> bool {
+        self.new_rows.contains(&line) || (self.new_rows.is_empty() && self.before_line == line)
+    }
+}
+
+/// HEAD→工作区 diff 的行标记 + hunk 列表（`compute_git_diff_summary` 产物）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitDiffSummary {
+    pub marks: Vec<(u32, GitLineMark)>,
+    pub hunks: Vec<GitHunkInfo>,
 }
 
 /// Diff 行种类（unified / split 视图的行底色装饰）。
@@ -445,6 +486,15 @@ pub(crate) struct LastLayout {
     pub(crate) wrap_width: Option<Pixels>,
     /// The line number area width of text layout, if not line number, this will be 0px.
     pub(crate) line_number_width: Pixels,
+    /// 行号数字位数（展开区旧行号按同宽格式化）。
+    pub(crate) line_number_len: usize,
+    /// git 展开区行数前缀表（平行于 `visible_buffer_lines`）：
+    /// `git_insert_shift[i]` = 锚点 ≤ `visible_buffer_lines[i]` 的累计插入行数。
+    /// 与 `git_insert_baseline` 配合，任意遍历可见行的 y 累计点都可 O(1)
+    /// 补上块高：`delta(i) = shift[i] - (i == 0 ? baseline : shift[i-1])`。
+    pub(crate) git_insert_shift: Rc<Vec<u32>>,
+    /// 首个可见行**之上**的插入行数（`visible_top` 已包含，不计入 delta）。
+    pub(crate) git_insert_baseline: usize,
     /// The cursor position (top, left) in pixels.
     pub(crate) cursor_bounds: Option<Bounds<Pixels>>,
     /// The text align of the text layout.
@@ -454,6 +504,29 @@ pub(crate) struct LastLayout {
 }
 
 impl LastLayout {
+    /// 第 i 个可见行相对上一行新增的 git 展开区行数（锚在该行上的块）。
+    /// 无展开区时恒为 0。
+    pub(crate) fn git_insert_delta(&self, i: usize) -> u32 {
+        if self.git_insert_shift.is_empty() {
+            return 0;
+        }
+        let cur = self
+            .git_insert_shift
+            .get(i)
+            .or(self.git_insert_shift.last())
+            .copied()
+            .unwrap_or(0);
+        let prev = if i == 0 {
+            self.git_insert_baseline as u32
+        } else {
+            self.git_insert_shift
+                .get(i - 1)
+                .copied()
+                .unwrap_or(self.git_insert_baseline as u32)
+        };
+        cur.saturating_sub(prev)
+    }
+
     /// Get the line layout for the given buffer row (0-based).
     ///
     /// Uses binary search on `visible_buffer_lines` to find the line.
@@ -542,6 +615,15 @@ pub struct InputState {
     pub(crate) git_gutter: bool,
     /// Git 变更标记数据：buffer 行号 → 变更类型（由 Editor 侧异步计算写入）。
     pub(crate) git_line_marks: std::collections::HashMap<u32, GitLineMark>,
+    /// Git diff hunk 列表（与 `git_line_marks` 同源），支撑行首色条点击展开。
+    pub(crate) git_hunks: Vec<GitHunkInfo>,
+    /// 已展开的 hunk 下标（升序）；diff 重算时整体清空。
+    pub(crate) expanded_git_hunks: std::collections::BTreeSet<usize>,
+    /// 行首色条点击目标：(buffer 行号, 窗口坐标 bounds)，paint 阶段写入。
+    pub(crate) git_bar_click_targets: Vec<(u32, Bounds<Pixels>)>,
+    /// 是否允许点击色条展开 hunk（普通文件编辑标签为 true；
+    /// diff 视图的编辑器本身已是展开态，置 false）。
+    pub(crate) git_expandable: bool,
     pub(crate) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
@@ -676,6 +758,10 @@ impl InputState {
             fold_click_targets: Vec::new(),
             git_gutter: true,
             git_line_marks: std::collections::HashMap::new(),
+            git_hunks: Vec::new(),
+            expanded_git_hunks: std::collections::BTreeSet::new(),
+            git_bar_click_targets: Vec::new(),
+            git_expandable: false,
             show_whitespaces: false,
             loading: false,
             pattern: None,
@@ -1360,6 +1446,173 @@ impl InputState {
     pub fn set_git_line_marks(&mut self, marks: Vec<(u32, GitLineMark)>, cx: &mut Context<Self>) {
         self.git_line_marks = marks.into_iter().collect();
         cx.notify();
+    }
+
+    /// 写入 Git 行标记与 hunk 列表（HEAD→工作区 diff 重算完成后调用）。
+    ///
+    /// 旧 hunk 的展开态随内容一并失效：行号与被删文本都基于旧 diff，
+    /// 保留只会显示过期内容，这里统一收起。
+    pub fn set_git_diff(&mut self, summary: GitDiffSummary, cx: &mut Context<Self>) {
+        self.git_line_marks = summary.marks.into_iter().collect();
+        self.git_hunks = summary.hunks;
+        self.expanded_git_hunks.clear();
+        self.sync_git_expansions();
+        cx.notify();
+    }
+
+    /// 普通文件编辑标签开启行首色条点击展开（diff 视图编辑器不开启）。
+    pub fn set_git_expandable(&mut self, enable: bool) {
+        self.git_expandable = enable;
+    }
+
+    /// 点击该 buffer 行的色条：展开/收起锚定在该行上的**全部**可展开
+    /// hunk（修改 hunk 与共享锚点的纯删除 hunk 一起展开，一次看全）。
+    pub fn toggle_git_hunk_for_line(&mut self, line: u32, cx: &mut Context<Self>) {
+        if !self.git_expandable {
+            return;
+        }
+        let indexes: Vec<usize> = self
+            .git_hunks
+            .iter()
+            .enumerate()
+            .filter(|(_, hunk)| hunk.contains_line(line) && hunk.expandable())
+            .map(|(ix, _)| ix)
+            .collect();
+        if indexes.is_empty() {
+            return;
+        }
+        let expand = !self.expanded_git_hunks.contains(&indexes[0]);
+        for ix in indexes {
+            if expand {
+                self.expanded_git_hunks.insert(ix);
+            } else {
+                self.expanded_git_hunks.remove(&ix);
+            }
+        }
+        self.sync_git_expansions();
+        cx.notify();
+    }
+
+    /// 该 buffer 行（0 起）所属的 hunk 下标（取第一个命中的：Modified hunk
+    /// 可能与相邻纯删除 hunk 共享锚点行）。
+    pub(crate) fn git_hunk_index_for_line(&self, line: u32) -> Option<usize> {
+        self.git_hunks
+            .iter()
+            .position(|h| h.contains_line(line) && h.expandable())
+    }
+
+    /// 该行是否处于已展开 hunk 的新行范围内（展开时整行加绿底，对齐 diff view）。
+    pub(crate) fn line_in_expanded_hunk(&self, line: u32) -> bool {
+        self.expanded_git_hunks.iter().any(|&ix| {
+            self.git_hunks
+                .get(ix)
+                .is_some_and(|hunk| hunk.new_rows.contains(&line))
+        })
+    }
+
+    /// 把当前展开态同步到 display map 的插入区。
+    fn sync_git_expansions(&mut self) {
+        let insertions = self
+            .expanded_git_hunks
+            .iter()
+            .filter_map(|&ix| {
+                let hunk = self.git_hunks.get(ix)?;
+                if hunk.deleted.is_empty() {
+                    return None;
+                }
+                Some(GitInsertion {
+                    before_buffer_row: hunk.before_line as usize,
+                    hunk_ix: ix,
+                    lines: std::rc::Rc::new(
+                        hunk.deleted
+                            .iter()
+                            .map(|d| GitInsertedLine {
+                                old_lineno: Some(d.old_lineno),
+                                text: std::rc::Rc::from(d.text.as_str()),
+                            })
+                            .collect(),
+                    ),
+                })            })
+            .collect();
+        self.display_map.set_git_insertions(insertions);
+    }
+
+    /// 文本编辑后随行调整 hunk 锚点与行标记（与 `adjust_folds_for_edit`
+    /// 同一调用点：行标记本身已是过期数据，这里只保证“整体随行平移”，
+    /// 让色条与展开区不会停在编辑前的旧行号上）。
+    pub(crate) fn adjust_git_diff_for_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        if self.git_hunks.is_empty() && self.git_line_marks.is_empty() {
+            return;
+        }
+        // 行漂移量 = 换行符数量变化（行号只对换行敏感）。
+        let removed = self
+            .text
+            .slice(range.clone())
+            .to_string()
+            .matches('\n')
+            .count();
+        let delta = new_text.matches('\n').count() as i64 - removed as i64;
+        let edit_start_line = self.text.offset_to_point(range.start).row;
+        let edit_end_line = self.text.offset_to_point(range.end).row;
+
+        if delta != 0 {
+            // 行首纯插入（如在行首按回车）：该行的既有内容整体下移一行，
+            // 内容性标记（Added/Modified 行、hunk 新行范围）随之平移；
+            // 纯删除锚点是「间隙在此行之前」的位置性标记，不随内容动。
+            let at_line_start = range.start == range.end
+                && self.text.line_start_offset(edit_start_line) == range.start;
+            let content_shift = |line: u32| -> u32 {
+                if line > edit_start_line as u32
+                    || (at_line_start && line >= edit_start_line as u32)
+                {
+                    (line as i64 + delta).clamp(0, u32::MAX as i64) as u32
+                } else {
+                    line
+                }
+            };
+            let anchor_shift = |line: u32| -> u32 {
+                if line > edit_start_line as u32 {
+                    (line as i64 + delta).clamp(0, u32::MAX as i64) as u32
+                } else {
+                    line
+                }
+            };
+            self.git_line_marks = self
+                .git_line_marks
+                .drain()
+                .map(|(line, mark)| (content_shift(line), mark))
+                .collect();
+            for hunk in &mut self.git_hunks {
+                hunk.before_line = if hunk.new_rows.is_empty() {
+                    anchor_shift(hunk.before_line)
+                } else {
+                    content_shift(hunk.before_line)
+                };
+                hunk.new_rows.start = content_shift(hunk.new_rows.start);
+                hunk.new_rows.end = content_shift(hunk.new_rows.end);
+            }
+        }
+
+        // 编辑落进某个 hunk 的新行范围：该 hunk 内容已变，收起其展开区。
+        let touched = |hunk: &GitHunkInfo| -> bool {
+            if hunk.new_rows.is_empty() {
+                edit_start_line as u32 <= hunk.before_line
+                    && hunk.before_line <= (edit_end_line + 1) as u32
+            } else {
+                hunk.new_rows.contains(&((edit_start_line) as u32))
+                    || hunk.new_rows.contains(&((edit_end_line) as u32))
+            }
+        };
+        let stale: Vec<usize> = self
+            .expanded_git_hunks
+            .iter()
+            .copied()
+            .filter(|&ix| self.git_hunks.get(ix).is_some_and(&touched))
+            .collect();
+        for ix in stale {
+            self.expanded_git_hunks.remove(&ix);
+        }
+        self.sync_git_expansions();
     }
 
     /// 同词高亮：返回光标处词的全文件出现范围（带缓存）。
@@ -3111,6 +3364,16 @@ impl InputState {
         }
 
         if event.button == MouseButton::Left {
+            // 行首 git 色条：点击展开/收起所在 hunk（不移动光标）。
+            if let Some((line, _)) = self
+                .git_bar_click_targets
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&event.position))
+            {
+                let line = *line;
+                self.toggle_git_hunk_for_line(line, cx);
+                return;
+            }
             if let Some((start_line, _)) = self
                 .fold_click_targets
                 .iter()
@@ -3628,6 +3891,10 @@ impl InputState {
             .zip(last_layout.visible_buffer_lines.iter())
             .enumerate()
         {
+            // git 展开区：锚在当前行上的块高先行（与绘制阶段同一累计）。
+            // 点击落在展开区内时，会越过块命中其后第一行的行首。
+            y_offset += line_height * last_layout.git_insert_delta(vi) as f32;
+
             let line_start_offset = last_layout.visible_line_byte_offsets[vi];
 
             // Calculate line origin for this display row
@@ -4041,6 +4308,7 @@ impl InputState {
         // Adjust folds before updating wrap map (zed's offset-based model:
         // edits inside a fold keep it; boundary-overlapping edits drop it).
         self.display_map.adjust_folds_for_edit(&range, new_text);
+        self.adjust_git_diff_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
@@ -4274,6 +4542,7 @@ impl EntityInputHandler for InputState {
         // Adjust folds before updating wrap map (zed's offset-based model:
         // edits inside a fold keep it; boundary-overlapping edits drop it).
         self.display_map.adjust_folds_for_edit(&range, new_text);
+        self.adjust_git_diff_for_edit(&range, new_text);
         self.display_map
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 

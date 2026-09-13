@@ -15,6 +15,7 @@ mod wrap_map;
 
 // Re-export public API
 pub use self::display_map::DisplayMap;
+pub use self::display_map::{GitInsertion, GitInsertedLine};
 pub(crate) use self::text_wrapper::LineLayout;
 
 // Re-export fold model (zed-style)

@@ -64,6 +64,8 @@ pub enum GitPanelEvent {
     RepoChanged,
     /// 暂存/取消暂存/放弃/提交失败：调用方弹错误提示。
     OperationFailed { message: String },
+    /// 状态列表已刷新（含清空）：文件树据此着色变更文件。
+    StatusChanged,
 }
 
 /// A single entry in the git panel list
@@ -472,10 +474,13 @@ impl GitPanel {
                     Ok(None) => {
                         this.repo = None;
                         this.repo_error = None;
+                        // 非仓库：文件树着色快照同步清空。
+                        cx.emit(GitPanelEvent::StatusChanged);
                     }
                     Err(e) => {
                         this.repo = None;
                         this.repo_error = Some(e);
+                        cx.emit(GitPanelEvent::StatusChanged);
                     }
                 }
                 cx.notify();
@@ -577,6 +582,7 @@ impl GitPanel {
             self.entries.clear();
             self.file_entries.clear();
             self.diff_stats.clear();
+            cx.emit(GitPanelEvent::StatusChanged);
             cx.notify();
             return;
         };
@@ -654,6 +660,9 @@ impl GitPanel {
                     }
                 }
 
+                // 状态列表变了：文件树着色随快照刷新。
+                cx.emit(GitPanelEvent::StatusChanged);
+
                 // Prefetch first few files so the initial click is instant.
                 if let Some(repo) = this.repo.clone().filter(|r| r.ssh_config().is_some()) {
                     for entry in this.file_entries.iter().take(3) {
@@ -683,9 +692,25 @@ impl GitPanel {
         .detach();
     }
 
+    /// 文件树着色用快照：`(仓库根, 仓库相对路径 → 状态)`。
+    ///
+    /// 仓库根是文件树路径的前缀（本地为绝对路径，远程为远程绝对路径），
+    /// 文件树条目剥掉该前缀后在此查状态。非仓库（或尚未就绪）返回 None。
+    pub fn status_snapshot(&self) -> Option<(String, Arc<HashMap<String, FileStatus>>)> {
+        let root = self.repo.as_ref()?.root().trim_end_matches('/').to_string();
+        if root.is_empty() {
+            return None;
+        }
+        let map: HashMap<String, FileStatus> = self
+            .file_entries
+            .iter()
+            .map(|e| (e.path.clone(), e.status))
+            .collect();
+        Some((root, Arc::new(map)))
+    }
+
     /// Schedule a refresh with a debounce to avoid refreshing too frequently
-    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
-        self.refresh_pending = true;
+    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {        self.refresh_pending = true;
         if self.refresh_debounce_task.is_some() {
             return;
         }

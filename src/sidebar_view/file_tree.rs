@@ -56,6 +56,13 @@ struct StickyAnchor {
     drifting: bool,
 }
 
+/// git 状态快照（文件树着色用）：仓库根 + 仓库相对路径 → 状态。
+#[derive(Clone, Default)]
+pub struct GitStatusSnapshot {
+    pub repo_root: Option<String>,
+    pub by_path: Arc<HashMap<String, crate::editor::git_status::FileStatus>>,
+}
+
 /// 侧边栏文件树组件 - 单列模式，类似 VSCode 文件树
 ///
 /// View 层：只负责渲染和用户交互，所有文件操作委托给 `FileTreeLoader`。
@@ -71,6 +78,8 @@ pub struct SidebarFileTree {
     pub(crate) root_expanded: bool,
     pub(crate) hovered_path: Option<PathBuf>,
     pub(crate) flat_cache: Option<Vec<(FileEntry, usize)>>,
+    /// git 变更文件着色快照（由 GitPanel 刷新后推送）。
+    pub(crate) git_status: GitStatusSnapshot,
     watcher_subscription: Option<Subscription>,
     pub(crate) watched_paths: HashSet<PathBuf>,
     scroll_handle: UniformListScrollHandle,
@@ -133,6 +142,7 @@ impl SidebarFileTree {
             root_expanded: true,
             hovered_path: None,
             flat_cache: None,
+            git_status: GitStatusSnapshot::default(),
             watcher_subscription,
             watched_paths: HashSet::new(),
             scroll_handle: UniformListScrollHandle::new(),
@@ -257,6 +267,45 @@ impl SidebarFileTree {
 
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// 接收 GitPanel 推送的状态快照（仓库根 + 相对路径 → 状态）。
+    pub fn set_git_status(
+        &mut self,
+        snapshot: Option<(String, Arc<HashMap<String, crate::editor::git_status::FileStatus>>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_status = match snapshot {
+            Some((repo_root, by_path)) => GitStatusSnapshot {
+                repo_root: Some(repo_root),
+                by_path,
+            },
+            None => GitStatusSnapshot::default(),
+        };
+        cx.notify();
+    }
+
+    /// 文件名按 git 状态着色：新增=绿、修改/改名=主题蓝、冲突=橙红。
+    /// 非 git 仓库内、快照未就绪或文件无变更时返回 None（用默认色）。
+    pub(crate) fn git_name_color(
+        &self,
+        path: &Path,
+        theme: &UiTheme,
+    ) -> Option<gpui::Hsla> {
+        let root = self.git_status.repo_root.as_ref()?;
+        let rel = path.strip_prefix(root).ok()?;
+        let key = rel.to_string_lossy();
+        let status = self.git_status.by_path.get(key.as_ref())?;
+        let color = if status.is_conflicted() {
+            theme.status_conflict
+        } else if status.is_created() {
+            // 未跟踪 / 暂存区新增：绿色
+            theme.status_added
+        } else {
+            // 修改 / 改名 / 类型变更：git 修改蓝（见 UiTheme::git_modified）
+            theme.git_modified
+        };
+        Some(color)
     }
 
     /// Terminal `Cmd+Click` reveal: expand ancestor chain + select + scroll
@@ -1239,8 +1288,11 @@ impl SidebarFileTree {
 
         let row_text = if is_selected {
             theme.accent_foreground
-        } else {
+        } else if is_directory {
             theme.text
+        } else {
+            // git 变更文件着色：新增绿 / 修改蓝 / 冲突橙红（选中态优先）。
+            self.git_name_color(&path, &theme).unwrap_or(theme.text)
         };
 
         let click_path = path.clone();

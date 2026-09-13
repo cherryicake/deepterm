@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// 把 GitPanel 的状态快照推给文件树着色。
+fn push_git_status(
+    git_panel: &gpui::Entity<crate::sidebar_view::git_panel::GitPanel>,
+    file_tree: &gpui::Entity<SidebarFileTree>,
+    cx: &mut gpui::App,
+) {
+    let snapshot = git_panel.read(cx).status_snapshot();
+    file_tree.update(cx, |tree, cx| tree.set_git_status(snapshot, cx));
+}
+
 impl MacosSidebar {
     fn subscribe_file_tree_to_terminal(
         &mut self,
@@ -150,11 +160,14 @@ impl MacosSidebar {
             panel.set_workspace_path(workspace_path, is_local, ssh_config, filesystem, cx);
         });
 
+        // 快照就绪时立即同步一次文件树着色（之后由 StatusChanged 事件驱动）。
+        push_git_status(git_panel, file_tree, cx);
+
         // 订阅 Git 面板事件（OpenDiff 等）转发给侧边栏
         self.git_panel_subscription.take();
         let sub = cx.subscribe(
             git_panel,
-            |_this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
+            |this, _, event: &crate::sidebar_view::git_panel::GitPanelEvent, cx| match event {
                 crate::sidebar_view::git_panel::GitPanelEvent::OpenDiffLoading {
                     path,
                     repo,
@@ -172,6 +185,14 @@ impl MacosSidebar {
                         path: path.clone(),
                         ssh_config: ssh_config.clone().map(Box::new),
                     });
+                }
+                crate::sidebar_view::git_panel::GitPanelEvent::StatusChanged => {
+                    // 状态列表刷新：推送快照给文件树着色（新增绿/修改蓝/冲突橙红）。
+                    if let (Some(tree), Some(panel)) =
+                        (this.file_tree_view.clone(), this.git_panel.clone())
+                    {
+                        push_git_status(&panel, &tree, cx);
+                    }
                 }
                 crate::sidebar_view::git_panel::GitPanelEvent::StageFile { path }
                 | crate::sidebar_view::git_panel::GitPanelEvent::UnstageFile { path }

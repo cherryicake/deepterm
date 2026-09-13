@@ -14,7 +14,7 @@ use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::notification::NotificationKind;
 use crate::editor::encoding::{self, FileEncoding};
-use crate::editor::git_marks::compute_git_line_marks;
+use crate::editor::git_marks::compute_git_diff_summary;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::goto_line;
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
@@ -2477,6 +2477,9 @@ impl Editor {
                 .multi_line(true);
             state.set_value(&content, window, cx);
             state.disabled = is_image || is_loading || read_only;
+            // 普通文件标签：行首 git 色条可点击展开 hunk
+            // （diff 视图自己的编辑器已是展开态，保持默认 false）。
+            state.set_git_expandable(true);
             state
         });
 
@@ -2697,26 +2700,56 @@ impl Editor {
                 .background_executor()
                 .spawn(async move {
                     let is_local = ssh_config.is_none();
-                    let repo =
-                        GitRepository::find(std::path::Path::new(&path), is_local, ssh_config)
-                            .ok()
-                            .flatten()?;
+                    // find_local 以该路径为 git 子进程的 current_dir：必须传目录，
+                    // 传文件路径会让 spawn 直接 ENOENT（编辑器色条因此从未加载）。
+                    let anchor = std::path::Path::new(&path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from(&path));
+                    let repo = match GitRepository::find(&anchor, is_local, ssh_config) {
+                        Ok(Some(repo)) => repo,
+                        Ok(None) => {
+                            log::debug!("git marks: not a git repo: {path:?}");
+                            return None;
+                        }
+                        Err(e) => {
+                            log::debug!("git marks: find failed: {e}");
+                            return None;
+                        }
+                    };
                     // 仓库相对路径：git show HEAD:<rel> 在仓库根目录下执行
-                    let rel = path.strip_prefix(repo.root())?.trim_start_matches('/');
+                    let rel = match path.strip_prefix(repo.root()) {
+                        Some(rel) => rel,
+                        None => {
+                            log::debug!(
+                                "git marks: strip_prefix failed root={:?} path={path:?}",
+                                repo.root()
+                            );
+                            return None;
+                        }
+                    };
+                    let rel = rel.trim_start_matches('/');
                     if rel.is_empty() {
+                        log::debug!("git marks: empty rel");
                         return None;
                     }
-                    let (old, new) = repo.diff_file_contents(rel).ok()?;
-                    Some(compute_git_line_marks(&old, &new))
+                    let (old, new) = match repo.diff_file_contents(rel) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::debug!("git marks: diff_file_contents err {e} rel={rel}");
+                            return None;
+                        }
+                    };
+                    Some(compute_git_diff_summary(&old, &new))
                 })
                 .await;
-            let Some(marks) = result else {
+            let Some(summary) = result else {
                 return;
             };
             let _ = weak.update(cx, |this, cx| {
                 if let Some(file) = this.open_files.iter().find(|f| f.id.as_ref() == tab_id) {
                     file.editor_state.update(cx, |state, cx| {
-                        state.set_git_line_marks(marks, cx);
+                        state.set_git_diff(summary, cx);
                     });
                 }
             });

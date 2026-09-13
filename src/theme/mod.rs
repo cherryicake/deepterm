@@ -76,6 +76,10 @@ pub struct UiTheme {
     pub status_added: Hsla,
     pub status_deleted: Hsla,
     pub status_conflict: Hsla,
+    /// Git「修改」的强调蓝：文件树变更文件名与编辑器行首色条用。
+    /// 独立于 `status_modified`（VSCode 金黄徽标色）与 `accent`（主题强调色，
+    /// ayu 系主题为橙黄），保证“修改 = 蓝色”在所有主题下成立。
+    pub git_modified: Hsla,
 }
 
 impl UiTheme {
@@ -480,6 +484,8 @@ struct UiThemeFile {
     status_deleted: String,
     #[serde(default = "default_status_conflict")]
     status_conflict: String,
+    #[serde(default = "default_git_modified")]
+    git_modified: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,6 +713,10 @@ fn default_status_deleted() -> String {
     "#f44336".to_string()
 }
 
+fn default_git_modified() -> String {
+    "#4a9eda".to_string()
+}
+
 fn default_status_conflict() -> String {
     "#ff9800".to_string()
 }
@@ -767,6 +777,7 @@ impl UiThemeFile {
             status_added: parse_color(&self.status_added)?,
             status_deleted: parse_color(&self.status_deleted)?,
             status_conflict: parse_color(&self.status_conflict)?,
+            git_modified: parse_color(&self.git_modified)?,
         })
     }
 }

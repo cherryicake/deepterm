@@ -363,11 +363,25 @@ impl TextElement {
 
         let mut prev_lines_offset = 0;
         let mut offset_y = px(0.);
+        // git 展开区：绝对坐标累计（从第 0 行起），锚点行上的块高先行。
+        let insert_total = state
+            .display_map
+            .git_insertions()
+            .iter()
+            .map(|ins| ins.lines.len())
+            .sum::<usize>();
+        let mut prev_insert_rows = 0usize;
         let buffer_lines = state.display_map.lines();
         let visible_buffer_lines = &last_layout.visible_buffer_lines;
         let mut vi = 0; // index into visible_buffer_lines / lines
         for (ix, wrap_line) in buffer_lines.iter().enumerate() {
             let row = ix;
+            // git 展开区：锚在本行上的块高先计入（line_origin 依赖它）。
+            if insert_total > 0 {
+                let rows_through = state.display_map.git_insertion_rows_before(ix + 1);
+                offset_y += line_height * (rows_through.saturating_sub(prev_insert_rows)) as f32;
+                prev_insert_rows = rows_through;
+            }
             let line_origin = point(px(0.), offset_y);
 
             // break loop if all cursor positions are found
@@ -682,11 +696,15 @@ impl TextElement {
         let mut line_corners = vec![];
 
         // Iterate only over visible (non-hidden) buffer lines
-        for (prev_lines_offset, line) in last_layout
+        for (vi, (prev_lines_offset, line)) in last_layout
             .visible_line_byte_offsets
             .iter()
             .zip(lines.iter())
+            .enumerate()
         {
+            // git 展开区：锚在当前行上的块高先行（与 paint 阶段一致）。
+            offset_y += line_height * last_layout.git_insert_delta(vi) as f32;
+
             let prev_lines_offset = *prev_lines_offset;
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
@@ -1320,6 +1338,10 @@ impl TextElement {
 
         let mut visible_range = 0..total_lines;
         let mut line_bottom = px(0.);
+        // git 展开区：块显示在锚点行上方（间隙归属锚点行），累计时先加块高
+        // 再加行高；`rows_through(ix)` 计锚点 ≤ ix 的块行。
+        let has_insertions = !state.display_map.git_insertions().is_empty();
+        let mut prev_insertion_rows = 0usize;
         for (ix, _line) in state.display_map.lines().iter().enumerate() {
             let visible_wrap_rows = state.display_map.visible_wrap_row_count_for_buffer_line(ix);
 
@@ -1327,11 +1349,22 @@ impl TextElement {
                 continue;
             }
 
+            let rows_through = if has_insertions {
+                state.display_map.git_insertion_rows_before(ix + 1)
+            } else {
+                0
+            };
+            let block_height =
+                line_height * (rows_through.saturating_sub(prev_insertion_rows)) as f32;
+            prev_insertion_rows = rows_through;
+
             let wrapped_height = line_height * visible_wrap_rows;
-            line_bottom += wrapped_height;
+            line_bottom += block_height + wrapped_height;
 
             if line_bottom < -scroll_top {
-                visible_top = line_bottom - wrapped_height;
+                // 行顶（不含锚在本行上的块——块从更上方开始画，超界行由
+                // 绘制阶段按视口裁剪）。
+                visible_top = line_bottom - wrapped_height - block_height;
                 visible_range.start = ix;
             }
 
@@ -1497,6 +1530,9 @@ impl TextElement {
                 .get(i)
                 .map(|line| line.size(line_height).height)
                 .unwrap_or(line_height);
+
+            // git 展开区：锚点行上的块高先行（与正文累计一致）。
+            offset_y += line_height * last_layout.git_insert_delta(i) as f32;
 
             // zed: `is_foldable |= !use_lsp_folding_ranges && starts_indent(row)`.
             let folded = state.display_map.is_line_folded(buffer_line);
@@ -1696,6 +1732,8 @@ impl TextElement {
                 .get(i)
                 .map(|line| line.size(line_height).height)
                 .unwrap_or(line_height);
+
+            offset_y += line_height * last_layout.git_insert_delta(i) as f32;
 
             if state.display_map.is_line_folded(buffer_line) {
                 if let Some(placeholder) = placeholders.iter_mut().find(|p| p.row == buffer_line) {
@@ -2109,6 +2147,13 @@ pub(crate) struct StickyLine {
     pub(crate) bounds: Bounds<Pixels>,
 }
 
+/// git 展开区一行的几何（相对视口内容坐标的 y；paint 时加 origin.y）。
+struct GitInsertRowPaint {
+    hunk_ix: usize,
+    row_ix: usize,
+    y: Pixels,
+}
+
 pub(crate) struct PrepaintState {
     /// The lines of entire lines.
     last_layout: LastLayout,
@@ -2137,6 +2182,13 @@ pub(crate) struct PrepaintState {
     fold_icon_layout: FoldIconLayout,
     /// Shaped `⋯` placeholders + trailing texts for visible folded rows.
     fold_placeholders: Vec<FoldPlaceholder>,
+    /// 可见 buffer 行几何：(buffer 行, 相对 y, 高度)。prepaint 计算，
+    /// paint 与 hitbox 创建共用。
+    line_geometry: Vec<(usize, Pixels, Pixels)>,
+    /// git 展开区行几何（相对 y）。
+    git_insert_rows: Vec<GitInsertRowPaint>,
+    /// 行首色条点击目标（prepaint 创建 hitbox，paint 落到 state）。
+    git_bar_hitboxes: Vec<(u32, Bounds<Pixels>, Hitbox)>,
 }
 
 impl PrepaintState {
@@ -2298,6 +2350,25 @@ impl Element for TextElement {
             )
         };
 
+        // git 展开区行数前缀表：所有遍历可见行的 y 累计点统一查表。
+        let (git_insert_shift, git_insert_baseline) = if state
+            .display_map
+            .git_insertions()
+            .is_empty()
+        {
+            (Rc::new(Vec::new()), 0)
+        } else {
+            let shift: Vec<u32> = visible_buffer_lines
+                .iter()
+                .map(|&line| state.display_map.git_insertion_rows_before(line + 1) as u32)
+                .collect();
+            let baseline = visible_buffer_lines
+                .first()
+                .map(|&first| state.display_map.git_insertion_rows_before(first))
+                .unwrap_or(0);
+            (Rc::new(shift), baseline)
+        };
+
         let mut last_layout = LastLayout {
             visible_range,
             visible_buffer_lines,
@@ -2307,6 +2378,9 @@ impl Element for TextElement {
             line_height,
             wrap_width,
             line_number_width,
+            line_number_len,
+            git_insert_shift,
+            git_insert_baseline,
             lines: Rc::new(vec![]),
             cursor_bounds: None,
             text_align: state.text_align,
@@ -2422,9 +2496,53 @@ impl Element for TextElement {
         }
         last_layout.lines = Rc::new(lines);
 
-        // The scrollable height counts *display* rows (folded rows hidden),
-        // matching what is actually painted.
-        let total_display_lines = state.display_map.display_row_count();
+        // 可见行几何（相对 y）：paint 阶段与色条 hitbox 创建共用。
+        // git 展开区：锚点行上的块高经 `git_insert_delta` 查表补入，
+        // 展开行（相对 y）与 buffer 行在同一累计中产出。
+        let (line_geometry, git_insert_rows) = {
+            let rows_total = state
+                .display_map
+                .git_insertions()
+                .iter()
+                .map(|ins| ins.lines.len())
+                .sum::<usize>();
+            let mut y = last_layout.visible_top;
+            let mut out = Vec::with_capacity(last_layout.visible_buffer_lines.len());
+            let mut insert_rows: Vec<GitInsertRowPaint> = Vec::with_capacity(rows_total);
+            for (i, (line, &buffer_line)) in last_layout
+                .lines
+                .iter()
+                .zip(last_layout.visible_buffer_lines.iter())
+                .enumerate()
+            {
+                let mut delta = last_layout.git_insert_delta(i) as usize;
+                for ins in state.display_map.git_insertions_at(buffer_line) {
+                    for (row_ix, _) in ins.lines.iter().enumerate() {
+                        insert_rows.push(GitInsertRowPaint {
+                            hunk_ix: ins.hunk_ix,
+                            row_ix,
+                            y,
+                        });
+                        y += line_height;
+                        delta = delta.saturating_sub(1);
+                        if delta == 0 {
+                            break;
+                        }
+                    }
+                    if delta == 0 {
+                        break;
+                    }
+                }
+                let height = line_height * line.wrapped_lines.len().max(1) as f32;
+                out.push((buffer_line, y, height));
+                y += height;
+            }
+            (out, insert_rows)
+        };
+
+        // The scrollable height counts *display* rows (folded rows hidden,
+        // git 展开区行计入), matching what is actually painted.
+        let total_display_lines = state.display_map.display_row_count_with_insertions();
         let empty_bottom_height = if state.mode.is_code_editor() {
             let base = bounds
                 .size
@@ -2596,6 +2714,29 @@ impl Element for TextElement {
 
         let fold_icon_layout = self.layout_fold_icons(&bounds, &last_layout, window, cx);
 
+        // git 行首色条 hitbox：光标布局调整过 bounds 之后创建（y 为绝对坐标），
+        // 与 fold 图标同一时机；paint 阶段据此设手型光标并注册点击目标。
+        let git_bar_hitboxes = {
+            // 短作用域重读（外层 state 守卫不能跨 layout_fold_icons 的 &mut cx）。
+            let state = self.state.read(cx);
+            let mut targets: Vec<(u32, Bounds<Pixels>, Hitbox)> = Vec::new();
+            if state.git_gutter && state.git_expandable {
+                for &(buffer_line, y, height) in line_geometry.iter() {
+                    let expandable = state.git_hunk_index_for_line(buffer_line as u32).is_some();
+                    if !expandable {
+                        continue;
+                    }
+                    let hit_bounds = Bounds::new(
+                        point(bounds.origin.x, bounds.origin.y + y),
+                        size(px(10.), height),
+                    );
+                    let hitbox = window.insert_hitbox(hit_bounds, HitboxBehavior::Normal);
+                    targets.push((buffer_line as u32, hit_bounds, hitbox));
+                }
+            }
+            targets
+        };
+
         // Sticky scroll：外围定义行（首可见行之上）钉在顶部
         let sticky_lines = self.layout_sticky_lines(
             &last_layout,
@@ -2623,6 +2764,9 @@ impl Element for TextElement {
             sticky_lines,
             fold_icon_layout,
             fold_placeholders,
+            line_geometry,
+            git_insert_rows,
+            git_bar_hitboxes,
         }
     }
 
@@ -2695,26 +2839,6 @@ impl Element for TextElement {
             None
         };
 
-        // Geometry of every visible line: (buffer row, y offset, height).
-        //
-        // Derived from the layout rather than from `line_numbers`, so the
-        // current-line highlight keeps working when line numbers are hidden.
-        let line_geometry: Vec<(usize, Pixels, Pixels)> = {
-            let mut y = invisible_top_padding;
-            let mut out = Vec::with_capacity(prepaint.last_layout.visible_buffer_lines.len());
-            for (line, &buffer_line) in prepaint
-                .last_layout
-                .lines
-                .iter()
-                .zip(prepaint.last_layout.visible_buffer_lines.iter())
-            {
-                let height = line_height * line.wrapped_lines.len().max(1) as f32;
-                out.push((buffer_line, y, height));
-                y += height;
-            }
-            out
-        };
-
         // Paint the current line background.
         //
         // This used to live inside the `line_numbers` block below, so hiding
@@ -2730,7 +2854,8 @@ impl Element for TextElement {
         //   会形成一块色差明显的矩形，导致输入区背景色不一致。
         let single_line = !state.mode.is_multi_line();
         if focused && !single_line && selected_range.is_empty() {
-            if let Some(&(buffer_line, y, height)) = line_geometry
+            if let Some(&(buffer_line, y, height)) = prepaint
+                .line_geometry
                 .iter()
                 .find(|(buffer_line, _, _)| prepaint.current_row == Some(*buffer_line))
             {
@@ -2751,22 +2876,15 @@ impl Element for TextElement {
             }
         }
 
+        // git 色条点击目标（paint 阶段填充，paint 结束写入 state）。
+        let mut git_bar_click_targets: Vec<(u32, Bounds<Pixels>)> = Vec::new();
+
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             let diff_line_colors = &self.state.read(cx).diff_line_colors;
-            // Git 变更标记（行号区右缘窄色条）
-            let (git_gutter_enabled, git_line_marks, fold_gutter_width) = {
-                let state = self.state.read(cx);
-                let fold_w = if state.mode.is_folding() {
-                    FOLD_ICON_HITBOX_WIDTH
-                } else {
-                    px(0.)
-                };
-                (state.git_gutter, &state.git_line_marks, fold_w)
-            };
 
-            // Each item is the normal lines; `line_numbers` is parallel to
-            // `line_geometry`, so the height comes from the geometry above.
-            for (&(buffer_line, y, height), _) in line_geometry.iter().zip(line_numbers) {
+            // Each item is the normal lines; `line_geometry` is parallel to
+            // `line_numbers`, so the height comes from the geometry above.
+            for (&(buffer_line, y, height), _) in prepaint.line_geometry.iter().zip(line_numbers) {
                 let p = point(input_bounds.origin.x, origin.y + y);
                 // Paint diff line background (added/deleted) below everything
                 // else. Selected/active rows use the deep tint — the same rule
@@ -2795,34 +2913,15 @@ impl Element for TextElement {
                         bg,
                     ));
                 }
-                // Paint git gutter marks：新增绿 / 修改蓝 / 删除红（顶部小短条）
-                if git_gutter_enabled {
-                    if let Some(mark) = git_line_marks.get(&(buffer_line as u32)) {
-                        let bar_x = input_bounds.origin.x + prepaint.last_layout.line_number_width
-                            - fold_gutter_width
-                            - px(8.);
-                        match mark {
-                            GitLineMark::Added => {
-                                window.paint_quad(fill(
-                                    Bounds::new(point(bar_x, p.y), size(px(3.), height)),
-                                    cx.theme().success,
-                                ));
-                            }
-                            GitLineMark::Modified => {
-                                window.paint_quad(fill(
-                                    Bounds::new(point(bar_x, p.y), size(px(3.), height)),
-                                    cx.theme().accent,
-                                ));
-                            }
-                            GitLineMark::Deleted => {
-                                // 此处上方有删除行：行顶小短条示意
-                                window.paint_quad(fill(
-                                    Bounds::new(point(bar_x, p.y), size(px(7.), px(3.))),
-                                    cx.theme().error,
-                                ));
-                            }
-                        }
-                    }
+                // 已展开 hunk 的新行：整行绿底（与 diff view 新增行同色）。
+                // 行首色条在下方「Paint line numbers」段里绘制 —— 行号区背景
+                // 全高后涂，画在它之前的色条会被盖住。
+                let expanded_tinted = self.state.read(cx).line_in_expanded_hunk(buffer_line as u32);
+                if expanded_tinted && !diff_line_colors.contains_key(&(buffer_line as u32)) {
+                    window.paint_quad(fill(
+                        Bounds::new(p, size(bounds.size.width, height)),
+                        cx.theme().status_added.opacity(0.14),
+                    ));
                 }
             }
         }
@@ -2838,7 +2937,7 @@ impl Element for TextElement {
         // with the deeper diff tint instead of letting the selection blue
         // cover the added/deleted row background.
         if let Some(sel) = selected_byte_range.as_ref() {
-            for (buffer_line, y, height) in &line_geometry {
+            for (buffer_line, y, height) in &prepaint.line_geometry {
                 if let Some((_, kind)) = state.diff_line_colors.get(&(*buffer_line as u32)) {
                     let row_start = state.text.line_start_offset(*buffer_line);
                     let row_end = state.text.line_start_offset(*buffer_line + 1);
@@ -3128,6 +3227,8 @@ impl Element for TextElement {
                     let Some(line) = prepaint.last_layout.lines.get(vi) else {
                         break;
                     };
+                    // git 展开区：锚点行上的块高先行（与正文累计一致）。
+                    gy += line_height * prepaint.last_layout.git_insert_delta(vi) as f32;
                     let line_h = line.size(line_height).height;
                     let line_y = origin.y + gy;
                     let count = count_at(buffer_line);
@@ -3186,12 +3287,15 @@ impl Element for TextElement {
         let mut fold_click_targets: Vec<(usize, Bounds<Pixels>)> = Vec::new();
         let fold_placeholder_bg = cx.theme().text.opacity(0.055);
 
-        for (line, _buffer_line) in prepaint
+        for (i, (line, _)) in prepaint
             .last_layout
             .lines
             .iter()
             .zip(prepaint.last_layout.visible_buffer_lines.iter())
+            .enumerate()
         {
+            offset_y +=
+                line_height * prepaint.last_layout.git_insert_delta(i) as f32;
             let line_y = origin.y + offset_y;
             let p = point(
                 origin.x + prepaint.last_layout.line_number_width + (scroll_offset),
@@ -3273,10 +3377,14 @@ impl Element for TextElement {
             ));
 
             // Each item is the normal lines.
-            for (lines, &buffer_line) in line_numbers
+            for (i, (lines, &buffer_line)) in line_numbers
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                .enumerate()
             {
+                // git 展开区：与正文累计保持一致（查表）。
+                offset_y +=
+                    line_height * prepaint.last_layout.git_insert_delta(i) as f32;
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
@@ -3313,7 +3421,14 @@ impl Element for TextElement {
                         };
                         Some(bg)
                     }
-                    None => active_plain.then_some(active_line_color).flatten(),
+                    None => {
+                        if self.state.read(cx).line_in_expanded_hunk(buffer_line as u32) {
+                            // 已展开 hunk 的新行：行号区同绿底，与正文一致。
+                            Some(cx.theme().status_added.opacity(0.14))
+                        } else {
+                            active_plain.then_some(active_line_color).flatten()
+                        }
+                    }
                 };
                 if let Some(bg) = cell_bg {
                     let gutter_w =
@@ -3356,9 +3471,184 @@ impl Element for TextElement {
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
+
+                // Paint git 行首色条：新增绿 / 修改蓝 / 删除红（行顶小短条）。
+                // 必须画在行号区背景之后（背景全高后涂会盖住先画的色条），
+                // 因此放在行号绘制循环内。
+                let git_gutter_enabled = self.state.read(cx).git_gutter;
+                if git_gutter_enabled {
+                    let (mark, expandable_here, deletion_expanded, hunk_expanded) = {
+                        let state = self.state.read(cx);
+                        let line_u32 = buffer_line as u32;
+                        let deletion_expanded = state.expanded_git_hunks.iter().any(|&ix| {
+                            state.git_hunks.get(ix).is_some_and(|h| {
+                                h.new_rows.is_empty() && h.before_line == line_u32
+                            })
+                        });
+                        (
+                            state.git_line_marks.get(&line_u32).copied(),
+                            state.git_expandable
+                                .then(|| state.git_hunk_index_for_line(line_u32))
+                                .flatten()
+                                .is_some(),
+                            deletion_expanded,
+                            state.line_in_expanded_hunk(line_u32),
+                        )
+                    };
+                    if let Some(mark) = mark {
+                        // 行首竖线：贴行最左缘，与 diff view 的行首色条同款。
+                        // hunk 展开时其中的新增/修改行色条转绿（此时它们扮演
+                        // 「增加」一侧，蓝条只用于收起态提示「此处有修改」）。
+                        let bar_color = match mark {
+                            GitLineMark::Added => cx.theme().status_added,
+                            GitLineMark::Modified => {
+                                if hunk_expanded {
+                                    cx.theme().status_added
+                                } else {
+                                    cx.theme().git_modified
+                                }
+                            }
+                            GitLineMark::Deleted => cx.theme().status_deleted,
+                        };
+                        if mark != GitLineMark::Deleted {
+                            window.paint_quad(fill(
+                                Bounds::new(point(input_bounds.origin.x, p.y), size(px(3.), height)),
+                                bar_color,
+                            ));
+                        } else {
+                            // 此处上方有删除行：行顶小短条示意（展开中则省略）
+                            if !deletion_expanded {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(input_bounds.origin.x, p.y),
+                                        size(px(7.), px(3.)),
+                                    ),
+                                    bar_color,
+                                ));
+                            }
+                        }
+                        if expandable_here {
+                            // hitbox 在 prepaint 创建（paint 阶段只能引用）。
+                            if let Some((target_line, hit_bounds, hitbox)) = prepaint
+                                .git_bar_hitboxes
+                                .iter()
+                                .find(|(l, _, _)| *l == buffer_line as u32)
+                            {
+                                if hitbox.is_hovered(window) {
+                                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                                }
+                                git_bar_click_targets.push((*target_line, *hit_bounds));
+                            }
+                        }
+                    }
+                }
             }
         }
 
+        // Paint git 展开区：被删除的旧行以红底插入 hunk 上方（只读，
+        // 与 diff view 删除行同色：0.14 行底 + 行首红条 + 红色旧行号）。
+        if !prepaint.git_insert_rows.is_empty() {
+            let style = window.text_style();
+            let insert_font = style.font();
+            let insert_font_size = self
+                .state
+                .read(cx)
+                .font_size
+                .unwrap_or_else(|| style.font_size.to_pixels(window.rem_size()));
+            let number_len = prepaint.last_layout.line_number_len;
+            let show_line_numbers = self.state.read(cx).mode.line_number();
+            let text_x = origin.x + prepaint.last_layout.line_number_width;
+            let viewport_bottom = origin.y + bounds.size.height;
+
+            // 一次性 shape 全部插入行（与 `git_insert_rows` 一一对应；
+            // 短作用域读 state，不跨 paint）。
+            let shaped_rows: Vec<(ShapedLine, ShapedLine)> = prepaint
+                .git_insert_rows
+                .iter()
+                .map(|row| {
+                    let state = self.state.read(cx);
+                    let Some(del) = state
+                        .git_hunks
+                        .get(row.hunk_ix)
+                        .and_then(|hunk| hunk.deleted.get(row.row_ix))
+                    else {
+                        return (ShapedLine::default(), ShapedLine::default());
+                    };
+                    let deleted_color = cx.theme().status_deleted;
+                    let text_color = cx
+                        .theme()
+                        .highlight_theme
+                        .style
+                        .editor_foreground
+                        .unwrap_or_else(|| cx.theme().text);
+                    let label: SharedString =
+                        format!("{:>width$}", del.old_lineno, width = number_len).into();
+                    let number_runs = window.text_system().shape_line(
+                        label.clone(),
+                        insert_font_size,
+                        &[TextRun {
+                            len: label.len(),
+                            font: insert_font.clone(),
+                            color: deleted_color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    let text: SharedString = del.text.as_str().into();
+                    let text_line = window.text_system().shape_line(
+                        text.clone(),
+                        insert_font_size,
+                        &[TextRun {
+                            len: text.len(),
+                            font: insert_font.clone(),
+                            color: text_color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    (text_line, number_runs)
+                })
+                .collect();
+
+            for (row, (text_line, number_line)) in prepaint.git_insert_rows.iter().zip(shaped_rows)
+            {
+                // prepaint 中 y 为相对坐标，这里换算为绝对 y。
+                let row_y = origin.y + row.y;
+                if row_y + line_height <= origin.y || row_y >= viewport_bottom {
+                    continue;
+                }
+                let p = point(input_bounds.origin.x, row_y);
+                let deleted_color = cx.theme().status_deleted;
+                // 整行红底（从行号区左缘铺到右缘，单层 0.14，与 diff view
+                // 删除行同色；行号区不再单独叠一层，避免两段深浅不一）。
+                window.paint_quad(fill(
+                    Bounds::new(p, size(bounds.size.width, line_height)),
+                    deleted_color.opacity(0.14),
+                ));
+                // 旧行号（红色，画在行底之上）。
+                if show_line_numbers {
+                    _ = number_line.paint(p, line_height, TextAlign::Left, None, window, cx);
+                }
+                // 行首红条。
+                window.paint_quad(fill(
+                    Bounds::new(p, size(px(3.), line_height)),
+                    deleted_color,
+                ));
+                // 被删除的旧行文本（只读展示，从正文左缘起画）。
+                _ = text_line.paint(
+                    point(text_x, row_y),
+                    line_height,
+                    TextAlign::Left,
+                    Some(prepaint.last_layout.content_width),
+                    window,
+                    cx,
+                );
+            }
+        }
         // Paint fold icons (only visible on hover or for current line)
         fold_click_targets.extend(self.paint_fold_icons(
             &mut prepaint.fold_icon_layout,
@@ -3448,6 +3738,7 @@ impl Element for TextElement {
             state.scrollbar_geometry = scrollbar_geometry;
             state.sticky_click_targets = sticky_click_targets;
             state.fold_click_targets = fold_click_targets;
+            state.git_bar_click_targets = git_bar_click_targets;
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());

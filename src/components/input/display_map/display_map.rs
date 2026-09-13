@@ -18,6 +18,25 @@ use crate::components::input::Point as TreeSitterPoint;
 use crate::components::input::display_map::WrapPoint;
 use crate::components::input::rope_ext::RopeExt as _;
 
+/// git hunk 展开区：插在 `before_buffer_row` 之前的只读虚拟行
+/// （被删除的旧行，红底展示）。不进入 buffer，也不参与光标/选区映射，
+/// 只影响显示行数与 y 几何。
+#[derive(Clone, Debug)]
+pub struct GitInsertion {
+    pub before_buffer_row: usize,
+    /// 对应 `InputState::git_hunks` 的下标（点击/回写用）。
+    pub hunk_ix: usize,
+    pub lines: std::rc::Rc<Vec<GitInsertedLine>>,
+}
+
+/// 插入区中的一行。
+#[derive(Clone, Debug)]
+pub struct GitInsertedLine {
+    /// 旧文件行号（1 起）；None 则不显示行号。
+    pub old_lineno: Option<u32>,
+    pub text: std::rc::Rc<str>,
+}
+
 /// DisplayMap is the main interface for Editor/Input coordinate mapping.
 ///
 /// It manages the two-layer projection:
@@ -28,6 +47,8 @@ use crate::components::input::rope_ext::RopeExt as _;
 pub struct DisplayMap {
     wrap_map: WrapMap,
     fold_map: FoldMap,
+    /// git hunk 展开区（按 `before_buffer_row` 升序）。
+    git_insertions: Vec<GitInsertion>,
 }
 
 impl DisplayMap {
@@ -35,6 +56,7 @@ impl DisplayMap {
         Self {
             wrap_map: WrapMap::new(font, font_size, wrap_width),
             fold_map: FoldMap::new(),
+            git_insertions: Vec::new(),
         }
     }
 
@@ -66,9 +88,62 @@ impl DisplayMap {
     }
 
     /// Get total number of visible display rows
+    ///
+    /// 注意：不含 git 展开区的虚拟行——它们不属于光标/行映射空间
+    /// （`move_vertical` 以此为行上限），只增加视觉高度。滚动高度用
+    /// [`Self::display_row_count_with_insertions`]。
     #[inline]
     pub fn display_row_count(&self) -> usize {
         self.fold_map.display_row_count()
+    }
+
+    /// 可见显示行数 + git 展开区行数（滚动内容高度用）。
+    #[inline]
+    pub fn display_row_count_with_insertions(&self) -> usize {
+        self.display_row_count() + self.git_insertion_rows_total()
+    }
+
+    // ==================== Git hunk 展开区（插入行） ====================
+
+    /// 替换展开区（调用方保证按 `before_buffer_row` 升序；当前实现里
+    /// hunk 按旧侧行序产出，天然有序）。
+    pub fn set_git_insertions(&mut self, insertions: Vec<GitInsertion>) {
+        self.git_insertions = insertions;
+    }
+
+    #[inline]
+    pub fn git_insertions(&self) -> &[GitInsertion] {
+        &self.git_insertions
+    }
+
+    /// `line` 之前显示的插入行总数（锚点行 `before_buffer_row < line`
+    /// 且锚点行未被折叠——折叠的锚点连带隐藏其展开区）。
+    pub fn git_insertion_rows_before(&self, line: usize) -> usize {
+        self.git_insertions
+            .iter()
+            .filter(|ins| {
+                ins.before_buffer_row < line && !self.fold_map.is_row_hidden(ins.before_buffer_row)
+            })
+            .map(|ins| ins.lines.len())
+            .sum()
+    }
+
+    /// 紧贴 `line` 之上显示的插入块（`before_buffer_row == line`）。
+    pub fn git_insertions_at(&self, line: usize) -> impl Iterator<Item = &GitInsertion> {
+        self.git_insertions
+            .iter()
+            .filter(move |ins| {
+                ins.before_buffer_row == line && !self.fold_map.is_row_hidden(ins.before_buffer_row)
+            })
+    }
+
+    /// 全部展开区行数（含锚点被折叠的——折叠时由查询方按需排除）。
+    fn git_insertion_rows_total(&self) -> usize {
+        self.git_insertions
+            .iter()
+            .filter(|ins| !self.fold_map.is_row_hidden(ins.before_buffer_row))
+            .map(|ins| ins.lines.len())
+            .sum()
     }
 
     /// Get the buffer line for a given display row
@@ -378,9 +453,13 @@ impl DisplayMap {
     /// 等价于 `sum(visible_wrap_row_count_for_buffer_line(ix) for ix in 0..line)`，
     /// 但走 wrap_map 的前缀和与 fold_map 的可见行二分，是 O(log n)。调用点
     /// 在每次光标移动的滚动路径上，逐行累加在 10 万行文件末尾是 10 万次迭代。
+    ///
+    /// 含 git 展开区插入行（锚点行在 `line` 之前的块）——滚动定位的 y
+    /// 必须包含这些视觉行高。
     pub fn display_row_for_buffer_line(&self, line: usize) -> usize {
         let wrap_row = self.wrap_map.buffer_line_to_first_wrap_row(line);
         self.fold_map.visible_display_rows_before(wrap_row)
+            + self.git_insertion_rows_before(line)
     }
 
     /// Get the wrap row count (before folding)
