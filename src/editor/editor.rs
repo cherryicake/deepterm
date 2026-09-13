@@ -1542,6 +1542,22 @@ impl Editor {
         self.pending_jumps.remove(tab_id)
     }
 
+    /// diff 标签 id：仓库标识 + 相对路径。
+    /// 本地仓库用 root，远程用 SSH 目标（同一路径在两台服务器上是不同仓库）。
+    /// 两种形态都以 `/{rel_path}` 结尾，`refresh_diff_for_path` 的后缀匹配
+    /// 依赖这一性质。
+    fn diff_tab_id(
+        rel_path: &str,
+        repo: &crate::editor::git_repository::GitRepository,
+    ) -> String {
+        match repo.ssh_config() {
+            Some(config) => {
+                format!("diff-{}@{}:{}/{}", config.username, config.host, config.port, rel_path)
+            }
+            None => format!("diff-{}/{}", repo.root(), rel_path),
+        }
+    }
+
     /// Opens the diff tab instantly; content loads in the background.
     /// 同一文件只有一个 diff tab（VSCode 行为）：已存在则切换并按需切换
     /// 工作区/已暂存内容；`staged` 为 true 打开已暂存 diff（HEAD↔暂存区）。
@@ -1553,7 +1569,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_id = format!("diff-{path}");
+        // tab id 必须含仓库标识：此前只有 `diff-{relpath}`，同一编辑器里
+        // 打开两个仓库的同名相对路径（本地 A + 远程 B 的 src/main.rs）时
+        // 会命中旧 tab，显示另一个仓库的内容。
+        let tab_id = Self::diff_tab_id(&path, &repo);
         if let Some(file) = self.open_files.iter().find(|file| file.id == tab_id) {
             if let Some(view) = file.diff.clone() {
                 view.update(cx, |v, cx| v.set_kind(staged, cx));
@@ -2726,12 +2745,35 @@ impl Editor {
         }
     }
 
+    /// 刷新所有普通编辑标签的 Git 行标记。
+    ///
+    /// 提交 / amend 后 HEAD 前移，所有已打开文件相对 HEAD 的差异整体过期
+    /// （刚提交完的文件不应继续显示满屏“已修改”色条）。StageFile 等
+    /// 事件都带路径刷新过标记，唯独 CommitDone 此前没有任何刷新。
+    pub fn refresh_all_git_marks(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<gpui::SharedString> = self
+            .open_files
+            .iter()
+            .filter(|f| f.diff.is_none())
+            .map(|f| f.id.clone())
+            .collect();
+        for id in ids {
+            self.refresh_git_marks(&id, cx);
+        }
+    }
+
     /// 刷新指定仓库相对路径的 diff 页（放弃更改/提交后 HEAD 或工作区已变）。
+    ///
+    /// diff tab id 现含仓库标识（见 [`Self::diff_tab_id`]，多仓库同名路径
+    /// 不再共用 tab），且以 `/{rel_path}` 结尾——事件只带相对路径，按后缀
+    /// 匹配即可命中任意仓库的对应 tab（多命中时多刷一遍，无害）。
     pub fn refresh_diff_for_path(&mut self, path: &str, cx: &mut Context<Self>) {
-        let tab_id = format!("diff-{path}");
-        if let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) {
+        let suffix = format!("/{path}");
+        for file in self.open_files.iter() {
             if let Some(view) = file.diff.clone() {
-                view.update(cx, |v, cx| v.refresh(cx));
+                if file.path == path || file.id.as_ref().ends_with(suffix.as_str()) {
+                    view.update(cx, |v, cx| v.refresh(cx));
+                }
             }
         }
     }
@@ -3920,6 +3962,10 @@ mod tests {
         let repo = crate::editor::git_repository::GitRepository::find(&tmp, true, None)
             .expect("find repo")
             .expect("should find temp repo");
+        // tab id 现含仓库标识（diff_tab_id），用同一规则构造期望 id
+        //（repo.root() 是 rev-parse 的输出，macOS 上 /tmp 可能解析为
+        // /private/tmp，不能拿 tmp 原样拼）。
+        let diff_id: String = Editor::diff_tab_id("test.txt", &repo);
         cx.update(|window, cx| {
             editor.update(cx, |editor, cx| {
                 editor.open_diff_file_loading("test.txt".to_string(), repo, false, window, cx);
@@ -3931,7 +3977,7 @@ mod tests {
             state.open_files_info[0].diff_repo.is_some(),
             "diff tab must carry its repo for reload"
         );
-        let diff_key: SharedString = "diff-test.txt".into();
+        let diff_key: SharedString = diff_id.clone().into();
         assert!(
             !state.cached_editor_states.contains_key(&diff_key),
             "diff placeholder state must not be cached as text"
@@ -3945,7 +3991,7 @@ mod tests {
                 .read(cx)
                 .open_files
                 .iter()
-                .any(|f| f.id.as_ref() == "diff-test.txt" && f.diff.is_some());
+                .any(|f| f.id.as_ref() == diff_id && f.diff.is_some());
             assert!(diff_ok, "diff tab must reuse its DiffView after restore");
         });
         // 路径二：无实体缓存时后台重载（兜底），同样不能是空白纯文本页。
@@ -3966,10 +4012,95 @@ mod tests {
                 .read(cx)
                 .open_files
                 .iter()
-                .any(|f| f.id.as_ref() == "diff-test.txt" && f.diff.is_some());
+                .any(|f| f.id.as_ref() == diff_id && f.diff.is_some());
             assert!(diff_ok, "diff tab must rebuild its DiffView after restore");
         });
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归（B4）：两个不同仓库的同名相对路径不得共用 diff tab。
+    /// 此前 tab id 只有 `diff-{relpath}`，第二个仓库的 src/main.rs 会命中
+    /// 第一个仓库的旧 tab，显示错误内容。
+    #[gpui::test]
+    fn diff_tabs_from_distinct_repos_do_not_collide(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            EditorHost(cx.new(|cx| Editor::new(window, cx)))
+        });
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+
+        let mk_repo = |tag: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("deepterm-diff-collide-{tag}-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&dir)
+                .output();
+            dir
+        };
+        let dir_a = mk_repo("a");
+        let dir_b = mk_repo("b");
+        let repo_a = crate::editor::git_repository::GitRepository::find(&dir_a, true, None)
+            .unwrap()
+            .expect("repo a");
+        let repo_b = crate::editor::git_repository::GitRepository::find(&dir_b, true, None)
+            .unwrap()
+            .expect("repo b");
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_diff_file_loading(
+                    "src/main.rs".to_string(),
+                    repo_a.clone(),
+                    false,
+                    window,
+                    cx,
+                );
+                editor.open_diff_file_loading(
+                    "src/main.rs".to_string(),
+                    repo_b.clone(),
+                    false,
+                    window,
+                    cx,
+                );
+            });
+        });
+        editor.read_with(cx, |editor, _cx| {
+            let ids: Vec<&SharedString> = editor
+                .open_files
+                .iter()
+                .filter(|f| f.diff.is_some())
+                .map(|f| &f.id)
+                .collect();
+            assert_eq!(ids.len(), 2, "两个仓库的同名路径必须是两个独立 tab: {ids:?}");
+            assert_ne!(ids[0], ids[1]);
+            // 每个仓库各有一个可解析到自身的 repo。
+            let repos: Vec<&crate::editor::git_repository::GitRepository> = editor
+                .open_files
+                .iter()
+                .filter_map(|f| f.diff_repo.as_ref())
+                .collect();
+            assert_eq!(repos.len(), 2);
+            assert_ne!(repos[0].root(), repos[1].root());
+        });
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// 回归：窗口拉宽时编辑器必须按比例跟着变宽（而不是钉死在拖拽宽度上），

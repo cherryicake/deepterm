@@ -232,16 +232,12 @@ impl FileStatus {
 }
 
 /// Section for grouping files in the git panel (VSCode 模型)。
-/// 排序：合并冲突 < 已暂存 < 更改 < 未跟踪。
+/// 排序：合并冲突 < 已暂存 < 更改（未跟踪文件也归入更改，U 徽标区分）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     Conflict,
     Staged,
     Changes,
-    New,
-    /// 兼容旧分组：完全未暂存的跟踪文件曾归入 `Tracked`。
-    /// 新代码不再产生该变体，仅保留以兼容旧缓存/旧排序。
-    Tracked,
 }
 
 impl Section {
@@ -250,8 +246,6 @@ impl Section {
             Section::Conflict => "合并更改",
             Section::Staged => "已暂存的更改",
             Section::Changes => "更改",
-            Section::New => "更改",
-            Section::Tracked => "更改",
         }
     }
 
@@ -261,8 +255,6 @@ impl Section {
             Section::Conflict => 0,
             Section::Staged => 1,
             Section::Changes => 2,
-            Section::New => 3,
-            Section::Tracked => 2,
         }
     }
 }
@@ -302,12 +294,14 @@ impl GitStatus {
                     return None;
                 }
                 let path = &entry[3..];
-                // Skip directories (untracked dirs end with '/')
-                if path.ends_with('/') {
-                    return None;
-                }
                 let status_bytes: [u8; 2] = [entry.as_bytes()[0], entry.as_bytes()[1]];
                 let status = FileStatus::from_bytes(status_bytes)?;
+                // 以 `/` 结尾的条目是子模块/嵌套仓库：`?? sub/`（未跟踪）
+                // 是现存 git 的形态，旧版 git 的跟踪子模块同样带后缀。
+                // VSCode 会展示它们，这里剥掉后缀、路径与文件树/暂存操作
+                // 保持一致。纯未跟踪目录不会以目录形态出现——本应用的
+                // status 固定 `--untracked-files=all`，目录总是被展开。
+                let path = path.strip_suffix('/').unwrap_or(path);
                 let section = classify_section(&status);
                 Some(StatusEntry {
                     path: path.to_string(),
@@ -438,6 +432,27 @@ mod tests {
         assert_eq!(status.entries.len(), 1);
         assert!(status.entries[0].status.is_conflicted());
         assert_eq!(status.entries[0].section, Section::Conflict);
+    }
+
+    /// 子模块/嵌套仓库条目以 `/` 结尾（`?? sub/` 未跟踪；旧版 git 的
+    /// 跟踪子模块 `M sub/` 同形）——必须保留且剥掉后缀，否则面板看不到
+    /// 新增子模块、无法暂存。
+    #[test]
+    fn test_parse_status_submodule_kept() {
+        let input = "?? sub2/\0 M sub/\0M  .gitmodules\0";
+        let status = GitStatus::parse(input);
+        assert_eq!(status.entries.len(), 3);
+        let sub2 = status.entries.iter().find(|e| e.path == "sub2").unwrap();
+        assert!(sub2.status.is_untracked());
+        assert_eq!(sub2.section, Section::Changes);
+        let sub = status.entries.iter().find(|e| e.path == "sub").unwrap();
+        assert!(sub.status.is_modified());
+        // " M" = 仅工作区改动 → 更改组。
+        assert_eq!(sub.section, Section::Changes);
+        assert!(
+            status.entries.iter().all(|e| !e.path.ends_with('/')),
+            "路径后缀必须剥掉，与文件树/暂存操作的路径一致"
+        );
     }
 
     #[test]

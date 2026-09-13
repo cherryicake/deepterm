@@ -144,8 +144,12 @@ pub struct DiffView {
     path: String,
     repo: GitRepository,
     editor: WeakEntity<Editor>,
-    /// File content at HEAD.
-    old_text: Arc<str>,
+    /// 左侧基线文本：工作区视图 = 暂存区（部分暂存时）否则 HEAD；已暂存
+    /// 视图 = HEAD。**所有** diff 计算（hunks/unified/滚动映射/补丁/还原）
+    /// 都以它为 old 侧——此前用 HEAD 文本，部分暂存时左栏显示暂存区内容
+    /// 而行号按 HEAD 算，高亮错位；stage_hunk 的补丁也因基线不等于 index
+    /// 内容而可能应用到错误行。
+    base_text: Arc<str>,
     /// Working-tree content at last load/save (dirty baseline).
     saved_text: String,
     left: Entity<InputState>,
@@ -173,8 +177,11 @@ pub struct DiffView {
     refreshing: bool,
     /// 当前对比目标（工作区/已暂存，构造时按点击来源确定，可经 set_kind 切换）。
     target: DiffTarget,
-    /// 暂存区内容缓存（随每次拉取更新；工作区视图的左侧基线可能即它）。
-    staged_text: String,
+    /// 路径不在 index 中（未跟踪文件）：hunk 暂存补丁用 `/dev/null` 头。
+    is_new: bool,
+    /// 任一侧不可按文本展示（二进制等）：视图整体只读，禁止保存/块操作，
+    /// 防止占位文本被写回覆盖二进制文件。
+    is_binary: bool,
     /// 正在暂存的 hunk 下标（按钮 loading 态）。
     staging_hunk: Option<usize>,
     /// 正在暂存整个文件。
@@ -236,7 +243,7 @@ impl DiffView {
             path,
             repo,
             editor,
-            old_text: "".into(),
+            base_text: "".into(),
             saved_text: String::new(),
             left,
             right,
@@ -259,7 +266,8 @@ impl DiffView {
             } else {
                 DiffTarget::Worktree
             },
-            staged_text: String::new(),
+            is_new: false,
+            is_binary: false,
             staging_hunk: None,
             staging_file: false,
             diff_menu: None,
@@ -325,7 +333,6 @@ impl DiffView {
     fn fetch_contents(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.load_error = None;
-        self.staged_text = String::new();
         // 快照失效：重算完成前禁止 unified 写回（见 unified_ready）。
         self.unified_ready = false;
         self.close_diff_menu(cx);
@@ -349,24 +356,31 @@ impl DiffView {
                         );
                         view.old_highlighter = SimpleHighlighter::new(&language);
                         view.new_highlighter = SimpleHighlighter::new(&language);
-                        view.old_text = base.head.clone().into();
-                        view.staged_text = base.staged.clone();
+                        view.is_new = base.is_new;
+                        view.is_binary = base.is_binary;
+                        // B1 修复核心：diff 基线 = 左栏实际显示的基线
+                        //（工作区视图在部分暂存时是暂存区），两侧行号自此一致，
+                        // hunk 暂存/还原也以同一基线计算。
+                        let base_side = match view.target {
+                            DiffTarget::Worktree => base.worktree_base().to_string(),
+                            DiffTarget::Staged => base.head.clone(),
+                        };
+                        view.base_text = base_side.clone().into();
                         view.saved_text = base.worktree.clone();
                         view.old_parsed = None;
                         view.new_parsed = None;
+                        let base_side_for_set = base_side;
                         view.left.update(cx, |state, cx| {
-                            state.set_text(
-                                match view.target {
-                                    DiffTarget::Worktree => base.worktree_base().to_string(),
-                                    DiffTarget::Staged => base.head.clone(),
-                                },
-                                cx,
-                            );
+                            state.set_text(base_side_for_set, cx);
                         });
+                        // 二进制占位文本不可编辑、不可保存：编辑后写回会
+                        // 用占位文本覆盖二进制文件。
+                        let readonly = view.is_binary
+                            || matches!(view.target, DiffTarget::Staged);
                         match view.target {
                             DiffTarget::Worktree => {
                                 view.right.update(cx, |state, cx| {
-                                    state.disabled = false;
+                                    state.disabled = readonly;
                                     state.set_text(base.worktree, cx);
                                 });
                                 view.dirty = false;
@@ -424,16 +438,20 @@ impl DiffView {
                 .await;
             weak.update(cx, |view, cx| {
                 if let Ok(base) = result {
-                    view.old_text = base.head.clone().into();
-                    view.staged_text = base.staged.clone();
+                    view.is_new = base.is_new;
+                    view.is_binary = base.is_binary;
                     // 工作区视图基线可能已变为暂存区；已暂存视图左栏恒为 HEAD。
                     let left_text = match view.target {
                         DiffTarget::Worktree => base.worktree_base().to_string(),
                         DiffTarget::Staged => base.head.clone(),
                     };
+                    view.base_text = left_text.clone().into();
                     view.left.update(cx, |state, cx| {
                         state.set_text(left_text, cx);
                     });
+                    if view.is_binary {
+                        view.right.update(cx, |state, _| state.disabled = true);
+                    }
                     // 已暂存视图右栏即暂存区，一起更新（只读，无 dirty 风险）。
                     if view.target == DiffTarget::Staged {
                         view.right.update(cx, |state, cx| {
@@ -493,8 +511,21 @@ impl DiffView {
 
     /// 暂存单个 hunk（`git apply --cached` 零上下文补丁）。
     /// 陈旧 hunk 先经 `resolve_hunk_for_revert` 重定位，避免写错位置。
+    ///
+    /// 补丁基线是 [`Self::base_text`]（= 暂存区，部分暂存时），与
+    /// `git apply --cached` 的目标 index 内容一致，行号才能对上；
+    /// 右栏有未保存编辑时拒绝执行——把仅存在于缓冲区的内容写进 index
+    /// 会造成 index 与磁盘不一致。
     fn stage_hunk(&mut self, hunk_ix: usize, cx: &mut Context<Self>) {
         if self.target != DiffTarget::Worktree || self.staging_hunk.is_some() {
+            return;
+        }
+        if self.is_binary {
+            self.notify_warning(cx, "二进制文件不支持按块暂存");
+            return;
+        }
+        if self.dirty {
+            self.notify_warning(cx, "有未保存的编辑，请先保存再暂存该块");
             return;
         }
         let current = self.right.read(cx).value().to_string();
@@ -502,12 +533,18 @@ impl DiffView {
             self.notify_warning(cx, "该块位置已变化，请稍后重试");
             return;
         };
-        let patch =
-            super::diff_model::build_hunk_patch(&self.path, &self.old_text, &current, &hunk);
+        let patch = super::diff_model::build_hunk_patch(
+            &self.path,
+            &self.base_text,
+            &current,
+            &hunk,
+            self.is_new,
+        );
         self.staging_hunk = Some(hunk_ix);
         cx.notify();
 
         let repo = self.repo.clone();
+        let path = self.path.clone();
         let this_weak = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx
@@ -520,6 +557,12 @@ impl DiffView {
                     match result {
                         Ok(()) => {
                             view.notify_success(cx, "已暂存该块", true);
+                            // index 已变：远端 diff 缓存的暂存层立即失效，
+                            // 下次拉取拿到新暂存区。
+                            super::git_repository::invalidate_remote_diff_cache(
+                                view.repo.root(),
+                                &path,
+                            );
                             // 左侧基线变为新的暂存区，右栏不动。
                             view.refresh_base(cx);
                         }
@@ -535,6 +578,11 @@ impl DiffView {
     /// 暂存整个文件（工具栏）。
     fn stage_file(&mut self, cx: &mut Context<Self>) {
         if self.staging_file || self.target != DiffTarget::Worktree {
+            return;
+        }
+        if self.dirty {
+            // 与 stage_hunk 同理：git add 读磁盘，缓冲区内容会被绕过。
+            self.notify_warning(cx, "有未保存的编辑，请先保存再暂存");
             return;
         }
         self.staging_file = true;
@@ -624,7 +672,7 @@ impl DiffView {
             &self.unified_lines,
             &self.unified_snapshot,
             &current,
-            &self.old_text,
+            &self.base_text,
         );
         // 快照保持到重算时更新（元数据必须与快照文本严格对应）；
         // 累积 diff 下一次按键仍能基于旧快照精确对齐。
@@ -675,7 +723,7 @@ impl DiffView {
         self.recompute_gen += 1;
         let generation = self.recompute_gen;
 
-        let old_text = self.old_text.clone();
+        let old_text = self.base_text.clone();
         let new_text = self.right.read(cx).value().to_string();
         let language = self.old_highlighter.language().to_string();
         let theme = cx.theme().highlight_theme.clone();
@@ -1267,7 +1315,7 @@ impl DiffView {
             return Some(stale);
         }
 
-        let fresh = super::diff_model::compute_hunks(&self.old_text, current);
+        let fresh = super::diff_model::compute_hunks(&self.base_text, current);
 
         // HEAD 侧行号是稳定锚点（右栏怎么编辑都不会改变它），所以评分以
         // `old_rows` 的距离为主、`new_rows` 的距离为辅。
@@ -1317,8 +1365,14 @@ impl DiffView {
         }
     }
 
-    /// Revert one hunk: replace the new-side lines with the HEAD lines.
+    /// Revert one hunk: replace the new-side lines with the base lines
+    /// (暂存区优先，部分暂存时——与左栏内容一致，VSCode 行为；此前用 HEAD，
+    /// 会把已暂存的改动一并丢回)。
     fn revert_hunk(&mut self, hunk_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_binary {
+            self.notify_warning(cx, "二进制文件不支持按块还原");
+            return;
+        }
         let current = self.right.read(cx).value().to_string();
         let Some(hunk) = self.resolve_hunk_for_revert(hunk_ix, &current) else {
             cx.notify();
@@ -1338,20 +1392,20 @@ impl DiffView {
             current.len()
         };
 
-        // Exact HEAD bytes for the reverted line range.
-        let old_starts = line_starts(&self.old_text);
-        let old_count = line_count(&self.old_text, &old_starts);
+        // Exact base bytes for the reverted line range (基线=左栏内容)。
+        let old_starts = line_starts(&self.base_text);
+        let old_count = line_count(&self.base_text, &old_starts);
         let repl_start = if hunk.old_rows.start < old_count {
             old_starts[hunk.old_rows.start as usize]
         } else {
-            self.old_text.len()
+            self.base_text.len()
         };
         let repl_end = if hunk.old_rows.end < old_count {
             old_starts[hunk.old_rows.end as usize]
         } else {
-            self.old_text.len()
+            self.base_text.len()
         };
-        let replacement = &self.old_text[repl_start..repl_end];
+        let replacement = &self.base_text[repl_start..repl_end];
 
         let mut updated =
             String::with_capacity(current.len() - (byte_end - byte_start) + replacement.len());
@@ -1378,6 +1432,11 @@ impl DiffView {
     pub fn save(&mut self, cx: &mut Context<Self>) {
         // 已暂存视图只读：保存无意义，直接忽略（按钮本身已禁用，此处为防御）。
         if self.target != DiffTarget::Worktree {
+            return;
+        }
+        // 二进制文件的右栏是占位文本，写回会毁掉二进制内容。
+        if self.is_binary {
+            self.notify_warning(cx, "二进制文件不支持文本编辑保存");
             return;
         }
         if self.saving || !self.dirty {
@@ -1466,14 +1525,15 @@ impl DiffView {
             this.update(cx, |view, cx| {
                 view.refreshing = false;
                 if let Ok(base) = result {
-                    view.old_text = base.head.clone().into();
-                    view.staged_text = base.staged.clone();
+                    view.is_new = base.is_new;
+                    view.is_binary = base.is_binary;
                     // 左栏基线：工作区视图取暂存区（部分暂存时）否则 HEAD；
-                    // 已暂存视图恒为 HEAD。
+                    // 已暂存视图恒为 HEAD。diff 计算基线同步更新。
                     let left_text = match view.target {
                         DiffTarget::Worktree => base.worktree_base().to_string(),
                         DiffTarget::Staged => base.head.clone(),
                     };
+                    view.base_text = left_text.clone().into();
                     view.left.update(cx, |state, cx| {
                         state.set_text(left_text, cx);
                     });
@@ -1488,7 +1548,9 @@ impl DiffView {
                                 );
                             } else {
                                 view.saved_text = base.worktree.clone();
+                                let readonly = view.is_binary;
                                 view.right.update(cx, |state, cx| {
+                                    state.disabled = readonly;
                                     state.set_text(base.worktree, cx);
                                 });
                             }
@@ -1708,7 +1770,7 @@ impl DiffView {
                     ),
                 ),
             )
-            .when(dirty && is_worktree, |this| {
+            .when(dirty && is_worktree && !self.is_binary, |this| {
                 this.child(
                     div()
                         .id("diff-save")

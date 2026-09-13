@@ -183,6 +183,9 @@ impl MacosSidebar {
                 crate::sidebar_view::git_panel::GitPanelEvent::CommitDone => {
                     cx.emit(SidebarEvent::GitCommitDone);
                 }
+                crate::sidebar_view::git_panel::GitPanelEvent::RepoChanged => {
+                    cx.emit(SidebarEvent::GitRepoChanged);
+                }
                 crate::sidebar_view::git_panel::GitPanelEvent::OperationFailed { message } => {
                     cx.emit(SidebarEvent::GitOperationFailed {
                         message: message.clone(),

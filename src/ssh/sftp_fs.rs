@@ -722,18 +722,22 @@ impl BlockingSftpSession {
 
     /// 在远程服务器上执行 shell 命令，返回 stdout/stderr 和退出码。
     /// 用于 Phase 3 服务器直连场景，在源服务器执行 scp/rsync 命令。
+    ///
+    /// stdout 按有损 UTF-8 解码。需要原始字节的调用方（git 输出等）请用
+    /// [`Self::execute_command_bytes`]。
     pub fn execute_command(
         &mut self,
         command: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(
+        let raw = self.execute_command_inner(
             command,
             timeout_secs,
             None,
             None::<&mut dyn FnMut(&[u8])>,
             false,
-        )
+        )?;
+        Ok(raw.into_lossy())
     }
 
     /// 带取消检查的远程命令执行。每 200ms 检查一次 `cancelled`，
@@ -744,13 +748,14 @@ impl BlockingSftpSession {
         timeout_secs: u64,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(
+        let raw = self.execute_command_inner(
             command,
             timeout_secs,
             Some(cancelled),
             None::<&mut dyn FnMut(&[u8])>,
             false,
-        )
+        )?;
+        Ok(raw.into_lossy())
     }
 
     /// 带取消检查的 agent forwarding 远程命令执行。
@@ -761,13 +766,28 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
         mut progress_cb: impl FnMut(&[u8]),
     ) -> anyhow::Result<RemoteCommandResult> {
-        self.execute_command_inner(
+        let raw = self.execute_command_inner(
             command,
             timeout_secs,
             Some(cancelled),
             Some(&mut progress_cb as &mut dyn FnMut(&[u8])),
             true,
-        )
+        )?;
+        Ok(raw.into_lossy())
+    }
+
+    /// stdout 保留原始字节的远程命令执行。
+    ///
+    /// 供需要按内容编码探测解码 stdout 的调用方使用（git show 的仓库
+    /// blob、`git status -z` 的非 UTF-8 文件名等），避免 `from_utf8_lossy`
+    /// 把 GBK 内容破坏成 U+FFFD 后无法还原。stderr 仅作错误展示，
+    /// 固定有损解码。
+    pub fn execute_command_bytes(
+        &mut self,
+        command: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<RemoteCommandRawResult> {
+        self.execute_command_inner(command, timeout_secs, None, None, false)
     }
 
     /// 统一的远程命令执行核心方法。
@@ -775,6 +795,9 @@ impl BlockingSftpSession {
     /// - `cancelled`: 可选的取消标志，每 200ms 检查一次
     /// - `progress_cb`: 可选的 stderr 实时回调（用于 scp 进度解析）
     /// - `agent_forward`: 是否启用 SSH agent forwarding
+    ///
+    /// 返回**原始字节**：stdout 的解码策略由调用方决定（git 输出需要按
+    /// 文本编码探测走 `decode_bytes`，而不是一刀切 `from_utf8_lossy`）。
     fn execute_command_inner(
         &mut self,
         command: &str,
@@ -782,7 +805,7 @@ impl BlockingSftpSession {
         cancelled: Option<&AtomicBool>,
         mut progress_cb: ProgressCallback<'_>,
         agent_forward: bool,
-    ) -> anyhow::Result<RemoteCommandResult> {
+    ) -> anyhow::Result<RemoteCommandRawResult> {
         sftp_block_on!({
             let mut channel = self
                 .handle
@@ -890,8 +913,9 @@ impl BlockingSftpSession {
             }
 
             match result {
-                Ok(Ok(())) => Ok(RemoteCommandResult {
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                Ok(Ok(())) => Ok(RemoteCommandRawResult {
+                    stdout,
+                    // stderr 仅作错误展示，固定有损解码。
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
                     exit_status,
                 }),
@@ -902,7 +926,36 @@ impl BlockingSftpSession {
     }
 }
 
-/// 远程命令执行结果
+/// 远程命令执行结果（原始字节）。
+///
+/// stderr 固定有损解码为 String（仅作错误展示）；stdout 保留字节。
+#[derive(Clone, Debug)]
+pub struct RemoteCommandRawResult {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub exit_status: Option<u32>,
+}
+
+impl RemoteCommandRawResult {
+    pub fn success(&self) -> bool {
+        self.exit_status == Some(0)
+    }
+
+    /// stdout 有损解码为文本（既有通用行为）。
+    pub fn into_lossy(self) -> RemoteCommandResult {
+        RemoteCommandResult {
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stderr: self.stderr,
+            exit_status: self.exit_status,
+        }
+    }
+}
+
+/// 远程命令执行结果（文本）。
+///
+/// stdout 按有损 UTF-8 解码。**注意**：需要按内容编码探测解码的调用方
+/// （如 git show 的仓库 blob）应使用 `execute_command_bytes`，否则 GBK
+/// 等非 UTF-8 内容会整篇变成 U+FFFD。
 #[derive(Clone, Debug)]
 pub struct RemoteCommandResult {
     pub stdout: String,

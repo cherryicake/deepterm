@@ -23,11 +23,16 @@ const MAX_WORD_DIFF_LINE_COUNT: usize = 8;
 /// 行号为 1-based；空侧按 git 惯例取插入点行号（文件头为 0）。
 /// 缺尾换行的末行追加 `\ No newline at end of file` 标记，
 /// 否则 apply 会补换行导致暂存内容与工作区不一致。
+///
+/// `is_new`：路径尚不在 index 中（未跟踪文件）。此时 preimage 必须是
+/// `/dev/null` 并声明 `new file mode`，否则 `git apply --cached` 会因
+/// 「a/{path} 不在 index 中」拒绝应用——未跟踪文件的 hunk 暂存就走不通。
 pub fn build_hunk_patch(
     path: &str,
     old_text: &str,
     new_text: &str,
     hunk: &DiffHunk,
+    is_new: bool,
 ) -> String {
     let old_starts = line_starts(old_text);
     let new_starts = line_starts(new_text);
@@ -47,7 +52,12 @@ pub fn build_hunk_patch(
 
     let mut patch = String::new();
     patch.push_str(&format!("diff --git a/{path} b/{path}\n"));
-    patch.push_str(&format!("--- a/{path}\n"));
+    if is_new {
+        patch.push_str("new file mode 100644\n");
+        patch.push_str("--- /dev/null\n");
+    } else {
+        patch.push_str(&format!("--- a/{path}\n"));
+    }
     patch.push_str(&format!("+++ b/{path}\n"));
     patch.push_str(&format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"));
 

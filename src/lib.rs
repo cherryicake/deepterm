@@ -529,6 +529,10 @@ impl AppWindow {
                             editor.update(cx, |e, cx| {
                                 // HEAD 前移：所有 diff 页的左栏与 hunk 全部过期。
                                 e.refresh_all_diff_views(cx);
+                                // 已打开文件的行变更标记（HEAD↔工作区）同样
+                                // 整体过期，一并重算——此前缺失，刚提交完的
+                                // 文件行号区还显示满屏“已修改”色条。
+                                e.refresh_all_git_marks(cx);
                             });
                         }
                     });
@@ -537,6 +541,20 @@ impl AppWindow {
                         crate::components::notification::NotificationKind::Success,
                         cx,
                     );
+                }
+                SidebarEvent::GitRepoChanged => {
+                    let editor = editor_for_open.clone();
+                    window.defer(cx, move |_, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                // stash pop/冲突解决会整体改写工作区：所有
+                                // diff 页与行标记全部重算；操作本身在面板
+                                // 已有行内反馈，这里不再弹通知。
+                                e.refresh_all_diff_views(cx);
+                                e.refresh_all_git_marks(cx);
+                            });
+                        }
+                    });
                 }
             },
         );

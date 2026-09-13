@@ -170,6 +170,8 @@ pub enum SidebarEvent {
     },
     /// Git 提交成功：弹成功提示并刷新 diff 页（HEAD 已变）。
     GitCommitDone,
+    /// 仓库结构级变化（stash、冲突解决、init 等）：静默刷新 diff 页与行标记。
+    GitRepoChanged,
 }
 
 impl std::fmt::Debug for SidebarEvent {
@@ -201,6 +203,7 @@ impl std::fmt::Debug for SidebarEvent {
                 .field("message", message)
                 .finish(),
             Self::GitCommitDone => write!(f, "GitCommitDone"),
+            Self::GitRepoChanged => write!(f, "GitRepoChanged"),
         }
     }
 }

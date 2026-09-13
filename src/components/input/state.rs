@@ -725,7 +725,7 @@ impl InputState {
     /// color) and word-level background colors (byte range → color).
     /// Used by the git diff view to render added/deleted lines and inline
     /// word highlights on top of the regular editor rendering.
-    pub fn set_diff_decorations(
+    pub(crate) fn set_diff_decorations(
         &mut self,
         line_colors: Vec<(u32, gpui::Hsla, DiffLineKind)>,
         range_colors: Vec<(Range<usize>, gpui::Hsla)>,

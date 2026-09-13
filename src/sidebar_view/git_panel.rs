@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -21,7 +21,7 @@ use crate::assets::file_icon_or_default;
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
 use crate::components::tooltip::Tooltip;
-use crate::editor::git_repository::GitRepository;
+use crate::editor::git_repository::{ConflictSide, GitRepository};
 use crate::editor::git_status::{DiffStat, FileStatus, Section};
 use crate::file_manager::filesystem::FileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, WatcherContext};
@@ -33,6 +33,9 @@ const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
 /// Fallback poll for remote git status (now also watches .git/index directly,
 /// so interval can be longer than file watcher but still catch missed events).
 const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// 分支信息（分支名 + ahead/behind）节流间隔。
+/// status 轮询是 10s，这里错开成 30s：两者合并一次后台任务取回。
+const BRANCH_INFO_TTL: Duration = Duration::from_secs(30);
 
 /// Git panel events
 pub enum GitPanelEvent {
@@ -56,6 +59,9 @@ pub enum GitPanelEvent {
     DiscardFile { path: String },
     /// 提交成功：调用方弹成功提示并刷新 diff 页。
     CommitDone,
+    /// 仓库结构级变化（stash push/pop、冲突解决、初始化等）：
+    /// diff 页与编辑器行标记需整体刷新，但不弹通知（操作本身已有反馈）。
+    RepoChanged,
     /// 暂存/取消暂存/放弃/提交失败：调用方弹错误提示。
     OperationFailed { message: String },
 }
@@ -162,6 +168,10 @@ pub struct GitPanel {
     collapsed: HashSet<Section>,
     /// 当前分支名（后台获取，提交框占位用）。
     branch_name: Option<String>,
+    /// ahead/behind 计数与上游名（`(领先, 落后, upstream)`，None = 尚未取回）。
+    branch_status: Option<(u32, u32, Option<String>)>,
+    /// 分支信息上次取回时间（节流：30s 内的重复请求直接复用现值）。
+    branch_info_fetched_at: Option<Instant>,
     /// 提交输入框（懒创建：需要 Window，只能在有窗口的回调中初始化）。
     commit_editor: Option<Entity<InputState>>,
     commit_subscription: Option<Subscription>,
@@ -204,6 +214,8 @@ impl GitPanel {
             selected_path: None,
             collapsed: HashSet::new(),
             branch_name: None,
+            branch_status: None,
+            branch_info_fetched_at: None,
             commit_editor: None,
             commit_subscription: None,
             amend_checked: false,
@@ -328,8 +340,10 @@ impl GitPanel {
         self.entries.clear();
         self.file_entries.clear();
         self.diff_stats.clear();
-        self.selected_path = None;
         self.branch_name = None;
+        self.branch_status = None;
+        self.branch_info_fetched_at = None;
+        self.selected_path = None;
         self.op_error = None;
         self.committing = false;
         self.amend_checked = false;
@@ -453,7 +467,7 @@ impl GitPanel {
                             }
                         }
                         this.refresh(cx);
-                        this.fetch_branch(cx);
+                        this.fetch_branch_info(false, cx);
                     }
                     Ok(None) => {
                         this.repo = None;
@@ -517,23 +531,40 @@ impl GitPanel {
         .detach();
     }
 
-    /// 后台获取分支名（阻塞 git 命令，不占 UI 线程）。
-    fn fetch_branch(&mut self, cx: &mut Context<Self>) {
+    /// 后台获取分支信息：分支名 + ahead/behind，合并为一次后台任务。
+    /// 30s 节流，`force` 用于提交、stash 等已知改变 HEAD 的操作后绕过节流。
+    fn fetch_branch_info(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !force
+            && self
+                .branch_info_fetched_at
+                .is_some_and(|at| at.elapsed() < BRANCH_INFO_TTL)
+        {
+            return;
+        }
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        self.branch_info_fetched_at = Some(Instant::now());
         let weak = cx.entity().downgrade();
         let generation = self.workspace_generation;
         cx.spawn(async move |_, cx| {
-            let name = cx
+            let (name, status) = cx
                 .background_executor()
-                .spawn(async move { repo.branch_name() })
+                .spawn(async move {
+                    // branch_status 失败（空仓库无 HEAD 等）按“无上游”处理，
+                    // 不是面板级错误。
+                    (
+                        repo.branch_name(),
+                        repo.branch_status().unwrap_or((0, 0, None)),
+                    )
+                })
                 .await;
             let _ = weak.update(cx, |this, cx| {
                 if generation != this.workspace_generation {
                     return;
                 }
                 this.branch_name = name;
+                this.branch_status = Some(status);
                 cx.notify();
             });
         })
@@ -605,18 +636,8 @@ impl GitPanel {
 
                         this.file_entries = file_entries;
 
-                        // Build list entries with section headers（折叠的分组只保留 header）。
-                        this.entries.clear();
-                        let mut current_section: Option<Section> = None;
-                        for entry in &this.file_entries {
-                            if current_section != Some(entry.section) {
-                                current_section = Some(entry.section);
-                                this.entries.push(GitListEntry::Header(entry.section));
-                            }
-                            if !this.collapsed.contains(&entry.section) {
-                                this.entries.push(GitListEntry::File(entry.clone()));
-                            }
-                        }
+                        // 列表结构统一经 rebuild_entries 构建（含提交记录区）。
+                        this.rebuild_entries();
 
                         // 选中文件若已不在列表（提交/放弃后消失），清除选中态。
                         if let Some(sel) = this.selected_path.clone()
@@ -651,6 +672,10 @@ impl GitPanel {
                     this.refresh_pending = false;
                     this.schedule_refresh(cx);
                 }
+
+                // 周期刷新顺带补分支信息（30s TTL 内自动跳过，只有跨过
+                // TTL 的那次刷新会真正发起后台任务）。
+                this.fetch_branch_info(false, cx);
 
                 cx.notify();
             });
@@ -815,6 +840,10 @@ impl GitPanel {
     }
 
     /// 放弃更改：跟踪文件 `git restore` 回 HEAD；未跟踪文件经文件系统删除（需二次确认）。
+    ///
+    /// 跟踪文件同样有二次确认：`restore --staged --worktree` 会把**已暂存 +
+    /// 工作区**的改动一并打回，与删除未跟踪文件一样不可逆（此前只有未跟踪
+    /// 文件确认，tracked 直接执行，行为不对称且更危险——暂存的内容也丢了）。
     fn discard_file(&self, entry: &GitFileEntry, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_ref() else {
             return;
@@ -830,8 +859,22 @@ impl GitPanel {
 
         let repo = repo.clone();
         let path = entry.path.clone();
+        let detail = format!("将放弃「{path}」的更改（含已暂存部分），此操作不可撤销。");
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "放弃更改",
+            Some(&detail),
+            &["放弃", "取消"],
+            cx,
+        );
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
+            let Ok(choice) = prompt.await else {
+                return;
+            };
+            if choice != 0 {
+                return;
+            }
             let path_for_task = path.clone();
             let result = cx
                 .background_executor()
@@ -1019,6 +1062,152 @@ impl GitPanel {
 
     /// 提交。Smart 范围：无已暂存内容时先暂存全部（VSCode 智能提交）；
     /// StagedOnly：只提交已暂存，无已暂存时报错。Amend 复选框决定是否 `--amend`。
+    /// 贮藏当前更改（消息取提交框内容，空则不带消息）。
+    /// 无更改时行内报错；成功后刷新面板 + 通知 diff 页重算。
+    fn stash_push(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        if self.file_entries.is_empty() {
+            self.report_op_error("没有更改可贮藏".to_string(), cx);
+            return;
+        }
+        let message = self.commit_message(cx);
+        let message = (!message.trim().is_empty()).then_some(message);
+        self.run_repo_op(cx, async move { repo.stash_push(message.as_deref()) }, "贮藏失败");
+    }
+
+    /// 弹出最近贮藏（有冲突时 git 保留贮藏并报错，用户可重试）。
+    fn stash_pop(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        self.run_repo_op(cx, async move { repo.stash_pop() }, "弹出贮藏失败");
+    }
+
+    /// 贮藏/弹出的公共骨架：后台执行 → 成功发 RepoChanged + 刷新面板，
+    /// 失败行内报错。这两类操作都会整体改变工作区（多文件同时变化），
+    /// 不能像 stage/discard 那样只按单路径刷新。
+    fn run_repo_op<F>(&mut self, cx: &mut Context<Self>, op: F, error_prefix: &'static str)
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = cx.background_executor().spawn(op).await;
+            let _ = weak.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.op_error = None;
+                        cx.emit(GitPanelEvent::RepoChanged);
+                        this.fetch_branch_info(true, cx);
+                    }
+                    Err(e) => {
+                        this.report_op_error(format!("{error_prefix}：{e}"), cx);
+                    }
+                }
+                // 失败也可能已部分改动工作区（stash pop 冲突时 git 保留
+                // 贮藏但改动已落盘），一律刷新列表防过期。
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 冲突解决三选一（右键菜单）：Ours/Theirs 丢弃另一侧，需二次确认；
+    /// Both 保留两侧不确认。成功后 RepoChanged + 刷新。
+    fn resolve_conflict(
+        &mut self,
+        path: &str,
+        side: ConflictSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let path = path.to_string();
+        let prompt = if matches!(side, ConflictSide::Ours | ConflictSide::Theirs) {
+            let side_label = match side {
+                ConflictSide::Ours => "当前",
+                ConflictSide::Theirs => "传入",
+                ConflictSide::Both => "两侧",
+            };
+            Some(window.prompt(
+                PromptLevel::Warning,
+                "解决冲突",
+                Some(&format!(
+                    "采用{side_label}更改解决「{path}」的冲突？另一侧的改动将被覆盖。"
+                )),
+                &["采用", "取消"],
+                cx,
+            ))
+        } else {
+            None
+        };
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            if let Some(prompt) = prompt
+                && let Ok(choice) = prompt.await
+                && choice != 0
+            {
+                return;
+            }
+            let result = cx
+                .background_executor()
+                .spawn(async move { repo.resolve_conflict(&path, side) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.op_error = None;
+                        cx.emit(GitPanelEvent::RepoChanged);
+                    }
+                    Err(e) => this.report_op_error(format!("解决冲突失败：{e}"), cx),
+                }
+                // 失败也可能处于中间态（union 已写回但暂存失败），
+                // 一律刷新防止列表与实际状态脱节。
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 勾选「修正」且提交框为空时，预填上次提交信息（VSCode amend 行为：
+    /// 用户只想修个错字时不必重新输入全文）。
+    fn prefill_amend_message(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let weak = cx.entity().downgrade();
+        let generation = self.workspace_generation;
+        cx.spawn(async move |_, cx| {
+            let message = cx
+                .background_executor()
+                .spawn(async move { repo.last_commit_message() })
+                .await;
+            let Some(message) = message else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                // 取回期间用户取消勾选 / 切了工作区 / 手动输入了内容：不覆盖。
+                if generation != this.workspace_generation
+                    || !this.amend_checked
+                    || !this.commit_message(cx).trim().is_empty()
+                {
+                    return;
+                }
+                if let Some(editor) = this.commit_editor.clone() {
+                    editor.update(cx, |state, cx| state.set_text(message, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn do_commit(&mut self, scope: CommitScope, cx: &mut Context<Self>) {
         if self.committing {
             return;
@@ -1032,13 +1221,23 @@ impl GitPanel {
             return;
         };
         let amend = self.amend_checked;
-        let need_stage_all = matches!(scope, CommitScope::Smart) && self.staged_count() == 0;
+        // VSCode 语义：智能提交只在**普通提交**时兜底暂存全部；amend 只提交
+        // 暂存区。此前 amend + 无暂存也会 `git add -A`，把整个工作区的改动
+        // 悄悄塞进被修正的提交——与注释声明的 VSCode 行为相反。
+        let need_stage_all =
+            matches!(scope, CommitScope::Smart) && !amend && self.staged_count() == 0;
         if matches!(scope, CommitScope::StagedOnly) && self.staged_count() == 0 {
             self.report_op_error("没有已暂存的更改，先暂存要提交的文件".to_string(), cx);
             return;
         }
-        // Amend 且工作区有未暂存改动时提醒：VSCode amend 只提交暂存区，
-        // 未暂存部分会留在工作区——行内错误不足以表达，弹通知说明。
+        if amend && self.staged_count() == 0 {
+            // 明确拒绝而不是悄悄 stage_all（见上方注释）。
+            self.report_op_error(
+                "修正是提交已暂存的更改：先暂存要并入的改动，或取消勾选「修正」".to_string(),
+                cx,
+            );
+            return;
+        }
         self.committing = true;
         self.op_error = None;
         cx.notify();
@@ -1068,6 +1267,10 @@ impl GitPanel {
                         this.amend_checked = false;
                         cx.emit(GitPanelEvent::CommitDone);
                         this.refresh(cx);
+                        // amend 会改写 HEAD；提交也可能触发 hooks 改分支状态
+                        //（如 pre-push hook、commit --fixup 流程）。分支名、
+                        // ahead/behind 与提交历史一并刷新，避免显示过期。
+                        this.fetch_branch_info(true, cx);
                     }
                     Err(e) => {
                         let verb = if amend { "修正" } else { "提交" };
@@ -1120,6 +1323,29 @@ impl GitPanel {
                             this.close_context_menu(cx);
                             this.amend_checked = true;
                             this.do_commit(CommitScope::Smart, cx);
+                        });
+                    }),
+                );
+            }
+            menu = menu.separator();
+            {
+                let this = this.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("贮藏更改").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| {
+                            this.close_context_menu(cx);
+                            this.stash_push(cx);
+                        });
+                    }),
+                );
+            }
+            {
+                let this = this.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("弹出最近贮藏").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| {
+                            this.close_context_menu(cx);
+                            this.stash_pop(cx);
                         });
                     }),
                 );
@@ -1207,6 +1433,7 @@ impl GitPanel {
         let entry = entry.clone();
         let can_stage = entry.can_stage();
         let can_unstage = entry.can_unstage();
+        let is_conflicted = entry.status.is_conflicted();
         self.open_menu(position, window, cx, move |menu, _window, _cx| {
             let mut menu = menu;
             {
@@ -1234,6 +1461,26 @@ impl GitPanel {
                 );
             }
             menu = menu.separator();
+            // 冲突文件：三选一解决（VSCode 合并更改组的右键菜单同款）。
+            if is_conflicted {
+                for (label, side) in [
+                    ("采用当前更改", ConflictSide::Ours),
+                    ("采用传入更改", ConflictSide::Theirs),
+                    ("保留两侧更改", ConflictSide::Both),
+                ] {
+                    let this = this.clone();
+                    let entry = entry.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.close_context_menu(cx);
+                                this.resolve_conflict(&entry.path, side, window, cx);
+                            });
+                        }),
+                    );
+                }
+                menu = menu.separator();
+            }
             if can_stage {
                 let this = this.clone();
                 let path = entry.path.clone();
@@ -1460,6 +1707,13 @@ impl GitPanel {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     this.amend_checked = !this.amend_checked;
+                                    // 勾选且提交框为空 → 预填上次提交信息
+                                    //（后台取，回来时再校验一次勾选状态）。
+                                    if this.amend_checked
+                                        && this.commit_message(cx).trim().is_empty()
+                                    {
+                                        this.prefill_amend_message(cx);
+                                    }
                                     cx.notify();
                                 }),
                             )
@@ -1489,6 +1743,32 @@ impl GitPanel {
                                     .text_color(theme.text_muted)
                                     .child("修正"),
                             ),
+                    )
+                    // ahead/behind 徽标（仅任一非零时显示；上游名在 tooltip）。
+                    .when_some(
+                        self.branch_status.clone().and_then(|(a, b, up)| {
+                            (a > 0 || b > 0).then_some((a, b, up))
+                        }),
+                        |this, (ahead, behind, upstream)| {
+                            let label = match (ahead > 0, behind > 0) {
+                                (true, true) => format!("↑{ahead} ↓{behind}"),
+                                (true, false) => format!("↑{ahead}"),
+                                _ => format!("↓{behind}"),
+                            };
+                            let tooltip = match upstream {
+                                Some(up) => format!("领先上游 {ahead} 个提交，落后 {behind} 个（{up}）"),
+                                None => format!("领先上游 {ahead} 个提交，落后 {behind} 个"),
+                            };
+                            this.child(
+                                div()
+                                    .id("git-ahead-behind")
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .tooltip(Tooltip::text(tooltip))
+                                    .child(label),
+                            )
+                        },
                     )
                     .child(div().flex_1())
                     .when(!message_empty, |this| {
@@ -1524,7 +1804,7 @@ impl GitPanel {
                                 cx.listener(|this, _, _, cx| {
                                     this.op_error = None;
                                     this.refresh(cx);
-                                    this.fetch_branch(cx);
+                                    this.fetch_branch_info(true, cx);
                                 }),
                             )
                     }),
@@ -1559,9 +1839,9 @@ impl GitPanel {
 
         // VSCode 组头操作：更改 → 暂存全部(+) + 放弃全部(垃圾桶)；
         // 已暂存的更改 → 全部取消暂存(−)；合并更改 → 无。
-        let show_stage_all = matches!(section, Section::Changes | Section::New)
+        let show_stage_all = section == Section::Changes
             && self.file_entries.iter().any(|e| e.section == section && e.can_stage());
-        let show_discard_all = matches!(section, Section::Changes | Section::New)
+        let show_discard_all = section == Section::Changes
             && self.file_entries.iter().any(|e| {
                 e.section == section
                     && !e.status.is_conflicted()
