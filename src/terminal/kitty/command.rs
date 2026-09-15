@@ -453,6 +453,39 @@ fn parse_value(buf: &[u8], key: u8) -> u32 {
     }
 }
 
+/// base64 编码（标准字母表，带 `=` 填充）。
+///
+/// 是 [`decode_base64`] 的逆运算：协议要求负载与路径都以 base64 承载，测试与
+/// 需要回写负载的调用方都得用它。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+
+    out
+}
+
 /// base64 解码。kitty 使用标准字母表，允许 `=` 填充。
 ///
 /// 非法字符直接跳过而非报错——与 kitty 的宽容行为一致（部分客户端会插入换行）。

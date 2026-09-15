@@ -208,6 +208,15 @@ impl KittyGraphicsScanner {
     /// 尺寸变化都要主动告知客户端，否则它只能靠 `CSI 14 t` 轮询。
     pub fn set_geometry(&mut self, geometry: escape_scan::TermGeometry) {
         self.geometry = Some(geometry);
+        // 同步给存储：删除类命令要把放置的像素尺寸换算成网格矩形，需要单元格
+        // 尺寸与终端列数（ghostty 同样现取 `t.width_px / t.cols`）。
+        self.store.set_geometry(
+            super::storage::CellGeometry {
+                cell_width: geometry.cell_width as u32,
+                cell_height: geometry.cell_height as u32,
+            },
+            geometry.cols as u32,
+        );
         if self.mode_2048 {
             let report =
                 escape_scan::encode_size_report(escape_scan::SizeReport::Mode2048, geometry);

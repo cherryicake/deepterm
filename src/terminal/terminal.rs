@@ -3152,10 +3152,25 @@ impl Terminal {
         if let Some(ref callback) = self.remote_resize_callback {
             callback(cols as u16, rows as u16, self.display_scale);
         }
+        // 远程终端的字节在 UI 线程解析，没有读线程替扫描器维护几何，只能在这里
+        // 推给它（本地路径由 LocalReader 负责）。
+        self.sync_remote_scanner_geometry();
         // 对应 ghostty `renderer_mailbox.push(.resize)` + `renderer_wakeup`。
         if wake {
             cx.emit(Event::Wakeup);
         }
+    }
+
+    /// 把当前几何告知远程扫描器。
+    ///
+    /// 尺寸上报（`CSI 16 t`/2048）由扫描器直接应答，删除类命令（`d=c` 等）
+    /// 还要拿单元格尺寸把放置的像素尺寸换算成网格矩形——两者都需要几何。
+    /// 本地路径在读线程里自己维护，远程路径没有读线程，只能在这里推。
+    fn sync_remote_scanner_geometry(&mut self) {
+        let Some(scanner) = self.kitty_scanner.as_mut() else {
+            return;
+        };
+        scanner.set_geometry(self.terminal_bounds.term_geometry(self.display_scale));
     }
 
     /// Enable or disable lazy link-range maintenance (URL regex + OSC8).
@@ -4860,6 +4875,87 @@ mod tests {
             b"\x1b[6;32;18t".to_vec(),
             "Retina 上应报物理像素 32x18，实际 {:?}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// 远程终端在 resize 后必须把几何推给扫描器。
+    ///
+    /// 本地路径由读线程维护扫描器几何，远程路径没有读线程——只有在
+    /// `apply_pending_resize` 里补上，否则删除类命令（`d=c`）拿不到单元格
+    /// 尺寸，未显式给出 `c=`/`r=` 的放置会被当成 1×1 格，跨格的图像删不掉。
+    ///
+    /// 观察点是共享存储里的放置数量：先用 `a=T` 把 30x60 像素的图放在光标处
+    /// （`bounds_for` 的格子在 1x 下是 9x16 像素 → 占 4 列 4 行），再用 `d=c`
+    /// 打它内部的**非锚点**格。几何若没送达，矩形退化成 1x1，这次删除就匹配
+    /// 不到任何东西。
+    ///
+    /// 不用尺寸上报做观察点：远程路径的 `CSI 16 t` 与 `?2048` 都由
+    /// `handle_size_sequences` 在 `terminal.rs` 里直接应答，且序列在进扫描器前
+    /// 就被摘除，看不到扫描器自己的状态。
+    #[gpui::test]
+    fn remote_resize_pushes_geometry_to_scanner(cx: &mut TestAppContext) {
+        use crate::terminal::kitty::scanner::KittyGraphicsScanner;
+
+        let terminal = cx.new(|_| {
+            let mut t = Terminal::create_error_terminal();
+            // 初始尺寸必须与下面 resize 的目标**不同**：行列与缩放都没变时
+            // `resize` 会早退（对应 ghostty 的同名早退），几何就不会被推送，
+            // 测的就不是本用例要覆盖的那条路径了。
+            t.terminal_bounds = bounds_for(80, 24);
+            t.remote_input_callback = Some(Box::new(|_bytes| {}));
+            t.kitty_scanner = Some(KittyGraphicsScanner::with_storage(
+                t.images.storage(),
+                true,
+                Box::new(crate::terminal::kitty::scanner::CollectingSink::default()),
+            ));
+            // 跳过首帧校正分支，让下面的 resize 直接走应用路径。
+            t.resize_primed = true;
+            t
+        });
+
+        // resize 走 apply_pending_resize，应把几何（1x，cell 9x16）同步给扫描器。
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(60, 20), 1.0, cx);
+        });
+
+        let storage = terminal.read_with(cx, |t, _| t.images_handle());
+        type Store = std::sync::Arc<std::sync::Mutex<crate::terminal::kitty::storage::Storage>>;
+        // 观测共享存储里 id=1 的放置数：几何送达与否直接决定这次删除命不命中。
+        fn placements(store: &Store) -> usize {
+            store
+                .lock()
+                .unwrap()
+                .get(1)
+                .map_or(0, |s| s.placements.len())
+        }
+
+        // 30x60 像素 → 除以 9x16 向上取整 = 4 列 4 行。
+        let mut raw = Vec::with_capacity(30 * 60 * 4);
+        for _ in 0..30 * 60 {
+            raw.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        let b64 = crate::terminal::kitty::command::encode_base64(&raw);
+
+        // `a=T` 才是"传输并显示"；`a=t` 只存不显示，不会有放置。
+        let seq = format!("\x1b[3;3H\x1b_Ga=T,i=1,f=32,s=30,v=60;{b64}\x1b\\");
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(seq.as_bytes(), false, cx);
+        });
+
+        assert_eq!(placements(&storage), 1, "a=T 应在光标 (2, 2) 处建立放置");
+
+        // 锚点在 (2, 2)，矩形覆盖 2..=5 行 x 2..=5 列；打内部的 (4, 4)。
+        // CUP 与 APC 分两次投递：APC 的锚点取自 vte 当前光标，同一批字节里
+        // 光标尚未推进，会把删除算到旧位置上。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[5;5H", false, cx);
+            t.process_pty_data(b"\x1b_Ga=d,d=c\x1b\\", false, cx);
+        });
+
+        assert_eq!(
+            placements(&storage),
+            0,
+            "d=c 打在矩形内部格应删除放置；未删说明几何没送达、矩形退化成 1x1"
         );
     }
 

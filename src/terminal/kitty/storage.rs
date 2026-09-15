@@ -30,6 +30,50 @@ pub enum PlacementLocation {
     Virtual,
 }
 
+/// 一个放置占据的网格矩形（闭区间，两端都含）。
+///
+/// 对应 ghostty `graphics_image.zig:862` 的 `Rect`：图像无法只占半个单元格，
+/// 所以边界向上取整到整格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRect {
+    pub top: i32,
+    pub bottom: i32,
+    pub left: u32,
+    pub right: u32,
+}
+
+impl GridRect {
+    /// 指定单元格是否落在这个矩形内。
+    ///
+    /// 对齐 ghostty `graphics_image.zig:869` 的 `Rect.contains`：列独立比较
+    /// （`top_left.x <= x <= bottom_right.x`），行也独立比较——两者都是闭区间，
+    /// 不是「锚点相等」。这正是 `d=c`/`d=p`/`d=q` 的语义：删除**与目标单元格
+    /// 相交**的放置，而不是恰好在目标格起点的放置。
+    pub fn contains(&self, row: i32, col: u32) -> bool {
+        col >= self.left && col <= self.right && row >= self.top && row <= self.bottom
+    }
+
+    /// 本矩形是否跨越列 `col`（`d=x` 语义）。
+    pub fn spans_column(&self, col: u32) -> bool {
+        col >= self.left && col <= self.right
+    }
+
+    /// 本矩形是否跨越行 `row`（`d=y` 语义）。
+    pub fn spans_row(&self, row: i32) -> bool {
+        row >= self.top && row <= self.bottom
+    }
+}
+
+/// 单元格几何：推导未指定尺寸的放置需要它。
+///
+/// 对应 ghostty 从 `terminal.Terminal` 取的 `t.width_px / t.cols` 与
+/// `t.height_px / t.rows`（`graphics_storage.zig:1970` 的 `gridSize`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellGeometry {
+    pub cell_width: u32,
+    pub cell_height: u32,
+}
+
 /// 一个图像放置：锚定到网格的哪一行/列、占多少行列、层级。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
@@ -74,6 +118,80 @@ impl Placement {
     /// 是否是虚拟放置（由占位符驱动，自身不绘制）。
     pub fn is_virtual(&self) -> bool {
         self.location == PlacementLocation::Virtual
+    }
+
+    /// 本放置占据的网格行列数。
+    ///
+    /// 逐行对齐 ghostty `graphics_storage.zig:1970` 的 `gridSize`：
+    /// - `c=`/`r=` **都**给出时直接用（规范规定此时按给定格数铺满，图像被拉伸）；
+    /// - 否则按 `图像像素 + 单元格内偏移` 除以单元格尺寸、**向上取整**到整格
+    ///   （ghostty 的 `pixelSize +| cellOffset`；注释点明取整方向：图像占不满
+    ///   一格也要占一格）。偏移同样要对齐——一个小图配一个接近整格的 `X=`
+    ///   偏移时会多占一列，漏掉这个加法就会少删一列。
+    ///
+    /// 只给 `c=` 或只给 `r=` 的情况 ghostty 并不单独处理——`gridSize` 只在
+    /// 「两者都 > 0」时走显式分支，否则一律回落到像素推导。deepterm 的渲染层
+    /// （`render.rs:placement_rect`）会按宽高比补出另一边，那是**绘制**的尺寸；
+    /// 删除判定必须与 ghostty 一致，所以这里不引入那个补算。
+    pub fn grid_size(&self, image: &DecodedImage, geometry: CellGeometry) -> (u32, u32) {
+        if let (Some(cols), Some(rows)) = (self.columns, self.rows) {
+            if cols > 0 && rows > 0 {
+                return (cols, rows);
+            }
+        }
+
+        // 单元格尺寸为 0 时无法推导（ghostty 对除零返回 0 并注释为安全）。
+        if geometry.cell_width == 0 || geometry.cell_height == 0 {
+            return (0, 0);
+        }
+
+        // `cellOffset`：偏移被夹在单元格内，先夹再相加。
+        let offset_x = self.x_offset.min(geometry.cell_width - 1);
+        let offset_y = self.y_offset.min(geometry.cell_height - 1);
+
+        let cols = image
+            .width
+            .saturating_add(offset_x)
+            .div_ceil(geometry.cell_width);
+        let rows = image
+            .height
+            .saturating_add(offset_y)
+            .div_ceil(geometry.cell_height);
+        (cols, rows)
+    }
+
+    /// 本放置占据的网格矩形；虚拟放置返回 `None`。
+    ///
+    /// 对齐 ghostty `graphics_storage.zig:2080` 的 `Placement.rect`：
+    /// - 虚拟放置没有自己的屏幕位置，几何查询一律不匹配（它们随父链移除）；
+    /// - 行列数为 0 的放置不占任何矩形；
+    /// - 右边界是 `min(col + cols - 1, 终端列数 - 1)`——减一是因为 `col`
+    ///   本身已经占了一格（ghostty 在该处有同样的注释），并夹到终端宽度内。
+    pub fn grid_rect(
+        &self,
+        image: &DecodedImage,
+        geometry: CellGeometry,
+        terminal_cols: u32,
+    ) -> Option<GridRect> {
+        if self.is_virtual() {
+            return None;
+        }
+
+        let (cols, rows) = self.grid_size(image, geometry);
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+
+        let right = self
+            .col
+            .saturating_add(cols - 1)
+            .min(terminal_cols.saturating_sub(1));
+        Some(GridRect {
+            top: self.row,
+            bottom: self.row.saturating_add_unsigned(rows - 1),
+            left: self.col,
+            right,
+        })
     }
 }
 
@@ -585,6 +703,188 @@ mod tests {
             height,
             rgba: vec![0; (width * height * 4) as usize],
         }
+    }
+
+    fn geom() -> CellGeometry {
+        CellGeometry {
+            cell_width: 10,
+            cell_height: 20,
+        }
+    }
+
+    fn placement(row: i32, col: u32) -> Placement {
+        Placement {
+            row,
+            col,
+            ..Placement::default()
+        }
+    }
+
+    // ===== 网格矩形（ghostty `gridSize` / `rect`）=====
+
+    /// `c=`/`r=` 都给出时直接用（规范：按给定格数铺满，图像被拉伸）。
+    #[test]
+    fn grid_size_prefers_explicit_cols_and_rows() {
+        let p = Placement {
+            columns: Some(5),
+            rows: Some(3),
+            ..placement(2, 2)
+        };
+        assert_eq!(p.grid_size(&img(8, 8), geom()), (5, 3));
+    }
+
+    /// 只给一边时不走显式分支——ghostty 只在「两者都 > 0」时直接用，否则回落到
+    /// 像素推导。这一点容易写错成「补出另一边」，但删除判定必须与 ghostty 一致。
+    #[test]
+    fn grid_size_falls_back_to_pixels_when_only_one_side_given() {
+        // 20x40 像素 / 10x20 格 = 2x2 格；只有 c= 时也只按像素算。
+        let p = Placement {
+            columns: Some(9),
+            rows: None,
+            ..placement(0, 0)
+        };
+        assert_eq!(p.grid_size(&img(20, 40), geom()), (2, 2));
+    }
+
+    /// 像素推导必须**向上取整**：图像占不满一格也要占一格。
+    #[test]
+    fn grid_size_rounds_up_to_whole_cells() {
+        // 25x45 像素 / 10x20 → 2.5 与 2.25，向上取整为 3x3。
+        let p = placement(0, 0);
+        assert_eq!(p.grid_size(&img(25, 45), geom()), (3, 3));
+
+        // 3x5 像素不足一格，仍然占 1x1。
+        assert_eq!(p.grid_size(&img(3, 5), geom()), (1, 1));
+    }
+
+    /// 单元格尺寸为 0 时无法推导（ghostty 对除零返回 0）。
+    #[test]
+    fn grid_size_is_zero_when_cell_size_unavailable() {
+        let zero = CellGeometry {
+            cell_width: 0,
+            cell_height: 0,
+        };
+        assert_eq!(placement(0, 0).grid_size(&img(20, 40), zero), (0, 0));
+    }
+
+    /// `X=`/`Y=` 偏移计入像素尺寸（ghostty `pixelSize +| cellOffset`）。
+    ///
+    /// 10 像素宽的图配 9 像素偏移，合计 19 > 10，必须多占一列；忽略偏移就
+    /// 会把它当成 1 列，删除时漏掉右边那一列。
+    #[test]
+    fn grid_size_includes_cell_offsets() {
+        let p = Placement {
+            x_offset: 9,
+            y_offset: 9,
+            ..placement(0, 0)
+        };
+        assert_eq!(p.grid_size(&img(10, 10), geom()), (2, 1));
+    }
+
+    /// 偏移夹在单元格内（ghostty `cellOffset` 的 `@min(offset, cell_size-1)`）。
+    ///
+    /// 50 像素偏移远超单元格尺寸，x 夹到 9（格宽 10）、y 夹到 19（格高 20），
+    /// 与 10 像素图相加得 19 / 29 → 2 列 2 行。不夹就会算出 6 列 3 行。
+    #[test]
+    fn grid_size_clamps_cell_offsets_to_one_cell() {
+        let p = Placement {
+            x_offset: 50,
+            y_offset: 50,
+            ..placement(0, 0)
+        };
+        assert_eq!(p.grid_size(&img(10, 10), geom()), (2, 2));
+    }
+
+    /// 矩形的右/下边界是 `起点 + 格数 - 1`：起点本身已占一格。
+    #[test]
+    fn grid_rect_uses_inclusive_bounds() {
+        let p = Placement {
+            columns: Some(5),
+            rows: Some(3),
+            ..placement(2, 2)
+        };
+        let rect = p.grid_rect(&img(8, 8), geom(), 80).unwrap();
+        assert_eq!(
+            rect,
+            GridRect {
+                top: 2,
+                bottom: 4,
+                left: 2,
+                right: 6
+            }
+        );
+    }
+
+    /// 右边界夹到终端列数之内（ghostty `rect()` 里的 `@min(.., t.cols - 1)`）。
+    #[test]
+    fn grid_rect_clamps_right_edge_to_terminal_width() {
+        let p = Placement {
+            columns: Some(10),
+            rows: Some(1),
+            ..placement(0, 75)
+        };
+        // 75 + 10 - 1 = 84 超出 80 列，应夹到 79。
+        let rect = p.grid_rect(&img(8, 8), geom(), 80).unwrap();
+        assert_eq!(rect.right, 79);
+        assert!(rect.contains(0, 79));
+        assert!(!rect.contains(0, 74), "左边界仍是 75");
+    }
+
+    /// 虚拟放置没有屏幕位置，几何查询一律不匹配。
+    #[test]
+    fn grid_rect_is_none_for_virtual_placement() {
+        let p = Placement {
+            columns: Some(5),
+            rows: Some(3),
+            location: PlacementLocation::Virtual,
+            ..placement(2, 2)
+        };
+        assert!(p.grid_rect(&img(8, 8), geom(), 80).is_none());
+    }
+
+    /// 行列数为 0 的放置不占矩形。
+    #[test]
+    fn grid_rect_is_none_when_grid_size_is_zero() {
+        let zero = CellGeometry {
+            cell_width: 0,
+            cell_height: 0,
+        };
+        assert!(placement(0, 0).grid_rect(&img(20, 40), zero, 80).is_none());
+    }
+
+    /// `contains` 是闭区间：四个角与内部都算“包含”。
+    #[test]
+    fn grid_rect_contains_is_inclusive_on_all_edges() {
+        let rect = GridRect {
+            top: 2,
+            bottom: 4,
+            left: 2,
+            right: 6,
+        };
+        assert!(rect.contains(2, 2), "左上角");
+        assert!(rect.contains(4, 6), "右下角");
+        assert!(rect.contains(3, 4), "内部");
+        assert!(rect.contains(2, 6), "右上角");
+        assert!(rect.contains(4, 2), "左下角");
+
+        assert!(!rect.contains(1, 4), "上方一行之外");
+        assert!(!rect.contains(5, 4), "下方一行之外");
+        assert!(!rect.contains(3, 1), "左侧一列之外");
+        assert!(!rect.contains(3, 7), "右侧一列之外");
+    }
+
+    #[test]
+    fn grid_rect_span_predicates_match_the_interval() {
+        let rect = GridRect {
+            top: 2,
+            bottom: 4,
+            left: 2,
+            right: 6,
+        };
+        assert!(rect.spans_column(2) && rect.spans_column(6));
+        assert!(!rect.spans_column(1) && !rect.spans_column(7));
+        assert!(rect.spans_row(2) && rect.spans_row(4));
+        assert!(!rect.spans_row(1) && !rect.spans_row(5));
     }
 
     #[test]

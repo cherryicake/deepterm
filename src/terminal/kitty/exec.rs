@@ -7,7 +7,7 @@ use super::command::{
     Action, Command, Compression, DeleteTarget, Format, Medium, ParseError, Quiet, decode_base64,
 };
 use super::image::{self, DecodeError, ImageId};
-use super::storage::{Placement, PlacementLocation, Storage};
+use super::storage::{CellGeometry, GridRect, Placement, PlacementLocation, Storage};
 
 /// 一次执行的产出。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -177,6 +177,16 @@ pub struct ImageStore {
     policy: MediumPolicy,
     /// 用隐式 id 时是否需要在响应里回报 id。
     enabled: bool,
+    /// 单元格几何，用于把放置的像素尺寸换算成网格矩形。
+    ///
+    /// 删除类命令（`d=c`/`d=p`/`d=q`/`d=x`/`d=y`）判定的是「放置占的网格矩形
+    /// 是否与目标相交」，而未显式给出 `c=`/`r=` 的放置只能由图像像素除以单元格
+    /// 尺寸推导行列数——ghostty 同样是从 `terminal.Terminal` 现取
+    /// `t.width_px / t.cols`（`graphics_storage.zig:1970`）。几何未知时退回
+    /// 「1 格」，与显式 `c=1,r=1` 等价。
+    geometry: Option<CellGeometry>,
+    /// 终端列数，用于把矩形右边界夹到屏幕内（ghostty `rect()` 同款）。
+    terminal_cols: u32,
 }
 
 /// 共享的图像存储句柄。
@@ -198,7 +208,25 @@ impl ImageStore {
             loading: None,
             policy: MediumPolicy::default(),
             enabled,
+            geometry: None,
+            terminal_cols: 0,
         }
+    }
+
+    /// 更新单元格几何与终端列数（尺寸变化时由扫描器调用）。
+    ///
+    /// 只影响删除命令的矩形换算，不影响已存入的图像数据。
+    pub fn set_geometry(&mut self, geometry: CellGeometry, terminal_cols: u32) {
+        self.geometry = Some(geometry);
+        self.terminal_cols = terminal_cols;
+    }
+
+    /// 当前几何；未设置时返回 1×1 像素格（使未指定尺寸的放置退化为 1 格）。
+    fn cell_geometry(&self) -> CellGeometry {
+        self.geometry.unwrap_or(CellGeometry {
+            cell_width: 1,
+            cell_height: 1,
+        })
     }
 
     /// 协议是否启用。
@@ -1179,20 +1207,23 @@ impl ImageStore {
                     }
                 })
             }
-            DeleteTarget::AtCursor => self.delete_intersecting(cursor.0, cursor.1, free_data),
+            DeleteTarget::AtCursor => self.delete_intersecting(cursor.0, cursor.1, free_data, None),
             DeleteTarget::AtCell | DeleteTarget::AtCellWithZ => {
                 // `x=`/`y=` 为 1-based 单元格坐标。
                 let x = cmd.control.u32(b'x').unwrap_or(1).saturating_sub(1);
                 let y = cmd.control.u32(b'y').unwrap_or(1).saturating_sub(1);
-                self.delete_intersecting(y as i32, x, free_data)
+                // `d=q`/`d=Q` 额外按 z 层过滤（ghostty `intersect_cell_z`）。
+                let z = matches!(target, DeleteTarget::AtCellWithZ)
+                    .then(|| cmd.control.i32(b'z').unwrap_or(0));
+                self.delete_intersecting(y as i32, x, free_data, z)
             }
             DeleteTarget::ByColumn => {
                 let x = cmd.control.u32(b'x').unwrap_or(1).saturating_sub(1);
-                self.delete_matching(|p| p.col == x, free_data)
+                self.delete_rect_matching(|_, rect| rect.spans_column(x), free_data)
             }
             DeleteTarget::ByRow => {
                 let y = cmd.control.u32(b'y').unwrap_or(1).saturating_sub(1);
-                self.delete_matching(|p| p.row == y as i32, free_data)
+                self.delete_rect_matching(|_, rect| rect.spans_row(y as i32), free_data)
             }
             DeleteTarget::ByImageIdRange => {
                 let lo = cmd.control.u32(b'x').unwrap_or(0);
@@ -1223,9 +1254,75 @@ impl ImageStore {
         })
     }
 
-    /// 删除与指定单元格相交的放置。
-    fn delete_intersecting(&mut self, row: i32, col: u32, free_data: bool) -> bool {
-        self.delete_matching(|p| p.row == row && p.col == col, free_data)
+    /// 删除**占用的网格矩形包含**指定单元格的放置（`d=c`/`d=p`/`d=q`）。
+    ///
+    /// 对齐 ghostty `graphics_storage.zig:1576` 的 `deleteIntersecting`：判定的是
+    /// `rect.contains(target)`，**不是**「锚点恰好等于目标格」。差别很实际——一张
+    /// 横跨 10 列 5 行的图像，光标落在它中间的任意一格都应当命中；用锚点相等则只
+    /// 有落在它左上角那一格才删得掉，客户端清理图像时会大量漏删。
+    ///
+    /// `z_filter` 为 `Some` 时只删除该 z 层的放置（`d=q`/`d=Q`，ghostty 的
+    /// `intersect_cell_z` 分支）。
+    fn delete_intersecting(
+        &mut self,
+        row: i32,
+        col: u32,
+        free_data: bool,
+        z_filter: Option<i32>,
+    ) -> bool {
+        self.delete_rect_matching(
+            |p, rect| rect.contains(row, col) && z_filter.is_none_or(|z| p.z == z),
+            free_data,
+        )
+    }
+
+    /// 按「放置 + 其网格矩形」谓词删除放置。
+    ///
+    /// 谓词同时拿到 `Placement`（取 `z` 等属性）与 `GridRect`（几何），因为
+    /// ghostty 的各删除分支都是先算矩形再叠加属性过滤。
+    fn delete_rect_matching(
+        &mut self,
+        mut pred: impl FnMut(&Placement, &GridRect) -> bool,
+        free_data: bool,
+    ) -> bool {
+        let geometry = self.cell_geometry();
+        let terminal_cols = self.terminal_cols;
+
+        // 先收集待删项，避免在持有存储不可变借用时又要可变借用。
+        let mut to_remove: Vec<(ImageId, u32)> = Vec::new();
+        self.with_storage(|s| {
+            for (id, stored) in s.iter() {
+                for (pid, p) in stored.placements.iter() {
+                    if let Some(rect) = p.grid_rect(&stored.image, geometry, terminal_cols)
+                        && pred(p, &rect)
+                    {
+                        to_remove.push((*id, *pid));
+                    }
+                }
+            }
+        });
+
+        if to_remove.is_empty() {
+            return false;
+        }
+
+        self.with_storage_mut(|s| {
+            let mut emptied: Vec<ImageId> = Vec::new();
+            for (id, pid) in to_remove {
+                s.remove_placement(id, pid);
+                if free_data
+                    && s.get(id).is_some_and(|stored| stored.placements.is_empty())
+                    && !emptied.contains(&id)
+                {
+                    emptied.push(id);
+                }
+            }
+
+            for id in emptied {
+                s.remove(id);
+            }
+            true
+        })
     }
 
     /// 按谓词删除放置；`free_data` 为真时释放不再被引用的图像。
@@ -1342,35 +1439,7 @@ mod tests {
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(raw).expect("压缩失败");
         let compressed = enc.finish().expect("压缩收尾失败");
-        base64_encode(&compressed)
-    }
-
-    /// 标准字母表 base64 编码（kitty 用它承载负载与路径）。
-    fn base64_encode(data: &[u8]) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut b64 = String::new();
-        for chunk in data.chunks(3) {
-            let b = [
-                chunk[0],
-                chunk.get(1).copied().unwrap_or(0),
-                chunk.get(2).copied().unwrap_or(0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            b64.push(TABLE[(n >> 18) as usize & 63] as char);
-            b64.push(TABLE[(n >> 12) as usize & 63] as char);
-            b64.push(if chunk.len() > 1 {
-                TABLE[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            b64.push(if chunk.len() > 2 {
-                TABLE[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        b64
+        crate::terminal::kitty::command::encode_base64(&compressed)
     }
 
     /// 在临时目录里写一个 `t=t`/`t=f` 用的载荷文件。
@@ -1490,6 +1559,214 @@ mod tests {
         let stored = guard.get(2).unwrap();
         assert_eq!(stored.placements.len(), 1, "a=T 应同时建立放置");
         assert!(!stored.transient, "a=T 不是临时图像");
+    }
+
+    // ===== 删除的矩形语义（ghostty `deleteIntersecting`）=====
+
+    /// 建一张 `w×h` 像素的图，并在 `(row, col)` 处放一个 `cols×rows` 格的放置。
+    ///
+    /// 测试用的单元格固定 10×20 像素（见 `test_geometry`）。
+    fn store_with_placement(
+        width: u32,
+        height: u32,
+        row: i32,
+        col: u32,
+        cols: Option<u32>,
+        rows: Option<u32>,
+    ) -> (ImageStore, u32) {
+        let mut store = ImageStore::new(64 * 1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+
+        // w*h 个不透明红像素，base64 编码。
+        let mut raw = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            raw.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        let b64 = crate::terminal::kitty::command::encode_base64(&raw);
+
+        let mut cmd = format!("a=t,i=1,f=32,s={width},v={height},m=0;{b64}");
+        // 传输后再显式放置，方便带上 c=/r=。
+        run(&mut store, &cmd, (0, 0)).unwrap();
+
+        cmd = format!("a=p,i=1");
+        if let Some(c) = cols {
+            cmd.push_str(&format!(",c={c}"));
+        }
+        if let Some(r) = rows {
+            cmd.push_str(&format!(",r={r}"));
+        }
+        run(&mut store, &cmd, (row, col)).unwrap();
+        (store, 1)
+    }
+
+    fn placement_count(store: &ImageStore) -> usize {
+        store
+            .lock_storage()
+            .get(1)
+            .map_or(0, |s| s.placements.len())
+    }
+
+    /// 核心回归：`d=c` 删除的是**占用的矩形包含光标格**的放置，不是「锚点等于
+    /// 光标格」的放置。修复前此处会漏删——一张 5×3 格的图，光标落在它中间时
+    /// 匹配不到任何东西。
+    #[test]
+    fn delete_at_cursor_matches_any_cell_inside_the_rect() {
+        // 8x8 像素的图，显式指定占 5 列 3 行，锚点在 (2, 2)。
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+        assert_eq!(placement_count(&store), 1);
+
+        // 光标落在矩形内部的右下角格 (2+3-1, 2+5-1) = (4, 6)——不是锚点。
+        let r = run(&mut store, "a=d,d=c", (4, 6)).unwrap();
+        assert!(r.images_changed, "光标在矩形内应命中并删除");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    #[test]
+    fn delete_at_cursor_still_matches_the_anchor_cell() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+        let r = run(&mut store, "a=d,d=c", (2, 2)).unwrap();
+        assert!(r.images_changed);
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    #[test]
+    fn delete_at_cursor_ignores_cells_outside_the_rect() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // 右边一列之外。
+        let r = run(&mut store, "a=d,d=c", (2, 7)).unwrap();
+        assert!(!r.images_changed, "矩形右边界是 6，列 7 不该命中");
+        assert_eq!(placement_count(&store), 1);
+
+        // 下面一行之外。
+        let r = run(&mut store, "a=d,d=c", (5, 2)).unwrap();
+        assert!(!r.images_changed, "矩形下边界是 4，行 5 不该命中");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// 未显式给出 `c=`/`r=` 时，行列数由图像像素除以单元格尺寸**向上取整**得
+    /// 到（ghostty `gridSize`）。25×45 像素在 10×20 的格子里 → 3 列 3 行。
+    #[test]
+    fn delete_at_cursor_derives_grid_size_from_pixels() {
+        let (mut store, _) = store_with_placement(25, 45, 0, 0, None, None);
+
+        // 推导出的矩形是 0..=2 行 × 0..=2 列，所以 (2, 2) 应命中。
+        let r = run(&mut store, "a=d,d=c", (2, 2)).unwrap();
+        assert!(r.images_changed, "25x45px 在 10x20 格内应占 3x3 格");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// 图像像素不足一格时也要占满一格——`divCeil` 而非截断。
+    #[test]
+    fn sub_cell_image_still_occupies_one_cell() {
+        let (mut store, _) = store_with_placement(3, 5, 1, 1, None, None);
+
+        let r = run(&mut store, "a=d,d=c", (1, 1)).unwrap();
+        assert!(r.images_changed, "3x5px 不足一格仍应占 1 格");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// `d=p` 用显式 `x=`/`y=`（1-based），语义与 `d=c` 相同。
+    #[test]
+    fn delete_at_cell_uses_explicit_coords_and_rect_semantics() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // x=5,y=3 → 0-based 列 4、行 2，落在矩形内。
+        let r = run(&mut store, "a=d,d=p,x=5,y=3", (0, 0)).unwrap();
+        assert!(r.images_changed, "显式坐标应走同一套矩形判定");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// `d=q` 在矩形判定之上再按 z 过滤：z 不匹配时保留。
+    #[test]
+    fn delete_at_cell_with_z_filters_by_z_index() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        let r = run(&mut store, "a=d,d=q,x=3,y=3,z=7", (0, 0)).unwrap();
+        assert!(!r.images_changed, "放置的 z 是 0，z=7 不该命中");
+        assert_eq!(placement_count(&store), 1);
+
+        let r = run(&mut store, "a=d,d=q,x=3,y=3,z=0", (0, 0)).unwrap();
+        assert!(r.images_changed, "z 匹配时应删除");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// `d=x` 删除**跨越该列**的放置（矩形区间），不是「锚点列等于 x」的放置。
+    #[test]
+    fn delete_by_column_matches_any_column_the_rect_spans() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // 覆盖列 2..=6；x=5 → 0-based 列 4 在区间内。
+        let r = run(&mut store, "a=d,d=x,x=5", (0, 0)).unwrap();
+        assert!(r.images_changed, "列 4 在矩形跨越范围内，应命中");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    #[test]
+    fn delete_by_column_ignores_columns_outside_the_rect() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // x=9 → 0-based 列 8，超出右边界 6。
+        let r = run(&mut store, "a=d,d=x,x=9", (0, 0)).unwrap();
+        assert!(!r.images_changed, "列 8 不在 2..=6 内，不该命中");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// `d=y` 同理：删除跨越该行的放置。
+    #[test]
+    fn delete_by_row_matches_any_row_the_rect_spans() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // 覆盖行 2..=4；y=4 → 0-based 行 3。
+        let r = run(&mut store, "a=d,d=y,y=4", (0, 0)).unwrap();
+        assert!(r.images_changed, "行 3 在矩形跨越范围内，应命中");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    #[test]
+    fn delete_by_row_ignores_rows_outside_the_rect() {
+        let (mut store, _) = store_with_placement(8, 8, 2, 2, Some(5), Some(3));
+
+        // y=9 → 0-based 行 8，超出下边界 4。
+        let r = run(&mut store, "a=d,d=y,y=9", (0, 0)).unwrap();
+        assert!(!r.images_changed, "行 8 不在 2..=4 内，不该命中");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// 虚拟放置没有屏幕矩形，几何类删除一律不匹配（ghostty `rect()` 对
+    /// `.virtual` 返回 null）。
+    #[test]
+    fn virtual_placement_is_never_matched_by_geometry_deletes() {
+        let mut store = ImageStore::new(64 * 1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+        run(
+            &mut store,
+            &format!(
+                "a=t,i=1,f=32,s=8,v=8,m=0;{}",
+                crate::terminal::kitty::command::encode_base64(&[255; 8 * 8 * 4])
+            ),
+            (0, 0),
+        )
+        .unwrap();
+        // U=1 → 虚拟放置，锚点在 (2,2) 也不参与几何判定。
+        run(&mut store, "a=p,i=1,U=1,c=5,r=3", (2, 2)).unwrap();
+        assert_eq!(placement_count(&store), 1, "虚拟放置应已建立");
+
+        let r = run(&mut store, "a=d,d=c", (2, 2)).unwrap();
+        assert!(!r.images_changed, "虚拟放置不该被 d=c 命中");
+        assert_eq!(placement_count(&store), 1);
     }
 
     #[test]
@@ -1632,7 +1909,7 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=T,f=32,s=4,v=4,t=f,i=1,q=2;{b64}",
-            b64 = base64_encode(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
 
@@ -1660,7 +1937,9 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=t,f=100,i=1,t=f;{b64}",
-            b64 = base64_encode(b"/nonexistent/definitely/not/here.png")
+            b64 = crate::terminal::kitty::command::encode_base64(
+                b"/nonexistent/definitely/not/here.png"
+            )
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
         let reply = String::from_utf8_lossy(&r.reply);
@@ -1680,7 +1959,7 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=t,f=32,s=1,v=1,t=t,i=9;{b64}",
-            b64 = base64_encode(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
         assert!(r.images_changed, "t=t 应读出数据");
@@ -1701,7 +1980,7 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=t,f=32,s=1,v=1,t=t,i=9;{b64}",
-            b64 = base64_encode(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
         let reply = String::from_utf8_lossy(&r.reply);
