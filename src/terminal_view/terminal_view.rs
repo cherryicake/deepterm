@@ -389,6 +389,11 @@ pub struct TerminalView {
     scrollbar_hide_task: Option<Task<()>>,
     /// Scroll timestamp used for the currently scheduled hide task.
     scrollbar_hide_scheduled_at: Option<Instant>,
+    /// 等待"该换动画帧了"的定时任务；到点唤醒一次重绘。
+    ///
+    /// 复用任务而不是每帧 spawn：动画活跃期间每帧都会走到调度点，不缓存任务
+    /// 会以帧率泄漏定时任务。
+    kitty_animation_task: Option<Task<()>>,
     /// SSH 连接进度视图 - 在连接建立期间覆盖终端内容
     ssh_connect_view: Option<Entity<SshConnectView>>,
     /// SSH 连接视图订阅 - 用于取消订阅重新连接事件
@@ -453,6 +458,18 @@ pub struct TerminalView {
     // are only read (never mutated) after being filled each frame.
     pub scratch_dirty_rows: Vec<bool>,
     pub scratch_dirty_row_bounds: Vec<Option<(usize, usize)>>,
+    /// Kitty 图像纹理缓存（跨帧复用）。
+    ///
+    /// 放在视图而非元素上：元素是每次 `render` 新建的临时对象，缓存必须
+    /// 跨帧存活才有意义。内容代际不变时复用同一张 `RenderImage`，避免每帧
+    /// 对大图做 RGBA→BGRA 的全量重写。见 [`crate::terminal::kitty::render`]。
+    pub kitty_image_cache: crate::terminal::kitty::render::ImageCache,
+    /// Kitty 动画帧的时钟与唤醒调度。
+    ///
+    /// GPUI 只在有变化时重绘，不像专用终端渲染器那样每 vsync 都驱动一遍
+    /// 动画，所以这里记住"下次该换帧的时刻"，只有到点才请求重绘——否则
+    /// 只要有动画在跑，`render` 就会自己把自己无限地重新调度下去。
+    pub kitty_animation_clock: crate::terminal::kitty::AnimationClock,
     // ── Scrollbar thumb animation ───────────────────────────────────────────
     /// Current animated thumb Y offset (relative to track top).
     pub scrollbar_thumb_y: Pixels,
@@ -762,6 +779,7 @@ impl TerminalView {
             broadcast_suppressed: Rc::new(Cell::new(false)),
             scrollbar_hide_task: None,
             scrollbar_hide_scheduled_at: None,
+            kitty_animation_task: None,
             ssh_connect_view: None,
             ssh_connect_subscription: None,
             ssh_connect_hide_task: None,
@@ -787,6 +805,8 @@ impl TerminalView {
             cached_selection_mouse_mode: false,
             scratch_dirty_rows: Vec::new(),
             scratch_dirty_row_bounds: Vec::new(),
+            kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
+            kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
             scrollbar_thumb_y: px(0.0),
             scrollbar_target_y: px(0.0),
             scrollbar_anim_from_y: px(0.0),
@@ -994,6 +1014,7 @@ impl TerminalView {
                 broadcast_suppressed: Rc::new(Cell::new(false)),
                 scrollbar_hide_task: None,
                 scrollbar_hide_scheduled_at: None,
+                kitty_animation_task: None,
                 ssh_connect_view: Some(connect_view.clone()),
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
@@ -1019,6 +1040,8 @@ impl TerminalView {
                 cached_selection_mouse_mode: false,
                 scratch_dirty_rows: Vec::new(),
                 scratch_dirty_row_bounds: Vec::new(),
+                kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
+                kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
                 scrollbar_thumb_y: px(0.0),
                 scrollbar_target_y: px(0.0),
                 scrollbar_anim_from_y: px(0.0),
@@ -1280,7 +1303,7 @@ impl TerminalView {
             .or_else(|| self.pending_remote_cwd_restore.clone())
     }
 
-        /// Hover at a view position: ensure link ranges are maintained, map the
+    /// Hover at a view position: ensure link ranges are maintained, map the
     /// pixels to a grid cell, hit-test, and refresh `hovered_link`.
     /// Shared by mouse-move hover and mouse-down click (click must not rely
     /// on a possibly stale/missing hover cache).
@@ -1771,6 +1794,49 @@ impl TerminalView {
         let last_scroll = term.last_scroll_time.get();
         let elapsed = last_scroll.elapsed();
         elapsed < SCROLLBAR_VISIBLE_AFTER_SCROLL
+    }
+
+    /// 推进 Kitty 动画帧，并在下一次该换帧时安排一次重绘。
+    ///
+    /// 每帧 `render` 调一次。约定：
+    /// - 到点了（或还没有在途计划）才推进时钟；否则只等定时任务唤醒，
+    ///   避免同一帧内对同一批动画反复 tick；
+    /// - tick 后如果仍有动画在跑，用一次 `cx.spawn` 定时到调度器给的延迟上，
+    ///   到点 `cx.notify()` 触发下一帧——这就是动画唯一的驱动力；
+    /// - 没有动画在跑就什么都不做，渲染循环保持静止（不会空转）。
+    fn tick_kitty_animations(&mut self, cx: &mut Context<Self>) {
+        if self.kitty_animation_clock.is_pending() && !self.kitty_animation_clock.due() {
+            return;
+        }
+
+        // 推进必须在终端实体上做：存储在里面，且 tick 会 bump 代际。
+        let now_ms = self.kitty_animation_clock.now_ms();
+        let delay = {
+            let terminal = self.terminal.clone();
+            terminal.update(cx, |terminal, _cx| terminal.animation_tick(now_ms))
+        };
+        self.kitty_animation_clock.schedule(delay);
+
+        // 没有动画在跑就彻底停下：否则每帧都会重新调度一次空转。
+        if delay.is_none() {
+            self.kitty_animation_task = None;
+            return;
+        }
+
+        // 已有一个在途任务就不重复 spawn（动画活跃时每帧都会走到这里）。
+        if self.kitty_animation_task.is_some() {
+            return;
+        }
+
+        let delay = self.kitty_animation_clock.time_until_due();
+        self.kitty_animation_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                this.kitty_animation_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Calculate the scrollbar thumb Y offset (relative to track top) from
@@ -3869,6 +3935,13 @@ impl Render for TerminalView {
         let cursor_visible = self.should_show_cursor(is_focused, cx);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
+        // ── Kitty 动画帧推进 ──────────────────────────────────────────────────
+        // 唯一驱动源：GPUI 不每 vsync 重绘，所以这里既推进动画、也安排下一次
+        // 唤醒。只有"确实到换帧点"才重新调度 `cx.notify()`，静止的动画不会
+        // 让渲染循环空转。换帧会 bump 图像代际，元素 prepaint 的
+        // `take_kitty_damage()` 随后认出来并全量重绘。
+        self.tick_kitty_animations(cx);
+
         // Pre-read terminal state needed below to avoid redundant entity locks.
         let (scrollbar_drag_offset, last_scroll_time) = {
             let term = self.terminal.read(cx);
@@ -4300,7 +4373,7 @@ mod tests {
         view.downgrade()
             .update_in(cx, |view, window, cx| {
                 view.terminal.update(cx, |terminal, cx| {
-                    terminal.resize(bounds, cx);
+                    terminal.resize(bounds, 1.0, cx);
                     terminal.handle_remote_data(&boot, cx);
                 });
                 view.open_search(window, cx);

@@ -9,12 +9,21 @@ use crate::terminal::terminal::TerminalBounds;
 #[derive(Clone, Copy, Debug)]
 enum MouseFormat {
     Sgr,
+    /// SGR-Pixels（模式 1016）：坐标是**终端空间像素**而非单元格。
+    SgrPixels,
     Normal(bool),
 }
 
 impl MouseFormat {
-    fn from_mode(mode: TermMode) -> Self {
-        if mode.contains(TermMode::SGR_MOUSE) {
+    /// 由终端模式推导编码格式。
+    ///
+    /// `sgr_pixels` 无法从 `TermMode` 得到——模式 1016 在 vte/alacritty 的
+    /// 枚举里不存在，由 deepterm 自己跟踪后显式传入（见调用方的
+    /// `sgr_pixels` 参数）。
+    fn from_mode(mode: TermMode, sgr_pixels: bool) -> Self {
+        if sgr_pixels {
+            MouseFormat::SgrPixels
+        } else if mode.contains(TermMode::SGR_MOUSE) {
             MouseFormat::Sgr
         } else if mode.contains(TermMode::UTF8_MOUSE) {
             MouseFormat::Normal(true)
@@ -78,17 +87,22 @@ impl AlacMouseButton {
 
 pub fn scroll_report(
     point: AlacPoint,
+    pixel_pos: Point<Pixels>,
     scroll_lines: i32,
     e: &ScrollWheelEvent,
     mode: TermMode,
+    sgr_pixels: bool,
+    scale: f32,
 ) -> Option<impl Iterator<Item = Vec<u8>>> {
     if mode.intersects(TermMode::MOUSE_MODE) {
         mouse_report(
             point,
+            pixel_pos,
             AlacMouseButton::from_scroll(e),
             true,
             e.modifiers,
-            MouseFormat::from_mode(mode),
+            MouseFormat::from_mode(mode, sgr_pixels),
+            scale,
         )
         .map(|report| std::iter::repeat_n(report, scroll_lines.unsigned_abs() as usize))
     } else {
@@ -110,19 +124,24 @@ pub fn alt_scroll(scroll_lines: i32) -> Vec<u8> {
 
 pub fn mouse_button_report(
     point: AlacPoint,
+    pixel_pos: Point<Pixels>,
     button: MouseButton,
     modifiers: Modifiers,
     pressed: bool,
     mode: TermMode,
+    sgr_pixels: bool,
+    scale: f32,
 ) -> Option<Vec<u8>> {
     let button = AlacMouseButton::from_button(button);
     if !button.is_other() && mode.intersects(TermMode::MOUSE_MODE) {
         mouse_report(
             point,
+            pixel_pos,
             button,
             pressed,
             modifiers,
-            MouseFormat::from_mode(mode),
+            MouseFormat::from_mode(mode, sgr_pixels),
+            scale,
         )
     } else {
         None
@@ -131,9 +150,12 @@ pub fn mouse_button_report(
 
 pub fn mouse_moved_report(
     point: AlacPoint,
+    pixel_pos: Point<Pixels>,
     button: Option<MouseButton>,
     modifiers: Modifiers,
     mode: TermMode,
+    sgr_pixels: bool,
+    scale: f32,
 ) -> Option<Vec<u8>> {
     let button = AlacMouseButton::from_move_button(button);
 
@@ -141,7 +163,15 @@ pub fn mouse_moved_report(
         if mode.contains(TermMode::MOUSE_DRAG) && matches!(button, AlacMouseButton::NoneMove) {
             None
         } else {
-            mouse_report(point, button, true, modifiers, MouseFormat::from_mode(mode))
+            mouse_report(
+                point,
+                pixel_pos,
+                button,
+                true,
+                modifiers,
+                MouseFormat::from_mode(mode, sgr_pixels),
+                scale,
+            )
         }
     } else {
         None
@@ -199,10 +229,12 @@ pub fn grid_point_and_side(
 
 fn mouse_report(
     point: AlacPoint,
+    pixel_pos: Point<Pixels>,
     button: AlacMouseButton,
     pressed: bool,
     modifiers: Modifiers,
     format: MouseFormat,
+    scale: f32,
 ) -> Option<Vec<u8>> {
     if point.line.0 < 0 {
         return None;
@@ -223,6 +255,15 @@ fn mouse_report(
         MouseFormat::Sgr => {
             Some(sgr_mouse_report(point, button as u8 + mods, pressed).into_bytes())
         }
+        // SGR-Pixels：与 SGR 同形，只把坐标换成像素。release 保持按钮标识
+        // （`'m'` + 原按钮号），与 ghostty `mouse_encode.zig:207-213` 一致——
+        // 那里显式豁免了 `.sgr`/`.sgr_pixels` 的「release 一律写成 3」规则。
+        MouseFormat::SgrPixels => Some(sgr_pixels_report(
+            pixel_pos,
+            button as u8 + mods,
+            pressed,
+            scale,
+        )),
         MouseFormat::Normal(utf8) => {
             if pressed {
                 normal_mouse_report(point, button as u8 + mods, utf8)
@@ -275,6 +316,29 @@ fn sgr_mouse_report(point: AlacPoint, button: u8, pressed: bool) -> String {
         point.line.0 + 1,
         c
     )
+}
+
+/// SGR-Pixels 报文：`\x1b[<{button};{x};{y}{M|m}`，坐标为终端空间像素。
+///
+/// 逐字节对齐 ghostty `input/mouse_encode.zig:164-172` + `posToPixels`
+/// （`:268-282`）：
+/// - 坐标是**终端空间像素**（相对内容区原点），**不做单元格换算**；
+/// - **不钳制**，允许为负或超出终端尺寸（ghostty 注释明示「Unlike grid
+///   conversion, terminal-space coordinates are not clamped」）；
+/// - 四舍五入（`@round`），不是向下取整。
+///
+/// `scale` 是 `Window::scale_factor()`：GPUI 的鼠标位置是**逻辑点**，而本
+/// 模式要报**物理像素**，两者相差正好这个系数（Retina 上 2.0）。漏乘会让
+/// 客户端拿到一半的坐标、点击落到指针左上角且偏移随距离放大。
+///
+/// 注意与 `sgr_mouse_report` 的差别：这里没有 `+1`。SGR 用 1-based 单元格
+/// 索引，而像素坐标是 0-based 距离值，ghostty 对两者同样不加偏移。
+fn sgr_pixels_report(pixel_pos: Point<Pixels>, button: u8, pressed: bool, scale: f32) -> Vec<u8> {
+    let c = if pressed { 'M' } else { 'm' };
+    let x = (pixel_pos.x.as_f32() * scale).round() as i32;
+    let y = (pixel_pos.y.as_f32() * scale).round() as i32;
+
+    format!("\x1b[<{};{};{}{}", button, x, y, c).into_bytes()
 }
 
 #[cfg(test)]
@@ -356,5 +420,96 @@ mod tests {
         // 视口第 7 行对应 grid 第 2 行。
         let (point, _) = grid_point_and_side(relative(4.0, 150.0), bounds, 5);
         assert_eq!(point, AlacPoint::new(GridLine(2), GridCol(0)));
+    }
+
+    // ===== 模式 1016：SGR-Pixels =====
+
+    /// 锚定 ghostty `mouse_encode.zig` 的 `sgr_pixels` 契约：
+    /// `\x1b[<{button};{x_px};{y_px}{M|m}`，像素坐标、无 `+1`、四舍五入。
+    #[test]
+    fn sgr_pixels_report_uses_pixel_coords_without_offset() {
+        let out = sgr_pixels_report(relative(13.6, 47.2), 0, true, 1.0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[<0;14;47M",
+            "像素坐标应四舍五入且不加 1（与 SGR 的 1-based 单元格不同）"
+        );
+    }
+
+    #[test]
+    fn sgr_pixels_release_keeps_button_identity() {
+        // ghostty `mouse_encode.zig:207-213`：`.sgr_pixels` 豁免「release 写成
+        // 按钮 3」的规则，因此右键 release 仍是 2 而不是 3。
+        let out = sgr_pixels_report(relative(5.0, 5.0), 2, false, 1.0);
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[<2;5;5m");
+    }
+
+    #[test]
+    fn sgr_pixels_does_not_clamp_negative_coords() {
+        // ghostty 明示像素坐标不钳制：拖出左上角应得到负值。
+        let out = sgr_pixels_report(relative(-12.0, -3.0), 0, true, 1.0);
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[<0;-12;-3M");
+    }
+
+    /// GPUI 的鼠标位置是**逻辑点**，而 1016 要报**物理像素**。漏乘缩放系数会
+    /// 让客户端拿到一半坐标（Retina 2x），点击落到指针左上角且偏移随距离放大。
+    #[test]
+    fn sgr_pixels_scales_logical_points_to_physical_pixels() {
+        let out = sgr_pixels_report(relative(13.6, 47.2), 0, true, 2.0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[<0;27;94M",
+            "Retina(2x) 下 13.6pt/47.2pt 应报 27px/94px"
+        );
+    }
+
+    /// 缩放要先乘再取整：13.5 * 2 = 27.0（若先取整乘缩放则不成立）。
+    #[test]
+    fn sgr_pixels_multiplies_before_rounding() {
+        let out = sgr_pixels_report(relative(13.5, 0.0), 0, true, 2.0);
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[<0;27;0M");
+    }
+
+    /// 端到端：1016 置位时 `mouse_button_report` 报出的是缩放后的像素坐标，
+    /// 而不是单元格索引。10x20 的格子在 2x 下每格 20x40 物理像素。
+    #[test]
+    fn mouse_button_report_sgr_pixels_end_to_end() {
+        let bounds = test_bounds(80, 24);
+        let pos = relative(25.0, 45.0);
+        let point = grid_point(pos, bounds, 0);
+        assert_eq!(point, AlacPoint::new(GridLine(2), GridCol(2)));
+
+        let bytes = mouse_button_report(
+            point,
+            pos,
+            MouseButton::Left,
+            Modifiers::default(),
+            true,
+            TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE,
+            true,
+            2.0,
+        )
+        .expect("1016 激活时应产生报文");
+
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "\x1b[<0;50;90M",
+            "应报像素(50,90)而非单元格(3,3)"
+        );
+    }
+
+    #[test]
+    fn sgr_pixels_takes_priority_over_sgr_mouse_mode() {
+        // 1016 置位时即使 SGR_MOUSE 也在，仍走像素编码（ghostty 中 1016 是
+        // 独立的 encoding 枚举值，优先级高于 sgr）。
+        assert!(matches!(
+            MouseFormat::from_mode(TermMode::SGR_MOUSE, true),
+            MouseFormat::SgrPixels
+        ));
+        // 未置位时不受影响。
+        assert!(matches!(
+            MouseFormat::from_mode(TermMode::SGR_MOUSE, false),
+            MouseFormat::Sgr
+        ));
     }
 }

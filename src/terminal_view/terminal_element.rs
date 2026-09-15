@@ -123,82 +123,84 @@ fn rendered_cell_colors(
     }
 }
 
-    /// Pure helper: check if a grid point falls within the given selection range.
-    /// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
-    #[inline]
-    #[cfg(test)]
-    fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
-        range.as_ref().is_some_and(|range| range.contains(*point))
+/// Pure helper: check if a grid point falls within the given selection range.
+/// Takes the pre-fetched range so callers avoid locking the FairMutex per cell.
+#[inline]
+#[cfg(test)]
+fn is_point_selected(point: &AlacPoint, range: &Option<SelectionRange>) -> bool {
+    range.as_ref().is_some_and(|range| range.contains(*point))
+}
+
+/// 用算术区间求交直接产出一行内的选区 span（O(1)，不逐格扫描）。
+///
+/// `cells` 的 point 与 `range` 的 start/end 同为网格坐标（line 可为负
+/// 的 scrollback 偏移），行 line 取首格坐标。语义与逐格调用
+/// `SelectionRange::contains` 完全等价（见 reference 平价测试）：
+/// Simple/Semantic/Lines 选区（is_block=false）：中间行整行高亮，
+/// 首行取 [start.col, 行尾]，尾行取 [0, end.col]；Block 选区：
+/// 每个相交行取相同列区间 [start.col, end.col]。
+fn selection_spans_for_row(
+    row_idx: usize,
+    row_cells: &[IndexedCell],
+    selection_range: &Option<SelectionRange>,
+) -> Vec<BackgroundSpan> {
+    let Some(range) = selection_range else {
+        return Vec::new();
+    };
+    let (Some(first), Some(last)) = (row_cells.first(), row_cells.last()) else {
+        return Vec::new();
+    };
+    let line = first.point.line;
+    if line < range.start.line || line > range.end.line {
+        return Vec::new();
     }
 
-    /// 用算术区间求交直接产出一行内的选区 span（O(1)，不逐格扫描）。
-    ///
-    /// `cells` 的 point 与 `range` 的 start/end 同为网格坐标（line 可为负
-    /// 的 scrollback 偏移），行 line 取首格坐标。语义与逐格调用
-    /// `SelectionRange::contains` 完全等价（见 reference 平价测试）：
-    /// Simple/Semantic/Lines 选区（is_block=false）：中间行整行高亮，
-    /// 首行取 [start.col, 行尾]，尾行取 [0, end.col]；Block 选区：
-    /// 每个相交行取相同列区间 [start.col, end.col]。
-    fn selection_spans_for_row(
-        row_idx: usize,
-        row_cells: &[IndexedCell],
-        selection_range: &Option<SelectionRange>,
-    ) -> Vec<BackgroundSpan> {
-        let Some(range) = selection_range else {
-            return Vec::new();
-        };
-        let (Some(first), Some(last)) = (row_cells.first(), row_cells.last()) else {
-            return Vec::new();
-        };
-        let line = first.point.line;
-        if line < range.start.line || line > range.end.line {
-            return Vec::new();
-        }
+    let last_col = last.point.column.0;
+    let (left, right) = if range.is_block || (line == range.start.line && line == range.end.line) {
+        // Block 选区：每个相交行取相同列区间；单行选区两端点即区间。
+        (range.start.column.0, range.end.column.0)
+    } else if line == range.start.line {
+        (range.start.column.0, last_col)
+    } else if line == range.end.line {
+        (0, range.end.column.0)
+    } else {
+        (0, last_col)
+    };
 
-        let last_col = last.point.column.0;
-        let (left, right) = if range.is_block
-            || (line == range.start.line && line == range.end.line)
-        {
-            // Block 选区：每个相交行取相同列区间；单行选区两端点即区间。
-            (range.start.column.0, range.end.column.0)
-        } else if line == range.start.line {
-            (range.start.column.0, last_col)
-        } else if line == range.end.line {
-            (0, range.end.column.0)
-        } else {
-            (0, last_col)
-        };
-
-        // 区间与 [0, last_col] 求交：起点越界 → 该行无选区（不能截断，
-        // 否则 start.column 越界的选区会伪造一个行尾 span）；终点越界
-        // → 截到行尾（contains 语义：p.column <= end.column 对整行成立）。
-        if left > last_col {
-            return Vec::new();
-        }
-        let right = right.min(last_col);
-        if left > right {
-            return Vec::new();
-        }
-        vec![BackgroundSpan::for_selection(left, row_idx, right - left + 1)]
+    // 区间与 [0, last_col] 求交：起点越界 → 该行无选区（不能截断，
+    // 否则 start.column 越界的选区会伪造一个行尾 span）；终点越界
+    // → 截到行尾（contains 语义：p.column <= end.column 对整行成立）。
+    if left > last_col {
+        return Vec::new();
     }
-
-    /// 平价测试参考实现：逐格 `SelectionRange::contains` 扫描再合并成 span。
-    /// 与 [`Self::selection_spans_for_row`] 输出必须完全一致
-    /// （`selection_spans_parity` 随机平价测试守护）。
-    #[cfg(test)]
-    fn selection_spans_for_row_reference(
-        row_idx: usize,
-        row_cells: &[IndexedCell],
-        selection_range: &Option<SelectionRange>,
-    ) -> Vec<BackgroundSpan> {
-        let mut cols: Vec<usize> = Vec::new();
-        for cell in row_cells {
-            if is_point_selected(&cell.point, selection_range) {
-                cols.push(cell.point.column.0);
-            }
-        }
-        selection_spans_for_cols(row_idx, &cols)
+    let right = right.min(last_col);
+    if left > right {
+        return Vec::new();
     }
+    vec![BackgroundSpan::for_selection(
+        left,
+        row_idx,
+        right - left + 1,
+    )]
+}
+
+/// 平价测试参考实现：逐格 `SelectionRange::contains` 扫描再合并成 span。
+/// 与 [`Self::selection_spans_for_row`] 输出必须完全一致
+/// （`selection_spans_parity` 随机平价测试守护）。
+#[cfg(test)]
+fn selection_spans_for_row_reference(
+    row_idx: usize,
+    row_cells: &[IndexedCell],
+    selection_range: &Option<SelectionRange>,
+) -> Vec<BackgroundSpan> {
+    let mut cols: Vec<usize> = Vec::new();
+    for cell in row_cells {
+        if is_point_selected(&cell.point, selection_range) {
+            cols.push(cell.point.column.0);
+        }
+    }
+    selection_spans_for_cols(row_idx, &cols)
+}
 
 /// Coalesce a row's sorted selected column indices into contiguous spans
 /// (`start_col`, `width`). Emits one `BackgroundSpan` per contiguous run,
@@ -824,7 +826,14 @@ impl TerminalElement {
                 .map(|(start, end)| col >= start && col < end)
                 .unwrap_or(false);
 
-            if ch == '\0' || ch == ' ' || box_drawing::is_box_drawing_char(ch) {
+            // 空格/制表/方框绘制字符不进文字批次。Unicode 占位符
+            // （U+10EEEE）也走这一支：它本身不该被当作字画出来，图案由
+            // Kitty 图像在上面覆盖（见 prepaint 里的 `plan_placeholders`）。
+            if ch == '\0'
+                || ch == ' '
+                || ch == crate::terminal::kitty::unicode::PLACEHOLDER
+                || box_drawing::is_box_drawing_char(ch)
+            {
                 Self::flush_text_batch(
                     row_idx,
                     &mut batched_runs,
@@ -1387,6 +1396,8 @@ impl Element for TerminalElement {
         Option<LocalOverlayLayout>,
         // 末位为搜索命中高亮（视口行映射后的 span，含当前命中配色）
         Vec<BackgroundSpan>,
+        // 末位为 Kitty 图像的本帧落位（已换算成像素，pain 直接使用）
+        Vec<crate::terminal::kitty::render::PlacedImage>,
     );
 
     fn id(&self) -> Option<ElementId> {
@@ -1460,10 +1471,12 @@ impl Element for TerminalElement {
         // 与网格尺寸一致、不会把 TUI 内容装进它没画过尺寸的网格而割裂。
         let requested = TerminalBounds::new(line_height, cell_width, content_bounds);
 
-        let (terminal_bounds, display_offset, cursor_point, cursor_shape) =
+        let (terminal_bounds, display_offset, cursor_point, cursor_shape, kitty_dirty) =
             self.terminal.update(cx, |terminal, cx| {
                 terminal.sync(window, cx);
-                terminal.resize(requested, cx);
+                // 缩放随窗口而来：尺寸上报（CSI 14 t / CSI 16 t）与 PTY 的
+                // `ws_xpixel` 需要物理像素，而 `requested` 是逻辑点。
+                terminal.resize(requested, window.scale_factor(), cx);
 
                 let content = terminal.last_content();
                 (
@@ -1471,6 +1484,9 @@ impl Element for TerminalElement {
                     content.display_offset,
                     content.cursor,
                     content.cursor_shape,
+                    // 图像集合变化不体现为网格 damage（例：删除一条不占格的
+                    // 图像），必须单独取一次，否则残影留在屏幕上。
+                    terminal.take_kitty_damage(),
                 )
             });
 
@@ -1486,7 +1502,14 @@ impl Element for TerminalElement {
         // across the many interleaved `cx` calls below (a borrowed slice from
         // the view/terminal cannot survive those), then put them back at the end
         // so the capacity is reused on the next frame.
-        let (mut dirty_rows, mut dirty_row_bounds, mouse_mode, selection_range, cursor_cell, palette) = {
+        let (
+            mut dirty_rows,
+            mut dirty_row_bounds,
+            mouse_mode,
+            selection_range,
+            cursor_cell,
+            palette,
+        ) = {
             let (mut dirty_rows, mut dirty_row_bounds) = self.view.update(cx, |view, _cx| {
                 (
                     std::mem::take(&mut view.scratch_dirty_rows),
@@ -1498,6 +1521,14 @@ impl Element for TerminalElement {
             dirty_rows.extend_from_slice(terminal_snapshot.dirty_rows());
             dirty_row_bounds.clear();
             dirty_row_bounds.extend_from_slice(terminal_snapshot.dirty_row_bounds());
+            // 图像集合变化时把整个 viewport 标脏：图像可能覆盖任意行，
+            // 且添加/移除都不一定伴随字符变化，无法用行的 damage 区间表达。
+            if kitty_dirty {
+                dirty_rows.iter_mut().for_each(|row| *row = true);
+                dirty_row_bounds
+                    .iter_mut()
+                    .for_each(|bounds| *bounds = Some((0, usize::MAX)));
+            }
             let content = terminal_snapshot.last_content();
             let palette = content.palette;
             let mouse_mode = content
@@ -1578,7 +1609,6 @@ impl Element for TerminalElement {
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
         let hovered_link = self.view.read(cx).hovered_link.clone();
-
 
         // O2：行缓存本身就是渲染数据源（paint 直接逐行遍历），不再有
         // flattened 拷贝。任何输入变化（主题/resize/选区/悬停/damage/度量）
@@ -1991,6 +2021,46 @@ impl Element for TerminalElement {
             }
         };
 
+        // Kitty 图像的本帧落位。`plan` 只做几何计算（网格 → 像素），
+        // 纹理的创建推迟到 paint（那里才有 `&mut Window`/`App` 可用，
+        // 且只有真正要画的图像才值得做 RGBA→BGRA 转换）。
+        let placed_images: Vec<crate::terminal::kitty::render::PlacedImage> =
+            if std::env::var_os("DEEPTERM_DISABLE_KITTY").is_some() {
+                Vec::new()
+            } else {
+                let metrics = crate::terminal::kitty::render::CellMetrics {
+                    cell_width,
+                    line_height,
+                };
+                let viewport = crate::terminal::kitty::render::Viewport {
+                    origin: terminal_bounds.bounds.origin,
+                    display_offset,
+                    rows: viewport_lines,
+                    cols: terminal_bounds.num_columns(),
+                };
+                // 占位符的源数据（网格里的 U+10EEEE 单元格）在终端实体上；先拍平
+                // 出来，避免带着实体借用去做图像存储的几何计算。
+                let placeholder_cells = self.terminal.read(cx).kitty_placeholder_cells();
+                self.terminal.read(cx).with_kitty_storage(|storage| {
+                    // 普通放置 + Unicode 占位符走两条路径，合成同一份绘制清单：
+                    // 两者都用 `PlacedImage` 表达，paint 时按 z 序统一绘制。
+                    let mut placed =
+                        crate::terminal::kitty::render::plan(storage, metrics, viewport);
+                    placed.extend(crate::terminal::kitty::render::plan_placeholders(
+                        storage,
+                        &placeholder_cells,
+                        metrics,
+                        viewport,
+                    ));
+                    placed.sort_by(|a, b| {
+                        a.z.cmp(&b.z)
+                            .then(a.id.cmp(&b.id))
+                            .then(a.placement_id.cmp(&b.placement_id))
+                    });
+                    placed
+                })
+            };
+
         (
             row_caches,
             cell_width,
@@ -2002,6 +2072,7 @@ impl Element for TerminalElement {
             cursor,
             input_overlay,
             search_spans,
+            placed_images,
         )
     }
 
@@ -2027,10 +2098,30 @@ impl Element for TerminalElement {
             cursor,
             input_overlay,
             search_spans,
+            placed_images,
         ) = prepaint_state;
 
         let origin = terminal_bounds.bounds.origin;
         window.paint_quad(fill(bounds, terminal_theme.background));
+
+        // Kitty 图像分两层绘制：`z < 0` 在文字之下、`z >= 0` 在文字之上。
+        // 先画下层（此时文字还没上屏），待文字画完后再画上层。
+        //
+        // 纹理缓存从 view 里 `take` 出来、绘制完归还（与行缓存同一套做法）：
+        // `paint` 需要在遍历中同时持有缓存可变借用与 view 的读取，两者不能
+        // 共存于一次 `view.update`。
+        let mut kitty_cache = self
+            .view
+            .update(cx, |view, _cx| std::mem::take(&mut view.kitty_image_cache));
+        let kitty_storage = self.terminal.read(cx).images_handle();
+        crate::terminal::kitty::render::paint_images(
+            placed_images,
+            true,
+            &kitty_storage,
+            &mut kitty_cache,
+            window,
+            cx,
+        );
 
         // O2：paint 直接按行序遍历行缓存，替代先前的 flattened 拷贝。
         // 同一行内绘制顺序保持 Zed 终端的层级：背景 span → 选区 → 文本
@@ -2149,6 +2240,25 @@ impl Element for TerminalElement {
         let mut row_caches = std::mem::take(row_caches);
         self.view.update(cx, |view, _cx| {
             view.row_render_cache = std::mem::take(&mut row_caches);
+        });
+
+        // 文字已上屏：绘制 z >= 0 的 Kitty 图像（它们在文字之上）。
+        crate::terminal::kitty::render::paint_images(
+            placed_images,
+            false,
+            &kitty_storage,
+            &mut kitty_cache,
+            window,
+            cx,
+        );
+
+        // 归还纹理缓存（顺带回收已删除/已替换图像的纹理，避免缓存无限增长）。
+        {
+            let guard = kitty_storage.lock().expect("kitty 图像存储锁被投毒");
+            kitty_cache.prune(&guard);
+        }
+        self.view.update(cx, |view, _cx| {
+            view.kitty_image_cache = std::mem::take(&mut kitty_cache);
         });
 
         // 使用prepaint阶段计算的光标布局进行渲染
@@ -2434,6 +2544,7 @@ mod tests {
                             cell: crate::terminal::terminal::PackedCell::from(
                                 &alacritty_terminal::term::cell::Cell::default(),
                             ),
+                            zerowidth: None,
                             hyperlink: None,
                         })
                         .collect()
@@ -2449,7 +2560,11 @@ mod tests {
                 Line(base_line + rng.below(ROWS_PER_CASE as u64) as i32),
                 Column(rng.below(cols as u64 * 2) as usize),
             );
-            let (start, end) = if start <= end { (start, end) } else { (end, start) };
+            let (start, end) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
             let is_block = rng.below(2) == 0;
 
             let range = SelectionRange::new(start, end, is_block);
@@ -2457,8 +2572,7 @@ mod tests {
 
             for (row_idx, row_cells) in rows.iter().enumerate() {
                 let fast = selection_spans_for_row(row_idx, row_cells, &sel);
-                let reference =
-                    selection_spans_for_row_reference(row_idx, row_cells, &sel);
+                let reference = selection_spans_for_row_reference(row_idx, row_cells, &sel);
                 assert_eq!(
                     fast, reference,
                     "case {case} row {row_idx} (cols={cols}, block={is_block}) 不平价: fast={fast:?} ref={reference:?}"

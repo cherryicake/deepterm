@@ -18,7 +18,7 @@ use std::{
 use alacritty_terminal::{
     Term,
     event::{Event as AlacTermEvent, EventListener, WindowSize},
-    event_loop::{EventLoop, EventLoopSender, Msg},
+    event_loop::{EventLoopSender, Msg},
     grid::{Dimensions, Scroll as AlacScroll},
     index::{Column, Line, Point as AlacPoint, Side},
     selection::{Selection, SelectionType},
@@ -30,6 +30,9 @@ use alacritty_terminal::{
         StdSyncHandler,
     },
 };
+// unix 本地终端走自建 `local_pty::LocalReader`，不再构造 alacritty 的 EventLoop。
+#[cfg(not(unix))]
+use alacritty_terminal::event_loop::EventLoop;
 use futures::{
     StreamExt,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -46,12 +49,13 @@ use crate::ssh::{
     platform::RemoteOS,
 };
 use crate::terminal::file_link_detector::{FileHit, detect_files_in_joined_text};
+use crate::terminal::kitty::scanner::ReplySink;
+use crate::terminal::kitty::storage::Storage as KittyStorage;
 use crate::terminal::link_detector::{HyperlinkRange, UrlRange};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
 };
-
 
 /// 最大滚动缓冲区行数限制
 const MAX_SCROLLBACK_LINES: usize = 100000;
@@ -120,6 +124,56 @@ pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
 /// 挂起，背压经 SSH 窗口传导到远端，避免无界队列在 UI 卡顿时无限膨胀。
 #[derive(Clone)]
 pub struct DriverListener(pub async_channel::Sender<DriverEvent>);
+
+/// Kitty 图形协议可占用的图像内存上限（320 MB）。
+///
+/// 与 ghostty 的 `image-storage-limit` 默认值**逐字节一致**
+/// （`config/Config.zig`: `320 * 1000 * 1000`，即十进制 320 MB；不是
+/// `320 * 1024 * 1024`）。ghostty 在 `termio/Termio.zig` 用该配置调用
+/// `setKittyGraphicsSizeLimit`，这里是同一语义的编译期常量。
+///
+/// 单张图上限另有 [`crate::terminal::kitty::image`] 的 `MAX_IMAGE_BYTES`
+/// 把关；这里是**全部图像合计**，超限按优先级淘汰。
+const KITTY_IMAGE_LIMIT: usize = 320 * 1000 * 1000;
+
+/// Kitty 协议应答的投递通道。
+///
+/// 有两个消费者，靠 `mem::take` 保证应答只被回写一次：
+/// - **本地读线程**：`take_pending()` 取走后直接 `write_all` 给 PTY。这是
+///   常规路径——终端应用的能力探测只等数百毫秒，必须即时回写。
+/// - **UI 线程**：`flush_kitty_replies()` 兜底（如应答产生于 UI 侧的扫描）。
+struct KittyReplySink {
+    /// 待回写的应答字节（kitty 规定应答必须按请求顺序回写）。
+    replies: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// 图像集合已变化标志，UI 据此决定是否需要重绘。
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReplySink for KittyReplySink {
+    fn reply(&mut self, bytes: &[u8]) {
+        if let Ok(mut buf) = self.replies.lock() {
+            buf.extend_from_slice(bytes);
+        }
+    }
+
+    fn images_changed(&mut self) {
+        self.changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 把已排队的应答取走，供读线程直接回写 PTY。
+    ///
+    /// 与 UI 线程的 `flush_kitty_replies` 是**互斥**的两条回写路径：谁先
+    /// 取到谁写，另一方看到空缓冲就跳过（`mem::take` 保证了不重复）。
+    /// 之所以允许读线程直接写，是因为终端应用的能力探测只等 500ms，而
+    /// UI 侧的重绘泵唤醒条件基于 vte 字节吞吐，探测负载（纯 APC）不满足。
+    fn take_pending(&mut self) -> Vec<u8> {
+        match self.replies.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        }
+    }
+}
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
@@ -263,8 +317,7 @@ fn hostname_via_syscall() -> String {
         let mut buf = [0u8; 256];
         // SAFETY（中文）：gethostname 为只读 syscall，缓冲区指针/长度均有效；
         // 名字超长时 Linux 截断并补 NUL、macOS 返回 ERANGE（此时退回空串）。
-        let ok =
-            unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
         if ok != 0 {
             return String::new();
         }
@@ -375,6 +428,64 @@ impl TerminalBounds {
     pub fn height(&self) -> Pixels {
         self.bounds.size.height
     }
+
+    /// 上报用的几何：cell 尺寸乘显示缩放，行列数不变。
+    ///
+    /// `self` 存的是**逻辑点**（布局与命中测试依赖它），而 ghostty 的
+    /// `size_report` 用的是**物理设备像素**——`renderer/size.zig:24-27`
+    /// 明确要求：「any pixel values should already be scaled to the current
+    /// DPI of the screen」。ghostty 从字号就按 DPI 换算
+    /// （`font/face.zig:55-58` 的 `points * ydpi / 72`，其中
+    /// `ydpi = content_scale * 72`），所以 cell 尺寸天生就是物理像素。
+    ///
+    /// 取整用 `round` 对齐 `font/Metrics.zig:265` 的 `@round`：截断每列会
+    /// 稳定少 1px，几十列累积后比例就歪了。
+    pub fn term_geometry(&self, scale: f32) -> crate::terminal::escape_scan::TermGeometry {
+        let scale = normalize_scale(scale);
+        crate::terminal::escape_scan::TermGeometry {
+            rows: self.num_lines() as u16,
+            cols: self.num_columns() as u16,
+            cell_width: (self.cell_width.as_f32() * scale).round().max(1.0) as u16,
+            cell_height: (self.line_height.as_f32() * scale).round().max(1.0) as u16,
+        }
+    }
+
+    /// 上报用的 `WindowSize`：只缩放 cell 像素尺寸，行列数保持原值。
+    ///
+    /// 两个消费方：
+    /// - PTY 的 `TIOCSWINSZ`：alacritty 自己算 `ws_xpixel = ws_col *
+    ///   cell_width`（`tty/unix.rs:433`），所以这里给物理像素即可。
+    /// - `CSI 14 t`：`term/mod.rs:2261` 算 `num_lines * cell_height`。
+    ///
+    /// 与 ghostty 的有意偏差：ghostty 直接把 surface 的原始像素宽高塞进
+    /// `ws_xpixel`（`termio/Exec.zig:912-913`），我们只能透传 cell 尺寸，
+    /// 于是得到的是 **grid 范围**（`floor(W/cw) * cw * scale`），最多比真实
+    /// surface 小一个缩放后的 cell。**不要为了补这个差去加字段**——差一个
+    /// cell 远好过差 2×，而且 `WindowSize` 没有 xpixel 字段可填。
+    ///
+    /// `num_lines`/`num_cols` **绝不能缩放**：它们是格子数，与 DPI 无关。
+    pub fn window_size(&self, scale: f32) -> WindowSize {
+        let scale = normalize_scale(scale);
+        WindowSize {
+            num_lines: self.num_lines() as u16,
+            num_cols: self.num_columns() as u16,
+            cell_width: (self.cell_width.as_f32() * scale).round().max(1.0) as u16,
+            cell_height: (self.line_height.as_f32() * scale).round().max(1.0) as u16,
+        }
+    }
+}
+
+/// 把外部传入的缩放归一为「可用的正数」。
+///
+/// `scale_factor()` 正常返回 1.0/2.0 这类值，但 headless 测试或平台初始化
+/// 早期可能拿到 0 或 NaN——那种情况下 `cell * scale` 会算出 0 或垃圾值，
+/// 让终端应用按 0×0 建 surface。退化为 1.0 至少保持上一轮修复前的行为。
+fn normalize_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
 }
 
 impl Default for TerminalBounds {
@@ -398,6 +509,26 @@ impl From<TerminalBounds> for WindowSize {
         WindowSize {
             num_lines: val.num_lines() as u16,
             num_cols: val.num_columns() as u16,
+            cell_width: val.cell_width.as_f32() as u16,
+            cell_height: val.line_height.as_f32() as u16,
+        }
+    }
+}
+
+/// 几何的第二种投影，供尺寸上报（`CSI 16 t` / in-band size reports）使用。
+///
+/// 与上面的 `WindowSize` 投影**必须保持同口径**：两者都由终端应用用来推算
+/// 像素尺寸，出现分歧会导致画面比例错误。`from_bounds_matches_window_size`
+/// 测试锁定这一点。
+///
+/// 这是按 `scale = 1.0`（即**逻辑点**）的便捷投影，只应在「还没有窗口、
+/// 拿不到 DPI」的场合使用（如构造期的 PTY 初始尺寸）。真正上报给终端应用
+/// 时必须走 [`TerminalBounds::term_geometry`]，否则 Retina 上会低报 2×。
+impl From<TerminalBounds> for crate::terminal::escape_scan::TermGeometry {
+    fn from(val: TerminalBounds) -> Self {
+        Self {
+            rows: val.num_lines() as u16,
+            cols: val.num_columns() as u16,
             cell_width: val.cell_width.as_f32() as u16,
             cell_height: val.line_height.as_f32() as u16,
         }
@@ -531,11 +662,33 @@ impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
 pub struct IndexedCell {
     pub point: AlacPoint,
     pub cell: PackedCell,
+    /// 该单元格的组合变音符（zero-width），最多前 3 个。
+    ///
+    /// 只有 Kitty 图形协议的 Unicode 占位符（U+10EEEE）会读它——行/列下标
+    /// 编码在第 1/2 个变音符、图像 id 的高 8 位在第 3 个（见
+    /// [`crate::terminal::kitty::unicode`]）。绝大多数单元格是 `None`，所以
+    /// 放在 `IndexedCell` 而不是 `PackedCell` 上：后者要维持 `Copy`，而
+    /// alacritty 的 `zerowidth()` 返回的是借用切片。
+    pub zerowidth: Option<[char; 3]>,
     /// OSC8 hyperlink for this cell (`None` = no link).
     /// alacritty's `Hyperlink` is `Arc`-backed, so snapshotting it per cell
     /// costs one refcount bump and no string allocation; `id`/`uri` strings
     /// are only materialized when grouping ranges for hover hit-testing.
     pub hyperlink: Option<alacritty_terminal::term::cell::Hyperlink>,
+}
+
+/// 取一个单元格的前 3 个组合变音符，没有则返回 `None`。
+///
+/// 位置不足 3 个时后面的位置填 `'\0'`；这些位置永远不会被查到
+/// （占位符解码按 `diacritics[0]`/`[1]`/`[2]` 顺序读取，读不到就算"没写"，
+/// 所以需要能区分"没有第 3 个变音符"与"第 3 个变音符是某个值"）。
+fn packed_zerowidth(cell: &alacritty_terminal::term::cell::Cell) -> Option<[char; 3]> {
+    let chars = cell.zerowidth()?;
+    let mut out = ['\0'; 3];
+    for (slot, ch) in out.iter_mut().zip(chars.iter()) {
+        *slot = *ch;
+    }
+    Some(out)
 }
 
 /// 滚动区搜索命中：起点 / 终点为 grid 绝对坐标（同一行内，`end` 为开区间列）。
@@ -549,7 +702,75 @@ pub struct SearchMatch {
 pub type RemoteInputCallback = Box<dyn Fn(&[u8]) + Send>;
 
 /// 远程终端调整大小回调类型
-pub type RemoteResizeCallback = Box<dyn Fn(u16, u16) + Send>;
+/// 远程窗口尺寸变更回调：`(cols, rows, scale)`。
+///
+/// `scale` 是窗口所在显示的缩放，用于把逻辑点的网格尺寸换算成物理像素后再
+/// 交给 PTY（`ws_xpixel`）。放在参数里而不是让实现方自己捕获，是因为捕获
+/// 会在终端创建时就固化一个值，跨显示器拖动后就是过期数据。
+pub type RemoteResizeCallback = Box<dyn Fn(u16, u16, f32) + Send>;
+
+/// Kitty 图形协议的图像集合。
+///
+/// 两条字节管线（本地读线程 / 远程 UI 线程）都写入同一份存储，因为本地
+/// 终端的读线程与 UI 线程需要共享它：读线程解析并落盘图像，UI 线程渲染。
+/// 用 `Arc<Mutex<..>>` 而非 `FairMutex`——读写都是短临界区（哈希表插入/
+/// 快照遍历），不涉及 vte 解析，无需 alacritty 那套让锁语义。
+///
+/// `generation` 独立于 `Terminal::content_generation`：图像变化不改变网格内容，
+/// 但需要触发重绘，用单独的代际号可以精确地区分「只有图像变了」。
+///
+/// 内部只有两个 `Arc`，`Clone` 即共享同一份存储与代际号（浅拷贝），这正是
+/// 扫描器与渲染层看到同一份图像的语义。
+#[derive(Clone)]
+pub struct KittyImages {
+    storage: std::sync::Arc<std::sync::Mutex<KittyStorage>>,
+    /// 存储变更代际（每次插入/删除/放置时自增）。
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl KittyImages {
+    pub fn new(limit_bytes: usize) -> Self {
+        Self {
+            storage: std::sync::Arc::new(std::sync::Mutex::new(KittyStorage::new(limit_bytes))),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// 存储句柄（供扫描器构造 `ImageStore`）。
+    pub fn storage(&self) -> std::sync::Arc<std::sync::Mutex<KittyStorage>> {
+        self.storage.clone()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 在当前代际上叠加 `delta`（由渲染层读到时使用，避免额外加锁读两次）。
+    pub fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 只读访问存储（渲染/测试用）。持锁期间执行，勿在其中再取 `term` 锁。
+    pub fn with_storage<R>(&self, f: impl FnOnce(&KittyStorage) -> R) -> R {
+        let guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        f(&guard)
+    }
+
+    /// 可变访问存储。只给 UI 线程上的操作使用（如推进动画帧）——读线程
+    /// 永远只读，因此这里的可变借用不会与渲染路径冲突。同样勿在其中取
+    /// `term` 锁。
+    pub fn with_storage_mut<R>(&self, f: impl FnOnce(&mut KittyStorage) -> R) -> R {
+        let mut guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        f(&mut guard)
+    }
+}
+
+impl Default for KittyImages {
+    fn default() -> Self {
+        Self::new(KITTY_IMAGE_LIMIT)
+    }
+}
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
@@ -576,8 +797,31 @@ pub struct Terminal {
     /// 远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 上报）
     remote_process_name: Option<String>,
     window_title: Option<String>,
-    /// 本地终端的事件循环发送器
+    /// 本地终端的事件循环发送器（仅 Windows：conpty 无裸 fd，沿用 alacritty EventLoop）
     sender: Option<EventLoopSender>,
+    /// 本地终端读线程的发送端（仅 unix）。与 `sender` 互斥，两者只会有一个为 `Some`。
+    #[cfg(unix)]
+    local_sender: Option<crate::terminal::local_pty::LocalSender>,
+    /// 本地读线程句柄（仅 unix）。持有它以保证读线程存活至终端析构。
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    local_reader: Option<crate::terminal::local_pty::LocalReader>,
+    /// Kitty 图形协议已存储的图像（本地路径：读线程写入，UI 线程只读渲染）。
+    ///
+    /// 远程路径下扫描发生在 UI 线程，直接由这里的扫描器更新。
+    images: KittyImages,
+    /// 待回写给 PTY 的协议应答（由读线程/扫描器投递，UI 线程消费）。
+    kitty_replies: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// 图像集合自上次重绘以来是否变化（读线程置位，UI 线程清除）。
+    kitty_images_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 图像变更代际：每次重绘时若与快照不同则触发一次全量重绘。
+    kitty_generation: u64,
+    last_kitty_generation: u64,
+    /// 远程路径的协议扫描器。
+    ///
+    /// 本地路径的扫描发生在读线程内，UI 线程只读结果；远程路径的字节本来
+    /// 就在 UI 线程解析，因此扫描器也放在这里（`None` = 本地/headless）。
+    kitty_scanner: Option<crate::terminal::kitty::scanner::KittyGraphicsScanner>,
     last_content: TerminalContent,
     pub content_generation: u64,
     content_dirty: bool,
@@ -623,6 +867,34 @@ pub struct Terminal {
     /// 异常输出（无终止符的 ESC ]）无限占用内存。
     pending_osc: Vec<u8>,
     pub terminal_bounds: TerminalBounds,
+    /// 远程路径的 in-band size reports（DECSET 2048）开关状态。
+    ///
+    /// 本地路径的状态在扫描器里（`KittyGraphicsScanner::mode_2048`）；远程
+    /// 路径没有读线程扫描器参与尺寸嗅探，因此在这里单独跟踪。
+    remote_mode_2048: bool,
+    /// SGR-Pixels 鼠标编码（DECSET 1016）开关状态。
+    ///
+    /// 对齐 ghostty `terminal/modes.zig:318` 的 `mouse_format_sgr_pixels`。
+    /// 与 2048 同理：模式 1016 不在 vte/alacritty 的枚举里，会被当作
+    /// `PrivateMode::Unknown`，因此无法从 `last_content.mode` 读出来——由
+    /// deepterm 自己在字节流里拦截 `DECSET ?1016` 并跟踪。
+    ///
+    /// 本地路径的状态在扫描器里（`KittyGraphicsScanner::mode_1016`），这里
+    /// 单独保存远程路径的状态。
+    remote_mode_1016: bool,
+    /// 本地路径的 1016 状态句柄（读线程写、UI 线程读）。
+    ///
+    /// 本地终端的字节由读线程里的扫描器消费，模式开关状态留在那边；鼠标报文
+    /// 却在 UI 线程编码，因此需要这个共享原子量把状态送过来。与
+    /// `kitty_images_dirty` 是同一套跨线程做法。
+    local_mode_1016: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 当前窗口所在的显示缩放（`Window::scale_factor()`，Retina 上为 2.0）。
+    ///
+    /// `terminal_bounds` 存逻辑点，而尺寸上报必须给物理像素
+    /// （ghostty `renderer/size.zig:24-27`），两者相差正好这个系数。
+    /// 只用于 [`TerminalBounds::term_geometry`] / `window_size` 的投影，
+    /// 绝不参与布局或命中测试。
+    display_scale: f32,
     selection_phase: SelectionPhase,
     /// Whether a mouse press was reported to the terminal application (mouse
     /// mode active at `mouse_down` time). The release report must be paired
@@ -712,6 +984,16 @@ impl Terminal {
             remote_process_name: None,
             window_title: None,
             sender: None,
+            #[cfg(unix)]
+            local_sender: None,
+            #[cfg(unix)]
+            local_reader: None,
+            images: KittyImages::default(),
+            kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kitty_generation: 0,
+            last_kitty_generation: 0,
+            kitty_scanner: None,
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -726,6 +1008,10 @@ impl Terminal {
             input_area_start: None,
             shell_fg_observed: None,
             pending_osc: Vec::new(),
+            remote_mode_2048: false,
+            remote_mode_1016: false,
+            local_mode_1016: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            display_scale: 1.0,
             terminal_bounds: default_bounds,
             selection_phase: SelectionPhase::Ended,
             mouse_report_active: false,
@@ -782,15 +1068,63 @@ impl Terminal {
         #[cfg(not(unix))]
         let (child_process_id, shell_process_group_id, pty_master_fd) =
             (pty.child_watcher().pid().map(|p| p.get()), None, None);
-        let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
-            Ok(event_loop) => event_loop,
-            Err(e) => {
-                log::error!("Failed to create terminal EventLoop: {e}");
-                return cx.new(|_cx| Self::create_error_terminal());
+
+        // Kitty 图形协议：读线程/扫描器写入，UI 线程渲染。存储在这两条
+        // 管线之间共享，因此这里先建好再分别交给扫描器与 `Terminal`。
+        let images = KittyImages::default();
+        let kitty_replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kitty_images_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 模式 1016（SGR-Pixels 鼠标）的本地状态句柄：读线程里的扫描器写，
+        // 鼠标报文编码（UI 线程）读。
+        let local_mode_1016 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // 本地终端字节管线：
+        // - unix：自建读线程（`LocalReader`），字节经应用层扫描后再喂 vte，
+        //   这样 APC（Kitty 图形协议）才能被拦截。
+        // - windows：conpty 无裸 fd，沿用 alacritty 的 EventLoop。
+        #[cfg(unix)]
+        let (local_reader, local_notices): (
+            Option<crate::terminal::local_pty::LocalReader>,
+            Option<async_channel::Receiver<crate::terminal::local_pty::LocalNotice>>,
+        ) = {
+            // 初始几何由 `LocalReader::spawn` 统一注入（见其
+            // `initial_geometry` 参数），这里只需构造扫描器并交出 1016 的
+            // 共享状态句柄（鼠标报文在 UI 线程按该状态编码）。
+            let scanner = crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage(
+                images.storage(),
+                KITTY_IMAGE_LIMIT > 0,
+                Box::new(KittyReplySink {
+                    replies: kitty_replies.clone(),
+                    changed: kitty_images_dirty.clone(),
+                }),
+            )
+            .with_mode_1016_shared(local_mode_1016.clone());
+            match crate::terminal::local_pty::LocalReader::spawn(
+                pty,
+                term.clone(),
+                listener,
+                Box::new(scanner),
+                default_bounds.into(),
+            ) {
+                Ok(parts) => (Some(parts.reader), Some(parts.notices)),
+                Err(e) => {
+                    log::error!("Failed to spawn local PTY reader: {e}");
+                    return cx.new(|_cx| Self::create_error_terminal());
+                }
             }
         };
-        let notifier = event_loop.channel();
-        let _ = event_loop.spawn();
+        #[cfg(not(unix))]
+        let (local_reader, local_notices) = {
+            let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
+                Ok(event_loop) => event_loop,
+                Err(e) => {
+                    log::error!("Failed to create terminal EventLoop: {e}");
+                    return cx.new(|_cx| Self::create_error_terminal());
+                }
+            };
+            let _ = event_loop.spawn();
+            (None, None)
+        };
 
         cx.new(|cx| {
             let term_clone = term.clone();
@@ -804,6 +1138,21 @@ impl Terminal {
                 }
             });
 
+            // unix：把读线程的通知（重绘 / 子进程退出）泵到 UI 线程。
+            // 读线程自身只做 vte 解析，凡需要 `Context` 的副作用都在这里完成。
+            let reader_notice_task = local_notices.map(|notices| {
+                cx.spawn(async move |this, cx| {
+                    while let Ok(notice) = notices.recv().await {
+                        let handled = this.update(cx, |terminal: &mut Self, cx| {
+                            terminal.handle_local_notice(notice, cx);
+                        });
+                        if handled.is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+
             Self {
                 term: term_clone,
                 child_process_id,
@@ -815,14 +1164,22 @@ impl Terminal {
                 remote_os,
                 remote_process_name: None,
                 window_title: None,
-                sender: Some(notifier),
+                sender: None,
+                local_sender: local_reader.as_ref().map(|r| r.sender()),
+                local_reader,
+                images,
+                kitty_replies,
+                kitty_images_dirty,
+                kitty_generation: 0,
+                last_kitty_generation: 0,
+                kitty_scanner: None,
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
-                driver_task: None,
+                driver_task: reader_notice_task,
                 pending_resize: None,
                 resize_task: None,
                 resize_primed: false,
@@ -830,12 +1187,18 @@ impl Terminal {
                 input_area_start: None,
                 shell_fg_observed: None,
                 pending_osc: Vec::new(),
+                remote_mode_2048: false,
+                remote_mode_1016: false,
+                // 复用上面交给扫描器的那一份：读线程写、UI 线程读，必须是同一个
+                // `Arc`，否则鼠标报文永远看不到 1016 被置位。
+                local_mode_1016: local_mode_1016.clone(),
+                display_scale: 1.0,
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
-            last_reported_mouse_cell: None,
+                last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
@@ -951,6 +1314,16 @@ impl Terminal {
             remote_process_name: None,
             window_title: None,
             sender: None,
+            #[cfg(unix)]
+            local_sender: None,
+            #[cfg(unix)]
+            local_reader: None,
+            images: KittyImages::default(),
+            kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kitty_generation: 0,
+            last_kitty_generation: 0,
+            kitty_scanner: None,
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -965,6 +1338,10 @@ impl Terminal {
             input_area_start: None,
             shell_fg_observed: None,
             pending_osc: Vec::new(),
+            remote_mode_2048: false,
+            remote_mode_1016: false,
+            local_mode_1016: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            display_scale: 1.0,
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             mouse_report_active: false,
@@ -1055,7 +1432,7 @@ impl Terminal {
             events_rx,
             driver_rx,
             move |data| russh_for_input.write(data),
-            move |cols, rows| russh_for_resize.resize(cols, rows),
+            move |cols, rows, _scale| russh_for_resize.resize(cols, rows),
             Some(russh_for_status),
         )
     }
@@ -1079,6 +1456,9 @@ impl Terminal {
         let pty_terminal = match SshPtyTerminal::new(
             ssh_config,
             default_bounds,
+            // 构造期没有窗口、拿不到 DPI，先用 1.0；首帧 `resize` 会带上真实
+            // 缩放纠正（与 PTY 初始尺寸走同一条路径）。
+            1.0,
             term.clone(),
             listener,
             remote_cwd,
@@ -1100,7 +1480,7 @@ impl Terminal {
             events_rx,
             driver_rx,
             move |data| pty_input.write(data),
-            move |cols, rows| {
+            move |cols, rows, scale| {
                 let bounds = TerminalBounds::new(
                     default_bounds.line_height,
                     default_bounds.cell_width,
@@ -1112,7 +1492,7 @@ impl Terminal {
                         },
                     },
                 );
-                pty_resize.resize(bounds);
+                pty_resize.resize(bounds, scale);
             },
             None,
         )
@@ -1126,11 +1506,16 @@ impl Terminal {
         events_rx: UnboundedReceiver<AlacTermEvent>,
         driver_rx: async_channel::Receiver<DriverEvent>,
         input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
-        resize_handler: impl Fn(u16, u16) + Send + Sync + 'static,
+        resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
         russh_handle: Option<RusshTerminal>,
     ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
         let ssh_config_clone = ssh_config.clone();
+
+        // 远程路径的字节在 UI 线程解析，因此扫描器/共享状态都在这里建立。
+        let images = KittyImages::default();
+        let kitty_replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kitty_images_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         cx.new(|cx| {
             let term_clone = term.clone();
@@ -1170,6 +1555,30 @@ impl Terminal {
                 remote_process_name: None,
                 window_title: None,
                 sender: None,
+                #[cfg(unix)]
+                local_sender: None,
+                #[cfg(unix)]
+                local_reader: None,
+                // 复用上面交给扫描器的那三份共享句柄：扫描器（写）与渲染/
+                // 应答路径（读）必须是**同一个** `Arc`，否则 SSH 下图像永远
+                // 渲染不出来、应答也发不出去。它们在外层创建，此处克隆
+                // （`kitty_scanner` 也在本字面量里用它们，故必须 clone）。
+                images: images.clone(),
+                kitty_replies: kitty_replies.clone(),
+                kitty_images_dirty: kitty_images_dirty.clone(),
+                kitty_generation: 0,
+                last_kitty_generation: 0,
+                kitty_scanner: Some(
+                    crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage_and_geometry(
+                        images.storage(),
+                        KITTY_IMAGE_LIMIT > 0,
+                        Box::new(KittyReplySink {
+                            replies: kitty_replies.clone(),
+                            changed: kitty_images_dirty.clone(),
+                        }),
+                        default_bounds.into(),
+                    ),
+                ),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
@@ -1184,12 +1593,16 @@ impl Terminal {
                 input_area_start: None,
                 shell_fg_observed: None,
                 pending_osc: Vec::new(),
+                remote_mode_2048: false,
+                remote_mode_1016: false,
+                local_mode_1016: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                display_scale: 1.0,
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
                 link_hover_active: false,
                 last_mouse_position: None,
-            last_reported_mouse_cell: None,
+                last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
@@ -1519,8 +1932,14 @@ impl Terminal {
         // 分段喂入：处理某个 OSC 时，其前置文本已经过 vte 解析，
         // 这样 OSC 133;B 捕获的光标位置精确反映提示符末尾，
         // 不受同 chunk 后续回显的影响。需要由应用层消费的 OSC
-        // 序列（如 133;B、cwd 更新）在此被拦截，OSC 52 等则透传给 vte。
+        // 序列（如 133;B、cwd 更新）在此被拦截，OSC 52 等则透传给 vte；
+        // Kitty 图形 APC 同样在此被摘出交给扫描器。
         self.process_pty_data(data, require_local_osc7_host, cx);
+
+        // 扫描器刚产生的协议应答（如 `OK`、隐式 id 回报）回写给远端。
+        self.flush_kitty_replies();
+        // 远程路径的扫描发生在本线程，图像变更同步是即时的。
+        self.sync_kitty_state();
 
         // 标记内容已更新
         self.content_dirty = true;
@@ -1556,6 +1975,64 @@ impl Terminal {
         cx.emit(Event::Wakeup);
     }
 
+    /// 处理本地读线程的通知。
+    ///
+    /// 读线程只做 vte 解析（不需要 `Context`），凡涉及事件派发/重绘的
+    /// 副作用统一回到 UI 线程在这里完成。
+    #[cfg(unix)]
+    fn handle_local_notice(
+        &mut self,
+        notice: crate::terminal::local_pty::LocalNotice,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::terminal::local_pty::LocalNotice;
+        match notice {
+            LocalNotice::Wakeup => {
+                // 字节已被读线程解析进 `term`，这里只负责触发重绘。
+                // 但协议应答必须由 UI 线程回写（读线程不能写 PTY）。
+                self.flush_kitty_replies();
+                self.sync_kitty_state();
+                self.content_generation += 1;
+                self.content_dirty = true;
+                cx.emit(Event::Wakeup);
+                self.check_focus_mode_enabled();
+            }
+            LocalNotice::ChildExit(status) => {
+                // 退出事件已由读线程通过 `ZedListener` 发出（process_event
+                // 会处理 CloseTerminal / ProcessExited）；这里只兜底触发一次重绘，
+                // 保证 drain 出来的最后一段输出能上屏。
+                self.flush_kitty_replies();
+                self.sync_kitty_state();
+                self.content_generation += 1;
+                self.content_dirty = true;
+                cx.emit(Event::Wakeup);
+                let _ = status;
+            }
+            LocalNotice::Error(reason) => {
+                log::error!("本地 PTY 读线程错误: {reason}");
+            }
+        }
+    }
+
+    /// 把读线程置位的「图像已变化」标志同步为 `Terminal` 自己的代际号。
+    ///
+    /// 读线程只 `store(true)`；真正读取存储、决定重绘的时机在 UI 线程，
+    /// 这样渲染层不会在读线程刚写入一半时读到中间状态。
+    fn sync_kitty_state(&mut self) {
+        let changed = self
+            .kitty_images_dirty
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if changed {
+            self.images.bump_generation();
+        }
+        self.kitty_generation = self.images.generation();
+    }
+
+    /// Windows / headless 占位：本地通知任务仅 unix 存在。
+    #[cfg(not(unix))]
+    #[allow(dead_code)]
+    fn handle_local_notice(&mut self, _cx: &mut Context<Self>) {}
+
     /// 把一段字节喂给 vte 解析器（作用于 term）。空段直接跳过。
     fn advance_vte(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -1565,21 +2042,144 @@ impl Terminal {
         self.vte_processor.advance(&mut *term, bytes);
     }
 
-    /// 逐段扫描数据块：普通文本段直接喂给 vte，完整 OSC 交由应用层
-    /// 判定（消费则丢弃，否则透传给 vte）。跨 chunk 未完成的 OSC
-    /// 存入 `pending_osc`，与下一个数据块拼接后重新扫描。
+    /// 喂给 vte 之前，先按 `removals`（相对**整块** `data` 的偏移）把尺寸序列摘下。
     ///
-    /// 快速路径：不含 OSC 起始符时一次性喂入，避免分段锁开销。
+    /// `slice` 是整块中 `[base, base + slice.len())` 这一段；`removals` 沿用
+    /// 整块的坐标系，因此这里用 `base` 换算。
+    fn advance_vte_without_size_sequences(
+        &mut self,
+        slice: &[u8],
+        base: usize,
+        removals: &[(usize, usize)],
+    ) {
+        if slice.is_empty() {
+            return;
+        }
+        if removals.is_empty() {
+            self.advance_vte(slice);
+            return;
+        }
+        let end = base + slice.len();
+        let mut cursor = base;
+        for &(start, len) in removals {
+            if start >= end {
+                break;
+            }
+            if start + len <= base {
+                continue;
+            }
+            let cut_start = start.max(base);
+            let cut_end = (start + len).min(end);
+            if cut_start > cursor {
+                self.advance_vte(&slice[cursor - base..cut_start - base]);
+            }
+            cursor = cursor.max(cut_end);
+        }
+        if cursor < end {
+            self.advance_vte(&slice[cursor - base..]);
+        }
+    }
+
+    /// 摘除并应答远程路径上的尺寸上报类序列。
+    ///
+    /// 返回需要从字节流中摘除的区间（相对 `data` 的偏移，升序）。
+    /// 应答经 `write_raw` 立刻回写——与 `TextAreaSizeRequest` 走同一通道。
+    ///
+    /// 只处理 vte/alacritty 都不支持的两种：
+    /// - `CSI 16 t`：cell 像素尺寸 → `\x1b[6;{cell_height};{cell_width}t`
+    /// - `DECSET/DECRST ?2048`：in-band size reports → 置位时立即上报几何
+    ///
+    /// `CSI 14 t` / `CSI 18 t` **不在此列**：vte 已能正确应答（格式与 ghostty
+    /// 一致），在这里再拦一次会造成双重应答。
+    fn handle_size_sequences(
+        &mut self,
+        data: &[u8],
+        _cx: &mut Context<Self>,
+    ) -> Vec<(usize, usize)> {
+        use crate::terminal::escape_scan::{self, SizeReport};
+
+        let mut removals = Vec::new();
+        // 上报必须用物理像素：`CSI 16 t` 的 cell 尺寸是终端应用推算宽高比的
+        // 唯一依据，给逻辑点会让 Retina 上的应用把 surface 建小一半。
+        let geometry = self.terminal_bounds.term_geometry(self.display_scale);
+
+        let mut search_from = 0;
+        while let Some((offset, len)) = escape_scan::find_csi_16_t(&data[search_from..]) {
+            let start = search_from + offset;
+            let report = escape_scan::encode_size_report(SizeReport::CellSize, geometry);
+            self.write_raw(report.as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
+        let mut search_from = 0;
+        while let Some(hit) = escape_scan::find_private_mode_2048(&data[search_from..]) {
+            self.remote_mode_2048 = hit.enabled;
+            // 对齐 ghostty：每次置位都重发；复位静默。
+            if hit.enabled {
+                let report = escape_scan::encode_size_report(SizeReport::Mode2048, geometry);
+                self.write_raw(report.as_bytes());
+            }
+            // 仅单参数序列可整条摘除；多参数时保留原文让 vte 处理其余模式
+            // （见 `find_private_mode` 文档）。
+            if let Some(r) = hit.removable {
+                removals.push(r);
+            }
+            search_from = search_from + hit.start + hit.len;
+        }
+
+        // `DECSET/DECRST ?1016`：SGR-Pixels 鼠标编码。不产生任何应答
+        // （ghostty 的鼠标模式同样是纯状态开关），只需摘除以免 vte 把它当
+        // 未知模式、进而让后续 `DECRQM` 答 0。
+        let mut search_from = 0;
+        while let Some(hit) = escape_scan::find_private_mode_1016(&data[search_from..]) {
+            self.remote_mode_1016 = hit.enabled;
+            if let Some(r) = hit.removable {
+                removals.push(r);
+            }
+            search_from = search_from + hit.start + hit.len;
+        }
+
+        // `DECRQM ?1016$p`：状态查询。vte/alacritty 对未知模式答
+        // `NotSupported = 0`（`term/mod.rs:2087`），而 ghostty 答
+        // 1（复位）/2（置位）。terminal-browser 正是靠这个探测像素级鼠标
+        // 是否可用，答 0 会让它回退到单元格命中测试——所以必须自己应答。
+        let mut search_from = 0;
+        while let Some((offset, len)) =
+            escape_scan::find_dec_rqm_private(&data[search_from..], b"1016")
+        {
+            let start = search_from + offset;
+            let state = if self.remote_mode_1016 { 2 } else { 1 };
+            self.write_raw(format!("\x1b[?1016;{state}$y").as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
+        removals.sort_unstable();
+        removals
+    }
+
+    /// 逐段扫描数据块：普通文本段直接喂给 vte，完整 OSC 交由应用层
+    /// 判定（消费则丢弃，否则透传给 vte），完整 APC（Kitty 图形协议）
+    /// 交给扫描器消费。跨 chunk 未完成的序列存入 `pending_osc`，与下一个
+    /// 数据块拼接后重新扫描。
+    ///
+    /// 快速路径：两种起始符都不含时一次性喂入，避免分段锁开销。
     fn process_pty_data(
         &mut self,
         data: &[u8],
         require_local_osc7_host: bool,
         cx: &mut Context<Self>,
     ) {
-        const OSC_START: &[u8] = b"\x1b]";
-        // 未完成 OSC 的缓存上限；超过则放弃拼接直接透传，防止异常
-        // 输出（无终止符的 ESC ]）无限占用内存。
+        use crate::terminal::escape_scan::{self, Extract};
+
+        // 未完成 OSC 的缓存上限；超过则放弃拼接直接透传，防止异常输出
+        // （无终止符的 ESC ]）无限占用内存。
         const MAX_PENDING_OSC: usize = 8 * 1024;
+        // 未完成 APC（Kitty 图形）的上限与单条命令负载上限一致：
+        // 图形分片单条可达数 MB（terminal-browser 的整帧传输），8 KiB 会
+        // 把合法序列透传给 vte 而丢失图像。
+        const MAX_PENDING_APC: usize = crate::terminal::kitty::command::MAX_COMMAND_BYTES;
 
         // 有跨 chunk 残尾时先拼接（拷贝一次，仅在有残尾时发生）。
         let pending = std::mem::take(&mut self.pending_osc);
@@ -1591,44 +2191,124 @@ impl Terminal {
             joined.as_slice()
         };
 
-        if memchr::memmem::find(data, OSC_START).is_none() {
+        let next_osc = memchr::memmem::find(data, escape_scan::OSC_START);
+        let next_apc = memchr::memmem::find(data, escape_scan::APC_START);
+        let next_csi = memchr::memmem::find(data, escape_scan::CSI_START);
+        if next_osc.is_none() && next_apc.is_none() && next_csi.is_none() {
             self.advance_vte(data);
             return;
         }
 
+        // 尺寸上报类序列（`CSI 16 t` / DECSET 2048）就地摘除并应答。
+        //
+        // vte 对 `CSI 16 t` 是 `unhandled!()`、alacritty 把 2048 视为未知模式，
+        // 因此必须在这一层处理。几何直接取 `self.terminal_bounds`（UI 线程，
+        // 恒为最新），无须像本地路径那样经过扫描器缓存。
+        let size_removals = self.handle_size_sequences(data, cx);
+        if next_osc.is_none() && next_apc.is_none() {
+            // 只有尺寸序列：喂入剩余文本即可。
+            self.advance_vte_without_size_sequences(data, 0, &size_removals);
+            return;
+        }
+
         let mut pos = 0;
-        while let Some(osc_offset) = memchr::memmem::find(&data[pos..], OSC_START) {
-            let osc_pos = pos + osc_offset;
-
-            // 先喂入 OSC 之前的普通文本，使光标反映这些内容
-            self.advance_vte(&data[pos..osc_pos]);
-
-            match Terminal::extract_osc_sequence(&data[osc_pos..]) {
-                Some((osc_end, osc_content)) => {
-                    if self.try_handle_osc_sequence(cx, osc_content, require_local_osc7_host) {
-                        // 已由应用层处理，跳过这个序列
-                        pos = osc_pos + osc_end;
+        loop {
+            // 下一个起始符（OSC / APC 中较早者）。
+            let osc_offset = memchr::memmem::find(&data[pos..], escape_scan::OSC_START);
+            let apc_offset = memchr::memmem::find(&data[pos..], escape_scan::APC_START);
+            let (offset, is_apc) = match (osc_offset, apc_offset) {
+                (Some(o), Some(a)) => {
+                    if a < o {
+                        (a, true)
                     } else {
-                        // 不是应用层关心的 OSC，保留给 vte 自己处理
-                        self.advance_vte(&data[osc_pos..osc_pos + osc_end]);
-                        pos = osc_pos + osc_end;
+                        (o, false)
                     }
                 }
-                None => {
-                    // 序列不完整：若残尾过大则直接透传，否则暂存等下一个 chunk
-                    if data.len() - osc_pos > MAX_PENDING_OSC {
-                        self.advance_vte(&data[osc_pos..]);
+                (Some(o), None) => (o, false),
+                (None, Some(a)) => (a, true),
+                (None, None) => break,
+            };
+            let seq_pos = pos + offset;
+
+            // 先喂入序列之前的普通文本，使光标反映这些内容。
+            // 尺寸序列只出现在这些"普通文本"里，逐段摘下。
+            self.advance_vte_without_size_sequences(&data[pos..seq_pos], pos, &size_removals);
+
+            if is_apc {
+                match escape_scan::extract_apc(&data[seq_pos..]) {
+                    Extract::Complete { len, content } => {
+                        // 图形 APC 由扫描器消费，不进入 vte（vte 会丢弃内容，
+                        // 但序列本身仍走一遍状态机——提前摘除更干净）。
+                        self.handle_kitty_apc(content);
+                        pos = seq_pos + len;
+                    }
+                    Extract::Incomplete => {
+                        if data.len() - seq_pos > MAX_PENDING_APC {
+                            self.advance_vte(&data[seq_pos..]);
+                        } else {
+                            self.pending_osc = data[seq_pos..].to_vec();
+                        }
+                        pos = data.len();
+                    }
+                    Extract::NotStart => pos = seq_pos + escape_scan::APC_START.len(),
+                }
+                continue;
+            }
+
+            match escape_scan::extract_osc(&data[seq_pos..]) {
+                Extract::Complete { len, content } => {
+                    if !self.try_handle_osc_sequence(cx, content, require_local_osc7_host) {
+                        // 不是应用层关心的 OSC，保留给 vte 自己处理。
+                        self.advance_vte(&data[seq_pos..seq_pos + len]);
+                    }
+                    pos = seq_pos + len;
+                }
+                Extract::Incomplete => {
+                    // 序列不完整：若残尾过大则直接透传，否则暂存等下一个 chunk。
+                    if data.len() - seq_pos > MAX_PENDING_OSC {
+                        self.advance_vte(&data[seq_pos..]);
                     } else {
-                        self.pending_osc = data[osc_pos..].to_vec();
+                        self.pending_osc = data[seq_pos..].to_vec();
                     }
                     pos = data.len();
                 }
+                Extract::NotStart => pos = seq_pos + escape_scan::OSC_START.len(),
             }
         }
 
         if pos < data.len() {
-            self.advance_vte(&data[pos..]);
+            self.advance_vte_without_size_sequences(&data[pos..], pos, &size_removals);
         }
+    }
+
+    /// 处理一条完整的 APC 内容（远程路径：扫描在 UI 线程完成）。
+    ///
+    /// 先同步光标位置——`a=T`/`a=p`/`d=c` 以光标为锚点，而扫描器不与 `term`
+    /// 争锁，只能由调用方在解析字节的间隙告知。
+    fn handle_kitty_apc(&mut self, content: &[u8]) {
+        use crate::terminal::escape_scan;
+        if !escape_scan::is_kitty_graphics(content) {
+            return;
+        }
+        let cursor = {
+            let term = self.term.lock();
+            let point = term.grid().cursor.point;
+            (point.line.0, point.column.0 as u32)
+        };
+        let Some(scanner) = self.kitty_scanner.as_mut() else {
+            return;
+        };
+        scanner.set_cursor(cursor.0, cursor.1);
+        scanner.scan_apc(content);
+    }
+
+    /// 把扫描器攒下的协议应答回写给 PTY/SSH。
+    fn flush_kitty_replies(&mut self) {
+        let replies = match self.kitty_replies.lock() {
+            Ok(mut buf) if !buf.is_empty() => std::mem::take(&mut *buf),
+            _ => return,
+        };
+        self.write_raw(&replies);
     }
 
     fn try_handle_osc_sequence(
@@ -1875,31 +2555,6 @@ impl Terminal {
         String::from_utf8(decoded).unwrap_or_else(|_| path.to_string())
     }
 
-    /// 提取完整的 OSC 序列
-    /// 返回 (序列长度, 序列内容不含 OSC 前缀)
-    fn extract_osc_sequence(data: &[u8]) -> Option<(usize, &[u8])> {
-        // OSC 序列格式: ESC ] <content> BEL
-        //           或: ESC ] <content> ESC \
-        if data.len() < 2 || data[0] != 0x1b || data[1] != b']' {
-            return None;
-        }
-
-        let body = &data[2..];
-
-        // 查找 BEL 结束符 (0x07)
-        if let Some(pos) = memchr::memchr(0x07, body) {
-            return Some((pos + 3, &body[..pos]));
-        }
-
-        // 查找 ESC \ 结束符 (0x1b 0x5c)
-        if let Some(pos) = memchr::memmem::find(body, b"\x1b\\") {
-            return Some((pos + 4, &body[..pos]));
-        }
-
-        // 未找到结束符，序列不完整
-        None
-    }
-
     fn process_event(&mut self, event: AlacTermEvent, cx: &mut Context<Self>) {
         match event {
             AlacTermEvent::Title(title) => {
@@ -1946,13 +2601,11 @@ impl Terminal {
                 self.write_raw(response.as_bytes());
             }
             AlacTermEvent::TextAreaSizeRequest(format) => {
-                // 响应窗口大小查询 (CSI t)
-                let window_size = alacritty_terminal::event::WindowSize {
-                    num_lines: self.terminal_bounds.num_lines() as u16,
-                    num_cols: self.terminal_bounds.num_columns() as u16,
-                    cell_width: self.terminal_bounds.cell_width.as_f32() as u16,
-                    cell_height: self.terminal_bounds.line_height.as_f32() as u16,
-                };
+                // 响应窗口大小查询 (CSI t) —— 这里是 `CSI 14 t` 的主路径
+                // （alacritty 在 `term/mod.rs:2258` 用闭包算 `num_lines *
+                // cell_height` / `num_cols * cell_width`，即 grid 的像素范围）。
+                // cell 尺寸同样必须是物理像素，理由同 `handle_size_sequences`。
+                let window_size = self.terminal_bounds.window_size(self.display_scale);
                 let response = format(window_size);
                 self.write_raw(response.as_bytes());
             }
@@ -2070,6 +2723,7 @@ impl Terminal {
             IndexedCell {
                 point: ic.point,
                 cell: PackedCell::from(ic.cell),
+                zerowidth: packed_zerowidth(ic.cell),
                 hyperlink: ic.cell.hyperlink(),
             }
         }));
@@ -2123,16 +2777,12 @@ impl Terminal {
             self.last_content.url_ranges.clear();
             self.last_content.hyperlink_ranges.clear();
             self.last_content.url_ranges.reserve(row_ranges.len());
-            self.last_content
-                .hyperlink_ranges
-                .reserve(row_ranges.len());
+            self.last_content.hyperlink_ranges.reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
                 let row_cells = &cells[*start..*end];
-                self.last_content
-                    .url_ranges
-                    .push(crate::terminal::link_detector::detect_urls_in_line(
-                        row_cells,
-                    ));
+                self.last_content.url_ranges.push(
+                    crate::terminal::link_detector::detect_urls_in_line(row_cells),
+                );
                 self.last_content.hyperlink_ranges.push(
                     crate::terminal::link_detector::detect_hyperlinks_in_line(row_cells),
                 );
@@ -2203,6 +2853,55 @@ impl Terminal {
         &self.dirty_row_bounds
     }
 
+    /// 返回视图行 damage 上界与「图像是否变化」。
+    ///
+    /// 图像渲染必须知道自上一帧以来图像集合是否变过：网格 damage 只覆盖
+    /// 文字，而 Kitty 图像的插入/删除往往不伴随任何文字变化（例：`a=d` 删除
+    /// 一条不占格的图像），此时若只看 `dirty_rows` 就不会重绘，屏幕上会残留
+    /// 已删除的图像。
+    pub fn take_kitty_damage(&mut self) -> bool {
+        let changed = self.kitty_generation != self.last_kitty_generation;
+        self.last_kitty_generation = self.kitty_generation;
+        changed
+    }
+
+    /// 只读访问 Kitty 图像存储（渲染层用）。
+    ///
+    /// 回调形式：持锁期间不要再去取 `term` 锁——本地终端的读线程会长时间
+    /// 持有 `term` 并最终申请图像存储锁，反向加锁会形成死锁环路。
+    pub fn with_kitty_storage<R>(&self, f: impl FnOnce(&KittyStorage) -> R) -> R {
+        self.images.with_storage(f)
+    }
+
+    /// 图像存储的共享句柄。
+    ///
+    /// 渲染层需要「先释放对 `Terminal` 实体的借用，再自行加锁」——因为
+    /// 纹理创建要走 GPUI 的 `App`，而带着 `Entity` 借用去调 GPUI 会造成
+    /// 借位冲突。拿到 `Arc` 后调用方可以脱开实体自行 `lock`。
+    pub fn images_handle(&self) -> std::sync::Arc<std::sync::Mutex<KittyStorage>> {
+        self.images.storage()
+    }
+
+    /// 当前图像集合代际（测试/诊断用）。
+    pub fn kitty_generation(&self) -> u64 {
+        self.kitty_generation
+    }
+
+    /// 推进所有正在播放的 Kitty 动画帧，返回距下一次换帧的毫秒数。
+    ///
+    /// 渲染层每构建一帧调用一次（`now_ms` 用与其它调用同一单调时钟），并按
+    /// 返回值安排一次唤醒——这就是动画唯一的驱动来源，不存在后台线程。
+    /// 换帧会 bump 图像代际，因此这里同步 `kitty_generation`，让
+    /// [`Terminal::take_kitty_damage`] 在下次 prepaint 认出"需要重绘"。
+    pub fn animation_tick(&mut self, now_ms: u64) -> Option<u64> {
+        let delay = self.images.with_storage_mut(|storage| {
+            crate::terminal::kitty::render::animation_tick(storage, now_ms)
+        });
+        // 换帧等价于"图像集合变了"：代际一变，渲染层就会失效纹理并全量重绘。
+        self.sync_kitty_state();
+        delay
+    }
+
     pub fn write(&mut self, data: &[u8]) {
         // 用户输入即将进入 PTY：维护输入区锚点（见 input_area_start 文档）。
         // - shell 前台且尚无锚点 → 以当前光标（提示符末尾）为锚点；
@@ -2213,6 +2912,12 @@ impl Terminal {
         self.observe_input_state();
         if memchr::memchr2(b'\r', b'\n', data).is_some() {
             self.input_area_start = None;
+        }
+
+        #[cfg(unix)]
+        if let Some(ref sender) = self.local_sender {
+            sender.input(data.to_vec());
+            return;
         }
 
         if let Some(ref sender) = self.sender {
@@ -2235,6 +2940,11 @@ impl Terminal {
     /// 误清锚点并把锚点重捕到程序输出末尾，使 `input_line_blank` 在非空行上
     /// 误报 true，导致 `/` 前缀被错误拦截进内建命令。
     pub fn write_raw(&mut self, data: &[u8]) {
+        #[cfg(unix)]
+        if let Some(ref sender) = self.local_sender {
+            sender.input(data.to_vec());
+            return;
+        }
         if let Some(ref sender) = self.sender {
             let msg = Msg::Input(Cow::Owned(data.to_vec()));
             let _ = sender.send(msg);
@@ -2297,7 +3007,12 @@ impl Terminal {
     ///   仅 drop `RusshTerminal` 无法终止连接，因为 `state` 被任务自身持有）。
     /// - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，随 `Terminal` 析构自动释放。
     pub fn kill(&mut self) {
-        // 本地终端：通知底层事件循环关闭（会回收 shell 子进程）
+        // 本地终端（unix）：通知读线程退出，释放 PTY / 回收 shell 子进程。
+        #[cfg(unix)]
+        if let Some(sender) = &self.local_sender {
+            sender.shutdown();
+        }
+        // 本地终端（windows）：通知底层事件循环关闭（会回收 shell 子进程）
         if let Some(sender) = &self.sender {
             let _ = sender.send(Msg::Shutdown);
         }
@@ -2307,7 +3022,10 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, bounds: TerminalBounds, cx: &mut Context<Self>) {
+    /// `scale` 是窗口所在显示的缩放（`Window::scale_factor()`）。它只影响
+    /// 尺寸上报与 PTY 的 `ws_xpixel`，不影响网格行列数或布局——`bounds`
+    /// 自身恒为逻辑点。
+    pub fn resize(&mut self, bounds: TerminalBounds, scale: f32, cx: &mut Context<Self>) {
         let cols = bounds.num_columns();
         let rows = bounds.num_lines();
 
@@ -2321,13 +3039,27 @@ impl Terminal {
         // 网格与 PTY 走合并通道，渲染层在两次应用之间始终用「已应用」尺寸。
         self.terminal_bounds.bounds.origin = bounds.bounds.origin;
 
+        // 必须在下面的早退之前更新：跨显示器拖动窗口时网格行列数可能一点
+        // 没变、只有 DPI 变了，早退会把这个更新吞掉，读线程就会一直拿着旧
+        // 几何上报（Retina ↔ 外接屏来回拖就会出现分辨率跳错）。
+        let scale = normalize_scale(scale);
+        let scale_changed = scale != self.display_scale;
+        self.display_scale = scale;
+
         // 对应 ghostty `Terminal.resize` 的 cols/rows 未变早退。
         let applied_cols = self.terminal_bounds.num_columns();
         let applied_rows = self.terminal_bounds.num_lines();
-        if cols == applied_cols && rows == applied_rows {
+        if cols == applied_cols && rows == applied_rows && !scale_changed {
             // 尺寸已与应用一致（可能拖回了旧尺寸）：撤销待应用的中间值。
             self.pending_resize = None;
             self.resize_task = None;
+            return;
+        }
+        if cols == applied_cols && rows == applied_rows {
+            // 只有 DPI 变化：没有网格 reflow 可合并，但 PTY 与扫描器必须
+            // 立刻拿到新几何，所以绕过 25ms 合并定时器直接应用。
+            self.pending_resize = Some(bounds);
+            self.apply_pending_resize(false, cx);
             return;
         }
 
@@ -2344,7 +3076,13 @@ impl Terminal {
 
         // deepterm 特有：headless / 错误终端没有子进程可同步，立即应用以保持
         // 测试与基准确定性（ghostty 无此形态）。
-        if self.sender.is_none() && self.remote_resize_callback.is_none() {
+        // 本地终端：读线程 / EventLoop 都没有子进程可同步时（headless、错误终端），
+        // 立即应用以保持测试与基准确定性。
+        #[cfg(unix)]
+        let has_local_sink = self.local_sender.is_some() || self.remote_resize_callback.is_some();
+        #[cfg(not(unix))]
+        let has_local_sink = self.sender.is_some() || self.remote_resize_callback.is_some();
+        if !has_local_sink {
             self.apply_pending_resize(false, cx);
             return;
         }
@@ -2355,9 +3093,7 @@ impl Terminal {
             return;
         }
         self.resize_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(RESIZE_COALESCE_DELAY)
-                .await;
+            cx.background_executor().timer(RESIZE_COALESCE_DELAY).await;
             let _ = this.update(cx, |terminal, cx| {
                 terminal.resize_task = None;
                 terminal.apply_pending_resize(true, cx);
@@ -2388,26 +3124,33 @@ impl Terminal {
 
         // 全量应用新 bounds（尺寸 + 度量 + 原点）—— 渲染层由此拿到新尺寸。
         self.terminal_bounds = bounds;
-        if cols == applied_cols && rows == applied_rows {
-            return;
+        let grid_changed = cols != applied_cols || rows != applied_rows;
+        if grid_changed {
+            {
+                let mut term = self.term.lock();
+                term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
+            }
+            // 对应 ghostty `Terminal.resize` 尾部的 `flags.dirty.clear = true`：
+            // resize 后强制渲染层全量重绘，行缓存不留任何旧尺寸的残留。
+            self.input_area_start = None;
+            self.update_last_content(true);
         }
 
-        {
-            let mut term = self.term.lock();
-            term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
+        // 注意：不能因 cols/rows 未变就跳过下面的通知。跨显示器拖动只改 DPI、
+        // 不改网格，此时 PTY 的 `ws_xpixel` 与读线程扫描器的几何都必须刷新。
+        //
+        // 本地终端：通过 sender 发送 resize 消息（cell 尺寸已按显示缩放
+        // 换算成物理像素，读线程据此填扫描器几何）。
+        #[cfg(unix)]
+        if let Some(ref sender) = self.local_sender {
+            sender.resize(bounds.window_size(self.display_scale));
         }
-        // 对应 ghostty `Terminal.resize` 尾部的 `flags.dirty.clear = true`：
-        // resize 后强制渲染层全量重绘，行缓存不留任何旧尺寸的残留。
-        self.input_area_start = None;
-        self.update_last_content(true);
-
-        // 本地终端：通过 sender 发送 resize 消息
         if let Some(ref sender) = self.sender {
-            let _ = sender.send(Msg::Resize(bounds.into()));
+            let _ = sender.send(Msg::Resize(bounds.window_size(self.display_scale)));
         }
-        // 远程终端：通过回调通知 SSH 通道调整窗口大小
+        // 远程终端：通过回调通知 SSH 通道调整窗口大小（带上缩放，理由见回调类型）
         if let Some(ref callback) = self.remote_resize_callback {
-            callback(cols as u16, rows as u16);
+            callback(cols as u16, rows as u16, self.display_scale);
         }
         // 对应 ghostty `renderer_mailbox.push(.resize)` + `renderer_wakeup`。
         if wake {
@@ -2448,9 +3191,9 @@ impl Terminal {
                 url_ranges.push(crate::terminal::link_detector::detect_urls_in_line(
                     row_cells,
                 ));
-                hyperlink_ranges.push(
-                    crate::terminal::link_detector::detect_hyperlinks_in_line(row_cells),
-                );
+                hyperlink_ranges.push(crate::terminal::link_detector::detect_hyperlinks_in_line(
+                    row_cells,
+                ));
             }
         } else {
             self.last_content.url_ranges.clear();
@@ -2460,6 +3203,34 @@ impl Terminal {
 
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
+    }
+
+    /// 收集视口里的 Unicode 占位符单元格（Kitty 图形协议 `U=1`）。
+    ///
+    /// 只挑 `U+10EEEE` 的单元格——绝大多数帧一个都没有，所以这里的成本就是
+    /// 一遍字符比较。结果按 `(行, 列)` 升序：`last_content.cells` 本身就是按
+    /// 可见行、行内列序排列的，顺序扫一遍即可。
+    ///
+    /// 为什么不直接让渲染层读 `last_content()`：那里需要同时持有终端实体的
+    /// 借用和 kitty 存储锁，而两者都要参与 `plan_placeholders`。这里先拍平成
+    /// 一份不借用终端的数据，渲染层拿去用就行。
+    pub fn kitty_placeholder_cells(&self) -> Vec<crate::terminal::kitty::render::PlaceholderCell> {
+        use crate::terminal::kitty::unicode::PLACEHOLDER;
+
+        let mut out = Vec::new();
+        for indexed in &self.last_content.cells {
+            if indexed.cell.c != PLACEHOLDER {
+                continue;
+            }
+            out.push(crate::terminal::kitty::render::PlaceholderCell {
+                row: indexed.point.line.0,
+                col: indexed.point.column.0 as u32,
+                fg: indexed.cell.fg,
+                underline_color: indexed.cell.underline_color,
+                zerowidth: indexed.zerowidth,
+            });
+        }
+        out
     }
 
     /// Find a URL at the given viewport position.
@@ -2531,15 +3302,12 @@ impl Terminal {
         viewport_row: usize,
         col: usize,
     ) -> Option<FileHit> {
-        use crate::terminal::file_link_detector::{
-            detect_files_in_line, file_hit_at_col,
-        };
+        use crate::terminal::file_link_detector::{detect_files_in_line, file_hit_at_col};
         let content = &self.last_content;
         let (start, end) = content.row_ranges.get(viewport_row).copied()?;
         let row_cells = &content.cells[start..end];
         // Fast path: no wrap continuation.
-        if !self.viewport_row_wrapped(viewport_row)
-            || viewport_row + 1 >= content.row_ranges.len()
+        if !self.viewport_row_wrapped(viewport_row) || viewport_row + 1 >= content.row_ranges.len()
         {
             let hits = detect_files_in_line(row_cells);
             return file_hit_at_col(&hits, col).cloned();
@@ -2550,7 +3318,7 @@ impl Terminal {
         let mut joined = String::new();
         for cell in row_cells.iter().chain(content.cells[nstart..nend].iter()) {
             let ch = cell.cell.c;
-            if ch == ' ' {
+            if ch == '\0' {
                 continue;
             }
             joined.push(ch);
@@ -2559,7 +3327,7 @@ impl Terminal {
         let mut first_map: Vec<usize> = Vec::new();
         for cell in row_cells {
             let ch = cell.cell.c;
-            if ch == ' ' {
+            if ch == '\0' {
                 continue;
             }
             let c = cell.point.column.0;
@@ -2593,6 +3361,21 @@ impl Terminal {
         let term = self.term.lock();
         let mode = term.mode();
         mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::VI)
+    }
+
+    /// SGR-Pixels 鼠标编码（DECSET 1016）当前是否生效。
+    ///
+    /// 该模式的开关状态无法从 `TermMode` 读出（vte/alacritty 不认识 1016），
+    /// 因此按路径分别取：
+    /// - 本地终端：读线程里的扫描器写入 `local_mode_1016` 共享原子量；
+    /// - 远程终端：UI 线程在 `process_pty_data` 里写入 `remote_mode_1016`。
+    ///
+    /// 两条路径只会有一条是活跃的，因此本地标志为假时回退到远程字段即可，
+    /// 无需额外的分支判断。
+    fn sgr_pixels_active(&self) -> bool {
+        self.local_mode_1016
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.remote_mode_1016
     }
 
     /// 清空旧选区并开始新选区（单次持锁，避免连续两次 term 锁）。
@@ -2636,9 +3419,16 @@ impl Terminal {
                 self.terminal_bounds,
                 self.last_content.display_offset,
             );
-            if let Some(bytes) =
-                mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode)
-            {
+            if let Some(bytes) = mouse_button_report(
+                point,
+                position,
+                e.button,
+                e.modifiers,
+                true,
+                self.last_content.mode,
+                self.sgr_pixels_active(),
+                self.display_scale,
+            ) {
                 self.write(&bytes);
             }
             return;
@@ -2688,9 +3478,16 @@ impl Terminal {
                 self.terminal_bounds,
                 self.last_content.display_offset,
             );
-            if let Some(bytes) =
-                mouse_button_report(point, e.button, e.modifiers, false, self.last_content.mode)
-            {
+            if let Some(bytes) = mouse_button_report(
+                point,
+                position,
+                e.button,
+                e.modifiers,
+                false,
+                self.last_content.mode,
+                self.sgr_pixels_active(),
+                self.display_scale,
+            ) {
                 self.write(&bytes);
             }
             return;
@@ -2785,14 +3582,27 @@ impl Terminal {
             // 按网格坐标去重：MOUSE_MOTION 模式下移动事件可达数百 Hz，
             // 每个（行,列）只发一次报文（alacritty 同样按 cell 去重），
             // 否则远端应用的重绘回报会成倍放大为全帧重排版。
-            if self.last_reported_mouse_cell == Some((point.line, point.column)) {
-                return;
+            //
+            // **SGR-Pixels 例外**：该模式下坐标精度是像素，同一单元格内的
+            // 移动也必须上报，否则应用只能拿到单元格粒度的位置。ghostty
+            // 在 `mouse_encode.zig:108` 显式豁免了 `.sgr_pixels`。因此这种
+            // 情况下跳过去重、也不更新 `last_reported_mouse_cell`。
+            if !self.sgr_pixels_active() {
+                if self.last_reported_mouse_cell == Some((point.line, point.column)) {
+                    return;
+                }
+                self.last_reported_mouse_cell = Some((point.line, point.column));
             }
-            self.last_reported_mouse_cell = Some((point.line, point.column));
 
-            if let Some(bytes) =
-                mouse_moved_report(point, e.pressed_button, e.modifiers, self.last_content.mode)
-            {
+            if let Some(bytes) = mouse_moved_report(
+                point,
+                position,
+                e.pressed_button,
+                e.modifiers,
+                self.last_content.mode,
+                self.sgr_pixels_active(),
+                self.display_scale,
+            ) {
                 self.write(&bytes);
             }
         }
@@ -2807,14 +3617,22 @@ impl Terminal {
             && scroll_lines != 0
         {
             if mouse_mode {
+                let position = e.position - self.terminal_bounds.bounds.origin;
                 let point = grid_point(
-                    e.position - self.terminal_bounds.bounds.origin,
+                    position,
                     self.terminal_bounds,
                     self.last_content.display_offset,
                 );
 
-                if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
-                {
+                if let Some(scrolls) = scroll_report(
+                    point,
+                    position,
+                    scroll_lines,
+                    e,
+                    self.last_content.mode,
+                    self.sgr_pixels_active(),
+                    self.display_scale,
+                ) {
                     for scroll in scrolls {
                         self.write(&scroll);
                     }
@@ -3165,7 +3983,10 @@ pub fn grid_search_snapshot<T: EventListener>(term: &Term<T>) -> SearchSnapshot 
             if cell.c == '\0' || cell.flags.intersects(spacer_flags) {
                 continue;
             }
-            let wide = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) {
+            let wide = if cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
+            {
                 2
             } else {
                 1
@@ -3270,7 +4091,10 @@ pub fn scroll_offset_to_center(viewport_rows: usize, history_size: usize, line: 
 
 #[cfg(test)]
 mod tests {
-    use super::{RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalType};
+    use super::{
+        IndexedCell, PackedCell, RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalContent,
+        TerminalType, packed_zerowidth,
+    };
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
     use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
@@ -3290,9 +4114,13 @@ mod tests {
             alacritty_terminal::event::VoidListener,
         );
         term.goto(0, 0);
-        for c in "hello".chars() { term.input(c); }
+        for c in "hello".chars() {
+            term.input(c);
+        }
         term.linefeed();
-        for c in "World".chars() { term.input(c); }
+        for c in "World".chars() {
+            term.input(c);
+        }
         // 光标移到屏底再 linefeed：两行内容整体进 scrollback（hello → Line(-1)）
         term.goto(3, 0);
         term.linefeed();
@@ -3323,7 +4151,9 @@ mod tests {
             alacritty_terminal::event::VoidListener,
         );
         term.goto(0, 0);
-        for c in "你好 deepterm 世界".chars() { term.input(c); }
+        for c in "你好 deepterm 世界".chars() {
+            term.input(c);
+        }
 
         let matches = super::search_matches_in_grid(&term, "你好");
         assert_eq!(matches.len(), 1, "应命中中文词");
@@ -3344,8 +4174,14 @@ mod tests {
         // "aa" 应命中 2 次（重叠跳过），而不是 3 次（滑动窗口）
         let matches = super::search_matches_in_grid(&term, "aa");
         assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].start.column, alacritty_terminal::index::Column(0));
-        assert_eq!(matches[1].start.column, alacritty_terminal::index::Column(2));
+        assert_eq!(
+            matches[0].start.column,
+            alacritty_terminal::index::Column(0)
+        );
+        assert_eq!(
+            matches[1].start.column,
+            alacritty_terminal::index::Column(2)
+        );
         // 空串 / 纯空白无命中
         assert!(super::search_matches_in_grid(&term, "").is_empty());
         assert!(super::search_matches_in_grid(&term, "   ").is_empty());
@@ -3353,10 +4189,10 @@ mod tests {
 
     #[test]
     fn search_snapshot_matches_sync_scan_and_follows_grid_drift() {
+        use super::AlacPoint;
         use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::test::TermSize;
-        use super::AlacPoint;
 
         let size = TermSize::new(20, 4);
         let mut term = alacritty_terminal::term::Term::new(
@@ -3389,7 +4225,11 @@ mod tests {
         }
         let shifted = super::search_matches_in_grid(&term, "hello");
         assert_eq!(shifted.len(), 1);
-        assert_eq!(shifted[0].start.line, Line(-3), "重算后应指向内容当前所在行");
+        assert_eq!(
+            shifted[0].start.line,
+            Line(-3),
+            "重算后应指向内容当前所在行"
+        );
         assert_ne!(shifted[0].start.line, via_snapshot[0].start.line);
     }
 
@@ -3431,13 +4271,11 @@ mod tests {
         assert_eq!(title, "构建失败");
         assert_eq!(body, "请检查日志");
         // urxvt OSC 777;notify;Title;Body
-        let (title, body) =
-            Terminal::parse_notification_osc(b"777;notify;Deploy;done").unwrap();
+        let (title, body) = Terminal::parse_notification_osc(b"777;notify;Deploy;done").unwrap();
         assert_eq!(title, "Deploy");
         assert_eq!(body, "done");
         // 简化 OSC 9;message：全文作标题，body 为空
-        let (title, body) =
-            Terminal::parse_notification_osc(b"9;hello world").unwrap();
+        let (title, body) = Terminal::parse_notification_osc(b"9;hello world").unwrap();
         assert_eq!(title, "hello world");
         assert_eq!(body, "");
         // OSC 9;4 进度上报（ConEmu）不是通知
@@ -3717,16 +4555,16 @@ mod tests {
     }
 
     /// 构造一个无 PTY、但带记录型 `remote_resize_callback` 的终端，
-    /// 以便观察「窗口尺寸通知」的下发次数与内容。
+    /// 以便观察「窗口尺寸通知」的下发次数与内容（含缩放）。
     fn resize_test_terminal(
         cx: &mut TestAppContext,
-    ) -> (Entity<Terminal>, Arc<Mutex<Vec<(u16, u16)>>>) {
+    ) -> (Entity<Terminal>, Arc<Mutex<Vec<(u16, u16, f32)>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sink = calls.clone();
         let terminal = cx.new(move |_| {
             let mut t = Terminal::create_error_terminal();
-            t.remote_resize_callback = Some(Box::new(move |cols, rows| {
-                sink.lock().unwrap().push((cols, rows));
+            t.remote_resize_callback = Some(Box::new(move |cols, rows, scale| {
+                sink.lock().unwrap().push((cols, rows, scale));
             }));
             t
         });
@@ -3746,30 +4584,32 @@ mod tests {
 
         // 首帧立即校正（deepterm 特有：PTY 以默认 55×18 启动）。
         terminal.update(cx, |t, cx| {
-            t.resize(bounds_for(30, 10), cx);
+            t.resize(bounds_for(30, 10), 1.0, cx);
             assert_eq!(grid_size(t), (30, 10));
         });
-        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10)]);
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10, 1.0)]);
 
         // 合并窗口内网格保持旧尺寸，只保留最新 pending。
         terminal.update(cx, |t, cx| {
-            t.resize(bounds_for(40, 14), cx);
+            t.resize(bounds_for(40, 14), 1.0, cx);
             assert_eq!(grid_size(t), (30, 10), "合并窗口内网格不应变化");
         });
         assert_eq!(calls.lock().unwrap().len(), 1, "合并窗口内不应通知");
 
         // 定时器活动期间后续事件不重置定时器（ghostty handleResize 语义）。
-        cx.background_executor.advance_clock(Duration::from_millis(10));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(10));
         cx.run_until_parked();
-        terminal.update(cx, |t, cx| t.resize(bounds_for(50, 15), cx));
-        cx.background_executor.advance_clock(Duration::from_millis(15));
+        terminal.update(cx, |t, cx| t.resize(bounds_for(50, 15), 1.0, cx));
+        cx.background_executor
+            .advance_clock(Duration::from_millis(15));
         cx.run_until_parked();
         terminal.read_with(cx, |t, _| {
             assert_eq!(grid_size(t), (50, 15), "25ms 到点应应用最新尺寸");
         });
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &[(30, 10), (50, 15)],
+            &[(30, 10, 1.0), (50, 15, 1.0)],
             "只通知最新尺寸"
         );
     }
@@ -3778,22 +4618,22 @@ mod tests {
     #[gpui::test]
     fn resize_zero_bounds_does_not_apply(cx: &mut TestAppContext) {
         let (terminal, calls) = resize_test_terminal(cx);
-        terminal.update(cx, |t, cx| t.resize(bounds_for(40, 10), cx));
+        terminal.update(cx, |t, cx| t.resize(bounds_for(40, 10), 1.0, cx));
         let before = calls.lock().unwrap().len();
 
         terminal.update(cx, |t, cx| {
-            t.resize(bounds_for(0, 10), cx);
+            t.resize(bounds_for(0, 10), 1.0, cx);
             assert_eq!(grid_size(t), (40, 10), "零尺寸不应改变网格");
         });
         assert_eq!(calls.lock().unwrap().len(), before, "零尺寸不应通知");
 
         // 恢复有效尺寸：走合并窗口后应用。
-        terminal.update(cx, |t, cx| t.resize(bounds_for(41, 10), cx));
+        terminal.update(cx, |t, cx| t.resize(bounds_for(41, 10), 1.0, cx));
         cx.background_executor.advance_clock(RESIZE_COALESCE_DELAY);
         cx.run_until_parked();
         assert_eq!(
             calls.lock().unwrap().last().copied(),
-            Some((41, 10)),
+            Some((41, 10, 1.0)),
             "恢复尺寸后应应用最新尺寸"
         );
     }
@@ -3802,18 +4642,18 @@ mod tests {
     #[gpui::test]
     fn resize_dedupes_when_returning_to_applied_size(cx: &mut TestAppContext) {
         let (terminal, calls) = resize_test_terminal(cx);
-        terminal.update(cx, |t, cx| t.resize(bounds_for(30, 10), cx)); // prime
-        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10)]);
+        terminal.update(cx, |t, cx| t.resize(bounds_for(30, 10), 1.0, cx)); // prime
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(30, 10, 1.0)]);
 
         terminal.update(cx, |t, cx| {
-            t.resize(bounds_for(40, 14), cx); // 武装合并定时器
-            t.resize(bounds_for(30, 10), cx); // 拖回已应用尺寸
+            t.resize(bounds_for(40, 14), 1.0, cx); // 武装合并定时器
+            t.resize(bounds_for(30, 10), 1.0, cx); // 拖回已应用尺寸
         });
         cx.background_executor.advance_clock(RESIZE_COALESCE_DELAY);
         cx.run_until_parked();
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &[(30, 10)],
+            &[(30, 10, 1.0)],
             "拖回原尺寸不应产生多余通知"
         );
     }
@@ -3824,10 +4664,10 @@ mod tests {
     fn resize_snapshot_stays_in_sync_with_grid(cx: &mut TestAppContext) {
         let (terminal, _calls) = resize_test_terminal(cx);
         terminal.update(cx, |t, cx| {
-            t.resize(bounds_for(30, 10), cx); // prime
+            t.resize(bounds_for(30, 10), 1.0, cx); // prime
 
             // 合并窗口内两者都不变，不变量成立
-            t.resize(bounds_for(80, 35), cx);
+            t.resize(bounds_for(80, 35), 1.0, cx);
             let c = t.last_content();
             assert_eq!(c.cols, t.terminal_bounds.num_columns());
             assert_eq!(c.rows, t.terminal_bounds.num_lines());
@@ -3841,6 +4681,496 @@ mod tests {
             assert_eq!(c.rows, t.terminal_bounds.num_lines());
             assert_eq!((c.cols, c.rows), (80, 35));
         });
+    }
+
+    /// 两个几何投影必须同口径。
+    ///
+    /// `TermGeometry`（尺寸上报用）与 `WindowSize`（PTY/SIGWINCH 用）都是
+    /// 从同一份 `TerminalBounds` 投影出来的，任何一处漂移都会让终端应用算出
+    /// 错误的像素尺寸（画面比例错乱）。这里把两者钉在一起。
+    #[test]
+    fn from_bounds_matches_window_size_conversion() {
+        use alacritty_terminal::event::WindowSize;
+
+        let bounds = bounds_for(80, 24);
+        let geometry: crate::terminal::escape_scan::TermGeometry = bounds.into();
+        let window: WindowSize = bounds.into();
+
+        assert_eq!(geometry.rows, window.num_lines);
+        assert_eq!(geometry.cols, window.num_cols);
+        assert_eq!(geometry.cell_width, window.cell_width);
+        assert_eq!(geometry.cell_height, window.cell_height);
+    }
+
+    /// 几何投影的像素结果必须自洽：`cell_width` 是宽度、`cell_height` 是高度。
+    ///
+    /// `bounds_for` 用 line_height=16、cell_width=9，因此 80x24 的文本区
+    /// 应是 720x384 像素。若两处字段被互换（`csi_16_t` 的高在前极易踩到
+    /// 这个坑），这条会失败。
+    #[test]
+    fn from_bounds_keeps_cell_axes_straight() {
+        let bounds = bounds_for(80, 24);
+        let geometry: crate::terminal::escape_scan::TermGeometry = bounds.into();
+
+        assert_eq!(geometry.cell_width, 9);
+        assert_eq!(geometry.cell_height, 16);
+        assert_eq!(geometry.width_pixels(), 720);
+        assert_eq!(geometry.height_pixels(), 384);
+    }
+
+    /// 缩放投影必须按 DPI 放大 cell 像素尺寸（Retina 上就是 2×）。
+    ///
+    /// 终端应用（如 `terminal-browser`）拿这个尺寸决定渲染 surface 的像素
+    /// 规模；少报一半就会渲染出低分辨率画面再放大。ghostty 从字号起就按
+    /// `content_scale` 换算（`font/face.zig:55-58`），这里锁定同一行为。
+    #[test]
+    fn scaled_geometry_doubles_extents() {
+        let bounds = bounds_for(80, 24);
+        let scaled = bounds.term_geometry(2.0);
+
+        assert_eq!(scaled.cell_width, 18, "cell 宽应随缩放翻倍");
+        assert_eq!(scaled.cell_height, 32, "cell 高应随缩放翻倍");
+        assert_eq!(scaled.width_pixels(), 1440);
+        assert_eq!(scaled.height_pixels(), 768);
+        // 行列数是格子数，与 DPI 无关。
+        assert_eq!((scaled.cols, scaled.rows), (80, 24));
+    }
+
+    /// 缩放后的取整必须四舍五入，与 ghostty `font/Metrics.zig:265` 的
+    /// `@round(face_width)` 一致。
+    ///
+    /// 截断（`as u16`）在 1.5× 这种分数缩放下每列稳定少 1px，几十列累积
+    /// 后宽高比就歪了。
+    #[test]
+    fn scaled_geometry_rounds_like_ghostty() {
+        let bounds = bounds_for(80, 24);
+        let scaled = bounds.term_geometry(1.5);
+
+        // 9 * 1.5 = 13.5 → 14（截断会得 13）
+        assert_eq!(scaled.cell_width, 14);
+        // 16 * 1.5 = 24，正好整除
+        assert_eq!(scaled.cell_height, 24);
+    }
+
+    /// `WindowSize` 随缩放只改 cell 像素尺寸，**绝不能**改行列数。
+    ///
+    /// `num_lines`/`num_cols` 是 PTY 的 `TIOCSWINSZ` 行列数，被缩放会让
+    /// 子进程的网格尺寸直接错乱。
+    #[test]
+    fn window_size_keeps_grid_counts_unscaled() {
+        let bounds = bounds_for(80, 24);
+        let base = bounds.window_size(1.0);
+        let scaled = bounds.window_size(2.0);
+
+        assert_eq!((base.num_lines, base.num_cols), (24, 80));
+        assert_eq!((scaled.num_lines, scaled.num_cols), (24, 80));
+        assert_eq!(scaled.cell_width, base.cell_width * 2);
+        assert_eq!(scaled.cell_height, base.cell_height * 2);
+    }
+
+    /// 非法的缩放值（0 / 负数 / NaN）退化为 1.0，而不是算出 0 尺寸。
+    ///
+    /// 平台初始化早期或 headless 测试可能拿到 0；若直接相乘，终端应用会
+    /// 按 0×0 建 surface，比低分辨率更糟。
+    #[test]
+    fn degenerate_scale_falls_back_to_one() {
+        let bounds = bounds_for(80, 24);
+
+        for bad in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            let geometry = bounds.term_geometry(bad);
+            assert_eq!(geometry.cell_width, 9, "scale={bad} 应退化为 1.0");
+            assert_eq!(geometry.cell_height, 16, "scale={bad} 应退化为 1.0");
+        }
+    }
+
+    // ===== 远程路径的尺寸上报 =====
+
+    /// 构造一个远程式终端：无 PTY，应答经 `remote_input_callback` 收集。
+    fn remote_size_test_terminal(
+        cx: &mut TestAppContext,
+        cols: usize,
+        rows: usize,
+    ) -> (Entity<Terminal>, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = written.clone();
+        let terminal = cx.new(move |_| {
+            let mut t = Terminal::create_error_terminal();
+            t.terminal_bounds = bounds_for(cols, rows);
+            t.remote_input_callback = Some(Box::new(move |bytes| {
+                sink.lock().unwrap().extend_from_slice(bytes);
+            }));
+            t
+        });
+        (terminal, written)
+    }
+
+    /// `CSI 16 t` 在远程路径上被应答，且序列不进 vte。
+    ///
+    /// 格式必须是 ghostty 的 `\x1b[6;{cell_height};{cell_width}t`——**高在前**。
+    /// `bounds_for` 给的是 cell_width=9、line_height=16。
+    #[gpui::test]
+    fn remote_csi_16_t_answered_with_cell_height_then_width(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[16t", false, cx);
+        });
+
+        let out = written.lock().unwrap().clone();
+        assert_eq!(
+            out,
+            b"\x1b[6;16;9t".to_vec(),
+            "应回应 `cell_height;cell_width`（高在前），实际 {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `CSI 14 t` / `CSI 18 t` 不得被拦截——vte 已能正确应答，重复拦截会
+    /// 造成双重应答（客户端收到两条尺寸）。
+    #[gpui::test]
+    fn remote_csi_14_and_18_not_intercepted(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[14t", false, cx);
+            t.process_pty_data(b"\x1b[18t", false, cx);
+        });
+
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "14/18 的应答由 vte 负责，本层不应写入任何字节"
+        );
+    }
+
+    /// `CSI 16 t` 的应答随显示缩放放大——这是「分辨率低一半」的主修复点。
+    ///
+    /// Retina 上 `display_scale` 是 2.0，因此 9x16 的 cell 必须报成 18x32。
+    #[gpui::test]
+    fn remote_csi_16_t_scales_with_display_scale(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.display_scale = 2.0;
+            t.process_pty_data(b"\x1b[16t", false, cx);
+        });
+
+        let out = written.lock().unwrap().clone();
+        assert_eq!(
+            out,
+            b"\x1b[6;32;18t".to_vec(),
+            "Retina 上应报物理像素 32x18，实际 {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `CSI 14 t` 的应答同样必须按物理像素给出。
+    ///
+    /// 走的是 `TextAreaSizeRequest`（alacritty 在闭包里算
+    /// `num_lines * cell_height`，即 `term/mod.rs:2258`），与 `CSI 16 t`
+    /// 是**两条独立的投影路径**，必须分别覆盖。80x24 的文本区在 2× 下是
+    /// 1440x768。
+    ///
+    /// 这里直接投递事件而不喂字节：vte 的 `EventProxy` 是异步的，字节路径
+    /// 需要事件循环泵才能观察到 `PtyWrite`。闭包按 alacritty 原样构造，因此
+    /// 测到的仍是真实格式化逻辑。
+    #[gpui::test]
+    fn remote_csi_14_t_reports_scaled_grid_extent(cx: &mut TestAppContext) {
+        use alacritty_terminal::event::WindowSize;
+
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.display_scale = 2.0;
+            // 与 `Term::text_area_size_pixels` 完全同构的格式化闭包。
+            t.process_event(
+                alacritty_terminal::event::Event::TextAreaSizeRequest(std::sync::Arc::new(
+                    move |window_size: WindowSize| {
+                        format!(
+                            "\x1b[4;{};{}t",
+                            window_size.num_lines * window_size.cell_height,
+                            window_size.num_cols * window_size.cell_width
+                        )
+                    },
+                )),
+                cx,
+            );
+        });
+
+        let out = written.lock().unwrap().clone();
+        assert_eq!(
+            out,
+            b"\x1b[4;768;1440t".to_vec(),
+            "CSI 14 t 应报物理像素 768x1440（高在前），实际 {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// DPI 变化而网格不变时，几何也必须被重新下发。
+    ///
+    /// 跨显示器拖动窗口时 cols/rows 往往一点没变、只有缩放变了。若
+    /// `resize` 的早退吞掉这次更新，PTY 与读线程就会一直用旧几何上报。
+    /// 这里两次 resize 尺寸相同、只换缩放，第二次必须仍产生通知。
+    #[gpui::test]
+    fn dpi_change_without_grid_change_updates_geometry(cx: &mut TestAppContext) {
+        let (terminal, calls) = resize_test_terminal(cx);
+
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(80, 24), 1.0, cx);
+            t.resize(bounds_for(80, 24), 2.0, cx);
+        });
+
+        let calls = calls.lock().unwrap().clone();
+        let scales: Vec<f32> = calls.iter().map(|(_, _, s)| *s).collect();
+        assert!(
+            scales.contains(&2.0),
+            "仅缩放变化也必须重新下发几何（否则 SSH/PTY 侧分辨率退回半分辨率），\
+             实际通知序列 {calls:?}"
+        );
+    }
+
+    /// 普通文本与尺寸序列混合时，只有尺寸序列被摘除，文本完整进入网格。
+    #[gpui::test]
+    fn remote_text_around_size_sequence_still_reaches_grid(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 40, 10);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"ab\x1b[16tcd", false, cx);
+        });
+
+        assert_eq!(written.lock().unwrap().clone(), b"\x1b[6;16;9t".to_vec());
+
+        // 文本 `abcd` 应完整落在网格上（尺寸序列不产生任何单元格）。
+        let text: String = terminal.read_with(cx, |t, _| {
+            let term = t.term.lock();
+            term.grid().display_iter().map(|c| c.cell.c).collect()
+        });
+        assert!(
+            text.starts_with("abcd"),
+            "`ab` + `cd` 应拼成 abcd（序列被摘除后无残留），实际 {text:?}"
+        );
+    }
+
+    /// 与 2048 合写的其它模式必须照常生效（回归：曾整条摘除导致粘贴保护消失）。
+    ///
+    /// `ESC[?2004;2048h` 里 `2004` 是 bracketed paste，由 vte 处理。若把整条
+    /// 序列摘掉，应用的粘贴保护就没了——zsh/fish 这类会插入裸文本而没有
+    /// `\x1b[200~`/`\x1b[201~` 包裹。
+    #[gpui::test]
+    fn remote_multi_param_decset_keeps_other_modes(cx: &mut TestAppContext) {
+        let (terminal, _written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?2004;2048h", false, cx);
+        });
+
+        let bracketed = terminal.read_with(cx, |t, _| {
+            t.term
+                .lock()
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+        });
+        assert!(
+            bracketed,
+            "`?2004;2048h` 不得吞掉 2004（bracketed paste），否则粘贴保护失效"
+        );
+
+        // 2048 本身也必须被识别（我们额外跟踪的那一份）。
+        let mode_2048 = terminal.read_with(cx, |t, _| t.remote_mode_2048);
+        assert!(mode_2048, "同一序列里的 2048 也必须被识别并置位");
+    }
+
+    /// DECSET 2048 置位时立即上报几何；复位静默。
+    #[gpui::test]
+    fn remote_mode_2048_enable_reports_and_disable_is_silent(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?2048h", false, cx);
+        });
+        // 80x24, cell 9x16 → 720x384 像素。
+        assert_eq!(
+            written.lock().unwrap().clone(),
+            b"\x1b[48;24;80;384;720t".to_vec(),
+            "置位应立即上报（rows;cols;height_px;width_px）"
+        );
+
+        written.lock().unwrap().clear();
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?2048l", false, cx);
+        });
+        assert!(written.lock().unwrap().is_empty(), "复位不应产生上报");
+    }
+
+    /// 模式 1016（SGR-Pixels 鼠标）的完整往返。
+    ///
+    /// 这是 terminal-browser 实际发出的序列组合：
+    /// `\x1b[?1016h` 置位、`\x1b[?1016$p` 探测。ghostty 对已置位的模式答
+    /// `2`，客户端据此启用像素级命中测试。修复前这里答的是 `?1016;0$y`
+    /// （vte/alacritty 的「不识别」），会让客户端退回单元格粒度。
+    #[gpui::test]
+    fn remote_mode_1016_probe_reports_recognized(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        // 未置位时应答「已识别但复位」= 1。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016$p", false, cx);
+        });
+        assert_eq!(
+            written.lock().unwrap().clone(),
+            b"\x1b[?1016;1$y".to_vec(),
+            "置位前的探测应答 `1`（已识别/复位），绝不能是 `0`（不识别）"
+        );
+
+        // 置位本身不产生应答（纯状态开关）。
+        written.lock().unwrap().clear();
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016h", false, cx);
+        });
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "DECSET 1016 是纯状态开关，不应产生任何应答"
+        );
+
+        // 置位后探测应答 `2`。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016$p", false, cx);
+        });
+        assert_eq!(
+            written.lock().unwrap().clone(),
+            b"\x1b[?1016;2$y".to_vec(),
+            "置位后探测应答 `2`（已识别/置位）"
+        );
+    }
+
+    /// 1016 的状态必须真的影响鼠标报文的坐标格式。
+    #[gpui::test]
+    fn remote_mode_1016_switches_mouse_report_to_pixels(cx: &mut TestAppContext) {
+        let (terminal, _written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016h", false, cx);
+            assert!(
+                t.sgr_pixels_active(),
+                "置位后 sgr_pixels_active 应为真（否则报文仍是单元格坐标）"
+            );
+        });
+
+        // 复位后必须回到假，否则像素模式会粘住。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016l", false, cx);
+            assert!(!t.sgr_pixels_active(), "复位后 sgr_pixels_active 应为假");
+        });
+    }
+
+    /// `CSI 16 t` 整条落在同一个 chunk 里时必然被应答。
+    ///
+    /// 注：跨 chunk 被切断的形态（如 `\x1b[1` + `6t`）会交给 vte 状态机，
+    /// 本轮不保证应答——终端应用的探测都是整条发送，且真发生也只是退化为
+    /// 「拿不到尺寸」（与修复前一致），不会更糟。这里只钉住整条到达的情形。
+    #[gpui::test]
+    fn remote_csi_16_t_answered_when_whole(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_size_test_terminal(cx, 80, 24);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[16t", false, cx);
+        });
+        assert_eq!(written.lock().unwrap().clone(), b"\x1b[6;16;9t".to_vec());
+    }
+
+    /// 占位符单元格能被拍平出来，且行/列/颜色/变音符齐全。
+    ///
+    /// 走一遍真实路径：用 vte 处理器往 alacritty 网格里打
+    /// `U+10EEEE` + 组合变音符，再让 `Terminal` 的快照把它捞出来。
+    #[test]
+    fn kitty_placeholder_cells_extracts_placeholder_with_diacritics() {
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+
+        let size = TermSize::new(20, 4);
+        let mut term = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+
+        // 必须走真正的 vte 解析器：`Handler::input` 只处理可打印/零宽字符，
+        // 不解析转义序列，直接喂字节会把 `[38;5;42m` 当正文打出来。
+        // `CSI 2;4H` 是 1-based 的行/列，落到位图第 1 行第 3 列。
+        let mut processor: Processor = Processor::new();
+        processor.advance(
+            &mut term,
+            "\x1b[2;4H\x1b[38;5;42m\u{10EEEE}\u{0305}\u{030D}".as_bytes(),
+        );
+
+        // 把这一行快照成 TerminalContent，再走 Terminal 的拍平函数。
+        let mut content = TerminalContent {
+            cells: Vec::new(),
+            row_ranges: Vec::new(),
+            cursor: alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(0),
+                alacritty_terminal::index::Column(0),
+            ),
+            cursor_cell: PackedCell::from(&alacritty_terminal::term::cell::Cell::default()),
+            cursor_shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+            display_offset: 0,
+            mode: alacritty_terminal::term::TermMode::empty(),
+            cols: 20,
+            rows: 4,
+            total_lines: 4,
+            viewport_lines: 4,
+            url_ranges: Vec::new(),
+            hyperlink_ranges: Vec::new(),
+            selection_range: None,
+            palette: Default::default(),
+        };
+        let renderable = term.renderable_content();
+        content
+            .cells
+            .extend(renderable.display_iter.map(|ic| IndexedCell {
+                point: ic.point,
+                cell: PackedCell::from(ic.cell),
+                zerowidth: packed_zerowidth(ic.cell),
+                hyperlink: ic.cell.hyperlink(),
+            }));
+        assert_eq!(
+            content.cells.len(),
+            80,
+            "display_iter 会给出整个 20x4 视口的单元格（含空白格）"
+        );
+
+        // 只有占位符那一个格子有内容，其余都是空白。
+        let non_blank: Vec<_> = content.cells.iter().filter(|c| c.cell.c != ' ').collect();
+        assert_eq!(non_blank.len(), 1, "非空单元格只有一个");
+
+        // 直接验证拍平后的字段，而不是构造整个 Terminal（那需要 GPUI 上下文）。
+        let cell = non_blank[0];
+        assert_eq!(cell.cell.c, crate::terminal::kitty::unicode::PLACEHOLDER);
+        assert_eq!(cell.point.line.0, 1, "行号 = 网格绝对行");
+        assert_eq!(cell.point.column.0, 3, "列号");
+        assert_eq!(cell.cell.fg, Color::Indexed(42));
+        assert_eq!(
+            cell.zerowidth,
+            Some(['\u{0305}', '\u{030D}', '\0']),
+            "变音符应被带上，且不足 3 个时补 0"
+        );
+        // 颜色与变音符能解码出正确的图像 id 与行列。
+        let decoded = crate::terminal::kitty::unicode::IncompletePlacement::decode(
+            crate::terminal::kitty::unicode::color_to_id(&cell.cell.fg),
+            cell.cell
+                .underline_color
+                .as_ref()
+                .map_or(0, crate::terminal::kitty::unicode::color_to_id),
+            &cell.zerowidth.unwrap(),
+        );
+        assert_eq!(decoded.image_id_low, 42);
+        assert_eq!(decoded.row, Some(0));
+        assert_eq!(decoded.col, Some(1));
+
+        // 命名色的对照：默认前景色解出来是 0 号命名色，不会误判成图像。
+        assert_eq!(
+            crate::terminal::kitty::unicode::color_to_id(&Color::Named(NamedColor::Foreground)),
+            NamedColor::Foreground as u32
+        );
     }
 }
 

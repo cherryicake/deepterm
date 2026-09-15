@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Term;
@@ -25,9 +24,13 @@ pub struct SshPtyTerminal {
 
 impl SshPtyTerminal {
     /// 创建新的 SSH PTY 终端
+    ///
+    /// `scale` 为窗口所在显示的缩放：`bounds` 是逻辑点，而 PTY 的
+    /// `ws_xpixel` 需要物理像素（ghostty 也是按 DPI 换算后下发）。
     pub fn new(
         config: &SshConnectionConfig,
         bounds: TerminalBounds,
+        scale: f32,
         term: Arc<FairMutex<Term<ZedListener>>>,
         listener: ZedListener,
         initial_cwd: Option<String>,
@@ -131,7 +134,7 @@ impl SshPtyTerminal {
         };
 
         // 转换窗口大小
-        let window_size = bounds_to_window_size(bounds);
+        let window_size = bounds.window_size(scale);
 
         // 创建 PTY
         log::debug!("创建 PTY...");
@@ -163,9 +166,9 @@ impl SshPtyTerminal {
         let _ = self.sender.send(msg);
     }
 
-    /// 调整窗口大小
-    pub fn resize(&self, bounds: TerminalBounds) {
-        let window_size = bounds_to_window_size(bounds);
+    /// 调整窗口大小。`scale` 为窗口所在显示的缩放（见 [`Self::new`]）。
+    pub fn resize(&self, bounds: TerminalBounds, scale: f32) {
+        let window_size = bounds.window_size(scale);
         log::debug!(
             "调整 SSH 窗口大小: {}x{}",
             window_size.num_cols,
@@ -178,16 +181,6 @@ impl SshPtyTerminal {
     pub fn close(&self) {
         log::info!("关闭 SSH 连接");
         let _ = self.sender.send(Msg::Shutdown);
-    }
-}
-
-/// 将 TerminalBounds 转换为 WindowSize
-fn bounds_to_window_size(bounds: TerminalBounds) -> WindowSize {
-    WindowSize {
-        num_cols: bounds.num_columns() as u16,
-        num_lines: bounds.num_lines() as u16,
-        cell_width: bounds.cell_width.as_f32() as u16,
-        cell_height: bounds.line_height.as_f32() as u16,
     }
 }
 

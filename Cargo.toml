@@ -23,6 +23,9 @@ async-channel = "2.0"
 itertools = "0.13"
 futures = "0.3"
 smol = "2.0"
+# 本地 PTY 读线程用 poller 同时等待 PTY 主设备 fd 与子进程 SIGCHLD fd
+# （alacritty 的 EventLoop 内部同款依赖，此处需直接引用其 poller 类型）。
+polling = "3.11"
 
 # SSH dependencies
 bytes = "1"
@@ -56,6 +59,8 @@ encoding_rs = "0.8"
 # Image / SVG preview
 image = "0.25.1"
 usvg = "0.46.0"
+# Kitty 图形协议 `o=z` 负载解压（zlib/DEFLATE 流；已在依赖树中，显式声明）
+flate2 = "1"
 
 # Markdown
 pulldown-cmark = "0.12"

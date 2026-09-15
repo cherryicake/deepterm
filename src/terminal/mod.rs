@@ -1,5 +1,9 @@
+pub mod escape_scan;
 pub mod file_link_detector;
+pub mod kitty;
 pub mod link_detector;
+#[cfg(unix)]
+pub mod local_pty;
 pub mod mappings;
 pub mod terminal;
 
