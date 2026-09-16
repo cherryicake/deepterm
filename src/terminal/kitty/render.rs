@@ -1423,9 +1423,10 @@ mod tests {
 
     /// 找不到虚拟放置 → 不画（客户端可能还没传图）。
     #[test]
-    fn placeholder_without_virtual_placement_is_skipped() {
+    fn placeholder_without_any_matching_placement_is_skipped() {
         let mut s = Storage::new(1024 * 1024);
         s.insert(1, image(500, 306), None, false);
+        // 图像存在但没有任何放置（更不用说虚拟放置）：零 id 回退必须落空。
         let cells = [placeholder_cell(0, 0, 1, 0, 0)];
         assert!(plan_placeholders(&s, &cells, metrics(), viewport()).is_empty());
     }

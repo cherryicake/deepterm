@@ -587,14 +587,16 @@ impl Storage {
         self.images.get_mut(&id)
     }
 
-    /// 找占位符指向的虚拟放置。
+    /// 找占位符指向的放置。
     ///
     /// 语义对齐 ghostty `graphics_storage.zig::placeholderTarget`：
-    /// - `placement_id != 0` 时必须**精确匹配**该放置，且它必须是虚拟放置
-    ///   （占位符不能指向普通放置——那样图像会既锚定在旧位置、又铺在
-    ///   占位符处）；
+    /// - `placement_id != 0` 时**精确匹配**该放置，不要求它是虚拟放置：
+    ///   占位符单元格只是"把某个放置画在这里"，指向普通放置是合法的
+    ///   （ghostty 只有在 `U=1` 与 `P=` 同时出现时才报 EINVAL）；
     /// - `placement_id == 0` 时取该图像的**第一个**虚拟放置，让客户端可以
-    ///   完全不在下划线色里编码放置 id；
+    ///   完全不在下划线色里编码放置 id；ghostty 用 `preferredOver` 保证
+    ///   确定（external 优先、同 tag 下 id 小者优先），deepterm 的放置 id
+    ///   全部由客户端指定，故"id 最小"即等价规则；
     /// - 找不到就返回 `None`，对应的占位符不绘制。
     ///
     /// 返回 `(placement_id, &Placement)`，调用方需要 `columns`/`rows` 来算
@@ -604,7 +606,7 @@ impl Storage {
 
         if placement_id != 0 {
             let placement = stored.placements.get(&placement_id)?;
-            return placement.is_virtual().then_some((placement_id, placement));
+            return Some((placement_id, placement));
         }
 
         // 未指定放置 id：取第一个虚拟放置。用最小 id 保证结果确定
@@ -1501,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_target_with_explicit_id_requires_virtual() {
+    fn placeholder_target_with_explicit_id_matches_exactly() {
         let mut s = Storage::new(1024);
         s.insert(1, img(1, 1), None, false);
         s.place(1, 0, anchor_placement());
@@ -1512,7 +1514,7 @@ mod tests {
         assert_eq!(pid, 7);
         assert_eq!(p.columns, Some(4));
 
-        // 显式指定但指向普通放置 → 不命中。
+        // 显式指定一个不存在的放置 id → 不命中。
         assert!(
             s.placeholder_target(1, 5).is_none(),
             "不存在的放置 id 应返回 None"
@@ -1520,14 +1522,18 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_target_ignores_anchor_when_explicit_id_given() {
+    fn placeholder_target_accepts_a_non_virtual_placement() {
         let mut s = Storage::new(1024);
         s.insert(1, img(1, 1), None, false);
         s.place(1, 3, anchor_placement());
 
-        // 放置 3 存在，但它不是虚拟放置：显式指向它必须失败，否则图像会既
-        // 锚定在光标处、又铺在占位符处。
-        assert!(s.placeholder_target(1, 3).is_none());
+        // ghostty 的 `placement_id > 0` 分支只做精确查找，不要求 `.virtual`：
+        // 占位符单元格可以把一个普通放置画到指定位置。
+        let (pid, p) = s
+            .placeholder_target(1, 3)
+            .expect("显式指向普通放置也应命中");
+        assert_eq!(pid, 3);
+        assert!(!p.is_virtual());
     }
 
     #[test]
@@ -1555,12 +1561,15 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_target_without_virtual_placement_is_none() {
+    fn placeholder_target_zero_never_falls_back_to_a_non_virtual_placement() {
         let mut s = Storage::new(1024);
         s.insert(1, img(1, 1), None, false);
-        s.place(1, 0, anchor_placement());
+        s.place(1, 3, anchor_placement());
+
+        // 只有普通放置时，零 id 回退必须落空——否则图像会既锚定在光标处、
+        // 又被当成占位符目标铺开。显式指向它才是合法的精确匹配。
         assert!(s.placeholder_target(1, 0).is_none());
-        assert!(s.placeholder_target(1, 3).is_none());
+        assert_eq!(s.placeholder_target(1, 3).map(|(pid, _)| pid), Some(3));
     }
 
     #[test]

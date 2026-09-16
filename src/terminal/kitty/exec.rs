@@ -3065,4 +3065,28 @@ mod tests {
         assert_eq!(pid, 0);
         assert_eq!(placement.columns, Some(3));
     }
+
+    #[test]
+    fn ordinary_placement_is_resolvable_as_placeholder_target_by_explicit_id() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(
+            &mut store,
+            &format!("a=t,i=7,f=32,s=1,v=1;{pixel}", pixel = rgba_pixel()),
+            (0, 0),
+        )
+        .unwrap();
+        // 普通放置（无 U=1），显式指定 p=。
+        run(&mut store, "a=p,i=7,p=4,c=2,r=2", (0, 0)).unwrap();
+
+        let guard = store.lock_storage();
+        // 零 id 回退仍然只认虚拟放置。
+        assert!(guard.placeholder_target(7, 0).is_none());
+        // 但显式指向普通放置是精确匹配，应当命中（对齐 ghostty）。
+        let (pid, placement) = guard
+            .placeholder_target(7, 4)
+            .expect("显式指定普通放置应命中");
+        assert_eq!(pid, 4);
+        assert!(!placement.is_virtual());
+        assert_eq!(placement.columns, Some(2));
+    }
 }
