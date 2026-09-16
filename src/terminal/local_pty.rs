@@ -17,6 +17,7 @@ use std::{
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener as _, OnResize, WindowSize},
+    grid::Dimensions as _,
     sync::FairMutex,
     term::Term,
     tty::{ChildEvent, EventedPty, EventedReadWrite, Pty},
@@ -53,17 +54,30 @@ const PTY_CHILD_EVENT_TOKEN: usize = 1;
 ///
 /// 实现运行在读线程上，**不得**依赖 GPUI 的 `Context`；需要通知 UI 的
 /// 事情通过 [`LocalNotice`] 回传。
+/// 扫描器在处理一条 APC 时需要的网格状态快照。
+///
+/// 两者都随解析推进而变化（前面的文本可能移动光标、可能触发滚动），所以由
+/// 调用方在处理序列的间隙**重新查询**，而不是先切完再一次性喂——否则同一个
+/// read 里常见的 `CSI <定位> + APC <贴图>` 组合会把锚点算到旧位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridState {
+    /// 当前光标（行、列）。
+    pub cursor: (i32, u32),
+    /// 当前可见的网格行窗口（`d=a` 的「屏幕上可见」判定）。
+    pub visible: crate::terminal::kitty::storage::VisibleRows,
+}
+
 pub trait PtyScanner: Send {
     /// 处理一段字节。
     ///
     /// `pending` 为跨读残尾缓冲：未完成的序列尾部留在其中，与下次读到的
     /// 字节拼接后重新扫描。
     ///
-    /// `emit` 用于把「序列之前的普通文本」按序交给 vte，`cursor` 用于在
-    /// 交出序列时查询当前光标。两者分两步（而非先切完再一次性喂）是为了
-    /// 让 APC 的锚点精确反映它前面那些文本的效果——同一个 read 里常见
-    /// `CSI <定位> + APC <贴图>` 的组合，若等整块文本都喂完才处理 APC，
-    /// 锚点会落后一个 chunk。
+    /// `emit` 用于把「序列之前的普通文本」按序交给 vte，`grid` 用于在
+    /// 交出序列时查询当前网格状态（光标与可见窗口）。两者分两步（而非先切完
+    /// 再一次性喂）是为了让 APC 的锚点精确反映它前面那些文本的效果——同一个
+    /// read 里常见 `CSI <定位> + APC <贴图>` 的组合，若等整块文本都喂完才处理
+    /// APC，锚点会落后一个 chunk。
     ///
     /// 为什么是回调而不是「返回区段列表」：文本与需消费序列是交替的，
     /// 回调天然表达顺序，且调用方无需为每次扫描分配区段向量。
@@ -72,7 +86,7 @@ pub trait PtyScanner: Send {
         data: &[u8],
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
-        cursor: &mut dyn FnMut() -> (i32, u32),
+        grid: &mut dyn FnMut() -> GridState,
     );
 
     /// 取走扫描器攒下的、需要回写给终端应用的应答字节。
@@ -111,7 +125,7 @@ impl PtyScanner for PassThroughScanner {
         data: &[u8],
         _pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
-        _cursor: &mut dyn FnMut() -> (i32, u32),
+        _grid: &mut dyn FnMut() -> GridState,
     ) {
         emit(data);
     }
@@ -132,7 +146,7 @@ impl PtyScanner for OscFilterScanner {
         data: &[u8],
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
-        _cursor: &mut dyn FnMut() -> (i32, u32),
+        _grid: &mut dyn FnMut() -> GridState,
     ) {
         use crate::terminal::escape_scan::{self, Extract};
 
@@ -448,7 +462,7 @@ fn run_loop(
 
 /// 扫描回调的借用上下文。
 ///
-/// `PtyScanner::scan` 需要「把文本喂给 vte」与「读当前光标」两种能力，两者
+/// `PtyScanner::scan` 需要「把文本喂给 vte」与「读当前网格状态」两种能力，两者
 /// 都作用于同一份 `Term`/`Processor`。用结构体统一持有，避免在调用点为两个
 /// 闭包同时借用同一变量而无法通过借用检查。
 struct ScanCtx<'a> {
@@ -464,10 +478,20 @@ impl ScanCtx<'_> {
         }
     }
 
-    /// 当前光标在网格中的绝对位置 `(行, 列)`。
-    fn cursor(&self) -> (i32, u32) {
-        let point = self.terminal.grid().cursor.point;
-        (point.line.0, point.column.0 as u32)
+    /// 当前网格状态：光标绝对位置 + 可见行窗口。
+    ///
+    /// 一次取全（而不是分成两个闭包）是因为两者必须来自**同一时刻**的 `grid`
+    /// 快照：`d=a` 的可见性判定要基于与锚点相同的那次滚动位置。
+    fn grid_state(&self) -> GridState {
+        let grid = self.terminal.grid();
+        let point = grid.cursor.point;
+        GridState {
+            cursor: (point.line.0, point.column.0 as u32),
+            visible: crate::terminal::kitty::storage::VisibleRows::new(
+                grid.display_offset(),
+                grid.screen_lines(),
+            ),
+        }
     }
 }
 
@@ -517,13 +541,13 @@ fn pty_read(
         // 应用层扫描：普通文本经 `emit` 即时喂给 vte，需消费的序列（OSC/APC）
         // 被摘除，未完成的尾部留在 `pending` 等下次拼接。
         //
-        // 扫描器不能自己碰 `Term`（锁已被本函数持有），所以文本喂入与光标
-        // 查询都以闭包形式由这里提供。这样 APC 处理时看到的光标已经包含了
-        // 同一 chunk 里在它之前的文本（如 `CSI 3;5H` 定位）。
+        // 扫描器不能自己碰 `Term`（锁已被本函数持有），所以文本喂入与网格
+        // 状态查询都以闭包形式由这里提供。这样 APC 处理时看到的网格状态已经
+        // 包含了同一 chunk 里在它之前的文本（如 `CSI 3;5H` 定位）。
         {
             // 两个闭包都借用同一份 `Term`/`Processor`，而借用检查器无法
             // 证明 `scan` 不会并发调用它们（实际上 `scan` 是顺序调用的：
-            // 一次 `emit` 或一次 `cursor`，绝不同时）。
+            // 一次 `emit` 或一次 `grid`，绝不同时）。
             //
             // 因此把上下文放进 `RefCell`，闭包各自 `borrow_mut` 一小段；
             // 若真的发生重入会 panic（而不是未定义行为），比裸指针安全。
@@ -532,8 +556,8 @@ fn pty_read(
                 terminal,
             });
             let mut emit = |bytes: &[u8]| ctx.borrow_mut().emit(bytes);
-            let mut cursor = || ctx.borrow().cursor();
-            scanner.scan(&buf[..unprocessed], pending, &mut emit, &mut cursor);
+            let mut grid = || ctx.borrow().grid_state();
+            scanner.scan(&buf[..unprocessed], pending, &mut emit, &mut grid);
         }
 
         processed += unprocessed;
@@ -605,7 +629,7 @@ mod tests {
             data: &[u8],
             _pending: &mut Vec<u8>,
             emit: &mut dyn FnMut(&[u8]),
-            _cursor: &mut dyn FnMut() -> (i32, u32),
+            _grid: &mut dyn FnMut() -> GridState,
         ) {
             self.seen.lock().unwrap().extend_from_slice(data);
             emit(data);

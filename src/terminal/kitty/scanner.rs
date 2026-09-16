@@ -195,6 +195,14 @@ impl KittyGraphicsScanner {
         self.cursor = (row, col);
     }
 
+    /// 告知扫描器当前可见的网格行窗口（`d=a`/`d=A` 的"屏幕上可见"判定）。
+    ///
+    /// 与光标一样由调用方在解析前同步：窗口随滚动变化，扫描器读不到 `Term`
+    /// 的滚动位置，只能每次送字节时一并告知。
+    pub fn set_visible_rows(&mut self, rows: super::storage::VisibleRows) {
+        self.store.set_visible_rows(Some(rows));
+    }
+
     /// 处理一条**完整**的 APC 内容（远程路径：UI 线程已在
     /// `process_pty_data` 里完成序列切分，无需再扫描字节流）。
     pub fn scan_apc(&mut self, content: &[u8]) {
@@ -380,7 +388,7 @@ impl PtyScanner for KittyGraphicsScanner {
         data: &[u8],
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
-        cursor: &mut dyn FnMut() -> (i32, u32),
+        grid: &mut dyn FnMut() -> crate::terminal::local_pty::GridState,
     ) {
         // 有跨读残尾时先拼接（仅在确有残尾时拷贝一次）。
         let joined: Vec<u8>;
@@ -419,8 +427,10 @@ impl PtyScanner for KittyGraphicsScanner {
 
             match escape_scan::extract_apc(&data[apc_pos..]) {
                 Extract::Complete { len, content } => {
-                    // 瞄准此刻的光标：前面的文本已经喂给 vte 了。
-                    self.cursor = cursor();
+                    // 瞄准此刻的网格状态：前面的文本已经喂给 vte 了。
+                    let state = grid();
+                    self.cursor = state.cursor;
+                    self.store.set_visible_rows(Some(state.visible));
                     // 图形 APC 被消费，不进入 vte（vte 会丢弃内容，但序列
                     // 本身仍会走一遍状态机——提前摘除更干净）。
                     self.handle_apc(content);
@@ -494,6 +504,15 @@ mod tests {
         )
     }
 
+    /// 测试用的网格状态：光标在左上角，可见窗口覆盖 0..=23 行（24 行视口、
+    /// 未滚动）。需要别的窗口的用例自行构造 `GridState`。
+    fn grid_state_fixture() -> crate::terminal::local_pty::GridState {
+        crate::terminal::local_pty::GridState {
+            cursor: (0, 0),
+            visible: crate::terminal::kitty::storage::VisibleRows::new(0, 24),
+        }
+    }
+
     /// 跑一遍 `scan`（即 `PtyScanner` 入口），返回 `(emit 出去的字节, 应答)`。
     ///
     /// 强调：必须走 `scan` 而不是 `scan_apc`——`scan_apc` 只接收已经切分好的
@@ -506,7 +525,7 @@ mod tests {
             input,
             &mut pending,
             &mut |bytes| emitted.extend_from_slice(bytes),
-            &mut || (0, 0),
+            &mut grid_state_fixture,
         );
         assert!(pending.is_empty(), "测试输入不应留下跨读残尾");
         (emitted, scanner.take_replies())

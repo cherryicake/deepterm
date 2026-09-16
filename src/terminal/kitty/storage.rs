@@ -74,6 +74,42 @@ pub struct CellGeometry {
     pub cell_height: u32,
 }
 
+/// 当前可见的网格行窗口（闭区间，含两端）。
+///
+/// 行号用 alacritty 的 grid 绝对坐标：屏幕顶行是 `top`，向上滚出屏幕进入
+/// scrollback 的行号为负。`d=a`/`d=A` 只删「屏幕上可见」的放置，需要它判定
+/// 一个放置的锚点或底边是否仍落在窗口内——对应 ghostty
+/// `graphics_storage.zig:1434` 用 `pointFromPin(.active, ...)` 判断某个 pin 是否
+/// 还在活动区。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibleRows {
+    /// 可见的最上一行（含）。
+    pub top: i32,
+    /// 可见的最下一行（含）。
+    pub bottom: i32,
+}
+
+impl VisibleRows {
+    /// 由显示偏移与视口行数构造。`display_offset` 是向上滚出屏幕的行数，
+    /// 所以屏幕顶行是 `-display_offset`。
+    pub fn new(display_offset: usize, viewport_rows: usize) -> Self {
+        let top = -(display_offset as i32);
+        // 视口为 0 行时窗口为空：bottom < top，任何行都不在窗口内。
+        let bottom = top.saturating_add(viewport_rows as i32).saturating_sub(1);
+        Self { top, bottom }
+    }
+
+    /// 空窗口不包含任何行。
+    pub fn is_empty(&self) -> bool {
+        self.bottom < self.top
+    }
+
+    /// 某行是否可见。
+    pub fn contains(&self, row: i32) -> bool {
+        !self.is_empty() && row >= self.top && row <= self.bottom
+    }
+}
+
 /// 一个图像放置：锚定到网格的哪一行/列、占多少行列、层级。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
@@ -192,6 +228,43 @@ impl Placement {
             left: self.col,
             right,
         })
+    }
+
+    /// 本放置是否在给定的可见行窗口内（`d=a`/`d=A` 的选择条件）。
+    ///
+    /// 对齐 ghostty `graphics_storage.zig:1414` 的 `deleteVisiblePlacements`：
+    /// - 虚拟放置（以及以父链定位的 `relative`）永远不算可见，它们随父放置
+    ///   一起移除；
+    /// - 锚点落在可见窗口内即视为可见（图像顶部还在屏幕上）；
+    /// - 锚点已滚出上方时，只要**底边**仍探进可见区（大图的上半部分滚出去
+    ///   了、下半部分还露着）同样算可见——ghostty 用 `rect.bottom_right` 做
+    ///   这第二次判定。
+    ///
+    /// 几何缺失（拿不到单元格尺寸）时无法算出底边，退化为只看锚点。
+    pub fn visible_in(
+        &self,
+        image: &DecodedImage,
+        geometry: CellGeometry,
+        visible: VisibleRows,
+    ) -> bool {
+        if self.is_virtual() {
+            return false;
+        }
+        if visible.contains(self.row) {
+            return true;
+        }
+        // 锚点已在窗口上方（或下方）：只有当底边仍探进窗口才算可见。底边由
+        // 网格行数决定，与列方向的裁剪无关，所以这里不走 `grid_rect`（它会
+        // 夹列宽，且大步数会饱和到 i32::MAX 误判成可见）。
+        if self.row > visible.bottom {
+            return false;
+        }
+        let (_, rows) = self.grid_size(image, geometry);
+        if rows == 0 {
+            return false;
+        }
+        let bottom = self.row.saturating_add_unsigned(rows - 1);
+        visible.contains(bottom)
     }
 }
 
@@ -576,6 +649,55 @@ impl Storage {
         self.images
             .get_mut(&id)
             .is_some_and(|stored| stored.placements.remove(&placement_id).is_some())
+    }
+
+    /// 删除**屏幕上可见**的放置（`d=a`/`d=A`）。返回是否发生了变化。
+    ///
+    /// 对齐 ghostty `graphics_storage.zig:1414` 的 `deleteVisiblePlacements` 与
+    /// kitty 协议原文："delete all placements visible on screen"。滚出到
+    /// scrollback 里的放置**不删**——客户端滚动回看时图像得还在。
+    ///
+    /// `free_data` 为真（大写 `d=A`）时，放置被删空且不再被引用的图像数据一并
+    /// 释放（协议："provided that the image is not referenced elsewhere, such as
+    /// in the scrollback buffer"）。
+    pub fn delete_visible_placements(
+        &mut self,
+        geometry: CellGeometry,
+        visible: VisibleRows,
+        free_data: bool,
+    ) -> bool {
+        // 先收集待删项，避免在持有不可变借用时又要可变借用。
+        let mut to_remove: Vec<(ImageId, u32)> = Vec::new();
+        for (id, stored) in self.images.iter() {
+            for (pid, p) in stored.placements.iter() {
+                if p.visible_in(&stored.image, geometry, visible) {
+                    to_remove.push((*id, *pid));
+                }
+            }
+        }
+
+        if to_remove.is_empty() {
+            return false;
+        }
+
+        let mut emptied: Vec<ImageId> = Vec::new();
+        for (id, pid) in to_remove {
+            self.remove_placement(id, pid);
+            if free_data
+                && self
+                    .images
+                    .get(&id)
+                    .is_some_and(|stored| stored.placements.is_empty())
+                && !emptied.contains(&id)
+            {
+                emptied.push(id);
+            }
+        }
+
+        for id in emptied {
+            self.remove(id);
+        }
+        true
     }
 
     /// 清空全部图像。

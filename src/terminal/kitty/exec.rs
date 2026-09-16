@@ -7,7 +7,7 @@ use super::command::{
     Action, Command, Compression, DeleteTarget, Format, Medium, ParseError, Quiet, decode_base64,
 };
 use super::image::{self, DecodeError, ImageId};
-use super::storage::{CellGeometry, GridRect, Placement, PlacementLocation, Storage};
+use super::storage::{CellGeometry, GridRect, Placement, PlacementLocation, Storage, VisibleRows};
 
 /// 一次执行的产出。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -187,6 +187,8 @@ pub struct ImageStore {
     geometry: Option<CellGeometry>,
     /// 终端列数，用于把矩形右边界夹到屏幕内（ghostty `rect()` 同款）。
     terminal_cols: u32,
+    /// 当前可见的网格行窗口（`d=a`/`d=A` 只删屏幕内可见的放置）。
+    visible_rows: Option<VisibleRows>,
 }
 
 /// 共享的图像存储句柄。
@@ -210,6 +212,7 @@ impl ImageStore {
             enabled,
             geometry: None,
             terminal_cols: 0,
+            visible_rows: None,
         }
     }
 
@@ -219,6 +222,20 @@ impl ImageStore {
     pub fn set_geometry(&mut self, geometry: CellGeometry, terminal_cols: u32) {
         self.geometry = Some(geometry);
         self.terminal_cols = terminal_cols;
+    }
+
+    /// 更新当前可见的网格行窗口（`d=a` 判定"屏幕上可见"用）。
+    ///
+    /// 与几何分开：滚动只改窗口、不改几何，而每帧都要跟随滚动更新。
+    /// `None` 时 `d=a` 退化为"全部可见"（等价于整个屏幕），供不跟踪滚动的
+    /// 调用方使用。
+    pub fn set_visible_rows(&mut self, rows: Option<VisibleRows>) {
+        self.visible_rows = rows;
+    }
+
+    /// 当前可见行窗口；调用方未提供时返回 `None`。
+    fn visible_rows(&self) -> Option<VisibleRows> {
+        self.visible_rows
     }
 
     /// 当前几何；未设置时返回 1×1 像素格（使未指定尺寸的放置退化为 1 格）。
@@ -1154,11 +1171,18 @@ impl ImageStore {
         };
 
         let changed = match target {
-            DeleteTarget::All => self.with_storage_mut(|s| {
-                let had = !s.is_empty();
-                s.clear();
-                had
-            }),
+            // `d=a`/`d=A` 删的是**屏幕上可见**的放置，不是存储里的全部——协议
+            // 原文 "delete all placements visible on screen"，滚进 scrollback
+            // 的放置必须留下。可见性需要几何与当前滚动位置，调用方没提供窗口
+            // 时退化为「整个屏幕都可见」，此时与旧行为一致。
+            DeleteTarget::All => {
+                let geometry = self.cell_geometry();
+                let visible = self.visible_rows().unwrap_or(VisibleRows {
+                    top: i32::MIN,
+                    bottom: i32::MAX,
+                });
+                self.with_storage_mut(|s| s.delete_visible_placements(geometry, visible, free_data))
+            }
             DeleteTarget::ByImageId => {
                 let id = cmd.control.u32(b'i').unwrap_or(0);
                 let placement_id = cmd.control.u32(b'p');
@@ -1769,6 +1793,191 @@ mod tests {
         assert_eq!(placement_count(&store), 1);
     }
 
+    // ===== `d=a`/`d=A` 只删屏幕上可见的放置 =====
+
+    /// 放一张图并显式把可见窗口设成 `top..=bottom`。
+    fn store_with_visible_window(row: i32, top: i32, bottom: i32) -> (ImageStore, VisibleRows) {
+        let (mut store, _) = store_with_placement(8, 8, row, 2, Some(5), Some(3));
+        let visible = VisibleRows { top, bottom };
+        store.set_visible_rows(Some(visible));
+        (store, visible)
+    }
+
+    /// 锚点在屏幕上：`d=a` 应删除。
+    #[test]
+    fn delete_all_removes_placement_anchored_on_screen() {
+        let (mut store, _) = store_with_visible_window(2, 0, 23);
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(r.images_changed, "锚点可见，d=a 应删除");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// 锚点已滚进 scrollback（行号为负且落在窗口上方）：`d=a` **不得**删除。
+    ///
+    /// 这是本修复的核心回归：修复前 `d=a` 直接 `clear()`，把 scrollback 里的
+    /// 图像也一并抹掉，客户端往回滚动时图像就永久消失了。
+    #[test]
+    fn delete_all_keeps_placement_scrolled_into_history() {
+        // 锚点在 -10 行，图像占 3 行 → 底边 -8，窗口从 0 开始，两者都在上方。
+        let (mut store, _) = store_with_visible_window(-10, 0, 23);
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(!r.images_changed, "滚出屏幕的放置不该被 d=a 删除");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// 锚点滚出上方但底边仍探进窗口：算可见，应删除。
+    ///
+    /// 对齐 ghostty `graphics_storage.zig:1440` 对 `rect.bottom_right` 的第二次
+    /// 判定——一张大图上半部分滚出去了、下半部分还露在屏幕上，用户还看得见它。
+    #[test]
+    fn delete_all_removes_placement_still_partially_visible() {
+        // 锚点在 -2 行、占 3 行 → 底边 -0，落在窗口 0..=23 内。
+        let (mut store, _) = store_with_visible_window(-2, 0, 23);
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(r.images_changed, "底边仍在屏幕上，应算可见");
+        assert_eq!(placement_count(&store), 0);
+    }
+
+    /// 锚点在窗口下方（还没画到可见区）：不删。
+    #[test]
+    fn delete_all_keeps_placement_below_the_window() {
+        let (mut store, _) = store_with_visible_window(50, 0, 23);
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(!r.images_changed, "锚点在窗口下方，不该删除");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// `d=a` 的可见性是逐放置判定的：可见的删、滚走的留。
+    #[test]
+    fn delete_all_selects_per_placement() {
+        let mut store = ImageStore::new(64 * 1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+        let b64 = crate::terminal::kitty::command::encode_base64(&[255; 8 * 8 * 4]);
+
+        // 两张图：一张锚在屏幕上，一张锚在 scrollback 里。
+        for (id, row) in [(1u32, 2i32), (2, -10)] {
+            run(
+                &mut store,
+                &format!("a=t,i={id},f=32,s=8,v=8,m=0;{b64}"),
+                (0, 0),
+            )
+            .unwrap();
+            run(&mut store, &format!("a=p,i={id},c=5,r=3"), (row, 2)).unwrap();
+        }
+        store.set_visible_rows(Some(VisibleRows { top: 0, bottom: 23 }));
+
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(r.images_changed);
+        let guard = store.lock_storage();
+        assert_eq!(
+            guard.get(1).map_or(0, |s| s.placements.len()),
+            0,
+            "屏幕上的放置应被删除"
+        );
+        assert_eq!(
+            guard.get(2).map_or(0, |s| s.placements.len()),
+            1,
+            "scrollback 里的放置应保留"
+        );
+    }
+
+    /// 小写 `d=a` 不释放图像数据（放置没了，数据还在，可重新显示）。
+    #[test]
+    fn delete_all_lowercase_keeps_image_data() {
+        let (mut store, _) = store_with_visible_window(2, 0, 23);
+        run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(
+            store.lock_storage().get(1).is_some(),
+            "小写 d=a 只删放置，图像数据必须保留"
+        );
+    }
+
+    /// 大写 `d=A` 删可见放置并释放不再被引用的图像数据。
+    #[test]
+    fn delete_all_uppercase_frees_unreferenced_data() {
+        let (mut store, _) = store_with_visible_window(2, 0, 23);
+        let r = run(&mut store, "a=d,d=A", (0, 0)).unwrap();
+        assert!(r.images_changed);
+        assert!(
+            store.lock_storage().get(1).is_none(),
+            "d=A 应释放已无放置引用的图像数据"
+        );
+    }
+
+    /// 大写 `d=A` 时若图像仍被 scrollback 里的放置引用，数据必须留下。
+    ///
+    /// 协议原文："provided that the image is not referenced elsewhere, such as
+    /// in the scrollback buffer"。
+    #[test]
+    fn delete_all_uppercase_keeps_data_still_referenced_by_history() {
+        let mut store = ImageStore::new(64 * 1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+        let b64 = crate::terminal::kitty::command::encode_base64(&[255; 8 * 8 * 4]);
+        run(
+            &mut store,
+            &format!("a=t,i=1,f=32,s=8,v=8,m=0;{b64}"),
+            (0, 0),
+        )
+        .unwrap();
+        // 同一张图两个放置：一个在屏幕上（p=0），一个在 scrollback（p=1）。
+        run(&mut store, "a=p,i=1,p=0,c=5,r=3", (2, 2)).unwrap();
+        run(&mut store, "a=p,i=1,p=1,c=5,r=3", (-10, 2)).unwrap();
+        store.set_visible_rows(Some(VisibleRows { top: 0, bottom: 23 }));
+
+        run(&mut store, "a=d,d=A", (0, 0)).unwrap();
+        let guard = store.lock_storage();
+        let stored = guard.get(1).expect("仍被 scrollback 引用，数据不得释放");
+        assert_eq!(stored.placements.len(), 1, "只剩 scrollback 里那个放置");
+    }
+
+    /// 虚拟放置永远不算可见（ghostty 对 `.virtual` 直接 `continue`）。
+    #[test]
+    fn delete_all_never_matches_virtual_placements() {
+        let mut store = ImageStore::new(64 * 1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+        let b64 = crate::terminal::kitty::command::encode_base64(&[255; 8 * 8 * 4]);
+        run(
+            &mut store,
+            &format!("a=t,i=1,f=32,s=8,v=8,m=0;{b64}"),
+            (0, 0),
+        )
+        .unwrap();
+        run(&mut store, "a=p,i=1,U=1,c=5,r=3", (2, 2)).unwrap();
+        store.set_visible_rows(Some(VisibleRows { top: 0, bottom: 23 }));
+
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(!r.images_changed, "虚拟放置不该被 d=a 命中");
+        assert_eq!(placement_count(&store), 1);
+    }
+
+    /// 调用方未提供可见窗口时退化为「全部可见」——与跟踪滚动之前的行为一致，
+    /// 保证不跟踪滚动的调用方不会突然删不掉任何东西。
+    #[test]
+    fn delete_all_without_window_falls_back_to_everything() {
+        let (mut store, _) = store_with_placement(8, 8, -10, 2, Some(5), Some(3));
+        let r = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(r.images_changed, "无窗口信息时应删全部");
+        assert_eq!(placement_count(&store), 0);
+    }
+
     #[test]
     fn chunked_transmission_assembles_payload() {
         let mut store = ImageStore::new(1024 * 1024);
@@ -1792,6 +2001,10 @@ mod tests {
         );
     }
 
+    /// `d=A` 释放数据：光标处那张图的放置被删空后，图像数据一并释放。
+    ///
+    /// 这里没设可见窗口（`ImageStore::new` 的默认），走的是「无窗口信息 →
+    /// 视为全部可见」的退化分支；带窗口的逐放置判定见 `delete_all_*` 系列。
     #[test]
     fn delete_all_clears_storage() {
         let mut store = ImageStore::new(1024 * 1024);

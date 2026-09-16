@@ -2284,21 +2284,30 @@ impl Terminal {
     /// 处理一条完整的 APC 内容（远程路径：扫描在 UI 线程完成）。
     ///
     /// 先同步光标位置——`a=T`/`a=p`/`d=c` 以光标为锚点，而扫描器不与 `term`
-    /// 争锁，只能由调用方在解析字节的间隙告知。
+    /// 争锁，只能由调用方在解析字节的间隙告知。可见行窗口同理：`d=a` 只删
+    /// 屏幕内可见的放置，而窗口随滚动变化。
     fn handle_kitty_apc(&mut self, content: &[u8]) {
         use crate::terminal::escape_scan;
         if !escape_scan::is_kitty_graphics(content) {
             return;
         }
-        let cursor = {
+        let (cursor, visible) = {
             let term = self.term.lock();
-            let point = term.grid().cursor.point;
-            (point.line.0, point.column.0 as u32)
+            let grid = term.grid();
+            let point = grid.cursor.point;
+            (
+                (point.line.0, point.column.0 as u32),
+                crate::terminal::kitty::storage::VisibleRows::new(
+                    grid.display_offset(),
+                    grid.screen_lines(),
+                ),
+            )
         };
         let Some(scanner) = self.kitty_scanner.as_mut() else {
             return;
         };
         scanner.set_cursor(cursor.0, cursor.1);
+        scanner.set_visible_rows(visible);
         scanner.scan_apc(content);
     }
 
