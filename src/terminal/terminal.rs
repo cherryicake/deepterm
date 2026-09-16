@@ -2133,6 +2133,9 @@ impl Terminal {
         // 未知模式、进而让后续 `DECRQM` 答 0。
         let mut search_from = 0;
         while let Some(hit) = escape_scan::find_private_mode_1016(&data[search_from..]) {
+            // 只记状态。去重缓存（`last_reported_mouse_cell`）的失效由
+            // `mouse_move` 用 `last_sgr_pixels_seen` 统一处理——本地路径的
+            // 置位发生在读线程，UI 侧只有在移动事件里才能发现翻转。
             self.remote_mode_1016 = hit.enabled;
             if let Some(r) = hit.removable {
                 removals.push(r);
@@ -5271,18 +5274,23 @@ mod tests {
         });
     }
 
-    /// 1016 开关切换后，同一单元格内的下一次移动仍必须上报。
+    /// 鼠标移动去重的完整语义（含 1016 开关后的行为）。
     ///
-    /// 去重缓存（`last_reported_mouse_cell`）只在**单元格**格式下参与拦阻；
-    /// 像素格式下跳过去重、直接上报。因此切换模式不能让缓存把新模式的
-    /// 第一次移动吞掉——那会让应用错过「回到单元格粒度」后的首个位置。
+    /// 去重缓存（`last_reported_mouse_cell`）只按**网格坐标**拦阻，且
+    /// **不随 1016 开关重置**——这是对齐 ghostty 的有意行为，不是缺陷：
+    /// `input/mouse_encode.zig:37` 的 `last_cell` 同样持久存在，
+    /// `Surface.zig:3713` 只在移动时写入、从不在模式开关时清空。
+    /// ghostty 唯一相关的拦阻条件是
+    /// `if (event.action == .motion and opts.format != .sgr_pixels)`（`:108-113`），
+    /// 与这里的 `if !self.sgr_pixels_active()` 等价。
     ///
-    /// 这里走完整序列：单元格模式下在 C 报一次 → 开 1016 → 关 1016 → 仍在 C
-    /// 内移动，必须再报一次。
+    /// 之所以不会「吞掉新模式后的第一次移动」：像素格式下整段去重被跳过，
+    /// 报文照发；切回单元格格式后，只要指针换了格子缓存自然失效。
+    ///
+    /// 本用例钉住三条：同格重复 → 去重；换格 → 必发；1016 开关一轮后换格
+    /// → 仍必发（缓存按格子失效，不因模式切换而误判）。
     #[gpui::test]
-    fn mouse_move_reports_after_1016_toggle_in_same_cell(cx: &mut TestAppContext) {
-        use alacritty_terminal::term::TermMode;
-
+    fn mouse_move_dedup_is_per_cell_and_survives_1016_toggle(cx: &mut TestAppContext) {
         let written = Arc::new(Mutex::new(Vec::new()));
         let sink = written.clone();
         let terminal = cx.new(move |_| {
@@ -5291,46 +5299,73 @@ mod tests {
             t.remote_input_callback = Some(Box::new(move |bytes| {
                 sink.lock().unwrap().extend_from_slice(bytes);
             }));
-            // MOUSE_MOTION：移动也上报，才会走到去重分支。
-            t.last_content.mode = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION;
             t
         });
 
-        // 单元格 C 内的一点（列 1、行 1 的中间）。
-        let pos = point(px(13.0), px(24.0));
+        // `mouse_mode()` 读的是 alacritty 的实时模式位，所以必须真的把
+        // `?1002h`（按钮拖动）+ `?1003h`（任意移动）喂进 vte。
+        //
+        // 但报文编码读的是 `last_content.mode` **快照**（`mouse_move` 尾部），
+        // 它只在 `update_last_content` 里从 `Term` 同步（真实路径由每帧负责）。
+        // 只置位 Term 而不刷新快照，`mouse_mode()` 会通过、报文却因快照里没有
+        // MOUSE_MOTION 而被 `mouse_moved_report` 判为 None —— 表现为一次都不写。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1002h\x1b[?1003h", false, cx);
+            t.update_last_content(false);
+            assert!(t.mouse_mode(false), "1002/1003 置位后应进入鼠标模式");
+        });
+        written.lock().unwrap().clear();
+
+        // bounds_for 是 9x16 的格子、原点 (0,0)：x∈[9,18) 是列 1，
+        // x∈[18,27) 是列 2；y=24 恒定落在行 1 中部，纵向不参与断言。
         let ev = |x: f32| gpui::MouseMoveEvent {
             position: point(px(x), px(24.0)),
             pressed_button: Some(gpui::MouseButton::Left),
             modifiers: gpui::Modifiers::default(),
         };
-        let _ = pos;
 
-        // 1) 单元格模式下在 C 内移动 → 上报一次。
+        // 1) 列 1 内首次移动 → 上报一次。
         terminal.update(cx, |t, cx| {
             t.mouse_move(&ev(13.0), cx);
         });
-        assert_eq!(written.lock().unwrap().len(), 1, "首次移动应上报");
+        let after_first = written.lock().unwrap().len();
+        assert!(after_first > 0, "首次移动应上报");
 
-        // 2) 同一单元格内再移动 → 被去重。
+        // 2) 同一格内再移动 → 被去重。
         terminal.update(cx, |t, cx| {
             t.mouse_move(&ev(14.0), cx);
         });
-        assert_eq!(written.lock().unwrap().len(), 1, "同格重复移动应被去重");
+        assert_eq!(
+            written.lock().unwrap().len(),
+            after_first,
+            "同格重复移动应被去重"
+        );
 
-        // 3) 开关 1016 一轮，指针不动。
+        // 3) 换到列 2 → 新格子必发。
+        terminal.update(cx, |t, cx| {
+            t.mouse_move(&ev(22.0), cx);
+        });
+        let after_cross = written.lock().unwrap().len();
+        assert!(after_cross > after_first, "跨格移动必须上报");
+
+        // 4) 开关 1016 一轮（指针不动）。
         terminal.update(cx, |t, cx| {
             t.process_pty_data(b"\x1b[?1016h", false, cx);
             t.process_pty_data(b"\x1b[?1016l", false, cx);
         });
+        assert!(
+            !terminal.read_with(cx, |t, _| t.sgr_pixels_active()),
+            "一轮开关后 1016 应回到复位状态"
+        );
 
-        // 4) 仍在同一单元格内移动 → 去重缓存若仍拦住就丢了这次上报。
+        // 5) 回到列 1（缓存里此刻是列 2）→ 属于换格，必发。开关本身不清缓存，
+        //    但换格令缓存失效，所以这次不会被陈旧坐标吞掉。
         terminal.update(cx, |t, cx| {
-            t.mouse_move(&ev(15.0), cx);
+            t.mouse_move(&ev(13.0), cx);
         });
-        assert_eq!(
-            written.lock().unwrap().len(),
-            2,
-            "1016 切回单元格模式后，同格移动必须重新上报，不能被陈旧缓存吞掉"
+        assert!(
+            written.lock().unwrap().len() > after_cross,
+            "1016 开关后换格移动必须上报（缓存按格子失效，不因模式切换而误判）"
         );
     }
 
