@@ -327,11 +327,11 @@ impl Parser {
 
             State::Value => match byte {
                 b',' => {
-                    self.finish_value();
+                    self.finish_value()?;
                     self.state = State::Key;
                 }
                 b';' => {
-                    self.finish_value();
+                    self.finish_value()?;
                     self.state = State::Data;
                 }
                 _ => self.value_buf.push(byte),
@@ -376,7 +376,7 @@ impl Parser {
         match self.state {
             State::Key | State::KeyIgnore => return Err(ParseError::InvalidFormat),
             // 值已累积完毕但尚未遇到 `,`/`;`，此处补写。
-            State::Value => self.finish_value(),
+            State::Value => self.finish_value()?,
             State::ValueIgnore | State::Data => {}
         }
 
@@ -415,11 +415,13 @@ impl Parser {
         })
     }
 
-    /// 把已累积的值写入控制表。
-    fn finish_value(&mut self) {
-        let value = parse_value(&self.value_buf, self.current_key);
+    /// 把已累积的值写入控制表。值是非法数字时报错（对齐 ghostty：解析
+    /// 失败即整条命令 `EINVAL`，而不是把坏值当 0 悄悄接受）。
+    fn finish_value(&mut self) -> Result<(), ParseError> {
+        let value = parse_value(&self.value_buf, self.current_key)?;
         self.control.put(self.current_key, value);
         self.value_buf.clear();
+        Ok(())
     }
 }
 
@@ -436,20 +438,24 @@ fn is_signed_key(key: u8) -> bool {
 ///
 /// 负数按有符号解析后再按位转回 `u32` 存储，取用时经 [`ControlPairs::i32`]
 /// 还原——这样 `z` 既能表达层级也能表达负值。
-fn parse_value(buf: &[u8], key: u8) -> u32 {
+///
+/// 非法数值（非 UTF-8、超范围、空值）返回 `Err`：ghostty 的 `finishValue`
+/// 是 `!void`，`std.fmt.parseInt` 的失败会一路传出去变成 `EINVAL` 应答。
+/// 静默按 0 处理会让客户端以为命令被接受（比如把 `i=abc` 当成图像 0）。
+fn parse_value(buf: &[u8], key: u8) -> Result<u32, ParseError> {
     if let [single] = buf
         && !single.is_ascii_digit()
         && single.is_ascii()
     {
-        return *single as u32;
+        return Ok(*single as u32);
     }
-    let Ok(text) = std::str::from_utf8(buf) else {
-        return 0;
-    };
+    let text = std::str::from_utf8(buf).map_err(|_| ParseError::InvalidFormat)?;
     if is_signed_key(key) {
-        text.parse::<i32>().map(|v| v as u32).unwrap_or(0)
+        text.parse::<i32>()
+            .map(|v| v as u32)
+            .map_err(|_| ParseError::InvalidFormat)
     } else {
-        text.parse::<u32>().unwrap_or(0)
+        text.parse::<u32>().map_err(|_| ParseError::InvalidFormat)
     }
 }
 
@@ -612,6 +618,48 @@ mod tests {
     #[test]
     fn unknown_action_is_rejected() {
         assert_eq!(parse("a=Z"), Err(ParseError::UnknownAction));
+    }
+
+    #[test]
+    fn non_numeric_value_is_invalid() {
+        // ghostty `finishValue` 会 `try parseInt`：坏值让整条命令失败，
+        // 而不是退化成 0 被当成"有效但为零"。
+        assert_eq!(parse("a=t,i=abc,f=32"), Err(ParseError::InvalidFormat));
+        // 允许多字符的标志位只对单字符生效；`t=ff` 是非法数字。
+        assert_eq!(parse("a=t,t=ff"), Err(ParseError::InvalidFormat));
+    }
+
+    #[test]
+    fn empty_value_is_invalid() {
+        // `i=` 的缓冲区长度为 0，ghostty 同样会在 parseInt 上失败。
+        assert_eq!(parse("a=t,i=,f=32"), Err(ParseError::InvalidFormat));
+        assert_eq!(parse("a=t,i="), Err(ParseError::InvalidFormat));
+    }
+
+    #[test]
+    fn overflowing_value_is_invalid() {
+        // u32 上界 4294967295 可接受，再多一位即溢出。
+        assert_eq!(
+            parse("a=t,i=4294967295").unwrap().control.u32(b'i'),
+            Some(u32::MAX)
+        );
+        assert_eq!(parse("a=t,i=4294967296"), Err(ParseError::InvalidFormat));
+    }
+
+    #[test]
+    fn negative_value_only_allowed_on_signed_keys() {
+        // `z` 是有符号键（层级 / 动画间隔），负数合法并保留位模式。
+        let cmd = parse("a=t,i=1,z=-3").unwrap();
+        assert_eq!(cmd.control.i32(b'z'), Some(-3));
+        // 其余键负数非法。
+        assert_eq!(parse("a=t,i=-1"), Err(ParseError::InvalidFormat));
+    }
+
+    #[test]
+    fn single_non_digit_ascii_value_is_a_codepoint() {
+        // 单字符标志位（`t=d`）取码值；数字字符仍按数值解析。
+        assert_eq!(parse("a=t,t=d").unwrap().control.byte(b't'), Some(b'd'));
+        assert_eq!(parse("a=t,i=7").unwrap().control.u32(b'i'), Some(7));
     }
 
     #[test]
