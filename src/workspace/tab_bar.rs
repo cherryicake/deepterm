@@ -787,10 +787,16 @@ impl TabBar {
             .on_drag_move::<DraggedTab>(cx.listener(|this, event, _window, cx| {
                 this.handle_tab_drag_move(event, cx);
             }))
-            // 拖拽重排：由 drag_move 维护的中点插入位直接应用
+            // 拖拽重排：由 drag_move 维护的中点插入位直接应用。
+            // 抖动兜底：GPUI 的拖拽启动阈值只有 2px（逻辑像素），在 1x 外接屏上
+            // 等于 2 个物理像素，手部微抖就会把一次点击变成拖拽——on_click 被
+            // 取消，而落点仍在原位、重排又是 no-op，看起来就是“点了没反应”
+            // （还会短暂闪出跟随鼠标的拖拽预览）。此时落点无实际位移，等价于
+            // 一次点击，直接补发 on_tab_click。
             .on_drop(cx.listener({
                 let on_tab_reorder = on_tab_reorder.clone();
-                move |this, dragged: &DraggedTab, _window, cx| {
+                let on_tab_click = self.on_tab_click.clone();
+                move |this, dragged: &DraggedTab, window, cx| {
                     cx.stop_propagation();
 
                     let insert_slot = this
@@ -798,6 +804,15 @@ impl TabBar {
                         .as_ref()
                         .filter(|preview| preview.dragged_tab.tab_id == dragged.tab_id)
                         .map(|preview| preview.insert_slot);
+
+                    // 只对本栏仍存在的标签补点击：外来 TabBar 的拖拽、已关闭的
+                    // 标签一律放行，避免把未知 id 喂给 on_tab_click。
+                    let is_own_tab = this.tabs.iter().any(|t| t.id == dragged.tab_id);
+                    let fire_click_as_fallback = |window: &mut Window, cx: &mut Context<TabBar>| {
+                        if is_own_tab && let Some(ref on_click) = on_tab_click {
+                            on_click(dragged.tab_id.clone(), window, cx);
+                        }
+                    };
 
                     if let Some(insert_slot) = insert_slot {
                         let did_reorder = this.apply_tab_reorder(dragged, insert_slot);
@@ -807,9 +822,14 @@ impl TabBar {
                             && did_reorder.is_some()
                         {
                             callback(dragged.clone(), insert_slot, cx);
+                        } else if did_reorder.is_none() {
+                            fire_click_as_fallback(window, cx);
                         }
                     } else {
                         this.clear_tab_reorder_preview(cx);
+                        // 拖拽启动后没有任何 drag_move（抖动极小、按下后原地释放）：
+                        // 同样视为点击。
+                        fire_click_as_fallback(window, cx);
                     }
                 }
             }))
@@ -1472,5 +1492,79 @@ mod tests {
         cx.simulate_mouse_down(outside, MouseButton::Left, gpui::Modifiers::none());
         cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
+    }
+
+    /// 回归：1x 外接屏上 GPUI 的 2px 拖拽阈值等于 2 个物理像素，物理鼠标按压
+    /// 微抖就会把一次点击误启动成拖拽——`on_click` 被取消，而落点仍在原位、
+    /// 重排又是 no-op，看起来就是“点了没反应”（还会短暂闪出跟随鼠标的拖拽
+    /// 预览）。此时原位 drop 必须把这次落点补发为一次点击。
+    #[gpui::test]
+    fn jittered_press_still_fires_tab_click(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| crate::theme::init(cx));
+
+        let clicked = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let reordered = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let bar = cx.update(|cx| {
+            TabBar::new_with_tabs(
+                "test-tab-bar-jitter",
+                cx,
+                vec![
+                    TabItem::new("t1", "Terminal 1"),
+                    TabItem::new("t2", "Terminal 2"),
+                ],
+            )
+        });
+        bar.update(cx, |bar, _| {
+            let fired = clicked.clone();
+            bar.on_tab_click(move |tab_id, _window, _cx| {
+                *fired.lock().unwrap() = Some(tab_id.to_string());
+            });
+            let moved = reordered.clone();
+            bar.on_tab_reorder(move |dragged, _slot, _cx| {
+                moved.lock().unwrap().push(dragged.tab_id.to_string());
+            });
+        });
+
+        let window = cx.open_window(gpui::size(px(400.), px(30.)), {
+            let bar = bar.clone();
+            move |_, _| MenuProbeHost { bar: bar.clone() }
+        });
+        let handle: gpui::AnyWindowHandle = window.into();
+        let cx = &mut gpui::VisualTestContext::from_window(handle, cx);
+        cx.run_until_parked();
+
+        // 对照：干净点击必须触发切换（既有行为不断裂）。
+        let pos = point(px(30.), px(15.));
+        cx.simulate_mouse_move(pos, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_click(pos, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(clicked.lock().unwrap().as_deref(), Some("t1"));
+        *clicked.lock().unwrap() = None;
+
+        // 抖动点击：按下后移动 5px（超过 GPUI 2px 拖拽阈值）再释放。
+        // 修复前：误启动拖拽 → click 被取消 → drop 又是原位 no-op → 无任何回调。
+        let down = point(px(30.), px(15.));
+        let up = point(px(34.), px(18.));
+        cx.simulate_mouse_move(down, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(down, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(up, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_up(up, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicked.lock().unwrap().as_deref(),
+            Some("t1"),
+            "抖动导致的原位 drop 必须补发 tab 点击"
+        );
+        assert!(reordered.lock().unwrap().is_empty(), "原位落点不得触发重排");
+        let order: Vec<String> = bar.update(cx, |bar, _| {
+            bar.tabs.iter().map(|t| t.id.to_string()).collect()
+        });
+        assert_eq!(order, ["t1", "t2"]);
     }
 }
