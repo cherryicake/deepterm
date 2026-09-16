@@ -3164,6 +3164,19 @@ impl Terminal {
         // 远程终端的字节在 UI 线程解析，没有读线程替扫描器维护几何，只能在这里
         // 推给它（本地路径由 LocalReader 负责）。
         self.sync_remote_scanner_geometry();
+
+        // in-band size reports（`?2048`）在远程路径上由本层应答并**摘除**，
+        // 序列进不到扫描器（见 `handle_size_sequences`），所以扫描器的
+        // `set_geometry` 重报不会发生——必须用本层自己的 `remote_mode_2048`
+        // 补一次。ghostty `stream_terminal.zig` 的 `resize()` 同样是在模式
+        // 启用期间每次尺寸变化都主动上报。
+        if self.remote_mode_2048 {
+            let report = crate::terminal::escape_scan::encode_size_report(
+                crate::terminal::escape_scan::SizeReport::Mode2048,
+                self.terminal_bounds.term_geometry(self.display_scale),
+            );
+            self.write_raw(report.as_bytes());
+        }
         // 对应 ghostty `renderer_mailbox.push(.resize)` + `renderer_wakeup`。
         if wake {
             cx.emit(Event::Wakeup);
@@ -4828,6 +4841,33 @@ mod tests {
         (terminal, written)
     }
 
+    /// 远程式终端 + Kitty 扫描器，供 resize 相关的协议用例使用。
+    ///
+    /// 与 [`remote_size_test_terminal`] 的差别：带上扫描器（`apply_pending_resize`
+    /// 会把几何推给它），并置 `resize_primed` 跳过首帧校正分支，让用例里的
+    /// resize 直接走「应用」路径而不是「首次校正」路径。
+    fn remote_kitty_terminal(cx: &mut TestAppContext) -> (Entity<Terminal>, Arc<Mutex<Vec<u8>>>) {
+        use crate::terminal::kitty::scanner::KittyGraphicsScanner;
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = written.clone();
+        let terminal = cx.new(move |_| {
+            let mut t = Terminal::create_error_terminal();
+            t.terminal_bounds = bounds_for(80, 24);
+            t.remote_input_callback = Some(Box::new(move |bytes| {
+                sink.lock().unwrap().extend_from_slice(bytes);
+            }));
+            t.kitty_scanner = Some(KittyGraphicsScanner::with_storage(
+                t.images.storage(),
+                true,
+                Box::new(crate::terminal::kitty::scanner::CollectingSink::default()),
+            ));
+            t.resize_primed = true;
+            t
+        });
+        (terminal, written)
+    }
+
     /// `CSI 16 t` 在远程路径上被应答，且序列不进 vte。
     ///
     /// 格式必须是 ghostty 的 `\x1b[6;{cell_height};{cell_width}t`——**高在前**。
@@ -4965,6 +5005,70 @@ mod tests {
             placements(&storage),
             0,
             "d=c 打在矩形内部格应删除放置；未删说明几何没送达、矩形退化成 1x1"
+        );
+    }
+
+    /// resize 时若 in-band size reports（DECSET ?2048）已启用，必须**重报一次**
+    /// 新尺寸，且这次重报要真的写回 SSH 通道。
+    ///
+    /// 对齐 ghostty `stream_terminal.zig` 的 `resize()`：模式启用期间每次尺寸
+    /// 变化都要主动告知客户端，否则它只能靠 `CSI 14 t` 轮询。
+    ///
+    /// 远程路径的 2048 开关由 `Terminal` 自己在 `handle_size_sequences` 里观察，
+    /// 序列随即被摘除——进不到扫描器，所以扫描器的 `set_geometry` 重报不会发生，
+    /// 必须由 `apply_pending_resize` 用 `remote_mode_2048` 自己补报一次。
+    #[gpui::test]
+    fn remote_resize_re_reports_2048_to_channel(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_kitty_terminal(cx);
+
+        // 开启 2048：此时会立即上报一次当前几何，先清掉，只观察 resize 那一次。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?2048h", false, cx);
+        });
+        assert!(
+            !written.lock().unwrap().is_empty(),
+            "置位 2048 时应立即上报一次当前几何"
+        );
+        written.lock().unwrap().clear();
+
+        // 行列都变 → 走 apply_pending_resize 的应用路径。
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(60, 20), 1.0, cx);
+        });
+
+        let out = written.lock().unwrap().clone();
+        assert!(
+            !out.is_empty(),
+            "resize 后必须立刻重报 2048 尺寸，实际没有写出任何字节"
+        );
+        let text = String::from_utf8_lossy(&out);
+        // 格式 `\x1b[48;{rows};{cols};{height_px};{width_px}t`；
+        // 60x20 网格、9x16 的 cell → 540 高 320 宽。
+        assert!(
+            text.contains("\x1b[48;20;60;320;540t"),
+            "应报新网格 20 行 60 列与 320x540 像素，实际 {text:?}"
+        );
+    }
+
+    /// `?2048l` 复位后 resize 不得再上报（对齐 ghostty：只有置位才发）。
+    #[gpui::test]
+    fn remote_resize_does_not_report_2048_after_reset(cx: &mut TestAppContext) {
+        let (terminal, written) = remote_kitty_terminal(cx);
+
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?2048h", false, cx);
+            t.process_pty_data(b"\x1b[?2048l", false, cx);
+        });
+        written.lock().unwrap().clear();
+
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds_for(60, 20), 1.0, cx);
+        });
+
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "2048 已复位，resize 不应再上报，实际 {:?}",
+            String::from_utf8_lossy(&written.lock().unwrap())
         );
     }
 
@@ -5165,6 +5269,69 @@ mod tests {
             t.process_pty_data(b"\x1b[?1016l", false, cx);
             assert!(!t.sgr_pixels_active(), "复位后 sgr_pixels_active 应为假");
         });
+    }
+
+    /// 1016 开关切换后，同一单元格内的下一次移动仍必须上报。
+    ///
+    /// 去重缓存（`last_reported_mouse_cell`）只在**单元格**格式下参与拦阻；
+    /// 像素格式下跳过去重、直接上报。因此切换模式不能让缓存把新模式的
+    /// 第一次移动吞掉——那会让应用错过「回到单元格粒度」后的首个位置。
+    ///
+    /// 这里走完整序列：单元格模式下在 C 报一次 → 开 1016 → 关 1016 → 仍在 C
+    /// 内移动，必须再报一次。
+    #[gpui::test]
+    fn mouse_move_reports_after_1016_toggle_in_same_cell(cx: &mut TestAppContext) {
+        use alacritty_terminal::term::TermMode;
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = written.clone();
+        let terminal = cx.new(move |_| {
+            let mut t = Terminal::create_error_terminal();
+            t.terminal_bounds = bounds_for(80, 24);
+            t.remote_input_callback = Some(Box::new(move |bytes| {
+                sink.lock().unwrap().extend_from_slice(bytes);
+            }));
+            // MOUSE_MOTION：移动也上报，才会走到去重分支。
+            t.last_content.mode = TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION;
+            t
+        });
+
+        // 单元格 C 内的一点（列 1、行 1 的中间）。
+        let pos = point(px(13.0), px(24.0));
+        let ev = |x: f32| gpui::MouseMoveEvent {
+            position: point(px(x), px(24.0)),
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::default(),
+        };
+        let _ = pos;
+
+        // 1) 单元格模式下在 C 内移动 → 上报一次。
+        terminal.update(cx, |t, cx| {
+            t.mouse_move(&ev(13.0), cx);
+        });
+        assert_eq!(written.lock().unwrap().len(), 1, "首次移动应上报");
+
+        // 2) 同一单元格内再移动 → 被去重。
+        terminal.update(cx, |t, cx| {
+            t.mouse_move(&ev(14.0), cx);
+        });
+        assert_eq!(written.lock().unwrap().len(), 1, "同格重复移动应被去重");
+
+        // 3) 开关 1016 一轮，指针不动。
+        terminal.update(cx, |t, cx| {
+            t.process_pty_data(b"\x1b[?1016h", false, cx);
+            t.process_pty_data(b"\x1b[?1016l", false, cx);
+        });
+
+        // 4) 仍在同一单元格内移动 → 去重缓存若仍拦住就丢了这次上报。
+        terminal.update(cx, |t, cx| {
+            t.mouse_move(&ev(15.0), cx);
+        });
+        assert_eq!(
+            written.lock().unwrap().len(),
+            2,
+            "1016 切回单元格模式后，同格移动必须重新上报，不能被陈旧缓存吞掉"
+        );
     }
 
     /// `CSI 16 t` 整条落在同一个 chunk 里时必然被应答。
