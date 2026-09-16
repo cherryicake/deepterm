@@ -43,9 +43,15 @@ pub fn client_side_decorations(
                 .when(!(tiling.bottom || tiling.left), |div| {
                     div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
                 })
-                .when(!tiling.top, |div| div.pt(CLIENT_SIDE_DECORATION_SHADOW))
+                // 内边距必须始终保留：它把内容推离顶部缩放热区
+                // （见下方 resize_edge，`pos.y < CLIENT_SIDE_DECORATION_SHADOW`
+                // 即判定为顶边缩放）。若按 tiling 丢弃 pt，全屏时（tiling.top
+                // 为真）内容会上移 SHADOW 像素，标题栏/tab 栏的上沿就落入缩放带，
+                // 点击被 start_window_resize 吃掉而看似无响应。
+                // tiling 只应控制装饰外观（圆角/边框/阴影），不控制内容位移。
+                .pt(CLIENT_SIDE_DECORATION_SHADOW)
                 .when(!tiling.bottom, |div| div.pb(CLIENT_SIDE_DECORATION_SHADOW))
-                .when(!tiling.left, |div| div.pl(CLIENT_SIDE_DECORATION_SHADOW))
+                .pl(CLIENT_SIDE_DECORATION_SHADOW)
                 .when(!tiling.right, |div| div.pr(CLIENT_SIDE_DECORATION_SHADOW))
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
                     let size = window.window_bounds().get_bounds().size;
