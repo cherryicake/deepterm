@@ -1312,6 +1312,54 @@ impl Workspace {
         self.do_panel_close(panel_id, window, cx);
     }
 
+    /// 取出指定视图的全部 Kitty 纹理并逐个 `drop_image`。
+    ///
+    /// 视图关闭后不再绘制，其 `ImageCache` 随视图释放，但 GPU 图集 tile 必须
+    /// 显式释放（见 `ImageCache` 文档），否则残留到窗口关闭。undo 恢复的是
+    /// 同一视图实体：缓存已清空，重绘按需重建，无副作用。
+    fn drop_view_kitty_textures(view: &Entity<TerminalView>, window: &mut Window, cx: &mut App) {
+        let textures = view.update(cx, |view, _| view.take_kitty_textures());
+        if !textures.is_empty() {
+            log::debug!("释放已关闭终端的 Kitty 纹理 {} 张", textures.len());
+        }
+        for texture in textures {
+            if let Err(err) = window.drop_image(texture) {
+                log::warn!("释放已关闭终端的 Kitty 纹理失败: {err}");
+            }
+        }
+    }
+
+    /// 释放在关闭前指定 panel 里终端视图缓存的 Kitty GPU 纹理。
+    fn drop_panel_kitty_textures(&self, panel_id: &str, window: &mut Window, cx: &mut App) {
+        let view = self.tabs.values().find_map(|tab_info| {
+            tab_info
+                .container
+                .find_panel(panel_id, cx)?
+                .read(cx)
+                .content()
+                .terminal_view()
+                .cloned()
+        });
+        if let Some(view) = view {
+            Self::drop_view_kitty_textures(&view, window, cx);
+        }
+    }
+
+    /// 释放关闭前某 tab 内所有终端视图的 Kitty GPU 纹理。
+    fn drop_tab_kitty_textures(&self, tab_id: &str, window: &mut Window, cx: &mut App) {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            return;
+        };
+        for panel in tab_info.container.collect_panels_vec() {
+            // 先把 `read` 借用结束（`cloned` 出 owned 实体），再 `update`，
+            // 否则两个可变借用打架。
+            let view = panel.read(cx).content().terminal_view().cloned();
+            if let Some(view) = view {
+                Self::drop_view_kitty_textures(&view, window, cx);
+            }
+        }
+    }
+
     /// 真正关闭 panel（已过确认）：从其所在 tab 的容器中移除。
     fn do_panel_close(&mut self, panel_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         // 在所有 tab 中搜索包含该 panel 的 tab
@@ -1337,6 +1385,10 @@ impl Workspace {
             self.do_tab_close(&target_tab_id, window, cx);
             return;
         }
+
+        // 先释放该 panel 的 GPU 纹理（只动关闭的这一个，同 tab 其他 panel 不受影响；
+        // 单 panel 的情况走下面的 do_tab_close，那边会整 tab 释放）。
+        self.drop_panel_kitty_textures(panel_id, window, cx);
 
         // 从container中移除指定的panel
         let new_container = {
@@ -2031,6 +2083,8 @@ impl Workspace {
 
     /// 真正关闭 tab（已过确认）：入 undo 栈 → 移除 → 切换/关窗。
     fn do_tab_close(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // 先释放该 tab 内所有终端视图的 GPU 纹理（视图移除后不再绘制）。
+        self.drop_tab_kitty_textures(tab_id, window, cx);
         // undo 栈：有其他 tab 可切回，且终端还在跑才值得恢复
         // （最后一个 tab 关闭即关窗，进程随窗口销毁；已 exit 的终端重开是死壳）
         let has_other_tabs = self.tabs.len() > 1;

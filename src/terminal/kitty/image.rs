@@ -5,12 +5,33 @@ use super::command::{Format, ParseError};
 /// 图像 id 类型（`i=` 键的存储键）。取值 0 表示未显式指定。
 pub type ImageId = u32;
 
-/// 单张图像的字节上限（对齐 ghostty `image.zig` 的 400 MB）。
-pub const MAX_IMAGE_BYTES: usize = 400 * 1024 * 1024;
+/// 单张图像解码后的字节上限（`w*h*4`）。
+///
+/// ghostty 取 400 MB，但 deepterm 同一张图常驻约 2 份 CPU 拷贝
+/// （`Storage` 的 RGBA + `ImageCache` 里 `RenderImage` 的 BGRA）再加一份 GPU
+/// 纹理，照抄 400 MB 会让单张图就吃掉上 GB 虚存。这里取 64 MB
+/// （恰好容纳 4096×4096 RGBA，远大于 Retina 全屏终端截图的 ~30 MB），
+/// 超限即报 `EINVAL: too large`。
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// 分片传输时累积的 base64 文本上限。
+///
+/// 对齐 ghostty `LoadingImage::addData` 的 `max_size` 检查：`m=1` 的中间片
+/// 只拼不解码，若不设上限，流式发送能把累积缓冲撑到远超单图上限
+/// （此前即无此检查，是常驻内存被撑爆的一条真实路径）。base64 相对原文
+/// 有 4/3 膨胀，再留 4 KiB 给分片边界填充。
+pub const MAX_LOADING_ENCODED_BYTES: usize = MAX_IMAGE_BYTES * 4 / 3 + 4096;
 
 /// 单张图像的像素数上限，防解压炸弹。
 /// 与 `editor/image_viewer.rs` 的 `MAX_IMAGE_PIXELS` 取同一量级（8000×8000）。
 pub const MAX_IMAGE_PIXELS: u64 = 8000 * 8000;
+
+/// 单边像素上限（对齐 ghostty `graphics_image.zig` 的 `max_dimension = 10000`）。
+///
+/// 总像素/总字节上限拦的是面积，这个拦的是长宽比：10000×1600 的细长条能
+/// 通过面积检查，却会产生 10000px 宽的 GPU 图集 tile。终端截图的边长远到
+/// 不了 10000，正常客户端无感。
+pub const MAX_IMAGE_DIMENSION: u32 = 10000;
 
 /// 解码后的图像：始终是 RGBA8 行主序。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +142,9 @@ fn check_dimensions(width: u32, height: u32) -> Result<(), DecodeError> {
     if width == 0 || height == 0 {
         return Err(DecodeError::MissingDimensions);
     }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Err(DecodeError::TooLarge);
+    }
     let pixels = width as u64 * height as u64;
     if pixels > MAX_IMAGE_PIXELS {
         return Err(DecodeError::TooLarge);
@@ -172,6 +196,16 @@ fn decode_raw(
 /// 解码 PNG（`f=100`）。
 fn decode_png(data: &[u8]) -> Result<DecodedImage, DecodeError> {
     use image::ImageReader;
+
+    // 先只读文件头拿尺寸、全量解码前先卡上限：`decode` 会一次性分配
+    // `w*h*4` 像素缓冲，恶意 PNG 用超大 IHDR 在这里瞬间吃掉几百 MB。
+    // 对齐 ghostty `decodePng` 的 `LimitedAllocator(max_size)` 设限。
+    let (header_w, header_h) = ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|_| DecodeError::InvalidPng)?
+        .into_dimensions()
+        .map_err(|_| DecodeError::InvalidPng)?;
+    check_dimensions(header_w, header_h)?;
 
     let reader = ImageReader::new(std::io::Cursor::new(data))
         .with_guessed_format()
@@ -247,6 +281,42 @@ mod tests {
     fn oversized_dimensions_rejected() {
         assert_eq!(
             decode(&[], Format::Rgba, Some(100_000), Some(100_000)),
+            Err(DecodeError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn oversized_side_is_rejected() {
+        // 对齐 ghostty `max_dimension = 10000`：面积不大但单边离谱的细长条同样拒绝。
+        assert_eq!(
+            decode(&[], Format::Rgba, Some(10_001), Some(1)),
+            Err(DecodeError::TooLarge)
+        );
+        assert_eq!(
+            decode(&[], Format::Rgba, Some(1), Some(10_001)),
+            Err(DecodeError::TooLarge)
+        );
+        // 边界值通过（这里只测上限本身，数据长度不足是另一回事）。
+        assert_eq!(
+            decode(&[0u8; 4], Format::Rgba, Some(10_000), Some(1)),
+            Err(DecodeError::LengthMismatch)
+        );
+    }
+
+    #[test]
+    fn png_with_oversized_header_is_rejected_before_decode() {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder as _};
+
+        // 10001×1：单边超限。编码后只有几十 KB，解码方应在读文件头即拒绝，
+        // 而不是先分配像素缓冲再拒绝。
+        let raw = vec![255u8; 10_001 * 4];
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&raw, 10_001, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        assert_eq!(
+            decode(&png, Format::Png, None, None),
             Err(DecodeError::TooLarge)
         );
     }

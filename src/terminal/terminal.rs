@@ -125,16 +125,19 @@ pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
 #[derive(Clone)]
 pub struct DriverListener(pub async_channel::Sender<DriverEvent>);
 
-/// Kitty 图形协议可占用的图像内存上限（320 MB）。
+/// Kitty 图形协议可占用的图像内存上限（128 MB，十进制）。
 ///
-/// 与 ghostty 的 `image-storage-limit` 默认值**逐字节一致**
-/// （`config/Config.zig`: `320 * 1000 * 1000`，即十进制 320 MB；不是
-/// `320 * 1024 * 1024`）。ghostty 在 `termio/Termio.zig` 用该配置调用
-/// `setKittyGraphicsSizeLimit`，这里是同一语义的编译期常量。
+/// ghostty 的 `image-storage-limit` 默认值是 `320 * 1000 * 1000`，这里**故意
+/// 取更小**：ghostty 上传 GPU 后即释放 CPU 像素（`renderer/image.zig` 的
+/// `upload` 会 `deinit` 掉 pending 数据），常驻只有 1 份 CPU + 可见图的 GPU
+/// 纹理；而 deepterm 同一张图常驻约 2 份 CPU 拷贝（`Storage` 的 RGBA +
+/// `ImageCache` 里 `RenderImage` 的 BGRA）再加 GPU 纹理。按 ~2.5 倍系数折算，
+/// 128 MB 的实际效果约等于 ghostty 默认 320 MB 的内存占用。
 ///
 /// 单张图上限另有 [`crate::terminal::kitty::image`] 的 `MAX_IMAGE_BYTES`
-/// 把关；这里是**全部图像合计**，超限按优先级淘汰。
-const KITTY_IMAGE_LIMIT: usize = 320 * 1000 * 1000;
+/// 把关（64 MB，不会单张吃掉整个预算）；这里是**全部图像合计**，超限按
+/// 优先级淘汰。
+const KITTY_IMAGE_LIMIT: usize = 128 * 1000 * 1000;
 
 /// Kitty 协议应答的投递通道。
 ///

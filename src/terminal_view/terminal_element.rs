@@ -2252,10 +2252,25 @@ impl Element for TerminalElement {
             cx,
         );
 
-        // 归还纹理缓存（顺带回收已删除/已替换图像的纹理，避免缓存无限增长）。
+        // 归还纹理缓存：CPU 侧裁剪 + GPU 图集释放，二者缺一不可。
+        // `RenderImage` 每次构造拿新的全局图集 id，而 GPUI atlas 不会自动回收——
+        // 只 prune HashMap 的话，被替换/删除/换帧的图像会在 Metal 图集里永久残留
+        // tile（统一内存上直接计进程内存，持续刷新的页面几分钟即达 GB 级）。
         {
             let guard = kitty_storage.lock().expect("kitty 图像存储锁被投毒");
-            kitty_cache.prune(&guard);
+            let freed = kitty_cache.prune(&guard);
+            if !freed.is_empty() {
+                log::debug!(
+                    "kitty 图像缓存裁剪 {} 张纹理（存储总量 {} 字节）",
+                    freed.len(),
+                    guard.total_bytes()
+                );
+            }
+            for texture in freed {
+                if let Err(err) = window.drop_image(texture) {
+                    log::warn!("释放 Kitty 图像纹理失败: {err}");
+                }
+            }
         }
         self.view.update(cx, |view, _cx| {
             view.kitty_image_cache = std::mem::take(&mut kitty_cache);

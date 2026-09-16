@@ -1201,6 +1201,14 @@ impl TerminalView {
         &self.terminal
     }
 
+    /// 取出全部已缓存的 Kitty 纹理（tab/panel 关闭时释放 GPU 图集用）。
+    ///
+    /// 调用方必须把返回的纹理逐个 `Window::drop_image`。缓存清空后若视图
+    /// 复活（如 undo 恢复），重绘会按需重建纹理，无副作用。
+    pub fn take_kitty_textures(&mut self) -> Vec<std::sync::Arc<gpui::RenderImage>> {
+        self.kitty_image_cache.take_all()
+    }
+
     pub fn working_directory(&self) -> Option<&PathBuf> {
         self.working_directory.as_ref()
     }

@@ -94,6 +94,36 @@ struct LoadingImage {
     frame: Option<FrameLoad>,
 }
 
+impl LoadingImage {
+    /// 追加一片 base64 文本，累积超限即报错。
+    ///
+    /// 对齐 ghostty `LoadingImage::addData` 的 `max_size` 检查（那边累计的是
+    /// 解码后字节，这里累计的是 base64 文本，上限见
+    /// [`image::MAX_LOADING_ENCODED_BYTES`]）。调用方在中途片超限时应丢弃
+    /// 整个未完成的加载并把错误回给客户端——与 ghostty「保留部分加载」
+    /// 不同，这里选择释放：设限就是为了省内存，留着超限的部分缓冲违背初衷；
+    /// 客户端收到 `EINVAL: too large` 后重发起即可，后续续片会因无加载状态
+    /// 而得到 `EINVAL: invalid chunk`。
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), ExecutionError> {
+        if self.encoded.len() + chunk.len() > image::MAX_LOADING_ENCODED_BYTES {
+            return Err(ExecutionError::Decode(DecodeError::TooLarge));
+        }
+        self.encoded.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// 首片的长度预检（与 `push_chunk` 同一上限）。
+    ///
+    /// 单条命令已有 65 MB 解析上限，正常到不了这里；防的是将来解析上限
+    /// 放宽后首片即超限。
+    fn check_first_chunk(chunk: &[u8]) -> Result<(), ExecutionError> {
+        if chunk.len() > image::MAX_LOADING_ENCODED_BYTES {
+            return Err(ExecutionError::Decode(DecodeError::TooLarge));
+        }
+        Ok(())
+    }
+}
+
 /// 正在加载的动画帧的上下文（`a=f`）。
 ///
 /// 分片续片只携带负载，所有帧参数都在首片随本结构保存。
@@ -512,9 +542,14 @@ impl ImageStore {
 
         if more {
             // 分片中间态：拼接 **base64 文本**，等最后一片再整体解码。
+            LoadingImage::check_first_chunk(&cmd.encoded)?;
             match &mut self.loading {
                 Some(loading) if explicit_id.is_none() || Some(loading.id) == explicit_id => {
-                    loading.encoded.extend_from_slice(&cmd.encoded);
+                    if let Err(e) = loading.push_chunk(&cmd.encoded) {
+                        // 超限：丢弃未完成的加载并报错（见 push_chunk 注释）。
+                        self.loading.take();
+                        return Err(e);
+                    }
                     return Ok(Response::default());
                 }
                 Some(_) => return Err(ExecutionError::InvalidChunk),
@@ -545,7 +580,9 @@ impl ImageStore {
                 {
                     return Err(ExecutionError::InvalidChunk);
                 }
-                loading.encoded.extend_from_slice(&cmd.encoded);
+                // 末片同样计入累积上限（`loading` 是 take 出来的 owned 值，
+                // `?` 失败时它随栈释放，部分缓冲即被丢弃）。
+                loading.push_chunk(&cmd.encoded)?;
                 (
                     loading.id,
                     self.payload_for_medium(&loading.encoded, loading.medium, loading.compression)?,
@@ -660,7 +697,11 @@ impl ImageStore {
             if loading.frame.is_none() {
                 return self.transmit(cmd, (0, 0), false);
             }
-            loading.encoded.extend_from_slice(&cmd.encoded);
+            if let Err(e) = loading.push_chunk(&cmd.encoded) {
+                // 超限：丢弃未完成的帧加载并报错（见 push_chunk 注释）。
+                self.loading.take();
+                return Err(e);
+            }
             if medium.supports_chunking() && cmd.control.u32(b'm').is_some_and(|v| v > 0) {
                 return Ok(Response::default());
             }
@@ -704,6 +745,7 @@ impl ImageStore {
             background: Background::from_bits(cmd.control.u32(b'Y').unwrap_or(0)),
         };
 
+        LoadingImage::check_first_chunk(&cmd.encoded)?;
         let more = medium.supports_chunking() && cmd.control.u32(b'm').is_some_and(|v| v > 0);
         self.loading = Some(LoadingImage {
             id,
@@ -1999,6 +2041,35 @@ mod tests {
             vec![255, 0, 0, 255],
             "分片应正确拼接解码"
         );
+    }
+
+    #[test]
+    fn chunked_accumulation_over_limit_is_rejected() {
+        use crate::terminal::kitty::command::{Compression, Format, Medium};
+        use crate::terminal::kitty::image::MAX_LOADING_ENCODED_BYTES;
+
+        fn loading_with(encoded_len: usize) -> LoadingImage {
+            LoadingImage {
+                id: 9,
+                number: None,
+                format: Format::Rgba,
+                compression: Compression::None,
+                medium: Medium::Direct,
+                width: Some(1),
+                height: Some(1),
+                encoded: vec![0u8; encoded_len],
+                frame: None,
+            }
+        }
+
+        // 边界上一字节：恰好顶满通过。
+        let mut loading = loading_with(MAX_LOADING_ENCODED_BYTES - 1);
+        assert!(loading.push_chunk(&[0]).is_ok());
+        assert_eq!(loading.encoded.len(), MAX_LOADING_ENCODED_BYTES);
+
+        // 再多一字节即超限，报 too large（客户端看到 `EINVAL: too large`）。
+        let err = loading.push_chunk(&[0]).unwrap_err();
+        assert_eq!(err, ExecutionError::Decode(DecodeError::TooLarge));
     }
 
     /// `d=A` 释放数据：光标处那张图的放置被删空后，图像数据一并释放。

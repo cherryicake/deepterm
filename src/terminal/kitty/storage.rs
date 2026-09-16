@@ -497,6 +497,12 @@ impl Storage {
             .map(|(_, img)| img.byte_len())
             .sum();
         if evictable < required {
+            log::debug!(
+                "kitty 动画帧预留 {} 字节失败：可淘汰 {} < 需要 {}",
+                bytes,
+                evictable,
+                required
+            );
             return false;
         }
 
@@ -788,9 +794,25 @@ impl Storage {
             return;
         }
 
+        // 对齐 ghostty 的淘汰日志：常驻内存异常时，用
+        // `RUST_LOG=deepterm::terminal::kitty=debug` 可直接看到淘汰频率与量级。
+        // 若淘汰日志刷屏而总量不降，说明客户端在持续灌入新图（而非泄漏）。
+        let over = self.total_bytes.saturating_sub(self.limit_bytes);
+        if over > 0 {
+            log::debug!(
+                "kitty 图像存储超限 {} 字节（总量 {} / 上限 {}），开始淘汰",
+                over,
+                self.total_bytes,
+                self.limit_bytes
+            );
+        }
         while self.total_bytes > self.limit_bytes {
             if !self.evict_one(protect) {
                 // 只剩受保护的那张：它本身就超限，无法再淘汰。
+                log::debug!(
+                    "kitty 图像存储仍超限 {} 字节，但只剩受保护图像，停止淘汰",
+                    self.total_bytes.saturating_sub(self.limit_bytes)
+                );
                 break;
             }
         }

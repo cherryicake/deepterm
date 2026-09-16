@@ -525,6 +525,12 @@ pub fn plan_placeholders(
 /// 存储代际不变时复用同一批纹理。键是 `(图像 id, 内容代际)`——客户端用相同
 /// id 重新传输（内容变了）时不能命中旧纹理，动画换帧时代际也会变
 /// （见 `Storage::mark_content_changed`），因此同一个键始终对应同一份像素。
+///
+/// 注意 GPU 侧的生命周期：`RenderImage::new` 每次分配全局唯一的图集 id，
+/// 而 GPUI 的 sprite atlas 没有引用计数、不会自动回收。裁剪缓存时必须把
+/// 被释放的纹理交给 `Window::drop_image`，否则每张被替换/删除/换帧的图像
+/// 都会在 Metal 图集里永久留下一块 tile（Apple Silicon 统一内存，直接计入
+/// 进程内存——终端里持续刷新的页面几分钟就能堆出 GB 级常驻）。
 pub struct ImageCache {
     /// `(id, storage_generation) -> 纹理`。
     textures: HashMap<(ImageId, u64), Arc<gpui::RenderImage>>,
@@ -543,13 +549,28 @@ impl ImageCache {
         Self::default()
     }
 
-    /// 丢弃不再被任何放置引用的纹理（以及所有过期代际的条目）。
-    fn retain_live(&mut self, storage: &Storage) {
-        self.textures.retain(|(id, generation), _| {
-            storage
-                .get(*id)
-                .is_some_and(|stored| stored.generation == *generation)
+    /// 丢弃不再需要的纹理，返回被释放的纹理。
+    ///
+    /// 对齐 ghostty `rebuildKitty` 的 `markForUnload`：以下两类都只卸 GPU，
+    /// 终端侧的图像数据原样保留——
+    /// - 世代过期（被替换/换帧）：旧像素永远不再显示；
+    /// - 图像已无任何放置（`d=` 删 placement 未释数据、或滚出可视区的虚拟
+    ///   放置从未落纹理）：留着 tile 占显存，重新放置时按需重建即可。
+    ///
+    /// 调用方必须把返回的纹理逐个传给 `Window::drop_image`（见本类型的文档），
+    /// 只 drop `Arc` 不释放图集 tile。
+    fn retain_live(&mut self, storage: &Storage) -> Vec<Arc<gpui::RenderImage>> {
+        let mut removed = Vec::new();
+        self.textures.retain(|(id, generation), texture| {
+            let live = storage.get(*id).is_some_and(|stored| {
+                stored.generation == *generation && stored.is_placed()
+            });
+            if !live {
+                removed.push(texture.clone());
+            }
+            live
         });
+        removed
     }
 
     /// 取得（必要时创建）某张图像**当前显示帧**的纹理。
@@ -575,11 +596,20 @@ impl ImageCache {
         Some(texture)
     }
 
-    /// 按当前存储裁剪缓存，返回被释放的纹理数（测试/诊断用）。
-    pub fn prune(&mut self, storage: &Storage) -> usize {
-        let before = self.textures.len();
-        self.retain_live(storage);
-        before - self.textures.len()
+    /// 按当前存储裁剪缓存，返回被释放的纹理。
+    ///
+    /// 调用方（持有 `&mut Window` 的绘制路径）必须把返回的纹理逐个
+    /// `drop_image`，否则 GPU 图集侧泄漏。
+    pub fn prune(&mut self, storage: &Storage) -> Vec<Arc<gpui::RenderImage>> {
+        self.retain_live(storage)
+    }
+
+    /// 取出全部纹理（视图销毁时释放 GPU 图集用）。
+    ///
+    /// 调用方必须把返回的纹理逐个 `drop_image`；缓存清空后重绘会按需重建，
+    /// 因此 undo 恢复等复活路径不受影响。
+    pub fn take_all(&mut self) -> Vec<Arc<gpui::RenderImage>> {
+        std::mem::take(&mut self.textures).into_values().collect()
     }
 
     #[cfg(test)]
@@ -1097,13 +1127,20 @@ mod tests {
         let mut cache = ImageCache::new();
         let app = gpui::TestAppContext::single();
         app.update(|cx| {
-            cache.get_or_insert(1, &s, cx).expect("应生成纹理");
+            let old = cache.get_or_insert(1, &s, cx).expect("应生成纹理");
 
             // 同一 id 重新传输：代际变化，旧纹理必须失效。
             s.insert(1, image(20, 20), None, false);
             assert_ne!(s.get(1).unwrap().generation, generation_before);
 
-            assert_eq!(cache.prune(&s), 1, "旧代际纹理应被释放");
+            // prune 必须把旧纹理本身交出来，调用方才能 `drop_image` 释放
+            // GPU 图集 tile（只 drop `Arc` 不释放 tile，图集侧会无界增长）。
+            let removed = cache.prune(&s);
+            assert_eq!(removed.len(), 1, "旧代际纹理应被释放");
+            assert!(
+                Arc::ptr_eq(&removed[0], &old),
+                "返回的应是同一份纹理，否则调用方无法释放正确的图集 tile"
+            );
             cache.get_or_insert(1, &s, cx).expect("应生成新纹理");
             assert_eq!(cache.len(), 1, "缓存不应无限增长");
         });
@@ -1114,6 +1151,9 @@ mod tests {
         let mut s = Storage::new(1024 * 1024);
         s.insert(1, image(10, 20), None, false);
         s.insert(2, image(10, 20), None, false);
+        // 对齐 ghostty `markForUnload`：只有被放置的图像才留纹理。
+        s.place(1, 0, Placement::default());
+        s.place(2, 0, Placement::default());
 
         let mut cache = ImageCache::new();
         let app = gpui::TestAppContext::single();
@@ -1123,7 +1163,33 @@ mod tests {
             assert_eq!(cache.len(), 2);
 
             s.remove(1);
-            assert_eq!(cache.prune(&s), 1, "被删除图像的纹理应释放");
+            assert_eq!(cache.prune(&s).len(), 1, "被删除图像的纹理应释放");
+            assert_eq!(cache.len(), 1);
+        });
+    }
+
+    #[test]
+    fn prune_unloads_images_without_placements() {
+        // 对齐 ghostty `markForUnload`：placement 被删光但数据保留的图像，
+        // 卸 GPU 纹理、留终端数据；重新放置后按需重建。
+        let mut s = Storage::new(1024 * 1024);
+        s.insert(1, image(10, 20), None, false);
+        s.place(1, 0, Placement::default());
+
+        let mut cache = ImageCache::new();
+        let app = gpui::TestAppContext::single();
+        app.update(|cx| {
+            cache.get_or_insert(1, &s, cx).expect("应生成纹理");
+            assert!(cache.prune(&s).is_empty(), "有放置时不应裁剪");
+
+            assert!(s.remove_placement(1, 0));
+            assert!(s.get(1).is_some(), "数据应保留");
+            assert_eq!(cache.prune(&s).len(), 1, "无放置应卸纹理");
+            assert!(cache.is_empty());
+
+            // 重新放置后纹理可重建。
+            s.place(1, 0, Placement::default());
+            cache.get_or_insert(1, &s, cx).expect("应重建纹理");
             assert_eq!(cache.len(), 1);
         });
     }
