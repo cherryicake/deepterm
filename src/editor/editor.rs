@@ -339,6 +339,9 @@ impl Editor {
         tab_bar.update(cx, |bar, cx| {
             bar.set_transparent_bg(true, cx);
             bar.set_compact(true, cx);
+            // 编辑器栏只显示文件：agent 图标 / 状态点 / 扫光都属于跑着 agent 的
+            // 终端标签，混进来会让人误以为「这个文件在跑 agent」。
+            bar.set_accepts_agent_state(false, cx);
         });
 
         let mut this = Self {
@@ -544,14 +547,26 @@ impl Editor {
             // 图片文件不能从文本 InputState 缓存恢复，必须重新加载二进制
             if is_image {
                 if let Some(ref ssh_config) = file_info.ssh_config {
-                    self.open_remote_file_no_notify(
+                    self.open_remote_file_inner(
                         file_info.path.clone(),
                         ssh_config.clone(),
                         window,
                         cx,
+                        false,
+                        false,
+                        false,
+                        true,
                     );
                 } else {
-                    self.open_file_no_notify(std::path::PathBuf::from(&file_info.path), window, cx);
+                    self.open_local_file_inner(
+                        std::path::PathBuf::from(&file_info.path),
+                        window,
+                        cx,
+                        false,
+                        false,
+                        false,
+                        true,
+                    );
                 }
                 continue;
             }
@@ -563,14 +578,26 @@ impl Editor {
             } else {
                 // 本地文件或正在加载的文件，重新打开
                 if let Some(ref ssh_config) = file_info.ssh_config {
-                    self.open_remote_file_no_notify(
+                    self.open_remote_file_inner(
                         file_info.path.clone(),
                         ssh_config.clone(),
                         window,
                         cx,
+                        false,
+                        false,
+                        false,
+                        true,
                     );
                 } else {
-                    self.open_file_no_notify(std::path::PathBuf::from(&file_info.path), window, cx);
+                    self.open_local_file_inner(
+                        std::path::PathBuf::from(&file_info.path),
+                        window,
+                        cx,
+                        false,
+                        false,
+                        false,
+                        true,
+                    );
                 }
             }
         }
@@ -1721,7 +1748,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_local_file_inner(path, window, cx, true, true, false);
+        self.open_local_file_inner(path, window, cx, true, true, false, false);
     }
 
     /// 在 Markdown 预览中双击：以同屏实时模式在新 tab 中打开同一文件。
@@ -1731,7 +1758,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_local_file_inner(path, window, cx, true, false, true);
+        self.open_local_file_inner(path, window, cx, true, false, true, false);
     }
 
     fn open_local_file(
@@ -1741,7 +1768,7 @@ impl Editor {
         cx: &mut Context<Self>,
         notify_app: bool,
     ) {
-        self.open_local_file_inner(path, window, cx, notify_app, false, false);
+        self.open_local_file_inner(path, window, cx, notify_app, false, false, false);
     }
 
     fn open_local_file_at(
@@ -1776,15 +1803,17 @@ impl Editor {
         }
         // 图片走 ImageViewer，没有行列概念：不记录 pending，避免泄漏后误跳。
         if line.is_some() && crate::editor::image_viewer::is_image_file(&path) {
-            self.open_local_file_inner(path, window, cx, notify_app, false, false);
+            self.open_local_file_inner(path, window, cx, notify_app, false, false, false);
             return;
         }
         if let Some(line) = line {
             self.pending_jumps.insert(tab_id.clone(), (line, col));
         }
-        self.open_local_file_inner(path, window, cx, notify_app, false, false);
+        self.open_local_file_inner(path, window, cx, notify_app, false, false, false);
     }
 
+    /// `silent` 透传给 [`Self::spawn_file_load`]：恢复会话时为 true，
+    /// 加载失败只关标签、不弹模态框（见 [`Self::spawn_file_load`] 的文档）。
     #[allow(clippy::too_many_arguments)]
     fn open_local_file_inner(
         &mut self,
@@ -1794,6 +1823,7 @@ impl Editor {
         notify_app: bool,
         edit_mode: bool,
         live_mode: bool,
+        silent: bool,
     ) {
         let live_mode = Self::default_live_mode(&path, edit_mode, live_mode);
         let path_str = path.to_string_lossy().to_string();
@@ -1846,11 +1876,23 @@ impl Editor {
             Arc::new(move || load_local_text(&path_for_task)),
             "读取文件失败",
             "无法读取本地文件",
+            silent,
             window,
             cx,
         );
     }
 
+    /// `silent` 控制加载失败时要不要弹窗。
+    ///
+    /// # 为什么恢复会话必须静默
+    ///
+    /// 恢复标签页组/文件树时会**重新加载**每个打开的文件，而文件可能在组被
+    /// 挂起期间被删掉、被移走，或者远端主机连不上。那些是正常情况，不是用户
+    /// 当下发起的操作——对着一个后台恢复动作弹「无法读取文件：No such file or
+    /// directory (os error 2)」的模态框，用户既没做错什么，也不知道该点哪个
+    /// 按钮（「重新加载」只会再失败一次）。直接关掉这个标签即可。
+    ///
+    /// 用户**主动**打开文件失败时仍然要弹：那时错误是操作的结果，需要可见。
     #[allow(clippy::too_many_arguments)]
     fn spawn_file_load(
         &mut self,
@@ -1859,6 +1901,7 @@ impl Editor {
         load_content: Arc<dyn Fn() -> Result<LoadedText, String> + Send + Sync>,
         error_title: &'static str,
         error_prefix: &'static str,
+        silent: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1973,6 +2016,20 @@ impl Editor {
                             break;
                         }
 
+                        // 静默（会话/标签页组恢复）：文件可能在挂起期间被删掉或
+                        // 远端不可达。直接关掉标签，不弹模态框——见
+                        // `spawn_file_load` 的文档。
+                        if silent {
+                            let _ = weak.update(cx, |this, cx| {
+                                if this.is_load_current(&tab_id, load_generation) {
+                                    this.loading_gens.remove(&tab_id);
+                                    this.close_file_direct(&tab_id, cx);
+                                }
+                                cx.notify();
+                            });
+                            break;
+                        }
+
                         let close = match cx.update_window(window_handle, |_view, window, cx| {
                             window.prompt(
                                 gpui::PromptLevel::Warning,
@@ -2009,17 +2066,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, false);
-    }
-
-    pub fn open_remote_file_no_notify(
-        &mut self,
-        path: String,
-        ssh_config: SshConnectionConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, false, false, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, false, false);
     }
 
     fn open_remote_file_at(
@@ -2056,13 +2103,13 @@ impl Editor {
         if line.is_some()
             && crate::editor::image_viewer::is_image_file(std::path::Path::new(&path))
         {
-            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false);
+            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false, false);
             return;
         }
         if let Some(line) = line {
             self.pending_jumps.insert(tab_id.clone(), (line, col));
         }
-        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false, false);
         // Cached remote files open synchronously (`is_loading=false`):
         // apply the pending jump immediately instead of waiting for a load.
         if let Some((line, col)) = self.take_pending_jump(&tab_id) {
@@ -2087,7 +2134,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true, true, false);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, true, false, false);
     }
 
     /// 远程 Markdown 预览中双击：以同屏实时模式在新 tab 中打开同一文件。
@@ -2098,9 +2145,11 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, true);
+        self.open_remote_file_inner(path, ssh_config, window, cx, true, false, true, false);
     }
 
+    /// `silent` 透传给 [`Self::spawn_file_load`]：恢复会话时为 true，
+    /// 加载失败只关标签、不弹模态框（见 [`Self::spawn_file_load`] 的文档）。
     #[allow(clippy::too_many_arguments)]
     fn open_remote_file_inner(
         &mut self,
@@ -2111,6 +2160,7 @@ impl Editor {
         notify_app: bool,
         edit_mode: bool,
         live_mode: bool,
+        silent: bool,
     ) {
         let live_mode =
             Self::default_live_mode(std::path::Path::new(&path), edit_mode, live_mode);
@@ -2275,6 +2325,7 @@ impl Editor {
             }),
             "读取文件失败",
             "无法读取远程文件",
+            silent,
             window,
             cx,
         );
@@ -3958,6 +4009,66 @@ mod tests {
                     })
             });
             assert!(live_ok, "live tab must keep its LiveMarkdownView after restore");
+        });
+    }
+
+    /// 回归：恢复标签页组时，**已消失的文件**必须静默关掉标签，不弹模态框。
+    ///
+    /// 恢复会重新加载每个打开的文件，而文件可能在组被挂起期间被删掉/移走，
+    /// 远端也可能连不上。曾经这类失败会走和「用户主动打开」同一条路径，弹出
+    /// 「无法读取文件：No such file or directory (os error 2)」的模态框——
+    /// 用户没做错什么，也不知道该点哪个按钮（「重新加载」只会再失败一次）。
+    ///
+    /// 这条断言的是恢复路径**不弹窗**：没有 window 也不该 panic，且失败后
+    /// 该标签被清掉、不会留下一个永远加载中的空壳。
+    #[gpui::test]
+    fn restore_of_vanished_file_closes_tab_without_prompt(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            EditorHost(cx.new(|cx| Editor::new(window, cx)))
+        });
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+
+        // 指向一个保证不存在的路径，模拟「文件在挂起期间被删掉」。
+        let missing = std::env::temp_dir().join("deepterm-restore-vanished-does-not-exist.txt");
+        let _ = std::fs::remove_file(&missing);
+        assert!(!missing.exists(), "前提：该路径必须不存在");
+
+        let info = EditorOpenFileInfo {
+            id: format!("editor-{}", missing.display()).into(),
+            path: missing.to_string_lossy().to_string(),
+            label: "vanished.txt".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: None,
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            diff_repo: None,
+        };
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.restore_from_info(vec![info], None, &HashMap::new(), &HashMap::new(), window, cx);
+            });
+        });
+        // 让后台加载跑完并回到 UI 线程处理失败。
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.open_files.iter().all(|f| !f.is_loading),
+                "失败后不该留下永远加载中的标签"
+            );
         });
     }
 

@@ -500,6 +500,16 @@ pub struct TabBar {
     pub active_tab_id: Option<SharedString>,
     transparent_bg: bool,
     compact: bool,
+    /// 本栏是否接受 agent 状态（图标 / 状态点 / 文字扫光）。
+    ///
+    /// 默认 `true`：终端栏是 agent 状态唯一的归属。编辑器栏由
+    /// [`TabBar::set_accepts_agent_state`] 显式关掉，见
+    /// [`TabBar::set_tab_agent`] 的「只作用于终端标签」一节。
+    ///
+    /// 有意**不**从 `compact` 推断：紧凑模式是视觉属性（编辑器栏恰好也用它
+    /// 对齐高度），拿它当语义开关会让「以后给终端栏开紧凑模式」这种纯样式
+    /// 改动悄悄关掉 agent 状态。
+    accepts_agent_state: bool,
     on_tab_click: OptionalTabCallback,
     on_tab_close: OptionalTabCallback,
     on_new_tab: Option<NewTabCallback>,
@@ -544,6 +554,8 @@ impl TabBar {
             active_tab_id,
             transparent_bg: false,
             compact: false,
+            // 默认接受：终端栏不显式设置，编辑器栏主动关掉。
+            accepts_agent_state: true,
             on_tab_click: None,
             on_tab_close: None,
             on_new_tab: None,
@@ -590,6 +602,17 @@ impl TabBar {
     pub fn set_compact(&mut self, compact: bool, cx: &mut Context<Self>) {
         if self.compact != compact {
             self.compact = compact;
+            cx.notify();
+        }
+    }
+
+    /// 关掉/打开本栏的 agent 状态接收。
+    ///
+    /// 编辑器栏必须调用 `set_accepts_agent_state(false)`：它显示的是文件，
+    /// 不是跑着 agent 的终端。见 [`TabBar::set_tab_agent`] 的「只作用于终端标签」。
+    pub fn set_accepts_agent_state(&mut self, accepts: bool, cx: &mut Context<Self>) {
+        if self.accepts_agent_state != accepts {
+            self.accepts_agent_state = accepts;
             cx.notify();
         }
     }
@@ -782,6 +805,16 @@ impl TabBar {
     /// 一个回合里触发几十次，而它多数时候只是把 `Working` 写成 `Working`。
     ///
     /// `tab_id` 不存在时返回 `None`。
+    ///
+    /// # 只作用于终端标签
+    ///
+    /// agent 状态只属于**跑着 agent 的终端**。编辑器标签（同一窗口里的
+    /// 另一个 `TabBar`）不该出现 agent 图标、状态点或扫光——那里显示的是
+    /// 文件名与保存状态，混进 agent 身份只会让人误以为「这个文件在跑 agent」。
+    ///
+    /// 这条边界由 [`TabBar::accepts_agent_state`] 保证，而不是靠调用方自觉：
+    /// 编辑器栏显式关掉接收后，本方法直接返回、不改动任何标签。有意**不**
+    /// 断言失败——「编辑器不显示 agent 状态」正是期望行为，不是需要崩溃的错误。
     pub fn set_tab_agent(
         &mut self,
         tab_id: &str,
@@ -790,6 +823,10 @@ impl TabBar {
         fallback: Option<Icon>,
         cx: &mut Context<Self>,
     ) -> Option<AgentStatus> {
+        if !self.accepts_agent_state {
+            return None;
+        }
+
         let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
 
         // 没有 agent 就没有状态点，也不必记住状态：留着会让「agent 退出后
@@ -2365,6 +2402,76 @@ mod tests {
             ),
             "纯黑品牌配浅色正文和浅底时清晰可见"
         );
+    }
+
+    /// 编辑器标签栏必须拒绝 agent 状态——agent 只属于跑着它的终端标签。
+    ///
+    /// 同一窗口里有**两个** `TabBar`：终端栏（`tab-bar`）与编辑器栏
+    /// （`editor-tab-bar`）。两者共用同一套渲染代码，所以「agent 不波及编辑器」
+    /// 不能靠「编辑器不调用 `set_tab_agent`」这个约定——那只在没人改动时才成立。
+    /// 这条钉住真正的边界：编辑器栏显式关掉接收后，即使把 agent 状态喂给它，
+    /// 也必须原样拒绝（不改图标、不设状态点）。
+    #[gpui::test]
+    fn editor_tab_bar_rejects_agent_state(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let bar = cx.update(|cx| {
+            TabBar::new_with_tabs(
+                "editor-tab-bar",
+                cx,
+                vec![TabItem::new("file-1", "main.rs")],
+            )
+        });
+        bar.update(cx, |bar, cx| bar.set_accepts_agent_state(false, cx));
+
+        let outcome = bar.update(cx, |bar, cx| {
+            bar.set_tab_agent(
+                "file-1",
+                Some(CLIAgent::Claude),
+                AgentStatus::Working,
+                None,
+                cx,
+            )
+        });
+
+        assert_eq!(outcome, None, "编辑器栏必须拒绝 agent 状态");
+        bar.read_with(cx, |bar, _| {
+            let tab = &bar.tabs[0];
+            assert_eq!(tab.agent_status, None, "编辑器标签不该有 agent 状态点");
+            assert!(
+                !matches!(tab.icon, Some(Icon::AgentIcon { .. })),
+                "编辑器标签不该被换成 agent 图标，实际是 {:?}",
+                tab.icon
+            );
+        });
+    }
+
+    /// 终端标签栏必须接受 agent 状态——上一条的对照，防止守卫写成「一律拒绝」。
+    #[gpui::test]
+    fn terminal_tab_bar_accepts_agent_state(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let bar = cx.update(|cx| {
+            TabBar::new_with_tabs("tab-bar", cx, vec![TabItem::new("tab-1", "claude")])
+        });
+        assert!(
+            bar.read_with(cx, |bar, _| bar.accepts_agent_state),
+            "终端栏默认必须接受 agent 状态"
+        );
+
+        bar.update(cx, |bar, cx| {
+            bar.set_tab_agent(
+                "tab-1",
+                Some(CLIAgent::Claude),
+                AgentStatus::Working,
+                None,
+                cx,
+            );
+        });
+
+        bar.read_with(cx, |bar, _| {
+            let tab = &bar.tabs[0];
+            assert_eq!(tab.agent_status, Some(AgentStatus::Working));
+            assert!(matches!(tab.icon, Some(Icon::AgentIcon { .. })));
+        });
     }
 
     /// `TabItem` 的品牌色必须来自图标本身携带的 `accent_rgb`。
