@@ -84,6 +84,7 @@ use crate::assets::Icon;
 use crate::builtin_commands::{BuiltinCommandManager, resolve_command_line};
 use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::ssh::SshConnectionConfig;
+use crate::ssh::config::SshGlobalConfig;
 use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::terminal::mappings::keys::to_esc_str;
@@ -610,6 +611,36 @@ impl SshCheckOutcome {
 /// 这两种锚点都保证「靠近光标的一边」始终贴合光标行。
 use crate::builtin_commands::OverlayAnchor;
 
+/// 用磁盘上的当前配置替换调用方手里那份可能过期的快照。
+///
+/// 恢复会话时传进来的是 `session_state.json` 里存的 config 副本（见
+/// `Panel::from_session_state`）。那份副本是保存会话那一刻的快照，用户之后在
+/// Host 表单里改的任何东西（端口转发规则、超时、昵称…）都不在里面。表现就是
+/// 「明明配了端口转发，恢复出来的终端却不建隧道」——规则被旧快照悄悄丢掉了。
+///
+/// 按 id 回查：查到就用当前配置（保留用户最新的规则），查不到（主机已删、或
+/// 从未保存过的临时连接）才退回快照——「连得上」优先于「参数最新」。
+///
+/// 抽成自由函数是为了能直接测：这是纯数据决策，不需要窗口或连接。
+fn resolve_current_ssh_config(
+    snapshot: &crate::ssh::SshConnectionConfig,
+    saved: &[crate::ssh::SshConnectionConfig],
+) -> crate::ssh::SshConnectionConfig {
+    match saved.iter().find(|current| current.id() == snapshot.id()) {
+        Some(current) => {
+            if current.port_forwards != snapshot.port_forwards {
+                log::info!(
+                    "SSH: 采用磁盘上的最新配置（转发规则 {} 条，会话快照里 {} 条）",
+                    current.port_forwards.len(),
+                    snapshot.port_forwards.len()
+                );
+            }
+            current.clone()
+        }
+        None => snapshot.clone(),
+    }
+}
+
 /// 读「该 agent 的上报机制是否已装」。**不碰 `TerminalView`**，因此可以整个
 /// 丢到后台线程执行。
 ///
@@ -867,8 +898,9 @@ impl TerminalView {
                 TerminalEvent::ProcessExited(status) => {
                     cx.emit(Event::ProcessExited(*status));
                 }
-                // 本地终端不会触发 SshAbnormalDisconnect，不需要处理
+                // 本地终端不会触发 SshAbnormalDisconnect，也不需要处理端口转发
                 TerminalEvent::SshAbnormalDisconnect => {}
+                TerminalEvent::PortForwardChanged => {}
                 TerminalEvent::BlinkChanged(blinking) => {
                     this.on_blink_changed(*blinking, cx);
                 }
@@ -1065,6 +1097,11 @@ impl TerminalView {
             ssh_config.port
         );
 
+        let ssh_config = &resolve_current_ssh_config(
+            ssh_config,
+            &SshGlobalConfig::load().saved_connections,
+        );
+
         let focus_handle = cx.focus_handle();
         let ssh_config_clone = ssh_config.clone();
         let initial_remote_cwd = initial_remote_cwd.filter(|cwd| !cwd.trim().is_empty());
@@ -1119,6 +1156,10 @@ impl TerminalView {
                     }
                     TerminalEvent::BlinkChanged(blinking) => {
                         this.on_blink_changed(*blinking, cx);
+                    }
+                    // 端口转发结果到达：弹一条 toast 告知端口与结果。
+                    TerminalEvent::PortForwardChanged => {
+                        this.notify_port_forward(cx);
                     }
                     // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
                     // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
@@ -1295,6 +1336,10 @@ impl TerminalView {
                 }
                 TerminalEvent::BlinkChanged(blinking) => {
                     this.on_blink_changed(*blinking, cx);
+                }
+                // 端口转发结果到达（重连路径与首次连接共用同一订阅体）。
+                TerminalEvent::PortForwardChanged => {
+                    this.notify_port_forward(cx);
                 }
                 // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
                 // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
@@ -2395,6 +2440,22 @@ impl TerminalView {
         .map_err(|e| format!("{e:#}"))
     }
 
+    /// 端口转发结果到达：弹一条 toast。
+    ///
+    /// 与 [`Self::notify_hook_install`] 共用同一套 toast 字段（本视图没有窗口引用，
+    /// 走宿主 `show_notification` 需要额外加一条 Event 转发链路）。
+    fn notify_port_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = self.terminal.read(cx).port_forward_status().cloned() else {
+            return;
+        };
+        let kind = if status.ok {
+            crate::components::notification::NotificationKind::Success
+        } else {
+            crate::components::notification::NotificationKind::Error
+        };
+        self.show_terminal_toast("端口转发".to_string(), status.message, kind, cx);
+    }
+
     /// 在终端上弹一条 Toast 反馈安装结果。
     ///
     /// 复用本视图已有的 toast（`toast_message` 是错误型的、`info_toast` 是信息型，
@@ -2404,6 +2465,18 @@ impl TerminalView {
     /// 成功走 `info_toast`，失败走 `toast_message`——后者在渲染里是警示色，
     /// 用户一眼能看出「配置没写成」这件事需要处理。
     fn notify_hook_install(&mut self, message: String, kind: crate::components::notification::NotificationKind, cx: &mut Context<Self>) {
+        self.show_terminal_toast("Hook 安装".to_string(), message, kind, cx);
+    }
+
+    /// 通用 Toast：`toast_message` 是错误型（警示色），`info_toast` 是信息型
+    /// （带标题）。见 [`Self::notify_hook_install`] 对「为什么不用宿主通知」的说明。
+    fn show_terminal_toast(
+        &mut self,
+        title: String,
+        message: String,
+        kind: crate::components::notification::NotificationKind,
+        cx: &mut Context<Self>,
+    ) {
         use crate::components::notification::NotificationKind;
         match kind {
             NotificationKind::Error => {
@@ -2421,7 +2494,7 @@ impl TerminalView {
                 }));
             }
             _ => {
-                self.info_toast = Some(("Hook 安装".to_string(), message));
+                self.info_toast = Some((title, message));
                 self.info_toast_hide_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
                         .timer(Duration::from_secs(8))
@@ -5623,4 +5696,54 @@ mod tests {
         assert!(!should_prompt_hook_install(None, false, false));
     }
 
+
+    /// 恢复会话时，端口转发规则必须来自磁盘上的当前配置，而不是会话快照。
+    ///
+    /// 回归用例：曾经 `Panel::from_session_state` 直接把快照里的 config 交给
+    /// 终端，用户在 Host 表单里新加的转发规则永远不会生效——隧道静默不建，
+    /// 表现为「远端连不上本机服务」。
+    #[test]
+    fn restored_session_picks_up_port_forwards_added_after_the_snapshot() {
+        use crate::ssh::SshConnectionConfig;
+        use crate::ssh::config::AuthMethod;
+        use crate::ssh::port_forward::PortForwardRule;
+
+        let mut snapshot = SshConnectionConfig::new("88.216.68.169", "root", AuthMethod::Agent);
+        snapshot.nickname = Some("M101".to_string());
+        // 快照保存时还没有任何转发规则（这正是用户遇到的情形）
+        assert!(snapshot.port_forwards.is_empty());
+
+        // 之后用户在 Host 表单里加了规则，已落盘
+        let mut current = snapshot.clone();
+        current.port_forwards = vec![PortForwardRule {
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 3801,
+            target_host: "127.0.0.1".to_string(),
+            target_port: 3801,
+            description: String::new(),
+        }];
+
+        let resolved = resolve_current_ssh_config(&snapshot, &[current.clone()]);
+        assert_eq!(
+            resolved.port_forwards, current.port_forwards,
+            "必须采用磁盘上的规则，而不是快照里的空列表"
+        );
+    }
+
+    /// 主机已从配置里删除（或从未保存）时退回快照：连得上优先于参数最新。
+    #[test]
+    fn unknown_host_falls_back_to_the_snapshot() {
+        use crate::ssh::SshConnectionConfig;
+        use crate::ssh::config::AuthMethod;
+
+        let mut snapshot = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+        snapshot.port = 2222;
+
+        // 磁盘上有别的主机，但没有这一台
+        let other = SshConnectionConfig::new("other.example.com", "root", AuthMethod::Agent);
+        let resolved = resolve_current_ssh_config(&snapshot, &[other]);
+
+        assert_eq!(resolved.host, "example.com");
+        assert_eq!(resolved.port, 2222, "查不到时保留快照，避免连错主机");
+    }
 }

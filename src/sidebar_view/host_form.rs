@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, Render, SharedString, Window, div,
-    px,
+    App, Context, Entity, FocusHandle, IntoElement, Render, SharedString, Window, div, px,
 };
 
 use crate::components::callbacks::OptionalAppCallback;
+use crate::assets::Icon;
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
 use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
@@ -37,6 +37,34 @@ impl AuthType {
     }
 }
 
+/// 解析远端绑定：`3801` → (`127.0.0.1`, 3801)；`0.0.0.0:3801` → (`0.0.0.0`, 3801)。
+///
+/// 只写端口时默认绑回环：`-R 3801:...` 在 OpenSSH 里等价于绑 127.0.0.1，
+/// 与本应用一致——对外暴露必须是用户的显式选择。
+fn parse_bind(raw: &str) -> Option<(String, u16)> {
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.rsplit_once(':') {
+        // IPv6 字面量要带方括号，`[::1]:3801`；裸 `::1` 会被 rsplit 切错，
+        // 因此这里只接受「无冒号 → 纯端口」与「host:port」两种形态。
+        Some((host, port)) if !host.is_empty() => {
+            Some((host.to_string(), port.parse::<u16>().ok()?))
+        }
+        Some(_) => None,
+        None => Some(("127.0.0.1".to_string(), raw.parse::<u16>().ok()?)),
+    }
+}
+
+/// 解析本机目标：必须是 `地址:端口`。
+fn parse_host_port(raw: &str) -> Option<(String, u16)> {
+    let (host, port) = raw.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
 /// Host配置表单
 /// - 标签在左（固定宽度，右对齐），控件在右
 /// - 分组标题 + 分割线
@@ -60,6 +88,12 @@ pub struct NewHostForm {
     group_select: Entity<MacosSelect>,
     group_options: Vec<Option<String>>,
     selected_group_id: Option<String>,
+
+    /// 已添加的端口转发规则（保存时写入 Host 配置）。
+    port_forwards: Vec<crate::ssh::port_forward::PortForwardRule>,
+    /// 新增规则的草稿输入：远端绑定 / 本机目标。
+    forward_bind_input: Entity<InputState>,
+    forward_target_input: Entity<InputState>,
 
     error_message: Option<String>,
     success_message: Option<String>,
@@ -112,6 +146,18 @@ impl NewHostForm {
             let credential_label_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("DeepTerm 自动生成标签")
+                    .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
+            });
+            let forward_bind_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("远端 3801")
+                    .placeholder_font_size(px(13.0))
+                    .font_size(px(13.0))
+            });
+            let forward_target_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("本机 127.0.0.1:3801")
                     .placeholder_font_size(px(13.0))
                     .font_size(px(13.0))
             });
@@ -187,6 +233,9 @@ impl NewHostForm {
                 group_select,
                 group_options: vec![None],
                 selected_group_id: None,
+                port_forwards: Vec::new(),
+                forward_bind_input,
+                forward_target_input,
                 error_message: None,
                 success_message: None,
                 on_cancel: None,
@@ -300,6 +349,11 @@ impl NewHostForm {
         self.selected_keychain_id = None;
         self.editing_config_id = None;
         self.selected_group_id = None;
+        self.port_forwards.clear();
+        self.forward_bind_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.forward_target_input
+            .update(cx, |input, cx| input.clear(cx));
         self.refresh_keychain_options(cx);
         self.refresh_group_options(cx);
         self.error_message = None;
@@ -367,6 +421,9 @@ impl NewHostForm {
         self.editing_config_id = Some(config.id());
         self.selected_group_id = config.group_id.clone();
         self.refresh_group_options(cx);
+
+        self.port_forwards = config.port_forwards.clone();
+
         cx.notify();
     }
 
@@ -502,6 +559,7 @@ impl NewHostForm {
                     Some(nickname.trim().to_string())
                 };
                 existing.group_id = self.selected_group_id.clone();
+                existing.port_forwards = self.port_forwards.clone();
                 true
             } else {
                 false
@@ -515,6 +573,7 @@ impl NewHostForm {
                 config = config.with_nickname(nickname.trim());
             }
             config.group_id = self.selected_group_id.clone();
+            config.port_forwards = self.port_forwards.clone();
             let next_sort = global_config
                 .saved_connections
                 .iter()
@@ -642,6 +701,155 @@ impl NewHostForm {
                     .into_any_element()
             })
         }
+    }
+
+    /// 端口转发规则编辑器：列出已添加的规则，并提供一行「远端端口 → 本机端口」的草稿。
+    ///
+    /// 逐条显示而不是一个总开关：转发本来就是多条规则（`ssh -R` 可以重复出现），
+    /// 一个开关没法表达「哪一条没建起来」。
+    ///
+    /// 两个输入框等宽（`FLEX_1` 而非一宽一窄）：它们是同一条规则的两端，视觉上
+    /// 对等才读得出「A 转到 B」；中间用箭头连起来，比两个并排的框更像一条管道。
+    fn render_port_forwards(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+        let rows = self.port_forwards.iter().enumerate().map(|(index, rule)| {
+            let text = rule.summary();
+            div()
+                .id(("forward-row", index))
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .bg(theme.elevated_background)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(theme.text)
+                        .child(text),
+                )
+                .child(
+                    Button::new(("forward-remove", index))
+                        .label("移除")
+                        .ghost()
+                        .with_size(ButtonSize::Small)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index < this.port_forwards.len() {
+                                this.port_forwards.remove(index);
+                            }
+                            cx.notify();
+                        })),
+                )
+        });
+
+        let draft = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .id("forward-bind-input")
+                    .debug_selector(|| "forward-bind-input".to_string())
+                    .flex_1()
+                    .min_w_0()
+                    .child(EditorInput::new(&self.forward_bind_input)),
+            )
+            .child(
+                // 箭头：这条规则的方向（远端 ← 本机服务）。宽度固定，两个输入框
+                // 才能拿到完全相同的剩余宽度。
+                gpui::svg()
+                    .w(px(12.))
+                    .h(px(12.))
+                    .flex_shrink_0()
+                    .path(Icon::ChevronRight.path())
+                    .text_color(theme.text_subtle),
+            )
+            .child(
+                div()
+                    .id("forward-target-input")
+                    .debug_selector(|| "forward-target-input".to_string())
+                    .flex_1()
+                    .min_w_0()
+                    .child(EditorInput::new(&self.forward_target_input)),
+            )
+            .child(
+                Button::new("forward-add")
+                    .label("添加")
+                    .with_size(ButtonSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.add_forward_draft(cx))),
+            );
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .children(rows)
+            .child(draft)
+            .child(
+                div()
+                    .w_full()
+                    .text_xs()
+                    .text_color(theme.text_subtle)
+                    .child("远端端口 → 本机端口，如 3801 → 127.0.0.1:3801"),
+            )
+    }
+
+    /// 把草稿行加进规则列表。
+    ///
+    /// 输入按 `bind[:port]` / `target_host:target_port` 解析；解析不出来就在
+    /// 表单上给出原因，而不是静默丢弃（用户会以为加上了）。
+    fn add_forward_draft(&mut self, cx: &mut Context<Self>) {
+        let bind_raw = self.forward_bind_input.read(cx).value().trim().to_string();
+        let target_raw = self
+            .forward_target_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+
+        let (bind_host, bind_port) = match parse_bind(&bind_raw) {
+            Some(v) => v,
+            None => {
+                self.error_message = Some(format!(
+                    "远端绑定 `{bind_raw}` 不合法：写端口（如 3801）或 地址:端口（如 0.0.0.0:3801）"
+                ));
+                cx.notify();
+                return;
+            }
+        };
+        let (target_host, target_port) = match parse_host_port(&target_raw) {
+            Some(v) => v,
+            None => {
+                self.error_message = Some(format!(
+                    "本机目标 `{target_raw}` 不合法：写 地址:端口（如 127.0.0.1:3801）"
+                ));
+                cx.notify();
+                return;
+            }
+        };
+
+        self.port_forwards
+            .push(crate::ssh::port_forward::PortForwardRule {
+                bind_host,
+                bind_port,
+                target_host,
+                target_port,
+                description: String::new(),
+            });
+        self.forward_bind_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.forward_target_input
+            .update(cx, |input, cx| input.clear(cx));
+        self.error_message = None;
+        cx.notify();
     }
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -812,7 +1020,172 @@ impl Render for NewHostForm {
                     ))
                 },
             )
+            // ── Port forward ──
+            .child(self.render_section_title("端口转发（把本机服务暴露到远端）", cx))
+            .child(self.render_port_forwards(cx))
             // ── Footer ──
             .child(self.render_buttons(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_port_binds_loopback_only() {
+        // `-R 3801:...` 在 OpenSSH 里就是绑回环；对外暴露必须显式写地址。
+        assert_eq!(parse_bind("3801"), Some(("127.0.0.1".to_string(), 3801)));
+        assert_eq!(
+            parse_bind("0.0.0.0:3801"),
+            Some(("0.0.0.0".to_string(), 3801))
+        );
+        assert_eq!(
+            parse_bind("192.168.1.5:8080"),
+            Some(("192.168.1.5".to_string(), 8080))
+        );
+    }
+
+    #[test]
+    fn malformed_bind_is_rejected_rather_than_guessed() {
+        assert_eq!(parse_bind(""), None);
+        assert_eq!(parse_bind("not-a-port"), None);
+        assert_eq!(parse_bind(":3801"), None, "空地址不该被当成回环");
+        assert_eq!(parse_bind("127.0.0.1:99999"), None, "越界端口");
+        assert_eq!(parse_bind("127.0.0.1:"), None);
+    }
+
+    #[test]
+    fn target_requires_explicit_host_and_port() {
+        assert_eq!(
+            parse_host_port("127.0.0.1:3801"),
+            Some(("127.0.0.1".to_string(), 3801))
+        );
+        assert_eq!(
+            parse_host_port("10.0.0.9:80"),
+            Some(("10.0.0.9".to_string(), 80))
+        );
+        // 目标必须写全：少了主机名就无从连接
+        assert_eq!(parse_host_port("3801"), None);
+        assert_eq!(parse_host_port(":3801"), None);
+        assert_eq!(parse_host_port("127.0.0.1"), None);
+        assert_eq!(parse_host_port("127.0.0.1:abc"), None);
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use gpui::{TestAppContext, px, size};
+
+    struct FormHost {
+        form: Entity<NewHostForm>,
+    }
+
+    impl Render for FormHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(520.)).h(px(900.)).child(self.form.clone())
+        }
+    }
+
+    /// 表单能真实渲染出来（走完整 render 路径，而不是只调解析函数）。
+    ///
+    /// 覆盖的是「加规则 → 出现在列表 → 保存进配置」这条用户路径：
+    /// 只测 `parse_bind` 无法发现 render 里把字段接错。
+    #[gpui::test]
+    fn adding_a_forward_rule_shows_up_and_saves(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+
+        let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<NewHostForm>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot_for_window = slot.clone();
+        let window = cx.open_window(size(px(520.), px(900.)), move |window, cx| {
+            let form = NewHostForm::new(window, cx);
+            *slot_for_window.borrow_mut() = Some(form.clone());
+            FormHost { form }
+        });
+        cx.run_until_parked();
+        let form = slot.borrow().clone().expect("表单应已构造");
+
+        // 真正画一帧：render 路径里的接线错误（字段用错、元素缺失）只有渲染才暴露。
+        let handle: gpui::AnyWindowHandle = window.into();
+        let _ = cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // 填一条规则并添加
+        cx.update(|cx| {
+            form.update(cx, |form, cx| {
+                form.hostname_input
+                    .update(cx, |input, cx| input.set_text("example.com", cx));
+                form.forward_bind_input
+                    .update(cx, |input, cx| input.set_text("3801", cx));
+                form.forward_target_input
+                    .update(cx, |input, cx| input.set_text("127.0.0.1:8080", cx));
+                form.add_forward_draft(cx);
+
+                assert_eq!(form.port_forwards.len(), 1, "草稿应被加进规则列表");
+                let rule = &form.port_forwards[0];
+                assert_eq!(rule.bind_host, "127.0.0.1", "只写端口默认绑回环");
+                assert_eq!(rule.bind_port, 3801);
+                assert_eq!(rule.target_host, "127.0.0.1");
+                assert_eq!(rule.target_port, 8080);
+                assert!(form.error_message.is_none(), "合法输入不该报错");
+                assert_eq!(
+                    form.forward_bind_input.read(cx).value().as_ref(),
+                    "",
+                    "添加后草稿应清空，方便连着加下一条"
+                );
+            });
+        });
+
+        // 加完再画一帧：规则行本身也要能渲染出来。
+        let _ = cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // 坏输入：报错且不产生规则
+        cx.update(|cx| {
+            form.update(cx, |form, cx| {
+                form.forward_bind_input
+                    .update(cx, |input, cx| input.set_text("bad-port", cx));
+                form.forward_target_input
+                    .update(cx, |input, cx| input.set_text("127.0.0.1:8080", cx));
+                form.add_forward_draft(cx);
+                assert_eq!(form.port_forwards.len(), 1, "非法输入不该加规则");
+                assert!(form.error_message.is_some(), "非法输入必须给出原因");
+            });
+        });
+
+        // 两个输入框必须等宽：它们是同一条规则的两端，一宽一窄读不出「A 转 B」。
+        // debug_bounds 在 VisualTestContext 上（TestAppContext 没有）。
+        let mut visual = gpui::VisualTestContext::from_window(handle, cx);
+        visual.run_until_parked();
+        let bind_bounds = visual.debug_bounds("forward-bind-input");
+        let target_bounds = visual.debug_bounds("forward-target-input");
+        let (bind_bounds, target_bounds) = (
+            bind_bounds.expect("远端端口输入框应有布局"),
+            target_bounds.expect("本机端口输入框应有布局"),
+        );
+        assert_eq!(
+            bind_bounds.size.width, target_bounds.size.width,
+            "两个输入框宽度必须一致：远端 {:?} vs 本机 {:?}",
+            bind_bounds.size.width, target_bounds.size.width
+        );
+        // 箭头在两者之间：远端框右边 < 本机框左边
+        assert!(
+            bind_bounds.right() <= target_bounds.left(),
+            "本机输入框应排在远端输入框右侧"
+        );
+
+
+        // 移除
+        cx.update(|cx| {
+            form.update(cx, |form, cx| {
+                form.port_forwards.clear();
+                assert!(form.port_forwards.is_empty());
+                cx.notify();
+            });
+        });
     }
 }

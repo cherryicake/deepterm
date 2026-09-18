@@ -35,6 +35,9 @@ struct SshClientHandler {
     host: String,
     port: u16,
     host_key_policy: crate::ssh::host_key::HostKeyPolicy,
+    /// 端口转发的认领表：有人连到远端监听端口时，服务器会发起
+    /// `forwarded-tcpip` 通道，由这里查到本机目标并桥接过去。
+    port_forwards: crate::ssh::port_forward::RemoteForwardTable,
 }
 
 impl client::Handler for SshClientHandler {
@@ -52,6 +55,40 @@ impl client::Handler for SshClientHandler {
             self.host_key_policy,
         )
         .await
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some((target_host, target_port)) = self
+            .port_forwards
+            .lookup(connected_address, connected_port as u16)
+        else {
+            // 认领不到就不是我们登记的转发：不桥接，直接丢弃（通道 drop 即关闭）。
+            log::warn!(
+                "russh: 收到未登记的转发连接 {connected_address}:{connected_port}，已忽略"
+            );
+            return Ok(());
+        };
+        log::info!("russh: 转发连接 {connected_address}:{connected_port} → 本机 {target_host}:{target_port}");
+        tokio::spawn(async move {
+            if let Err(e) = crate::ssh::port_forward::serve_forwarded_channel(
+                channel,
+                target_host.clone(),
+                target_port,
+            )
+            .await
+            {
+                log::warn!("russh: 转发到本机 {target_host}:{target_port} 失败: {e}");
+            }
+        });
+        Ok(())
     }
 }
 
@@ -128,6 +165,7 @@ impl RusshTerminal {
                         initial_cols,
                         initial_rows,
                         initial_cwd_for_task.as_deref(),
+                        &driver_listener_for_task,
                     )
                     .await
                     {
@@ -276,6 +314,7 @@ impl RusshTerminal {
         cols: u32,
         rows: u32,
         initial_cwd: Option<&str>,
+        driver_listener_for_setup: &DriverListener,
     ) -> anyhow::Result<(
         client::Handle<SshClientHandler>,
         russh::Channel<client::Msg>,
@@ -291,6 +330,11 @@ impl RusshTerminal {
             ..Default::default()
         });
 
+        // 转发认领表必须在 `client::connect` **之前**建好并交给 handler：
+        // 服务器可能在 tcpip-forward 成功后的任何时刻发起 forwarded-tcpip 通道，
+        // 表后挂会让最早那几条连接被当成「未登记」丢弃。
+        let port_forwards = crate::ssh::port_forward::RemoteForwardTable::default();
+
         log::info!("russh: 连接到 {}:{}", config.host, config.port);
         // config.timeout 生效：TCP+SSH 握手整体限时。此前该配置从未被使用，
         // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
@@ -303,6 +347,7 @@ impl RusshTerminal {
                     host: config.host.clone(),
                     port: config.port,
                     host_key_policy: crate::ssh::host_key::policy_from_global_config(),
+                    port_forwards: port_forwards.clone(),
                 },
             ),
         )
@@ -324,6 +369,34 @@ impl RusshTerminal {
                 "SSH 认证被拒绝（用户: {}）",
                 config.username
             ));
+        }
+
+        if !config.port_forwards.is_empty() {
+            // 失败不阻断登录：转发是登录的**附加**能力，远端拒绝监听
+            // （端口被占、sshd 禁了 AllowTcpForwarding）时用户仍应拿到可用的终端。
+            // 结果经 `DriverEvent::PortForward` 报到 UI。
+            let (established, errors) = crate::ssh::port_forward::install_all(
+                &handle,
+                &config.port_forwards,
+                &port_forwards,
+            )
+            .await;
+            for done in &established {
+                log::info!("russh: 端口转发已建立 {}", done.summary());
+            }
+            for e in &errors {
+                log::warn!("russh: 端口转发失败: {e}");
+            }
+            if let Some((ok, message)) =
+                crate::ssh::port_forward::outcome_message(&established, &errors)
+            {
+                // driver_listener 尚未移入 io_loop；这里借道它把结果送回 UI。
+                driver_listener_for_setup
+                    .0
+                    .send(DriverEvent::PortForward { message, ok })
+                    .await
+                    .ok();
+            }
         }
 
         log::info!("russh: 认证成功，打开会话通道");

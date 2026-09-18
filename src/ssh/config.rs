@@ -129,6 +129,10 @@ pub struct SshConnectionConfig {
     /// 检测到的远程操作系统 ID
     #[serde(default)]
     pub os: Option<String>,
+    /// 端口转发：把本机服务经 SSH 暴露到远端（`ssh -R` 语义），
+    /// 连接该主机时逐条建立。见 [`crate::ssh::port_forward`]。
+    #[serde(default)]
+    pub port_forwards: Vec<crate::ssh::port_forward::PortForwardRule>,
     /// 所属文件夹分组 id，None 表示未分组
     #[serde(default)]
     pub group_id: Option<String>,
@@ -150,6 +154,7 @@ impl PartialEq for SshConnectionConfig {
             && self.extra_args == other.extra_args
             && self.timeout == other.timeout
             && self.save_config == other.save_config
+            && self.port_forwards == other.port_forwards
             && self.os == other.os
             && self.group_id == other.group_id
             && self.sort_order == other.sort_order
@@ -208,6 +213,7 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: default_save(),
             os: None,
+            port_forwards: Vec::new(),
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
@@ -226,6 +232,7 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: false,
             os: None,
+            port_forwards: Vec::new(),
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
@@ -251,6 +258,7 @@ impl SshConnectionConfig {
             timeout: default_timeout(),
             save_config: default_save(),
             os: None,
+            port_forwards: Vec::new(),
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
@@ -898,6 +906,54 @@ mod tests {
         let back: SshConnectionConfig =
             serde_json::from_str(&json).expect("含 Auto 的配置必须可反序列化");
         assert!(matches!(back.auth_method, AuthMethod::Auto));
+    }
+
+    #[test]
+    fn existing_host_json_without_port_forwards_still_loads() {
+        // 升级兼容：老 ssh.json 里没有 port_forwards 字段，必须照常反序列化
+        // （缺省为空规则表），否则用户保存的主机会整体消失。
+        let json = r#"{
+            "host": "example.com",
+            "port": 22,
+            "username": "root",
+            "auth_type": "agent",
+            "nickname": "old-host",
+            "extra_args": null,
+            "timeout": 30,
+            "save_config": false,
+            "os": "ubuntu",
+            "group_id": null,
+            "sort_order": null,
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let conn: SshConnectionConfig = serde_json::from_str(json).expect("老配置必须可读");
+        assert_eq!(conn.nickname.as_deref(), Some("old-host"));
+        assert!(conn.port_forwards.is_empty(), "老配置没有转发规则");
+    }
+
+    #[test]
+    fn port_forwards_roundtrip_and_participate_in_equality() {
+        use crate::ssh::port_forward::PortForwardRule;
+
+        let mut conn = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+        let rule = PortForwardRule {
+            bind_host: "0.0.0.0".to_string(),
+            bind_port: 8080,
+            target_host: "127.0.0.1".to_string(),
+            target_port: 3000,
+            description: "dev server".to_string(),
+        };
+        conn.port_forwards = vec![rule.clone()];
+
+        let json = serde_json::to_string(&conn).unwrap();
+        let back: SshConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_forwards, vec![rule]);
+
+        // 转发规则是连接身份的一部分：改了规则就必须被认为「配置变了」
+        // （否则「已保存的主机」判重会漏掉这次修改）。
+        let mut other = conn.clone();
+        other.port_forwards.clear();
+        assert_ne!(conn, other);
     }
 
     #[test]

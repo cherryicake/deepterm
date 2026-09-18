@@ -91,6 +91,12 @@ pub enum DriverEvent {
     AbnormalDisconnect {
         reason: String,
     },
+    /// 端口转发的建立结果：`message` 是给用户看的一行说明（逐条摘要，或失败原因），
+    /// `ok` 表示全部规则都建好了。逐条独立——一条失败不影响其它条。
+    PortForward {
+        message: String,
+        ok: bool,
+    },
 }
 
 /// 一次本地前台 agent 检测的结果。
@@ -137,6 +143,17 @@ pub enum Event {
     /// `remote_process_name` 就是这个模式），把状态塞进变体会复制一份并迫使
     /// 每次 emit 都 `Clone`。与既有的 `TitleChanged` 等保持一致。
     AgentChanged,
+    /// 端口转发的建立结果到达（见 [`Terminal::port_forward_status`]）。
+    PortForwardChanged,
+}
+
+/// 端口转发的建立结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortForwardStatus {
+    /// 给用户看的一行说明（逐条摘要，或失败原因）。
+    pub message: String,
+    /// 是否全部规则都建好了。
+    pub ok: bool,
 }
 
 #[derive(Clone)]
@@ -831,6 +848,9 @@ pub struct Terminal {
     pub remote_os: Option<RemoteOS>,
     /// 远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 上报）
     remote_process_name: Option<String>,
+    /// 端口转发的建立结果（`None` = 该连接未配置转发，或尚未回报）。
+    /// 与 `remote_os` 同属「连接期一次性结果」，由 `DriverEvent::PortForward` 写入。
+    port_forward_status: Option<PortForwardStatus>,
     /// 进程检测发现的前台 CLI agent。`None` = 前台不是 agent（含 shell 回到前台）。
     ///
     /// 只回答"是哪个 agent"，**不代表它在忙**——回合状态一律以
@@ -1028,6 +1048,7 @@ impl Terminal {
             reported_working_directory: None,
             remote_os: None,
             remote_process_name: None,
+            port_forward_status: None,
             foreground_agent: None,
             agent_session: None,
             window_title: None,
@@ -1224,6 +1245,7 @@ impl Terminal {
                 reported_working_directory: None,
                 remote_os,
                 remote_process_name: None,
+                port_forward_status: None,
                 foreground_agent: None,
                 agent_session: None,
                 window_title: None,
@@ -1375,6 +1397,7 @@ impl Terminal {
             reported_working_directory: None,
             remote_os: None,
             remote_process_name: None,
+            port_forward_status: None,
             foreground_agent: None,
             agent_session: None,
             window_title: None,
@@ -1508,7 +1531,9 @@ impl Terminal {
         remote_cwd: Option<String>,
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
-        let (_driver_tx, driver_rx) = async_channel::bounded(1);
+        // 系统 ssh 路径原本没有驱动事件（`-R` 由 ssh 进程自己维护），这条通道
+        // 现在只用来回报端口转发的建立结果。
+        let (driver_tx, driver_rx) = async_channel::bounded(1);
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
 
@@ -1537,6 +1562,30 @@ impl Terminal {
 
         let pty_input = pty_terminal.clone();
         let pty_resize = pty_terminal.clone();
+
+        // 系统 ssh 路径的隧道由 ssh 进程自己维护（`-R` 已在 ssh 参数里），
+        // 这里只把「本次带了哪些规则」报到 UI。
+        let rules: Vec<crate::ssh::port_forward::PortForwardRule> =
+            ssh_config.port_forwards.iter().filter(|r| r.is_complete()).cloned().collect();
+        if !rules.is_empty() {
+            // 这条路径拿不到远端的确认（`-R` 的结果只体现在 ssh 的 stderr 上，
+            // 直接落在终端里）。所以只陈述「请求了什么」，不谎称已绑定成功。
+            let summary = rules
+                .iter()
+                .map(|r| r.summary())
+                .collect::<Vec<_>>()
+                .join("；");
+            driver_tx
+                .try_send(DriverEvent::PortForward {
+                    message: format!(
+                        "已随连接请求转发：{summary}（远端端口被占用时 ssh 会在终端里提示）"
+                    ),
+                    ok: true,
+                })
+                .ok();
+        }
+        // 未配置：丢掉发送端，driver_rx 立即结束（与改动前行为一致）。
+        drop(driver_tx);
 
         Self::create_remote_terminal(
             cx,
@@ -1604,6 +1653,11 @@ impl Terminal {
                             log::warn!("SSH 连接异常断开: {}", reason);
                             cx.emit(Event::SshAbnormalDisconnect);
                         }
+                        DriverEvent::PortForward { message, ok } => {
+                            terminal.port_forward_status =
+                                Some(PortForwardStatus { message, ok });
+                            cx.emit(Event::PortForwardChanged);
+                        }
                     });
                 }
             });
@@ -1618,6 +1672,7 @@ impl Terminal {
                 reported_working_directory: None,
                 remote_os: None,
                 remote_process_name: None,
+                port_forward_status: None,
                 foreground_agent: None,
                 agent_session: None,
                 window_title: None,
@@ -1846,6 +1901,11 @@ impl Terminal {
     /// 获取 SSH 连接错误信息（如果连接失败）
     pub fn ssh_error_message(&self) -> Option<String> {
         self.russh_handle.as_ref()?.error_message()
+    }
+
+    /// 端口转发的建立结果（未配置或尚未回报时为 `None`）。
+    pub fn port_forward_status(&self) -> Option<&PortForwardStatus> {
+        self.port_forward_status.as_ref()
     }
 
     /// 按索引解析主题色（用于颜色查询应答的回退）。

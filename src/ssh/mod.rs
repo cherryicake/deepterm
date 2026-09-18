@@ -14,6 +14,7 @@ pub mod auth;
 pub mod config;
 pub mod host_key;
 pub mod keychain;
+pub mod port_forward;
 pub mod platform;
 pub mod russh_terminal;
 pub mod sftp_fs;
