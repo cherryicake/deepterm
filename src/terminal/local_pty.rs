@@ -114,6 +114,18 @@ pub trait PtyScanner: Send {
     fn set_geometry(&mut self, geometry: escape_scan::TermGeometry) {
         let _ = geometry;
     }
+
+    /// 接管 OSC 序列的去处。
+    ///
+    /// 由 `LocalReader::spawn` 在启动时注入（[`NoticeOscSink`]），因为扫描器
+    /// 构造时还不知道通知通道长什么样——扫描器可能在 `Terminal::new` 的很早
+    /// 阶段就被建好，而通道与读线程一起创建。
+    ///
+    /// 默认空实现：不解析 OSC 的扫描器（透传）无需实现；未实现则所有 OSC
+    /// 原样交给 vte，行为与拦截之前完全一致。
+    fn set_osc_sink(&mut self, sink: Box<dyn crate::terminal::kitty::scanner::OscSink>) {
+        let _ = sink;
+    }
 }
 
 /// 全量透传的扫描器：不做任何识别，字节原样交给 vte。
@@ -131,61 +143,46 @@ impl PtyScanner for PassThroughScanner {
     }
 }
 
-/// 摘除 OSC 序列的扫描器基元：把本模块关心的序列切出去，其余透传。
+/// 把摘到的 OSC 经 [`LocalNotice`] 转给 UI 线程的 [`OscSink`]。
 ///
-/// 本地路径用它处理 OSC；APC 由 Kitty 扫描器另行处理（见
-/// `terminal::kitty::scanner`）。
-pub struct OscFilterScanner {
-    /// 每收到一条完整 OSC 内容时的回调。
-    pub on_osc: Box<dyn FnMut(&[u8]) -> bool + Send>,
+/// # 为什么读线程只"通知"、不再决定"透传还是消费"
+///
+/// 判定一条 OSC 该不该由应用层消费，依赖 `Context`（发事件、弹通知）与
+/// `Terminal` 自己的字段（cwd 去重、前台进程名），两者都只在 UI 线程上可用。
+/// 所以判定只有一处：UI 线程的 `Terminal::try_handle_osc_sequence`。
+///
+/// 但**字节不必等判定**：扫描器把序列按原位置喂给 vte（见
+/// [`crate::terminal::kitty::scanner::KittyGraphicsScanner::scan`]），这里只是
+/// 旁路通知 UI 线程。两条路由认识的前缀互不重叠，所以同一序列"既进 vte、
+/// 又通知 UI"不会被处理两次。
+///
+/// 若在这里就地判定"属不属于本层"，就必须把 `try_handle_osc_sequence`
+/// 认识的全部前缀复制一份到读线程，两处清单必然漂移。
+pub struct NoticeOscSink {
+    notice: async_channel::Sender<LocalNotice>,
 }
 
-impl PtyScanner for OscFilterScanner {
-    fn scan(
-        &mut self,
-        data: &[u8],
-        pending: &mut Vec<u8>,
-        emit: &mut dyn FnMut(&[u8]),
-        _grid: &mut dyn FnMut() -> GridState,
-    ) {
-        use crate::terminal::escape_scan::{self, Extract};
+impl NoticeOscSink {
+    pub fn new(notice: async_channel::Sender<LocalNotice>) -> Self {
+        Self { notice }
+    }
+}
 
-        // 拼上跨读残尾（仅在确有残尾时拷贝）。
-        let joined: Vec<u8>;
-        let data: &[u8] = if pending.is_empty() {
-            data
-        } else {
-            let mut v = std::mem::take(pending);
-            v.extend_from_slice(data);
-            joined = v;
-            joined.as_slice()
-        };
-
-        let mut pos = 0;
-        while let Some(offset) = memchr::memmem::find(&data[pos..], escape_scan::OSC_START) {
-            let osc_pos = pos + offset;
-            emit(&data[pos..osc_pos]);
-
-            match escape_scan::extract_osc(&data[osc_pos..]) {
-                Extract::Complete { len, content } => {
-                    // 回调返回 true 表示已消费（丢弃）；false 表示透传给 vte。
-                    if !(self.on_osc)(content) {
-                        emit(&data[osc_pos..osc_pos + len]);
-                    }
-                    pos = osc_pos + len;
-                }
-                Extract::Incomplete => {
-                    // 残尾：留给下次拼接，不上屏。
-                    *pending = data[osc_pos..].to_vec();
-                    return;
-                }
-                Extract::NotStart => {
-                    pos = osc_pos + escape_scan::OSC_START.len();
-                }
-            }
+impl crate::terminal::kitty::scanner::OscSink for NoticeOscSink {
+    fn osc(&mut self, content: &[u8], cursor: (i32, u32)) {
+        // 通道满或 UI 已退出：丢一条通知。字节已按位置喂给 vte，所以标题 /
+        // 超链接 / 调色板这些**由 vte 处理**的序列不受影响；只有应用层的那几种
+        // （cwd 上报、133 标记、hook 事件）会少一次刷新，好过阻塞读线程。
+        if self
+            .notice
+            .try_send(LocalNotice::Osc {
+                content: content.to_vec(),
+                cursor,
+            })
+            .is_err()
+        {
+            log::warn!("本地 OSC 通知通道已满/关闭，丢弃一条 OSC 通知");
         }
-
-        emit(&data[pos..]);
     }
 }
 
@@ -250,6 +247,25 @@ impl LocalSender {
 pub enum LocalNotice {
     /// 有字节被解析，UI 需要重绘。
     Wakeup,
+    /// 读线程摘到一条**完整**的 OSC 序列（内容不含 `ESC ]` 与终止符），
+    /// 附该序列出现时刻的网格光标 `(行, 列)`。
+    ///
+    /// 为什么要绕到 UI 线程：应用层判定一条 OSC 是否有意义依赖两类状态——
+    /// `Context`（发事件、弹通知）与 `Terminal` 自己的字段（cwd 去重、
+    /// 前台进程名）。两者都只在 UI 线程上可访问，读线程不能碰。
+    ///
+    /// 为什么要带光标：`OSC 133;B` 的语义是「此刻光标即输入区起点」。通知
+    /// 到达 UI 线程时同一 chunk 后续字节早已解析完，现读光标只能拿到行尾，
+    /// 所以必须由读线程在序列位置就地取样。
+    ///
+    /// 通道容量足够：hook 事件与提示符标记都是"每命令几条"的量级，不像
+    /// PTY 输出那样连续成兆；`try_send` 失败时该条被丢弃（丢一条 hook 事件
+    /// 只影响一次状态刷新，好过阻塞读线程）。字节本身已按位置喂给 vte，
+    /// 丢通知不会影响 vte 侧的那几类 OSC。
+    Osc {
+        content: Vec<u8>,
+        cursor: (i32, u32),
+    },
     /// 子进程退出，附退出状态。
     ChildExit(Option<std::process::ExitStatus>),
     /// 读线程出错（PTY 读取失败等）。
@@ -297,6 +313,11 @@ impl LocalReader {
 
         let (tx, rx) = async_channel::bounded::<LocalMsg>(256);
         let (notice_tx, notice_rx) = async_channel::bounded::<LocalNotice>(256);
+
+        // 读线程摘到的 OSC 要经通知通道交给 UI 线程判定（见 [`NoticeOscSink`]）。
+        // 通道发送端克隆一份给扫描器；`notice_tx` 本体仍归 `run_loop`
+        // （重绘/退出/错误通知走那条）。
+        scanner.set_osc_sink(Box::new(NoticeOscSink::new(notice_tx.clone())));
 
         let poller = Arc::new(Poller::new()?);
 
@@ -1574,5 +1595,52 @@ mod tests {
         );
 
         reader.sender().shutdown();
+    }
+
+    // ===== NoticeOscSink：读线程把 OSC 旁路通知给 UI 线程 =====
+
+    /// sink 必须把内容与**序列时刻光标**原样送进通知通道。
+    ///
+    /// 光标是这里唯一需要从读线程带走的上下文：`133;B` 的语义是"此刻光标即
+    /// 输入区起点"，等 UI 线程处理通知时同一 chunk 的后续字节早已解析完。
+    #[test]
+    fn notice_osc_sink_forwards_payload_and_cursor() {
+        use crate::terminal::kitty::scanner::OscSink;
+
+        let (tx, rx) = async_channel::bounded::<LocalNotice>(4);
+        let mut sink = NoticeOscSink::new(tx);
+
+        sink.osc(b"777;notify;deepterm://cli-agent;{}", (3, 7));
+
+        match rx.try_recv().expect("应收到一条 Osc 通知") {
+            LocalNotice::Osc { content, cursor } => {
+                assert_eq!(content, b"777;notify;deepterm://cli-agent;{}");
+                assert_eq!(cursor, (3, 7), "序列时刻光标必须原样带上来");
+            }
+            other => panic!("通知类型不对：{other:?}"),
+        }
+    }
+
+    /// 通道满时 sink 不 panic、不阻塞：丢一条通知即可。
+    ///
+    /// 字节本身已由扫描器按位置喂给 vte，所以丢通知不影响 vte 侧的那几类
+    /// OSC（标题 / 超链接 / 调色板）；只有应用层的那几种少一次刷新。
+    #[test]
+    fn notice_osc_sink_drops_when_channel_is_full() {
+        use crate::terminal::kitty::scanner::OscSink;
+
+        // 容量 1，且先塞满。
+        let (tx, rx) = async_channel::bounded::<LocalNotice>(1);
+        let mut sink = NoticeOscSink::new(tx.clone());
+        sink.osc(b"0;first", (0, 0));
+        // 此时第二条必然 `try_send` 失败——只要求不 panic、不阻塞。
+        sink.osc(b"0;second", (0, 0));
+
+        let first = rx.try_recv().expect("第一条应已入队");
+        assert!(matches!(first, LocalNotice::Osc { .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "第二条应被丢弃，而不是挤掉已入队的通知"
+        );
     }
 }

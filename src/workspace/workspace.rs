@@ -18,6 +18,8 @@ fn get_broadcast_queue() -> &'static Mutex<Vec<(String, String, BroadcastMsg)>> 
     QUEUE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+use crate::agent::AgentStatus;
+use crate::assets::Icon;
 use crate::components::button::{
     Button, ButtonVariants, Icon as MenuIcon, Sizable, Size as ButtonSize,
 };
@@ -1060,9 +1062,67 @@ impl Workspace {
                     });
                 }
             }
+            PanelEvent::AgentStateChanged {
+                panel_id,
+                agent,
+                status,
+            } => {
+                // 找到包含该 panel 的 tab，更新其 agent 图标 / 状态点。
+                let Some(tab_id) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
+                    tab_info
+                        .container
+                        .contains_panel(panel_id, cx)
+                        .then_some(tab_id.clone())
+                }) else {
+                    return;
+                };
+
+                // agent 消失时要把图标交还给原来的 OS / Workspace 图标，
+                // 否则 tab 会永远留着一个已经退出的 agent 的图形。
+                let fallback = self.fallback_tab_icon(&tab_id, panel_id, cx);
+                let is_active = tab_id == self.active_tab_id;
+
+                let previous = self.tab_bar.update(cx, |tab_bar, cx| {
+                    tab_bar.set_tab_agent(&tab_id, *agent, *status, fallback, cx)
+                });
+
+                // 「需关注」红点只认 Working → Done 这个**边沿**，而不是
+                // 「现在是 Done」：后者会让每次 Stop 都重复点亮、也会在用户
+                // 切回 tab 清除红点后又被残留的 Done 立刻点亮。
+                if should_mark_unread(previous, *status, is_active) {
+                    self.tab_bar.update(cx, |tab_bar, cx| {
+                        tab_bar.modify_tab(&tab_id, |tab| tab.needs_attention = true, cx);
+                    });
+                }
+
+                cx.emit(WorkspaceEvent::TabBarChanged);
+            }
         }
     }
 
+    /// agent 退出后 tab 图标应该回落到什么。
+    ///
+    /// 与恢复会话时的判定表保持一致（见 `restore_from_session_state` 里
+    /// `TabSessionType` 的 match）：Workspace tab 保留自己的图标，
+    /// 普通 tab 回落到触发本次事件的 panel 检测到的远端系统图标；
+    /// 本地终端没有 `remote_os`，回落为 `None`（不显示图标）。
+    ///
+    /// 只看 `panel_id` 这一个 panel 而不是扫全 tab：同一 tab 里能同时有
+    /// 本地与远程 split，而图标本来就只是「这台 tab 大概是干什么的」的
+    /// 一个粗略提示，取第一个远端系统并不比取触发事件的那个更正确。
+    fn fallback_tab_icon(&self, tab_id: &str, panel_id: &str, cx: &App) -> Option<Icon> {
+        let tab_info = self.tabs.get(tab_id)?;
+        if matches!(tab_info.tab_type, TabType::Workspace) {
+            return Some(Icon::Workspace);
+        }
+
+        tab_info
+            .container
+            .find_panel(panel_id, cx)
+            .and_then(|panel| panel.read(cx).remote_os)
+            .filter(|os| *os != RemoteOS::Unknown)
+            .map(|os| os.icon())
+    }
 
     /// 处理广播状态切换
     fn handle_broadcast_toggle(&mut self, cx: &mut Context<Self>) {
@@ -2836,6 +2896,30 @@ impl IntoElement for ResizeHandlerElement {
     }
 }
 
+/// 纯函数：这次 agent 状态变化该不该点亮 tab 的「需关注」红点。
+///
+/// 只认 `Working → Done` 这一个**边沿**，而不是「当前是 Done」：
+///
+/// - 只看状态的话，同一个 `Done` 会被重复上报（`Stop` 重发、状态机重放），
+///   每次都给已经亮着的 tab 重新点亮，用户切回来清掉又立刻亮起。
+/// - 边沿还能自然处理「用户没在看」这个前提：`is_active` 时说明用户正盯着
+///   这个 tab，agent 说完话他直接就能看见，不需要红点。
+///
+/// `Waiting`（等授权 / 提问）**不**点亮红点：它是 agent 在等人，而人可能
+/// 就坐在这个 tab 前面；状态点已经用空心圆环把这件事说清楚了。
+///
+/// `pub(crate)` 而非私有：它点亮的是 [`crate::workspace::tab_bar::TabItem::needs_attention`]，
+/// 而那个标志**能否画出来**由 tab_bar 的 `should_show_attention_dot` 决定。
+/// 两者曾经互相抵消（这边点亮、那边让位），各自却都有测试。tab_bar 的
+/// `done_edge_flag_actually_renders_a_dot` 需要把它接起来做组合断言。
+pub(crate) fn should_mark_unread(
+    previous: Option<AgentStatus>,
+    next: AgentStatus,
+    is_active: bool,
+) -> bool {
+    !is_active && previous == Some(AgentStatus::Working) && next == AgentStatus::Done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2847,5 +2931,28 @@ mod tests {
         assert_eq!(Workspace::workspace_label_for_index(1), "WorkSpace[1]");
         assert_eq!(Workspace::workspace_label_for_index(2), "WorkSpace[2]");
         assert_eq!(Workspace::workspace_label_for_index(10), "WorkSpace[10]");
+    }
+
+    /// 红点只在「后台 tab 跑完一个回合」时点亮。
+    #[test]
+    fn unread_dot_only_on_working_to_done_edge() {
+        use AgentStatus::*;
+
+        // 唯一该点亮的组合：上一状态 Working、新状态 Done、且不是当前 tab。
+        assert!(should_mark_unread(Some(Working), Done, false));
+
+        // 当前 tab 不点：用户正看着，不需要红点提醒。
+        assert!(!should_mark_unread(Some(Working), Done, true));
+
+        // 非 Working → Done 的迁移都不点。
+        assert!(!should_mark_unread(None, Done, false));
+        assert!(!should_mark_unread(Some(Idle), Done, false));
+        assert!(!should_mark_unread(Some(Waiting), Done, false));
+        assert!(!should_mark_unread(Some(Done), Done, false));
+
+        // Waiting 是「agent 在等人」，不是「干完了」，不点红点。
+        assert!(!should_mark_unread(Some(Working), Waiting, false));
+        assert!(!should_mark_unread(Some(Working), Working, false));
+        assert!(!should_mark_unread(Some(Working), Idle, false));
     }
 }

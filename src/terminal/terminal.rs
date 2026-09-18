@@ -43,6 +43,7 @@ use gpui::{
     SharedString, Size, Task, Window, px,
 };
 
+use crate::agent::{AgentEvent, AgentSessionState, CLIAgent};
 use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal, platform::detect_local_os};
 use crate::ssh::{
     keychain::{PreferredSshTransport, preferred_ssh_transport},
@@ -92,6 +93,22 @@ pub enum DriverEvent {
     },
 }
 
+/// 一次本地前台 agent 检测的结果。
+///
+/// 存在的意义是把「查不了」和「查了、但不是 agent」分开——这两件事都会让
+/// `detect_agent_for_local` 拿不到 `CLIAgent`，但对界面意味着相反的动作。
+/// 折叠成 `Option` 会逼调用方猜，猜错的代价是图标乱闪或该消失时不消失。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalAgentProbe {
+    /// 认出来了：前台跑的就是这个 agent。
+    Agent(CLIAgent),
+    /// **有效结论**：拿到了前台进程的 argv，但没有任何 token 命中已知 agent
+    /// （shell 提示符、`vim`、`grep`…）。agent 已经不在前台了。
+    NoAgent,
+    /// **不是结论**：缺 fd、`tcgetpgrp` 失败、取不到 argv。调用方应当保持现状。
+    Unavailable,
+}
+
 /// Terminal events
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -113,6 +130,13 @@ pub enum Event {
     /// 终端应用通过 DEC 私有模式 ?12 或 CSI `Ps SP q` 改变了光标闪烁策略。
     /// `bool` 为 true 表示应用希望光标闪烁。
     BlinkChanged(bool),
+    /// 前台 CLI agent 的身份或回合状态发生变化（见 [`Terminal::foreground_agent`]
+    /// 与 [`Terminal::agent_session`]）。
+    ///
+    /// 有意不带载荷：订阅方通过 `term.read(cx)` 现场取状态（`tab_label` 读
+    /// `remote_process_name` 就是这个模式），把状态塞进变体会复制一份并迫使
+    /// 每次 emit 都 `Clone`。与既有的 `TitleChanged` 等保持一致。
+    AgentChanged,
 }
 
 #[derive(Clone)]
@@ -789,16 +813,35 @@ pub struct Terminal {
     remote_shell_ready: bool,
     /// 终端通过 OSC 7 / CurrentDir 等序列主动上报的工作目录。
     ///
-    /// 这里同时服务本地 PTY 与 SSH 终端：
-    /// - 本地 PTY 走 vendored vte/alacritty 的 OSC 7 事件，由 `PwdChanged` 写入。
-    /// - SSH 数据流先在 DeepTerm 侧截获 OSC，再复用同一套解析和保存逻辑。
-    ///   统一保存“终端自己声明的 cwd”，可以避免再用 `lsof`/进程 cwd 猜测 shell
-    ///   状态；后者无法稳定追踪 shell 内建 `cd` 后的实时目录。
+    /// 两条管线都在这里汇合：
+    /// - 本地 PTY：读线程的扫描器摘出 OSC，经 `LocalNotice::Osc` 回到 UI 线程
+    ///   后由 `handle_local_osc` 喂进 `try_handle_osc_sequence`（host 须为本机）。
+    /// - SSH：字节在 UI 线程解析，`process_pty_data` 就地判定。host 属于远端，
+    ///   不做本机校验。
+    ///
+    /// 统一保存"终端自己声明的 cwd"，可以避免再用 `lsof`/进程 cwd 猜测 shell
+    /// 状态；后者无法稳定追踪 shell 内建 `cd` 后的实时目录。
+    ///
+    /// 历史注记：这里曾写着"本地 PTY 走 vendored vte/alacritty 的 OSC 7 事件，
+    /// 由 `PwdChanged` 写入"——**那是错的**。alacritty 0.26 与 vte 0.15 都没有
+    /// `PwdChanged`，vte 的 `osc_dispatch` 对 OSC 7 直接落到 `unhandled()` 丢弃，
+    /// 因此在补上本地拦截之前，本地 shell 的 cwd 上报一直是石沉大海。
     reported_working_directory: Option<String>,
     /// 检测到的远程操作系统
     pub remote_os: Option<RemoteOS>,
     /// 远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 上报）
     remote_process_name: Option<String>,
+    /// 进程检测发现的前台 CLI agent。`None` = 前台不是 agent（含 shell 回到前台）。
+    ///
+    /// 只回答"是哪个 agent"，**不代表它在忙**——回合状态一律以
+    /// `agent_session` 为准（见 [`Self::agent_session`]）。
+    foreground_agent: Option<CLIAgent>,
+    /// hook 事件驱动的 agent 回合状态。
+    ///
+    /// 与 `foreground_agent` 的两种解耦情况：
+    /// - 装了 hook 但进程检测认不出（agent 被包装器裹着）：靠事件里的 agent 兜底建 session。
+    /// - 没装 hook：检测出身份、session 为 `None`，界面显示品牌图标 + Idle，绝不误报 Working。
+    agent_session: Option<AgentSessionState>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器（仅 Windows：conpty 无裸 fd，沿用 alacritty EventLoop）
     sender: Option<EventLoopSender>,
@@ -985,6 +1028,8 @@ impl Terminal {
             reported_working_directory: None,
             remote_os: None,
             remote_process_name: None,
+            foreground_agent: None,
+            agent_session: None,
             window_title: None,
             sender: None,
             #[cfg(unix)]
@@ -1035,11 +1080,24 @@ impl Terminal {
 
     fn build_local_terminal(
         cx: &mut App,
-        pty_options: tty::Options,
+        mut pty_options: tty::Options,
         pty_error_message: String,
         remote_os: Option<RemoteOS>,
         shell_program: Option<String>,
     ) -> Entity<Self> {
+        // 把当前二进制所在目录前置进子 shell 的 PATH：Finder 启动与
+        // `cargo run` 都不保证 deepterm 已在 PATH 里，而用户在终端里可能想
+        // 直接调它。仅注入本地 PTY，不能把本机路径传给 SSH。
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(directory) = executable.parent() {
+                let path = pty_options.env.get("PATH").cloned().unwrap_or_default();
+                if let Ok(path) = std::env::join_paths(
+                    std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
+                ) {
+                    pty_options.env.insert("PATH".into(), path.to_string_lossy().into_owned());
+                }
+            }
+        }
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
@@ -1166,6 +1224,8 @@ impl Terminal {
                 reported_working_directory: None,
                 remote_os,
                 remote_process_name: None,
+                foreground_agent: None,
+                agent_session: None,
                 window_title: None,
                 sender: None,
                 local_sender: local_reader.as_ref().map(|r| r.sender()),
@@ -1315,6 +1375,8 @@ impl Terminal {
             reported_working_directory: None,
             remote_os: None,
             remote_process_name: None,
+            foreground_agent: None,
+            agent_session: None,
             window_title: None,
             sender: None,
             #[cfg(unix)]
@@ -1556,6 +1618,8 @@ impl Terminal {
                 reported_working_directory: None,
                 remote_os: None,
                 remote_process_name: None,
+                foreground_agent: None,
+                agent_session: None,
                 window_title: None,
                 sender: None,
                 #[cfg(unix)]
@@ -1684,6 +1748,19 @@ impl Terminal {
     /// 获取远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 1337;Proc= 上报）。
     pub fn remote_process_name(&self) -> Option<&str> {
         self.remote_process_name.as_deref()
+    }
+
+    /// 前台 CLI agent 的身份（进程检测或 hook 声明）。
+    ///
+    /// `None` 表示前台不是 agent——包括"shell 回到了前台"和"检测认不出来"。
+    /// 注意 `Some` 不代表它在忙：回合状态在 [`Self::agent_session`]。
+    pub fn foreground_agent(&self) -> Option<CLIAgent> {
+        self.foreground_agent
+    }
+
+    /// agent 的回合状态。`None` = 没有 agent 在前台，或没装 hook 所以没有状态来源。
+    pub fn agent_session(&self) -> Option<&AgentSessionState> {
+        self.agent_session.as_ref()
     }
 
     /// 获取当前 TTY 前台进程的名称（本地终端）。
@@ -1982,8 +2059,10 @@ impl Terminal {
     ///
     /// 读线程只做 vte 解析（不需要 `Context`），凡涉及事件派发/重绘的
     /// 副作用统一回到 UI 线程在这里完成。
+    /// `pub(crate)` 而非私有：测试要能灌一条 OSC 走**本地**这条真实入口
+    /// （远程那条是 `handle_remote_data`，两者在 OSC 处理上并不等价）。
     #[cfg(unix)]
-    fn handle_local_notice(
+    pub(crate) fn handle_local_notice(
         &mut self,
         notice: crate::terminal::local_pty::LocalNotice,
         cx: &mut Context<Self>,
@@ -2011,10 +2090,200 @@ impl Terminal {
                 cx.emit(Event::Wakeup);
                 let _ = status;
             }
+            LocalNotice::Osc { content, cursor } => {
+                // agent 事件与桌面通知共用 OSC 777 信道，必须**先**试 agent 解析：
+                // 否则会落进 handle_local_osc → try_handle_osc_sequence →
+                // parse_notification_osc，弹出一条虚假桌面通知（同远程侧的排序理由）。
+                //
+                // 顺序必须在这个分支里，不能塞进 `handle_local_osc` 内部靠后的位置
+                // ——那时通知已经发出去了。
+                if let Some(event) = crate::agent::parse_agent_event(&content) {
+                    self.apply_agent_events(&[event], cx);
+                } else {
+                    self.handle_local_osc(&content, Some(cursor), cx);
+                }
+            }
             LocalNotice::Error(reason) => {
                 log::error!("本地 PTY 读线程错误: {reason}");
             }
         }
+    }
+
+    /// 判定读线程报来的一条 OSC 是否由应用层消费。
+    ///
+    /// 与远程路径的关系：远程路径在 `process_pty_data` 里就地判定；本地路径的
+    /// 判定发生在序列被读线程**旁路通知**之后（判定要 `Context` 与 `Terminal`
+    /// 字段，读线程都没有）。字节本身不必在这里补喂——扫描器已按原位置喂给
+    /// vte 了（见 `NoticeOscSink`），这里只做「是否消费」的判定，避免与 vte
+    /// 争抢同一序列的处理权。
+    ///
+    /// `cursor_at_sequence`：见 [`Self::try_handle_osc_sequence`]。本地路径必须
+    /// 由读线程带上（同 chunk 的后续字节已经解析完），不能现读光标。
+    ///
+    /// `require_local_osc7_host = true`：这条序列来自本机 PTY，OSC 7 的 host
+    /// 必须解析为**本机**才采信。远程路径传 `false`（host 属于远端，不该拿
+    /// 本机 hostname 比对）。这正是两条管线共用 `try_handle_osc_sequence` 时
+    /// 唯一需要区分的语义。
+    #[cfg(unix)]
+    fn handle_local_osc(
+        &mut self,
+        content: &[u8],
+        cursor_at_sequence: Option<(i32, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.try_handle_osc_sequence(cx, content, true, cursor_at_sequence);
+    }
+
+    /// 把一批 agent 事件并入状态。
+    ///
+    /// 与 tty7 的 `apply_agent_signals` 的差异（均为刻意）：
+    /// - 无 daemon 通知通道，改用 `Event::AgentChanged` 让订阅方主动取状态；
+    /// - 不接收 `notification` 参数——deepterm 的桌面通知与 agent 状态**不关联**
+    ///   （已确认：普通通知完全忽略，状态只由 hook 事件驱动）；
+    /// - 无 `rich` / `launch_argv`——那两个服务于 daemon 跨重启保留 pane 状态，
+    ///   本仓库没有 daemon（见 `cli_agent.rs` 对 `AgentSessionState` 的说明）。
+    pub fn apply_agent_events(&mut self, events: &[AgentEvent], cx: &mut Context<Self>) {
+        if events.is_empty() {
+            return;
+        }
+        let before_agent = self.foreground_agent;
+        let before_session = self.agent_session.clone();
+
+        for event in events {
+            // hook 自己声明的 agent 是**兜底**：进程检测认不出（包装器、临时进程名）
+            // 时才采信；已经认出来的不覆盖——检测结果来自真实进程，比事件里的自称可靠。
+            if self.foreground_agent.is_none() && event.agent.is_some() {
+                self.foreground_agent = event.agent;
+            }
+            // 门控建 session：仅当"确实有 agent"时才建，避免杂散 sentinel 输出
+            // 凭空造出一个没有 agent 的孤儿 session（那会让界面显示状态点却无图标）。
+            if self.agent_session.is_none()
+                && (event.agent.is_some() || self.foreground_agent.is_some())
+            {
+                self.agent_session = Some(AgentSessionState::default());
+            }
+            if let Some(session) = self.agent_session.as_mut() {
+                session.apply_event(event);
+            }
+        }
+
+        // 两个判定**不可合并**：agent 身份可能单独变化而 session 全等。
+        // 例如 session_id 已经设好、status 已经是 Idle 时再收一条 `SessionStart`，
+        // session 前后完全相同，但若这次事件顺带把 `foreground_agent` 从 None 补成了
+        // `Some(Claude)`（兜底路径），界面必须刷新才显示得出图标。
+        // tty7 的片段只判 session，照抄会静默丢掉这类"纯身份"变更。
+        //
+        // 这里能直接比整份 session，前提是它**没有**「每个事件都变」的字段：
+        // 曾经有个 `activity`（工具调用计数）在 `ToolComplete` 里自增，于是
+        // 一个回合里几十次 `ToolComplete` 每次都判为"变了"，每次都发
+        // `AgentChanged`，订阅方白重绘、白转发。那个字段已删除（它当时也没有
+        // 任何渲染消费方）。**新增字段时请确认它不会在状态未变时自增。**
+        if self.foreground_agent != before_agent || self.agent_session != before_session {
+            cx.emit(Event::AgentChanged);
+        }
+    }
+
+    /// 前台 agent 身份的**权威**写入：`Some` 建立身份，`None` 表示确认退出了。
+    ///
+    /// `None` 会一并清掉 `agent_session`——所以调用方必须确认「真的没有 agent」，
+    /// 而不是「这一次没查出来」。
+    ///
+    /// 两条管线的「回到 None」机制并不对称，各自都在这条路径上落地：
+    /// - 本地：`tcgetpgrp(fd) == shell_process_group_id` 时 `detect_agent_for_local`
+    ///   直接返回 `None`，连 argv 都不取。但检测是**轮询**，它的 `None` 不可靠，
+    ///   所以走 [`Self::apply_detected_agent`] 而不是这里。
+    /// - 远程：没有 pgrp 概念，壳集成回到提示符时会**重新上报 shell 自己的 basename**
+    ///   （`assets/shell-integration/zsh/deepterm-integration:126` 发 `OSC 1337;Proc=zsh`），
+    ///   所以 `remote_process_name` 永远不会变回 `None`，只会被覆盖成 shell 名；
+    ///   这是**事件驱动**、结论明确，所以直接调这里。
+    ///
+    /// 值不变时不发事件（检测按 TTL 周期性跑，重复结果很多）。
+    pub fn set_foreground_agent(&mut self, agent: Option<CLIAgent>, cx: &mut Context<Self>) {
+        if self.foreground_agent == agent {
+            return;
+        }
+        if agent.is_none() && self.agent_session.is_some() {
+            self.agent_session = None;
+        }
+        self.foreground_agent = agent;
+        cx.emit(Event::AgentChanged);
+    }
+
+    /// 进程检测结果的写入路径。
+    ///
+    /// 与 [`Self::set_foreground_agent`] 的区别在于**`NoAgent` 与 `Unavailable`
+    /// 被区别对待**：检测是每 2 秒一次的轮询，它「查不了」和「查了、前台不是
+    /// agent」是两件事，混为一谈会让图标乱闪。
+    ///
+    /// - [`LocalAgentProbe::Agent`]：认出来了，更新身份。
+    /// - [`LocalAgentProbe::NoAgent`]：前台确实是个我们认识的程序序列里
+    ///   没有的东西（shell 提示符、`vim`、`grep`…）。**这是有效结论**：
+    ///   agent 已经退到后台或退出了，图标该落回去。
+    /// - [`LocalAgentProbe::Unavailable`]：没有 fd、`tcgetpgrp` 失败、
+    ///   取不到 argv。**这不是结论**，保持现状。
+    ///
+    /// 为什么 `Unavailable` 必须保持现状：agent 启动的瞬间、或它 fork 出的
+    /// 短命子进程短暂占据前台时，检测会连续几轮拿不到有效结果。如果那时把
+    /// 身份清掉，tab 上的图标就会闪一下再回来，而 hook 报的状态点更是会
+    /// 直接消失且**不会自己恢复**——hook 要等下一个回合事件才再报一次。
+    ///
+    /// 取舍是「宁可多留一会儿」而不是「宁可闪一下」：图标多留 2 秒是轻微
+    /// 的信息滞后，闪一下则是明显的视觉噪声。
+    pub fn apply_detected_agent(&mut self, probe: LocalAgentProbe, cx: &mut Context<Self>) {
+        match probe {
+            LocalAgentProbe::Agent(agent) => self.set_foreground_agent(Some(agent), cx),
+            LocalAgentProbe::NoAgent => self.set_foreground_agent(None, cx),
+            LocalAgentProbe::Unavailable => {}
+        }
+    }
+
+    /// 本地前台 agent 检测。
+    ///
+    /// **必须在后台线程调用**：macOS 走 `sysctl`，Linux 读 `/proc`。之所以做成
+    /// 自由函数而不是 `Terminal` 方法，就是因为后台线程不能碰 `Terminal`——
+    /// 这里只接受两个 `Copy` 值。
+    #[cfg(unix)]
+    pub fn detect_agent_for_local(
+        pty_master_fd: Option<i32>,
+        shell_process_group_id: Option<i32>,
+    ) -> LocalAgentProbe {
+        // 「查不了」和「查了，不是 agent」必须区分开——见 [`LocalAgentProbe`]。
+        let Some(fd) = pty_master_fd else {
+            return LocalAgentProbe::Unavailable;
+        };
+        // SAFETY（中文）：`tcgetpgrp` 只读查询，传入存活的 pty master fd；
+        // 失败返回 -1，由下面判掉。
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        if pgid < 0 {
+            return LocalAgentProbe::Unavailable;
+        }
+        // shell 在前台：这是**确定**的「前台不是 agent」，属于有效结论。
+        if shell_process_group_id == Some(pgid) {
+            return LocalAgentProbe::NoAgent;
+        }
+        // 取不到 argv（进程已退出、权限不足）：退回「查不了」，
+        // 不能据此断言前台不是 agent。
+        let Some(argv) = crate::terminal::foreground_argv::foreground_argv(pgid as u32) else {
+            return LocalAgentProbe::Unavailable;
+        };
+        match CLIAgent::detect_from_argv_with(&argv, &HashMap::new()) {
+            Some(agent) => LocalAgentProbe::Agent(agent),
+            // 拿到了 argv 但没有一个 token 命中已知 agent：
+            // 前台确实跑着某个程序，只是我们不认识它。
+            None => LocalAgentProbe::NoAgent,
+        }
+    }
+
+    /// 供后台线程取 pty master fd（[`Self::detect_agent_for_local`] 的入参）。
+    #[cfg(unix)]
+    pub(crate) fn pty_master_fd(&self) -> Option<i32> {
+        self.pty_master_fd
+    }
+
+    /// 供后台线程取 shell 进程组 id（[`Self::detect_agent_for_local`] 的入参）。
+    #[cfg(unix)]
+    pub(crate) fn shell_process_group_id(&self) -> Option<i32> {
+        self.shell_process_group_id
     }
 
     /// 把读线程置位的「图像已变化」标志同步为 `Terminal` 自己的代际号。
@@ -2263,7 +2532,9 @@ impl Terminal {
 
             match escape_scan::extract_osc(&data[seq_pos..]) {
                 Extract::Complete { len, content } => {
-                    if !self.try_handle_osc_sequence(cx, content, require_local_osc7_host) {
+                    // 远程路径按序列**分段**喂入：处理到这里时其前置文本已经过
+                    // vte 解析，所以 133;B 的光标现读即正确（`None`）。
+                    if !self.try_handle_osc_sequence(cx, content, require_local_osc7_host, None) {
                         // 不是应用层关心的 OSC，保留给 vte 自己处理。
                         self.advance_vte(&data[seq_pos..seq_pos + len]);
                     }
@@ -2326,24 +2597,61 @@ impl Terminal {
         self.write_raw(&replies);
     }
 
+    /// 判定一条 OSC 是否由应用层消费。
+    ///
+    /// `cursor_at_sequence`：序列出现时刻的网格光标，由**读线程**在字节流里
+    /// 就地取样后随通知带上来。只有本地路径能给（那条管线的字节在读线程解析，
+    /// 等通知到 UI 线程时同一 chunk 的后续字节早已喂完）；远程路径传 `None`，
+    /// 因为它在 UI 线程内**分段**喂入，处理到这里时光标恰好就是序列位置。
+    ///
+    /// 只有 `133;B`（输入区锚点）需要它，其余分支与光标无关。
     fn try_handle_osc_sequence(
         &mut self,
         cx: &mut Context<Self>,
         osc_content: &[u8],
         require_local_osc7_host: bool,
+        cursor_at_sequence: Option<(i32, u32)>,
     ) -> bool {
+        // agent 事件与桌面通知**共用** OSC 777 信道，所以这一判定必须排在
+        // `parse_notification_osc` 之前。理由（已核实）：后者在 `777;notify;`
+        // 分支里会把 sentinel 负载切成 `title="deepterm://cli-agent"`、
+        // `body="<json>"`，于是弹出一条**虚假桌面通知**——hook 每报一次事件
+        // 用户就收到一条垃圾通知。
+        //
+        // 为什么不需要 tty7 那句 `if title != Some(AGENT_EVENT_SENTINEL)` 显式检查：
+        // tty7 的 `osc::parse_notification` 是通用解析器，必须回查 title 才能排除
+        // sentinel；而本仓库的 `parse_agent_event`（`cli_agent.rs:550`）**硬剥**
+        // `777;notify;deepterm://cli-agent;` 字面前缀，非此一律 `None`。
+        // 因此"先试 agent 解析、`None` 再落通知解析"这个结构本身就已完备。
+        //
+        // 那句检查还**有害**：一条 title 恰好是字面量 `deepterm://cli-agent` 的
+        // 真实用户通知会被静默吞掉，而这里会正确送达。**请勿**为了"对齐 tty7"补回来。
+        if let Some(event) = crate::agent::parse_agent_event(osc_content) {
+            self.apply_agent_events(&[event], cx);
+            return true;
+        }
+
         if Self::matches_osc_prefix(osc_content, "133;A") {
             self.remote_shell_ready = true;
             return true;
         }
 
         if Self::matches_osc_prefix(osc_content, "133;B") {
-            // 输入区起点标记：提示符文本已经过 process_pty_data 分段喂入，
-            // 此时光标即输入区起点，作为空行判定的锚点。
+            // 输入区起点标记，作为空行判定的锚点。
             // （兼容 `133;B;aid=...` 等带后缀的变体。）
-            let point = {
-                let term = self.term.lock();
-                term.grid().cursor.point
+            //
+            // 光标必须取**序列出现时**的位置，不能现读 `Term`：
+            // - 本地路径：同一 chunk 里 `133;B` 之后的输入回显早已被读线程
+            //   解析完，现读拿到的是行尾，`input_line_blank` 于是把非空行
+            //   误判为空行（`/` 前缀会被错误拦截成内建命令）。
+            // - 远程路径：`process_pty_data` 按序列分段喂入，处理到这里时
+            //   光标恰好就是锚点，`None` 分支现读即正确。
+            let point = match cursor_at_sequence {
+                Some((line, column)) => AlacPoint::new(Line(line), Column(column as usize)),
+                None => {
+                    let term = self.term.lock();
+                    term.grid().cursor.point
+                }
             };
             self.input_area_start = Some(point);
             return true;
@@ -2370,7 +2678,15 @@ impl Terminal {
 
         if let Some(proc) = Self::parse_remote_process_osc(osc_content) {
             if self.remote_process_name.as_deref() != Some(proc.as_str()) {
+                // 远程检测是**纯字符串比较、无 fork**，所以就地同步执行，不必
+                // 走 `TerminalView` 那套异步缓存（那套存在的理由是本地检测要
+                // sysctl / 读 /proc）。顺带也不用等 2 秒 TTL。
+                let agent = CLIAgent::detect_from_argv_with(
+                    std::slice::from_ref(&proc),
+                    &HashMap::new(),
+                );
                 self.remote_process_name = Some(proc);
+                self.set_foreground_agent(agent, cx);
             }
             return true;
         }
@@ -2487,7 +2803,7 @@ impl Terminal {
         // - kitty-shell-cwd://host/path：Kitty/Ghostty 使用的格式，语义同样是 cwd。
         //
         // 和 Ghostty 一样，解析 URL 时保持“本地/远程上下文”分层：
-        // - 本地 PTY 通过 alacritty/vte 的 PwdChanged 进入，要求 host 是本机。
+        // - 本地 PTY 通过 `handle_local_osc` 进入，要求 host 是本机。
         // - SSH 数据流通过 try_handle_osc_sequence 进入，host 属于远端，不做本机校验。
         let (host, path) = if let Some(rest) = uri.strip_prefix("file://") {
             Self::split_osc7_host_path(rest)?
@@ -4138,6 +4454,9 @@ mod tests {
         IndexedCell, PackedCell, RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalContent,
         TerminalType, packed_zerowidth,
     };
+    /// 本地路径的 OSC 通知类型（仅 unix：`local_pty` 模块本身是 `#[cfg(unix)]`）。
+    #[cfg(unix)]
+    use crate::terminal::local_pty::LocalNotice;
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
     use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
@@ -4509,6 +4828,722 @@ mod tests {
         terminal.update(cx, |t, cx| {
             t.handle_pty_data(&data, false, cx);
             assert!(t.pending_osc.is_empty());
+        });
+    }
+
+    // ===== 本地路径 OSC 拦截测试（仅 unix）=====
+    //
+    // 与上面几条的分工：那些走 `handle_pty_data`（远程/UI 线程内的就地判定），
+    // 这些走 `handle_local_osc`（读线程旁路通知后由 UI 线程判定，本地路径）。
+    // 两条路径的处理函数相同，差异只在入口与 `require_local_osc7_host`。
+    //
+    // 整段都是 `#[cfg(unix)]`：`local_pty`（`LocalNotice` 的来源）只在 unix 存在。
+
+    /// 本地路径的 OSC 133;B 必须被消费并设置输入区锚点。
+    ///
+    /// 这条锁住的是"读线程旁路通知 → LocalNotice::Osc → UI 线程判定"整条链：
+    /// 修补前本地 shell 的提示符标记全部石沉大海（vte 没有 133 分支）。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn local_osc133_b_sets_input_area_anchor(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.advance_vte(b"$ ");
+            // 读线程在序列位置取样的光标是 (0,2)；UI 线程必须采信它，
+            // 而不是现读 `Term`（那时同 chunk 的后续字节已解析完）。
+            t.handle_local_notice(
+                LocalNotice::Osc {
+                    content: b"133;B".to_vec(),
+                    cursor: (0, 2),
+                },
+                cx,
+            );
+            let anchor = t.input_area_start.expect("本地 133;B 应被消费并捕获锚点");
+            assert_eq!(anchor.column.0, 2, "锚点应取自通知里的序列时刻光标");
+        });
+    }
+
+    /// 回归护栏：`133;B` 之后的输入回显**不得**污染锚点。
+    ///
+    /// 这是"本地路径空行判定"最容易错的形态：读线程把整个 chunk 解析完后才
+    /// 发通知，若 UI 线程现读 `Term` 的光标，拿到的是行尾（回显之后）而不是
+    /// 锚点，`input_line_blank` 就会把有内容的行误判为空行——`/` 前缀会被
+    /// 错误拦截成内建命令。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn local_osc133_b_anchor_ignores_trailing_echo(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            // 模拟读线程：`$ ` + 锚点 + 用户输入 `abc` 全部已解析进 term。
+            t.advance_vte(b"$ \x1b]133;B\x07abc");
+            // 通知稍后才到，带的是序列时刻的光标 (0,2)。
+            t.handle_local_notice(
+                LocalNotice::Osc {
+                    content: b"133;B".to_vec(),
+                    cursor: (0, 2),
+                },
+                cx,
+            );
+
+            assert_eq!(
+                t.input_area_start.map(|p| p.column.0),
+                Some(2),
+                "锚点必须是提示符末尾，不能被后续回显推到行尾"
+            );
+            assert!(
+                !t.input_line_blank(),
+                "行内已有 'abc'，不该被判定为空行"
+            );
+        });
+    }
+
+    /// 本地路径的 OSC 777 通知应被消费。
+    ///
+    /// 断言方式说明：`Event::NotificationReceived` 的订阅需要 `Entity`
+    /// 回调机制，在 `TestAppContext` 里写起来脆；这里退一步验证"消费判定
+    /// 本身"——它决定应用层是否派发通知。通知事件的派发是既有代码，
+    /// 远程路径的同类测试已覆盖。
+    #[gpui::test]
+    fn local_osc_notification_is_consumed(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            let consumed =
+                t.try_handle_osc_sequence(cx, b"777;notify;Build;done", true, None);
+            assert!(consumed, "本地 OSC 777 通知应由应用层消费");
+        });
+    }
+
+    /// 应用层不认识的 OSC（调色板、标题、超链接…）必须被判为"未消费"。
+    ///
+    /// 这条守住两条管线的分工：这类序列由 **vte** 处理，而扫描器已把它们按
+    /// 原位置喂进 vte（见 `scanner::KittyGraphicsScanner::scan`）。若这里误判
+    /// 成"消费"，应用层就会以为自己处理过了——虽然字节仍在流里，但语义上
+    /// 把 vte 的职责划到了应用层，后续任何"消费了就不喂"的改动都会让超链接
+    /// 与调色板静默失效。
+    ///
+    /// 用 OSC 4（调色板）做探针：vte 认它，应用层不认，两边界限清晰。
+    #[gpui::test]
+    fn unclaimed_local_osc_is_left_to_vte(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            assert!(
+                !t.try_handle_osc_sequence(cx, b"4;1;#123456", true, None),
+                "OSC 4（调色板）不应由应用层消费，它归 vte 处理"
+            );
+            // 同理：OSC 8（超链接）是 vte 的职责，应用层不得认领。
+            assert!(
+                !t.try_handle_osc_sequence(cx, b"8;;https://example.com", true, None),
+                "OSC 8（超链接）不应由应用层消费，它归 vte 处理"
+            );
+        });
+    }
+
+    // ===== 阶段 3：agent 状态测试 =====
+    //
+    // 这些测试集中的不变式：
+    // - agent 事件走 OSC 777 与桌面通知**共用**的信道，但绝不能被当成通知；
+    // - 状态只由 hook 事件驱动，进程检测只管"是哪个 agent"；
+    // - 只有真正变化才发 `AgentChanged`。
+
+
+    /// 判定一条 OSC 应落到哪条路由。
+    ///
+    /// 把 `try_handle_osc_sequence` 顶部的两个分支抽成纯函数穷举测试，比订阅
+    /// 式断言稳（订阅需要 `Entity` 回调机制，`TestAppContext` 里写起来脆）。
+    /// 返回 `(是否会被 agent 路由拿走, 是否会产生桌面通知)`。
+    ///
+    /// 注意第二个分量不是"`parse_notification_osc` 能解析"——那只说明格式像通知。
+    /// **真正会不会弹通知取决于顺序**：agent 判定在前，一旦被它拿走，
+    /// `parse_notification_osc` 在 `try_handle_osc_sequence` 里根本不会被调用。
+    /// 所以这里显式表达顺序（与实现同构），否则测试无法暴露排序写反。
+    #[cfg(test)]
+    fn route_osc(content: &[u8]) -> (bool, bool) {
+        if crate::agent::parse_agent_event(content).is_some() {
+            return (true, false);
+        }
+        (false, Terminal::parse_notification_osc(content).is_some())
+    }
+
+    /// agent sentinel 与三种真实通知/无关序列的路由互不串台。
+    ///
+    /// 关键是第一行：sentinel 必须**只**命中 agent，绝不能同时被判成通知
+    /// ——否则每报一次 hook 事件用户就多收一条垃圾桌面通知。
+    #[test]
+    fn agent_sentinel_does_not_route_to_notification() {
+        assert_eq!(
+            route_osc(b"777;notify;deepterm://cli-agent;{\"event\":\"stop\"}"),
+            (true, false),
+            "sentinel 负载应只走 agent 路由"
+        );
+        assert_eq!(
+            route_osc(b"777;notify;Build;done"),
+            (false, true),
+            "普通 777 通知不受影响"
+        );
+        assert_eq!(route_osc(b"9;hello"), (false, true), "OSC 9 通知不受影响");
+        assert_eq!(
+            route_osc(b"4;1;#123456"),
+            (false, false),
+            "调色板既非 agent 也非通知，应透传"
+        );
+    }
+
+    /// 一条 title 恰为字面量 `deepterm://cli-agent` 的**真实**通知必须送达。
+    ///
+    /// 这条钉住"为什么不需要 tty7 那句显式 sentinel 检查"：tty7 是回查解析出的
+    /// title 来排除 sentinel，因此会把这种命名撞车的真实通知静默吞掉。deepterm 的
+    /// `parse_agent_event` 要求完整前缀 `777;notify;deepterm://cli-agent;`（带分号
+    /// 与 JSON），title 只有 sentinel 且 body 不是 JSON 时它返回 `None`，于是正确
+    /// 落入通知路由。若有人为了"对齐 tty7"补回检查，这条会失败。
+    #[test]
+    fn user_notification_titled_like_sentinel_still_delivered() {
+        assert_eq!(
+            route_osc(b"777;notify;deepterm://cli-agent;hello world"),
+            (false, true),
+            "title 撞车的真实通知不应被 agent 路由吞掉"
+        );
+    }
+
+    /// 远程路径：sentinel 经 `try_handle_osc_sequence` 后建立 session，
+    /// 且**不**产生 `NotificationReceived`。
+    #[gpui::test]
+    fn remote_agent_sentinel_builds_session_without_notification(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let events = Arc::new(Mutex::new(Vec::<crate::terminal::Event>::new()));
+        let sink = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                sink.lock().unwrap().push(ev.clone());
+            })
+        });
+
+        let payload =
+            br#"777;notify;deepterm://cli-agent;{"v":1,"agent":"claude","event":"prompt-submit","session_id":"s-1"}"#;
+        terminal.update(cx, |t, cx| {
+            assert!(
+                t.try_handle_osc_sequence(cx, payload, false, None),
+                "远程 sentinel 应被消费"
+            );
+            let session = t.agent_session().expect("hook 事件应建立 session");
+            assert_eq!(session.status, crate::agent::AgentStatus::Working);
+            assert_eq!(session.session_id.as_deref(), Some("s-1"));
+            assert_eq!(t.foreground_agent(), Some(crate::agent::CLIAgent::Claude));
+        });
+
+        // 关键：绝不能弹出一条虚假桌面通知（订阅回调在 update 返回后才跑）。
+        let seen = events.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, crate::terminal::Event::NotificationReceived { .. })),
+            "sentinel 不得被当成桌面通知，实际事件 {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| *e == crate::terminal::Event::AgentChanged),
+            "应发出 AgentChanged，实际事件 {seen:?}"
+        );
+    }
+
+    /// 本地路径：同一负载经 `handle_local_notice(LocalNotice::Osc(..))`。
+    ///
+    /// 这条专门锁住 `handle_local_notice` 里 agent 判定**先于** `handle_local_osc`
+    /// 的排序——写反的话事件会落进 `parse_notification_osc`，session 建不起来。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn local_agent_sentinel_builds_session_without_notification(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let events = Arc::new(Mutex::new(Vec::<crate::terminal::Event>::new()));
+        let sink = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                sink.lock().unwrap().push(ev.clone());
+            })
+        });
+
+        let payload =
+            br#"777;notify;deepterm://cli-agent;{"v":1,"agent":"claude","event":"prompt-submit","session_id":"s-2"}"#;
+        terminal.update(cx, |t, cx| {
+            t.handle_local_notice(
+                LocalNotice::Osc {
+                    content: payload.to_vec(),
+                    cursor: (0, 0),
+                },
+                cx,
+            );
+            let session = t
+                .agent_session()
+                .expect("本地 sentinel 应建立 session（排序写反就会失败）");
+            assert_eq!(session.status, crate::agent::AgentStatus::Working);
+            assert_eq!(t.foreground_agent(), Some(crate::agent::CLIAgent::Claude));
+        });
+
+        let seen = events.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, crate::terminal::Event::NotificationReceived { .. })),
+            "本地 sentinel 不得被当成桌面通知，实际事件 {seen:?}"
+        );
+    }
+
+    /// 本地路径的普通通知仍然照常派发，别被 agent 判定顺手吃掉。
+    ///
+    /// 这条是上一条的对照：agent 判定只该拿走 sentinel，其余一切照旧。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn local_plain_notification_still_delivered(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let events = Arc::new(Mutex::new(Vec::<crate::terminal::Event>::new()));
+        let sink = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                sink.lock().unwrap().push(ev.clone());
+            })
+        });
+
+        terminal.update(cx, |t, cx| {
+            t.handle_local_notice(
+                LocalNotice::Osc {
+                    content: b"777;notify;Build;done".to_vec(),
+                    cursor: (0, 0),
+                },
+                cx,
+            );
+            assert!(
+                t.agent_session().is_none(),
+                "普通通知不应建出 agent session"
+            );
+            assert!(t.foreground_agent().is_none());
+        });
+
+        let seen = events.lock().unwrap();
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                crate::terminal::Event::NotificationReceived { title, body }
+                    if title == "Build" && body == "done"
+            )),
+            "普通 777 通知必须照常派发，实际事件 {seen:?}"
+        );
+    }
+
+    /// 远程路径的普通通知也应照常派发（对照上一条的远程版本）。
+    #[gpui::test]
+    fn remote_plain_notification_still_delivered(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let events = Arc::new(Mutex::new(Vec::<crate::terminal::Event>::new()));
+        let sink = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                sink.lock().unwrap().push(ev.clone());
+            })
+        });
+
+        terminal.update(cx, |t, cx| {
+            assert!(t.try_handle_osc_sequence(cx, b"777;notify;Build;done", false, None));
+            assert!(t.agent_session().is_none());
+        });
+
+        let seen = events.lock().unwrap();
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                crate::terminal::Event::NotificationReceived { title, body }
+                    if title == "Build" && body == "done"
+            )),
+            "远程普通 777 通知必须照常派发，实际事件 {seen:?}"
+        );
+    }
+
+    /// hook 声明的 agent 在进程检测失败时兜底，但**不覆盖**已检测出的身份。
+    ///
+    /// 检测结果来自真实进程 argv，比事件里的自称可靠：包装器脚本可能报错、也可能
+    /// 一个 pane 里套了两层 agent，都不该让身份来回翻。
+    #[gpui::test]
+    fn hook_agent_fills_in_only_when_detection_failed(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            let ev = |agent: Option<crate::agent::CLIAgent>, kind| crate::agent::AgentEvent {
+                agent,
+                kind,
+                session_id: None,
+                message: None,
+                cwd: None,
+                prompt: None,
+            };
+
+            assert!(t.foreground_agent().is_none());
+            t.apply_agent_events(
+                &[ev(
+                    Some(crate::agent::CLIAgent::Claude),
+                    crate::agent::AgentEventKind::SessionStart,
+                )],
+                cx,
+            );
+            assert_eq!(
+                t.foreground_agent(),
+                Some(crate::agent::CLIAgent::Claude),
+                "检测失败时应采信 hook 声明的 agent"
+            );
+
+            // 再来一个自称别的 agent 的事件：身份必须保持不变。
+            t.apply_agent_events(
+                &[ev(
+                    Some(crate::agent::CLIAgent::Aider),
+                    crate::agent::AgentEventKind::Notification,
+                )],
+                cx,
+            );
+            assert_eq!(
+                t.foreground_agent(),
+                Some(crate::agent::CLIAgent::Claude),
+                "已确定的身份不应被后续事件覆盖"
+            );
+        });
+    }
+
+    /// 门控：没有任何 agent 声明的事件不得凭空建出孤儿 session。
+    ///
+    /// 场景是"杂散 sentinel 输出"——比如用户 `cat` 了一个含 hook 日志的文件。
+    /// 建出 session 会让界面显示状态点却没有品牌图标。
+    #[gpui::test]
+    fn agentless_event_does_not_create_orphan_session(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.apply_agent_events(
+                &[crate::agent::AgentEvent {
+                    agent: None,
+                    kind: crate::agent::AgentEventKind::Stop,
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            );
+            assert!(t.agent_session().is_none(), "无 agent 不应建 session");
+            assert!(t.foreground_agent().is_none());
+        });
+    }
+
+    /// `AgentChanged` 只在真正变化时发一次。
+    ///
+    /// 检测按 TTL 周期跑、hook 事件也可能重复投递，若每次都 emit 会让订阅方
+    /// 无谓重绘。
+    ///
+    /// 注意 gpui 的派发时机：`cx.emit` 的订阅回调在**发射方 `update` 闭包返回之后**
+    /// 才跑。所以断言必须放在闭包外——在闭包内断言 `emissions` 恒为 0（这不是本实现
+    /// 的缺陷，是 `Context` 借用期的语义）。曾经在闭包内断言，白白排查了很久。
+    #[gpui::test]
+    fn agent_changed_emitted_only_on_real_change(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let emissions = Arc::new(Mutex::new(Vec::<crate::terminal::Event>::new()));
+        let sink = emissions.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                sink.lock().unwrap().push(ev.clone());
+            })
+        });
+        assert_eq!(emissions.lock().unwrap().len(), 0, "订阅应已挂上（无事件）");
+
+        let session_start = || crate::agent::AgentEvent {
+            agent: Some(crate::agent::CLIAgent::Claude),
+            kind: crate::agent::AgentEventKind::SessionStart,
+            session_id: None,
+            message: None,
+            cwd: None,
+            prompt: None,
+        };
+
+        // 第一次：建立 session，必须发一次。
+        terminal.update(cx, |t, cx| t.apply_agent_events(&[session_start()], cx));
+        assert_eq!(
+            emissions.lock().unwrap().len(),
+            1,
+            "第一次事件就该发 AgentChanged"
+        );
+
+        // 第二次：同一事件，session 前后全等，不该再发。
+        terminal.update(cx, |t, cx| t.apply_agent_events(&[session_start()], cx));
+        assert_eq!(
+            emissions.lock().unwrap().len(),
+            1,
+            "重复的同一事件只应发一次"
+        );
+
+        // 第三次：状态从 Idle 变 Done，要发。
+        terminal.update(cx, |t, cx| {
+            t.apply_agent_events(
+                &[crate::agent::AgentEvent {
+                    agent: Some(crate::agent::CLIAgent::Claude),
+                    kind: crate::agent::AgentEventKind::Stop,
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            )
+        });
+        assert_eq!(
+            emissions.lock().unwrap().len(),
+            2,
+            "状态真的变了要再发一次"
+        );
+    }
+
+    /// **仅身份变化**（session 全等）也必须发 `AgentChanged`。
+    ///
+    /// 这是最容易踩的坑：tty7 的片段末尾只判 `agent_session != before`。
+    /// 这里构造 session_id 已设、status 已是 Idle 的情形——此时再来一条
+    /// `SessionStart`（同样把 status 设成 Idle、带同一个 session_id）会让 session
+    /// 前后逐字段相等，但它顺带把 `foreground_agent` 从 `None` 兜底成 `Some(Claude)`。
+    /// 界面必须收到事件才显示得出图标，只判 session 的实现会静默丢掉。
+    #[gpui::test]
+    fn agent_changed_emitted_for_identity_only_change(cx: &mut TestAppContext) {
+        use crate::agent::{AgentSessionState, AgentStatus, AgentEvent, AgentEventKind, CLIAgent};
+
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let emissions = Arc::new(Mutex::new(0usize));
+        let sink = emissions.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                if *ev == crate::terminal::Event::AgentChanged {
+                    *sink.lock().unwrap() += 1;
+                }
+            })
+        });
+
+        // 起点：身份已确定（模拟进程检测结果），session 由一条事件建立。
+        terminal.update(cx, |t, cx| {
+            t.foreground_agent = Some(CLIAgent::Claude);
+            t.apply_agent_events(
+                &[AgentEvent {
+                    agent: None,
+                    kind: AgentEventKind::SessionStart,
+                    session_id: Some("fixed".to_string()),
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            )
+        });
+
+        let expected = AgentSessionState {
+            status: AgentStatus::Idle,
+            session_id: Some("fixed".to_string()),
+            ..Default::default()
+        };
+        terminal.update(cx, |t, _cx| {
+            assert_eq!(t.agent_session(), Some(&expected), "起点 session 应为 Idle + 固定 id");
+        });
+        let before = *emissions.lock().unwrap();
+
+        // 关键一幕：身份被清掉（模拟检测短暂失败），再收一条事件把它兜底回
+        // `Some(Claude)`。session 前后逐字段相等，只有身份变了。
+        terminal.update(cx, |t, cx| {
+            t.foreground_agent = None;
+            t.apply_agent_events(
+                &[AgentEvent {
+                    agent: Some(CLIAgent::Claude),
+                    kind: AgentEventKind::SessionStart,
+                    session_id: Some("fixed".to_string()),
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            )
+        });
+
+        terminal.update(cx, |t, _cx| {
+            assert_eq!(
+                t.agent_session(),
+                Some(&expected),
+                "前提：session 在这次事件前后必须逐字段相等（否则测的不是纯身份变更）"
+            );
+            assert_eq!(t.foreground_agent(), Some(CLIAgent::Claude));
+        });
+        assert_eq!(
+            *emissions.lock().unwrap(),
+            before + 1,
+            "仅身份变化（session 全等）也必须发 AgentChanged"
+        );
+    }
+
+    /// 一个回合里的几十次 `ToolComplete` **不得**各发一次 `AgentChanged`。
+    ///
+    /// 这是上面那条「只在真正变化时发」最容易失守的形态：判断用的是整份
+    /// session 相等，只要 `ToolComplete` 里塞了任何自增字段，状态明明停在
+    /// `Working`，每次工具调用却都判为"变了"。订阅方（`TerminalView` → panel →
+    /// workspace → tab 栏）于是被每 100ms 级的工具调用拖着反复重绘、反复同步。
+    ///
+    /// 曾经的 `AgentSessionState::activity` 正是这样一个字段，且没有任何渲染
+    /// 消费方。这条测试锁住「状态不变 ⇒ 不发事件」。
+    #[gpui::test]
+    fn tool_completions_do_not_storm_agent_changed(cx: &mut TestAppContext) {
+        use crate::agent::{AgentEvent, AgentEventKind, CLIAgent};
+
+        let terminal = cx.new(|_| anchor_test_terminal());
+        let emissions = Arc::new(Mutex::new(0usize));
+        let sink = emissions.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, ev: &crate::terminal::Event, _| {
+                if *ev == crate::terminal::Event::AgentChanged {
+                    *sink.lock().unwrap() += 1;
+                }
+            })
+        });
+
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+            prompt: None,
+        };
+
+        // 起手：一个回合开始（建立 session + 进 Working）。
+        terminal.update(cx, |t, cx| t.apply_agent_events(&[ev(AgentEventKind::PromptSubmit)], cx));
+        let after_prompt = *emissions.lock().unwrap();
+        assert_eq!(after_prompt, 1, "建立 session 并进 Working 应发一次");
+
+        // 二十次工具完成：状态一直是 Working，不该再发。
+        for _ in 0..20 {
+            terminal.update(cx, |t, cx| {
+                t.apply_agent_events(&[ev(AgentEventKind::ToolComplete)], cx)
+            });
+        }
+        assert_eq!(
+            *emissions.lock().unwrap(),
+            after_prompt,
+            "Working 状态下的 ToolComplete 不该再发 AgentChanged（状态没变）"
+        );
+
+        // 收尾仍然要发——别把真实变化一起静默掉。
+        terminal.update(cx, |t, cx| t.apply_agent_events(&[ev(AgentEventKind::Stop)], cx));
+        assert_eq!(
+            *emissions.lock().unwrap(),
+            after_prompt + 1,
+            "Working → Done 是真实变化，必须发"
+        );
+    }
+
+    /// agent 退出、shell 回到前台时清空身份与 session。
+    ///
+    /// 远程的清除机制靠"检测对 shell 名返回 `None`"，所以这里直接喂壳集成在
+    /// 回到提示符时上报的值（`OSC 1337;Proc=zsh`，见
+    /// `assets/shell-integration/zsh/deepterm-integration:126`）。
+    #[gpui::test]
+    fn returning_to_shell_clears_agent_and_session(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            // 先进 agent。
+            t.handle_pty_data(b"\x1b]1337;Proc=claude\x1b\\", false, cx);
+            assert_eq!(t.foreground_agent(), Some(crate::agent::CLIAgent::Claude));
+            t.apply_agent_events(
+                &[crate::agent::AgentEvent {
+                    agent: None,
+                    kind: crate::agent::AgentEventKind::PromptSubmit,
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            );
+            assert!(t.agent_session().is_some());
+
+            // 回提示符：壳集成重新上报 shell 自己的 basename。
+            t.handle_pty_data(b"\x1b]1337;Proc=zsh\x1b\\", false, cx);
+            assert!(
+                t.foreground_agent().is_none(),
+                "回到 shell 后身份应清空，实际 {:?}",
+                t.foreground_agent()
+            );
+            assert!(
+                t.agent_session().is_none(),
+                "身份清空必须一并清掉 session"
+            );
+        });
+    }
+
+    /// 钉住上一条测试的前提：**没有任何 agent alias 与 shell 名冲突**。
+    ///
+    /// 这条前提是"远程靠检测返回 `None` 来清空"能成立的**唯一**依据。若将来
+    /// 给某个 agent 加了 `sh`/`bash` 之类的 alias，`OSC 1337;Proc=zsh` 会被误判
+    /// 成 agent，回到提示符也清不掉——那时这条测试会先失败，比线上怪异行为好。
+    #[test]
+    fn no_agent_alias_collides_with_shell_names() {
+        use std::collections::HashMap;
+        for shell in ["zsh", "bash", "fish", "sh", "dash", "tcsh", "ksh"] {
+            let argv = vec![shell.to_string()];
+            assert_eq!(
+                crate::agent::CLIAgent::detect_from_argv_with(&argv, &HashMap::new()),
+                None,
+                "shell 名 {shell:?} 不应被识别成任何 agent"
+            );
+        }
+    }
+
+    /// `set_foreground_agent` 值不变时不发事件；清空时顺带清 session。
+    #[gpui::test]
+    fn set_foreground_agent_is_idempotent(cx: &mut TestAppContext) {
+        use crate::agent::{AgentEvent, AgentEventKind, CLIAgent};
+
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.set_foreground_agent(Some(CLIAgent::Claude), cx);
+            assert_eq!(t.foreground_agent(), Some(CLIAgent::Claude));
+            t.apply_agent_events(
+                &[AgentEvent {
+                    agent: None,
+                    kind: AgentEventKind::PromptSubmit,
+                    session_id: None,
+                    message: None,
+                    cwd: None,
+                    prompt: None,
+                }],
+                cx,
+            );
+            assert!(t.agent_session().is_some());
+
+            // 同一个值：不得清 session（否则周期检测会把状态洗掉）。
+            t.set_foreground_agent(Some(CLIAgent::Claude), cx);
+            assert!(
+                t.agent_session().is_some(),
+                "值未变化时不应动 session"
+            );
+
+            t.set_foreground_agent(None, cx);
+            assert!(t.foreground_agent().is_none());
+            assert!(t.agent_session().is_none());
+        });
+    }
+
+    /// 本地 OSC 7 的 host 必须是本机才采信（`require_local_osc7_host = true`）。
+    ///
+    /// 远程路径传 `false`（host 属于远端，拿本机 hostname 比对必然失败）。
+    /// 若本地误传 `false`，伪造的 host 会被当成合法 cwd 写进来。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn local_osc7_rejects_foreign_host(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            t.handle_local_notice(
+                LocalNotice::Osc {
+                    content: b"7;file://definitely-not-this-machine.local/tmp".to_vec(),
+                    cursor: (0, 0),
+                },
+                cx,
+            );
+            assert!(
+                t.reported_working_directory.is_none(),
+                "非本机 host 的本地 OSC 7 不应被采信，实际 {:?}",
+                t.reported_working_directory
+            );
         });
     }
 

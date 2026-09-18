@@ -72,6 +72,7 @@ unicode-segmentation = "1.12"
 unicode-width = "0.2"
 notify = "7"
 aho-corasick = "1"
+toml_edit = "0.22"
 # 敏感内存清零（口令/私钥字节），防堆内存残留与 core dump 泄露
 zeroize = "1"
 

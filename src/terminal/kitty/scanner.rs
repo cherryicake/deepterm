@@ -53,6 +53,49 @@ impl ReplySink for CollectingSink {
     }
 }
 
+/// 本地字节流里 OSC 序列的去处。
+///
+/// 为什么需要它：alacritty 0.26 用的 vte 0.15 **没有实现 `osc_dispatch`**，
+/// 只走默认实现——OSC 0/2（标题）、4、8、10-12、22、50、52、104-112 有分支，
+/// 其余（7 cwd、9/777 通知、133 shell 标记、1337、1338）一律落到
+/// `unhandled()` 被丢弃。远程路径早在 `Terminal::process_pty_data` 里自己
+/// 切分了 OSC，本地路径此前**完全没有**，于是本地 shell 的 cwd 上报与
+/// agent hook 事件全都石沉大海。
+///
+/// 与 [`ReplySink`] 的关系：那个是「要回写给 PTY 的应答」，这个是「读到一条
+/// OSC 后要通知 UI」。两者正交，实现类各管一边。
+pub trait OscSink: Send {
+    /// 收到一条**完整**的 OSC 内容（不含 `ESC ]` 与终止符），外加该序列
+    /// 出现时的网格光标 `(行, 列)`。
+    ///
+    /// 光标是这里唯一需要从读线程带走的上下文：`OSC 133;B`（输入区锚点）的
+    /// 语义是「**此刻**光标就是输入区起点」。等 UI 线程处理这条通知时，同一个
+    /// chunk 里后续的字节早已解析完，再从 `Term` 现读光标拿到的是行尾而不是
+    /// 锚点。所以必须在序列出现的位置就地取样。
+    ///
+    /// 本层**不**用返回值决定是否交给 vte：序列永远按原位置喂给 vte（理由见
+    /// [`KittyGraphicsScanner::scan`]），这里只是旁路通知。
+    fn osc(&mut self, content: &[u8], cursor: (i32, u32));
+}
+
+/// 什么都不接的 [`OscSink`]：OSC 只喂给 vte，不通知 UI 线程。
+///
+/// 这是「本层不关心 OSC」时的显式选择，也让测试可以只测 APC 路径。
+#[derive(Debug, Default)]
+pub struct PassThroughOscSink;
+
+impl OscSink for PassThroughOscSink {
+    fn osc(&mut self, _content: &[u8], _cursor: (i32, u32)) {}
+}
+
+/// 未完成 OSC 残尾的上限。
+///
+/// 与远程路径 `Terminal::process_pty_data` 的 `MAX_PENDING_OSC` 取同一个值：
+/// 同一类序列在两条管线上不该有不同的大小上限，否则「本机能跑、远程丢字符」
+/// 这种差异极难排查。超限则放弃该序列、原样透传，与 APC 残尾策略一致
+/// （防止没有终止符的 `ESC ]` 无限占用内存）。
+const MAX_PENDING_OSC: usize = 8 * 1024;
+
 /// 未完成 APC 残尾的上限。
 ///
 /// 与单条命令的负载上限（[`MAX_COMMAND_BYTES`]）一致：残尾本质是"一条尚未
@@ -91,6 +134,8 @@ pub struct KittyGraphicsScanner {
     mode_1016: bool,
     /// 对外可见的 1016 状态（读线程写、UI 线程读）。
     mode_1016_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// OSC 序列的去处。默认全部透传（见 [`PassThroughOscSink`]）。
+    osc_sink: Box<dyn OscSink>,
 }
 
 impl KittyGraphicsScanner {
@@ -161,7 +206,18 @@ impl KittyGraphicsScanner {
             mode_2048: false,
             mode_1016: false,
             mode_1016_shared,
+            osc_sink: Box::new(PassThroughOscSink),
         }
+    }
+
+    /// 接管 OSC 序列。不调用时全部 OSC 原样透传给 vte。
+    ///
+    /// 为什么是 setter 而不是 `with_osc_sink` 构造链：sink 的通道与读线程
+    /// 一起创建（见 `LocalReader::spawn`），而扫描器在这之前就已构造完毕
+    /// （构造它还需要 PTY 的初始几何等）。构造链风格会迫使调用方把扫描器的
+    /// 创建推迟到通道之后，反而打乱依赖顺序。
+    pub fn set_osc_sink(&mut self, sink: Box<dyn OscSink>) {
+        self.osc_sink = sink;
     }
 
     /// 接管外部的 1016 状态句柄，使 UI 线程能读到读线程观察到的模式状态。
@@ -411,44 +467,102 @@ impl PtyScanner for KittyGraphicsScanner {
         // emit 切片切开」的连续性隐患。
         let removals = self.handle_size_sequences(data);
 
-        // 无 APC 起始符时整段透传（摘下尺寸序列后），零额外开销。
-        if memchr::memmem::find(data, escape_scan::APC_START).is_none() {
+        // OSC 与 APC 必须**单趟按位置推进**处理，不能「先把 OSC 全摘掉、
+        // 再走 APC 循环」：两条序列可能交替出现，两趟扫描会让某一趟看到的位置
+        // 与另一趟错位，跨读残尾（`pending`）也会被写成后一趟的错误后缀。
+        let next_osc = memchr::memmem::find(data, escape_scan::OSC_START);
+        let next_apc = memchr::memmem::find(data, escape_scan::APC_START);
+
+        // 两者都没有：整段透传（摘下尺寸序列后）。
+        if next_osc.is_none() && next_apc.is_none() {
             Self::emit_without_removals(data, &removals, emit, 0, data.len());
             return;
         }
 
         let mut pos = 0;
-        while let Some(offset) = memchr::memmem::find(&data[pos..], escape_scan::APC_START) {
-            let apc_pos = pos + offset;
-            // APC 之前的普通文本原样交给 vte——必须在处理 APC **之前**交出，
-            // 这样 `cursor()` 才能反映这些文本（如 `CSI 3;5H` 定位）的效果。
-            // 尺寸序列从这一段里摘除。
-            Self::emit_without_removals(data, &removals, emit, pos, apc_pos);
-
-            match escape_scan::extract_apc(&data[apc_pos..]) {
-                Extract::Complete { len, content } => {
-                    // 瞄准此刻的网格状态：前面的文本已经喂给 vte 了。
-                    let state = grid();
-                    self.cursor = state.cursor;
-                    self.store.set_visible_rows(Some(state.visible));
-                    // 图形 APC 被消费，不进入 vte（vte 会丢弃内容，但序列
-                    // 本身仍会走一遍状态机——提前摘除更干净）。
-                    self.handle_apc(content);
-                    pos = apc_pos + len;
+        loop {
+            let osc_offset = memchr::memmem::find(&data[pos..], escape_scan::OSC_START);
+            let apc_offset = memchr::memmem::find(&data[pos..], escape_scan::APC_START);
+            let (offset, is_apc) = match (osc_offset, apc_offset) {
+                (Some(o), Some(a)) => {
+                    if a < o {
+                        (a, true)
+                    } else {
+                        (o, false)
+                    }
                 }
-                Extract::Incomplete => {
-                    if data.len() - apc_pos > MAX_PENDING_APC {
-                        // 残尾过大：放弃整条，避免无限占用内存。
-                        // 已 `emit` 的前缀保持原样；剩余部分透传给 vte。
-                        Self::emit_without_removals(data, &removals, emit, apc_pos, data.len());
+                (Some(o), None) => (o, false),
+                (None, Some(a)) => (a, true),
+                (None, None) => break,
+            };
+            let seq_pos = pos + offset;
+
+            // 序列之前的普通文本原样交给 vte——必须在处理序列**之前**交出，
+            // 这样 APC 的锚点（`grid()`）才能反映这些文本（如 `CSI 3;5H` 定位）
+            // 的效果。尺寸序列从这一段里摘除。
+            Self::emit_without_removals(data, &removals, emit, pos, seq_pos);
+
+            if is_apc {
+                match escape_scan::extract_apc(&data[seq_pos..]) {
+                    Extract::Complete { len, content } => {
+                        // 瞄准此刻的网格状态：前面的文本已经喂给 vte 了。
+                        let state = grid();
+                        self.cursor = state.cursor;
+                        self.store.set_visible_rows(Some(state.visible));
+                        // 图形 APC 被消费，不进入 vte（vte 会丢弃内容，但序列
+                        // 本身仍会走一遍状态机——提前摘除更干净）。
+                        self.handle_apc(content);
+                        pos = seq_pos + len;
+                    }
+                    Extract::Incomplete => {
+                        if data.len() - seq_pos > MAX_PENDING_APC {
+                            // 残尾过大：放弃整条，避免无限占用内存。
+                            // 已 `emit` 的前缀保持原样；剩余部分透传给 vte。
+                            Self::emit_without_removals(data, &removals, emit, seq_pos, data.len());
+                        } else {
+                            *pending = data[seq_pos..].to_vec();
+                        }
                         return;
                     }
-                    *pending = data[apc_pos..].to_vec();
+                    Extract::NotStart => pos = seq_pos + escape_scan::APC_START.len(),
+                }
+                continue;
+            }
+
+            match escape_scan::extract_osc(&data[seq_pos..]) {
+                Extract::Complete { len, content } => {
+                    // 旁路通知 UI 线程，**同时**把原字节按位置喂给 vte。
+                    //
+                    // 为什么两件事都要做（而不是"应用层消费了就不喂 vte"）：
+                    // 位置相关的 OSC 只有按流序喂进 vte 才正确——超链接
+                    // （OSC 8）绑定的是**其后的单元格**，调色板（OSC 4）、
+                    // 标题（OSC 0/2）、剪贴板（OSC 52）同理。若在读线程把序列
+                    // 摘掉、稍后由 UI 线程补喂，序列之后的文本早已进入 vte，
+                    // 超链接就会挂到错误的单元格上（安全相关：可见文本与实际
+                    // URL 不符）。
+                    //
+                    // 两条路由的清单**互不重叠**，所以"都做"不会重复处理：
+                    // vte 只认 0/2/4/8/10-12/22/50/52/104/110-112，应用层只认
+                    // 7/133/633/777/9/1337；各自对不认识的一律忽略。
+                    //
+                    // 光标必须在**此处**取样：前面的文本已经喂给 vte，所以它
+                    // 就是序列出现时刻的位置。133;B（输入区锚点）的语义正是
+                    // "此刻光标即输入区起点"，等 UI 线程再读就已经是行尾了。
+                    let state = grid();
+                    self.osc_sink.osc(content, state.cursor);
+                    Self::emit_without_removals(data, &removals, emit, seq_pos, seq_pos + len);
+                    pos = seq_pos + len;
+                }
+                Extract::Incomplete => {
+                    if data.len() - seq_pos > MAX_PENDING_OSC {
+                        // 残尾过大：放弃拼接，原样透传（与 APC 同策略）。
+                        Self::emit_without_removals(data, &removals, emit, seq_pos, data.len());
+                    } else {
+                        *pending = data[seq_pos..].to_vec();
+                    }
                     return;
                 }
-                Extract::NotStart => {
-                    pos = apc_pos + escape_scan::APC_START.len();
-                }
+                Extract::NotStart => pos = seq_pos + escape_scan::OSC_START.len(),
             }
         }
 
@@ -470,6 +584,11 @@ impl PtyScanner for KittyGraphicsScanner {
     /// reports 启用时会顺带重发一次上报。
     fn set_geometry(&mut self, geometry: escape_scan::TermGeometry) {
         KittyGraphicsScanner::set_geometry(self, geometry);
+    }
+
+    /// 接管 OSC 序列的去处（由读线程启动时注入）。
+    fn set_osc_sink(&mut self, sink: Box<dyn OscSink>) {
+        KittyGraphicsScanner::set_osc_sink(self, sink);
     }
 }
 
@@ -529,6 +648,67 @@ mod tests {
         );
         assert!(pending.is_empty(), "测试输入不应留下跨读残尾");
         (emitted, scanner.take_replies())
+    }
+
+    /// 把一个输入按 `chunks` 切成多次 `scan`（模拟跨读边界），
+    /// 返回 `(全部 emit 的字节, 每次 scan 后的残尾快照)`。
+    ///
+    /// 残尾快照用于断言"切在序列中间时确实被暂存"，而不只是看最终结果——
+    /// 否则一个「先整段透传、再靠 vte 兜底」的错误实现也可能碰巧通过。
+    fn run_scan_chunked(
+        scanner: &mut KittyGraphicsScanner,
+        chunks: &[&[u8]],
+    ) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut pending = Vec::new();
+        let mut emitted = Vec::new();
+        let mut pendings = Vec::new();
+        for chunk in chunks {
+            scanner.scan(
+                chunk,
+                &mut pending,
+                &mut |bytes| emitted.extend_from_slice(bytes),
+                &mut grid_state_fixture,
+            );
+            pendings.push(pending.clone());
+        }
+        (emitted, pendings)
+    }
+
+    /// 带 OSC 收集器的扫描器。
+    ///
+    /// 返回 `(扫描器, 收到的 OSC 内容, 每条 OSC 的序列时刻光标)`。
+    fn scanner_with_osc_collector() -> (
+        KittyGraphicsScanner,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>>,
+    ) {
+        let collected: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cursors: std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut scanner = scanner_with_geometry();
+        scanner.set_osc_sink(Box::new(SharedCollectingOscSink {
+            shared: collected.clone(),
+            cursors: cursors.clone(),
+        }));
+        (scanner, collected, cursors)
+    }
+
+    /// 把 OSC payload 收集到外部共享缓冲的 [`OscSink`]（测试用）。
+    ///
+    /// 被 boxed 之后测试就拿不到 sink 自己的字段了，所以写进外部 `Arc<Mutex<..>>`。
+    /// 同时记录每条 OSC 的**序列时刻光标**，供锚点类用例断言读线程取样正确。
+    struct SharedCollectingOscSink {
+        shared: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        /// 每条 OSC 出现时刻的光标，与 `shared` 一一对应。
+        cursors: std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>>,
+    }
+
+    impl OscSink for SharedCollectingOscSink {
+        fn osc(&mut self, content: &[u8], cursor: (i32, u32)) {
+            self.shared.lock().unwrap().push(content.to_vec());
+            self.cursors.lock().unwrap().push(cursor);
+        }
     }
 
     #[test]
@@ -703,5 +883,245 @@ mod tests {
 
         let (_emitted, replies) = run_scan(&mut scanner, b"\x1b[16t");
         assert_eq!(replies, b"\x1b[6;18;9t");
+    }
+
+    /// 默认（未注入 sink）时 OSC 必须原样透传，行为与拦截之前完全一致。
+    ///
+    /// 这是回归护栏：一旦有人把 `PassThroughOscSink` 换成"默认消费"，本地终端
+    /// 的标题、超链接、剪贴板会全部静默失效。
+    #[test]
+    fn osc_passes_through_when_no_sink_installed() {
+        let mut scanner = scanner_with_geometry();
+        let input = b"\x1b]0;my title\x07";
+        let (emitted, _replies) = run_scan(&mut scanner, input);
+
+        assert_eq!(emitted, input, "无 sink 时 OSC 必须原样交给 vte");
+    }
+
+    /// OSC 一律按**原位置**喂给 vte，同时旁路通知 sink。
+    ///
+    /// 位置是这里的关键：OSC 8（超链接）绑定的是**其后的单元格**，所以序列
+    /// 必须在其后文本之前进入 vte。曾经的做法是读线程把序列摘掉、稍后由 UI
+    /// 线程补喂——补喂时后面的文本早已解析完，超链接就挂到了错误的单元格上。
+    #[test]
+    fn osc_is_forwarded_in_place_and_also_reported() {
+        let (mut scanner, collected, _cursors) = scanner_with_osc_collector();
+        let input = b"\x1b]0;my title\x07";
+        let (emitted, _replies) = run_scan(&mut scanner, input);
+
+        assert_eq!(
+            emitted, input,
+            "OSC 必须原样、原位置交给 vte（否则位置相关的序列会错位）"
+        );
+        assert_eq!(
+            *collected.lock().unwrap(),
+            vec![b"0;my title".to_vec()],
+            "sink 仍应看到内容（判定归 UI 线程，读线程只负责旁路通知）"
+        );
+    }
+
+    /// 回归护栏：OSC 8 超链接必须绑定到**它后面**的文本，而不是前面的。
+    ///
+    /// 这条直接以 vte 解析后的 `Cell::hyperlink()` 为断言对象——它是唯一能
+    /// 反映"序列与文本的相对顺序"的可观察结果。摘除后补喂的实现会在此失败：
+    /// 补喂发生在 `LINKTEXT` 之后，超链接会落到 `PLAIN` 上。
+    #[test]
+    fn osc8_hyperlink_binds_to_following_text_not_preceding() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        let (mut scanner, _collected, _cursors) = scanner_with_osc_collector();
+
+        let size = alacritty_terminal::term::test::TermSize::new(20, 4);
+        let mut term = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+
+        // 扫描器把 OSC 按原位置 emit；整段喂给 vte 后看单元格归属。
+        let mut pending = Vec::new();
+        let mut emitted = Vec::new();
+        scanner.scan(
+            b"PLAIN\x1b]8;;https://evil.example\x1b\\LINK\x1b]8;;\x1b\\",
+            &mut pending,
+            &mut |bytes| emitted.extend_from_slice(bytes),
+            &mut grid_state_fixture,
+        );
+        processor.advance(&mut term, &emitted);
+        assert!(pending.is_empty(), "完整输入不应留下残尾");
+
+        let linked: String = (0..10)
+            .filter(|&col| term.grid()[Line(0)][Column(col)].hyperlink().is_some())
+            .map(|col| term.grid()[Line(0)][Column(col)].c)
+            .collect();
+        assert_eq!(
+            linked, "LINK",
+            "超链接应绑定到 OSC 8 **之后**的文本；绑到 PLAIN 上说明序列被错位重放"
+        );
+    }
+
+    /// 被消费的 OSC **也**进入 vte——两条路由认识的序列互不重叠。
+    ///
+    /// 本地 agent hook 事件（OSC 777）属于应用层，vte 对它只会 `unhandled()`
+    /// 丢弃（那是纯 `debug!`，无副作用），所以"既通知 UI 又喂 vte"不会重复
+    /// 处理，也不会互相干扰。
+    #[test]
+    fn consumed_osc_still_reaches_vte_without_side_effects() {
+        let (mut scanner, collected, _cursors) = scanner_with_osc_collector();
+        let input = b"before\x1b]777;notify;deepterm://cli-agent;{\"k\":1}\x07after";
+
+        let (emitted, _replies) = run_scan(&mut scanner, input);
+
+        assert_eq!(
+            emitted, input,
+            "字节流必须原样保留（vte 对未知 OSC 是 no-op，不会误处理）"
+        );
+        assert!(
+            collected.lock().unwrap()[0].starts_with(b"777;notify;deepterm://cli-agent"),
+            "hook 事件内容应完整到达 sink"
+        );
+    }
+
+    /// ST（`ESC \`）终止的 OSC 与 BEL 终止的等价——hook 脚本两种都可能发。
+    #[test]
+    fn osc_terminated_by_st_is_handled() {
+        let (mut scanner, collected, _cursors) = scanner_with_osc_collector();
+        let (emitted, _replies) = run_scan(&mut scanner, b"\x1b]7;file://host/repo\x1b\\x");
+
+        assert_eq!(emitted, b"\x1b]7;file://host/repo\x1b\\x", "字节原样保留");
+        assert_eq!(
+            *collected.lock().unwrap(),
+            vec![b"7;file://host/repo".to_vec()]
+        );
+    }
+
+    /// sink 收到的光标必须是**该序列出现时**的位置，不是 chunk 末尾的位置。
+    ///
+    /// 这是 `OSC 133;B` 锚点正确性的根据：UI 线程处理通知时同一 chunk 的后续
+    /// 字节已经解析完，现读光标只能拿到行尾。这里用真实 `Term` 做网格状态源
+    /// （`emit` 推进它、`grid` 读它），与读线程里的 `ScanCtx` 同构；若扫描器
+    /// 在序列之后才取样，拿到的会是 `(1,0)` 而不是 `(0,2)`。
+    #[test]
+    fn osc_reports_cursor_at_sequence_position() {
+        use alacritty_terminal::grid::Dimensions as _;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        let (mut scanner, _collected, cursors) = scanner_with_osc_collector();
+
+        let size = alacritty_terminal::term::test::TermSize::new(20, 4);
+        let term = std::cell::RefCell::new(alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        ));
+        let processor = std::cell::RefCell::new(Processor::<StdSyncHandler>::new());
+
+        // `$ ` 之后是序列（光标应在 (0,2)），之后还有文本 + 换行。
+        let mut pending = Vec::new();
+        scanner.scan(
+            b"$ \x1b]133;B\x07abc\r\n",
+            &mut pending,
+            &mut |bytes| processor.borrow_mut().advance(&mut *term.borrow_mut(), bytes),
+            &mut || {
+                let t = term.borrow();
+                let point = t.grid().cursor.point;
+                crate::terminal::local_pty::GridState {
+                    cursor: (point.line.0, point.column.0 as u32),
+                    visible: crate::terminal::kitty::storage::VisibleRows::new(
+                        t.grid().display_offset(),
+                        t.grid().screen_lines(),
+                    ),
+                }
+            },
+        );
+        assert!(pending.is_empty(), "完整输入不应留下残尾");
+
+        assert_eq!(
+            *cursors.lock().unwrap(),
+            vec![(0, 2)],
+            "光标应是序列出现时的 (0,2)，而不是 chunk 末尾的 (1,0)"
+        );
+    }
+
+    /// 回归护栏：OSC 与 APC **交替**出现在同一个 chunk 里时，两者都要被正确处理。
+    ///
+    /// 若实现成"先摘完 OSC 再走 APC 循环"（两趟扫描），第二趟看到的偏移量是
+    /// 第一趟裁剪后的坐标系，APC 会被错位切分——这条会失败。
+    #[test]
+    fn interleaved_osc_and_apc_are_both_handled() {
+        let (mut scanner, collected, _cursors) = scanner_with_osc_collector();
+        let (emitted, replies) = run_scan(
+            &mut scanner,
+            b"A\x1b]0;t1\x07B\x1b_Gi=7,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\C\x1b]0;t2\x07D",
+        );
+
+        assert_eq!(
+            emitted, b"A\x1b]0;t1\x07BC\x1b]0;t2\x07D",
+            "只有 APC 该被摘除；两条 OSC 必须按原位置保留给 vte"
+        );
+        assert_eq!(
+            *collected.lock().unwrap(),
+            vec![b"0;t1".to_vec(), b"0;t2".to_vec()],
+            "两条 OSC 都应按序到达 sink"
+        );
+        assert!(
+            replies.windows(6).any(|w| w == b"i=7;OK"),
+            "APC 仍须被 kitty 路径应答，实际 {:?}",
+            String::from_utf8_lossy(&replies)
+        );
+    }
+
+    /// 序列跨读被截断：残尾必须暂存，拼上后续字节后仍然正确旁路通知。
+    ///
+    /// 切点故意选在 OSC 内容中间（而非起始符之前），确保测的是"序列不完整"
+    /// 而非"还没看到起始符"。
+    #[test]
+    fn osc_split_across_read_boundaries_is_reassembled() {
+        let (mut scanner, collected, _cursors) = scanner_with_osc_collector();
+        let input = b"before\x1b]777;notify;deepterm://cli-agent;{}\x07after";
+        let (emitted, pendings) = run_scan_chunked(
+            &mut scanner,
+            &[
+                b"before\x1b]777;noti",
+                b"fy;deepterm://cli",
+                b"-agent;{}\x07after",
+            ],
+        );
+
+        assert!(
+            pendings[0].starts_with(b"\x1b]777;noti"),
+            "第一段读完后残尾应是从 OSC 起始符起的内容，实际 {:?}",
+            String::from_utf8_lossy(&pendings[0])
+        );
+        assert!(!pendings[1].is_empty(), "第二段仍未结束，残尾应继续增长");
+        assert!(
+            pendings[2].is_empty(),
+            "最后一段补齐后残尾必须清空，实际 {:?}",
+            String::from_utf8_lossy(&pendings[2])
+        );
+        assert_eq!(emitted, input, "拼接后字节应与一次性读到完全一致");
+        assert_eq!(
+            *collected.lock().unwrap(),
+            vec![b"777;notify;deepterm://cli-agent;{}".to_vec()],
+            "重组后的内容应与一次性读到时一致"
+        );
+    }
+
+    /// 残尾超限（无终止符的 `ESC ]`）必须放弃拼接、原样透传，不能无限占内存。
+    #[test]
+    fn oversized_osc_residue_is_flushed() {
+        let (mut scanner, _collected, _cursors) = scanner_with_osc_collector();
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', MAX_PENDING_OSC + 1));
+
+        let (emitted, pendings) = run_scan_chunked(&mut scanner, &[input.as_slice()]);
+
+        assert!(
+            pendings[0].is_empty(),
+            "超过上限的残尾不该被缓存（会无限增长）"
+        );
+        assert_eq!(emitted, input, "超限残尾应原样透传");
     }
 }

@@ -54,6 +54,12 @@ pub enum Event {
     /// 后台铃：终端 BEL / 通知到达且本视图未聚焦，
     /// 面板链路据此点亮 tab 的需关注红点。
     BellRangWhileUnfocused,
+    /// 前台 CLI agent 的身份或回合状态发生变化。
+    ///
+    /// 与 [`Terminal::Event::AgentChanged`] 一样有意不带载荷：订阅方通过
+    /// [`TerminalView::agent_tab_state`] 现场取「身份 + 状态」的快照，
+    /// 避免事件里带一份可能与终端实际状态脱节的副本。
+    AgentChanged,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -73,6 +79,7 @@ pub struct ImeState {
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::TermMode;
 
+use crate::agent::{AgentStatus, CLIAgent};
 use crate::assets::Icon;
 use crate::builtin_commands::{BuiltinCommandManager, resolve_command_line};
 use crate::components::input::{EditorInput, InputEvent, InputState};
@@ -340,6 +347,24 @@ struct ProcessCwdCache {
     refresh_in_flight: bool,
 }
 
+/// 本地前台 agent 的后台检测节流。
+///
+/// 与 [`ProcessCwdCache`] 的区别在于**不存结果**：检测结论直接写进
+/// `Terminal`（`apply_detected_agent`），那里才是 agent 身份与回合状态的
+/// 唯一真源，tab 图标走的 `agent_tab_state()` 也是从 `Terminal` 取。
+/// 这里只留节流所需的两项——存一份副本只会多一个可能与真源脱节的地方。
+///
+/// 之所以还需要这个 struct 而不是散落两个字段：TTL 与 in-flight 是同一件
+/// 事的两个面（「最近查过没有」/「正在查」），放一起不容易用错。
+#[derive(Default)]
+struct ForegroundAgentCache {
+    /// 最近一次检测时间。含「查不了」的结果——那也是一次有效的轮询，
+    /// 记下来才能避免同一秒内反复 spawn 后台任务。
+    checked_at: Option<Instant>,
+    /// 后台检测进行中（同时只允许一个）
+    refresh_in_flight: bool,
+}
+
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     terminal_subscription: Option<Subscription>,
@@ -405,6 +430,8 @@ pub struct TerminalView {
     cached_working_directory: Option<String>,
     /// 本地 shell 进程 cwd（后台线程刷新，UI 路径只读）
     process_cwd: ProcessCwdCache,
+    /// 本地前台 agent（后台线程检测，UI 路径只读）
+    foreground_agent: ForegroundAgentCache,
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
@@ -512,6 +539,45 @@ pub struct TerminalView {
     tab_label_debounce_task: Option<Task<()>>,
     /// Tab 标签是否需要在防抖触发后重新计算
     tab_label_pending: bool,
+    // ── Hook 安装引导 ──────────────────────────────────────────────────────
+    /// 本次进程里**已经问过**的 agent 集合。
+    ///
+    /// **按 agent 记**（用户明确要求），不能用一个 bool 了事：Claude 与 CodeBuddy
+    /// 各自弹不同的窗，共用一个标志会让「先跑了 CodeBuddy」把 Claude 的安装引导
+    /// 永久吞掉——用户明明还没被问过要不要装 Claude 的 hook。
+    ///
+    /// **只存内存、不落盘**（用户明确要求）：用户选「暂不」后本次进程不再骚扰，
+    /// 但关掉 deepterm 重开就会再问一次。这是刻意的——安装状态可能在两次运行
+    /// 之间被用户自己改掉（换机器、重装 agent），落盘记「已问过」会让引导
+    /// 永久失效且用户无从恢复。
+    hook_prompt_answered: std::collections::HashSet<CLIAgent>,
+    /// 该 agent 的 hook 是否已装（最近一次读取配置文件得出的结论）。
+    ///
+    /// `None` = 还没查过。查过之后缓存，避免每次 `AgentChanged` 都读盘——
+    /// 那是热路径（agent 干活时每个工具调用都会发事件）。
+    /// 「该 agent 的上报机制装了没」的缓存，**按 agent 分别记**。
+    ///
+    /// 三个 agent 装的是三个不同文件，共用一个布尔会把它们互相污染。
+    /// `None`（key 不存在）＝还没查过。
+    hook_installed_checked: std::collections::HashMap<CLIAgent, bool>,
+    /// 正在后台查「装了没」的 agent。
+    ///
+    /// 判定要读盘（远程还要开 SFTP 会话），所以走后台线程；这个集合防止同一
+    /// agent 被重复派活——`AgentChanged` 在 agent 干活时每个工具调用都发。
+    hook_install_checks_in_flight: std::collections::HashSet<CLIAgent>,
+    /// 本视图所在窗口的句柄，「装 hook」提示要用**系统原生弹窗**（NSAlert）。
+    ///
+    /// GPUI 的 `Window::prompt` 必须拿得到 `&mut Window`，而本视图的事件订阅
+    /// 回调（`AgentChanged`）里没有 window，只有 render 时才有——所以 render
+    /// 时把句柄记下来。`None` = 还没渲染过；此时跳过提示即可，下一次
+    /// `AgentChanged` 会重试（「已问过」在真正弹窗时才记，见
+    /// `maybe_prompt_hook_install`）。
+    window_handle: Option<gpui::AnyWindowHandle>,
+    /// CodeBuddy 的「暂不支持」提示框。
+    ///
+    /// 安装提示已改成系统弹窗（不需要实体），这个保留应用内弹窗：它没有
+    /// 安装按钮，只是长解释文案，系统弹窗放不下也不合适。
+    hook_unsupported_modal: Entity<crate::components::modal::ModalState>,
 }
 
 /// SSH 连接状态检查结果
@@ -543,6 +609,63 @@ impl SshCheckOutcome {
 /// 当光标在窗口底部、上方有空间时用 `Bottom`，浮窗底端贴近光标，列表从下往上增长。
 /// 这两种锚点都保证「靠近光标的一边」始终贴合光标行。
 use crate::builtin_commands::OverlayAnchor;
+
+/// 读「该 agent 的上报机制是否已装」。**不碰 `TerminalView`**，因此可以整个
+/// 丢到后台线程执行。
+///
+/// 为什么必须是自由函数：远程判定要开 SFTP 会话（`with_cached_session` 在缓存
+/// 未命中时同步连接），在 UI 线程上跑会把窗口卡住。触发源是 `AgentChanged`，
+/// agent 干活时每个工具调用都会发——虽然缓存把重复读挡掉了，但**首次**那次
+/// 仍然会卡住首帧交互。
+///
+/// 本地路径一律经 [`hooks::local_bridge_path`] 换算，**不**自己拼
+/// `$HOME/<rel>`：那个函数统一处理 `CLAUDE_CONFIG_DIR` / `XDG_CONFIG_HOME`
+/// 等覆盖。曾经 Claude 走的是另一条分支（直接读 `SETTINGS_REL_PATH`），
+/// 于是 `local_bridge_path` 里的 Claude 分支成了死代码——设了
+/// `CLAUDE_CONFIG_DIR` 的用户会被反复引导安装，因为读的地方根本找不到
+/// 已装好的配置。
+///
+/// 读不到一律按「未安装」处理：文件不存在是首次使用的正常状态，应当引导
+/// 安装，而不是弹一个错误。
+fn read_installed_state_offline(
+    agent: CLIAgent,
+    ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+    home: Option<&std::path::Path>,
+) -> bool {
+    use crate::agent::hooks;
+
+    // Claude 没有 `HookInstallPlan`（它的 settings.json 要**合并**而非覆盖，
+    // 且另有一个 hook 脚本，见 `hook_install_plan` 的文档），所以这里单独
+    // 取相对路径；其余 agent 的相对路径由计划给出。
+    let plan = hooks::hook_install_plan(agent);
+    let rel = match &plan {
+        Some(plan) => plan.rel_path,
+        None if agent == CLIAgent::Claude => hooks::SETTINGS_REL_PATH,
+        None => return false,
+    };
+
+    let bytes = match (ssh_config, home) {
+        // 远端：读远端同一路径。本机的环境变量不能拿去解释远端路径
+        // （见 `local_bridge_path` 的文档）。
+        (Some(config), _) => {
+            let cmd = format!("cat \"$HOME/{rel}\" 2>/dev/null || true");
+            crate::ssh::sftp_fs::with_cached_session(config, |session| {
+                session.execute_command_bytes(&cmd, 5)
+            })
+            .map(|out| out.stdout)
+            .unwrap_or_default()
+        }
+        (None, Some(home)) => {
+            std::fs::read(hooks::local_bridge_path(agent, home, rel)).unwrap_or_default()
+        }
+        (None, None) => return false,
+    };
+
+    match &plan {
+        Some(plan) => hooks::bridge_installed(agent, plan, &bytes),
+        None => hooks::has_deepterm_hook(&bytes),
+    }
+}
 
 impl TerminalView {
     /// 处理 SSH 连接异常断开事件
@@ -749,6 +872,13 @@ impl TerminalView {
                 TerminalEvent::BlinkChanged(blinking) => {
                     this.on_blink_changed(*blinking, cx);
                 }
+                // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
+                // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
+                TerminalEvent::AgentChanged => {
+                    cx.emit(Event::AgentChanged);
+                    cx.notify();
+                    this.maybe_prompt_hook_install(cx);
+                }
             },
         );
 
@@ -786,6 +916,7 @@ impl TerminalView {
             remote_os: None,
             cached_working_directory: None,
             process_cwd: ProcessCwdCache::default(),
+            foreground_agent: ForegroundAgentCache::default(),
             pending_remote_cwd_restore: None,
             hovered_link: None,
             search: TerminalSearchState::default(),
@@ -825,6 +956,11 @@ impl TerminalView {
             last_tab_label: None,
             tab_label_debounce_task: None,
             tab_label_pending: false,
+            hook_prompt_answered: std::collections::HashSet::new(),
+            hook_installed_checked: std::collections::HashMap::new(),
+            hook_install_checks_in_flight: std::collections::HashSet::new(),
+            window_handle: None,
+            hook_unsupported_modal: crate::components::modal::ModalState::entity(cx),
         }
     }
 
@@ -984,6 +1120,13 @@ impl TerminalView {
                     TerminalEvent::BlinkChanged(blinking) => {
                         this.on_blink_changed(*blinking, cx);
                     }
+                    // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
+                    // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
+                    TerminalEvent::AgentChanged => {
+                        cx.emit(Event::AgentChanged);
+                        cx.notify();
+                        this.maybe_prompt_hook_install(cx);
+                    }
                 },
             );
 
@@ -1021,6 +1164,7 @@ impl TerminalView {
                 remote_os: None,
                 cached_working_directory: None,
                 process_cwd: ProcessCwdCache::default(),
+                foreground_agent: ForegroundAgentCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
                 search: TerminalSearchState::default(),
@@ -1060,6 +1204,11 @@ impl TerminalView {
                 last_tab_label: None,
                 tab_label_debounce_task: None,
                 tab_label_pending: false,
+                hook_prompt_answered: std::collections::HashSet::new(),
+                hook_installed_checked: std::collections::HashMap::new(),
+            hook_install_checks_in_flight: std::collections::HashSet::new(),
+                window_handle: None,
+                hook_unsupported_modal: crate::components::modal::ModalState::entity(cx),
             };
 
             // 订阅 SshConnectView 的重新连接事件并存储订阅
@@ -1146,6 +1295,13 @@ impl TerminalView {
                 }
                 TerminalEvent::BlinkChanged(blinking) => {
                     this.on_blink_changed(*blinking, cx);
+                }
+                // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
+                // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
+                TerminalEvent::AgentChanged => {
+                    cx.emit(Event::AgentChanged);
+                    cx.notify();
+                    this.maybe_prompt_hook_install(cx);
                 }
             },
         )
@@ -1298,6 +1454,71 @@ impl TerminalView {
         .detach();
         self.process_cwd.cwd.clone()
     }
+
+    /// 按需后台检测本地前台 agent，结果写回 `Terminal::apply_detected_agent`。
+    ///
+    /// 与 [`Self::local_process_cwd`] 同构：TTL + in-flight 防抖，过期期间不重复
+    /// 派活。检测本身在后台线程跑（macOS 走 `sysctl`、Linux 读 `/proc`），
+    /// `tcgetpgrp` 拿到的前台进程组在检测期间可能已经消失——那类情况返回
+    /// [`LocalAgentProbe::Unavailable`]，**不**当成「agent 退出了」。
+    ///
+    /// 写回走 `apply_detected_agent` 而不是 `set_foreground_agent`：后者会把
+    /// 「查不了」当成「确认没有 agent」，进而清掉 hook 建立的会话状态，
+    /// tab 上的图标和状态点会跟着闪。
+    ///
+    /// 远程终端直接返回：远程的 `1337;Proc=` 已在 `Terminal` 侧同步检测过了。
+    ///
+    /// 仅 unix：本地检测要 `tcgetpgrp`（无 fd 的平台上不存在这个概念）与
+    /// `/proc`（Linux）/ `KERN_PROCARGS2`（macOS），`Terminal::detect_agent_for_local`
+    /// 本身就是 `#[cfg(unix)]`。非 unix 保留空实现而不是删掉调用点——调用点在
+    /// `do_check_tab_label_changed` 里，与平台无关。
+    #[cfg(unix)]
+    fn refresh_foreground_agent(&mut self, cx: &mut Context<Self>) {
+        const TTL: Duration = Duration::from_secs(2);
+
+        if self.is_remote(cx) {
+            return;
+        }
+
+        let cache_fresh = self
+            .foreground_agent
+            .checked_at
+            .is_some_and(|at| at.elapsed() < TTL);
+        if cache_fresh || self.foreground_agent.refresh_in_flight {
+            return;
+        }
+
+        let (fd, shell_pgid) = {
+            let term = self.terminal.read(cx);
+            (term.pty_master_fd(), term.shell_process_group_id())
+        };
+
+        self.foreground_agent.refresh_in_flight = true;
+        let terminal = self.terminal.clone();
+        cx.spawn(async move |this, cx| {
+            let probe = cx
+                .background_executor()
+                .spawn(async move { Terminal::detect_agent_for_local(fd, shell_pgid) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.foreground_agent = ForegroundAgentCache {
+                    checked_at: Some(Instant::now()),
+                    refresh_in_flight: false,
+                };
+                // 结论不变时 `apply_detected_agent` 自己不发事件，
+                // 所以这里无需再比一次新旧——重复调用是廉价的。
+                terminal.update(cx, |term, cx| term.apply_detected_agent(probe, cx));
+            });
+        })
+        .detach();
+    }
+
+    /// 非 unix：本地 agent 检测不可用（见 unix 版文档）。
+    ///
+    /// 远程 SSH tab 仍能通过 `1337;Proc=` 得到 agent 身份——那条路径在
+    /// `Terminal::try_handle_osc_sequence` 里，与平台无关。
+    #[cfg(not(unix))]
+    fn refresh_foreground_agent(&mut self, _cx: &mut Context<Self>) {}
 
     fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
         self.cached_working_directory
@@ -1730,6 +1951,493 @@ impl TerminalView {
         }
     }
 
+    /// Tab 图标/状态点所需的 agent 快照：`(身份, 回合状态)`。
+    ///
+    /// 两者在同一个 `terminal.read` 里取出，保证不会读到「新身份配旧状态」的
+    /// 撕裂帧——`AgentChanged` 的订阅方紧接着就要拿它去改 tab。
+    ///
+    /// 没有 agent 时身份为 `None`，状态回落 `AgentStatus::default()`（`Idle`）：
+    /// 此时调用方应当忽略状态，只用 `None` 去把 tab 图标换回 OS 图标。
+    pub fn agent_tab_state(&self, cx: &App) -> (Option<CLIAgent>, AgentStatus) {
+        let term = self.terminal.read(cx);
+        let agent = term.foreground_agent();
+        let status = term
+            .agent_session()
+            .map(|session| session.status)
+            .unwrap_or_default();
+        (agent, status)
+    }
+
+    // ── Hook 安装引导 ──────────────────────────────────────────────────────
+
+    /// 检测到 agent 之后，按需弹出「要不要装 hook」的提示框。
+    ///
+    /// # 为什么挂在这里而不是 `set_foreground_agent`
+    ///
+    /// `refresh_foreground_agent` 对**远程早退**（见其文档），所以只挂它会让
+    /// SSH tab 永远不弹。而 `set_foreground_agent`（terminal.rs）是本地/远程
+    /// 两条管线的唯一交汇点，但它属于 `Terminal`——`Terminal` 不该知道
+    /// 「弹窗」与「询问历史」的存在。`AgentChanged` 事件已经把两者解耦好了：
+    /// 无论哪条管线写入身份，都会经订阅走到这里。三处订阅都必须调用本方法，
+    /// 漏掉任何一处，对应构造路径下就不弹。
+    ///
+    /// # 为什么读取「是否已装」要缓存
+    ///
+    /// `AgentChanged` 在 agent 干活时**每个工具调用**都会发一次，而判断是否已装
+    /// 需要读配置文件（远程还要开 SFTP 会话）。不缓存会让热路径上反复读盘。
+    /// 缓存的生命周期是「本视图」：用户在弹窗里点安装后会**立即清掉**缓存并
+    /// 重新判定，所以不存在「装完还在弹」的问题。
+    fn maybe_prompt_hook_install(&mut self, cx: &mut Context<Self>) {
+        let (agent, _) = self.agent_tab_state(cx);
+        let Some(agent) = agent else {
+            return;
+        };
+
+        // CodeBuddy 走纯解释弹窗：两个机制它都不支持（见 `agent::hooks` 的
+        // 模块文档），写配置也不会有状态点。给它弹安装窗是在骗用户。
+        if agent == CLIAgent::CodeBuddy {
+            if self.hook_prompt_answered.insert(agent) {
+                self.hook_unsupported_modal
+                    .update(cx, |state, cx| state.open(cx));
+            }
+            return;
+        }
+
+        // 其余 agent 静默：没有可装的机制，弹窗也无从下手。
+        // 这张名单由 `INSTALLABLE_AGENTS` 说了算，不要在这里另写一份。
+        if !crate::agent::hooks::INSTALLABLE_AGENTS.contains(&agent) {
+            return;
+        }
+
+        // 已经问过：不再读配置、也不弹（本次进程内只问一次）。
+        if self.hook_prompt_answered.contains(&agent) {
+            return;
+        }
+
+        // 已查过：直接按结论决定弹不弹。
+        if let Some(&installed) = self.hook_installed_checked.get(&agent) {
+            self.prompt_hook_install_if_needed(agent, installed, cx);
+            return;
+        }
+
+        // 还没查过：**异步**查。
+        //
+        // 远程判定要开 SFTP 会话（`with_cached_session` 在缓存未命中时同步
+        // 连接），跑在 UI 线程上会把整个窗口卡住——而这条路径的触发源是
+        // `AgentChanged`，agent 干活时每个工具调用都会发。
+        if !self.hook_install_checks_in_flight.insert(agent) {
+            return; // 已经有一发在飞，别重复派活
+        }
+
+        let config = self.ssh_config.clone();
+        let home = dirs::home_dir();
+        cx.spawn(async move |this, cx| {
+            let installed = cx
+                .background_executor()
+                .spawn(async move { read_installed_state_offline(agent, config.as_ref(), home.as_deref()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.hook_install_checks_in_flight.remove(&agent);
+                this.hook_installed_checked.insert(agent, installed);
+                this.prompt_hook_install_if_needed(agent, installed, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 查完了：该弹就弹。`installed == true` 或已问过时什么都不做。
+    fn prompt_hook_install_if_needed(
+        &mut self,
+        agent: CLIAgent,
+        installed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::agent::hooks::should_prompt_hook_install(
+            Some(agent),
+            self.hook_prompt_answered.contains(&agent),
+            installed,
+        ) {
+            return;
+        }
+
+        // 系统弹窗必须拿得到窗口。`AgentChanged` 可能赶在首帧 render 之前到达，
+        // 此时先跳过：「已问过」还没记，下一次事件（每个工具调用都会发）会重试。
+        let Some(handle) = self.window_handle else { return; };
+        // 先记「问过」再弹：系统弹窗没有 on_close 回调可记，且用户无论怎么关
+        // 都不应在同一会话里被反复打扰。
+        self.hook_prompt_answered.insert(agent);
+
+        // 精简文案：一句话说清「装了能得到什么」，必要的后续步骤各一行。
+        // 不再列文件清单——那是实现细节，用户关心的是效果。
+        let Some(copy) = crate::agent::hooks::hook_install_copy(agent) else {
+            return;
+        };
+        let mut detail = copy.blurb;
+        if let Some(after) = copy.after_install {
+            detail.push('\n');
+            detail.push_str(&after);
+        }
+
+        let clicked = handle.update(cx, |_, window, cx| {
+            window.prompt(
+                gpui::PromptLevel::Info,
+                &copy.title,
+                Some(&detail),
+                &["安装", "暂不"],
+                cx,
+            )
+        });
+        // 窗口可能已在关闭中（更新失败），那就不弹了。
+        let Some(clicked) = clicked.ok() else { return };
+        cx.spawn(async move |this, cx| {
+            // macOS 上 Esc/关闭对应直接丢弃应答，两者都视为「暂不」。
+            if clicked.await.ok() == Some(0) {
+                // 装的是**本次弹窗对应的那个 agent**：弹窗是异步应答的，
+                // 期间前台 agent 可能已经换了，不能等到这里再问一遍
+                // `agent_tab_state`（那会装错人）。
+                this.update(cx, |this, cx| this.install_hook_for(agent, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// 用户点了「安装」：写 hook 脚本 + 合并进 agent 的配置文件。
+    ///
+    /// # 为什么是「写配置 + 明确告知需确认」而不是「装完就完事」
+    ///
+    /// CodeBuddy 与 Claude Code 都会在启动时**快照** hooks 配置，外部改动需要
+    /// 用户在其面板里确认后才生效（CodeBuddy 官方文档：
+    /// 「直接编辑设置文件中的 hooks 不会立即生效……需要在 `/hooks` 菜单中
+    /// 审查才能应用更改」）。所以装完必须**明确告诉用户去确认**，否则用户会
+    /// 以为没装上。
+    ///
+    /// # 两条路径
+    ///
+    /// - 本地：写 `~/.deepterm/hooks/claude-hook.sh`，再把 `~/.claude/settings.json`
+    ///   原子替换（tmp + rename）。
+    /// - 远程：同内容经 `cat > file` 写到远端家目录，权限用 `chmod`。
+    ///
+    /// **合并而非覆盖**：`plan_install` 保证了这一点（见其文档）——本机
+    /// `~/.claude/settings.json` 里就有 Otty 装的 hook，覆盖会毁掉别人的集成。
+    ///
+    /// `agent` 由调用方给出（弹窗的应答是异步的，装时必须用**弹窗当时**的
+    /// 那个 agent，不能在这里重新读前台——期间前台可能已经换了，那会装错人）。
+    fn install_hook_for(&mut self, agent: CLIAgent, cx: &mut Context<Self>) {
+        let result = if let Some(config) = self.ssh_config.clone() {
+            self.install_bridge_for_agent(agent, Some(&config))
+        } else {
+            self.install_bridge_for_agent(agent, None)
+        };
+
+        match result {
+            Ok(()) => {
+                // 装完清缓存：否则 `hook_installed_checked` 会一直说「没装」，
+                // 用户下次开终端又被问一遍。
+                self.hook_installed_checked.clear();
+                let message = match (agent, self.ssh_config.is_some()) {
+                    // Claude 需要用户在 /hooks 里确认一次才生效（见上面文档）。
+                    (CLIAgent::Claude, true) => {
+                        "已在远程主机写入 hook 配置。请在 Claude Code 中运行 /hooks 确认后生效"
+                            .to_string()
+                    }
+                    (CLIAgent::Claude, false) => {
+                        "已写入 hook 配置。请在 Claude Code 中运行 /hooks 确认后生效".to_string()
+                    }
+                    // opencode / pi 是插件，重启 agent 后自然加载，没有确认步骤。
+                    (other, true) => format!(
+                        "已在远程主机写入 {} 状态集成。重启 {} 后生效",
+                        other.display_name(),
+                        other.display_name()
+                    ),
+                    (other, false) => format!(
+                        "已写入 {} 状态集成。重启 {} 后生效",
+                        other.display_name(),
+                        other.display_name()
+                    ),
+                };
+                self.notify_hook_install(
+                    message,
+                    crate::components::notification::NotificationKind::Success,
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.notify_hook_install(
+                    format!("写入失败：{err}"),
+                    crate::components::notification::NotificationKind::Error,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// 按 agent 分派安装：Claude 走 settings.json 合并，其余走计划文件。
+    fn install_bridge_for_agent(
+        &self,
+        agent: CLIAgent,
+        remote: Option<&crate::ssh::SshConnectionConfig>,
+    ) -> Result<(), String> {
+        match agent {
+            CLIAgent::Claude => match remote {
+                Some(config) => self.install_claude_hook_remote(config),
+                None => self.install_claude_hook_local(),
+            },
+            other => {
+                let plan = crate::agent::hooks::hook_install_plan(other)
+                    .ok_or_else(|| format!("{} 暂无可安装的上报机制", other.display_name()))?;
+                self.write_plan_file(agent, &plan, remote)
+            }
+        }
+    }
+
+    /// 把一份 [`crate::agent::hooks::HookInstallPlan`] 写到本地或远端。
+    ///
+    /// 共享 JSON/TOML 只替换 deepterm handler，独占插件文件整体更新。
+    /// 两条路径都会先写**上报脚本**（[`hooks::agent_report_script`]）——
+    /// hook 命令全部指向它，它是纯 shell，远端因此不需要任何 deepterm
+    /// 二进制（旧的「远端必须有 deepterm」就绪探测已随此删除）。
+    fn write_plan_file(
+        &self,
+        agent: CLIAgent,
+        plan: &crate::agent::hooks::HookInstallPlan,
+        remote: Option<&crate::ssh::SshConnectionConfig>,
+    ) -> Result<(), String> {
+        let Some(config) = remote else {
+            // 本地：`atomic_write` 会自动建父目录。
+            let home = dirs::home_dir().ok_or_else(|| "找不到用户主目录".to_string())?;
+            self.write_reporter_script_local(&home)?;
+            let path = crate::agent::hooks::local_bridge_path(agent, &home, plan.rel_path);
+            let existing = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(format!("读取 {} 失败：{e}", path.display())),
+            };
+            let content = crate::agent::hooks::merge_bridge_config(agent, plan, &existing)?;
+            if agent == CLIAgent::Codex {
+                let env = crate::terminal::mappings::default_terminal_env();
+                let output = std::process::Command::new("codex")
+                    .args(["features", "enable", "hooks"]).envs(env).output()
+                    .map_err(|e| format!("无法启用 Codex hooks：{e}"))?;
+                if !output.status.success() {
+                    return Err(format!("启用 Codex hooks 失败：{}", String::from_utf8_lossy(&output.stderr)));
+                }
+            }
+            crate::utils::fs_atomic::atomic_write(&path, content.as_bytes())
+                .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+            return Ok(());
+        };
+
+        // 脚本和配置写完即完成安装：上报通路就是那个 shell 脚本本身，
+        // 不再依赖远端有任何二进制，也就没有「就绪探测」这一步了。
+        let parent = std::path::Path::new(plan.rel_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        crate::ssh::sftp_fs::with_cached_session(config, |session| {
+            self.write_reporter_script_remote(session)?;
+            let read = session.execute_command_bytes(&format!("if [ -e \"$HOME/{}\" ]; then cat \"$HOME/{}\"; fi", plan.rel_path, plan.rel_path), 10)?;
+            if !read.success() { anyhow::bail!("读取远端配置失败：{}", read.stderr); }
+            let content = crate::agent::hooks::merge_bridge_config(agent, plan, &read.stdout).map_err(anyhow::Error::msg)?;
+            if agent == CLIAgent::Codex {
+                let enabled = session.execute_command_bytes("codex features enable hooks", 15)?;
+                if !enabled.success() { anyhow::bail!("启用远端 Codex hooks 失败：{}", enabled.stderr); }
+            }
+            let write = format!(
+                "mkdir -p \"$HOME/{parent}\" && printf %s {} > \"$HOME/{}.deepterm-tmp\" && mv \"$HOME/{}.deepterm-tmp\" \"$HOME/{}\"",
+                crate::utils::shell::shell_quote_single(&content), plan.rel_path, plan.rel_path, plan.rel_path
+            );
+            let written = session.execute_command_bytes(&write, 15)?;
+            if !written.success() { anyhow::bail!("远端写入失败：{}", written.stderr); }
+            Ok(())
+        })
+        .map_err(|e| format!("远程写入失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 把上报脚本写到本地 `$HOME` 下。
+    ///
+    /// 可执行位必须每次都设：`atomic_write` 走「写临时文件 + rename」，
+    /// 每次装出来都是一个新文件，别指望上次的权限还在。
+    fn write_reporter_script_local(&self, home: &std::path::Path) -> Result<(), String> {
+        use crate::agent::hooks::{agent_report_script, REPORTER_REL_PATH};
+
+        let path = home.join(REPORTER_REL_PATH);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
+        }
+        crate::utils::fs_atomic::atomic_write(&path, agent_report_script().as_bytes())
+            .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("设置可执行权限失败：{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 把上报脚本写到远端 `$HOME` 下（chmod 755 在 mv 之前做，rename 保留权限）。
+    fn write_reporter_script_remote(
+        &self,
+        session: &mut crate::ssh::sftp_fs::BlockingSftpSession,
+    ) -> anyhow::Result<()> {
+        use crate::agent::hooks::{agent_report_script, HOOK_SCRIPT_REL_DIR, REPORTER_REL_PATH};
+        use crate::utils::shell::shell_quote_single;
+
+        let script = agent_report_script();
+        let write = format!(
+            "mkdir -p \"$HOME/{HOOK_SCRIPT_REL_DIR}\" && printf %s {} > \"$HOME/{REPORTER_REL_PATH}.deepterm-tmp\" \
+             && chmod 755 \"$HOME/{REPORTER_REL_PATH}.deepterm-tmp\" && mv \"$HOME/{REPORTER_REL_PATH}.deepterm-tmp\" \"$HOME/{REPORTER_REL_PATH}\"",
+            shell_quote_single(&script)
+        );
+        let written = session.execute_command_bytes(&write, 15)?;
+        if !written.success() {
+            anyhow::bail!("远端写入上报脚本失败：{}", written.stderr);
+        }
+        Ok(())
+    }
+
+    /// 本地安装。
+    fn install_claude_hook_local(&self) -> Result<(), String> {
+        use crate::agent::hooks;
+        use crate::utils::fs_atomic::atomic_write;
+
+        let home = dirs::home_dir().ok_or_else(|| "找不到用户主目录".to_string())?;
+
+        // 1. hook 脚本。权限 0755：Claude Code 会直接执行它。
+        let script_path = home
+            .join(hooks::HOOK_SCRIPT_REL_DIR)
+            .join(hooks::HOOK_SCRIPT_FILE_NAME);
+        if let Some(parent) = script_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
+        }
+        std::fs::write(&script_path, hooks::hook_script())
+            .map_err(|e| format!("写入 {} 失败：{e}", script_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("设置可执行权限失败：{e}"))?;
+        }
+
+        // 2. 合并进 settings.json。读不到就当作空 JSON——那正是首次安装。
+        //
+        // 路径必须经 `local_bridge_path` 换算，与「是否已装」的读取侧（
+        // `read_installed_state`）同源：否则设了 `CLAUDE_CONFIG_DIR` 的用户会
+        // 写进 `$HOME/.claude/`、读却看 `$CLAUDE_CONFIG_DIR`（或反之），
+        // 表现为「装完还在反复引导」。
+        let settings_path =
+            hooks::local_bridge_path(CLIAgent::Claude, &home, hooks::SETTINGS_REL_PATH);
+        let existing = std::fs::read(&settings_path).unwrap_or_else(|_| b"{}".to_vec());
+        let planned = hooks::plan_install(&existing).map_err(|e| match e {
+            hooks::HookPlanError::Unparsable => format!(
+                "{} 不是合法 JSON，为避免写坏你的配置已中止",
+                settings_path.display()
+            ),
+            hooks::HookPlanError::NotAnObject => format!(
+                "{} 的顶层或 hooks 字段不是对象，已中止",
+                settings_path.display()
+            ),
+        })?;
+        atomic_write(&settings_path, &planned)
+            .map_err(|e| format!("写入 {} 失败：{e}", settings_path.display()))?;
+        Ok(())
+    }
+    /// 远程安装：同内容写到远端家目录。
+    fn install_claude_hook_remote(&self, config: &crate::ssh::SshConnectionConfig) -> Result<(), String> {
+        use crate::agent::hooks;
+        use crate::utils::shell::shell_quote_single;
+
+        let script_rel = format!("{}/{}", hooks::HOOK_SCRIPT_REL_DIR, hooks::HOOK_SCRIPT_FILE_NAME);
+        let script = hooks::hook_script();
+        let settings_rel = hooks::SETTINGS_REL_PATH;
+
+        crate::ssh::sftp_fs::with_cached_session(config, |session| {
+            // 先确保目录存在（`~/.deepterm/hooks`；`~/.claude` 可能也没有）。
+            let mkdir = format!(
+                "mkdir -p \"$HOME/{}\" \"$HOME/{}\"",
+                hooks::HOOK_SCRIPT_REL_DIR,
+                ".claude"
+            );
+            session.execute_command_bytes(&mkdir, 10)?;
+
+            // 写脚本：整体做单引号转义，避免内容里的引号/反斜杠被 shell 解释。
+            let write_script = format!(
+                "printf %s {} > \"$HOME/{script_rel}\" && chmod 755 \"$HOME/{script_rel}\"",
+                shell_quote_single(&script)
+            );
+            session.execute_command_bytes(&write_script, 15)?;
+
+            // 读回远端现有配置（可能是空），在本地合并后再整体写回。
+            let read_settings = format!("cat \"$HOME/{settings_rel}\" 2>/dev/null || true");
+            let existing = session
+                .execute_command_bytes(&read_settings, 10)
+                .map(|out| out.stdout)
+                .unwrap_or_default();
+            let existing = if existing.iter().all(|b| b.is_ascii_whitespace()) {
+                b"{}".to_vec()
+            } else {
+                existing
+            };
+            let planned = hooks::plan_install(&existing)
+                .map_err(|e| anyhow::anyhow!("远端配置无法解析（{e:?}），已中止以免写坏"))?;
+
+            // 原子替换：先写 tmp 再 mv，避免中途失败把用户配置截断。
+            let planned_str = String::from_utf8(planned)
+                .map_err(|_| anyhow::anyhow!("合并结果不是合法 UTF-8"))?;
+            let write_settings = format!(
+                "printf %s {} > \"$HOME/{settings_rel}.tmp\" && mv \"$HOME/{settings_rel}.tmp\" \"$HOME/{settings_rel}\"",
+                shell_quote_single(&planned_str)
+            );
+            session.execute_command_bytes(&write_settings, 15)?;
+            Ok(())
+        })
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// 在终端上弹一条 Toast 反馈安装结果。
+    ///
+    /// 复用本视图已有的 toast（`toast_message` 是错误型的、`info_toast` 是信息型，
+    /// 见字段定义），而不是去够宿主窗口的 `show_notification`：`TerminalView`
+    /// 没有窗口引用，为这一条提示加一条 `Event` 转发链路得不偿失。
+    ///
+    /// 成功走 `info_toast`，失败走 `toast_message`——后者在渲染里是警示色，
+    /// 用户一眼能看出「配置没写成」这件事需要处理。
+    fn notify_hook_install(&mut self, message: String, kind: crate::components::notification::NotificationKind, cx: &mut Context<Self>) {
+        use crate::components::notification::NotificationKind;
+        match kind {
+            NotificationKind::Error => {
+                self.toast_message = Some(message);
+                self.toast_hide_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(6))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.toast_message = None;
+                        this.toast_hide_task = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+            _ => {
+                self.info_toast = Some(("Hook 安装".to_string(), message));
+                self.info_toast_hide_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(8))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.info_toast = None;
+                        this.info_toast_hide_task = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+        }
+        cx.notify();
+    }
+
     /// 检查 tab 标签是否发生变化，带防抖：首次立即计算，后续快速调用在间隔内只触发一次。
     fn check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
         if self.tab_label_debounce_task.is_none() {
@@ -1754,6 +2462,9 @@ impl TerminalView {
     fn do_check_tab_label_changed(&mut self, cx: &mut Context<Self>) {
         // 先后台刷新进程 cwd 缓存（防抖后低频），标签计算只读缓存
         self.local_process_cwd(cx);
+        // 同理刷新前台 agent（检测结果经 `apply_detected_agent` 落到 `Terminal`，
+        // 有变化时由 `Terminal::Event::AgentChanged` 一路发到 tab 图标/状态点）
+        self.refresh_foreground_agent(cx);
         let current = self.tab_label(cx);
         if self.last_tab_label.as_deref() != Some(&current) {
             self.last_tab_label = Some(current);
@@ -3910,6 +4621,9 @@ fn render_bell_flash(started: Instant, cx: &App) -> gpui::AnyElement {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 记下窗口句柄：系统弹窗（Window::prompt）只能在拿到 window 的地方发，
+        // 而装 hook 提示的触发点（AgentChanged 订阅）里没有 window。
+        self.window_handle = Some(window.window_handle());
         let terminal = self.terminal.clone();
         let focus_handle = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
@@ -4334,6 +5048,121 @@ impl Render for TerminalView {
                         this.child(div().absolute().inset_0().child(connect_view))
                     }),
             )
+            // Hook「暂不支持」弹窗。挂在终端根部的**兄弟节点**上（而不是嵌在
+            // 终端内容里），这样 `Modal` 的遮罩能盖住整个视图；否则它在
+            // 终端元素的层叠上下文里，遮罩范围会被终端内容裁掉。
+            // （装 hook 的提示已改为系统原生弹窗，不走这里。）
+            //
+            // 返回的是 `tuple` 而不是单个元素：GPUI 的 `Render` 要求单一类型，
+            // 用 `(a, b)` 表达「两个并列的兄弟」是既有惯例。
+            .when(
+                self.hook_unsupported_modal.read(cx).is_rendered(),
+                |this| this.child(self.render_hook_prompts(cx)),
+            )
+    }
+}
+
+impl TerminalView {
+    /// 「暂不支持」提示框的容器。
+    ///
+    /// 用 `relative` + `absolute inset_0` 的经典遮罩组合，与
+    /// `workspace::render_close_confirm_body` 的挂法一致：`Modal` 自己负责
+    /// 遮罩与居中，这里只提供一个铺满的定位容器。
+    fn render_hook_prompts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .when(self.hook_unsupported_modal.read(cx).is_rendered(), |this| {
+                let state = self.hook_unsupported_modal.read(cx);
+                let view = cx.entity().downgrade();
+                this.child(
+                    crate::components::modal::Modal::new("terminal-hook-unsupported")
+                        .closing(state.is_closing())
+                        .epoch(state.epoch())
+                        .width(px(440.0))
+                        .on_close(move |window, cx| {
+                            let _ = window;
+                            if let Some(view) = view.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.hook_unsupported_modal
+                                        .update(cx, |state, cx| state.close(cx));
+                                });
+                            }
+                        })
+                        .child(self.render_hook_unsupported_body(cx)),
+                )
+            })
+    }
+
+    /// CodeBuddy 的「暂不支持」提示框（**没有安装按钮**）。
+    ///
+    /// 刻意不提供安装：CodeBuddy 的 hook 无法发出 OSC 序列（见
+    /// `agent::hooks` 的模块文档），装上也不会有状态点。给一个装了没用的按钮
+    /// 比不给按钮更糟——用户会以为是自己配错了。
+    ///
+    /// 名字从 `display_name()` 取而不是写字面量：当前只有 CodeBuddy 走这条路，
+    /// 但文案里出现两处硬编码的 `CodeBuddy` 意味着将来若有第二个不可装的 agent，
+    /// 弹窗会指着它说 CodeBuddy。
+    fn render_hook_unsupported_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::components::button::{Button, Sizable, Size as ButtonSize};
+        let theme = cx.theme().ui;
+        let (agent, _) = self.agent_tab_state(cx);
+        let name = agent.unwrap_or(CLIAgent::CodeBuddy).display_name();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(16.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(format!("{name} 暂不支持状态指示")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .line_height(gpui::relative(1.5))
+                            .child(format!(
+                                "deepterm 可以读取 agent 上报的状态事件，但 {name} 的 \
+                                 hook 目前无法把这类事件发出来。"
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .line_height(gpui::relative(1.5))
+                            .child(format!(
+                                "这不是你的配置问题——装上 hook 也不会有状态点。\
+                                 标签上仍会显示 {name} 的图标，只是不会有工作状态点。"
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .justify_end()
+                    .child(
+                        Button::new("hook-unsupported-ok")
+                            .label("知道了")
+                            .rounded(px(10.0))
+                            .with_size(ButtonSize::Small)
+                            .px(px(14.0))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.hook_unsupported_modal
+                                    .update(cx, |state, cx| state.close(cx));
+                            })),
+                    ),
+            )
     }
 }
 
@@ -4427,4 +5256,371 @@ mod tests {
             "内容漂移后命中必须落到新的 grid 行，否则高亮会画错行"
         );
     }
+
+    /// agent 状态要从 `Terminal` 一路转发到 `TerminalView::Event`。
+    ///
+    /// 这条链路曾经断在中间一跳：`Terminal::Event::AgentChanged` 有，
+    /// `TerminalView::Event::AgentChanged` 没有，三处订阅只 `cx.notify()` 就完事。
+    /// 编译通过、测试全绿，但 tab 上什么都看不到——因为**没人把事件转发上去**。
+    /// 这个测试就是那个断点的回归护栏：它断言的是「转发发生了」，
+    /// 而不只是「Terminal 的状态变了」。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn agent_changed_is_forwarded_out_of_the_view(cx: &mut TestAppContext) {
+        use crate::agent::{AGENT_EVENT_SENTINEL, AgentStatus, CLIAgent};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 200);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        // 记录 TerminalView 向上发出的事件。
+        //
+        // 注意断言必须放在 `update` 闭包**外面**：gpui 的 `cx.emit` 订阅回调
+        // 要等发出方那个 update 闭包返回之后才跑（见 feedback_gpui_emit_timing）。
+        let forwarded: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = forwarded.clone();
+        cx.update(|_window, cx| {
+            cx.subscribe(&view, move |_view, event: &Event, _cx| {
+                sink.borrow_mut().push(match event {
+                    Event::AgentChanged => "agent",
+                    _ => "other",
+                });
+            })
+            .detach();
+        });
+
+        // 1) 身份先落地：直接写 Terminal 的前台 agent（本地检测走 sysctl，
+        //    测试里没有真实 pty，所以从这一层注入）。
+        view.downgrade()
+            .update_in(cx, |view, _window, cx| {
+                view.terminal.update(cx, |term, cx| {
+                    term.set_foreground_agent(Some(CLIAgent::CodeBuddy), cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            forwarded.borrow().as_slice(),
+            ["agent"],
+            "身份变化必须转发成 TerminalView::Event::AgentChanged"
+        );
+
+        // 2) 再验证状态也走同一条路：经 OSC 777 哨兵通道灌一个回合事件。
+        forwarded.borrow_mut().clear();
+        // 线上形状是 `777;notify;<sentinel>;<json>`——`parse_agent_event` 硬剥这两段
+        // 前缀，少一段就退化成 `None`、被当成普通桌面通知。
+        // 本地路径用 `LocalNotice::Osc`（读线程旁路通知的 content，不含 `ESC ]` / ST）。
+        let payload = format!(
+            "777;notify;{AGENT_EVENT_SENTINEL};{}",
+            r#"{"v":1,"event":"prompt-submit"}"#
+        );
+        view.downgrade()
+            .update_in(cx, |view, _window, cx| {
+                view.terminal.update(cx, |term, cx| {
+                    term.handle_local_notice(
+                        crate::terminal::local_pty::LocalNotice::Osc {
+                            content: payload.clone().into_bytes(),
+                            cursor: (0, 0),
+                        },
+                        cx,
+                    )
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // 状态快照必须已经是 Working，且事件已转发。
+        let (agent, status) = view.read_with(cx, |view, cx| view.agent_tab_state(cx));
+        assert_eq!(agent, Some(CLIAgent::CodeBuddy), "身份应保持 CodeBuddy");
+        assert_eq!(status, AgentStatus::Working, "prompt-submit 应进 Working");
+        assert_eq!(
+            forwarded.borrow().as_slice(),
+            ["agent"],
+            "状态变化也必须转发出去，否则 tab 上的状态点不会动"
+        );
+    }
+
+    /// 检测**查不了**时不能清掉 hook 上报的会话状态。
+    ///
+    /// 检测是每 2 秒一次的轮询，它会因为「没有 pty fd」这类原因查不出东西。
+    /// 早期实现把所有 `None` 都当成「agent 退出了」，于是 agent 正在干活、
+    /// 状态点刚变成 Working，一次检测抖动就让状态点凭空消失，而且**不会
+    /// 自己回来**——hook 要等下一个回合事件才再报一次。
+    ///
+    /// 这个测试锁住「查不了 ≠ 没有 agent」这条不变量。
+    /// 其对立面见 [`conclusive_no_agent_probe_clears_the_icon`]。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn failed_local_detection_does_not_clear_hook_reported_session(cx: &mut TestAppContext) {
+        use crate::agent::{AGENT_EVENT_SENTINEL, AgentStatus};
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let view = cx.new(|cx| {
+            let terminal = Terminal::new_headless(cx, 200);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        // hook 报了一个回合事件：agent 自己在事件里声明了身份。
+        //
+        // 走本地路径：读线程旁路通知 OSC，经 `LocalNotice::Osc` 交给 UI 线程
+        // （`handle_local_osc` → `try_handle_osc_sequence`），这是本地终端
+        // 真实经过的一跳；`handle_remote_data` 是 SSH 那条管线，在这里会绕过
+        // 读线程的摘除逻辑。
+        let payload = format!(
+            "777;notify;{AGENT_EVENT_SENTINEL};{}",
+            r#"{"v":1,"event":"prompt-submit","agent":"claude"}"#
+        );
+        view.update(cx, |view, cx| {
+            view.terminal.update(cx, |term, cx| {
+                term.handle_local_notice(
+                    crate::terminal::local_pty::LocalNotice::Osc {
+                        content: payload.clone().into_bytes(),
+                        cursor: (0, 0),
+                    },
+                    cx,
+                )
+            });
+        });
+        cx.run_until_parked();
+
+        let (agent, status) = view.read_with(cx, |view, cx| view.agent_tab_state(cx));
+        assert_eq!(agent, Some(crate::agent::CLIAgent::Claude));
+        assert_eq!(status, AgentStatus::Working, "前提：hook 已把状态推到 Working");
+
+        // 模拟一次「检测什么都不知道」：headless 没有 pty fd，
+        // 检测会返回 `Unavailable`（缺 fd 属于「查不了」，不是「没有 agent」）。
+        assert_eq!(
+            Terminal::detect_agent_for_local(None, None),
+            crate::terminal::terminal::LocalAgentProbe::Unavailable,
+            "前提：缺 fd 必须是「查不了」，不能是有效结论"
+        );
+        view.update(cx, |view, cx| {
+            view.refresh_foreground_agent(cx);
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        // 「查不了」不该被当成「agent 退出了」。
+        let (agent_after, status_after) = view.read_with(cx, |view, cx| view.agent_tab_state(cx));
+        assert_eq!(
+            status_after,
+            AgentStatus::Working,
+            "检测查不了时状态点不能消失——那不是「agent 退出」的证据"
+        );
+        assert_eq!(
+            agent_after,
+            Some(crate::agent::CLIAgent::Claude),
+            "hook 声明的身份也不该被检测失败抹掉"
+        );
+    }
+
+    /// 但**有效结论**「前台不是 agent」必须让图标落回去。
+    ///
+    /// 与上一条测试是一对：`Unavailable` 保持现状，`NoAgent` 清空。
+    /// 少了这条，修完上一条之后很容易把 `NoAgent` 也一起忽略掉，
+    /// 结果是 agent 退出后图标永远挂着。
+    ///
+    /// 仅 unix：`LocalAgentProbe` / `apply_detected_agent` 都是 `#[cfg(unix)]`
+    /// （本地检测要 `tcgetpgrp` 与 `/proc` / `KERN_PROCARGS2`）。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn conclusive_no_agent_probe_clears_the_icon(cx: &mut TestAppContext) {
+        use crate::agent::CLIAgent;
+        use crate::terminal::terminal::LocalAgentProbe;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let view = cx.new(|cx| {
+            let terminal = Terminal::new_headless(cx, 200);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        view.update(cx, |view, cx| {
+            view.terminal
+                .update(cx, |term, cx| term.set_foreground_agent(Some(CLIAgent::CodeBuddy), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.agent_tab_state(cx)).0,
+            Some(CLIAgent::CodeBuddy),
+            "前提：身份已建立"
+        );
+
+        // 拿到了 argv 但没有一个 token 命中：这是**结论**。
+        view.update(cx, |view, cx| {
+            view.terminal
+                .update(cx, |term, cx| term.apply_detected_agent(LocalAgentProbe::NoAgent, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.agent_tab_state(cx)).0,
+            None,
+            "有效结论「前台不是 agent」必须清掉图标，否则 agent 退出后图标永远挂着"
+        );
+    }
+
+    // ── Hook 安装引导 ──────────────────────────────────────────────────────
+
+    /// 每个 agent **各记各的**「已问过」。
+    ///
+    /// 这条守的是一个真实的设计缺陷：最初两种提示共用一个 `bool`，于是
+    /// 「先跑了 CodeBuddy」会把 Claude 的安装引导永久吞掉——用户明明还没被问过
+    /// 要不要给 Claude 装 hook。用 `HashSet<CLIAgent>` 之后两者互不影响。
+    ///
+    /// 用纯数据结构直接验证（不碰弹窗实体）：这里要锁的是**判定规则**，
+    /// 弹窗能否渲染是 GPUI 的事。
+    #[test]
+    fn hook_prompt_is_tracked_per_agent() {
+        use crate::agent::CLIAgent;
+        use crate::agent::hooks::should_prompt_hook_install;
+
+        let mut answered = std::collections::HashSet::new();
+
+        // 前提：还没问过、也没装 → Claude 该弹。
+        assert!(should_prompt_hook_install(
+            Some(CLIAgent::Claude),
+            answered.contains(&CLIAgent::Claude),
+            false
+        ));
+
+        // 用户先跑了 CodeBuddy：只该记下 CodeBuddy。
+        answered.insert(CLIAgent::CodeBuddy);
+
+        assert!(
+            should_prompt_hook_install(
+                Some(CLIAgent::Claude),
+                answered.contains(&CLIAgent::Claude),
+                false
+            ),
+            "记下 CodeBuddy 不该影响 Claude 的引导——两者是独立的"
+        );
+
+        // 用户又对 Claude 选了「暂不」：这才轮到 Claude 被抑制。
+        answered.insert(CLIAgent::Claude);
+        assert!(!should_prompt_hook_install(
+            Some(CLIAgent::Claude),
+            answered.contains(&CLIAgent::Claude),
+            false
+        ));
+    }
+
+    /// 「是否已装」的读取必须走 `local_bridge_path` 换算后的路径。
+    ///
+    /// 这是「装完还在反复引导」那类 bug 的护栏：读侧与写侧（`install_claude_hook_local`）
+    /// 必须解析到**同一个文件**。曾经读侧硬拼 `$HOME/.claude/settings.json`，
+    /// 而写侧尊重 `CLAUDE_CONFIG_DIR`——两边一分叉，配置写进去了却读不到，
+    /// 用户被无限引导。
+    ///
+    /// 断言用的是「经 `local_bridge_path` 算出的路径」（而不是硬编码的
+    /// `$HOME/.claude/...`），所以设不设 `CLAUDE_CONFIG_DIR` 都成立，
+    /// 且恰好锁住了「读侧确实调用了那个函数」这件事。
+    #[test]
+    fn installed_state_reads_from_the_same_path_the_installer_writes() {
+        use crate::agent::hooks;
+
+        let home = std::env::temp_dir().join(format!(
+            "deepterm-hook-path-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let path = hooks::local_bridge_path(CLIAgent::Claude, &home, hooks::SETTINGS_REL_PATH);
+
+        // 前提：文件还不存在 → 判为「未装」（首次使用的正常状态）。
+        assert!(
+            !read_installed_state_offline(CLIAgent::Claude, None, Some(&home)),
+            "配置文件不存在时应判为未安装"
+        );
+
+        // 写入一份**真实**的安装结果（`plan_install` 生成的内容），
+        // 位置就是 `local_bridge_path` 给出的那个。
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, hooks::plan_install(b"{}").unwrap()).unwrap();
+
+        assert!(
+            read_installed_state_offline(CLIAgent::Claude, None, Some(&home)),
+            "写入 {} 后必须判为已安装；判不出来说明读侧没有走 local_bridge_path",
+            path.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 「已装」判定必须**按 agent 分开**。
+    ///
+    /// 三个 agent 装的是三个不同文件。共用一个布尔会让「Claude 装了」把
+    /// opencode 也判成已装，于是 opencode 永远不弹安装引导——用户看到的现象
+    /// 就是「跑 opencode 什么都不提示」。
+    #[test]
+    fn installed_state_is_per_agent() {
+        use crate::agent::hooks;
+
+        let home = std::env::temp_dir().join(format!(
+            "deepterm-hook-peragent-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // 只给 Claude 装上。
+        let claude = hooks::local_bridge_path(CLIAgent::Claude, &home, hooks::SETTINGS_REL_PATH);
+        if let Some(parent) = claude.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&claude, hooks::plan_install(b"{}").unwrap()).unwrap();
+
+        assert!(
+            read_installed_state_offline(CLIAgent::Claude, None, Some(&home)),
+            "前提：Claude 已装"
+        );
+        assert!(
+            !read_installed_state_offline(CLIAgent::OpenCode, None, Some(&home)),
+            "opencode 装的是另一个文件，不该继承 Claude 的结论"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 没有上游 hook 适配的 agent 不弹安装窗。
+    #[test]
+    fn other_agents_are_not_prompted() {
+        use crate::agent::CLIAgent;
+        use crate::agent::hooks::should_prompt_hook_install;
+
+        for agent in [
+            CLIAgent::Aider,
+            CLIAgent::Cursor,
+            CLIAgent::Hermes,
+            CLIAgent::Vibe,
+        ] {
+            assert!(
+                !should_prompt_hook_install(Some(agent), false, false),
+                "{agent:?} 不该弹安装引导——它既没有 terminalSequence，也没有可装的插件机制"
+            );
+        }
+        // 前台没有 agent 时同样不弹。
+        assert!(!should_prompt_hook_install(None, false, false));
+    }
+
 }

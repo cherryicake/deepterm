@@ -5,6 +5,7 @@ use gpui::{
 };
 use std::path::PathBuf;
 
+use crate::agent::{AgentStatus, CLIAgent};
 use crate::assets::Icon;
 use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
@@ -107,6 +108,16 @@ pub enum PanelEvent {
     /// 后台铃：所属 tab 点亮需关注红点，切到该 tab 后自动清除。
     BellRang {
         panel_id: String,
+    },
+    /// 前台 CLI agent 的身份 / 回合状态变化。
+    ///
+    /// 带载荷而不是让 workspace 自己去 `terminal.read(cx)`：`Panel` 已经持有
+    /// `TerminalView`，在订阅回调里取一次快照最省事，也避免了 workspace 去
+    /// 反查「哪个 panel 对应哪个 view」。
+    AgentStateChanged {
+        panel_id: String,
+        agent: Option<CLIAgent>,
+        status: AgentStatus,
     },
 }
 
@@ -309,6 +320,16 @@ impl Panel {
                 TerminalViewEvent::BellRangWhileUnfocused => {
                     cx.emit(PanelEvent::BellRang {
                         panel_id: close_panel_id.clone(),
+                    });
+                }
+                TerminalViewEvent::AgentChanged => {
+                    // 现场取快照而不是让事件带载荷：`AgentChanged` 只表示
+                    // 「变了」，具体变成什么以 terminal 当前状态为准。
+                    let (agent, status) = view.read(cx).agent_tab_state(cx);
+                    cx.emit(PanelEvent::AgentStateChanged {
+                        panel_id: close_panel_id.clone(),
+                        agent,
+                        status,
                     });
                 }
             },

@@ -132,6 +132,10 @@ unset __deepterm_initial_cwd
         r#"
 __deepterm_shell="${SHELL:-/bin/sh}"
 __deepterm_shell_name="${__deepterm_shell##*/}"
+# agent 状态上报的门控变量：上报脚本只在它存在时才写终端序列，
+# 这样装进 agent 配置里的插件在**别的终端**里是无害的（见 `agent::hooks`）。
+# 本地路径在 `terminal::mappings` 里同样设置，两条路径必须一致。
+export DEEPTERM=true
 case "$__deepterm_shell_name" in
   zsh)
     if [ -n "${ZDOTDIR+x}" ]; then

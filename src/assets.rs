@@ -114,6 +114,16 @@ pub enum Icon {
     GoToFile,    // VSCode SCM "Open File" (file with arrow)
     /// Dynamic file icon loaded by extension/name (e.g., language icons from Seti UI).
     FileIcon(&'static str),
+    /// CLI agent 图标（Claude / Codex / …）。
+    ///
+    /// 不按 agent 逐个枚举变体：agent 集合会随品牌增删，而
+    /// `CLIAgent::icon_path()`（agent/cli_agent.rs）已经是唯一真源。
+    /// 这里只借道 `&'static str`，与 [`Icon::FileIcon`] 同构——两者都是
+    /// 「路径本身即身份」的动态图标。
+    ///
+    /// 图形色和圆盘底色分别来自 `icon_rgb()` / `accent_rgb()`。
+    /// SVG 只提供 alpha mask，不从文件填充色推断品牌色。
+    AgentIcon { path: &'static str, rgb: u32, accent_rgb: u32 },
 }
 
 impl Icon {
@@ -194,6 +204,7 @@ impl Icon {
             Icon::DiscardThick => SharedString::new_static("icons/discard.thick.svg"),
             Icon::RefreshThick => SharedString::new_static("icons/arrow.clockwise.thick.svg"),
             Icon::FileIcon(path) => SharedString::new_static(path),
+            Icon::AgentIcon { path, .. } => SharedString::new_static(path),
         }
     }
 }

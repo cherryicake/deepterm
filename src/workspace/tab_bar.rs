@@ -1,14 +1,16 @@
 use std::rc::Rc;
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
 
 use gpui::prelude::*;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId, Entity,
-    FocusHandle, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle,
-    SharedString, Stateful, TextRun, TextStyle, Transformation, Window, actions, div, ease_in_out,
-    ease_out_quint, percentage, px, svg,
+    FocusHandle, HighlightStyle, Hsla, IntoElement, MouseButton, Pixels, Point, Render,
+    ScrollHandle, SharedString, Stateful, StyledText, TextRun, TextStyle, Transformation, Window,
+    actions, div, ease_in_out, ease_out_quint, percentage, px, rgb, svg,
 };
 
+use crate::agent::{AgentStatus, CLIAgent};
 use crate::assets::Icon;
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::theme::{ActiveTheme, UiTheme};
@@ -55,6 +57,23 @@ struct PanelDropPreview {
     tab_label: SharedString,
 }
 
+/// tty7 的圆盘边界规则：sRGB 相对亮度对比小于 1.25 时描边。
+fn agent_disc_needs_edge(fill: u32, surface: gpui::Hsla) -> bool {
+    let luminance = |color: gpui::Rgba| {
+        let linear = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    };
+    let a = luminance(rgb(fill));
+    let b = luminance(surface.into());
+    (a.max(b) + 0.05) / (a.min(b) + 0.05) < 1.25
+}
+
 const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
 const TAB_REORDER_GAP_PX: f32 = 4.0;
 const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
@@ -67,6 +86,12 @@ const TAB_PADDING_X_PX: f32 = 12.0;
 const TAB_RADIUS_PX: f32 = 8.0;
 const ICON_SIZE_PX: f32 = 16.0;
 const FILE_ICON_SIZE_PX: f32 = 22.0;
+const AGENT_DOT_SIZE_PX: f32 = 6.0;
+
+/// Working 状态标签文字的往返扫光：一个完整「去 + 回」的周期。
+const AGENT_WORK_SHIMMER_PERIOD_MS: u64 = 2400;
+/// 限制逐帧重绘频率；文字扫光对帧率不敏感，60→30 fps 省一半重排。
+const AGENT_WORK_SHIMMER_MAX_FPS: f32 = 30.0;
 const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
 
 /// 拖拽预览视图
@@ -144,6 +169,106 @@ impl Render for DragPreview {
             )
     }
 }
+/// Cosine envelope: strongest at the center, zero with a flat slope at both edges.
+fn shimmer_intensity(distance: f32, radius: f32) -> f32 {
+    let position = (distance.abs() / radius).min(1.0);
+    (1.0 + (position * std::f32::consts::PI).cos()) * 0.5
+}
+
+/// 为**所有**字形生成高亮，而非只覆盖扫光带内的字形。
+///
+/// # 为什么不能只高亮带内字形
+/// gpui 的 `shape_text` 只把「颜色等 decoration 完全相同」的相邻 run 合并进同一个
+/// FontRun，而 FontRun 边界决定 CoreText 的分段 shaping（跨边界 kerning 丢失、
+/// 相邻 run 用微差字号防连字）。若带外字形不带高亮，它们会合并成一段基色 run，
+/// 扫光带每移动一帧段边界就跟着移动 → 每帧以不同边界重排 → 字形位置逐帧微漂，
+/// 视觉上就是「标签宽度稳了，但里面的字还在动」。
+///
+/// 所以这里给每个字形都发一段高亮（带外 strength=0，颜色即基色），并给颜色加上
+/// 交替的 ±ε 偏移，保证**相邻**字形颜色永不相等 → 每个字形恒为独立 run，分段
+/// 只取决于字形边界、与帧无关 → 整个动画期间 shaping 结果恒定（LineLayoutCache
+/// 键相同直接命中），文字纹丝不动。ε 比渲染时 8-bit 颜色的最小可辨差小约 40 倍，
+/// 肉眼不可见。
+fn shimmer_highlights<'a>(
+    glyphs: &'a [(std::ops::Range<usize>, f32)],
+    width: f32,
+    phase: f32,
+    base: gpui::Rgba,
+    accent: gpui::Rgba,
+) -> impl Iterator<Item = (std::ops::Range<usize>, HighlightStyle)> + 'a {
+    let radius = (width * 0.18).clamp(2.5, 6.0);
+    let center = phase * width;
+    glyphs
+        .iter()
+        .enumerate()
+        .map(move |(index, (range, position))| {
+            let strength = shimmer_intensity(*position - center, radius);
+            // 交替微调红色通道：仅用于阻止相邻同色字形被合并进同一个 FontRun，
+            // 不是视觉效果的一部分。
+            let nudge = if index % 2 == 0 { 1e-4 } else { -1e-4 };
+            let color = gpui::Rgba {
+                r: (base.r + (accent.r - base.r) * strength + nudge).clamp(0.0, 1.0),
+                g: base.g + (accent.g - base.g) * strength,
+                b: base.b + (accent.b - base.b) * strength,
+                a: base.a,
+            };
+            (
+                range.clone(),
+                HighlightStyle {
+                    color: Some(color.into()),
+                    ..Default::default()
+                },
+            )
+        })
+}
+
+/// 往返相位：0 → 1 → 0，两端由余弦自然减速。
+fn shimmer_phase(t01: f32) -> f32 {
+    (1.0 - (t01 * std::f32::consts::TAU).cos()) / 2.0
+}
+
+/// Only glyph foreground colors animate. Grapheme boundaries keep combining
+/// marks and emoji together; display-cell positions account for wide CJK text.
+/// The font, layout and background remain unchanged; colors outside the band
+/// stay visually at the base color (see `shimmer_highlights` for why they
+/// still carry an imperceptible per-glyph offset).
+fn render_working_label(
+    tab_id: &str,
+    label: &SharedString,
+    base_color: Hsla,
+    highlight_color: Hsla,
+) -> AnyElement {
+    let id = format!("tab-shimmer-{tab_id}");
+    let mut width = 0.0;
+    let glyphs: Vec<_> = label
+        .grapheme_indices(true)
+        .map(|(start, glyph)| {
+            let advance = unicode_width::UnicodeWidthStr::width(glyph) as f32;
+            let center = width + advance * 0.5;
+            width += advance;
+            (start..start + glyph.len(), center)
+        })
+        .collect();
+    let base = gpui::Rgba::from(base_color);
+    let accent = gpui::Rgba::from(highlight_color);
+    StyledText::new(label.clone())
+        .with_animation(
+            ElementId::Name(id.into()),
+            Animation::new(Duration::from_millis(AGENT_WORK_SHIMMER_PERIOD_MS))
+                .repeat()
+                .with_max_fps(AGENT_WORK_SHIMMER_MAX_FPS),
+            move |styled, delta| {
+                styled.with_highlights(shimmer_highlights(
+                    &glyphs,
+                    width,
+                    shimmer_phase(delta),
+                    base,
+                    accent,
+                ))
+            },
+        )
+        .into_any_element()
+}
 
 /// 标签页项
 #[derive(Clone)]
@@ -157,6 +282,15 @@ pub struct TabItem {
     /// 需要关注（后台 tab 的终端响了铃 / 发了通知）：显示小红点，
     /// tab 激活时自动清除（见 [`TabBar::set_active_tab`]）。
     pub needs_attention: bool,
+    /// 前台 CLI agent 的回合状态（`Working` / `Waiting` / `Done`）。
+    ///
+    /// 只有 [`Self::icon`] 是 `Icon::AgentIcon` 时才有意义，但有意不做成
+    /// 二选一的枚举：状态本身会频繁变化（`ToolComplete` 一个回合能触发几十次）
+    /// 而 agent 身份通常不变，解耦之后 `set_tab_agent` 可以在身份不动时
+    /// 只更新状态点，不必重建整个图标。
+    ///
+    /// `None` 表示「没有 agent」，此时不画状态点。
+    pub agent_status: Option<AgentStatus>,
 }
 
 impl TabItem {
@@ -169,6 +303,7 @@ impl TabItem {
             is_remote: false,
             is_loading: false,
             needs_attention: false,
+            agent_status: None,
         }
     }
 
@@ -238,6 +373,63 @@ fn reorder_offset(from_index: usize, to_index: usize, index: usize, shift_width:
     } else {
         0.0
     }
+}
+
+/// agent 状态点的填充方式。
+///
+/// `Waiting` 必须与 `Done` 有**形状**差异，而不只是颜色差异：两者的颜色是
+/// 琥珀与绿，正是红绿色觉最难分辨的一对，而这一对恰好是「要不要过去看一眼」
+/// 的决定性问题。填充圆点与空心圆环在小尺寸下也能一眼分开。
+/// 约束来源见 `AgentStatus::dot_rgb` 的注释（agent/cli_agent.rs）。
+#[derive(Debug, PartialEq, Eq)]
+enum AgentDot {
+    Filled,
+    /// 空心圆环：只描边，中心透出图标底色。
+    Hollow,
+}
+
+/// 纯函数：`AgentStatus` → `(颜色, 填充方式)`；`None` 表示不画点。
+///
+/// 颜色从 `dot_rgb()` 取而不是写死在这里，保证与 agent 模块对状态颜色的定义
+/// 不会各说各话。`Idle` 天然落到 `None`——agent 开着但没干活时图标本身
+/// 已经说明了它的存在，再点一个点只是噪声。
+fn agent_dot(status: AgentStatus) -> Option<(u32, AgentDot)> {
+    let (rgb, dot) = match status {
+        AgentStatus::Idle => return None,
+        AgentStatus::Working => (status.dot_rgb()?, AgentDot::Filled),
+        AgentStatus::Waiting => (status.dot_rgb()?, AgentDot::Hollow),
+        AgentStatus::Done => (status.dot_rgb()?, AgentDot::Filled),
+    };
+    Some((rgb, dot))
+}
+
+/// 纯函数：标签行里要不要画「需关注」红点。
+///
+/// 抽出来是为了能直接测这个二选一逻辑——它此前写成内联的
+/// `needs_attention && !is_modified`，加上 agent 那一维后条件变三条，
+/// 内联形式只能靠读代码确认。
+///
+/// 两条规则：
+/// - 没在等你看（`needs_attention == false`）→ 不画；
+/// - 有未保存改动 → 让位给「未保存」灰点，两个点挤在一起会都看不清。
+///
+/// # 为什么 agent 有状态点时**不**让位
+///
+/// 曾经这里还有第三条：agent 状态点已画出时红点让位，理由是"两个点讲同一件事"。
+/// 那条规则让本函数与 `workspace::should_mark_unread` 互相抵消——后者只在
+/// `Working → Done` 边沿点亮红点，而那一刻 `agent_status` 必然是 `Done`
+/// （状态点可见），于是红点**永远画不出来**，`needs_attention` 成了死标志。
+///
+/// 两者其实不重复，是两个维度：
+/// - 图标上的状态点回答「agent 现在/最近在干什么」，**不会**因为用户看过而消失；
+/// - 文字边的红点回答「你有没有看过这次完成」，**激活该 tab 即清除**
+///   （见 [`TabBar::set_active_tab`]）。
+///
+/// 后台 tab 上"跑完了、你还没看"这件事正需要后者：图标很小、非激活时还是
+/// 弱化的，状态点本身不足以把人叫回来。后台铃（`PanelEvent::BellRang`）用的是
+/// 同一个标志、同一个红点，语义一致。
+fn should_show_attention_dot(tab: &TabItem) -> bool {
+    tab.needs_attention && !tab.is_modified
 }
 
 /// 标签栏组件
@@ -512,6 +704,55 @@ impl TabBar {
             f(tab);
             cx.notify();
         }
+    }
+
+    /// 更新标签的 agent 图标与回合状态点，返回该标签**原先**的状态。
+    ///
+    /// 返回值是改之前的状态，而不是 `bool`：调用方需要判断
+    /// `Working → Done` 这个**边沿**来决定要不要点亮「需关注」红点。只看
+    /// 「现在是不是 Done」会在每次 `Stop` 重复点亮，也会在切回 tab 后
+    /// 因为残留的 `Done` 反复点亮。
+    ///
+    /// `agent` 为 `None`（agent 已退出）时图标回落到 `fallback`，由调用方
+    /// 决定「这台 tab 本来该显示什么」——`TabBar` 无从知道该 tab 是
+    /// Workspace 还是连了哪台远端机器。
+    ///
+    /// 状态与图标都没变时直接返回、不 `cx.notify()`：`ToolComplete` 会在
+    /// 一个回合里触发几十次，而它多数时候只是把 `Working` 写成 `Working`。
+    ///
+    /// `tab_id` 不存在时返回 `None`。
+    pub fn set_tab_agent(
+        &mut self,
+        tab_id: &str,
+        agent: Option<CLIAgent>,
+        status: AgentStatus,
+        fallback: Option<Icon>,
+        cx: &mut Context<Self>,
+    ) -> Option<AgentStatus> {
+        let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
+
+        // 没有 agent 就没有状态点，也不必记住状态：留着会让「agent 退出后
+        // 又启动另一个 agent」这一串事件里出现一个陈旧的 Done。
+        let status = agent.is_some().then_some(status);
+        let icon = match agent {
+            Some(agent) => Some(Icon::AgentIcon {
+                path: agent.icon_path(),
+                rgb: agent.icon_rgb(),
+                accent_rgb: agent.accent_rgb(),
+            }),
+            None => fallback,
+        };
+
+        let previous = tab.agent_status;
+        if tab.agent_status == status && tab.icon == icon {
+            return previous;
+        }
+
+        tab.agent_status = status;
+        tab.icon = icon;
+
+        cx.notify();
+        previous
     }
 
     pub fn active_tab_id(&self) -> Option<&SharedString> {
@@ -1055,6 +1296,30 @@ impl TabBar {
                     },
                 )
                 .into_any_element()
+        } else if let Some(Icon::AgentIcon {
+            path,
+            rgb,
+            accent_rgb,
+        }) = icon
+        {
+            // agent 图标压过一切：跑着 agent 的 tab，「这是哪个 agent、它现在
+            // 在干嘛」永远比「什么类型的 panel」更重要。这个分支必须排在下面
+            // 的通用 icon 分支之前——`AgentIcon` 也是一个 `Icon`。
+            let surface = if self.compact {
+                theme.tab_bar_background
+            } else if is_active {
+                theme.tab_active_background
+            } else {
+                theme.tab_inactive_background
+            };
+            Self::render_agent_icon_slot(
+                path,
+                rgb,
+                accent_rgb,
+                tab.agent_status,
+                surface,
+                theme.border,
+            )
         } else if let Some(icon) = icon {
             let icon_size = if matches!(icon, Icon::FileIcon(_)) {
                 px(FILE_ICON_SIZE_PX)
@@ -1083,8 +1348,77 @@ impl TabBar {
             .into_any_element()
     }
 
+    /// agent 图标 + 右下角状态点。
+    ///
+    /// 与 tty7 一致：品牌色圆盘承载单色剪影，不能把圆盘色当成图形色。
+    ///
+    /// 状态点用 `absolute()` 压在图标右下角：不占布局空间，所以图标仍然
+    /// 居中在自己的 16px 槽位里，有没有状态点都不会让标签左右抖动。
+    fn render_agent_icon_slot(
+        path: &'static str,
+        rgb_value: u32,
+        accent_rgb: u32,
+        status: Option<AgentStatus>,
+        surface: gpui::Hsla,
+        border: gpui::Hsla,
+    ) -> AnyElement {
+        let dot = status.and_then(agent_dot);
+
+        div()
+            .relative()
+            .size(px(ICON_SIZE_PX))
+            .child(
+                div()
+                    .size(px(ICON_SIZE_PX))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(rgb(accent_rgb))
+                    .when(agent_disc_needs_edge(accent_rgb, surface), |disc| {
+                        disc.border_1().border_color(border)
+                    })
+                    .child(
+                        svg()
+                            .size(px(ICON_SIZE_PX * 0.54))
+                            .text_color(rgb(rgb_value))
+                            .path(path),
+                    ),
+            )
+            .when_some(dot, |this, (dot_rgb_value, shape)| {
+                this.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .bottom_0()
+                        .size(px(AGENT_DOT_SIZE_PX))
+                        .rounded_full()
+                        // Hollow：只描边、中心透明，与实心点形成形状差异。
+                        // 描边宽度取 1px——6px 的环再粗就糊成实心了。
+                        .when(shape == AgentDot::Filled, |this| {
+                            this.bg(rgb(dot_rgb_value))
+                        })
+                        .when(shape == AgentDot::Hollow, |this| {
+                            this.border_1().border_color(rgb(dot_rgb_value))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
     /// 标签文本（含未保存 / 需关注圆点），非激活时限宽截断
+    ///
+    /// 两个圆点是**两个维度**，可以同时出现：
+    /// - 灰点 = 文件有未保存改动（编辑器专属语义）；
+    /// - 红点 = 「需关注」——后台 tab 响了铃，或 agent 跑完了一个回合而你还没
+    ///   看过它（激活即清除）。判定见 [`should_show_attention_dot`]。
+    ///
+    /// 红点**不**因为图标上有 agent 状态点而让位：那个点说的是"agent 在干什么"，
+    /// 不会因为你切过去看过就消失；红点说的是"这次完成你还没看"。前者是状态，
+    /// 后者是未读，两者不重复。详见 [`should_show_attention_dot`] 的文档。
     fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
+        let show_attention = should_show_attention_dot(tab);
+
         div()
             .relative()
             .overflow_hidden()
@@ -1107,7 +1441,7 @@ impl TabBar {
                 )
             })
             // 需关注（后台铃 / 通知）：更醒目的强调色圆点，激活后清除。
-            .when(tab.needs_attention && !tab.is_modified, |this| {
+            .when(show_attention, |this| {
                 this.child(
                     div()
                         .size(px(7.0))
@@ -1118,11 +1452,11 @@ impl TabBar {
             })
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .text_sm()
                     .whitespace_nowrap()
-                    .text_ellipsis()
                     .font_weight(if is_active {
                         gpui::FontWeight::SEMIBOLD
                     } else {
@@ -1133,7 +1467,42 @@ impl TabBar {
                     } else {
                         theme.text_muted
                     })
-                    .child(tab.label.clone()),
+                    // 宽度基准（ghost sizer）：这里必须永远渲染一份**普通文本**。
+                    // 扫光动画每帧都会改变高亮分段，gpui 会按分段重新 shaping，
+                    // 行宽在两个整像素值之间逐帧振荡；若让扫光文本直接待在文档流里，
+                    // tab（flex_shrink_0 自适应内容）就会跟着一帧一抖。
+                    // 普通文本是单 run 排版，宽度逐帧恒定，由它撑住 tab 宽度；
+                    // Working 时只把它隐形，扫光以覆盖层形式叠在上面，不参与布局。
+                    // text_ellipsis 挂在 sizer 上而不是外层容器：避免覆盖层里的
+                    // 扫光文本继承截断样式，被逐帧重排出的亚像素宽度差误触发截断。
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .when(
+                                tab.agent_status == Some(AgentStatus::Working),
+                                |this| this.opacity(0.),
+                            )
+                            .child(tab.label.clone()),
+                    )
+                    .when(tab.agent_status == Some(AgentStatus::Working), |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .child(render_working_label(
+                                    &tab.id,
+                                    &tab.label,
+                                    if is_active {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    },
+                                    theme.accent,
+                                )),
+                        )
+                    }),
             )
     }
 
@@ -1276,6 +1645,61 @@ impl Render for TabBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_disc_edge_preserves_low_contrast_brands() {
+        assert!(agent_disc_needs_edge(0x000000, rgb(0x101010).into()));
+        assert!(agent_disc_needs_edge(0xFFFFFF, rgb(0xF8F8F8).into()));
+        assert!(!agent_disc_needs_edge(0x000000, rgb(0xFFFFFF).into()));
+        assert!(!agent_disc_needs_edge(0xFFFFFF, rgb(0x000000).into()));
+        assert!(agent_disc_needs_edge(0x000000, rgb(0x1D1D1D).into()));
+        assert!(!agent_disc_needs_edge(0x000000, rgb(0x1E1E1E).into()));
+    }
+
+    #[test]
+    fn sweep_center_is_strongest_with_symmetric_soft_edges() {
+        let base = gpui::Rgba::from(rgb(0x808080));
+        let accent = gpui::Rgba::from(rgb(0x2080ff));
+        let glyphs: Vec<_> = (0..11).map(|i| (i..i + 1, i as f32)).collect();
+        let frame: Vec<_> = shimmer_highlights(&glyphs, 10.0, 0.5, base, accent).collect();
+        let color = |index| {
+            frame
+                .iter()
+                .find(|(range, _)| range.start == index)
+                .map(|(_, style)| gpui::Rgba::from(style.color.unwrap()))
+                .unwrap_or(base)
+        };
+        // 带外字形必须**视觉上**等于基色：ε 微调远小于 8-bit 最小可辨差（≈4e-3），
+        // 但不要求逐位相等（ε 的存在正是为了拆开相邻字形，见 shimmer_highlights）。
+        const VISUALLY_SAME: f32 = 5e-4;
+        assert!((color(0).r - base.r).abs() < VISUALLY_SAME);
+        assert!((color(10).r - base.r).abs() < VISUALLY_SAME);
+        assert!((color(5).b - accent.b).abs() < 1e-5);
+        assert!(color(5).b > color(4).b && color(4).b > color(3).b && color(3).b > base.b);
+        assert!((color(4).b - color(6).b).abs() < 1e-5);
+        assert!((color(3).b - color(7).b).abs() < 1e-5);
+        // 防抖不变量：每个字形都有高亮，且相邻字形颜色永不相等——
+        // 否则 gpui 会把它们合并进同一个 FontRun，段边界随帧移动导致文字微漂。
+        assert_eq!(frame.len(), glyphs.len());
+        for pair in frame.windows(2) {
+            assert_ne!(pair[0].1.color, pair[1].1.color);
+        }
+        // A sub-character movement must change intensity, not jump a solid band.
+        let next: Vec<_> = shimmer_highlights(&glyphs, 10.0, 0.51, base, accent).collect();
+        assert_ne!(frame, next);
+    }
+
+    /// 相位必须是 0→1→0 的往返，且两端（t=0 / t=1）速度为零。
+    #[test]
+    fn shimmer_phase_round_trips_with_soft_ends() {
+        assert_eq!(shimmer_phase(0.0), 0.0);
+        assert_eq!(shimmer_phase(1.0), 0.0);
+        assert!((shimmer_phase(0.5) - 1.0).abs() < 1e-6);
+        // 对称：t 与 1-t 的相位互补（往返一致）。
+        assert!((shimmer_phase(0.25) + shimmer_phase(0.75) - 1.0).abs() < 1e-4);
+        // 中点附近相位单调上升，两端平缓（余弦包络）。
+        assert!(shimmer_phase(0.5) > shimmer_phase(0.4));
+    }
+
     use gpui::{point, size};
 
     fn make_tabs(ids: &[&str]) -> Vec<TabItem> {
@@ -1409,20 +1833,74 @@ mod tests {
     }
 
     impl Render for MenuProbeHost {
-        fn render(
-            &mut self,
-            _window: &mut Window,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             // 固定 400x30 顶左布局：首个 tab 落在 (0..~150, 0..30)。
             div().w(px(400.)).h(px(30.)).child(self.bar.clone())
         }
     }
 
     #[gpui::test]
-    fn tab_right_click_opens_menu_and_action_reaches_handler(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn working_sweep_keeps_tab_background_stable(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let mut tab = TabItem::new("sweep-probe", "opencode: ~/Documents/工作区/deepterm");
+        tab.agent_status = Some(AgentStatus::Working);
+        let bar = cx.update(|cx| TabBar::new_with_tabs("sweep-bar", cx, vec![tab]));
+        let window = cx.open_window(size(px(600.), px(40.)), {
+            let bar = bar.clone();
+            move |_, _| MenuProbeHost { bar: bar.clone() }
+        });
+        cx.run_until_parked();
+        let capture = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .map(|quad| {
+                        // Ignore submission order; compare the actual visible rectangle,
+                        // clipping, background and border submitted to the renderer.
+                        format!(
+                            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                            quad.bounds,
+                            quad.content_mask,
+                            quad.background,
+                            quad.border_color,
+                            quad.corner_radii,
+                            quad.border_widths
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+        };
+        let baseline = capture(cx);
+        assert!(
+            !baseline.is_empty(),
+            "probe must paint a real tab background"
+        );
+        for frame in 1..=16 {
+            cx.executor().advance_clock(Duration::from_millis(150));
+            cx.run_until_parked();
+            assert_eq!(
+                capture(cx),
+                baseline,
+                "background changed on sweep frame {frame}"
+            );
+        }
+        bar.update(cx, |bar, cx| {
+            bar.tabs[0].agent_status = Some(AgentStatus::Done);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            capture(cx),
+            baseline,
+            "leaving Working changed tab geometry or background"
+        );
+    }
+
+    #[gpui::test]
+    fn tab_right_click_opens_menu_and_action_reaches_handler(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| crate::theme::init(cx));
 
         let menu_built = std::sync::Arc::new(std::sync::Mutex::new(false));
@@ -1470,11 +1948,7 @@ mod tests {
         );
         // 右键必须同时记下 tab id，供菜单动作回调使用。
         let recorded = bar.update(cx, |bar, _| bar.context_menu_tab_id());
-        assert_eq!(
-            recorded.as_deref(),
-            Some("t1"),
-            "右键必须记下被点的 tab id"
-        );
+        assert_eq!(recorded.as_deref(), Some("t1"), "右键必须记下被点的 tab id");
 
         // 菜单项派发 Action：必须到达 TabBar 根的 on_action 处理器。
         cx.update(|window, cx| {
@@ -1566,5 +2040,132 @@ mod tests {
             bar.tabs.iter().map(|t| t.id.to_string()).collect()
         });
         assert_eq!(order, ["t1", "t2"]);
+    }
+
+    // ===== agent 状态点（阶段 4）=====
+
+    /// `Waiting` 必须与 `Done` 有形状差异，而不只是颜色差异。
+    ///
+    /// 这是一个**无障碍回归护栏**：两者的颜色是琥珀与绿，正是红绿色觉最难
+    /// 分辨的一对，而这一对恰好决定「要不要过去看一眼」。如果哪天有人为了
+    /// 「看起来更统一」把 Waiting 也改成实心，这个测试必须挡住。
+    #[test]
+    fn agent_dot_shapes_distinguish_waiting_from_done() {
+        use AgentStatus::*;
+
+        let (waiting_rgb, waiting_shape) = agent_dot(Waiting).expect("Waiting 必须有状态点");
+        let (done_rgb, done_shape) = agent_dot(Done).expect("Done 必须有状态点");
+        let (_, working_shape) = agent_dot(Working).expect("Working 必须有状态点");
+
+        assert_eq!(waiting_shape, AgentDot::Hollow, "Waiting 必须是空心圆环");
+        assert_eq!(done_shape, AgentDot::Filled);
+        assert_eq!(working_shape, AgentDot::Filled);
+
+        // 形状与颜色两个维度都不能重合，否则红绿色觉用户只剩颜色可依赖。
+        assert_ne!(waiting_shape, done_shape);
+        assert_ne!(waiting_rgb, done_rgb);
+
+        // Idle 不画点：agent 开着但没干活，图标本身已经说明它的存在。
+        assert_eq!(agent_dot(Idle), None);
+    }
+
+    /// 状态点颜色必须来自 `AgentStatus::dot_rgb()`，不能在本模块另起一套。
+    #[test]
+    fn agent_dot_color_comes_from_status() {
+        use AgentStatus::*;
+
+        for status in [Working, Waiting, Done] {
+            let expected = status.dot_rgb().expect("这三个状态都该有颜色");
+            let (rgb_value, _) = agent_dot(status).expect("都该有状态点");
+            assert_eq!(rgb_value, expected, "{status:?} 的颜色与 dot_rgb 不一致");
+        }
+    }
+
+    /// 「需关注」红点的让位规则。
+    #[test]
+    fn attention_dot_yields_to_modified_only() {
+        let base = |needs_attention, is_modified| TabItem {
+            needs_attention,
+            is_modified,
+            ..TabItem::new("t", "terminal")
+        };
+
+        // 没在等你看 → 不画。
+        assert!(!should_show_attention_dot(&base(false, false)));
+
+        // 普通的「后台响了铃」→ 画。
+        assert!(should_show_attention_dot(&base(true, false)));
+
+        // 有未保存改动 → 让位给灰点。
+        assert!(!should_show_attention_dot(&base(true, true)));
+    }
+
+    /// **组合断言**：agent 跑完后，红点标志必须真的能画出来。
+    ///
+    /// 这条是本模块最容易「两半都对、合起来错」的地方：`workspace::should_mark_unread`
+    /// 只认 `Working → Done` 边沿，而那一刻 `agent_status` 必然是 `Done`。
+    /// 若 `should_show_attention_dot` 在"有 agent 状态点"时让位（曾经如此），
+    /// 标志被点亮后**永远画不出来**——两个纯函数各自都有测试，却没有任何一条
+    /// 覆盖它们的组合。这里显式把两边接起来断言。
+    #[test]
+    fn done_edge_flag_actually_renders_a_dot() {
+        use crate::workspace::workspace::should_mark_unread;
+        use AgentStatus::*;
+
+        // 后台 tab：agent 从 Working 走到 Done。
+        let previous = Some(Working);
+        let next = Done;
+        let is_active = false;
+        assert!(
+            should_mark_unread(previous, next, is_active),
+            "前提：后台 tab 的 Working → Done 边沿应点亮标志"
+        );
+
+        // 标志点亮后的 tab 状态：Done 让 `agent_dot` 返回 `Some`（绿实心点可见）。
+        let tab = TabItem {
+            needs_attention: true,
+            is_modified: false,
+            agent_status: Some(next),
+            ..TabItem::new("t", "terminal")
+        };
+        assert!(
+            agent_dot(next).is_some(),
+            "前提：Done 确实有图标状态点，所以旧的让位规则会吞掉红点"
+        );
+        assert!(
+            should_show_attention_dot(&tab),
+            "agent 跑完点亮的红点必须真的画出来，不能被图标状态点吞掉"
+        );
+
+        // 用户切过去看过 → 标志被清（`set_active_tab` 的语义），红点随之消失。
+        let viewed = TabItem {
+            needs_attention: false,
+            ..tab
+        };
+        assert!(
+            !should_show_attention_dot(&viewed),
+            "看过之后红点必须消失，否则「未读」语义就没了"
+        );
+    }
+
+    /// 每个 `CLIAgent` 的图标都必须在嵌入资源里真实存在。
+    ///
+    /// 这是最容易悄无声息失效的一环：`icon_path()` 返回一个不存在的路径时
+    /// gpui 只是画不出东西，不报错、不 panic，tab 上就是空一块。所以直接拿
+    /// `Assets::get` 查一遍，而不是只断言路径字符串长得对。
+    #[test]
+    fn every_agent_icon_resolves_to_an_embedded_asset() {
+        for agent in CLIAgent::ALL {
+            let icon = Icon::AgentIcon {
+                path: agent.icon_path(),
+                rgb: agent.icon_rgb(),
+                accent_rgb: agent.accent_rgb(),
+            };
+            let path = icon.path();
+            assert!(
+                crate::assets::Assets::get(path.as_ref()).is_some(),
+                "{agent:?} 的图标 {path} 不在嵌入资源里"
+            );
+        }
     }
 }

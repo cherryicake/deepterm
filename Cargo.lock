@@ -1840,6 +1840,7 @@ dependencies = [
  "smol",
  "streaming-iterator",
  "tokio",
+ "toml_edit 0.22.27",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
