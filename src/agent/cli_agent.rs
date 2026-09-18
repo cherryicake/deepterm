@@ -182,46 +182,75 @@ impl CLIAgent {
     }
 
     /// Tab 头像圆盘的填充色：agent 的品牌色。
+    ///
+    /// 取值一律以**官方一手来源**为准（官网 CSS/logo 资源、官方 npm 包内资源、
+    /// 官方 favicon），不用配色聚合站。判定 logo 颜色时要区分「标志本身的颜色」
+    /// 与「favicon 的底色」——两者常不同，前者才是品牌色。
+    ///
+    /// 不少 agent 的官方 logo 本就是单色的（OpenAI、xAI、Qoder、Cursor、Factory、
+    /// Kimi、OpenCode、Augment），此时取它们的黑白主色，而不是编造一个色相。
     pub fn accent_rgb(self) -> u32 {
         match self {
+            // claude.com 品牌 CSS 的 --swatch--clay: #d97757。
             CLIAgent::Claude => 0xD97757,
+            // openai.com/favicon.svg 用 fill="currentColor"，官方标志为单色。
             CLIAgent::Codex => 0x000000,
-            // 品牌图形自带绿前景、衬在黑底上，所以外面那张 Tab 头像也得是黑的。
-            CLIAgent::TraeCode => 0x000000,
-            CLIAgent::Gemini => 0x4285F4,
+            // TRAE 官方 favicon 底色 #0A0B0D，中心图形是 #32F08C 绿（见 icon_rgb）。
+            CLIAgent::TraeCode => 0x0A0B0D,
+            // Gemini 官方 sparkle SVG 与 favicon 的主色均为 #3186ff。
+            CLIAgent::Gemini => 0x3186FF,
+            // aider.chat/assets/logo.svg 的 fill 就是 #14B014。
             CLIAgent::Aider => 0x14B014,
             CLIAgent::Amp => 0xF34E3F,
-            CLIAgent::OpenCode => 0x6E56CF,
-            CLIAgent::Copilot => 0x8957E5,
+            // OpenCode 官方 favicon 与 app-icon 的底色 #131010（近黑单色）。
+            CLIAgent::OpenCode => 0x131010,
+            // brand.github.com 明文「Copilot Purple」#8534F3。
+            CLIAgent::Copilot => 0x8534F3,
+            // Cursor 官方 favicon 与站内 logo 均无彩色（#EDECEC 灰白系）。
             CLIAgent::Cursor => 0x9AA0A6,
+            // block/goose 官方 logo.svg 的 fill #3ECC5F。
             CLIAgent::Goose => 0x3ECC5F,
-            CLIAgent::Droid => 0xEF6F2E,
-            CLIAgent::Pi => 0x0EA5E9,
-            CLIAgent::Auggie => 0x16A34A,
+            // Factory 官网（含 CLI 产品页）唯一可见的品牌色 #d15010。
+            CLIAgent::Droid => 0xD15010,
+            // pi.dev 官方 logo 的三段色之一，取最暖、辨识度最高的那段。
+            CLIAgent::Pi => 0xF09082,
+            // augmentcode.com/favicon.svg 为纯黑白，官方标志单色。
+            CLIAgent::Auggie => 0x000000,
             CLIAgent::Hermes => 0x8B5CF6,
-            CLIAgent::Vibe => 0xFA520F,
-            CLIAgent::Antigravity => 0x3186FF,
+            // mistral.ai 官方 CSS 的 #fa500f（出现 32 次，为主色）。
+            CLIAgent::Vibe => 0xFA500F,
+            // antigravity.google 官方 logo.png 的主色 #3087FB。
+            CLIAgent::Antigravity => 0x3087FB,
+            // x.ai 官方 icon.png 为纯灰度（R=G=B），标志单色。
             CLIAgent::Grok => 0x000000,
-            CLIAgent::Qwen => 0x6D44E8,
+            CLIAgent::Qwen => 0x6336E7,
             CLIAgent::OhMyPi => 0xF97316,
-            // Kimi 品牌图形里那簇火焰的蓝；图形本身是黑的，而黑色 Codex 和
-            // Grok 已经占了。
-            CLIAgent::Kimi => 0x027AFF,
-            CLIAgent::QoderCLI => 0xFFFFFF,
-            // Charm 给 Crush 那颗心铺的蓝紫底。
+            // kimi.com 官方 favicon（light/dark 两版）都是黑白单色标志。
+            CLIAgent::Kimi => 0x000000,
+            // Qoder 官方站点实际显示的 logo 是纯黑（qoder.com 的 lightOnly
+            // 变体 PNG，98.3% 像素为 #0F0D0C）。页面上那个 `theme-color:
+            // #8B5CF6` 是残留的 meta 标签，站点里没有任何可见元素用它。
+            CLIAgent::QoderCLI => 0x0F0D0C,
+            // charm.sh 官方 main.css 的 background-color:#6b50ff。
             CLIAgent::Crush => 0x6B50FF,
-            // 官网 logo 渐变的上端色（#6C4DFF → #583ED3 里取亮的那端）。
+            // codebuddy.cn 官方渐变 #6C4DFF → #583ED3，取亮端。
             CLIAgent::CodeBuddy => 0x6C4DFF,
         }
     }
 
-    /// 圆盘上的单色图形，与 tty7 的头像配色一致。
-    /// SVG 作为 alpha mask 渲染，品牌底色由 `accent_rgb` 提供。
+    /// 圆盘上的单色图形。SVG 作为 alpha mask 渲染，品牌底色由 `accent_rgb` 提供。
+    ///
+    /// 图形颜色由**底色亮度**决定，而不是写死一张表：16px 圆盘里的图形只有约
+    /// 8.6px，白字对比度低于 3:1 就糊成一团。所以底色够深时用白，偏亮时翻黑
+    /// （Goose 的官方绿 `#3ECC5F` 白字仅 2.1:1，黑字 10.0:1）。这样以后
+    /// 再调品牌色，图形会自动跟着适配，不会留下黑压黑/白压白的死角。
     pub fn icon_rgb(self) -> u32 {
         match self {
+            // TRAE 的 logo 自带绿色前景（官方 favicon 中心就是 #32F08C），
+            // 它不是「单色 mask」而是品牌图形的一部分，所以不走亮度规则。
             CLIAgent::TraeCode => 0x32F08C,
-            CLIAgent::QoderCLI => 0x000000,
-            _ => 0xFFFFFF,
+            _ if contrast_against_white(self.accent_rgb()) >= 3.0 => 0xFFFFFF,
+            _ => 0x000000,
         }
     }
 
@@ -318,6 +347,24 @@ impl CLIAgent {
             .collect();
         Self::detect_from_argv_with(&argv, custom)
     }
+}
+
+/// 一个 sRGB 十六进制色与**白色**的 WCAG 对比度（1.0 = 同色，21 = 纯黑对纯白）。
+///
+/// 自带实现而不是复用 `workspace::tab_bar` 的 `contrast_ratio`：那个吃
+/// `gpui::Rgba`，而这个模块是纯逻辑层（识别、状态机、事件协议），除测试外
+/// 不依赖 gpui。为了一个 3 行的亮度计算把渲染依赖引进核心层不划算。
+fn contrast_against_white(hex: u32) -> f32 {
+    let linear = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [_, r, g, b] = hex.to_be_bytes().map(|b| b as f32 / 255.0);
+    let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    1.05 / (luminance + 0.05)
 }
 
 /// 把 shell 集成捕获的命令行切成 argv，**保留大小写**。
@@ -635,6 +682,41 @@ mod tests {
         CLIAgent::detect_from_argv_with(&argv(parts), &HashMap::new())
     }
 
+    /// 每个 agent 的圆盘图形都必须在自己底色上看得清。
+    ///
+    /// 图形只有约 8.6px（16px 圆盘的 54%），对比度不足就糊成一团。这条守的是
+    /// 「改了品牌色、忘了图形颜色」——黑压黑或白压白会让图标整个消失。
+    /// 3:1 是 WCAG 对非文本图形的下限。
+    #[test]
+    fn every_agent_glyph_is_legible_on_its_disc() {
+        let luminance = |hex: u32| {
+            let linear = |v: f32| {
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let [_, r, g, b] = hex.to_be_bytes().map(|b| b as f32 / 255.0);
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        };
+        let contrast = |a: u32, b: u32| {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+
+        for agent in CLIAgent::ALL {
+            let disc = agent.accent_rgb();
+            let glyph = agent.icon_rgb();
+            let ratio = contrast(disc, glyph);
+            assert!(
+                ratio >= 3.0,
+                "{agent:?} 的图形 #{:06X} 在底色 #{:06X} 上对比度只有 {:.2}:1，看不清",
+                glyph, disc, ratio
+            );
+        }
+    }
+
 
     #[test]
     fn detects_native_binaries() {
@@ -743,50 +825,64 @@ mod tests {
         }
     }
 
-    /// 品牌色是纯黑的 agent，靠一道细边才不至于和深色主题背景糊在一起。
+    /// 品牌色接近纯黑的 agent，靠一道细边才不至于和深色主题背景糊在一起。
     /// 这个测试锁住「哪些是黑的」这个事实，渲染层的描边逻辑依赖它。
     #[test]
     fn black_branded_avatars_keep_their_brand_field() {
-        assert_eq!(CLIAgent::Codex.accent_rgb(), 0x000000);
-        assert_eq!(CLIAgent::Grok.accent_rgb(), 0x000000);
-        // TraeCode 的图形自带绿前景，底刻意选黑。
-        assert_eq!(CLIAgent::TraeCode.accent_rgb(), 0x000000);
-        // QoderCLI 反过来：底是白的，图形是黑的。
-        assert_eq!(CLIAgent::QoderCLI.accent_rgb(), 0xFFFFFF);
+        // 官方标志本身就是单色的：OpenAI 的 favicon 用 currentColor、
+        // x.ai 的 icon 是纯灰度、Qoder 官网 logo 是 #0F0D0C、
+        // OpenCode 的 app-icon 底色是 #131010、TRAE 的 favicon 底色是 #0A0B0D。
+        for agent in [
+            CLIAgent::Codex,
+            CLIAgent::Grok,
+            CLIAgent::QoderCLI,
+            CLIAgent::OpenCode,
+            CLIAgent::Kimi,
+            CLIAgent::Auggie,
+        ] {
+            assert!(
+                luminance(agent.accent_rgb()) < 0x20,
+                "{agent:?} 的底色 {:#08X} 不再是近黑，描边判定要跟着改",
+                agent.accent_rgb()
+            );
+        }
+        // TRAE 是近黑而非纯黑（官方 favicon 底色 #0A0B0D）。
+        assert_eq!(CLIAgent::TraeCode.accent_rgb(), 0x0A0B0D);
     }
 
-    /// 黑/白品牌的图形色必须**反相**，否则在对应主题下隐形。
+    /// 图形色必须在自己底色上看得清——判据是 `icon_rgb` 按底色亮度自动反相。
     ///
-    /// 这是 `icon_rgb` 唯一不能用「直接返回 accent」的理由，也是最容易在改色时
-    /// 被顺手删掉的一处，所以单独钉住：
-    ///
-    /// - 品牌色是**黑**的：图形的 accent 就是黑的，深色主题下图形贴在同色背景上
-    ///   等于没有 → 图形必须比 accent 亮。
-    /// - 品牌色是**白**的（QoderCLI 是黑底图形落白盘）：浅色主题下同理 → 图形
-    ///   必须比 accent 暗。
-    ///
-    /// 只断言「亮/暗」的方向而不是具体色值：具体色值是可调的（换主题色板会动），
-    /// 方向错了则是功能故障。
+    /// 这是 `icon_rgb` 不能用「直接返回 accent」的理由，也是最容易在改色时被顺手
+    /// 删掉的一处，所以单独钉住：图形默认白，底色偏亮时翻黑。方向错了则是功能故障
+    /// （黑压黑 / 白压白，图标整个消失）。
     #[test]
     fn black_and_white_brands_invert_their_glyph_colour() {
-        // 黑底品牌：图形要够亮。
-        for agent in [CLIAgent::Codex, CLIAgent::Grok, CLIAgent::TraeCode] {
+        // 深色底：图形要够亮。
+        for agent in [
+            CLIAgent::Codex,
+            CLIAgent::Grok,
+            CLIAgent::QoderCLI,
+            CLIAgent::OpenCode,
+            CLIAgent::Kimi,
+            CLIAgent::Auggie,
+        ] {
             let glyph = agent.icon_rgb();
             assert_ne!(glyph, agent.accent_rgb(), "{agent:?} 的图形色没反相");
             assert!(
                 luminance(glyph) > 0x80,
-                "{agent:?} 的图形色 {glyph:#08X} 太暗，深色主题下会隐形"
+                "{agent:?} 的图形色 {glyph:#08X} 太暗，深色底上会隐形"
             );
         }
 
-        // 白盘品牌：图形要够暗。
-        let qoder = CLIAgent::QoderCLI;
-        assert_ne!(qoder.icon_rgb(), qoder.accent_rgb());
-        assert!(
-            luminance(qoder.icon_rgb()) < 0x80,
-            "QoderCLI 的图形色 {:08X} 太亮，浅色主题下会隐形",
-            qoder.icon_rgb()
-        );
+        // 亮底：图形要够暗（Goose 的官方绿 #3ECC5F 白字仅 2.1:1）。
+        for agent in [CLIAgent::Goose, CLIAgent::Pi, CLIAgent::Aider, CLIAgent::Cursor] {
+            let glyph = agent.icon_rgb();
+            assert_ne!(glyph, agent.accent_rgb(), "{agent:?} 的图形色没反相");
+            assert!(
+                luminance(glyph) < 0x80,
+                "{agent:?} 的图形色 {glyph:#08X} 太亮，亮底上会隐形"
+            );
+        }
     }
 
     /// 粗糙的亮度近似（0..=255），只用来判断「亮底还是暗底」，不做色彩管理。
@@ -798,13 +894,21 @@ mod tests {
     }
 
     /// 白底或近白底的 agent 与浅色主题背景糊在一起，描边判定同样依赖这个事实。
+    ///
+    /// 官方色核验后**没有**任何 agent 的品牌色是纯白：Qoder 的官方 logo 是
+    /// 近黑 `#0F0D0C`（此前误用了纯白），其余白色系品牌（Cursor 的 `#EDECEC` 等）
+    /// 也都改成了各自官方 logo 的实际颜色。这条钉住这个事实，避免以后又引入
+    /// 一个和浅色背景同色的品牌色。
     #[test]
     fn white_branded_avatars_are_known() {
         let white: Vec<CLIAgent> = CLIAgent::ALL
             .into_iter()
-            .filter(|a| a.accent_rgb() == 0xFFFFFF)
+            .filter(|a| luminance(a.accent_rgb()) > 0xF0)
             .collect();
-        assert_eq!(white, vec![CLIAgent::QoderCLI]);
+        assert!(
+            white.is_empty(),
+            "品牌色不应是纯白（会与浅色主题背景同色）：{white:?}"
+        );
     }
 
     /// 只有没有自有图形的 agent 才回退到通用机器人图标——

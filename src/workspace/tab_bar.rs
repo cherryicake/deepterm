@@ -57,21 +57,56 @@ struct PanelDropPreview {
     tab_label: SharedString,
 }
 
+/// sRGB 分量 → 线性光（0.04045 是 sRGB 传递函数的分段点）。
+fn linearize(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB 相对亮度（WCAG 定义）：0 = 黑，1 = 白。
+fn relative_luminance(color: gpui::Rgba) -> f32 {
+    0.2126 * linearize(color.r) + 0.7152 * linearize(color.g) + 0.0722 * linearize(color.b)
+}
+
+/// WCAG 对比度：1.0 = 完全同色，21 = 纯黑对纯白。
+fn contrast_ratio(a: gpui::Rgba, b: gpui::Rgba) -> f32 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
 /// tty7 的圆盘边界规则：sRGB 相对亮度对比小于 1.25 时描边。
 fn agent_disc_needs_edge(fill: u32, surface: gpui::Hsla) -> bool {
-    let luminance = |color: gpui::Rgba| {
-        let linear = |v: f32| {
-            if v <= 0.04045 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
-    };
-    let a = luminance(rgb(fill));
-    let b = luminance(surface.into());
-    (a.max(b) + 0.05) / (a.min(b) + 0.05) < 1.25
+    contrast_ratio(rgb(fill), surface.into()) < 1.25
+}
+
+/// 两个颜色在 OKLab 空间的欧氏距离（≈ ΔE）；用于判断"能不能看出区别"。
+///
+/// 为什么不用亮度对比度（[`agent_disc_needs_edge`] 用的那套）：那个衡量的是
+/// "前景在背景上够不够清楚"，对**色相**差异不敏感。两个等亮度但色相相反的颜色
+/// 亮度比是 1.0，却一眼能分开——文字扫光正是这种情形（高亮色与基色同为前景，
+/// 差异主要来自色相）。OKLab 是感知均匀空间，距离与人眼判断一致。
+///
+/// 经验刻度：0.02 刚可察觉，0.05 明显不同，0.15+ 差异强烈。
+fn oklab_distance(a: gpui::Rgba, b: gpui::Rgba) -> f32 {
+    let (l1, a1, b1) = to_oklab(a);
+    let (l2, a2, b2) = to_oklab(b);
+    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+}
+
+/// sRGB → OKLab（Björn Ottosson 的系数）。
+fn to_oklab(c: gpui::Rgba) -> (f32, f32, f32) {
+    let (r, g, b) = (linearize(c.r), linearize(c.g), linearize(c.b));
+    let l = (0.412_221_47 * r + 0.536_332_54 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    (
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    )
 }
 
 const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
@@ -196,7 +231,21 @@ fn shimmer_highlights<'a>(
     base: gpui::Rgba,
     accent: gpui::Rgba,
 ) -> impl Iterator<Item = (std::ops::Range<usize>, HighlightStyle)> + 'a {
-    let radius = (width * 0.18).clamp(2.5, 6.0);
+    // 亮核半径随标签宽度成比例——**不能**加上限。
+    //
+    // 相位是余弦往返，带中心的峰值速度 = π·width / period，即每帧位移
+    // 随宽度线性增长；而亮核宽度就是 radius。一旦帧位移接近或超过亮核宽度，
+    // 带就会「跳过」字形：某个字形从进入带内到离开，期间没有任何一帧采样到
+    // 它的峰值，视觉上表现为部分字**根本不亮**。
+    //
+    // 实测（30fps、周期 2.4s，width=120px 时每帧位移 5.24px）：旧的
+    // `.clamp(2.5, 6.0)` 把 radius 卡在 6px，帧位移/亮核 = 0.87，60% 的字
+    // 达不到峰值；宽度 180px 时 47% 的字不亮。按 0.18·width 放开上限后，
+    // 该比值恒定在 0.242（< 0.35 的临界值），任意宽度下都没有字被跳过。
+    //
+    // 下限 2.5px 仍然保留：极窄标签（<14px）若亮核小于 2.5px，扫光会退化成
+    // 一根细线扫过，看不出「一道光」的形状。
+    let radius = (width * 0.18).max(2.5);
     let center = phase * width;
     glyphs
         .iter()
@@ -325,6 +374,18 @@ impl TabItem {
     pub fn with_is_remote(mut self, is_remote: bool) -> Self {
         self.is_remote = is_remote;
         self
+    }
+
+    /// 当前 agent 的品牌色；不是 agent 图标时为 `None`。
+    ///
+    /// 品牌色已经存在 [`Icon::AgentIcon::accent_rgb`] 里（圆盘底色用的就是它），
+    /// 这里只是把它取出来给文字扫光复用——**不**在渲染层重新查一遍
+    /// `CLIAgent`，那样会多一个"图标是 A、颜色按 B 画"的错配来源。
+    fn agent_accent_rgb(&self) -> Option<u32> {
+        match self.icon {
+            Some(Icon::AgentIcon { accent_rgb, .. }) => Some(accent_rgb),
+            _ => None,
+        }
     }
 }
 
@@ -1126,6 +1187,15 @@ impl TabBar {
                 Some(theme.tab_hover_background),
             )
         };
+        // 标签底色：扫光文字要在它上面可见（见 `agent_sweep_color`）。compact
+        // 模式下标签自身透明，文字实际压在标签栏背景上，所以按标签栏取。
+        let surface = if self.compact {
+            theme.tab_bar_background
+        } else if is_active {
+            theme.tab_active_background
+        } else {
+            theme.tab_inactive_background
+        };
         let tab_inner = div()
             .id(tab_id.clone())
             .h(tab_height)
@@ -1164,7 +1234,7 @@ impl TabBar {
                 },
             )
             .child(self.render_tab_icon_slot(tab, &tab_id, is_active, cx))
-            .child(Self::render_tab_label(tab, is_active, theme))
+            .child(Self::render_tab_label(tab, is_active, theme, surface))
             .on_click(cx.listener({
                 let on_tab_click = self.on_tab_click.clone();
                 let tab_id = tab_id.clone();
@@ -1406,6 +1476,50 @@ impl TabBar {
             .into_any_element()
     }
 
+    /// 标签文字扫光的高亮色：当前 agent 的**品牌色**。
+    ///
+    /// # 为什么要做可见性兜底
+    ///
+    /// 品牌色里有一批是近黑或近白（Codex / Grok / Kimi / OpenCode / Auggie 是黑，
+    /// Cursor 是浅灰）。它们与文字**基色**撞色时，扫光扫过去什么都看不见。
+    ///
+    /// # 为什么用感知距离而不是亮度对比
+    ///
+    /// 亮度对比度是给"前景 vs 背景"判断可读性的，用在"两个前景色能否区分"
+    /// 上会严重误判：solarized-dark 的文字 `#839496` 与 Claude 橙 `#D97757`
+    /// 亮度比只有 1.01（看起来"隐形"），但两者色相迥异，感知距离 0.151，
+    /// **肉眼一眼可辨**。若按亮度判，21/23 个 agent 都会被无谓地回落掉。
+    ///
+    /// 所以这里用 OKLab 的欧氏距离（≈ ΔE）：它对色相差异敏感，与人眼判断一致。
+    /// 阈值 0.05 取自"明显不同"的下限（刚可察觉约 0.02）。
+    ///
+    /// # 为什么还要查一次背景
+    ///
+    /// "与基色分得开"只是必要条件：扫光是把**文字**染成品牌色，所以品牌色还得
+    /// 在标签底色上看得见。只看基色会放过一整类反例——浅色主题的标签底色接近
+    /// 纯白（github-light 就是 `#FFFFFF`），黑色品牌色与正文分得很开，扫光扫过去
+    /// 却直接压进底色里，**文字整段消失**。
+    ///
+    /// 两条判据都过才用品牌色，否则回落到主题 accent。实测 23 个 agent ×
+    /// 31 个主题 × 2 种激活态共 1426 个组合：8 个 agent 会在部分主题下回落
+    /// （品牌色越接近黑白，回落越多），其余组合全部保留品牌色。回落目标本身
+    /// 始终安全：accent 对正文的最小感知距离 0.051、对底色最小对比度 1.63。
+    fn agent_sweep_color(
+        brand_rgb: u32,
+        base: gpui::Hsla,
+        surface: gpui::Hsla,
+        accent: gpui::Hsla,
+    ) -> gpui::Hsla {
+        let brand = rgb(brand_rgb);
+        let distinguishable = oklab_distance(brand, base.into()) >= 0.05;
+        let visible_on_surface = contrast_ratio(brand, surface.into()) >= 1.25;
+        if distinguishable && visible_on_surface {
+            brand.into()
+        } else {
+            accent
+        }
+    }
+
     /// 标签文本（含未保存 / 需关注圆点），非激活时限宽截断
     ///
     /// 两个圆点是**两个维度**，可以同时出现：
@@ -1416,7 +1530,12 @@ impl TabBar {
     /// 红点**不**因为图标上有 agent 状态点而让位：那个点说的是"agent 在干什么"，
     /// 不会因为你切过去看过就消失；红点说的是"这次完成你还没看"。前者是状态，
     /// 后者是未读，两者不重复。详见 [`should_show_attention_dot`] 的文档。
-    fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
+    fn render_tab_label(
+        tab: &TabItem,
+        is_active: bool,
+        theme: UiTheme,
+        surface: gpui::Hsla,
+    ) -> Div {
         let show_attention = should_show_attention_dot(tab);
 
         div()
@@ -1499,7 +1618,20 @@ impl TabBar {
                                     } else {
                                         theme.text_muted
                                     },
-                                    theme.accent,
+                                    // 扫光高亮用当前 agent 的品牌色，而不是主题
+                                    // 强调色：文字在动的时候顺带说明"是哪个 agent
+                                    // 在干活"。品牌色与正文或标签底色撞色时由
+                                    // `agent_sweep_color` 回落到主题 accent。
+                                    Self::agent_sweep_color(
+                                        tab.agent_accent_rgb().unwrap_or(0),
+                                        if is_active {
+                                            theme.text
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                        surface,
+                                        theme.accent,
+                                    ),
                                 )),
                         )
                     }),
@@ -1686,6 +1818,48 @@ mod tests {
         // A sub-character movement must change intensity, not jump a solid band.
         let next: Vec<_> = shimmer_highlights(&glyphs, 10.0, 0.51, base, accent).collect();
         assert_ne!(frame, next);
+    }
+
+    /// 扫光带不能「跳过」字形：任何宽度的标签上，每个字都要有机会亮到峰值。
+    ///
+    /// 相位是余弦往返，带中心的峰值速度 = π·width / period，即每帧位移随宽度
+    /// **线性增长**；而亮核宽度就是 radius。一旦帧位移逼近亮核宽度，字形从进入
+    /// 带到离开之间没有任何一帧采样到它的峰值——部分字**根本不亮**。
+    ///
+    /// 这条守的是 radius 的上限回归：旧代码 `.clamp(2.5, 6.0)` 把亮核卡在 6px，
+    /// 30fps 下 width=120px 时帧位移 5.24px（比值 0.87），60% 的字达不到峰值。
+    /// 按 0.18·width 放开上限后该比值恒为 0.242，任意宽度都无字形被跳过。
+    #[test]
+    fn every_glyph_reaches_peak_across_label_widths() {
+        // base 纯黑、accent 纯白：红通道即强度（仅差 ±1e-4 的防合并微调）。
+        let base = rgb(0x000000);
+        let accent = rgb(0xFFFFFF);
+        let frames =
+            (AGENT_WORK_SHIMMER_PERIOD_MS as f32 / 1000.0 * AGENT_WORK_SHIMMER_MAX_FPS) as usize;
+
+        for width in [30.0, 60.0, 120.0, 180.0, 240.0] {
+            let count = (width / 8.0) as usize;
+            let glyphs: Vec<_> = (0..count)
+                .map(|i| (i..i + 1, (i as f32 + 0.5) * width / count as f32))
+                .collect();
+            let mut peak = vec![0.0f32; count];
+            // 按真实帧率逐帧跑满一个周期，记录每个字形见过的最强亮度。
+            for frame in 0..frames {
+                let phase = shimmer_phase(frame as f32 / frames as f32);
+                for (index, (_, style)) in
+                    shimmer_highlights(&glyphs, width, phase, base, accent).enumerate()
+                {
+                    let r = gpui::Rgba::from(style.color.unwrap()).r;
+                    peak[index] = peak[index].max(r);
+                }
+            }
+            let dim = peak.iter().filter(|p| **p < 0.9).count();
+            assert_eq!(
+                dim, 0,
+                "width={width}: {dim}/{count} 个字形整周期都没亮到峰值——\
+                 扫光带跳过了它们（radius 相对每帧位移太小）"
+            );
+        }
     }
 
     /// 相位必须是 0→1→0 的往返，且两端（t=0 / t=1）速度为零。
@@ -2081,6 +2255,145 @@ mod tests {
         }
     }
 
+    /// 扫光高亮色优先用 agent 品牌色；与正文或标签底色撞色时才回落。
+    ///
+    /// 守两类失败：
+    /// 1. 高亮色退化成主题 accent（改动前的行为）——文字在动，但看不出是哪个 agent；
+    /// 2. 品牌色撞色时直接用它——扫光扫过去**什么都看不见**。
+    ///
+    /// 撞色有两种，必须都判：
+    /// - 与**正文基色**重合（品牌色与正文同色时扫光不可见）；
+    /// - 在**标签底色**上不可见（浅色主题的标签底色接近纯白，黑色品牌色
+    ///   扫过去直接压进底色里）。只看正文会放过后者。
+    ///
+    /// 用例取自 `assets/themes/builtin.json` 的真实值，不手编：手编极易把
+    /// 「看起来该重合」当成重合（纯黑配 #1A1A1A 实际感知距离 0.218，完全可辨）。
+    #[test]
+    fn agent_sweep_color_uses_brand_unless_indistinguishable() {
+        let accent: gpui::Hsla = rgb(0x3B82F6).into();
+        // `Hsla`/`Rgba` 没有精确 `PartialEq`（浮点分量），逐通道比较。
+        let same = |a: gpui::Hsla, b: gpui::Hsla| {
+            let (x, y) = (gpui::Rgba::from(a), gpui::Rgba::from(b));
+            (x.r - y.r).abs() < 1e-4 && (x.g - y.g).abs() < 1e-4 && (x.b - y.b).abs() < 1e-4
+        };
+        // 中性的安全底色（对纯黑/纯白都有足够对比度），用于隔离「与正文撞色」。
+        let neutral: gpui::Hsla = rgb(0x808080).into();
+
+        // solarized-dark 正文（#839496）与 Claude 橙：亮度比 1.01 但色相迥异，
+        // 感知距离 0.151 → 必须保留品牌色。这是亮度判据会误杀的典型形态。
+        let solarized_dark_text: gpui::Hsla = rgb(0x839496).into();
+        assert!(
+            same(
+                TabBar::agent_sweep_color(
+                    0xD97757,
+                    solarized_dark_text,
+                    rgb(0x002b36).into(),
+                    accent
+                ),
+                rgb(0xD97757).into()
+            ),
+            "色相迥异时必须保留品牌色，不能被亮度判据误杀"
+        );
+
+        // 与正文重合：macos26-dark 的正文就是 #FFFFFF，纯白品牌与它距离 0
+        // → 回落（底色中性，排除背景因素）。
+        let white_text: gpui::Hsla = rgb(0xFFFFFF).into();
+        assert!(
+            same(
+                TabBar::agent_sweep_color(0xFFFFFF, white_text, neutral, accent),
+                accent
+            ),
+            "品牌色与正文完全重合时必须回落，否则扫光不可见"
+        );
+
+        // 在底色上不可见：github-light 的标签底色是 #FFFFFF，纯白品牌
+        // 与正文 #24292F 分得很开（dE 0.722），但白字压白底对比度 1.00
+        // → 必须回落。只看正文的判据会在这里放行。
+        let github_light_text: gpui::Hsla = rgb(0x24292F).into();
+        let github_light_bg: gpui::Hsla = rgb(0xFFFFFF).into();
+        assert!(
+            same(
+                TabBar::agent_sweep_color(
+                    0xFFFFFF,
+                    github_light_text,
+                    github_light_bg,
+                    accent
+                ),
+                accent
+            ),
+            "品牌色在标签底色上不可见时必须回落（白字压白底）"
+        );
+
+        // 同一个纯白品牌配 macos26-light 的底色（#DEDEE4，对比度 1.29）→ 保留。
+        assert!(
+            same(
+                TabBar::agent_sweep_color(
+                    0xFFFFFF,
+                    rgb(0x1D1D1F).into(),
+                    rgb(0xDEDEE4).into(),
+                    accent
+                ),
+                rgb(0xFFFFFF).into()
+            ),
+            "品牌色在底色上可见、与正文也分得开时必须保留"
+        );
+
+        // 纯黑品牌（Codex / Grok / Kimi / OpenCode / Auggie）配 ayu-dark 的
+        // 深色底色（#0a0e14，对比度 1.09）→ 回落；同一个黑色配浅色正文和浅底
+        // → 保留。
+        assert!(
+            same(
+                TabBar::agent_sweep_color(
+                    0x000000,
+                    rgb(0xb3b1ad).into(),
+                    rgb(0x0a0e14).into(),
+                    accent
+                ),
+                accent
+            ),
+            "纯黑品牌在深色底色上不可见时必须回落"
+        );
+        assert!(
+            same(
+                TabBar::agent_sweep_color(
+                    0x000000,
+                    rgb(0x1D1D1F).into(),
+                    rgb(0xF5F5F7).into(),
+                    accent
+                ),
+                rgb(0x000000).into()
+            ),
+            "纯黑品牌配浅色正文和浅底时清晰可见"
+        );
+    }
+
+    /// `TabItem` 的品牌色必须来自图标本身携带的 `accent_rgb`。
+    ///
+    /// 渲染层若自己再查一次 `CLIAgent`，就多了一个「图标画的是 A、扫光按 B 取色」
+    /// 的错配来源。这里锁住两者同源。
+    #[test]
+    fn tab_item_brand_color_comes_from_its_icon() {
+        use crate::agent::CLIAgent;
+
+        let tab = TabItem {
+            icon: Some(Icon::AgentIcon {
+                path: CLIAgent::Claude.icon_path(),
+                rgb: CLIAgent::Claude.icon_rgb(),
+                accent_rgb: CLIAgent::Claude.accent_rgb(),
+            }),
+            ..TabItem::new("t", "terminal")
+        };
+        assert_eq!(
+            tab.agent_accent_rgb(),
+            Some(CLIAgent::Claude.accent_rgb()),
+            "品牌色必须与图标携带的 accent_rgb 一致"
+        );
+
+        // 非 agent 图标没有品牌色（普通终端 / 编辑器 tab）。
+        let plain = TabItem::new("t2", "terminal");
+        assert_eq!(plain.agent_accent_rgb(), None);
+    }
+
     /// 「需关注」红点的让位规则。
     #[test]
     fn attention_dot_yields_to_modified_only() {
@@ -2168,4 +2481,5 @@ mod tests {
             );
         }
     }
+
 }
