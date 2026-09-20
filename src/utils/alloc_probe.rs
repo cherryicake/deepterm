@@ -25,6 +25,11 @@ use std::alloc::{GlobalAlloc, Layout};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 一次 `phys_footprint` 快照（字节）。
+///
+/// **这是进程级的量**：`phys_footprint` 覆盖整个进程，不区分分配来自哪个
+/// 线程。因此基于它的测量（如 `terminal_scrollback_footprint_scales_linearly`）
+/// 只在「同一时刻没有其他测试在分配大块内存」的前提下才成立——GPUI 测试默认
+/// 多线程跑，谁拿到这个锁，别人的分配就会污染差值。
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct Footprint(pub u64);

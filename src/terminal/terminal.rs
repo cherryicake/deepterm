@@ -61,6 +61,22 @@ use crate::terminal::mappings::mouse::{
 /// 最大滚动缓冲区行数限制
 const MAX_SCROLLBACK_LINES: usize = 100000;
 
+/// 渲染侧连续跳过多少次网格锁之后，退回公平锁（见 `update_last_content`）。
+///
+/// 取 4：足够吸收「读线程正在喂一个 chunk」的短暂窗口（一跳就是一帧），
+/// 又不至于让持续大流量把画面永久饿住——超过这个次数说明锁确实被长期占用，
+/// 此时排在 lease 后面的有界等待，比继续丢帧更划算。
+pub(crate) const MAX_SNAPSHOT_LOCK_SKIPS: u32 = 4;
+
+/// 跳过快照刷新后，隔多久主动补一帧（见 `sync_inner`）。
+///
+/// 跳过本身只在「恰好还有下一帧」时才安全：`sync` 的唯一调用点是元素
+/// prepaint，所以**必须有人再排一帧**，否则最后一次唤醒（读线程退出前的
+/// drain、SSH 断连、`ChildExit`）若撞上被占住的锁，`content_dirty` 会永久
+/// 置位、画面停在旧内容上，直到用户碰鼠标。窗口内重绘不可靠（`notify` 与
+/// `refresh` 在 prepaint 期间都不排队新帧），所以用一个短定时器兜底。
+const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(8);
+
 /// resize 合并间隔（1:1 移植 ghostty `termio/Thread.zig` 的 `Coalesce.min_ms = 25`）。
 ///
 /// ghostty 语义：定时器活动期间只更新最新值、**不重置定时器**（节流而非防抖），
@@ -702,7 +718,12 @@ impl From<&alacritty_terminal::term::cell::Cell> for PackedCell {
     }
 }
 
-#[derive(Clone, Debug)]
+/// 视口快照里的一个单元格。
+///
+/// `PartialEq` 是给平价测试用的：增量路径与整体重建必须逐格完全一致，
+/// 包括 `zerowidth`（Kitty `U=1` 占位符的行/列编码）与 `hyperlink`。
+/// 手写比对容易漏掉后来新增的字段，整格比较则不会。
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexedCell {
     pub point: AlacPoint,
     pub cell: PackedCell,
@@ -891,6 +912,18 @@ pub struct Terminal {
     last_content: TerminalContent,
     pub content_generation: u64,
     content_dirty: bool,
+    /// 连续多少次因为拿不到网格锁而跳过了快照刷新（见 `update_last_content`）。
+    /// 超过 [`MAX_SNAPSHOT_LOCK_SKIPS`] 后退回公平锁，保证画面一定跟得上。
+    snapshot_lock_skips: u32,
+    /// 测试专用：增量快照分支的命中次数（见 `incremental_snapshot_count_for_test`）。
+    #[cfg(test)]
+    incremental_snapshot_count: u64,
+    /// 测试专用：兜底全量重建分支的命中次数（见 `row_ranges` 不一致那条路径）。
+    #[cfg(test)]
+    snapshot_fallback_count: u64,
+    /// 测试专用：累计重建了多少个 `IndexedCell`（增量快照收益的直接度量）。
+    #[cfg(test)]
+    snapshot_cells_built: u64,
     /// 每次 update_last_content 后，标记哪些 viewport 行（0 = 顶行）发生了变化
     dirty_rows: Vec<bool>,
     /// 每次 update_last_content 后，记录 viewport 行的脏区列范围 `(left, right)`。
@@ -906,6 +939,11 @@ pub struct Terminal {
     pending_resize: Option<TerminalBounds>,
     /// resize 合并任务句柄（ghostty 式 25ms 非重置节流）；drop 即取消。
     resize_task: Option<Task<()>>,
+    /// 跳过快照刷新后的补帧任务句柄（见 [`SNAPSHOT_RETRY_DELAY`]）；drop 即取消。
+    ///
+    /// 只保证「一定会再有一帧」，不保证那一帧就能拿到锁——拿不到就再排一个，
+    /// 直到 `MAX_SNAPSHOT_LOCK_SKIPS` 触发的公平锁兜底把它刷完为止。
+    snapshot_retry_task: Option<Task<()>>,
     /// 是否已完成首次 resize。deepterm 特有：PTY 以默认 55×18 启动，首帧需立即
     /// 校正（ghostty spawn 时就用 surface 实际尺寸创建 PTY，无此问题）。
     resize_primed: bool,
@@ -1066,12 +1104,20 @@ impl Terminal {
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
+            snapshot_lock_skips: 0,
+            #[cfg(test)]
+            incremental_snapshot_count: 0,
+            #[cfg(test)]
+            snapshot_fallback_count: 0,
+            #[cfg(test)]
+            snapshot_cells_built: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
             event_loop_task: None,
             driver_task: None,
             pending_resize: None,
             resize_task: None,
+            snapshot_retry_task: None,
             resize_primed: false,
             vte_processor: Processor::<StdSyncHandler>::new(),
             input_area_start: None,
@@ -1261,12 +1307,20 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                snapshot_lock_skips: 0,
+                #[cfg(test)]
+                incremental_snapshot_count: 0,
+                #[cfg(test)]
+                snapshot_fallback_count: 0,
+                #[cfg(test)]
+                snapshot_cells_built: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 driver_task: reader_notice_task,
                 pending_resize: None,
                 resize_task: None,
+                snapshot_retry_task: None,
                 resize_primed: false,
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 input_area_start: None,
@@ -1415,12 +1469,20 @@ impl Terminal {
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
+            snapshot_lock_skips: 0,
+            #[cfg(test)]
+            incremental_snapshot_count: 0,
+            #[cfg(test)]
+            snapshot_fallback_count: 0,
+            #[cfg(test)]
+            snapshot_cells_built: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
             event_loop_task: None,
             driver_task: None,
             pending_resize: None,
             resize_task: None,
+            snapshot_retry_task: None,
             resize_primed: false,
             vte_processor: Processor::<StdSyncHandler>::new(),
             input_area_start: None,
@@ -1704,12 +1766,20 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                snapshot_lock_skips: 0,
+                #[cfg(test)]
+                incremental_snapshot_count: 0,
+                #[cfg(test)]
+                snapshot_fallback_count: 0,
+                #[cfg(test)]
+                snapshot_cells_built: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 event_loop_task: Some(event_loop_task),
                 driver_task: Some(driver_task),
                 pending_resize: None,
                 resize_task: None,
+                snapshot_retry_task: None,
                 resize_primed: false,
                 vte_processor: Processor::<StdSyncHandler>::new(),
                 input_area_start: None,
@@ -1970,7 +2040,11 @@ impl Terminal {
         }
         // 光标槽位不自动 damage，这里强制刷新一次内容快照，
         // 保证 palette 立刻反映新主题。
-        self.update_last_content(true);
+        // 注意：`force_full_damage` 只是「拿不到锁时也退回公平锁」，首选仍是
+        // 非阻塞的 `try_lock_unfair`，所以本调用**仍可能返回 false**（快照跳过
+        // 本帧）。这不影响正确性：主题色已写进 `Term.colors`，下一帧快照自然
+        // 会带上；调用方也无需重试。
+        let _ = self.update_last_content(true);
     }
 
     /// 更新终端焦点状态。
@@ -3053,16 +3127,97 @@ impl Terminal {
         }
     }
 
-    fn update_last_content(&mut self, force_full_damage: bool) {
-        let mut term = self.term.lock();
+    /// 对整个视口重建快照：铺满 `cells` 并据此重算 `row_ranges`。
+    ///
+    /// `Full` damage（滚动 / resize / 清屏…）与几何变化都走这里；增量路径
+    /// 只覆盖脏行、不碰这两个缓冲，所以这段逻辑必须保持「全量且自洽」。
+    fn rebuild_viewport_snapshot<'a>(
+        cells: &mut Vec<IndexedCell>,
+        row_ranges: &mut Vec<(usize, usize)>,
+        display_iter: impl Iterator<Item = alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>>,
+        num_rows: usize,
+    ) {
+        let estimated_size = display_iter.size_hint().0;
+        cells.clear();
+        if cells.capacity() < estimated_size {
+            cells.reserve(estimated_size);
+        }
+
+        cells.extend(display_iter.map(|ic| {
+            // `hyperlink()` is an `Arc` clone (no string allocation); the
+            // `id`/`uri` strings are only materialized when grouping ranges
+            // for hover hit-testing while the link modifier is held.
+            IndexedCell {
+                point: ic.point,
+                cell: PackedCell::from(ic.cell),
+                zerowidth: packed_zerowidth(ic.cell),
+                hyperlink: ic.cell.hyperlink(),
+            }
+        }));
+
+        row_ranges.clear();
+        row_ranges.reserve(num_rows.max(cells.len() / 4));
+        let mut start = 0usize;
+        while start < cells.len() {
+            let line = cells[start].point.line;
+            let mut end = start + 1;
+            while end < cells.len() && cells[end].point.line == line {
+                end += 1;
+            }
+            row_ranges.push((start, end));
+            start = end;
+        }
+    }
+
+    /// 刷新 `last_content` 快照；返回 false 表示没拿到网格锁、快照未更新
+    /// （调用方应保持 `content_dirty`，下一帧再试）。
+    fn update_last_content(&mut self, force_full_damage: bool) -> bool {
+        // 渲染侧不排队等网格锁。
+        //
+        // `Term` 由 `FairMutex` 保护，读线程解析一个 chunk 时会先拿 `lease()`
+        // 占住 `next`，再持 `data` 直到 `MAX_LOCKED_READ`（64 KiB）喂完。UI
+        // 线程若用公平的 `lock()`，就得排在那个 lease 后面——一个 pane 的写
+        // 入速度会直接绑住整个窗口的帧率（同一 UI 线程要画所有 pane）。
+        //
+        // 所以先 `try_lock_unfair()` 抄近路（不排队、不阻塞）。拿不到说明读
+        // 线程正在写网格，此时**本轮跳过**快照刷新：`content_dirty` 保持置位，
+        // 下一个事件循环的 `sync()` 会再试一次，屏幕上最坏只是少画一帧——
+        // 与 tty7 在 `TerminalElement::build_grid` 里的取舍同源。
+        //
+        // 连续跳过的次数有上限（[`MAX_SNAPSHOT_LOCK_SKIPS`]）：持续大流量下
+        // 读线程喂完一个 chunk 就立刻回来重取锁，`try_lock_unfair` 可能一次次
+        // 落空，屏幕就再也不更新了。超限后退回公平锁——它确实会排在 lease
+        // 后面，但 lease 只在喂一个 chunk（最多 64 KiB）期间持有，代价有界，
+        // 换来的是「画面一定跟得上」。
+        //
+        // 例外是 `force_full_damage`：resize / 主题换色这类路径要求快照与网格
+        // 立刻一致（否则会拿旧尺寸的内容去配新网格），所以拿不到锁时它**不跳过**，
+        // 而是退回公平锁排队。注意它并非「总是排队」——首选仍是上面的非阻塞
+        // `try_lock_unfair`，只有在抢不到时才走到 `self.term.lock()`。
+        let mut term = match self.term.try_lock_unfair() {
+            Some(term) => {
+                self.snapshot_lock_skips = 0;
+                term
+            }
+            None if force_full_damage => self.term.lock(),
+            None if self.snapshot_lock_skips >= MAX_SNAPSHOT_LOCK_SKIPS => self.term.lock(),
+            None => {
+                self.snapshot_lock_skips += 1;
+                return false;
+            }
+        };
 
         // Collect damage info while we hold the lock, before resetting.
         let num_rows = self.terminal_bounds.num_lines();
         let num_cols = self.terminal_bounds.num_columns();
+        // `Full` damage（滚动、resize、模式切换、清屏…）意味着视口里没有一行
+        // 可以信任，必须整体重建快照；`Partial` 则只列出真正变过的行。
+        let full_damage;
         if force_full_damage {
             // 在重置前先消费掉待处理的 damage，这样即使我们将强制进行
             // 全量失效，内部的 damage 追踪器状态也能保持一致。
             let _ = term.damage();
+            full_damage = true;
             Self::mark_viewport_fully_dirty(
                 &mut self.dirty_rows,
                 &mut self.dirty_row_bounds,
@@ -3075,6 +3230,7 @@ impl Terminal {
             self.dirty_row_bounds.clear();
             match damage {
                 TermDamage::Full => {
+                    full_damage = true;
                     Self::mark_viewport_fully_dirty(
                         &mut self.dirty_rows,
                         &mut self.dirty_row_bounds,
@@ -3083,6 +3239,7 @@ impl Terminal {
                     );
                 }
                 TermDamage::Partial(iter) => {
+                    full_damage = false;
                     self.dirty_rows.resize(num_rows, false);
                     self.dirty_row_bounds.resize(num_rows, None);
                     for line_damage in iter {
@@ -3099,38 +3256,84 @@ impl Terminal {
         term.reset_damage();
 
         let content = term.renderable_content();
+        let display_offset = content.display_offset;
 
-        let estimated_size = content.display_iter.size_hint().0;
+        // ── 视口快照：只有 `Partial` damage 时按行增量刷新 ──────────────────
+        //
+        // 旧实现每帧对**整个视口**（默认 80×24 = 1920 格，大窗口更多）重新
+        // 构造 `IndexedCell`（每格 56 字节，含一次 `Arc` 克隆），即使只有一行
+        // 变过。打字 / 回显这种稳态场景下，每帧的绝大部分工作都是白做的。
+        //
+        // 增量成立的前提由 alacritty 的 damage 语义保证：任何会让**视口整体
+        // 错位**的操作（`scroll_display`、resize、`scroll_up_relative` /
+        // `scroll_down_relative`、清屏、模式切换）都会 `mark_fully_damaged()`，
+        // 于是我们只会看到 `TermDamage::Full`，走整体重建。`Partial` 因此
+        // 意味着「只有这些行变了，且它们仍在原来的视口行号上」。
+        //
+        // 另外必须守住的两条：
+        // - `display_offset` 变了必然是全量（同上，`scroll_display` 已置 Full），
+        //   这里仍显式比对一次，作为不依赖上游实现的自身防线；
+        // - 视口行列数变了（resize 的 reflow 可能早于 damage 被观察）同样是
+        //   全量，否则行切片长度会对不上。
+        let geometry_changed = self.last_content.cols != num_cols
+            || self.last_content.rows != num_rows
+            || self.last_content.display_offset != display_offset;
+        let rebuild_all = full_damage || geometry_changed;
+
         let cells = &mut self.last_content.cells;
-        cells.clear();
-        if cells.capacity() < estimated_size {
-            cells.reserve(estimated_size);
-        }
-
-        cells.extend(content.display_iter.map(|ic| {
-            // `hyperlink()` is an `Arc` clone (no string allocation); the
-            // `id`/`uri` strings are only materialized when grouping ranges
-            // for hover hit-testing while the link modifier is held.
-            IndexedCell {
-                point: ic.point,
-                cell: PackedCell::from(ic.cell),
-                zerowidth: packed_zerowidth(ic.cell),
-                hyperlink: ic.cell.hyperlink(),
-            }
-        }));
-
         let row_ranges = &mut self.last_content.row_ranges;
-        row_ranges.clear();
-        row_ranges.reserve(num_rows.max(cells.len() / 4));
-        let mut start = 0usize;
-        while start < cells.len() {
-            let line = cells[start].point.line;
-            let mut end = start + 1;
-            while end < cells.len() && cells[end].point.line == line {
-                end += 1;
+
+        if rebuild_all {
+            Self::rebuild_viewport_snapshot(cells, row_ranges, content.display_iter, num_rows);
+            #[cfg(test)]
+            {
+                self.snapshot_cells_built += cells.len() as u64;
             }
-            row_ranges.push((start, end));
-            start = end;
+        } else if row_ranges.len() == num_rows {
+            // 行切片长度与视口行数一致 → 原地覆盖变过的行，其余保持不动。
+            // 每行的 grid 行号由 display_offset 与行下标唯一确定，与整体重建
+            // 得到的 `IndexedCell::point.line` 完全一致。
+            #[cfg(test)]
+            {
+                self.incremental_snapshot_count += 1;
+            }
+            for (row_idx, (start, end)) in row_ranges.iter_mut().enumerate() {
+                if !self.dirty_rows.get(row_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let line = alacritty_terminal::index::Line(row_idx as i32 - display_offset as i32);
+                let cols = (*end - *start).min(num_cols);
+                #[cfg(test)]
+                {
+                    self.snapshot_cells_built += cols as u64;
+                }
+                for col in 0..cols {
+                    let point = AlacPoint::new(line, Column(col));
+                    let cell = &term.grid()[point];
+                    cells[*start + col] = IndexedCell {
+                        point,
+                        cell: PackedCell::from(cell),
+                        zerowidth: packed_zerowidth(cell),
+                        hyperlink: cell.hyperlink(),
+                    };
+                }
+            }
+        } else {
+            // 兜底：行切片长度与视口行数不一致。按上面的论证这条路径**不可达**
+            // （几何变化必然伴随 `Full` damage，已被 `rebuild_all` 拦下），
+            // 全量测试也确实走不到它。保留它是为了让「不变量万一被上游改动
+            // 打破」时退化成正确但慢的全量重建，而不是切片越界 panic。
+            // 测试靠 `corrupt_row_ranges_for_test` 人为破坏不变量进来——防御性
+            // 代码若从不执行，就无法证明它真能兜住。
+            #[cfg(test)]
+            {
+                self.snapshot_fallback_count += 1;
+            }
+            Self::rebuild_viewport_snapshot(cells, row_ranges, content.display_iter, num_rows);
+            #[cfg(test)]
+            {
+                self.snapshot_cells_built += cells.len() as u64;
+            }
         }
 
         self.last_content.cursor = content.cursor.point;
@@ -3198,6 +3401,9 @@ impl Terminal {
                 }
             }
         }
+
+        // 快照已与本帧的网格对齐（调用方据此清除 `content_dirty`）。
+        true
     }
 
     pub fn sync(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -3213,10 +3419,94 @@ impl Terminal {
         self.sync_inner(cx);
     }
 
-    fn sync_inner(&mut self, _cx: &mut Context<Self>) {
+    /// 测试专用：强制走一次**整体重建**的视口快照。
+    ///
+    /// 供增量快照的平价测试当参考实现——两条路径是同一函数里的两个分支，
+    /// 所以比对的是真实代码的等价性。
+    #[doc(hidden)]
+    pub fn full_snapshot_for_test(&mut self) {
+        let _ = self.update_last_content(true);
+    }
+
+    /// 测试专用：增量快照分支被真正走过的次数。
+    ///
+    /// 平价测试必须证明它比的是「增量 vs 全量」，而不是「全量 vs 全量」——
+    /// 否则测试会在增量路径彻底失效时依然全绿。这个计数器让那种失效可见。
+    #[cfg(test)]
+    pub fn incremental_snapshot_count_for_test(&self) -> u64 {
+        self.incremental_snapshot_count
+    }
+
+    /// 测试专用：网格锁句柄，供饥饿测试人为占住锁。
+    #[cfg(test)]
+    pub fn term_lock_for_test(&self) -> Arc<FairMutex<Term<ZedListener>>> {
+        self.term.clone()
+    }
+
+    /// 测试专用：置位内容脏标记，模拟「读线程送来了新输出」。
+    #[cfg(test)]
+    pub fn mark_content_dirty_for_test(&mut self) {
+        self.content_dirty = true;
+    }
+
+    /// 测试专用：快照是否仍待刷新。
+    #[cfg(test)]
+    pub fn content_dirty_for_test(&self) -> bool {
+        self.content_dirty
+    }
+
+    /// 测试专用：累计重建了多少个 `IndexedCell`。
+    ///
+    /// 这是增量快照收益的**确定性**度量——不受机器负载影响，比 wall-clock
+    /// 更能说明「每帧少做多少工作」。
+    #[cfg(test)]
+    pub fn snapshot_cells_built_for_test(&self) -> u64 {
+        self.snapshot_cells_built
+    }
+
+    /// 测试专用：立刻应用挂起的 resize（绕过 25ms 合并定时器）。
+    #[cfg(test)]
+    pub fn apply_pending_resize_for_test(&mut self, cx: &mut Context<Self>) {
+        self.apply_pending_resize(false, cx);
+    }
+
+    /// 测试专用：人为破坏「`row_ranges.len() == 视口行数`」这个不变量，
+    /// 逼 [`Terminal::update_last_content`] 走兜底的全量重建分支。
+    ///
+    /// 该分支在生产路径上不可达（几何变化必然伴随 `Full` damage，已被
+    /// `rebuild_all` 拦下），但它存在的意义正是「万一上游改动打破了不变量，
+    /// 退化成正确但慢的全量重建，而不是切片越界 panic」。防御性代码若从不
+    /// 被执行，就无法证明它真的能兜住——这个钩子让测试能真的走进去。
+    #[cfg(test)]
+    pub fn corrupt_row_ranges_for_test(&mut self) {
+        // 丢掉最后一行切片：`len()` 与视口行数不再相等，但剩余切片仍然
+        // 自洽（不会越界），这样兜底分支能顺利重建而不是先 panic。
+        self.last_content.row_ranges.pop();
+    }
+
+    /// 测试专用：当前行切片数量（配合 `corrupt_row_ranges_for_test` 断言）。
+    #[cfg(test)]
+    pub fn row_range_count_for_test(&self) -> usize {
+        self.last_content.row_ranges.len()
+    }
+
+    /// 测试专用：兜底全量重建分支的命中次数。
+    #[cfg(test)]
+    pub fn snapshot_fallback_count_for_test(&self) -> u64 {
+        self.snapshot_fallback_count
+    }
+
+    fn sync_inner(&mut self, cx: &mut Context<Self>) {
         if self.content_dirty {
-            self.update_last_content(false);
-            self.content_dirty = false;
+            // 拿不到网格锁时快照**保持旧值**、`content_dirty` 保持置位：这一帧
+            // 用上一帧的内容画，稍后再试。屏幕最多晚一帧，但整个窗口不会被
+            // 某个 pane 的读线程拖住。
+            if self.update_last_content(false) {
+                self.content_dirty = false;
+                self.snapshot_retry_task = None;
+            } else {
+                self.schedule_snapshot_retry(cx);
+            }
         } else {
             // Nothing changed this frame – tell the element all rows are clean.
             self.dirty_rows.fill(false);
@@ -3232,6 +3522,43 @@ impl Terminal {
                     term.selection.as_ref().and_then(|s| s.to_range(&term));
             }
         }
+    }
+
+    /// 排一个补帧任务，确保跳过快照刷新后**一定**还会再 `sync` 一次。
+    ///
+    /// 为什么不能只依赖「下一个事件循环」：`sync` 的唯一调用点是元素
+    /// `prepaint`，而 GPUI 不按 vsync 空转。若这次跳过之后不再有新输出，
+    /// 就再没有任何东西会驱动一帧——`content_dirty` 永久置位、画面停在旧内容
+    /// 上。触发条件并不罕见：读线程退出前的 drain、SSH 断连、`ChildExit`
+    /// 这类「最后一次唤醒」只要撞上被占住的锁就会中招。
+    ///
+    /// 也不能靠 `cx.notify()` / `Window::refresh()`：两者在 prepaint 期间都
+    /// 不排队新帧（`Window::refresh` 只在 `draw_phase == None` 时生效，
+    /// `notify` 在绘制中只标脏当前帧）。所以用一个短定时器绕开绘制阶段，
+    /// 代价是跳帧时多一次 8ms 的定时器。
+    ///
+    /// 已有任务在跑时不重复排：持续跳过只需一个在途任务，它每次唤醒都会再排，
+    /// 直到某一帧真的把快照刷完。
+    fn schedule_snapshot_retry(&mut self, cx: &mut Context<Self>) {
+        if self.snapshot_retry_task.is_some() {
+            return;
+        }
+        self.snapshot_retry_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SNAPSHOT_RETRY_DELAY).await;
+            let _ = this.update(cx, |terminal, cx| {
+                terminal.snapshot_retry_task = None;
+                if terminal.content_dirty {
+                    // 直接重试一次快照；仍然拿不到锁就再排下一个补帧。
+                    if terminal.update_last_content(false) {
+                        terminal.content_dirty = false;
+                    } else {
+                        terminal.schedule_snapshot_retry(cx);
+                    }
+                    // 让渲染层重新跑一遍 prepaint，把新快照画出来。
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// Returns which viewport rows (0 = top) changed since the last `sync()`.
@@ -3524,7 +3851,9 @@ impl Terminal {
             // 对应 ghostty `Terminal.resize` 尾部的 `flags.dirty.clear = true`：
             // resize 后强制渲染层全量重绘，行缓存不留任何旧尺寸的残留。
             self.input_area_start = None;
-            self.update_last_content(true);
+            // resize 后必须拿到与新几何一致的内容：`force_full_damage` 保证
+            // 抢不到锁时会退回公平锁排队（而不是跳过本帧）。
+            let _ = self.update_last_content(true);
         }
 
         // 注意：不能因 cols/rows 未变就跳过下面的通知。跨显示器拖动只改 DPI、
@@ -6409,7 +6738,7 @@ mod tests {
         // MOUSE_MOTION 而被 `mouse_moved_report` 判为 None —— 表现为一次都不写。
         terminal.update(cx, |t, cx| {
             t.process_pty_data(b"\x1b[?1002h\x1b[?1003h", false, cx);
-            t.update_last_content(false);
+            let _ = t.update_last_content(false);
             assert!(t.mouse_mode(false), "1002/1003 置位后应进入鼠标模式");
         });
         written.lock().unwrap().clear();

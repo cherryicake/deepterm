@@ -4,7 +4,7 @@ use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
-use crate::terminal_view::terminal_view::{HoveredLink, TerminalView};
+use crate::terminal_view::terminal_view::TerminalView;
 use crate::theme::{ActiveTheme, TerminalTheme};
 #[cfg(test)]
 use alacritty_terminal::index::Point as AlacPoint;
@@ -311,13 +311,16 @@ pub struct RenderMetricsSignature {
 /// 跨帧渲染缓存签名（O2 优化后不再保存渲染数据的第二份拷贝）。
 ///
 /// paint 阶段直接按行序遍历 `RowRenderCache`（见 `TerminalElement::paint`），
-/// 本结构只保留「缓存是否仍有效」的判定信号：排版度量签名与悬停链接状态。
-#[derive(Clone, Default)]
+/// 本结构只保留「缓存是否仍有效」的判定信号：排版度量签名。
+///
+/// 这里曾有一个 `hovered_link` 字段，用来「记住产生本缓存的悬停状态」——
+/// 但悬停失效早已改由 `RowRenderCache::hovered_url_cols` 逐行比对（见
+/// `prepaint` 的行循环），该字段写入后从未被读过。它每帧被 `clone` 一次
+/// （`HoveredLink` 344 字节 + 其 `String`/`SharedString` 堆分配），是一处
+/// 纯浪费，已删除。`Copy` 让签名比对不再有克隆成本。
+#[derive(Clone, Copy, Default)]
 pub struct FlattenedRenderCache {
     pub metrics: Option<RenderMetricsSignature>,
-    /// Tracks the hovered link state that produced this cache so we can
-    /// detect changes and rebuild when the user moves between URLs.
-    pub hovered_link: Option<HoveredLink>,
 }
 
 /// CursorLayout - simplified implementation inspired by Zed's CursorLayout
@@ -467,21 +470,33 @@ impl CursorLayout {
     }
 }
 
+/// 一行里的一段同款式文本，带已排版好的 `ShapedLine`。
+///
+/// `shaped_line` 走 `Arc`：`ShapedLine` 本体约 3 KB（内联 32 条
+/// `DecorationRun` 的 `SmallVec`），而 `BatchedTextRun` 会被成行成批地
+/// `clone`（增量重算里保留未变动的 run、整行布局回写前的暂存），按值克隆
+/// 会把这几 KB 逐 run 拷一遍。`Arc` 之后克隆是一次引用计数自增，结构体
+/// 从 3008 字节降到 32 字节。
 #[derive(Clone, Debug)]
 pub struct BatchedTextRun {
     pub start_col: usize,
     pub start_row: usize,
     pub cell_count: usize,
-    pub shaped_line: gpui::ShapedLine,
+    pub shaped_line: std::sync::Arc<gpui::ShapedLine>,
 }
 
 impl BatchedTextRun {
-    fn new(row: usize, col: usize, cell_count: usize, shaped_line: gpui::ShapedLine) -> Self {
+    fn new(
+        row: usize,
+        col: usize,
+        cell_count: usize,
+        shaped_line: gpui::ShapedLine,
+    ) -> Self {
         BatchedTextRun {
             start_col: col,
             start_row: row,
             cell_count,
-            shaped_line,
+            shaped_line: std::sync::Arc::new(shaped_line),
         }
     }
 }
@@ -1572,7 +1587,7 @@ impl Element for TerminalElement {
                 match &view.cached_theme_id {
                     Some(theme_id) if active_theme_id == *theme_id => (
                         std::mem::take(&mut view.row_render_cache),
-                        view.flattened_render_cache.clone(),
+                        view.flattened_render_cache,
                         selection_changed,
                     ),
                     _ => {
@@ -1608,7 +1623,15 @@ impl Element for TerminalElement {
         let mut dirty_count = 0usize;
         let mut cache_hit_count = 0usize;
         let mut partial_run_update_count = 0usize;
-        let hovered_link = self.view.read(cx).hovered_link.clone();
+        // 只取悬停链接在本行的列区间：`HoveredLink` 有 344 字节 + 若干堆
+        // 分配（`String`/`SharedString`），而行循环用到的只有 (row, 起止列)。
+        // 整份 `clone` 每帧都白付一次堆拷贝。
+        let hovered_span = self
+            .view
+            .read(cx)
+            .hovered_link
+            .as_ref()
+            .map(|link| (link.row, link.start_col, link.end_col));
 
         // O2：行缓存本身就是渲染数据源（paint 直接逐行遍历），不再有
         // flattened 拷贝。任何输入变化（主题/resize/选区/悬停/damage/度量）
@@ -1632,12 +1655,8 @@ impl Element for TerminalElement {
             } else {
                 &[]
             };
-            let hovered_url_cols = hovered_link.as_ref().and_then(|link| {
-                if link.row == row_idx {
-                    Some((link.start_col, link.end_col))
-                } else {
-                    None
-                }
+            let hovered_url_cols = hovered_span.and_then(|(row, start_col, end_col)| {
+                (row == row_idx).then_some((start_col, end_col))
             });
 
             // Invalidate cached layout when the hovered URL range on this row changes,
@@ -1816,7 +1835,6 @@ impl Element for TerminalElement {
 
         let new_signature = FlattenedRenderCache {
             metrics: Some(metrics_signature),
-            hovered_link,
         };
         // Single write-back: row caches, signature and the returned scratch
         // buffers (merged so the frame performs one entity update instead

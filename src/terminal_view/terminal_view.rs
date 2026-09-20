@@ -2258,14 +2258,12 @@ impl TerminalView {
                 Err(e) => return Err(format!("读取 {} 失败：{e}", path.display())),
             };
             let content = crate::agent::hooks::merge_bridge_config(agent, plan, &existing)?;
+            // 顺序刻意如此：**先开特性、后落盘**。反过来（先写 hooks.json
+            // 再开特性）一旦开特性失败，`bridge_installed` 只看文件内容，
+            // 会判定「装好了」——用户再也不会被引导，状态点却永远不亮。
+            // 现在失败则文件里没有我们的条目，下次 agent 活动会重新引导。
             if agent == CLIAgent::Codex {
-                let env = crate::terminal::mappings::default_terminal_env();
-                let output = std::process::Command::new("codex")
-                    .args(["features", "enable", "hooks"]).envs(env).output()
-                    .map_err(|e| format!("无法启用 Codex hooks：{e}"))?;
-                if !output.status.success() {
-                    return Err(format!("启用 Codex hooks 失败：{}", String::from_utf8_lossy(&output.stderr)));
-                }
+                self.enable_codex_hooks_local(&home)?;
             }
             crate::utils::fs_atomic::atomic_write(&path, content.as_bytes())
                 .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
@@ -2283,9 +2281,16 @@ impl TerminalView {
             let read = session.execute_command_bytes(&format!("if [ -e \"$HOME/{}\" ]; then cat \"$HOME/{}\"; fi", plan.rel_path, plan.rel_path), 10)?;
             if !read.success() { anyhow::bail!("读取远端配置失败：{}", read.stderr); }
             let content = crate::agent::hooks::merge_bridge_config(agent, plan, &read.stdout).map_err(anyhow::Error::msg)?;
+            // 与本地同一条顺序理由：先开特性，失败就还没落盘，下次会重新引导。
             if agent == CLIAgent::Codex {
-                let enabled = session.execute_command_bytes("codex features enable hooks", 15)?;
-                if !enabled.success() { anyhow::bail!("启用远端 Codex hooks 失败：{}", enabled.stderr); }
+                let enabled = session
+                    .execute_command_bytes(&crate::agent::hooks::codex_enable_hooks_command(), 15)?;
+                if !enabled.success() {
+                    anyhow::bail!(
+                        "启用远端 Codex hooks 失败（已在 PATH 中补入 ~/.local/bin 等用户目录，请确认远端装了 codex）：{}",
+                        enabled.stderr.trim()
+                    );
+                }
             }
             let write = format!(
                 "mkdir -p \"$HOME/{parent}\" && printf %s {} > \"$HOME/{}.deepterm-tmp\" && mv \"$HOME/{}.deepterm-tmp\" \"$HOME/{}\"",
@@ -2296,6 +2301,50 @@ impl TerminalView {
             Ok(())
         })
         .map_err(|e| format!("远程写入失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 本地启用 Codex 的 `hooks` 特性。
+    ///
+    /// # 为什么要自己拼 `PATH`
+    ///
+    /// `default_terminal_env` 给出的 `PATH` 是「系统目录 + Homebrew」，
+    /// 不含用户级可执行目录。Codex 的 standalone 安装器把二进制装在
+    /// `~/.local/bin`（`~/.codex/packages/standalone/current/bin/codex` 的
+    /// 软链），那种装法下 `Command::new("codex")` 直接 `NotFound`，安装
+    /// 在写 `hooks.json` 之前就失败。远端同因（见
+    /// [`crate::agent::hooks::USER_BIN_DIRS`]），所以两边共用同一份目录表。
+    ///
+    /// 找不到 `codex` 时报错而不是静默跳过：跳过会留下「hook 装好了但
+    /// 特性没开」的半装状态，用户看到的是状态点永远不亮。
+    fn enable_codex_hooks_local(&self, home: &std::path::Path) -> Result<(), String> {
+        let mut env = crate::terminal::mappings::default_terminal_env();
+        // 三段都要：用户目录（standalone / cargo / npm 装法）、
+        // `default_terminal_env` 的系统 + Homebrew 表（Finder 启动时本进程
+        // 的 PATH 只有 launchd 那几个目录，Homebrew 的 codex 全靠它），
+        // 以及本进程自己的 PATH（从终端启动时带着用户的真实环境）。
+        let mut base: Vec<std::path::PathBuf> = env
+            .get("PATH")
+            .map(|system| std::env::split_paths(system).collect())
+            .unwrap_or_default();
+        base.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = crate::agent::hooks::path_with_user_bins(home, &base)
+            .ok_or_else(|| "拼装 PATH 失败".to_string())?;
+        env.insert("PATH".to_string(), path);
+
+        let output = std::process::Command::new("codex")
+            .args(["features", "enable", "hooks"])
+            .envs(env)
+            .output()
+            .map_err(|e| format!("无法启用 Codex hooks（找不到 codex？）：{e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "启用 Codex hooks 失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
         Ok(())
     }
 

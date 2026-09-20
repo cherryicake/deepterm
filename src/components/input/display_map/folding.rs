@@ -41,8 +41,14 @@ impl Crease {
 
 /// Byte length of a line's leading whitespace ("indent"), and whether the
 /// whole line is blank. Equivalent to Zed's `LineIndent { raw_len, is_line_blank }`.
+///
+/// Uses [`RopeExt::line_content`] rather than `slice_line`: the latter keeps a
+/// trailing `\r` on CRLF documents, which would make the `\r` look like the
+/// first non-whitespace character. Every CRLF line — including genuinely empty
+/// ones — would then be reported as non-blank, and `starts_indent` /
+/// `crease_for_buffer_row` would treat blank lines as fold boundaries.
 fn line_indent(text: &Rope, row: usize) -> (usize, bool) {
-    let line = text.slice_line(row);
+    let line = text.line_content(row);
     let mut raw_len = 0;
     let mut is_blank = true;
     for ch in line.chars() {
@@ -52,10 +58,6 @@ fn line_indent(text: &Rope, row: usize) -> (usize, bool) {
             is_blank = false;
             break;
         }
-    }
-    // A `\r` remainder after the whitespace still counts as blank.
-    if is_blank && raw_len == 0 && !line.chars().any(|c| c != '\r') {
-        is_blank = true;
     }
     (raw_len, is_blank)
 }
@@ -270,5 +272,45 @@ mod tests {
                 end: Point::new(3, 4),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use ropey::Rope;
+
+    /// 空行（0 字节内容）的 is_blank 应为 true。
+    #[test]
+    fn probe_empty_line_is_blank() {
+        let rope = Rope::from("a\n\nb\n");
+        let (raw_len, is_blank) = line_indent(&rope, 1);
+        assert_eq!(raw_len, 0);
+        assert!(is_blank, "空行必须被判为 blank，否则折叠会跨过空行");
+    }
+
+    /// 仅含空白（空格）的行 is_blank 应为 true。
+    #[test]
+    fn probe_whitespace_only_line_is_blank() {
+        let rope = Rope::from("a\n    \nb\n");
+        let (raw_len, is_blank) = line_indent(&rope, 1);
+        assert_eq!(raw_len, 4);
+        assert!(is_blank, "纯空白行必须判为 blank");
+    }
+
+    /// CRLF 空行：slice_line 返回 "\r"，is_blank 应为 true。
+    #[test]
+    fn probe_crlf_empty_line_is_blank() {
+        let rope = Rope::from("a\r\n\r\nb\r\n");
+        let (raw_len, is_blank) = line_indent(&rope, 1);
+        assert_eq!(raw_len, 0);
+        assert!(is_blank, "CRLF 空行必须判为 blank");
+    }
+
+    /// 全文档只有空行时，starts_indent 不应 panic。
+    #[test]
+    fn probe_starts_indent_all_blank() {
+        let rope = Rope::from("\n\n\n");
+        assert!(!starts_indent(&rope, 0));
     }
 }

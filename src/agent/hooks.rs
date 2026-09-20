@@ -369,6 +369,8 @@ pub fn bridge_installed(agent: CLIAgent, plan: &HookInstallPlan, existing: &[u8]
 /// - Claude 写两个文件（脚本 + `settings.json`），而且**必须**去跑一次
 ///   `/hooks` 才生效——这是 Claude Code 的信任门（见模块文档）。
 /// - opencode / pi 只写一个插件文件，**没有**确认步骤，重启 agent 即生效。
+/// - Codex 要写 `hooks.json`，并额外开一次 `features enable hooks`；那一步由
+///   安装流程自己完成，用户同样只需要重启。
 ///
 /// 早先这段文案是硬编码的 Claude 版，于是给 opencode 弹窗时会告诉用户去运行
 /// `/hooks`——那是错的，opencode 里没有这个命令。把它做成纯函数是因为
@@ -409,11 +411,9 @@ pub fn hook_install_copy(agent: CLIAgent) -> Option<HookInstallCopy> {
                     CLIAgent::Codex | CLIAgent::Goose => format!("安装后显示 {name} 的工作中 / 已完成状态；上游适配不提供权限等待事件。"),
                     _ => format!("安装后按 {name} 提供的事件同步回合状态；部分版本不提供权限等待事件。"),
                 },
-                after_install: Some(if other == CLIAgent::Codex {
-                    "安装时启用 codex features enable hooks；重启 Codex 后生效。".into()
-                } else {
-                    format!("重启 {name} 后生效。")
-                }),
+                // Codex 的 `hooks` 特性由安装流程自己开（见
+                // `codex_enable_hooks_command`），不需要用户再跑命令。
+                after_install: Some(format!("重启 {name} 后生效。")),
             })
         }
     }
@@ -866,6 +866,60 @@ pub fn reporter_command(agent: &str, event: &str) -> String {
     format!("~/{REPORTER_REL_PATH} {agent} {event}")
 }
 
+/// 用户级可执行目录（相对 `$HOME`）：standalone 安装器（Codex）、cargo、
+/// npm / bun 全局安装的默认落点。
+///
+/// # 为什么要显式补进 `PATH`
+///
+/// 装 hook 时 deepterm 要**自己**调一次 agent 的命令行（Codex 需要
+/// `features enable hooks`）。这条调用不走用户的交互 shell：远端是 SFTP
+/// 会话上的 `channel.exec`（无 PTY、非登录 shell），本地是 `Command::new`
+/// 配一份自拼的 `PATH`（见 `default_terminal_env`）——两边都不读
+/// `~/.profile` / `~/.bashrc`，于是「只在 rc 里出现」的目录不在 `PATH` 里。
+///
+/// 实测：Codex 由 standalone 安装器装在 `~/.local/bin`，远端非交互通道
+/// `command -v codex` 为空、`codex features enable hooks` 退出 127，安装
+/// 因此在写 `hooks.json` 之前中断——现场就是「上报脚本在、hook 没装」。
+///
+/// 登录 shell 不是替代方案：zsh 的 `-l` 只读 `~/.zprofile`（`PATH` 常写在
+/// `~/.zshrc` 里），nvm 管理的 node 目录同样只在 rc 里。列目录更确定。
+pub const USER_BIN_DIRS: &[&str] =
+    &[".local/bin", ".cargo/bin", ".npm-global/bin", ".bun/bin", "bin"];
+
+/// [`USER_BIN_DIRS`] 在给定主目录下的绝对路径（本地 `Command` 拼 `PATH` 用）。
+pub fn user_bin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    USER_BIN_DIRS.iter().map(|dir| home.join(dir)).collect()
+}
+
+/// 把用户级可执行目录**前置**到一组既有搜索路径上，拼成可直接塞进
+/// `Command::env("PATH", …)` 的字符串。
+///
+/// 前置而不是追加：同名的 `codex` 若在系统目录里也有一份（Homebrew、
+/// 发行版包管理器），用户 `~/.local/bin` 里那份才是他们日常在用的——
+/// 装 hook 要开的是**那个**版本的特性。
+///
+/// 重复目录不去重：`PATH` 里重复项无害，而去重要在每个平台上处理
+/// 大小写/符号链接语义，收益不成比例。
+pub fn path_with_user_bins(home: &std::path::Path, base: &[std::path::PathBuf]) -> Option<String> {
+    let dirs = user_bin_dirs(home).into_iter().chain(base.iter().cloned());
+    std::env::join_paths(dirs)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// 远端启用 Codex `hooks` 特性的完整命令。
+///
+/// `${PATH:-…}` 而不是裸 `$PATH`：`PATH` 为空时末尾会留下一个空段，POSIX
+/// 把空段解释为**当前目录**——那等于允许 `codex` 从远端 cwd 里被找到。
+pub fn codex_enable_hooks_command() -> String {
+    let dirs = USER_BIN_DIRS
+        .iter()
+        .map(|dir| format!("\"$HOME/{dir}\""))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!("PATH={dirs}:\"${{PATH:-/usr/bin:/bin}}\"; export PATH; codex features enable hooks")
+}
+
 /// 判定 opencode 插件「已安装」的标记。
 pub const OPENCODE_PLUGIN_MARKER: &str = ".deepterm/hooks/agent-report.sh opencode";
 
@@ -1119,6 +1173,151 @@ mod tests {
             .rposition(|b| *b == 0x07)
             .expect("序列必须以 BEL 收尾");
         &start[..end]
+    }
+
+    /// 用户级目录必须**前置**到既有 PATH 上，且既有路径一个都不能丢。
+    ///
+    /// 前置：同名 `codex` 同时在 `~/.local/bin` 和 Homebrew 里时，用户
+    /// 日常在用的是前者，要开的是那个版本的特性。
+    /// 不丢：Finder 启动时本进程 PATH 只有 launchd 那几个目录，
+    /// `default_terminal_env` 补的 Homebrew 表是唯一能找到 Homebrew
+    /// `codex` 的线索——丢了这个，从 Finder 启动就装不上。
+    #[test]
+    fn path_with_user_bins_prepends_and_keeps_the_base() {
+        let home = std::path::Path::new("/home/someone");
+        let base: Vec<std::path::PathBuf> =
+            vec!["/usr/bin".into(), "/opt/homebrew/bin".into()];
+        let path = path_with_user_bins(home, &base).expect("必须能拼出 PATH");
+        let dirs: Vec<&str> = path.split(':').collect();
+
+        assert_eq!(dirs[0], "/home/someone/.local/bin", "用户目录必须在前");
+        for dir in USER_BIN_DIRS {
+            let expected = format!("/home/someone/{dir}");
+            assert!(dirs.contains(&expected.as_str()), "缺少 ~/{dir}：{path}");
+        }
+        for kept in ["/usr/bin", "/opt/homebrew/bin"] {
+            assert!(dirs.contains(&kept), "既有路径 {kept} 被丢了：{path}");
+        }
+    }
+
+    /// 本地路径（`Command::new("codex")` + 自拼 `PATH`）同样要能找到装在
+    /// `~/.local/bin` 的 Codex。
+    ///
+    /// 远端那条已经由 `codex_enable_hooks_command_finds_codex_without_inherited_path`
+    /// 用真实 shell 覆盖；本地这条**不走 shell**，靠的是 `Command` 在子进程
+    /// 环境里按我们设的 `PATH` 查找——两条机制不同，必须各自验证。
+    #[test]
+    fn path_with_user_bins_lets_command_resolve_a_standalone_codex() {
+        let home = std::env::temp_dir().join(format!(
+            "deepterm-local-codex-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = home.join("argv.txt");
+        let fake = bin.join("codex");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s' \"$*\" > {}\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 与 `enable_codex_hooks_local` 同一条组装路径，且刻意把 base 留空：
+        // 模拟「系统目录里没有 codex」的 standalone 装法。
+        let path = path_with_user_bins(&home, &[]).expect("必须能拼出 PATH");
+        let output = Command::new("codex")
+            .args(["features", "enable", "hooks"])
+            .env("PATH", path)
+            .output()
+            .expect("必须能在自拼的 PATH 里找到 codex");
+
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "features enable hooks",
+            "必须真的调到 codex 且参数正确"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 远端启用 Codex hooks 的命令必须**自带 PATH 兜底**。
+    ///
+    /// 这是「远程安装失败」那个 bug 的护栏：deepterm 走 SFTP 会话上的
+    /// `channel.exec`，那是非交互、非登录 shell，`~/.profile` / `~/.bashrc`
+    /// 都不执行。Codex 的 standalone 安装器把二进制放在 `~/.local/bin`，
+    /// 于是裸 `codex features enable hooks` 退出 127，安装中断在写
+    /// `hooks.json` 之前——现场只剩一个孤儿上报脚本。
+    ///
+    /// 断言的是**具体目录出现在命令里**，而不是「命令非空」：后者在命令
+    /// 退化成裸 `codex ...` 时照样通过，正是这次要防的回归。
+    #[test]
+    fn codex_enable_hooks_command_carries_its_own_path() {
+        let command = codex_enable_hooks_command();
+        for dir in USER_BIN_DIRS {
+            assert!(
+                command.contains(&format!("\"$HOME/{dir}\"")),
+                "命令必须补入 ~/{dir}，否则非交互通道找不到 codex：{command}"
+            );
+        }
+        assert!(command.contains("codex features enable hooks"));
+        // 空 PATH 兜底：裸 `$PATH` 为空时末尾空段会被 POSIX 解释成当前目录。
+        assert!(
+            command.contains("${PATH:-/usr/bin:/bin}"),
+            "PATH 为空时必须有安全兜底，不能让空段退化成当前目录：{command}"
+        );
+    }
+
+    /// 远端命令必须是合法 POSIX shell，且真的能在**没有 PATH 继承**的环境里
+    /// 找到可执行文件。
+    ///
+    /// 用真实的 `/bin/sh` 跑一遍：造一个假的 `codex`（记录 argv 后退出 0），
+    /// 只放进 `~/.local/bin`，然后把 `PATH` 清空。若命令没自带兜底，这一步会
+    /// 以 127 失败——与远端现场一致。
+    #[test]
+    fn codex_enable_hooks_command_finds_codex_without_inherited_path() {
+        let home = std::env::temp_dir().join(format!(
+            "deepterm-codex-path-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = home.join("argv.txt");
+        let fake = bin.join("codex");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\nprintf '%s' \"$*\" > {}\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(codex_enable_hooks_command())
+            .env("HOME", &home)
+            .env("PATH", "")
+            .output()
+            .expect("命令必须能被 /bin/sh 执行");
+
+        assert!(
+            output.status.success(),
+            "命令必须自带 PATH 兜底才能在非交互通道跑通：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "features enable hooks",
+            "必须真的调到 codex 且参数正确"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

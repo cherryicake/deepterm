@@ -161,8 +161,20 @@ pub fn platform_default_font_family() -> SharedString {
     }
 }
 
-/// 平台默认字体回退列表
+/// 平台默认字体回退列表。
+///
+/// 结果缓存在 `LazyLock` 里：`FontFallbacks` 本体就是 `Arc<Vec<String>>`
+/// 的包装（`Clone` 只做引用计数自增），而调用方里有**每帧都调**的渲染
+/// 路径（`TerminalElement::prepaint`）。此前每次调用都重新构造一遍
+/// `Vec<String>`（macOS 7 个、Linux 8 个 `String` + 一次 `Vec` + 一次
+/// `Arc` 分配），在每帧的 prepaint 里是纯浪费。
 pub fn platform_default_fallbacks() -> gpui::FontFallbacks {
+    static FALLBACKS: std::sync::LazyLock<gpui::FontFallbacks> =
+        std::sync::LazyLock::new(build_platform_default_fallbacks);
+    FALLBACKS.clone()
+}
+
+fn build_platform_default_fallbacks() -> gpui::FontFallbacks {
     #[cfg(target_os = "macos")]
     {
         gpui::FontFallbacks::from_fonts(vec![
