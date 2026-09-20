@@ -379,6 +379,9 @@ impl RusshTerminal {
                 &handle,
                 &config.port_forwards,
                 &port_forwards,
+                // 单条 tcpip-forward 请求的等待上限：这一段不在上面的握手超时里，
+                // 不回应的服务器不能把登录一起拖死。
+                Duration::from_secs(config.timeout.max(1)),
             )
             .await;
             for done in &established {

@@ -108,7 +108,10 @@ pub enum DriverEvent {
         reason: String,
     },
     /// 端口转发的建立结果：`message` 是给用户看的一行说明（逐条摘要，或失败原因），
-    /// `ok` 表示全部规则都建好了。逐条独立——一条失败不影响其它条。
+    /// `ok` 表示没有失败项。逐条独立——一条失败不影响其它条。
+    ///
+    /// 注意：系统 ssh 路径（`-R`）拿不到远端确认，那里的 `ok: true` 只表示
+    /// 「已随连接请求转发」，不代表绑定成功——文案里已如实说明。
     PortForward {
         message: String,
         ok: bool,
@@ -168,7 +171,8 @@ pub enum Event {
 pub struct PortForwardStatus {
     /// 给用户看的一行说明（逐条摘要，或失败原因）。
     pub message: String,
-    /// 是否全部规则都建好了。
+    /// 是否没有失败项（系统 ssh 路径拿不到远端确认，`true` 仅表示「已随
+    /// 连接请求转发」，见 [`DriverEvent::PortForward`]）。
     pub ok: bool,
 }
 

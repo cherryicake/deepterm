@@ -20,9 +20,6 @@ use crate::terminal::terminal::ZedListener;
 pub struct SshPtyTerminal {
     /// PTY 事件循环发送器
     sender: EventLoopSender,
-    /// 本次随连接请求的 `-R` 规则（未配置时为 None）。
-    /// 隧道由 ssh 进程自己维护，本结构只用于向 UI 回报「请求了什么」。
-    port_forwards: Option<Vec<String>>,
 }
 
 impl SshPtyTerminal {
@@ -99,22 +96,13 @@ impl SshPtyTerminal {
             ResolvedAuthMethod::Agent | ResolvedAuthMethod::Auto => {}
         }
 
-        // 端口转发：系统 ssh 路径没有 russh handle，反向隧道用 `-R` 表达。
+        // 端口转发：系统 ssh 路径没有 russh handle，反向隧道用 `-R` 表达，
+        // 隧道由 ssh 进程自己维护；「请求了什么」由 terminal.rs 直接按 config 报给 UI。
         let forward_args = crate::ssh::port_forward::openssh_args(&config.port_forwards);
-        let port_forwards = if forward_args.is_empty() {
-            None
-        } else {
+        if !forward_args.is_empty() {
             log::info!("SSH: 端口转发参数 {:?}", forward_args);
-            ssh_args.extend(forward_args.iter().cloned());
-            Some(
-                config
-                    .port_forwards
-                    .iter()
-                    .filter(|r| r.is_complete())
-                    .map(|r| r.summary())
-                    .collect(),
-            )
-        };
+            ssh_args.extend(forward_args);
+        }
 
         // 目标主机
         ssh_args.push(format!("{}@{}", config.username, config.host));
@@ -176,15 +164,7 @@ impl SshPtyTerminal {
 
         log::info!("SSH PTY 终端创建成功");
 
-        Ok(Self {
-            sender,
-            port_forwards,
-        })
-    }
-
-    /// 本次连接请求的转发摘要（未配置时为 None）。
-    pub fn port_forwards(&self) -> Option<&[String]> {
-        self.port_forwards.as_deref()
+        Ok(Self { sender })
     }
 
     /// 写入数据到 SSH（键盘输入）
