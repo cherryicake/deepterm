@@ -16,6 +16,18 @@
 //! - 隧道连接断开（网络故障、远端重启）时下一次使用自动重建；
 //! - 规则变更时**增量对齐**：新增的补建、移除的撤销，已有的一条都不动。
 //!
+//! # 端口已被占住时不再误报
+//!
+//! 按主机共享只解决了**本进程**自己撞自己。端口还可能被进程外的会话占着：
+//! 早先版本的 DeepTerm（那时每个标签各自建监听）留下的连接、用户自己跑的
+//! `ssh -R`、或上一个进程还没被内核回收的会话。此时 `tcpip-forward` 照样被拒，
+//! 但那个监听**正在服务**——远端确实能连上该端口，用户要的效果已经成立。
+//!
+//! 所以请求被拒后先探一下端口上是否有人在听（[`port_forward::establish`] 内部的
+//! `direct-tcpip` 探测）：在听就**接手**这条监听（登记认领、静默复用），只有
+//! 确实没人听时才报错。接手来的监听不属于我们，撤销时不会向远端发
+//! `cancel_tcpip_forward`。
+//!
 //! # 生命周期
 //!
 //! 隧道按主机常驻进程（取舍与 OpenSSH `ControlPersist` 一致），不随某个标签
@@ -62,6 +74,9 @@ pub fn host_key(config: &SshConnectionConfig) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InstalledForward {
     rule: PortForwardRule,
+    /// `established.adopted == true` 表示这个监听**不归我们管**（见
+    /// [`crate::ssh::port_forward::probe_existing_listener`]）：撤销时不能向
+    /// 远端发 `cancel_tcpip_forward`，那是别人的监听。
     established: EstablishedForward,
 }
 
@@ -85,6 +100,43 @@ fn bind_key(rule: &PortForwardRule) -> (String, u16) {
     (wire_host(&rule.bind_host).to_string(), rule.bind_port)
 }
 
+/// 上一次每条规则失败的原因，按规则键存。
+///
+/// 用来**去重失败提示**：远端端口被别的进程占着时，每开一个标签都会再失败
+/// 一次，但用户早就看到过那条提示了。同一条规则、同一个原因只报一次；原因
+/// 变了（例如从「被占用」变成「sshd 禁了转发」）才重新报。连接重建后这份
+/// 记录随连接一起消失，新连接上的失败会重新报一次——那是新情况。
+///
+/// 独立成类型而不是散在 `TunnelConnection` 上：去重逻辑（首次报、同因不报、
+/// 异因重报、成功即清）是本次修复的核心判定之一，不该只能靠真连一台机器来验。
+#[derive(Default)]
+struct FailureLog {
+    entries: Mutex<Vec<(PortForwardRule, String)>>,
+}
+
+impl FailureLog {
+    /// 记录该规则本次的失败原因；返回 `true` 表示与上次不同、应当报给用户。
+    fn remember(&self, rule: &PortForwardRule, message: &str) -> bool {
+        let mut entries = self.entries.lock();
+        match entries.iter_mut().find(|(r, _)| same_forward(r, rule)) {
+            Some(slot) if slot.1 == message => false,
+            Some(slot) => {
+                slot.1 = message.to_string();
+                true
+            }
+            None => {
+                entries.push((rule.clone(), message.to_string()));
+                true
+            }
+        }
+    }
+
+    /// 该规则成功了：忘掉它的失败记录，下次失败重新报。
+    fn clear(&self, rule: &PortForwardRule) {
+        self.entries.lock().retain(|(r, _)| !same_forward(r, rule));
+    }
+}
+
 /// 一条专职隧道连接。
 struct TunnelConnection {
     handle: client::Handle<SshClientHandler>,
@@ -93,6 +145,8 @@ struct TunnelConnection {
     forwards: RemoteForwardTable,
     /// 已装上的转发；对齐与复用判断都读它。
     installed: Mutex<Vec<InstalledForward>>,
+    /// 逐条失败去重，见 [`FailureLog`]。
+    failures: FailureLog,
 }
 
 impl TunnelConnection {
@@ -166,6 +220,10 @@ pub struct TunnelOutcome {
     pub established: Vec<EstablishedForward>,
     /// 本次调用复用的转发（隧道里早就装好了，本标签没有再请求一次监听）。
     pub reused: Vec<EstablishedForward>,
+    /// 本次调用**接手**的转发：请求监听被拒，但探明远端端口已经有监听在服务
+    /// （见 [`crate::ssh::port_forward::probe_existing_listener`]）。效果上等价于可用，
+    /// 因此不算失败；但监听不是我们建的，撤销时不能碰。
+    pub adopted: Vec<EstablishedForward>,
     /// 失败原因（逐条独立：一条失败不影响其它条）。
     pub errors: Vec<String>,
 }
@@ -235,6 +293,7 @@ pub async fn acquire(
         handle,
         forwards,
         installed: Mutex::new(Vec::new()),
+        failures: FailureLog::default(),
     });
     let outcome = reconcile(&conn, &desired, timeout).await;
     // 装完才发布：中途让别的标签看到一条「还没有转发」的隧道，它会白等一次。
@@ -302,25 +361,49 @@ async fn reconcile(
     desired: &[PortForwardRule],
     timeout: Duration,
 ) -> TunnelOutcome {
-    let plan = plan(&conn.installed_snapshot(), desired);
+    prune_stale_adopted(conn).await;
+    let before = conn.installed_snapshot();
+    let plan = plan(&before, desired);
     let mut outcome = TunnelOutcome::default();
 
     for f in &plan.supersede {
         cancel_forward(conn, f).await;
     }
     for rule in &plan.establish {
-        match port_forward::establish(&conn.handle, rule, &conn.forwards, timeout).await {
+        // 同一绑定位上有一个**别人的**监听、而规则又变了：我们既不能撤销它，
+        // 也无法把新目标接上去（远端监听归对方会话所有，数据不会送到我们这条
+        // 连接）。此时**不**允许「探到有人在听就接手」——接手会登记一个永远
+        // 收不到流量的目标，让用户以为新规则生效了。照实报冲突。
+        let allow_adopt = !supersedes_adopted(&before, rule);
+        match port_forward::establish(&conn.handle, rule, &conn.forwards, timeout, allow_adopt)
+            .await
+        {
             Ok(done) => {
-                log::info!("russh: 端口转发已建立 {}", done.summary());
-                conn.installed.lock().push(InstalledForward {
+                // 成功（含接手）：清掉这条规则上次的失败记录，让下一次失败能报出来。
+                conn.failures.clear(rule);
+                let entry = InstalledForward {
                     rule: rule.clone(),
                     established: done.clone(),
-                });
-                outcome.established.push(done);
+                };
+                if done.adopted {
+                    log::info!("russh: 端口转发沿用远端已有监听 {}", done.summary());
+                    outcome.adopted.push(done);
+                } else {
+                    log::info!("russh: 端口转发已建立 {}", done.summary());
+                    outcome.established.push(done);
+                }
+                conn.installed.lock().push(entry);
             }
             Err(e) => {
-                log::warn!("russh: 端口转发失败: {e:#}");
-                outcome.errors.push(format!("{e:#}"));
+                let message = format!("{e:#}");
+                log::warn!("russh: 端口转发失败: {message}");
+                // 同一条规则、同一个原因只报一次：远端端口被别人占着时，
+                // 每开一个标签都会失败一遍，反复弹同一句话是噪音。
+                if conn.failures.remember(rule, &message) {
+                    outcome.errors.push(message);
+                } else {
+                    log::info!("russh: 端口转发失败与上次相同，不再重复提示");
+                }
             }
         }
     }
@@ -332,17 +415,69 @@ async fn reconcile(
     outcome
 }
 
+/// 丢掉已经失效的**接手**监听。
+///
+/// 接手的监听不归我们管，因此它的生死不受本连接影响：持有它的会话一旦结束
+/// （旧版本的标签关掉、用户自己的 `ssh -R` 退出），端口就空了。而我们的
+/// `installed` 里还记着它，`plan` 会把它当「已装好」而一直复用——转发静静地
+/// 不可用，且永远不会重建。
+///
+/// 所以每次对齐前先复查一遍接手的条目：探不到了就摘掉，让 `plan` 把它当
+/// 缺失的规则重新建立（这次建的是我们自己的监听，后续归我们维护）。
+///
+/// 只查接手的条目：我们自己建的监听由本连接的生命周期保证，不需要额外探测
+/// （多探一次就是多一次无谓的往返）。
+async fn prune_stale_adopted(conn: &TunnelConnection) {
+    let adopted: Vec<InstalledForward> = conn
+        .installed_snapshot()
+        .into_iter()
+        .filter(|f| f.established.adopted)
+        .collect();
+    for f in adopted {
+        let wire = wire_host(&f.rule.bind_host);
+        let port = f.established.bind_port;
+        if port_forward::probe_existing_listener(&conn.handle, wire, port).await {
+            continue;
+        }
+        log::info!(
+            "russh: 接手的监听 {} 已不存在，改为由本连接重新建立",
+            f.established.summary()
+        );
+        conn.forwards.unregister(wire, port);
+        conn.installed.lock().retain(|x| x.rule != f.rule);
+    }
+}
+
+/// `rule` 是否与某个**接手的**（非我方）监听占用同一个绑定位。
+///
+/// 是的话就不能再靠「探到有人在听」来接手：那个监听属于别的会话，它上面的
+/// 流量不会经过我们这条连接，接手只会让用户以为规则生效。
+fn supersedes_adopted(before: &[InstalledForward], rule: &PortForwardRule) -> bool {
+    let key = bind_key(rule);
+    before
+        .iter()
+        .any(|f| f.established.adopted && bind_key(&f.rule) == key && !same_forward(&f.rule, rule))
+}
+
 /// 撤销一条转发：先让远端停掉监听，再摘掉认领表条目。
+///
+/// **接手的监听不发撤销请求**：远端那个监听是别人的会话建的，
+/// `cancel_tcpip_forward` 撤不掉它（端口不属于本会话），却可能被服务器理解为
+/// 一次越权请求。只把认领表条目和本地记录摘掉。
 async fn cancel_forward(conn: &TunnelConnection, f: &InstalledForward) {
     let wire = wire_host(&f.rule.bind_host);
     let port = f.established.bind_port;
-    match conn
-        .handle
-        .cancel_tcpip_forward(wire.to_string(), u32::from(port))
-        .await
-    {
-        Ok(()) => log::info!("russh: 端口转发已撤销 {}", f.established.summary()),
-        Err(e) => log::warn!("russh: 撤销端口转发 {} 失败: {e}", f.established.summary()),
+    if f.established.adopted {
+        log::info!("russh: 释放接手的端口转发 {}", f.established.summary());
+    } else {
+        match conn
+            .handle
+            .cancel_tcpip_forward(wire.to_string(), u32::from(port))
+            .await
+        {
+            Ok(()) => log::info!("russh: 端口转发已撤销 {}", f.established.summary()),
+            Err(e) => log::warn!("russh: 撤销端口转发 {} 失败: {e}", f.established.summary()),
+        }
     }
     conn.forwards.unregister(wire, port);
     conn.installed.lock().retain(|x| x.rule != f.rule);
@@ -408,6 +543,22 @@ mod tests {
                 bind_port: actual_bind_port,
                 target_host: rule.target_host.clone(),
                 target_port: rule.target_port,
+                adopted: false,
+            },
+            rule,
+        }
+    }
+
+    /// 与 [`installed`] 同理，但模拟「远端端口上已经有别人的监听、我们只是接手」
+    /// 的那条记录：撤销时不能向远端发 `cancel_tcpip_forward`。
+    fn adopted(rule: PortForwardRule, actual_bind_port: u16) -> InstalledForward {
+        InstalledForward {
+            established: EstablishedForward {
+                bind_host: rule.bind_host.clone(),
+                bind_port: actual_bind_port,
+                target_host: rule.target_host.clone(),
+                target_port: rule.target_port,
+                adopted: true,
             },
             rule,
         }
@@ -605,5 +756,89 @@ mod tests {
         let c = config("198.51.100.8");
         assert!(!has_live_tunnel(&c));
         assert!(installed_rules(&c).is_empty());
+    }
+
+    #[test]
+    fn adopted_listener_is_reused_and_not_reestablished() {
+        // 接手来的监听也是「已装好」：同一条规则第二次来必须复用，
+        // 不能再发一次 tcpip_forward（那会再撞一次端口）。
+        let r = rule(3801, 3801);
+        let before = vec![adopted(r.clone(), 3801)];
+
+        let p = plan(&before, std::slice::from_ref(&r));
+        assert!(p.establish.is_empty(), "已接手的规则不该再请求监听");
+        assert!(p.cancel.is_empty());
+        assert!(p.supersede.is_empty());
+        assert_eq!(p.reused.len(), 1);
+    }
+
+    #[test]
+    fn adopted_listener_is_not_cancelled_remotely() {
+        // 接手来的监听属于别人的会话：`cancel_tcpip_forward` 撤不掉它，
+        // 发过去只会得到错误。因此 `cancel_forward` 对它必须走「只摘本地记录」
+        // 这条路。这里直接验证判据本身（真发请求需活连接，无法单测）。
+        let r = rule(3801, 3801);
+        assert!(adopted(r.clone(), 3801).established.adopted);
+        assert!(!installed(r, 3801).established.adopted);
+    }
+
+    #[test]
+    fn adopted_listener_blocks_silent_takeover_when_rule_changed() {
+        // 同绑定位上占着的是**别人的**监听、而目标变了：不能靠「探到有人在听」
+        // 接手（那个监听上的流量不会经过我们这条连接），必须照实报冲突。
+        let old = rule(3801, 3801);
+        let new = rule(3801, 9090);
+        let before = vec![adopted(old.clone(), 3801)];
+
+        assert!(
+            supersedes_adopted(&before, &new),
+            "规则变了 + 占位是别人的监听 ⇒ 不允许接手"
+        );
+        // 规则没变就是普通复用，不涉及接手。
+        assert!(!supersedes_adopted(&before, &old));
+        // 我们自己建的监听被顶替是正常路径（先撤后建），不受这条限制。
+        assert!(!supersedes_adopted(&[installed(old.clone(), 3801)], &new));
+        // 不同绑定位互不相干。
+        assert!(!supersedes_adopted(&before, &rule(3802, 9090)));
+    }
+
+    #[test]
+    fn repeated_identical_failure_is_reported_only_once() {
+        // 远端端口被别的进程占着时，每开一个标签都会失败一遍；同一原因
+        // 只该报一次，否则用户被同一句话反复打扰。
+        let failures = FailureLog::default();
+        let r = rule(3801, 3801);
+
+        assert!(failures.remember(&r, "端口已被占用"), "首次要报");
+        assert!(!failures.remember(&r, "端口已被占用"), "同一原因不再报");
+        assert!(
+            failures.remember(&r, "sshd 关闭了转发"),
+            "原因变了要重报（那是新情况）"
+        );
+        assert!(!failures.remember(&r, "sshd 关闭了转发"));
+
+        // 不同规则各自记账，互不影响。
+        let other = rule(3802, 3802);
+        assert!(failures.remember(&other, "端口已被占用"));
+
+        // 成功一次就清掉记录：之后再失败应当重新报出来。
+        failures.clear(&r);
+        assert!(failures.remember(&r, "sshd 关闭了转发"));
+    }
+
+    #[test]
+    fn failure_dedupe_ignores_description_changes() {
+        // 判据是转发语义（`same_forward`），改备注不算另一条规则。
+        let failures = FailureLog::default();
+        let mut before = rule(3801, 3801);
+        before.description = "改前".to_string();
+        let mut after = rule(3801, 3801);
+        after.description = "改后".to_string();
+
+        assert!(failures.remember(&before, "端口已被占用"));
+        assert!(
+            !failures.remember(&after, "端口已被占用"),
+            "只改备注不该让同一条失败重新报"
+        );
     }
 }

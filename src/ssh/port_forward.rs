@@ -37,7 +37,9 @@
 //! - 默认只绑远端回环：只有那台机器自己能用这条隧道。要暴露给别的机器，
 //!   由用户在 `bind_host` 里显式写 `0.0.0.0`——这是用户的决定，不是默认值。
 //! - 转发是**附加**能力：远端拒绝（端口被占、sshd 禁了 AllowTcpForwarding）
-//!   只报警告，不阻断登录。
+//!   只报警告，不阻断登录。**但「被拒」不等于「不可用」**：端口上已经有人在
+//!   听时（同一进程早先的连接、用户自己的 `ssh -R`），效果已经成立，
+//!   此时接手该监听、静默复用，而不是弹一条「端口可能已被占用」的假警报。
 //! - 隧道**不跨主机复用**：`0.0.0.0:3801` 在 A 机与 B 机互不影响，各自的
 //!   隧道各自绑定。同一主机上重复配置同一条规则（同一 bind 端口）会被
 //!   认领表拦下，按该条失败处理（不会静默丢一条）。
@@ -210,6 +212,12 @@ pub struct EstablishedForward {
     pub bind_port: u16,
     pub target_host: String,
     pub target_port: u16,
+    /// 这条监听是**别人**已经在远端开着、我们只是接手使用的（见
+    /// [`probe_existing_listener`]）。
+    ///
+    /// 撤销时必须区分：`cancel_tcpip_forward` 只能撤我们自己请求成功的监听；
+    /// 对别人的监听发撤销请求不但无效，还可能把用户另一个会话的转发弄掉。
+    pub adopted: bool,
 }
 
 impl EstablishedForward {
@@ -222,11 +230,65 @@ impl EstablishedForward {
     }
 }
 
+/// 探测「远端该端口是否已经有人在听」的等待上限。
+///
+/// 刻意与 `tcpip_forward` 的请求超时分开：探测发生在**建立锁**内（同一主机
+/// 同时只能有一个标签在建隧道），用 30s 去等一个连不上的端口会把后来所有标签
+/// 一起堵住。而探测的目的只是确认「端口上有没有服务」——本机回环上一个无人
+/// 监听的端口会立即回 RST，根本不需要等。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 请求监听被拒后，探一下远端该端口是否已经有人在听。
+///
+/// 用 `direct-tcpip` 通道去连 `bind_host:bind_port`：连得上就说明监听存在
+/// （sshd 会替我们完成这次 TCP 连接，因此探测本身不依赖远端有别的工具）。
+///
+/// 典型来源是同一个 DeepTerm 进程里早先建立的监听（旧版本没有隧道共享，每个
+/// 标签各自 `tcpip-forward`；或本次进程上一次连接留下的会话），也可能是用户
+/// 自己跑的 `ssh -R`。无论哪种，用户想要的「远端能连上这个端口」这个**效果**
+/// 已经成立，把它报成失败是假警报。
+///
+/// 只对**可连接的具体地址**做探测：`0.0.0.0` / `::` 是通配地址，不是可连接的
+/// 目的地址，「已有人在听」这个判断在它们身上本就无从区分（可能是别的接口），
+/// 因此直接判为未探明，按原来的失败处理——宁可多报一次，也不要谎称转发可用。
+///
+/// 探测失败（连不上、超时）一律当作「没有人在听」，也就是原来的失败语义。
+///
+/// `pub(crate)`：`tunnel` 也要用它复查接手的监听是否还在（见
+/// `tunnel::prune_stale_adopted`）。
+pub(crate) async fn probe_existing_listener<H: client::Handler>(
+    handle: &client::Handle<H>,
+    bind_host: &str,
+    bind_port: u16,
+) -> bool {
+    if bind_port == 0 || bind_host == "0.0.0.0" || bind_host == "::" {
+        return false;
+    }
+    let probe = handle.channel_open_direct_tcpip(
+        bind_host.to_string(),
+        u32::from(bind_port),
+        "127.0.0.1".to_string(),
+        0,
+    );
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Ok(channel)) => {
+            // 连上就立刻关掉：我们要的只是「有人监听」这个事实，不产生业务流量。
+            let _ = channel.close().await;
+            true
+        }
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 /// 建立一条反向转发：请求远端监听，并把认领登记进 `forwards`。
 ///
 /// `timeout` 限制单条请求的等待：`tcpip_forward` 是全局请求，要等服务器回复，
 /// 而这一段不在连接握手超时（`config.timeout` 只包 `client::connect`）范围内。
 /// 不回或慢回的服务器不能把登录一起拖死——超时按该条失败处理。
+///
+/// `allow_adopt`：请求被拒时是否允许「探到端口上已经有人在听就接手」。
+/// 调用方在「同绑定位上占着的是别人的监听、而规则又变了」时传 `false`——
+/// 那种情况下接手会登记一个永远收不到流量的目标（详见 `tunnel::supersedes_adopted`）。
 ///
 /// 调用方负责在连接断开时让 `forwards` 随之失效——表本身按连接持有，
 /// 连接没了表也就没了，无需显式清理。
@@ -235,6 +297,7 @@ pub async fn establish<H: client::Handler>(
     rule: &PortForwardRule,
     forwards: &RemoteForwardTable,
     timeout: std::time::Duration,
+    allow_adopt: bool,
 ) -> anyhow::Result<EstablishedForward> {
     let wire = wire_host(&rule.bind_host);
     // 固定端口的规则先登记再请求：服务器可能在 tcpip_forward 回复送达前就
@@ -275,6 +338,25 @@ pub async fn establish<H: client::Handler>(
             ));
         }
         Ok(Err(e)) => {
+            // 被拒 ≠ 转发不可用。先探一下端口上是不是已经有人听着：本进程
+            // 早先的连接（旧版本每个标签各自建监听）、用户自己的 `ssh -R`
+            // 都会占住端口，而那种情况下「远端能连上这个端口」这个用户真正
+            // 要的效果已经成立。此时把监听认下来、静默复用，而不是弹一条
+            // 「端口可能已被占用」的假警报（用户看到的是「明明好用却报错」）。
+            if allow_adopt && probe_existing_listener(handle, wire, rule.bind_port).await {
+                log::info!(
+                    "russh: 远端 {}:{} 已有监听在服务，复用该监听而不重复请求（{e}）",
+                    rule.bind_host,
+                    rule.bind_port
+                );
+                return Ok(EstablishedForward {
+                    bind_host: rule.bind_host.clone(),
+                    bind_port: rule.bind_port,
+                    target_host: rule.target_host.clone(),
+                    target_port: rule.target_port,
+                    adopted: true,
+                });
+            }
             if pre_registered {
                 forwards.unregister(wire, rule.bind_port);
             }
@@ -311,6 +393,7 @@ pub async fn establish<H: client::Handler>(
         bind_port,
         target_host: rule.target_host.clone(),
         target_port: rule.target_port,
+        adopted: false,
     })
 }
 
@@ -320,13 +403,21 @@ pub async fn establish<H: client::Handler>(
 /// 每开一个标签都弹一次「已就绪」就是噪音，与旧实现「每开一个标签撞一次
 /// 端口」是同一个毛病的一体两面。复用只写日志。
 ///
+/// **纯接手**同样返回 `None`：接手是「端口上已经有东西在听、效果已经成立」
+/// 的情形（典型来源：同一个 DeepTerm 进程里早先建立的监听）。用户要的是
+/// 「远端能连上」，那件事本来就成立，弹一条提示只是把以前的假警报换个说法。
+/// 与新建/失败混在一起时才顺带说一句，让用户知道哪些不是本次建的。
+///
 /// `reused` 仅在**部分**复用（新加了规则、其余沿用）时出现在文案里，让用户
 /// 知道哪些是这次新建的、哪些本来就在。
 pub fn tunnel_outcome_message(
     established: &[EstablishedForward],
     reused: &[EstablishedForward],
+    adopted: &[EstablishedForward],
     errors: &[String],
 ) -> Option<(bool, String)> {
+    // 只有「本次新建了东西」或「有失败」才值得打扰用户。接手（adopted）单独
+    // 出现时不算：那意味着端口上早就有东西在听、用户要的效果本来就成立。
     if established.is_empty() && errors.is_empty() {
         return None;
     }
@@ -341,6 +432,11 @@ pub fn tunnel_outcome_message(
     let mut parts = Vec::new();
     if !established.is_empty() {
         parts.push(format!("已就绪：{}", summarize(established)));
+    }
+    if !adopted.is_empty() {
+        // 接手的监听不是本次建的，也不能由我们撤销；文案要说清「能用」
+        // 与「不是我们建的」这两件事。
+        parts.push(format!("已沿用远端已有监听：{}", summarize(adopted)));
     }
     if !reused.is_empty() {
         parts.push(format!(
@@ -486,24 +582,50 @@ mod tests {
             bind_port: 3801,
             target_host: "127.0.0.1".to_string(),
             target_port: 3801,
+            adopted: false,
         };
 
         assert_eq!(
-            tunnel_outcome_message(&[], &[], &[]),
+            tunnel_outcome_message(&[], &[], &[], &[]),
             None,
             "没启用规则时不该弹提示"
         );
 
-        let (ok, message) = tunnel_outcome_message(std::slice::from_ref(&done), &[], &[]).unwrap();
+        let (ok, message) =
+            tunnel_outcome_message(std::slice::from_ref(&done), &[], &[], &[]).unwrap();
         assert!(ok);
         assert!(message.contains("3801"), "{message}");
         assert!(message.contains("已就绪"), "{message}");
 
         // 纯复用要**静默**：转发按主机共享，每开一个标签弹一次就是噪音。
         assert_eq!(
-            tunnel_outcome_message(&[], std::slice::from_ref(&done), &[]),
+            tunnel_outcome_message(&[], std::slice::from_ref(&done), &[], &[]),
             None,
             "隧道早装好了、这次什么都没变，不该弹提示"
+        );
+
+        // 纯接手也要**静默**：端口上已经有人在听、效果已经成立，弹提示只是
+        // 把以前的假警报换个说法。这是本次修复的核心断言。
+        let mut adopted = done.clone();
+        adopted.adopted = true;
+        assert_eq!(
+            tunnel_outcome_message(&[], &[], std::slice::from_ref(&adopted), &[]),
+            None,
+            "远端端口已在服务且转发可用时，不该弹任何提示"
+        );
+
+        // 但接手与失败同时出现时要说出来（用户得知道哪条没成）。
+        let (ok, message) = tunnel_outcome_message(
+            &[],
+            &[],
+            std::slice::from_ref(&adopted),
+            &["另一条失败".to_string()],
+        )
+        .unwrap();
+        assert!(!ok);
+        assert!(
+            message.contains("沿用远端已有监听") && message.contains("另一条失败"),
+            "{message}"
         );
 
         // 部分复用（新加了规则）要把「新建的」和「沿用的」分开说。
@@ -512,10 +634,12 @@ mod tests {
             bind_port: 3802,
             target_host: "127.0.0.1".to_string(),
             target_port: 3802,
+            adopted: false,
         };
         let (ok, message) = tunnel_outcome_message(
             std::slice::from_ref(&added),
             std::slice::from_ref(&done),
+            &[],
             &[],
         )
         .unwrap();
@@ -529,13 +653,15 @@ mod tests {
             "{message}"
         );
 
-        let (ok, message) = tunnel_outcome_message(&[], &[], &["端口被占用".to_string()]).unwrap();
+        let (ok, message) =
+            tunnel_outcome_message(&[], &[], &[], &["端口被占用".to_string()]).unwrap();
         assert!(!ok);
         assert!(message.contains("端口被占用"), "{message}");
 
         // 部分成功必须两边都说，不能只报喜或只报忧
         let (ok, message) = tunnel_outcome_message(
             std::slice::from_ref(&done),
+            &[],
             &[],
             &["另一条失败".to_string()],
         )

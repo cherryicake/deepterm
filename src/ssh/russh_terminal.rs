@@ -366,6 +366,7 @@ impl RusshTerminal {
                 if let Some((ok, message)) = crate::ssh::port_forward::tunnel_outcome_message(
                     &outcome.established,
                     &outcome.reused,
+                    &outcome.adopted,
                     &outcome.errors,
                 ) {
                     driver_for_tunnel
