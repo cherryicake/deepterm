@@ -31,13 +31,20 @@ enum InputMsg {
 }
 
 /// russh 客户端事件处理器
-struct SshClientHandler {
-    host: String,
-    port: u16,
-    host_key_policy: crate::ssh::host_key::HostKeyPolicy,
+///
+/// `pub(crate)`：共享转发隧道（[`crate::ssh::tunnel`]）也要用它建连接——隧道
+/// 连接与终端连接共用同一套主机密钥校验与转发认领逻辑，两边行为必须一致。
+pub(crate) struct SshClientHandler {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) host_key_policy: crate::ssh::host_key::HostKeyPolicy,
     /// 端口转发的认领表：有人连到远端监听端口时，服务器会发起
     /// `forwarded-tcpip` 通道，由这里查到本机目标并桥接过去。
-    port_forwards: crate::ssh::port_forward::RemoteForwardTable,
+    ///
+    /// 终端连接传**空表**：转发全部挂在专职隧道连接上（见
+    /// [`crate::ssh::tunnel`]），终端连接不请求监听，也就不会收到
+    /// `forwarded-tcpip`；真收到了说明不是我们的转发，按未登记忽略。
+    pub(crate) port_forwards: crate::ssh::port_forward::RemoteForwardTable,
 }
 
 impl client::Handler for SshClientHandler {
@@ -319,87 +326,55 @@ impl RusshTerminal {
         client::Handle<SshClientHandler>,
         russh::Channel<client::Msg>,
     )> {
-        let russh_config = Arc::new(client::Config {
-            // keepalive 30s × 3 次无响应 = 90s 判定断连。inactivity 若设为
-            // 60s 会先于 keepalive 兜底触发（keepalive_max 形同虚设），故置
-            // None，让断连判定完全由 keepalive 负责；对正常空闲会话（keepalive
-            // 有响应）无影响。
-            inactivity_timeout: None,
-            keepalive_interval: Some(Duration::from_secs(30)),
-            keepalive_max: 3,
-            ..Default::default()
-        });
-
-        // 转发认领表必须在 `client::connect` **之前**建好并交给 handler：
-        // 服务器可能在 tcpip-forward 成功后的任何时刻发起 forwarded-tcpip 通道，
-        // 表后挂会让最早那几条连接被当成「未登记」丢弃。
-        let port_forwards = crate::ssh::port_forward::RemoteForwardTable::default();
-
-        log::info!("russh: 连接到 {}:{}", config.host, config.port);
-        // config.timeout 生效：TCP+SSH 握手整体限时。此前该配置从未被使用，
-        // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
-        let mut handle = tokio::time::timeout(
-            Duration::from_secs(config.timeout.max(1)),
-            client::connect(
-                russh_config,
-                (config.host.as_str(), config.port),
-                SshClientHandler {
-                    host: config.host.clone(),
-                    port: config.port,
-                    host_key_policy: crate::ssh::host_key::policy_from_global_config(),
-                    port_forwards: port_forwards.clone(),
-                },
-            ),
+        let handle = connect_and_authenticate(
+            config,
+            SshClientHandler {
+                host: config.host.clone(),
+                port: config.port,
+                host_key_policy: crate::ssh::host_key::policy_from_global_config(),
+                // 终端连接不承担转发（见 `tunnel` 模块）：空表意味着任何
+                // `forwarded-tcpip` 都是未登记的，按忽略处理。
+                port_forwards: crate::ssh::port_forward::RemoteForwardTable::default(),
+            },
         )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "连接超时（{} 秒内未完成与 {}:{} 的 TCP/SSH 握手）",
-                config.timeout,
-                config.host,
-                config.port
-            )
-        })?
-        .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {}", e))?;
+        .await?;
 
-        log::info!("russh: 开始认证 (用户: {})", config.username);
-        let auth_result = Self::authenticate(&mut handle, config).await?;
-        if !auth_result.success() {
-            return Err(anyhow::anyhow!(
-                "SSH 认证被拒绝（用户: {}）",
-                config.username
-            ));
-        }
-
-        if !config.port_forwards.is_empty() {
-            // 失败不阻断登录：转发是登录的**附加**能力，远端拒绝监听
-            // （端口被占、sshd 禁了 AllowTcpForwarding）时用户仍应拿到可用的终端。
-            // 结果经 `DriverEvent::PortForward` 报到 UI。
-            let (established, errors) = crate::ssh::port_forward::install_all(
-                &handle,
-                &config.port_forwards,
-                &port_forwards,
-                // 单条 tcpip-forward 请求的等待上限：这一段不在上面的握手超时里，
-                // 不回应的服务器不能把登录一起拖死。
-                Duration::from_secs(config.timeout.max(1)),
-            )
-            .await;
-            for done in &established {
-                log::info!("russh: 端口转发已建立 {}", done.summary());
-            }
-            for e in &errors {
-                log::warn!("russh: 端口转发失败: {e}");
-            }
-            if let Some((ok, message)) =
-                crate::ssh::port_forward::outcome_message(&established, &errors)
-            {
-                // driver_listener 尚未移入 io_loop；这里借道它把结果送回 UI。
-                driver_listener_for_setup
-                    .0
-                    .send(DriverEvent::PortForward { message, ok })
-                    .await
-                    .ok();
-            }
+        // 转发挂在**按主机共享的专职隧道**上，不在本连接上：反向监听端口是
+        // 远端资源，每个标签各请求一次的话，第二个标签起必然被远端拒绝
+        // （端口被本进程上一个标签占着）。
+        //
+        // 规则为空但该主机已有隧道时也要走一遍：用户可能刚把规则全删了，
+        // 那些远端监听需要随之撤销，不该留到进程退出。
+        if !config.port_forwards.is_empty() || crate::ssh::tunnel::has_live_tunnel(config) {
+            // 后台进行、不 await：隧道是一条独立的 SSH 连接，首建要握手+认证，
+            // 挡在这里会让每个新标签的 shell 都多等一次连接建立。结果经
+            // `DriverEvent::PortForward` 异步报到 UI，失败不阻断登录。
+            let config_for_tunnel = config.clone();
+            let driver_for_tunnel = driver_listener_for_setup.clone();
+            tokio::spawn(async move {
+                let outcome = crate::ssh::tunnel::acquire(
+                    &config_for_tunnel,
+                    &config_for_tunnel.port_forwards,
+                    // 单条 tcpip-forward 请求的等待上限：这一段不在握手超时里，
+                    // 不回应的服务器不能把登录一起拖死。
+                    Duration::from_secs(config_for_tunnel.timeout.max(1)),
+                )
+                .await;
+                for e in &outcome.errors {
+                    log::warn!("russh: 端口转发失败: {e}");
+                }
+                if let Some((ok, message)) = crate::ssh::port_forward::tunnel_outcome_message(
+                    &outcome.established,
+                    &outcome.reused,
+                    &outcome.errors,
+                ) {
+                    driver_for_tunnel
+                        .0
+                        .send(DriverEvent::PortForward { message, ok })
+                        .await
+                        .ok();
+                }
+            });
         }
 
         log::info!("russh: 认证成功，打开会话通道");
@@ -431,68 +406,6 @@ impl RusshTerminal {
         Ok((handle, channel))
     }
 
-    /// 执行 SSH 认证（支持密码、密钥和自动模式）
-    async fn authenticate(
-        handle: &mut client::Handle<SshClientHandler>,
-        config: &SshConnectionConfig,
-    ) -> anyhow::Result<AuthResult> {
-        let resolved_auth = resolve_auth_method(&config.auth_method)?;
-
-        match &resolved_auth {
-            ResolvedAuthMethod::Password { password } => {
-                log::info!("russh: 密码认证");
-                handle
-                    .authenticate_password(&config.username, password.as_str())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("密码认证失败: {}", e))
-            }
-
-            ResolvedAuthMethod::PrivateKey {
-                path,
-                passphrase,
-                certificate_path,
-                ..
-            } => {
-                log::info!("russh: 私钥认证 ({:?})", path);
-                let key = load_key_material(path, passphrase.as_deref().map(|p| p.as_str()))?;
-                if let Some(certificate_path) = certificate_path {
-                    let cert = load_certificate(certificate_path)?;
-                    handle
-                        .authenticate_openssh_cert(&config.username, key, cert)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("OpenSSH 证书认证失败: {}", e))
-                } else {
-                    let hash_alg = handle
-                        .best_supported_rsa_hash()
-                        .await
-                        .ok()
-                        .flatten()
-                        .flatten();
-                    handle
-                        .authenticate_publickey(
-                            &config.username,
-                            PrivateKeyWithHashAlg::new(key, hash_alg),
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("公钥认证失败: {}", e))
-                }
-            }
-
-            ResolvedAuthMethod::Auto => {
-                // "尝试多种方法"语义：agent → 默认密钥。auth.rs 的 try_agent_auth
-                // 已实现完整回退链（agent 不可达/无密钥时自动尝试 ~/.ssh 默认密钥），
-                // 此前这里只试默认密钥，agent 有密钥但 ~/.ssh 无默认密钥的用户
-                // 在 Auto 模式下认证失败（与 SFTP 通道行为一致地错）。
-                log::info!("russh: 自动认证模式（agent → 默认密钥）");
-                try_agent_auth(handle, config).await
-            }
-
-            ResolvedAuthMethod::Agent => {
-                log::info!("russh: SSH Agent 认证 (SSH_AUTH_SOCK)");
-                try_agent_auth(handle, config).await
-            }
-        }
-    }
 
     /// SSH I/O 循环（在 tokio 任务中持续运行直到连接断开）
     ///
@@ -594,4 +507,117 @@ impl RusshTerminal {
 /// 内部终端结构（连接成功后创建）
 struct RusshTerminalInner {
     input_tx: UnboundedSender<InputMsg>,
+}
+
+/// 建立 SSH 连接并完成认证（终端连接与共享转发隧道共用）。
+///
+/// 抽出来的意义：两条连接的**握手与认证必须完全一致**（同样的超时、keepalive、
+/// 主机密钥校验、认证回退链）。此前隧道若各自实现一遍，任何一侧漏改都会让隧道
+/// 与终端在同一个主机上表现不一致。
+pub(crate) async fn connect_and_authenticate<H: client::Handler + Send + 'static>(
+    config: &SshConnectionConfig,
+    handler: H,
+) -> anyhow::Result<client::Handle<H>> {
+    let russh_config = Arc::new(client::Config {
+        // keepalive 30s × 3 次无响应 = 90s 判定断连。inactivity 若设为
+        // 60s 会先于 keepalive 兜底触发（keepalive_max 形同虚设），故置
+        // None，让断连判定完全由 keepalive 负责；对正常空闲会话（keepalive
+        // 有响应）无影响。
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
+
+    log::info!("russh: 连接到 {}:{}", config.host, config.port);
+    // config.timeout 生效：TCP+SSH 握手整体限时。此前该配置从未被使用，
+    // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
+    let mut handle = tokio::time::timeout(
+        Duration::from_secs(config.timeout.max(1)),
+        client::connect(russh_config, (config.host.as_str(), config.port), handler),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "连接超时（{} 秒内未完成与 {}:{} 的 TCP/SSH 握手）",
+            config.timeout,
+            config.host,
+            config.port
+        )
+    })?
+    // H::Error 只保证 Debug（russh 的约束），用 {:?} 而不是 {}。
+    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}"))?;
+
+    log::info!("russh: 开始认证 (用户: {})", config.username);
+    let auth_result = authenticate(&mut handle, config).await?;
+    if !auth_result.success() {
+        return Err(anyhow::anyhow!(
+            "SSH 认证被拒绝（用户: {}）",
+            config.username
+        ));
+    }
+    Ok(handle)
+}
+
+/// 执行 SSH 认证（支持密码、密钥和自动模式）
+async fn authenticate<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    config: &SshConnectionConfig,
+) -> anyhow::Result<AuthResult> {
+    let resolved_auth = resolve_auth_method(&config.auth_method)?;
+
+    match &resolved_auth {
+        ResolvedAuthMethod::Password { password } => {
+            log::info!("russh: 密码认证");
+            handle
+                .authenticate_password(&config.username, password.as_str())
+                .await
+                .map_err(|e| anyhow::anyhow!("密码认证失败: {}", e))
+        }
+
+        ResolvedAuthMethod::PrivateKey {
+            path,
+            passphrase,
+            certificate_path,
+            ..
+        } => {
+            log::info!("russh: 私钥认证 ({:?})", path);
+            let key = load_key_material(path, passphrase.as_deref().map(|p| p.as_str()))?;
+            if let Some(certificate_path) = certificate_path {
+                let cert = load_certificate(certificate_path)?;
+                handle
+                    .authenticate_openssh_cert(&config.username, key, cert)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OpenSSH 证书认证失败: {}", e))
+            } else {
+                let hash_alg = handle
+                    .best_supported_rsa_hash()
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+                handle
+                    .authenticate_publickey(
+                        &config.username,
+                        PrivateKeyWithHashAlg::new(key, hash_alg),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("公钥认证失败: {}", e))
+            }
+        }
+
+        ResolvedAuthMethod::Auto => {
+            // "尝试多种方法"语义：agent → 默认密钥。auth.rs 的 try_agent_auth
+            // 已实现完整回退链（agent 不可达/无密钥时自动尝试 ~/.ssh 默认密钥），
+            // 此前这里只试默认密钥，agent 有密钥但 ~/.ssh 无默认密钥的用户
+            // 在 Auto 模式下认证失败（与 SFTP 通道行为一致地错）。
+            log::info!("russh: 自动认证模式（agent → 默认密钥）");
+            try_agent_auth(handle, config).await
+        }
+
+        ResolvedAuthMethod::Agent => {
+            log::info!("russh: SSH Agent 认证 (SSH_AUTH_SOCK)");
+            try_agent_auth(handle, config).await
+        }
+    }
 }

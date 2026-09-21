@@ -8,6 +8,7 @@
 //! - [`ssh_pty`]: PTY + ssh 命令方式实现 SSH 终端
 //! - [`russh_terminal`]: russh 实现的 SSH 终端（默认传输路径）
 //! - [`sftp_fs`]: SFTP 文件系统
+//! - [`tunnel`][]: 按主机共享的反向端口转发隧道（同一主机的标签只监听一次）
 
 pub mod agent;
 pub mod auth;
@@ -20,6 +21,7 @@ pub mod russh_terminal;
 pub mod sftp_fs;
 pub mod shared_runtime;
 pub mod ssh_pty;
+pub mod tunnel;
 
 pub use config::{AuthMethod, SshConnectionConfig};
 

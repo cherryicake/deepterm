@@ -13,12 +13,34 @@
 //! - 系统 ssh（FIDO2 / Touch ID 密钥走这条）：等价于给 ssh 加
 //!   `-R bind:target`，隧道由 ssh 进程自己维护，本模块不参与。
 //!
+//! # 隧道按主机共享（进程级单例）
+//!
+//! 反向监听端口是**远端资源**，一个 `<bind_host>:<bind_port>` 在同一台远端
+//! 上只能被一个 sshd 会话持有。若每个终端标签各自建连、各自发一次
+//! `tcpip-forward`，那么第二个标签起必然被远端拒绝（`RequestDenied`，
+//! 远端日志里是「port already in use」）——而占住端口的恰恰是本进程自己。
+//! 用户看到的就是「每开一个标签弹一次端口被占用」。
+//!
+//! 因此隧道不再绑定在「某一条终端连接」上，而是按主机（`user@host:port`）
+//! 在进程内共享（见 [`crate::ssh::tunnel`]）：那里保存一条**专职隧道连接**，
+//! 它不承载 shell，只负责监听与桥接；同一主机的所有终端标签共用它。首个
+//! 标签建隧道，后续标签直接复用（不再重发 `tcpip-forward`，也就不会再撞
+//! 端口）。
+//!
+//! 隧道连接与承载 shell 的终端连接是两条独立连接：终端标签关掉不影响隧道
+//! （其它标签还在用）。隧道按主机常驻进程，不随最后一个标签关闭而消失——
+//! 否则「关掉再打开」会在旧监听的释放与新请求之间赛跑，重新撞上同一个端口。
+//! 隧道连接断开（网络故障、远端重启）时下一次使用自动重建，重连后远端端口
+//! 已空出，不会残留。
 //! # 边界
 //!
 //! - 默认只绑远端回环：只有那台机器自己能用这条隧道。要暴露给别的机器，
 //!   由用户在 `bind_host` 里显式写 `0.0.0.0`——这是用户的决定，不是默认值。
 //! - 转发是**附加**能力：远端拒绝（端口被占、sshd 禁了 AllowTcpForwarding）
 //!   只报警告，不阻断登录。
+//! - 隧道**不跨主机复用**：`0.0.0.0:3801` 在 A 机与 B 机互不影响，各自的
+//!   隧道各自绑定。同一主机上重复配置同一条规则（同一 bind 端口）会被
+//!   认领表拦下，按该条失败处理（不会静默丢一条）。
 
 use std::collections::HashMap;
 use std::io;
@@ -83,7 +105,7 @@ impl PortForwardRule {
 /// 表单输入与 `ssh -R` 参数用带方括号的形态（OpenSSH 语法要求），但
 /// `tcpip-forward` 全局请求里的地址是裸字面量，服务器回报的也是裸的；
 /// 认领表必须按 wire 形态存取，否则永远查不到。
-fn wire_host(bind_host: &str) -> &str {
+pub(crate) fn wire_host(bind_host: &str) -> &str {
     bind_host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -292,60 +314,44 @@ pub async fn establish<H: client::Handler>(
     })
 }
 
-/// 为 russh 连接装上全部启用的规则。
+/// 结果文案（toast 用）：**只在状态变化时报**——新建了转发、或失败了。
 ///
-/// 返回 `(成功建立的转发, 失败原因)`：**逐条独立**，一条失败不影响其它条，
-/// 也不影响登录本身。`timeout` 是单条请求的等待上限（见 [`establish`]）。
-pub async fn install_all<H: client::Handler>(
-    handle: &client::Handle<H>,
-    rules: &[PortForwardRule],
-    forwards: &RemoteForwardTable,
-    timeout: std::time::Duration,
-) -> (Vec<EstablishedForward>, Vec<String>) {
-    let mut established = Vec::new();
-    let mut errors = Vec::new();
-    for rule in rules.iter().filter(|r| r.is_complete()) {
-        match establish(handle, rule, forwards, timeout).await {
-            Ok(done) => established.push(done),
-            Err(e) => errors.push(format!("{e:#}")),
-        }
-    }
-    (established, errors)
-}
-
-/// 结果文案（toast 用）。`None` 表示没有启用任何规则。
-pub fn outcome_message(
+/// 纯复用（隧道早就装好、这次什么都没变）返回 `None`：转发是按主机共享的，
+/// 每开一个标签都弹一次「已就绪」就是噪音，与旧实现「每开一个标签撞一次
+/// 端口」是同一个毛病的一体两面。复用只写日志。
+///
+/// `reused` 仅在**部分**复用（新加了规则、其余沿用）时出现在文案里，让用户
+/// 知道哪些是这次新建的、哪些本来就在。
+pub fn tunnel_outcome_message(
     established: &[EstablishedForward],
+    reused: &[EstablishedForward],
     errors: &[String],
 ) -> Option<(bool, String)> {
-    match (established.is_empty(), errors.is_empty()) {
-        (true, true) => None,
-        (false, true) => Some((
-            true,
-            format!(
-                "端口转发已就绪：{}",
-                established
-                    .iter()
-                    .map(EstablishedForward::summary)
-                    .collect::<Vec<_>>()
-                    .join("；")
-            ),
-        )),
-        (true, false) => Some((false, errors.join("；"))),
-        (false, false) => Some((
-            false,
-            format!(
-                "已转发 {}，失败 {}：{}",
-                established
-                    .iter()
-                    .map(EstablishedForward::summary)
-                    .collect::<Vec<_>>()
-                    .join("；"),
-                errors.len(),
-                errors.join("；")
-            ),
-        )),
+    if established.is_empty() && errors.is_empty() {
+        return None;
     }
+    let summarize = |items: &[EstablishedForward]| {
+        items
+            .iter()
+            .map(EstablishedForward::summary)
+            .collect::<Vec<_>>()
+            .join("；")
+    };
+    let ok = errors.is_empty();
+    let mut parts = Vec::new();
+    if !established.is_empty() {
+        parts.push(format!("已就绪：{}", summarize(established)));
+    }
+    if !reused.is_empty() {
+        parts.push(format!(
+            "沿用已有隧道：{}（同一主机只监听一次）",
+            summarize(reused)
+        ));
+    }
+    if !errors.is_empty() {
+        parts.push(format!("失败 {}：{}", errors.len(), errors.join("；")));
+    }
+    Some((ok, parts.join("；")))
 }
 
 /// 系统 ssh 路径要加的 `-R` 参数（逐条规则一个）。
@@ -474,27 +480,67 @@ mod tests {
     }
 
     #[test]
-    fn outcome_message_distinguishes_none_success_and_failure() {
-        assert_eq!(outcome_message(&[], &[]), None, "没启用规则时不该弹提示");
-
-        let ok = EstablishedForward {
+    fn tunnel_outcome_message_distinguishes_none_new_reused_and_failure() {
+        let done = EstablishedForward {
             bind_host: "127.0.0.1".to_string(),
             bind_port: 3801,
             target_host: "127.0.0.1".to_string(),
             target_port: 3801,
         };
-        let (ready, message) = outcome_message(std::slice::from_ref(&ok), &[]).unwrap();
-        assert!(ready);
-        assert!(message.contains("3801"), "{message}");
 
-        let (ready, message) = outcome_message(&[], &["端口被占用".to_string()]).unwrap();
-        assert!(!ready);
+        assert_eq!(
+            tunnel_outcome_message(&[], &[], &[]),
+            None,
+            "没启用规则时不该弹提示"
+        );
+
+        let (ok, message) = tunnel_outcome_message(std::slice::from_ref(&done), &[], &[]).unwrap();
+        assert!(ok);
+        assert!(message.contains("3801"), "{message}");
+        assert!(message.contains("已就绪"), "{message}");
+
+        // 纯复用要**静默**：转发按主机共享，每开一个标签弹一次就是噪音。
+        assert_eq!(
+            tunnel_outcome_message(&[], std::slice::from_ref(&done), &[]),
+            None,
+            "隧道早装好了、这次什么都没变，不该弹提示"
+        );
+
+        // 部分复用（新加了规则）要把「新建的」和「沿用的」分开说。
+        let added = EstablishedForward {
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 3802,
+            target_host: "127.0.0.1".to_string(),
+            target_port: 3802,
+        };
+        let (ok, message) = tunnel_outcome_message(
+            std::slice::from_ref(&added),
+            std::slice::from_ref(&done),
+            &[],
+        )
+        .unwrap();
+        assert!(ok);
+        assert!(
+            message.contains("已就绪") && message.contains("3802"),
+            "{message}"
+        );
+        assert!(
+            message.contains("沿用已有隧道") && message.contains("3801"),
+            "{message}"
+        );
+
+        let (ok, message) = tunnel_outcome_message(&[], &[], &["端口被占用".to_string()]).unwrap();
+        assert!(!ok);
         assert!(message.contains("端口被占用"), "{message}");
 
         // 部分成功必须两边都说，不能只报喜或只报忧
-        let (ready, message) =
-            outcome_message(std::slice::from_ref(&ok), &["另一条失败".to_string()]).unwrap();
-        assert!(!ready);
+        let (ok, message) = tunnel_outcome_message(
+            std::slice::from_ref(&done),
+            &[],
+            &["另一条失败".to_string()],
+        )
+        .unwrap();
+        assert!(!ok);
         assert!(
             message.contains("3801") && message.contains("另一条失败"),
             "{message}"

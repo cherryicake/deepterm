@@ -1631,12 +1631,16 @@ impl Terminal {
 
         // 系统 ssh 路径的隧道由 ssh 进程自己维护（`-R` 已在 ssh 参数里），
         // 这里只把「本次带了哪些规则」报到 UI。
-        let rules: Vec<crate::ssh::port_forward::PortForwardRule> =
-            ssh_config.port_forwards.iter().filter(|r| r.is_complete()).cloned().collect();
-        if !rules.is_empty() {
+        //
+        // 共享隧道已覆盖的规则不再计入：那些端口已经被本进程的专职隧道监听着，
+        // 再加 `-R` 只会让 ssh 报「端口被占用」（占住的是我们自己），报到 UI
+        // 就成了一条自己制造的假警报。
+        let pending =
+            crate::ssh::tunnel::rules_for_openssh(ssh_config, &ssh_config.port_forwards);
+        if !pending.is_empty() {
             // 这条路径拿不到远端的确认（`-R` 的结果只体现在 ssh 的 stderr 上，
             // 直接落在终端里）。所以只陈述「请求了什么」，不谎称已绑定成功。
-            let summary = rules
+            let summary = pending
                 .iter()
                 .map(|r| r.summary())
                 .collect::<Vec<_>>()
@@ -1650,6 +1654,8 @@ impl Terminal {
                 })
                 .ok();
         }
+        // 全部由共享隧道覆盖时不报：与 russh 路径一致，纯复用是静默的
+        // （每开一个标签弹一次「已就绪」就是噪音）。
         // 未配置：丢掉发送端，driver_rx 立即结束（与改动前行为一致）。
         drop(driver_tx);
 

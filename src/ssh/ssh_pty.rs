@@ -98,10 +98,18 @@ impl SshPtyTerminal {
 
         // 端口转发：系统 ssh 路径没有 russh handle，反向隧道用 `-R` 表达，
         // 隧道由 ssh 进程自己维护；「请求了什么」由 terminal.rs 直接按 config 报给 UI。
-        let forward_args = crate::ssh::port_forward::openssh_args(&config.port_forwards);
+        //
+        // 但若该主机已有活着的**共享隧道**（另一个 russh 标签建的，见
+        // `crate::ssh::tunnel`），这些规则已经装在上面了：再加 `-R` 只会让 ssh
+        // 拿到「端口被占用」的警告——占住端口的正是本进程自己。此时省掉。
+        let pending_forwards =
+            crate::ssh::tunnel::rules_for_openssh(config, &config.port_forwards);
+        let forward_args = crate::ssh::port_forward::openssh_args(&pending_forwards);
         if !forward_args.is_empty() {
             log::info!("SSH: 端口转发参数 {:?}", forward_args);
             ssh_args.extend(forward_args);
+        } else if !config.port_forwards.is_empty() {
+            log::info!("SSH: 端口转发已由共享隧道覆盖，本次连接不再重复请求监听");
         }
 
         // 目标主机
