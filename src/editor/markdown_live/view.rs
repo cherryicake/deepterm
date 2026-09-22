@@ -38,8 +38,9 @@ use crate::editor::markdown_live::images::{
 };
 use crate::editor::markdown_live::interactions::{
     backspace_marker, classify_alone, insert_link, line_selection, list_cols,
-    on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_insert_row_below,
-    table_nav, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
+    on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_cell_at,
+    table_cell_bounds, table_goto_cell, table_insert_row_below, table_last_row_line, table_nav,
+    table_row_line, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
 };
 use crate::editor::markdown_live::layout::{
     byte_for_col, col_for_byte, plan_cell, src_for_vis, vis_for_src, RowKind,
@@ -1119,36 +1120,235 @@ impl LiveMarkdownView {
         self.edit(cx, |m| m.move_to(line, col, true));
     }
 
-    /// 光标在表格里时，Esc 的目标行：该表格块的最后一行 + 1（贴文档尾则
-    /// 表格首行前一行）。光标不在表格里返回 `None`（Esc 维持原行为）。
-    fn table_exit_line(&self) -> Option<usize> {
-        let cur = self.buffer.cursor().line;
+    /// Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容（不升级到整表/整文档）。
+    /// 返回 `true` 表示已处理。
+    fn select_table_cell_contents(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        let Some((cs, ce)) = self.table_cell_content_at(cur.line, cur.col) else {
+            return false;
+        };
+        self.edit(cx, |m| m.select_range(cs, ce));
+        cx.notify();
+        true
+    }
+
+    /// Typora：格首退格不合并单元格——光标跳到上一格**末**（无文本改动）。
+    /// 首行首格则什么都不做。返回 `true` 表示事件已被表格消费。
+    fn table_backspace_at_start(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        let lines: Vec<String> = self.buffer.lines().to_vec();
+        // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
+        // 需要可变借用，闭包持不可变借用会冲突）。
+        let table_lines: Vec<bool> = {
+            let mut v = vec![false; self.buffer.line_count()];
+            for r in &self.planned {
+                if matches!(r.block, Block::Table) && r.line < v.len() {
+                    v[r.line] = true;
+                }
+            }
+            v
+        };
+        let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
+        let Some((row, col, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
+            return false;
+        };
+        if cur.col > cs {
+            return false;
+        }
+        // 上一格（流序）：同行前一格，或上一行末格。
+        let (prev_row, prev_col) = if col > 0 {
+            (row, col - 1)
+        } else {
+            match row.checked_sub(1) {
+                Some(r) => (r, usize::MAX),
+                None => {
+                    // 表格最开头：消费事件但不移动（Typora 同款无操作）。
+                    return true;
+                }
+            }
+        };
+        let prev_col = if prev_col == usize::MAX {
+            let Some(l) = table_row_line(&lines, &is_table, cur.line, prev_row) else {
+                return true;
+            };
+            table_cell_bounds(lines.get(l).map(String::as_str).unwrap_or(""))
+                .len()
+                .saturating_sub(1)
+        } else {
+            prev_col
+        };
+        let moved = self.edit(cx, |m| {
+            table_goto_cell(m, &lines, &is_table, cur.line, prev_row, prev_col, true)
+        });
+        if moved {
+            self.after_move(cx);
+        }
+        true
+    }
+
+    /// 表格里的上下移动（Typora）：按**列索引**换行，不是按像素 x。
+    /// 越过表头/末行则退出表格。返回 `true` 表示已处理。
+    fn table_move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        let lines: Vec<String> = self.buffer.lines().to_vec();
+        // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
+        // 需要可变借用，闭包持不可变借用会冲突）。
+        let table_lines: Vec<bool> = {
+            let mut v = vec![false; self.buffer.line_count()];
+            for r in &self.planned {
+                if matches!(r.block, Block::Table) && r.line < v.len() {
+                    v[r.line] = true;
+                }
+            }
+            v
+        };
+        let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
+        let Some((row, col, _)) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
+            return false;
+        };
+        let target_row = if down {
+            row + 1
+        } else {
+            match row.checked_sub(1) {
+                Some(r) => r,
+                None => return false,
+            }
+        };
+        // Typora: ↑ 落在目标格**末**，↓ 落在**首**。
+        let moved = self.edit(cx, |m| {
+            table_goto_cell(m, &lines, &is_table, cur.line, target_row, col, !down)
+        });
+        if moved {
+            let _ = extend;
+            self.after_move(cx);
+            return true;
+        }
+        false
+    }
+
+    /// 表格里的左右移动（Typora）：到格边界后跳到**上/下一行的同列格**。
+    /// 表格两端不环绕。返回 `true` 表示已处理。
+    fn table_move_horizontal(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        let lines: Vec<String> = self.buffer.lines().to_vec();
+        // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
+        // 需要可变借用，闭包持不可变借用会冲突）。
+        let table_lines: Vec<bool> = {
+            let mut v = vec![false; self.buffer.line_count()];
+            for r in &self.planned {
+                if matches!(r.block, Block::Table) && r.line < v.len() {
+                    v[r.line] = true;
+                }
+            }
+            v
+        };
+        let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
+        let Some((row, col, (cs, ce))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
+            return false;
+        };
+        let at_edge = if forward { cur.col >= ce } else { cur.col <= cs };
+        if !at_edge {
+            return false;
+        }
+        // 先试同行相邻格，再试相邻行的同列格（Typora 是流序：按列索引走）。
+        let cols = table_cell_bounds(lines.get(cur.line).map(String::as_str).unwrap_or("")).len();
+        let (next_row, next_col) = if forward {
+            if col + 1 < cols {
+                (row, col + 1)
+            } else {
+                (row + 1, 0)
+            }
+        } else if col > 0 {
+            (row, col - 1)
+        } else {
+            match row.checked_sub(1) {
+                Some(r) => (r, usize::MAX),
+                None => return false,
+            }
+        };
+        // 目标列：`usize::MAX` 表示"上一行的最后一格"。
+        let next_col = if next_col == usize::MAX {
+            let Some(l) = table_row_line(&lines, &is_table, cur.line, next_row) else {
+                return false;
+            };
+            table_cell_bounds(lines.get(l).map(String::as_str).unwrap_or(""))
+                .len()
+                .saturating_sub(1)
+        } else {
+            next_col
+        };
+        let moved = self.edit(cx, |m| {
+            table_goto_cell(
+                m,
+                &lines,
+                &is_table,
+                cur.line,
+                next_row,
+                next_col,
+                !forward,
+            )
+        });
+        if moved {
+            self.after_move(cx);
+            return true;
+        }
+        false
+    }
+
+    /// 表格里的 Enter（Typora）：移到**下方同列**格；没有下一行则退出表格。
+    /// 返回 `true` 表示已处理。
+    fn table_enter_down(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        let lines: Vec<String> = self.buffer.lines().to_vec();
+        // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
+        // 需要可变借用，闭包持不可变借用会冲突）。
+        let table_lines: Vec<bool> = {
+            let mut v = vec![false; self.buffer.line_count()];
+            for r in &self.planned {
+                if matches!(r.block, Block::Table) && r.line < v.len() {
+                    v[r.line] = true;
+                }
+            }
+            v
+        };
+        let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
+        let Some((row, col, _)) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
+            return false;
+        };
+        let moved = self.edit(cx, |m| {
+            table_goto_cell(m, &lines, &is_table, cur.line, row + 1, col, false)
+        });
+        if moved {
+            self.after_move(cx);
+            return true;
+        }
+        // 末行：退出表格（落到表格后一行）。
+        if let Some(last) = table_last_row_line(&lines, &is_table, cur.line) {
+            let exit = (last + 1).min(lines.len().saturating_sub(1));
+            self.edit(cx, |m| m.move_to(exit, 0, false));
+            self.after_move(cx);
+            return true;
+        }
+        false
+    }
+
+    /// 表格里的 Esc（Typora）：**不退出表格**，只关闭弹窗类 UI。
+    /// 这里保留搜索面板关闭，其余情况清掉选区/不做动作。
+    fn table_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
         if !self
             .planned
             .iter()
-            .find(|r| r.line == cur)
+            .find(|r| r.line == cur.line)
             .is_some_and(|r| matches!(r.block, Block::Table))
         {
-            return None;
+            return false;
         }
-        let last = self
-            .planned
-            .iter()
-            .filter(|r| matches!(r.block, Block::Table))
-            .map(|r| r.line)
-            .max()?;
-        let line_count = self.buffer.line_count();
-        Some(if last + 1 < line_count {
-            last + 1
-        } else {
-            self.planned
-                .iter()
-                .filter(|r| matches!(r.block, Block::Table))
-                .map(|r| r.line)
-                .min()
-                .unwrap_or(0)
-                .saturating_sub(1)
-        })
+        if self.buffer.selection().is_some() {
+            self.edit(cx, |m| m.clear_selection());
+            cx.notify();
+        }
+        true
     }
 
     /// 表格活动单元格：光标所在行 + 列 + 该格的**内容字节范围**。    ///
@@ -1618,6 +1818,10 @@ impl LiveMarkdownView {
 
         match key {
             "left" => {
+                if !platform && !alt && self.table_move_horizontal(false, cx) {
+                    // 表格内：格边界处跳到上一格/上一行（Typora）。
+                    return;
+                }
                 self.edit(cx, |m| {
                     if platform {
                         m.home(shift)
@@ -1632,6 +1836,10 @@ impl LiveMarkdownView {
                 return;
             }
             "right" => {
+                if !platform && !alt && self.table_move_horizontal(true, cx) {
+                    // 表格内：格边界处跳到下一格/下一行（Typora）。
+                    return;
+                }
                 self.edit(cx, |m| {
                     if platform {
                         m.end(shift)
@@ -1649,6 +1857,8 @@ impl LiveMarkdownView {
                 if platform {
                     self.edit(cx, |m| m.doc_start(shift));
                     self.after_move(cx);
+                } else if self.table_move_vertical(false, shift, cx) {
+                    // 表格内：按列索引上移（Typora）。
                 } else {
                     self.move_visual(false, shift, cx);
                 }
@@ -1658,6 +1868,8 @@ impl LiveMarkdownView {
                 if platform {
                     self.edit(cx, |m| m.doc_end(shift));
                     self.after_move(cx);
+                } else if self.table_move_vertical(true, shift, cx) {
+                    // 表格内：按列索引下移（Typora）。
                 } else {
                     self.move_visual(true, shift, cx);
                 }
@@ -1706,6 +1918,12 @@ impl LiveMarkdownView {
                         }
                     }
                 }
+                // 表格格首退格（Typora）：光标在该格内容起点时，跳到上一格
+                // **末**，不删字符、不合并单元格。必须在通用 backspace 之前
+                // 判断，否则行内字符会被先删掉。
+                if sel_none && !platform && !alt && self.table_backspace_at_start(cx) {
+                    return;
+                }
                 let changed = self.edit(cx, |m| {
                     if m.selection().is_some() {
                         m.delete_selection()
@@ -1751,6 +1969,36 @@ impl LiveMarkdownView {
                 return;
             }
             "enter" => {
+                // Typora 表格内的 Enter 家族优先（否则会被下面的
+                // Cmd+Enter 任务切换等分支抢先消费）：
+                //  - Shift+Enter → 插入 `<br />`（GFM 单元格不支持换行）
+                //  - Cmd/Ctrl+Enter → 在当前行下方插入空行
+                //  - Enter → 移到**下方同列**格；末行则退出表格
+                if !self.read_only
+                    && self
+                        .planned
+                        .iter()
+                        .find(|r| r.line == self.buffer.cursor().line)
+                        .is_some_and(|r| matches!(r.block, Block::Table))
+                {
+                    if self.buffer.selection().is_some() {
+                        self.edit(cx, |m| m.delete_selection());
+                    }
+                    if shift {
+                        self.edit(cx, |m| m.insert("<br />"));
+                        self.after_edit(cx);
+                        return;
+                    }
+                    if platform || control {
+                        if self.edit(cx, table_insert_row_below) {
+                            self.after_edit(cx);
+                        }
+                        return;
+                    }
+                    if self.table_enter_down(cx) {
+                        return;
+                    }
+                }
                 if platform {
                     if self.read_only {
                         return;
@@ -1774,14 +2022,6 @@ impl LiveMarkdownView {
                     .iter()
                     .find(|r| r.line == cur.line)
                     .map(|r| r.block.clone());
-                // Typora Enter inside a table: empty row below (no selection).
-                if self.buffer.selection().is_none()
-                    && matches!(planned_block, Some(Block::Table))
-                    && self.edit(cx, table_insert_row_below)
-                {
-                    self.after_edit(cx);
-                    return;
-                }
                 let in_code = matches!(
                     planned_block,
                     Some(Block::CodeLine | Block::Fence { .. } | Block::FrontMatter)
@@ -1843,14 +2083,10 @@ impl LiveMarkdownView {
                     cx.stop_propagation();
                     return;
                 }
-                // 表格里按 Esc：退出表格（Notion / codemirror-markdown-tables
-                // 同款）——光标移到表格后一行，不动任何文本。选区仍优先处理，
-                // 这样「先取消选区、再退出表格」是两段式，符合直觉。
-                if self.buffer.selection().is_none()
-                    && let Some(exit) = self.table_exit_line()
-                {
-                    self.edit(cx, |m| m.move_to(exit, 0, false));
-                    self.after_move(cx);
+                // Typora：Esc 在表格里**不退出表格**，只关闭弹窗类 UI
+                //（搜索面板已在上方处理）。这里额外清掉选区，其余不动。
+                if self.table_escape(cx) {
+                    cx.stop_propagation();
                     return;
                 }
                 if self.buffer.selection().is_some() {
@@ -1860,6 +2096,12 @@ impl LiveMarkdownView {
                 return;
             }
             "a" if platform => {
+                // Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容，不升级到
+                // 整表/整文档。
+                if self.select_table_cell_contents(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 self.edit(cx, |m| m.select_all());
                 cx.notify();
                 cx.stop_propagation();
@@ -5361,13 +5603,156 @@ mod live_frame_tests {
             "Tab 不得离开表格（line={line_a}）"
         );
 
-        // 4) Esc 退出表格：光标移到表格后一行（第 4 行），文本不变。
+        // 4) Esc：Typora 在表格里**不退出表格**（只关弹窗/清选区），光标
+        // 留在格内、文本不变。
         let before = view.read_with(cx, |v, _| v.text());
+        let line_before = view.read_with(cx, |v, _| v.buffer.cursor().line);
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
-        assert_eq!(line, 4, "Esc 应把光标移出表格（line={line}）");
+        assert_eq!(line, line_before, "Esc 不该把光标移出表格（Typora 语义）");
         assert_eq!(view.read_with(cx, |v, _| v.text()), before, "Esc 不得改动文本");
+
+        // 5) Enter：移到**下方同列**格（Typora），不是插入新行。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        let rows_before = view.read_with(cx, |v, _| v.buffer.line_count());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            rows_before,
+            "Enter 不该改变行数（Typora：移到下方同列格）"
+        );
+        assert!(
+            line > 2,
+            "Enter 应移到下方单元格（line={line}, col={col}）"
+        );
+
+        // 6) Cmd/Ctrl+Enter：在当前行下方插入空行（Typora）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        let rows_before = view.read_with(cx, |v, _| v.buffer.line_count());
+        cx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            rows_before + 1,
+            "Cmd+Enter 应插入一行（Typora）"
+        );
+    }
+
+    /// Typora 表格键盘语义：Cmd+A 只选当前格、格首退格跳到上一格末（不合并）、
+    /// 左右键跨格、上下键按列索引。
+    #[gpui::test]
+    fn live_table_typora_keyboard_semantics(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // 0:表头 1:分隔 2:数据 3:数据
+        const DOC: &str = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+
+        // 1) Cmd+A：只选当前格内容（`2`），不是整行/整文档。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 8, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.run_until_parked();
+        let sel = view.read_with(cx, |v, _| v.buffer.selection());
+        let text = view.read_with(cx, |v, _| v.selected_source_text());
+        assert!(sel.is_some(), "Cmd+A 应产生选区");
+        assert_eq!(
+            text.as_deref(),
+            Some("2"),
+            "Cmd+A 在表格里只选当前格内容（Typora）"
+        );
+
+        // 2) 格首退格：跳到上一格末，不删字符、不合并。
+        let before = view.read_with(cx, |v, _| v.text());
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 6, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            before,
+            "格首退格不得删字符/合并单元格"
+        );
+        assert!(
+            line < 2 || (line == 2 && col < 6),
+            "格首退格应退到上一格（line={line}, col={col}）"
+        );
+
+        // 3) 左右键跨格：在最后一格末按右键 → 环绕到下一行首格（Typora
+        //    是流序导航，不是几何位置）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 7, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        let (line_r, col_r) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert!(
+            line_r > 2 || col_r > 7,
+            "格末按右键应前进到下一格/下一行（line={line_r}, col={col_r}）"
+        );
+        // 从第 3 行首格按左键 → 回到第 2 行末格。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(3, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        let (line_l, col_l) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert!(
+            line_l < 3 || col_l < 2,
+            "行首格按左键应回到上一行末格（line={line_l}, col={col_l}）"
+        );
+
+        // 4) 上下键按列索引：从第 2 行第 2 格向下 → 第 3 行第 2 格。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 8, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(line, 3, "下键应到下一行（line={line}）");
+        assert!(
+            (6..=9).contains(&col),
+            "下键应保持**列索引**（第 2 格），col={col}"
+        );
     }
 
     /// 表格里方向键不应把光标停在管道或格间空格上（Typora 语义：只有格

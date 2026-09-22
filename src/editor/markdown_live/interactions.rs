@@ -417,10 +417,130 @@ pub fn table_insert_row_below(model: &mut EditorModel) -> bool {
     true
 }
 
+/// Which table row/column the cursor sits in, for cross-cell navigation.
+/// Returns `(row_index_in_table, col_index, cell_content_char_cols)`.
+pub fn table_cell_at(
+    lines: &[String],
+    is_table: &dyn Fn(usize) -> bool,
+    line: usize,
+    col: usize,
+) -> Option<(usize, usize, (usize, usize))> {
+    if !is_table(line) {
+        return None;
+    }
+    let text = lines.get(line)?;
+    let spans = table_cell_bounds(text);
+    let byte = byte_for_col(text, col);
+    let ci = spans
+        .iter()
+        .position(|(s, e)| byte >= *s && byte <= *e)
+        .or_else(|| spans.iter().position(|(s, _)| *s >= byte))
+        .unwrap_or(spans.len().saturating_sub(1));
+    // Row index counts table rows from the block start, skipping the
+    // delimiter row (Typora's header is a real row, the delimiter is not).
+    let mut row = 0usize;
+    let mut l = line;
+    while l > 0 && is_table(l - 1) {
+        l -= 1;
+    }
+    let start = l;
+    for i in start..line {
+        if table_delimiter_cols(&lines[i]).is_none() {
+            row += 1;
+        }
+    }
+    let (s, e) = *spans.get(ci)?;
+    let raw = &text[s..e];
+    let lead = raw.len() - raw.trim_start().len();
+    let trail = raw.len() - raw.trim_end().len();
+    let cs = col_for_byte(text, s + lead);
+    let ce = col_for_byte(text, (e - trail).max(s + lead));
+    Some((row, ci, (cs, ce.max(cs))))
+}
+
+/// The table row (line index) at `row` index within the block containing
+/// `line`. `None` when the index falls outside the table.
+pub fn table_row_line(
+    lines: &[String],
+    is_table: &dyn Fn(usize) -> bool,
+    line: usize,
+    row: usize,
+) -> Option<usize> {
+    if !is_table(line) {
+        return None;
+    }
+    let mut l = line;
+    while l > 0 && is_table(l - 1) {
+        l -= 1;
+    }
+    let mut seen = 0usize;
+    let mut i = l;
+    while i < lines.len() && is_table(i) {
+        if table_delimiter_cols(&lines[i]).is_none() {
+            if seen == row {
+                return Some(i);
+            }
+            seen += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The last table row line of the block containing `line`.
+pub fn table_last_row_line(
+    lines: &[String],
+    is_table: &dyn Fn(usize) -> bool,
+    line: usize,
+) -> Option<usize> {
+    if !is_table(line) {
+        return None;
+    }
+    let mut i = line;
+    let mut last = None;
+    while i < lines.len() && is_table(i) {
+        if table_delimiter_cols(&lines[i]).is_none() {
+            last = Some(i);
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Move the caret to the cell `row`/`col` of the table, landing at the
+/// **start** (`to_end = false`) or **end** of its content. `None` when that
+/// cell does not exist (caller then exits the table).
+pub fn table_goto_cell(
+    model: &mut EditorModel,
+    lines: &[String],
+    is_table: &dyn Fn(usize) -> bool,
+    line: usize,
+    row: usize,
+    col: usize,
+    to_end: bool,
+) -> bool {
+    let Some(target) = table_row_line(lines, is_table, line, row) else {
+        return false;
+    };
+    let Some(text) = lines.get(target) else {
+        return false;
+    };
+    let spans = table_cell_bounds(text);
+    let Some((s, e)) = spans.get(col).copied() else {
+        return false;
+    };
+    let raw = &text[s..e];
+    let lead = raw.len() - raw.trim_start().len();
+    let trail = raw.len() - raw.trim_end().len();
+    let cs = col_for_byte(text, s + lead);
+    let ce = col_for_byte(text, (e - trail).max(s + lead));
+    model.move_to(target, if to_end { ce } else { cs }, false);
+    true
+}
+
 /// [`Pos`] of full-text byte `off` (lines joined by single newlines).
 /// Interior offsets floor to the char start; past-end clamps to doc end.
-pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {
-    for (i, line) in lines.iter().enumerate() {
+pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {    for (i, line) in lines.iter().enumerate() {
         if off <= line.len() {
             return Pos::new(i, col_for_byte(line, off));
         }
