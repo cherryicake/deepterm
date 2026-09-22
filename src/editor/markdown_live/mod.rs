@@ -19,6 +19,7 @@ pub mod images;
 pub mod inline;
 pub mod interactions;
 pub mod layout;
+pub mod mermaid;
 pub mod model;
 pub mod reveal;
 pub mod view;

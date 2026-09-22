@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle, ShapedLine, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, TextRun, Window, div, px, rems,
-    svg,
+    Animation, AnimationExt, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
+    ShapedLine, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
+    TextRun, Window, div, px, rems, svg,
 };
 
 use crate::assets::Icon;
@@ -30,6 +30,7 @@ use crate::editor::markdown_live::element::{
 };
 use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::highlight::HighlightCache;
+use crate::editor::markdown_live::mermaid::{MermaidBody, MermaidColors, MermaidState};
 use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
 };
@@ -90,6 +91,9 @@ pub struct LiveMarkdownView {
     /// `table_refs` 对应的缓存键；`None` 表示还没算过。
     table_refs_key: Option<(u64, (Pos, Option<(Pos, Pos)>, bool, bool, bool))>,
     copied_code_blocks: HashSet<usize>,
+    /// Mermaid 图渲染缓存 +「预览 | 源码」按钮状态（缓存键 = 块源码 + 主题指纹，
+    /// 后台 + 防抖渲染；详见 `mermaid` 模块）。
+    mermaid: MermaidState,
     /// Bring the caret's row into view on the next render (set by every
     /// edit/move; consumed by `scroll_to_item` on the rows column).
     scroll_to_cursor: bool,
@@ -186,6 +190,7 @@ impl LiveMarkdownView {
             table_refs: Rc::new(HashMap::new()),
             table_refs_key: None,
             copied_code_blocks: HashSet::new(),
+            mermaid: MermaidState::new(),
             scroll_to_cursor: false,
             row_targets: Vec::new(),
             row_layouts: std::collections::HashMap::new(),
@@ -656,6 +661,9 @@ impl LiveMarkdownView {
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
+        // 搜索/替换等程序化移动可能把光标送进图模式块（源码未渲染）：
+        // 统一夹出块外，保证「编辑只能经『源码』tab」不被旁路。
+        self.clamp_cursor_out_of_image_blocks(cx);
         // Slash menu highlight resets on every edit (Up/Down move through
         // `after_move`, which preserves it); the query itself re-derives
         // from the buffer each frame.
@@ -675,6 +683,9 @@ impl LiveMarkdownView {
     }
 
     fn after_move(&mut self, cx: &mut Context<Self>) {
+        // 图模式 mermaid 块是移动禁区（源码行未渲染）：Up/Down 越过、
+        // 搜索跳转/点击落进来时夹到块外——光标永远不驻留在隐藏源码里。
+        self.clamp_cursor_out_of_image_blocks(cx);
         cx.notify();
         cx.stop_propagation();
     }
@@ -914,6 +925,12 @@ impl LiveMarkdownView {
         let Some(line) = self.line_for_click(ev.position) else {
             return;
         };
+        // 点击图模式 mermaid 图片区：无文本可落点，不移动光标
+        //（仍聚焦并停冒泡——但绝不会把光标放进隐藏源码里）。
+        if self.line_in_mermaid_image(line) {
+            cx.stop_propagation();
+            return;
+        }
         let col = self.col_for_click(line, ev.position);
         let shift = ev.modifiers.shift;
         let click_count = ev.click_count;
@@ -941,8 +958,138 @@ impl LiveMarkdownView {
         let Some(line) = self.line_for_click(position) else {
             return;
         };
+        // 拖拽扫过图模式图片区：忽略（保持光标在块外），不扩展进隐藏源码。
+        if self.line_in_mermaid_image(line) {
+            return;
+        }
         let col = self.col_for_click(line, position);
         self.edit(cx, |m| m.move_to(line, col, true));
+    }
+
+    // ---- mermaid 图模式禁区（严格 tab-only：图可见时源码不可编辑） -------
+
+    /// 「预览 | 源码」按钮的唯一入口：切状态 + 切到预览时把光标夹出块外。
+    ///
+    /// 夹光标必须在**切换的同一帧**做完：只改状态的话，光标会滞留在下一帧
+    /// 就不可见的源码区里（真实点击路径实测复现，见 `live_mermaid_graph_mode`
+    /// 第 4 步）。
+    fn set_mermaid_showing_code(
+        &mut self,
+        block_id: usize,
+        showing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mermaid.set_showing_code(block_id, showing) && !showing {
+            self.clamp_cursor_out_of_image_blocks(cx);
+        }
+        cx.notify();
+    }
+
+    /// 全文档源码模式开关（`Cmd+/` / 状态条芯片）：关掉源码模式时，原本
+    /// 可编辑的 mermaid 块会变回图，光标必须同帧夹出隐藏区。
+    fn toggle_show_source(&mut self, cx: &mut Context<Self>) {
+        self.show_source = !self.show_source;
+        if !self.show_source {
+            self.clamp_cursor_out_of_image_blocks(cx);
+        }
+        cx.notify();
+    }
+
+    /// `line` 是否落在某个「正在画图」的 mermaid 块源码区间内。
+    fn line_in_mermaid_image(&self, line: usize) -> bool {
+        self.mermaid_image_ranges()
+            .iter()
+            .any(|&(a, b)| line >= a && line <= b)
+    }
+
+    /// 图模式下（卡片画着图、源码行未渲染）mermaid 块占用的源码行范围
+    /// `(开围栏行, 末行)`。与渲染分支共用 `MermaidState::body` 判定，
+    /// 永远与「眼睛看到的」一致：图在画 → 禁区；回退源码 / 源码 tab → 不是。
+    fn mermaid_image_ranges(&self) -> Vec<(usize, usize)> {
+        if self.mermaid.is_empty() {
+            return Vec::new();
+        }
+        // `planned` 是上一帧规划（帧间判定只关心文本相关范围，光标无关）。
+        let rows = &self.planned;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            let Block::Fence { open: true, lang } = &rows[i].block else {
+                i += 1;
+                continue;
+            };
+            let is_mermaid = lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
+            let open_pi = i;
+            i += 1;
+            let mut last_code = open_pi;
+            while i < rows.len() && matches!(rows[i].block, Block::CodeLine) {
+                last_code = i;
+                i += 1;
+            }
+            let close_pi = if i < rows.len()
+                && matches!(rows[i].block, Block::Fence { open: false, .. })
+            {
+                let c = i;
+                i += 1;
+                Some(c)
+            } else {
+                None
+            };
+            // 非 mermaid / 空块：与渲染分支一致（空块恒显源码）。
+            if !is_mermaid || last_code == open_pi {
+                continue;
+            }
+            let block_id = rows[open_pi].line;
+            // 与渲染分支同源：mermaid 块不吃「光标停在围栏行」的行级揭示
+            //（严格 tab-only），只有全文档源码模式才回源码。
+            let fence_revealed = rows[open_pi].plan.revealed
+                || close_pi.is_some_and(|c| rows[c].plan.revealed);
+            let revealed = fence_revealed && self.show_source;
+            if revealed || self.mermaid.is_showing_code(block_id) {
+                continue;
+            }
+            let source = (open_pi + 1..=last_code)
+                .map(|pi| self.buffer.line(rows[pi].line).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if matches!(self.mermaid.body(&source), MermaidBody::Image { .. }) {
+                let end = close_pi.unwrap_or(last_code);
+                out.push((rows[open_pi].line, rows[end].line));
+            }
+        }
+        out
+    }
+
+    /// 光标落进图模式 mermaid 块（隐藏源码区）→ 夹到块外：优先块后一行，
+    /// 贴文档尾则块前一行。移动（`after_move`）与编辑（`after_edit`）、
+    /// 搜索跳转统一走这里 —— 隐藏源码永远不会被就地编辑。
+    fn clamp_cursor_out_of_image_blocks(&mut self, cx: &mut Context<Self>) {
+        if self.mermaid.is_empty() {
+            return;
+        }
+        let ranges = self.mermaid_image_ranges();
+        if ranges.is_empty() {
+            return;
+        }
+        let cur = self.buffer.cursor();
+        let line_count = self.buffer.line_count();
+        for (a, b) in ranges {
+            if cur.line < a || cur.line > b {
+                continue;
+            }
+            let after = b + 1;
+            let target = if after < line_count {
+                after
+            } else if a > 0 {
+                a - 1
+            } else {
+                // 整篇文档就是这一张图：无处可夹，留在原地（光标在图上
+                // 不绘制；on_key 入口的防御分支会吞掉编辑键）。
+                return;
+            };
+            self.edit(cx, |m| m.move_to(target, 0, false));
+            return;
+        }
     }
 
     // ---- visual-row movement (B6) ---------------------------------------
@@ -1095,6 +1242,12 @@ impl LiveMarkdownView {
     ) {
         window.focus(&self.focus, cx);
         self.goal_x = None;
+        // 图模式 mermaid 块内不渲染文本行：真实 LiveLine 命中不该出现，
+        // 防御性兜底——落进禁区直接忽略，光标留在块外。
+        if self.line_in_mermaid_image(line) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(src_line) = self.buffer.line(line).map(str::to_string) else {
             return;
         };
@@ -1191,6 +1344,15 @@ impl LiveMarkdownView {
             (key, platform),
             ("f", true) | ("g", true) | ("escape", _)
         ) {
+            return;
+        }
+
+        // 防御：光标若经非常规路径落入图模式 mermaid 块（隐藏源码区），
+        // 先夹出块外并吞掉本键——源码可见才可编辑，编辑必须经「源码」tab
+        //（严格 tab-only，无任何自动显示源码的行为）。
+        if !platform && !control && !alt && self.line_in_mermaid_image(self.buffer.cursor().line) {
+            self.clamp_cursor_out_of_image_blocks(cx);
+            self.after_move(cx);
             return;
         }
 
@@ -1598,8 +1760,7 @@ impl LiveMarkdownView {
             }
             "/" if platform => {
                 // Typora 源码模式切换（与状态条"源码"芯片同一开关）。
-                self.show_source = !self.show_source;
-                cx.notify();
+                self.toggle_show_source(cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1806,6 +1967,8 @@ impl SearchTarget for LiveMarkdownView {
             m.move_to(s.line, s.col, false);
             m.move_to(e.line, e.col, true);
         });
+        // 搜索跳转可能落进图模式块（隐藏源码区）：夹到块外。
+        self.clamp_cursor_out_of_image_blocks(cx);
     }
 
     fn replace_match(
@@ -1822,6 +1985,8 @@ impl SearchTarget for LiveMarkdownView {
         let s = pos_of_offset(&lines, range.start);
         let e = pos_of_offset(&lines, range.end);
         self.edit(cx, |m| m.replace_range(s, e, text));
+        // 替换后的落点可能在图模式块内：夹到块外再发射变更。
+        self.clamp_cursor_out_of_image_blocks(cx);
         self.after_edit(cx);
     }
 
@@ -2803,6 +2968,34 @@ impl Render for LiveMarkdownView {
         } else {
             Rc::new(HashMap::new())
         };
+        // ---- mermaid pass1：对**全部** mermaid 组（含视口外，虚拟化不参与）
+        // ensure 渲染缓存（后台 + 200ms 防抖），随后推进缓存帧。
+        // 全量而非只扫视口内的原因：「上一帧同位置成品图」回退按文档序对齐，
+        // 只扫视口会让窗口滑动时位置错位、把别的块的旧图闪现到这个块上。
+        {
+            let mm_colors = MermaidColors::resolve(&theme);
+            self.mermaid.begin_frame(mm_colors.fingerprint());
+            for g in &groups {
+                if let Group::Fence { open, code, .. } = g {
+                    let lang = match &rows[*open].block {
+                        Block::Fence { open: true, lang } => lang.as_deref(),
+                        _ => None,
+                    };
+                    if !code.is_empty()
+                        && lang.is_some_and(|l| l.eq_ignore_ascii_case("mermaid"))
+                    {
+                        let block_id = rows[*open].line;
+                        let src = code
+                            .iter()
+                            .map(|c| self.buffer.line(rows[*c].line).unwrap_or(""))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.mermaid.ensure(block_id, &src, &mm_colors, cx);
+                    }
+                }
+            }
+            self.mermaid.end_frame();
+        }
         let mut window_counts: Vec<usize> = Vec::new();
         for (gi, group) in groups.iter().enumerate() {
             if virtualized && (gi < v_lo || gi > v_hi) {
@@ -3170,8 +3363,17 @@ impl Render for LiveMarkdownView {
                     // cursor sitting on ```). Code lines stay rendered in
                     // the card while editing them — Obsidian behavior — so
                     // clicking into code never un-renders it.
-                    let revealed = rows[*open].plan.revealed
+                    //
+                    // mermaid 例外（严格 tab-only）：光标停在围栏行**不再**翻
+                    // 源码 —— 否则「光标路过」就等于自动显示源码/可编辑，违背
+                    // 「只能点『源码』tab 才能编辑」。只保留全文档源码模式
+                    //（`Cmd+/`，plan_document 会把所有行 revealed）这条用户显式
+                    // 通道。
+                    let is_mermaid =
+                        lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
+                    let fence_revealed = rows[*open].plan.revealed
                         || close.is_some_and(|c| rows[c].plan.revealed);
+                    let revealed = fence_revealed && (!is_mermaid || self.show_source);
                     let block_id = rows[*open].line;
                     if revealed || code.is_empty() {
                         // Source editing mode: mono lines, fences visible.
@@ -3205,6 +3407,17 @@ impl Render for LiveMarkdownView {
                         .map(|c| self.buffer.line(rows[*c].line).unwrap_or(""))
                         .collect::<Vec<_>>()
                         .join("\n");
+                    // ---- mermaid：预览/源码切换（唯一的状态改变入口） -------
+                    let showing_code = is_mermaid && self.mermaid.is_showing_code(block_id);
+                    let mm_body = if is_mermaid {
+                        Some(self.mermaid.body(&code_text))
+                    } else {
+                        None
+                    };
+                    // 图模式且真的画出了图 → 卡体画图；其余（回退源码 /
+                    // 源码 tab / 渲染中无旧图）都画源码行。
+                    let show_image =
+                        !showing_code && matches!(&mm_body, Some(MermaidBody::Image { .. }));
                     let mut outer = div()
                         .group("live-code")
                         .relative()
@@ -3231,20 +3444,72 @@ impl Render for LiveMarkdownView {
                             ..Default::default()
                         });
                     }
-                    let mut inner = div()
-                        .id(("live-code-inner", block_id))
-                        .debug_selector(|| "live-code-inner".into())
-                        // Preview parity: the read-only card scrolls long
-                        // Nowrap lines horizontally instead of clipping them.
-                        .overflow_x_scroll();
+                    let mut inner = if show_image {
+                        // 图体：固定尺寸图片，裁剪而非横向滚动条。
+                        div()
+                            .id(("live-code-inner", block_id))
+                            .debug_selector(|| "live-code-inner".into())
+                            .overflow_hidden()
+                    } else {
+                        div()
+                            .id(("live-code-inner", block_id))
+                            .debug_selector(|| "live-code-inner".into())
+                            // Preview parity: the read-only card scrolls long
+                            // Nowrap lines horizontally instead of clipping them.
+                            .overflow_x_scroll()
+                    };
                     if lang.is_some() {
                         inner = inner.pt(px(24.0));
                     }
-                    for pi in code {
-                        inner = inner.child(live_line(*pi, &paints, &entity, &colors));
+                    if show_image {
+                        if let Some(MermaidBody::Image { image, pending }) = &mm_body {
+                            let (dw, dh) = image.display_size();
+                            let img = gpui::img(image.image().clone())
+                                .w(px(dw))
+                                .h(px(dh))
+                                .object_fit(gpui::ObjectFit::Contain);
+                            // 重渲染中：旧图继续显示 + 呼吸提示（不闪回源码）。
+                            let fig = if *pending {
+                                img.with_animation(
+                                    ("live-mm-pulse", block_id),
+                                    Animation::new(Duration::from_millis(1600))
+                                        .repeat()
+                                        .with_easing(gpui::pulsating_between(0.45, 1.0)),
+                                    |el, delta| el.opacity(delta),
+                                )
+                                .into_any_element()
+                            } else {
+                                img.into_any_element()
+                            };
+                            inner = inner.child(
+                                div().w_full().flex().justify_center().child(fig),
+                            );
+                        }
+                    } else {
+                        for pi in code {
+                            inner = inner.child(live_line(*pi, &paints, &entity, &colors));
+                        }
                     }
                     let mut card = outer.child(inner);
-                    if let Some(lang) = lang {
+                    if is_mermaid {
+                        // 测试探针：mermaid 卡片当前态。`live-mm-graph` 只在
+                        // **真的画着图**（含重渲染中的旧图）时出现，渲染中/失败
+                        // 回退源码时是 `live-mm-source` —— 与禁区判定同源，
+                        // 避免测试靠 tab 状态猜渲染结果。
+                        let is_image = show_image;
+                        card = card.debug_selector(move || {
+                            if is_image {
+                                "live-mm-graph".into()
+                            } else {
+                                "live-mm-source".into()
+                            }
+                        });
+                    }
+                    // mermaid 卡片不渲染语言徽章（左上角让位给「预览 | 源码」
+                    // tab）；其他语言保持原样。
+                    if !is_mermaid
+                        && let Some(lang) = lang
+                    {
                         card = card.child(
                             div()
                                 .absolute()
@@ -3265,6 +3530,7 @@ impl Render for LiveMarkdownView {
                     let view_ent = entity.clone();
                     let copy_btn = div()
                         .id(("live-copy", block_id))
+                        .debug_selector(|| "live-copy".into())
                         .px_2()
                         .py_1()
                         .rounded(px(4.0))
@@ -3291,37 +3557,115 @@ impl Render for LiveMarkdownView {
                             });
                         })
                         .into_any_element();
+                    if is_mermaid {
+                        // 「预览」「源码」两个独立圆角矩形按钮，贴左上角
+                        //（原语言徽章的位置），中间留一点间隔。tab 是图/源码
+                        // 的唯一切换入口；复制按钮仍独占右上角、组级 hover。
+                        //
+                        // 垂直对齐：复制按钮 = top 6 + py 4 + 16px 图标 → 中心
+                        // 18px；这里 top 9 + 高度 18（py 2 + 行高 14）→ 中心也是
+                        // 18px，两者文字/图标落在同一条水平线上。
+                        let tab_btn = |label: &'static str,
+                                       active: bool,
+                                       id: (&'static str, usize),
+                                       sel: &'static str,
+                                       to_source: bool,
+                                       ent: Entity<Self>| {
+                            div()
+                                .id(id)
+                                .debug_selector(move || sel.to_string())
+                                .px(px(9.0))
+                                .py(px(2.0))
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .bg(if active {
+                                    ui.text.opacity(0.12)
+                                } else {
+                                    ui.text.opacity(0.05)
+                                })
+                                .text_size(px(10.0))
+                                .line_height(px(14.0))
+                                .font_weight(gpui::FontWeight(600.))
+                                .text_color(if active { ui.text } else { ui.text_muted })
+                                .child(label)
+                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                    ent.update(cx, |v, cx| {
+                                        v.set_mermaid_showing_code(block_id, to_source, cx)
+                                    });
+                                })
+                        };
+                        card = card.child(
+                            div()
+                                .absolute()
+                                .top(px(9.0))
+                                .left(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(tab_btn(
+                                    "预览",
+                                    !showing_code,
+                                    ("live-mm-tab-graph", block_id),
+                                    "live-mm-tab-graph",
+                                    false,
+                                    entity.clone(),
+                                ))
+                                .child(tab_btn(
+                                    "源码",
+                                    showing_code,
+                                    ("live-mm-tab-src", block_id),
+                                    "live-mm-tab-src",
+                                    true,
+                                    entity.clone(),
+                                ))
+                                .into_any_element(),
+                        );
+                    }
                     card = card.child(
                         div()
                             .absolute()
                             .top(px(6.0))
                             .right(px(6.0))
                             .flex()
-                            .rounded(px(6.0))
-                            .bg(theme.editor_background())
-                            .border_1()
-                            .border_color(ui.border.opacity(0.18))
-                            .shadow_sm()
                             .child(copy_btn)
                             .into_any_element(),
                     );
-                    // Mermaid has no render engine here: say so in a dim
-                    // footer instead of silently showing a code card.
-                    if lang.as_deref() == Some("mermaid") {
-                        card = card.child(
-                            div()
-                                .px(px(12.))
-                                .py(px(6.))
-                                .text_size(px(11.))
-                                .text_color(ui.text_muted.opacity(0.7))
-                                .child("Mermaid 图暂以源码卡片展示，可直接编辑源码行")
-                                .into_any_element(),
-                        );
+                    // 图模式回退源码时的 footer：失败给出原因 / 渲染中给出
+                    // 呼吸提示。源码 tab（编辑态）不打扰，保持纯净。
+                    if is_mermaid && !showing_code && !show_image {
+                        let (label, pending) = match &mm_body {
+                            Some(MermaidBody::Source { error: Some(msg) }) => (msg.clone(), false),
+                            _ => ("渲染中…".to_string(), true),
+                        };
+                        let foot = div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(ui.text_muted.opacity(0.7))
+                            .child(label);
+                        let foot_el = if pending {
+                            foot.with_animation(
+                                ("live-mm-foot", block_id),
+                                Animation::new(Duration::from_millis(1600))
+                                    .repeat()
+                                    .with_easing(gpui::pulsating_between(0.5, 1.0)),
+                                |el, delta| el.opacity(delta),
+                            )
+                            .into_any_element()
+                        } else {
+                            foot.into_any_element()
+                        };
+                        card = card.child(foot_el);
                     }
                     let group_last_line = close
                         .map(|c| rows[c].line)
                         .unwrap_or_else(|| rows[*code.last().unwrap()].line);
-                    if rows[*open].line <= cursor.line && cursor.line <= group_last_line {
+                    // 图模式不画光标（源码行未渲染，光标不可驻留——移动/
+                    // 点击/搜索路径均已在 `mermaid_image_ranges` 处夹取）。
+                    if !show_image
+                        && rows[*open].line <= cursor.line
+                        && cursor.line <= group_last_line
+                    {
                         caret_el_ix = Some(row_els.len());
                     }
                     // Fallback target: the first code line (lands the cursor
@@ -3770,8 +4114,7 @@ impl Render for LiveMarkdownView {
                                 MouseButton::Left,
                                 cx.listener(|this, _e, window, cx| {
                                     window.focus(&this.focus, cx);
-                                    this.show_source = !this.show_source;
-                                    cx.notify();
+                                    this.toggle_show_source(cx);
                                     cx.stop_propagation();
                                 }),
                             ),
@@ -4438,6 +4781,148 @@ mod live_frame_tests {
         assert!(
             code_line.is_some() && table_line.is_some(),
             "showcase must contain code + table rows for this guard"
+        );
+    }
+
+    /// Mermaid 图模式端到端：卡片默认画图（源码行不渲染）→ 源码 tab 可编辑
+    /// → 回图 tab 复原；图模式下光标是禁区（移动越过、编辑被吞）。
+    #[gpui::test]
+    fn live_mermaid_graph_mode_and_source_tab(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // 0:# 标题 1:空 2:```mermaid 3:A-->B 4:``` 5:空 6:尾段
+        const DOC: &str = "# T\n\n```mermaid\nflowchart TD\n    A[开始] --> B[结束]\n```\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        // 等后台渲染落地：防抖 200ms 是 `background_executor` 的定时器，
+        // 测试里必须推进假时钟才会到期（纯 sleep 不会）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(250));
+            cx.run_until_parked();
+            if cx.debug_bounds("live-mm-graph").is_some() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "mermaid 图应在若干帧内渲染完成（graph 卡片出现）");
+        let graph = cx.debug_bounds("live-mm-graph").expect("图卡片应有实体");
+        assert!(graph.size.height > px(40.), "图卡片高度异常：{graph:?}");
+        assert!(
+            cx.debug_bounds("live-mm-source").is_none(),
+            "图模式不该有源码卡片"
+        );
+        // 布局：两个 tab 与复制图标必须落在同一条水平中心线上
+        //（`top 9 + 高 18` 对齐 `top 6 + py 4 + 图标 16` 的中心 18px）。
+        let src_tab_b = cx.debug_bounds("live-mm-tab-src").expect("源码按钮");
+        let copy_b = cx.debug_bounds("live-copy").expect("复制按钮");
+        let tab_cy = src_tab_b.center().y;
+        let copy_cy = copy_b.center().y;
+        assert!(
+            (f32::from(tab_cy) - f32::from(copy_cy)).abs() <= 1.0,
+            "按钮与复制图标必须水平对齐：tab_cy={tab_cy:?} copy_cy={copy_cy:?}"
+        );
+
+        // 1) 图模式：光标不能驻留在块内（从块前一行向下移动，应直接跳到块后）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(1, 0, false));
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| v.move_visual(true, false, cx));
+        });
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert!(
+            line >= 5,
+            "图模式下 Down 必须越过整个 mermaid 块（落点 line={line}）"
+        );
+
+        // 2) 图模式：落到块内的编辑（模拟搜索跳转）会被夹出块外，源码不变。
+        let before = view.read_with(cx, |v, _| v.text());
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(3, 1, false));
+            v.clamp_cursor_out_of_image_blocks(cx);
+        });
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert!(line >= 5, "块内落点必须被夹到块外（line={line}）");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            before,
+            "夹取不得改动文本"
+        );
+
+        // 3) 真实鼠标点击「源码」按钮：卡片切成源码、图消失，且光标可进入块内编辑。
+        //（这是用户唯一允许的切换入口，必须验证点击没被文档级鼠标处理器吃掉。）
+        let src_tab = cx
+            .debug_bounds("live-mm-tab-src")
+            .expect("源码按钮应有实体");
+        cx.simulate_click(src_tab.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.mermaid.is_showing_code(2)),
+            "点击「源码」按钮必须真的切到源码（tab 是唯一入口）"
+        );
+        assert!(
+            cx.debug_bounds("live-mm-source").is_some(),
+            "源码 tab 应显示源码卡片"
+        );
+        assert!(
+            cx.debug_bounds("live-mm-graph").is_none(),
+            "源码 tab 不该还在画图"
+        );
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(3, 0, false));
+            v.after_move(cx);
+        });
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert_eq!(line, 3, "源码模式下光标应能进入块内（line={line}）");
+
+        // 4) 真实点击「预览」按钮：图重新出现，光标被夹出块外。
+        let graph_tab = cx
+            .debug_bounds("live-mm-tab-graph")
+            .expect("预览按钮应有实体");
+        cx.simulate_click(graph_tab.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |v, _| v.mermaid.is_showing_code(2)),
+            "点击「预览」按钮必须切回图模式"
+        );
+        assert!(
+            cx.debug_bounds("live-mm-graph").is_some(),
+            "回预览应恢复图卡片"
+        );
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert!(
+            !(2..=5).contains(&line),
+            "切回预览后光标必须被夹出隐藏源码区（line={line}）"
+        );
+
+        // 5) 全文档源码模式（Cmd+/ 同一开关）关闭时同样要夹光标：先开源码、
+        // 把光标放进块内、再关掉，光标不得滞留在隐藏区。
+        view.update(cx, |v, cx| {
+            v.toggle_show_source(cx);
+            v.edit(cx, |m| m.move_to(3, 0, false));
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert_eq!(line, 3, "全文档源码模式下光标应能进入块内（line={line}）");
+        view.update(cx, |v, cx| v.toggle_show_source(cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert!(
+            !(2..=5).contains(&line),
+            "关闭全文档源码模式后光标必须被夹出隐藏区（line={line}）"
         );
     }
 
