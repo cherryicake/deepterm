@@ -942,15 +942,33 @@ pub const PI_EXTENSION_MARKER: &str = ".deepterm/hooks/agent-report.sh pi";
 /// 于是上报交给自带的**上报脚本**（[`agent_report_script`]）完成：它是纯
 /// shell，本地/远端同一份，不需要 `deepterm` 在 PATH 里。
 ///
-/// # 结构照抄 tty7
+/// # 形状是 OpenCode **V2** 的插件契约
 ///
-/// 这份模板与 tty7 的 `opencode_plugin_js` 同构，包括两处不显然的处理：
+/// V2 要求 default 导出一个带 `id` + `setup(ctx)` 的定义；V1 那种
+/// 「具名导出一个返回 hooks 对象的函数」在 V2 下**连加载都不会发生**——
+/// 报 `Plugin must export a default definition with an id and an effect or
+/// setup function`，然后整个桥接静默失效。V1/V2 的逐项对应关系：
+///
+/// | V1                         | V2                                    |
+/// | -------------------------- | ------------------------------------- |
+/// | 返回的 hooks 对象          | `setup` 里用 `ctx.*.hook(...)` 注册   |
+/// | `event` 回调               | `ctx.event.subscribe()` 异步循环      |
+/// | 返回的 `dispose`           | `setup` 返回的清理函数                |
+/// | `tool.execute.before`      | `ctx.tool.hook("execute.before", …)`  |
+/// | `permission.ask`           | 事件流里的 `permission.asked`         |
+/// | 事件的 `properties`        | 事件的 `data`（V2 改名了）            |
+/// | `$`（Bun shell helper）    | 自己 import `node:child_process` 管   |
+///
+/// `session.updated` 在 V2 里不存在了；指明父会话的只剩 `session.created`
+/// 的 `parentID`，所以子会话只能在那里被记住。
+///
+/// # 两处不显然的处理（与 tty7 同构）
 ///
 /// 1. **`DEEPTERM` 门控**。插件文件是长期装着的，不在 deepterm 里时必须
 ///    什么都不做，否则用户换别的终端会看到一堆错误。
 /// 2. **subagent 抑制**。子 agent 跑在**同一个事件流**的子会话上，它的事件
-///    与主会话的事件无法区分——只有 `session.created`/`session.updated`
-///    会指明父会话。所以记住子会话 id，避免子 agent 让整块面板提前变「完成」。
+///    与主会话的事件无法区分——只有 `session.created` 会指明父会话。所以
+///    记住子会话 id，避免子 agent 让整块面板提前变「完成」。
 pub fn opencode_plugin_js() -> String {
     // 命令前缀。`~` 由 `sh -c` 展开——写死绝对路径会在换机器/换用户后失效，
     // 走 PATH 查找 `deepterm` 又会重蹈「远程非交互 shell 找不到二进制」的覆辙；
@@ -962,63 +980,87 @@ pub fn opencode_plugin_js() -> String {
 // Bridges OpenCode plugin events onto the deepterm reporter script
 // (`{prefix} <event>`), which is inert outside deepterm (gated on the
 // DEEPTERM env var).
-export const DeeptermPresence = async ({{ $ }}) => {{
-  if (!process.env["DEEPTERM"]) return {{}}
-  const cmd = "{prefix} "
-  let sessionId = ""
-  let announced = ""
-  // A subagent runs in a child session on the *same* event stream, and its
-  // status events are indistinguishable from the pane's own — only
-  // `session.created`/`session.updated` name a parent. Remember the children,
-  // so a task tool cannot call the pane done when only the subagent is.
-  const children = new Set()
-  const emit = (event) => {{
-    // Every event carries the session id, so a pane that restarts can resume
-    // the same session with `opencode --session`.
-    const payload = sessionId ? new Response(JSON.stringify({{ session_id: sessionId }})) : undefined
-    const proc = payload ? $`sh -c ${{cmd + event}} < ${{payload}}` : $`sh -c ${{cmd + event}}`
-    return proc.quiet().nothrow()
-  }}
-  // The session id is only known once opencode creates the session (the
-  // `session.created` event); the session-start report rides on the first
-  // event that names one.
-  const capture = async (id) => {{
-    if (id && !children.has(id)) sessionId = id
-    if (sessionId && sessionId !== announced) {{
-      announced = sessionId
-      await emit("session-start")
-    }}
-  }}
-  const ACTION = {{
-    "session.status.busy": "prompt-submit",
-    "session.status.idle": "stop",
-    "session.idle": "stop",
-    "permission.replied": "prompt-submit",
-  }}
+//
+// OpenCode 2 shape: V2 only loads a default-exported definition carrying an
+// `id` and a `setup(ctx)`, so there is no V1 function export here.
+//
+// No plugin-package import: that bare specifier does not resolve from the
+// global `~/.config/opencode/plugins/` directory, and `Plugin.define` is a
+// plain identity function anyway.
+import {{ spawn }} from "node:child_process"
 
-  return {{
-    dispose: async () => {{
-      await emit("session-end")
-    }},
-    "tool.execute.before": async (input) => {{
-      await capture(input?.sessionID)
+export default {{
+  id: "deepterm",
+  async setup(ctx) {{
+    if (!process.env["DEEPTERM"]) return
+    const cmd = "{prefix} "
+    let sessionId = ""
+    let announced = ""
+    // A subagent runs in a child session on the *same* event stream, and its
+    // status events are indistinguishable from the pane's own — only
+    // `session.created` names a parent. Remember the children, so a task tool
+    // cannot call the pane done when only the subagent is.
+    const children = new Set()
+    // V1 handed us a Bun `$` shell helper; V2 has none, so spawn `sh` directly.
+    // stdin carries the session id (the reporter reads it with `head -c`), and
+    // it must be closed even when there is no id yet or the script would block.
+    const emit = (event) =>
+      new Promise((resolve) => {{
+        // Every event carries the session id, so a pane that restarts can resume
+        // the same session with `opencode --session`.
+        const child = spawn("sh", ["-c", cmd + event], {{
+          stdio: [sessionId ? "pipe" : "ignore", "ignore", "ignore"],
+        }})
+        child.on("error", () => resolve())
+        child.on("close", () => resolve())
+        if (sessionId && child.stdin) child.stdin.end(JSON.stringify({{ session_id: sessionId }}))
+      }})
+    // The session id is only known once opencode creates the session (the
+    // `session.created` event); the session-start report rides on the first
+    // event that names one.
+    const capture = async (id) => {{
+      if (id && !children.has(id)) sessionId = id
+      if (sessionId && sessionId !== announced) {{
+        announced = sessionId
+        await emit("session-start")
+      }}
+    }}
+    const ACTION = {{
+      "session.status.busy": "prompt-submit",
+      "session.status.idle": "stop",
+      "session.idle": "stop",
+      "permission.asked": "permission-request",
+      "permission.replied": "prompt-submit",
+    }}
+
+    // V2 events carry their payload in `data` — V1 called it `properties` — and
+    // `session.created` is the only event left that names a parent session.
+    const controller = new AbortController()
+    void (async () => {{
+      for await (const event of ctx.event.subscribe({{ signal: controller.signal }})) {{
+        const data = event.data ?? {{}}
+        if (event.type === "session.created" && data.parentID) children.add(data.sessionID)
+        if (data.sessionID && children.has(data.sessionID)) continue
+        await capture(data.sessionID)
+        const key = event.type === "session.status" ? `session.status.${{data.status?.type}}` : event.type
+        const action = ACTION[key]
+        if (action) await emit(action)
+      }}
+    }})()
+
+    // V1's `tool.execute.before` hook: a running tool means the pane is busy.
+    await ctx.tool.hook("execute.before", async (event) => {{
+      await capture(event.sessionID)
       await emit("prompt-submit")
-    }},
-    "permission.ask": async (input) => {{
-      await capture(input?.sessionID)
-      await emit("permission-request")
-    }},
-    event: async ({{ event }}) => {{
-      const properties = event.properties ?? {{}}
-      const info = properties.info
-      if (info?.id && info.parentID) children.add(info.id)
-      if (properties.sessionID && children.has(properties.sessionID)) return
-      await capture(properties.sessionID)
-      const key = event.type === "session.status" ? `session.status.${{properties.status?.type}}` : event.type
-      const action = ACTION[key]
-      if (action) await emit(action)
-    }},
-  }}
+    }})
+
+    // Unload: stop the subscription first so teardown cannot be outrun by a
+    // late event, then report the pane as done.
+    return async () => {{
+      controller.abort()
+      await emit("session-end")
+    }}
+  }},
 }}
 "#
     )
@@ -1756,9 +1798,76 @@ mod tests {
         let js = opencode_plugin_js();
         assert!(js.contains("const children = new Set()"), "必须记住子会话");
         assert!(
-            js.contains("children.has(properties.sessionID)"),
+            js.contains("children.has(data.sessionID)"),
             "子会话的事件必须被跳过"
         );
+        // 抑制的入口是 `session.created` 的 parentID——V2 里唯一指明父会话的
+        // 事件（V1 还有 session.updated，V2 已删）。
+        assert!(
+            js.contains(r#"event.type === "session.created" && data.parentID"#),
+            "必须在 session.created 上记下子会话"
+        );
+    }
+
+    /// opencode 插件必须是 **V2 契约**：default 导出一个 `id` + `setup` 的定义。
+    ///
+    /// V2 对形状不符的插件是**直接拒绝加载**（`SchemaError(Missing key at
+    /// ["default"])`），而不是降级运行——于是桥接静默失效，面板状态不再更新，
+    /// 日志里也只有一条 WARN。这里把入口形状钉死，防止模板被改回 V1 那种
+    /// 具名函数导出。
+    #[test]
+    fn opencode_plugin_exports_a_v2_definition() {
+        let js = opencode_plugin_js();
+        assert!(
+            js.contains("export default {"),
+            "V2 只认 default 导出的定义"
+        );
+        assert!(js.contains(r#"id: "deepterm""#), "每个 V2 插件都需要一个稳定 id");
+        assert!(js.contains("async setup(ctx) {"), "必须有 setup 函数");
+        assert!(
+            !js.contains("export const DeeptermPresence"),
+            "V1 的具名函数导出在 V2 下根本不会被加载"
+        );
+        // V2 事件的载荷字段是 `data`；照抄 V1 的 `properties` 读到的是
+        // undefined，所有上报会静默消失（不报错）。
+        assert!(js.contains("event.data"), "V2 事件的载荷字段是 data");
+        assert!(
+            !js.contains("event.properties"),
+            "V1 的 properties 在 V2 事件上不存在"
+        );
+        // V1 送我们一个 Bun `$` shell helper，V2 的插件上下文里没有它——
+        // 用了就是运行时 ReferenceError。
+        assert!(
+            js.contains(r#"import { spawn } from "node:child_process""#),
+            "必须自己 import 进程 API"
+        );
+        assert!(!js.contains(r#"$`sh -c"#), "不得再依赖 V1 的 `$` helper");
+        // `@opencode/plugin` 在全局 `~/.config/opencode/plugins/` 下**解析不到**
+        // （实测 `ResolveMessage`），而 `Plugin.define` 只是恒等函数——所以
+        // 入口必须是裸对象，import 了反而加载失败。
+        assert!(
+            !js.contains("@opencode/plugin"),
+            "不得 import 解析不到的 @opencode/plugin"
+        );
+    }
+
+    /// V1 的四个 hook 在 V2 里各有新的落点，少一个就是那类事件不再上报。
+    #[test]
+    fn opencode_plugin_registers_every_v2_registration_point() {
+        let js = opencode_plugin_js();
+        for needle in [
+            // V1 `event` 回调 → 事件流订阅
+            "ctx.event.subscribe({ signal: controller.signal })",
+            // V1 `tool.execute.before` → 工具域 hook
+            r#"await ctx.tool.hook("execute.before""#,
+            // V1 `permission.ask` → 事件流里的 permission.asked
+            r#""permission.asked": "permission-request""#,
+            // V1 返回的 `dispose` → setup 返回的清理函数
+            "controller.abort()",
+            r#"await emit("session-end")"#,
+        ] {
+            assert!(js.contains(needle), "缺少 {needle}——那条通路会静默失效");
+        }
     }
 
     /// pi 的 `ui_prompt_end` 必须恢复被打断前的 `turn`，而不是一律

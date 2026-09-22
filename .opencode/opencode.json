@@ -7,8 +7,5 @@
       "command": ["fff-mcp"],
       "enabled": true
     }
-  },
-  "plugin": [
-    "@franlol/opencode-md-table-formatter@latest"
-  ]
+  }
 }
