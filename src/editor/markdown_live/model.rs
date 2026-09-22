@@ -438,6 +438,56 @@ impl EditorModel {
     self.cursor = Pos::new(line, self.line_len(line));
   }
 
+  /// Select the word under the cursor, **clamped to `[start, end)` char
+  /// columns** (table cells: a double-click must not spill into the
+  /// neighbouring cells or the pipes).
+  pub fn select_word_within(&mut self, start: usize, end: usize) {
+    self.coalescing = false;
+    self.goal_col = None;
+    let line = self.cursor.line;
+    let chars: Vec<char> = self.lines[line].chars().collect();
+    let start = start.min(chars.len());
+    let end = end.min(chars.len()).max(start);
+    let col = self.cursor.col.clamp(start, end);
+    if start >= end {
+      return;
+    }
+    // The word char under the cursor, or the one before at a word end.
+    let seed = if col < end && is_word(chars[col]) {
+      col
+    } else if col > start && is_word(chars[col - 1]) {
+      col - 1
+    } else {
+      // No word under the cursor: select the whole (trimmed) cell content,
+      // which is what a double-click on punctuation does in Typora.
+      self.anchor = Some(Pos::new(line, start));
+      self.cursor = Pos::new(line, end);
+      return;
+    };
+    let mut ws = seed;
+    while ws > start && is_word(chars[ws - 1]) {
+      ws -= 1;
+    }
+    let mut we = seed + 1;
+    while we < end && is_word(chars[we]) {
+      we += 1;
+    }
+    self.anchor = Some(Pos::new(line, ws));
+    self.cursor = Pos::new(line, we);
+  }
+
+  /// Select an explicit char-column range on the cursor's line.
+  pub fn select_range(&mut self, start: usize, end: usize) {
+    self.coalescing = false;
+    self.goal_col = None;
+    let line = self.cursor.line;
+    let len = self.line_len(line);
+    let start = start.min(len);
+    let end = end.min(len).max(start);
+    self.anchor = Some(Pos::new(line, start));
+    self.cursor = Pos::new(line, end);
+  }
+
   /// The selected text, `None` when nothing is selected.
   pub fn selected_text(&self) -> Option<String> {
     let (start, end) = self.selection()?;
@@ -1193,6 +1243,51 @@ mod tests {
     m.select_line();
     assert_eq!(m.selection(), Some((at(1, 0), at(1, 3))));
     assert_eq!(m.selected_text().as_deref(), Some("def"));
+  }
+
+  #[test]
+  fn select_word_within_clamps_to_the_cell() {
+    // `| foo bar | baz |`：第二格内容在 char 12..15（`baz`）。
+    let line = "| foo bar | baz |";
+    let mut m = EditorModel::new(line);
+    // 在第二格里双击 `baz` 中间 → 只选中 `baz`，不会带上管道或前一格。
+    m.move_to(0, 13, false);
+    m.select_word_within(12, 15);
+    assert_eq!(m.selected_text().as_deref(), Some("baz"));
+    // 第一格里双击 `bar` → 只选中 `bar`（不越到 `foo` 或管道）。
+    m.move_to(0, 8, false);
+    m.select_word_within(2, 9);
+    assert_eq!(m.selected_text().as_deref(), Some("bar"));
+    // 格首双击非词字符 → 选中整个格内容。
+    m.move_to(0, 12, false);
+    m.select_word_within(12, 15);
+    assert_eq!(m.selected_text().as_deref(), Some("baz"));
+  }
+
+  #[test]
+  fn select_range_selects_the_cell_content() {
+    // 三击选格：`| foo bar | baz |` 第二格内容 12..15。
+    let mut m = EditorModel::new("| foo bar | baz |");
+    m.move_to(0, 13, false);
+    m.select_range(12, 15);
+    assert_eq!(m.selected_text().as_deref(), Some("baz"));
+    // 空格：范围折叠，不产生选区。
+    m.select_range(5, 5);
+    assert_eq!(m.selection(), None);
+  }
+
+  #[test]
+  fn select_word_within_never_escapes_the_range() {
+    // 词跨越范围边界时必须截断（拖到格边界就停）。
+    let mut m = EditorModel::new("aaa bbb ccc");
+    m.move_to(0, 5, false);
+    m.select_word_within(4, 7);
+    assert_eq!(m.selected_text().as_deref(), Some("bbb"));
+    // 光标在范围外时夹进范围。
+    m.move_to(0, 9, false);
+    m.select_word_within(4, 7);
+    let sel = m.selection().expect("有选区");
+    assert!(sel.0.col >= 4 && sel.1.col <= 7, "选区必须夹在范围内：{sel:?}");
   }
 
   #[test]

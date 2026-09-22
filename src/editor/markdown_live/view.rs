@@ -978,6 +978,57 @@ impl LiveMarkdownView {
         self.buffer.line(line).map(str::to_string)
     }
 
+    /// 光标所在单元格的**内容 char 列范围**（去 padding），用于把双击选词
+    /// / 三击选格夹在格内。光标不在表格格里时返回 `None`。
+    fn table_cell_content_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
+        let text = self.buffer.line(line)?;
+        let spans = table_cell_spans(text);
+        let byte = byte_for_col(text, col);
+        let (s, e) = spans
+            .iter()
+            .copied()
+            .find(|(s, e)| byte >= *s && byte <= *e)
+            .or_else(|| spans.iter().copied().find(|(s, _)| *s >= byte))
+            .or_else(|| spans.last().copied())?;
+        let raw = &text[s..e];
+        let lead = raw.len() - raw.trim_start().len();
+        let trail = raw.len() - raw.trim_end().len();
+        let cs = col_for_byte(text, s + lead);
+        let ce = col_for_byte(text, (e - trail).max(s + lead));
+        Some((cs, ce.max(cs)))
+    }
+
+    /// Typora `.md-expand` 的展开范围：光标所在**行内元素**的字节范围
+    /// （整格保持渲染，只有这个元素的标记显示）。
+    ///
+    /// 返回 `None` 表示不展开任何标记（光标不在这格、或落在没有标记的纯
+    /// 文本里）。范围换算到**行内绝对偏移**，与 `plan_cell` 的 segs 一致。
+    fn table_cell_expand_range(
+        &self,
+        src_line: &str,
+        content: std::ops::Range<usize>,
+        cursor_col: usize,
+        caret_in_cell: bool,
+    ) -> Option<std::ops::Range<usize>> {
+        if !caret_in_cell {
+            return None;
+        }
+        let byte = byte_for_col(src_line, cursor_col);
+        if byte < content.start || byte > content.end {
+            return None;
+        }
+        // 在**格内容切片**上解析：与 `plan_cell` 的 `inline_range` 同一套
+        // 输入，span 边界才与它一致（整行解析会被管道/空格影响）。
+        let inline = crate::editor::markdown_live::inline::parse_with_refs(
+            &src_line[content.clone()],
+            &self.planned_refs,
+        );
+        let rel = byte - content.start;
+        let r = inline.expand_at(rel)?;
+        // 换回行内绝对偏移。
+        Some(content.start + r.start..content.start + r.end)
+    }
+
     /// 单元格内的点击：把光标放到格内对应位置（不再整块跳回源码首行）。
     pub(crate) fn on_table_cell_mouse_down(
         &mut self,
@@ -990,13 +1041,24 @@ impl LiveMarkdownView {
     ) {
         window.focus(&self.focus, cx);
         self.goal_x = None;
+        // 双击选词 / 三击选格：都夹在本格内容范围内（Typora 表格语义：
+        // 双击选格内的词，三击选整个单元格内容，而不是整行含管道）。
+        let cell_range = self.table_cell_content_at(line, col);
         self.edit(cx, |m| {
             m.move_to(line, col, shift);
             if !shift {
                 if click_count == 2 {
-                    m.select_word();
+                    if let Some((s, e)) = cell_range {
+                        m.select_word_within(s, e);
+                    } else {
+                        m.select_word();
+                    }
                 } else if click_count > 2 {
-                    m.select_line();
+                    if let Some((s, e)) = cell_range {
+                        m.select_range(s, e);
+                    } else {
+                        m.select_line();
+                    }
                 }
             }
         });
@@ -1005,7 +1067,42 @@ impl LiveMarkdownView {
         cx.notify();
     }
 
-    /// 单元格内拖拽：把选区终点扩到格内对应位置。
+    /// 光标落在表格行的**管道或 padding 空白**上时，移到最近的格内容位置。
+    ///
+    /// 表格里光标只应停在格内容上（Typora 语义）：`|` 与格间空格不是可停靠
+    /// 位置。只在光标已落在某个格内容里时保持不动，否则夹到相邻格内容。
+    fn clamp_cursor_off_table_pipe(&mut self, cx: &mut Context<Self>) {
+        let cur = self.buffer.cursor();
+        if !self
+            .planned
+            .iter()
+            .find(|r| r.line == cur.line)
+            .is_some_and(|r| matches!(r.block, Block::Table))
+        {
+            return;
+        }
+        // 光标不在表格行上：不处理。
+        if !self
+            .planned
+            .iter()
+            .find(|r| r.line == cur.line)
+            .is_some_and(|r| matches!(r.block, Block::Table))
+        {
+            return;
+        }
+        let Some((cs, ce)) = self.table_cell_content_at(cur.line, cur.col) else {
+            return;
+        };
+        if cur.col >= cs && cur.col <= ce {
+            return;
+        }
+        // 夹到格内容里（优先光标右侧的格内容，与前进方向一致）。
+        let target = if cur.col < cs { cs } else { ce };
+        self.edit(cx, |m| m.move_to(cur.line, target, false));
+    }
+
+    /// 单元格内拖拽：把选区终点扩到格内对应位置（**夹在本格内容范围内**，
+    /// 拖过格边界时不会把 `|` 和相邻格纳入选区）。
     pub(crate) fn on_table_cell_drag(
         &mut self,
         line: usize,
@@ -1015,6 +1112,10 @@ impl LiveMarkdownView {
         if !self.selecting {
             return;
         }
+        let col = self
+            .table_cell_content_at(line, col)
+            .map(|(s, e)| col.clamp(s, e))
+            .unwrap_or(col);
         self.edit(cx, |m| m.move_to(line, col, true));
     }
 
@@ -1526,6 +1627,7 @@ impl LiveMarkdownView {
                         m.move_left(shift)
                     }
                 });
+                self.clamp_cursor_off_table_pipe(cx);
                 self.after_move(cx);
                 return;
             }
@@ -1539,6 +1641,7 @@ impl LiveMarkdownView {
                         m.move_right(shift)
                     }
                 });
+                self.clamp_cursor_off_table_pipe(cx);
                 self.after_move(cx);
                 return;
             }
@@ -4069,10 +4172,45 @@ impl Render for LiveMarkdownView {
                                     .get(di.min(src_lines.len() - 1))
                                     .map(String::as_str)
                                     .unwrap_or("");
-                                let plan = plan_cell(src_line, content.clone(), true, &table_refs);
+                                // Typora `.md-expand`：整格保持渲染，只把光标
+                                // 所在的那个行内元素的标记展开（`**粗体**` 里的
+                                // `**`），而不是整格翻成源码。
+                                let expand = self.table_cell_expand_range(
+                                    src_line,
+                                    content.clone(),
+                                    cursor.col,
+                                    row_line == cursor.line,
+                                );
+                                let plan = plan_cell(src_line, content.clone(), expand, &table_refs);
                                 let base = row_base_style(&plan, &style);
-                                let runs =
+                                let mut runs =
                                     runs_for_row(&plan, &base, &colors, &style, &self.hl, &theme);
+                                // 选区高亮：与普通行同一套映射（源列 → 源字节
+                                // → 可见字节），但**夹在本格内容范围内** —— 拖过
+                                // 格边界时不会把 `|` 和相邻格染上。
+                                if let Some((s, e)) = selection {
+                                    let line_len = src_line.chars().count();
+                                    if let Some((cs, ce, _)) =
+                                        line_selection(s, e, row_line, line_len)
+                                    {
+                                        let bs = byte_for_col(src_line, cs)
+                                            .max(content.start);
+                                        let be =
+                                            byte_for_col(src_line, ce).min(content.end);
+                                        if be > bs {
+                                            let vsel = (
+                                                vis_for_src(&plan.segs, bs),
+                                                vis_for_src(&plan.segs, be),
+                                            );
+                                            runs = apply_selection(
+                                                runs,
+                                                plan.visible.len(),
+                                                Some(vsel),
+                                                colors.selection,
+                                            );
+                                        }
+                                    }
+                                }
                                 let caret_vis = show_caret.then(|| {
                                     vis_for_src(
                                         &plan.segs,
@@ -4121,7 +4259,7 @@ impl Render for LiveMarkdownView {
                                 let trail = raw.len() - raw.trim_end().len();
                                 let content = (s + lead)..(e - trail).max(s + lead);
                                 let plan =
-                                    plan_cell(src_line, content, false, &table_refs);
+                                    plan_cell(src_line, content, None, &table_refs);
                                 let cell_base = row_base_style(&plan, &style);
                                 let runs = runs_for_row(
                                     &plan, &cell_base, &colors, &style, &self.hl, &theme,
@@ -5230,6 +5368,63 @@ mod live_frame_tests {
         let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
         assert_eq!(line, 4, "Esc 应把光标移出表格（line={line}）");
         assert_eq!(view.read_with(cx, |v, _| v.text()), before, "Esc 不得改动文本");
+    }
+
+    /// 表格里方向键不应把光标停在管道或格间空格上（Typora 语义：只有格
+    /// 内容是可停靠位置）。
+    #[gpui::test]
+    fn live_table_arrow_keys_skip_pipes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // `| foo | bar |`：内容分别在第 2..5 与 8..11 列。
+        const DOC: &str = "| foo | bar |\n|---|---|\n| baz | qux |\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        // 光标放到第一格内容末尾（`foo` 之后，col 5）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 5, false));
+            v.after_move(cx);
+        });
+        // 再按 Right：源码上会走到 col 6（空格）或 7（管道），必须被夹回
+        // 某个格内容里（要么本格末，要么下一格内容首）。
+        for _ in 0..3 {
+            cx.update(|_, cx| {
+                view.update(cx, |v, cx| {
+                    v.edit(cx, |m| m.move_right(false));
+                    v.clamp_cursor_off_table_pipe(cx);
+                    v.after_move(cx);
+                });
+            });
+        }
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(line, 0, "Right 不该跨行（line={line}）");
+        assert!(
+            (2..=5).contains(&col) || (8..=11).contains(&col),
+            "光标必须停在某个格内容里，不能停在管道/空格上（col={col}）"
+        );
+        // Left 同理：从第二格内容首往回退，不能停在管道上。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 8, false));
+            for _ in 0..3 {
+                v.edit(cx, |m| m.move_left(false));
+                v.clamp_cursor_off_table_pipe(cx);
+            }
+            v.after_move(cx);
+        });
+        let col = view.read_with(cx, |v, _| v.buffer.cursor().col);
+        assert!(
+            (2..=5).contains(&col) || (8..=11).contains(&col),
+            "Left 后光标必须停在格内容里（col={col}）"
+        );
     }
 
     /// 表格里「光标在哪个格」的判定必须与 GFM 切分一致：含转义管道的行

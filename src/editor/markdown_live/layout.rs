@@ -109,15 +109,20 @@ impl RowPlan {
 ///
 /// `content` is the cell's trimmed content byte range in `line`; parsing
 /// stops at `content.end`, so neighbouring cells never leak in.
-/// `reveal` = true keeps the markup markers visible (the active cell shows
-/// the characters the user is typing); false hides them like the preview.
+///
+/// `expand` is Typora's `.md-expand` rule: markers stay hidden **except**
+/// inside the one inline element the caret sits in (pass its byte range;
+/// `None` = nothing expanded, i.e. the fully rendered look). This is what
+/// makes the active cell look rendered while still letting the user edit
+/// the markdown it contains — the whole cell never flips to source.
 pub fn plan_cell(
   line: &str,
   content: Range<usize>,
-  reveal: bool,
+  expand: Option<Range<usize>>,
   refs: &HashMap<String, String>,
 ) -> RowPlan {
-  let mut b = Builder::new(line, reveal, refs);
+  let mut b = Builder::new(line, false, refs);
+  b.expand = expand;
   b.inline_range(content, false);
   b.finish(RowKind::Table)
 }
@@ -282,6 +287,9 @@ struct Builder<'a> {
   runs: Vec<RunAttrs>,
   segs: Vec<Seg>,
   links: Vec<(Range<usize>, String)>,
+  /// Typora `.md-expand`: reveal markers **only** inside this byte range
+  /// (the inline element under the caret). `None` = hide every marker.
+  expand: Option<Range<usize>>,
 }
 
 impl<'a> Builder<'a> {
@@ -294,6 +302,7 @@ impl<'a> Builder<'a> {
       runs: Vec::new(),
       segs: Vec::new(),
       links: Vec::new(),
+      expand: None,
     }
   }
 
@@ -384,7 +393,14 @@ impl<'a> Builder<'a> {
     let inline = inline::parse_with_refs(content, self.refs);
     for span in &inline.spans {
       let src = at + span.range.start..at + span.range.end;
-      if span.marker && !self.reveal {
+      // Markers hide unless revealed, or unless they sit inside the
+      // expanded element (Typora: only the caret's own inline element shows
+      // its delimiters; the rest of the line stays rendered).
+      let expanded = self
+        .expand
+        .as_ref()
+        .is_some_and(|ex| ex.start <= src.start && src.end <= ex.end);
+      if span.marker && !self.reveal && !expanded {
         self.hide(src);
       } else {
         self.emit(src, span.marker, dim, span.style);
@@ -681,7 +697,7 @@ mod tests {
     // 真实一行的第一格：`| **粗** | b |` 的 `**粗**` 在字节 2..9。
     let line = "| **粗** | b |";
     let content = 2..9;
-    let plan = plan_cell(line, content.clone(), true, &HashMap::new());
+    let plan = plan_cell(line, content.clone(), Some(content.clone()), &HashMap::new());
     // 揭示态：标记可见，可见文本就是这一格的内容（不含相邻格/管道）。
     assert_eq!(plan.visible, "**粗**");
     assert_eq!(plan.kind, RowKind::Table);
@@ -713,7 +729,7 @@ mod tests {
   fn plan_cell_hides_markers_when_not_revealed() {
     let line = "| **粗** | b |";
     let content = 2..9;
-    let plan = plan_cell(line, content.clone(), false, &HashMap::new());
+    let plan = plan_cell(line, content.clone(), None, &HashMap::new());
     // 非揭示态：标记隐藏，只剩内容（预览观感）。
     assert_eq!(plan.visible, "粗");
     // 隐藏的标记字节塌缩到内容起点，不会跑到邻格。
@@ -724,7 +740,7 @@ mod tests {
   fn plan_cell_handles_links_inside_the_cell() {
     let line = "| [docs](https://x.dev) | b |";
     let content = 2..23;
-    let plan = plan_cell(line, content, true, &HashMap::new());
+    let plan = plan_cell(line, content.clone(), Some(content), &HashMap::new());
     // 链接目标必须记录在**行内**绝对范围里（点击激活用）。
     assert_eq!(plan.links.len(), 1);
     let (r, target) = &plan.links[0];
@@ -734,10 +750,37 @@ mod tests {
   }
 
   #[test]
+  fn plan_cell_expands_only_the_caret_element() {
+    // Typora `.md-expand`：整格保持渲染，只有光标所在的那个行内元素的
+    // 标记显示。这是「1:1 复刻」的核心行为。
+    let line = "| plain **bold** `code` |";
+    // 内容 = `plain **bold** `code``（去掉两侧 `| ` 与 ` |`）。
+    let content = 2..23;
+    // 与生产代码同源：在**格内容切片**上解析，再把光标列换算成切片内偏移。
+    let slice = &line[content.clone()];
+    let inline = inline::parse_with_refs(slice, &HashMap::new());
+    let expand_at = |cursor_in_slice: usize| {
+      let expand = inline.expand_at(cursor_in_slice);
+      plan_cell(line, content.clone(), expand.map(|r| content.start + r.start..content.start + r.end), &HashMap::new())
+        .visible
+    };
+    let bt = '\u{60}';
+    // 光标在纯文本里 → 整格渲染，**所有**标记都隐藏（含反引号）。
+    assert_eq!(expand_at(1), "plain bold code");
+    assert_eq!(expand_at(4), "plain bold code");
+    // 光标在粗体里 → 只展开粗体的 `**`，代码段的反引号仍隐藏。
+    // 切片内偏移：`**bold**` 是 6..14，内容 `bold` 是 8..12。
+    assert_eq!(expand_at(9), "plain **bold** code");
+    assert_eq!(expand_at(11), "plain **bold** code");
+    // 光标在代码段里 → 只展开代码段的反引号（`code` 在 15..21）。
+    assert_eq!(expand_at(18), format!("plain bold {bt}code{bt}"));
+  }
+
+  #[test]
   fn plan_cell_of_escaped_pipe_cell_keeps_the_escape() {
     // 转义管道格：`a\|b` 是一个格，反斜杠是内容的一部分。
     let line = "| a\\|b | c |";
-    let plan = plan_cell(line, 2..6, true, &HashMap::new());
+    let plan = plan_cell(line, 2..6, Some(2..6), &HashMap::new());
     assert_eq!(plan.visible, "a\\|b");
     assert_eq!(plan.segs.last().unwrap().src.end, 6);
   }

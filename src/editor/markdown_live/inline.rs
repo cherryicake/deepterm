@@ -113,6 +113,115 @@ impl Inline {
       .find(|s| s.range.contains(&at) && s.link.is_some())?;
     Some(&self.links[span.link?])
   }
+
+  /// Byte range of the **inline element** containing `at` (delimiters
+  /// included) — the construct an expansion would apply to.
+  ///
+  /// The parser gives a construct's delimiters the **same style** as its
+  /// content (only `marker` differs), so the element is the maximal run of
+  /// spans sharing the anchor's style + link. Plain text has the default
+  /// style, which is why a caret in plain text expands nothing.
+  ///
+  /// Nested constructs return the **outermost** element, matching Typora
+  /// (`Brush.expand` walks up to the outermost expandable ancestor).
+  pub fn element_at(&self, at: usize) -> Option<Range<usize>> {
+    let idx = self.spans.iter().position(|s| s.range.contains(&at))?;
+    // The caret's byte decides which construct it belongs to:
+    //  - on content  → that content's construct;
+    //  - on a **closing** delimiter (content of the same style precedes it)
+    //    → the construct to its left;
+    //  - on an **opening** delimiter (content of the same style follows)
+    //    → the construct to its right.
+    let anchor = if self.spans[idx].marker {
+      let style = self.spans[idx].style.clone();
+      let link = self.spans[idx].link;
+      let same = |s: &InlineSpan| s.link == link && s.style == style && !s.marker;
+      let left = self.spans[..idx].iter().rposition(same);
+      let right = self.spans[idx + 1..]
+        .iter()
+        .position(same)
+        .map(|off| idx + 1 + off);
+      match (left, right) {
+        // Prefer the content that immediately abuts this delimiter: a
+        // closing marker has its content on the left, an opening one on
+        // the right.
+        (Some(l), Some(r)) => {
+          let l_gap = self.spans[l].range.end == self.spans[idx].range.start;
+          let r_gap = self.spans[idx].range.end == self.spans[r].range.start;
+          if l_gap {
+            l
+          } else if r_gap {
+            r
+          } else {
+            r
+          }
+        }
+        (Some(l), None) => l,
+        (None, Some(r)) => r,
+        (None, None) => idx,
+      }
+    } else {
+      idx
+    };
+    let style = self.spans[anchor].style.clone();
+    let link = self.spans[anchor].link;
+    // A link construct is identified by its `link` index (its text carries
+    // `link_text` while its `[`/`](url)` delimiters do not, so style alone
+    // would split the construct). Everything else groups by style.
+    let belongs = |span: &InlineSpan| {
+      if link.is_some() {
+        span.link == link
+      } else {
+        span.link.is_none() && span.style == style
+      }
+    };
+    // Plain text (default style, no link) is not an expandable element:
+    // there are no markers to reveal, so a caret in it expands nothing.
+    let is_default = |s: &InlineStyle| {
+      !s.bold
+        && !s.italic
+        && !s.code
+        && !s.strike
+        && !s.highlight
+        && !s.math
+        && !s.sup
+        && !s.sub
+        && !s.emoji
+        && !s.footnote
+        && !s.link
+    };
+    if link.is_none() && is_default(&style) {
+      return Some(self.spans[idx].range.clone());
+    }
+    let mut start = anchor;
+    let mut end = anchor;
+    while start > 0 && belongs(&self.spans[start - 1]) {
+      start -= 1;
+    }
+    while end + 1 < self.spans.len() && belongs(&self.spans[end + 1]) {
+      end += 1;
+    }
+    Some(self.spans[start].range.start..self.spans[end].range.end)
+  }
+
+  /// Typora `.md-expand`: the element whose markers should be revealed for
+  /// a caret at byte `at`, or `None` to keep everything rendered.
+  ///
+  /// Rule: the caret is **inside** the element → that element's delimiters
+  /// show, everything else in the line stays rendered. This is Typora's
+  /// documented hybrid-editing behavior — "Moving the cursor to the middle
+  /// of a span element will expand that element into the Markdown source"
+  /// (support.typora.io, *Markdown Reference* §Span Elements).
+  ///
+  /// Plain text has no delimiters, so a caret there expands nothing.
+  pub fn expand_at(&self, at: usize) -> Option<Range<usize>> {
+    let el = self.element_at(at)?;
+    let has_marker = self
+      .spans
+      .iter()
+      .any(|s| s.marker && el.start <= s.range.start && s.range.end <= el.end);
+    has_marker.then_some(el)
+  }
 }
 
 const NO_LINK: usize = usize::MAX;
@@ -1163,5 +1272,87 @@ mod tests {
     assert!(!style_of("a \\`b\\` c", "b").code);
     // Double backslash: first marks, second is literal text.
     assert_eq!(frags("a \\\\ b"), vec![("a ".into(), false), ("\\".into(), true), ("\\ b".into(), false)]);
+  }
+}
+
+#[cfg(test)]
+mod element_at_tests {
+  use super::*;
+
+  fn el(text: &str, at: usize) -> String {
+    let inline = parse(text);
+    let r = inline.element_at(at).expect("有元素");
+    text[r].to_string()
+  }
+
+  #[test]
+  fn element_at_recovers_emphasis_constructs() {
+    let t = "a **bold** b";
+    // `**bold**` 在字节 2..10；光标在内容里 → 整个构造。
+    assert_eq!(el(t, 5), "**bold**");
+    // 光标在开标记上 → 同一个构造。
+    assert_eq!(el(t, 2), "**bold**");
+    // 光标在闭标记上 → 同一个构造。
+    assert_eq!(el(t, 9), "**bold**");
+  }
+
+  #[test]
+  fn element_at_keeps_plain_text_separate() {
+    // 光标在纯文本里 → 只有纯文本 span，不该吞掉后面的粗体。
+    let t = "plain **bold**";
+    let inline = parse(t);
+    let r = inline.element_at(2).expect("有元素");
+    assert_eq!(&t[r], "plain ");
+  }
+
+  #[test]
+  fn element_at_handles_code_spans() {
+    let t = "x `code` y";
+    assert_eq!(el(t, 5), "`code`");
+  }
+
+  #[test]
+  fn element_at_handles_links() {
+    let t = "see [docs](https://x.dev) now";
+    let inline = parse(t);
+    let r = inline.element_at(6).expect("有元素");
+    assert_eq!(&t[r], "[docs](https://x.dev)");
+  }
+
+  #[test]
+  fn element_at_handles_two_adjacent_bolds() {
+    // 两个相邻粗体是**两个**元素（Typora 也是分开展开）。
+    let t = "**a** **b**";
+    let inline = parse(t);
+    let first = inline.element_at(3).expect("有元素");
+    assert_eq!(&t[first], "**a**");
+    let second = inline.element_at(7).expect("有元素");
+    assert_eq!(&t[second], "**b**");
+  }
+
+  #[test]
+  fn expand_at_only_for_elements_with_markers() {
+    // Typora `.md-expand`：只有「有标记可展开」的元素才展开。
+    // 纯文本没有标记 → 不展开（整行保持渲染）。
+    let t = "plain **bold** tail";
+    let inline = parse(t);
+    assert_eq!(inline.expand_at(2), None, "纯文本不该展开");
+    assert_eq!(
+      inline.expand_at(9).map(|r| &t[r]),
+      Some("**bold**"),
+      "粗体内部应展开"
+    );
+    // 标记上也算「在里面」（用户正在编辑那些字符）。
+    assert_eq!(
+      inline.expand_at(6).map(|r| &t[r]),
+      Some("**bold**"),
+      "开标记上应展开"
+    );
+  }
+
+  #[test]
+  fn expand_at_is_none_for_plain_lines() {
+    let t = "just words here";
+    assert!(parse(t).expand_at(4).is_none());
   }
 }

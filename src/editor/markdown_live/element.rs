@@ -724,7 +724,7 @@ mod tests {
     fn rendered(cell: &str) -> String {
         use crate::editor::markdown_live::layout::plan_cell;
         let line = format!("| {cell} | c |");
-        let plan = plan_cell(&line, 2..2 + cell.len(), false, &Default::default());
+        let plan = plan_cell(&line, 2..2 + cell.len(), None, &Default::default());
         plan.visible
     }
 
@@ -751,8 +751,8 @@ mod tests {
             let lead = cell.len() - cell.trim_start().len();
             let trail = cell.len() - cell.trim_end().len();
             let content = (s + lead)..(e - trail).max(s + lead);
-            let inactive = plan_cell(line, content.clone(), false, &Default::default());
-            let active = plan_cell(line, content.clone(), true, &Default::default());
+            let inactive = plan_cell(line, content.clone(), None, &Default::default());
+            let active = plan_cell(line, content.clone(), Some(content.clone()), &Default::default());
             // 两条路径都是 plan_cell：非揭示态只隐藏标记，可见文本一致。
             assert!(
                 !inactive.visible.is_empty(),
@@ -797,7 +797,7 @@ mod tests {
             let lead = cell.len() - cell.trim_start().len();
             let trail = cell.len() - cell.trim_end().len();
             let content = (s + lead)..(e - trail).max(s + lead);
-            let in_cell = plan_cell(&line, content, false, &Default::default());
+            let in_cell = plan_cell(&line, content, None, &Default::default());
             assert_eq!(
                 para.visible, in_cell.visible,
                 "段落与单元格的可见文本必须一致（src={src:?}）"
@@ -854,7 +854,7 @@ mod tests {
         let mut refs = HashMap::new();
         refs.insert("docs".to_string(), "https://x.dev".to_string());
         let line = "| [docs] | c |";
-        let plan = plan_cell(line, 2..8, false, &refs);
+        let plan = plan_cell(line, 2..8, None, &refs);
         assert_eq!(plan.visible, "docs");
         assert_eq!(plan.links.len(), 1, "引用链接必须解析出目标：{plan:?}");
         assert_eq!(plan.links[0].1, "https://x.dev");
