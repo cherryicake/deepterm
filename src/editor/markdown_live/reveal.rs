@@ -78,6 +78,22 @@ pub struct Reveal {
     pub selection: Option<(Pos, Pos)>,
     pub focused: bool,
     pub read_only: bool,
+    /// Whole-document source mode (`Cmd+/`): every line shows its raw
+    /// source, including tables (which otherwise stay rendered grids so a
+    /// cell can be edited in place).
+    pub show_source: bool,
+}
+
+impl Default for Reveal {
+    fn default() -> Self {
+        Self {
+            cursor: Pos::default(),
+            selection: None,
+            focused: false,
+            read_only: false,
+            show_source: false,
+        }
+    }
 }
 
 impl Reveal {
@@ -218,8 +234,26 @@ pub fn plan_rows_with_refs(
 
     // 2. Line reveal set, then block expansion over source-only runs.
     let mut revealed = reveal.line_set(lines.len());
-    // Expand over contiguous Table/FrontMatter/math runs (code/fence rows
-    // are reveal-invariant and keep the rendered card while editing).
+    // Table rows never take part in line-level reveal: the grid stays
+    // rendered and the *cell* under the cursor reveals its own source (see
+    // `Group::Table`), so clicking a cell edits it in place instead of
+    // flipping the whole block back to source lines.
+    //
+    // Exception: whole-document source mode (`Cmd+/`) must still show the
+    // raw table — it is the escape hatch for bulk-editing alignment and
+    // formatting.
+    if !reveal.show_source {
+        revealed.retain(|l| !matches!(blocks.get(*l), Some(Block::Table)));
+    }
+    // Expand over contiguous FrontMatter/math runs (code/fence rows are
+    // reveal-invariant and keep the rendered card while editing).
+    //
+    // Tables are deliberately NOT expanded: a table stays a rendered grid
+    // and the *cell* under the cursor reveals its own source (see
+    // `Group::Table`), so clicking a cell edits it in place instead of
+    // flipping the whole block back to source lines. The whole-table
+    // source view is still available through `show_source` (`Cmd+/`),
+    // which reveals every line via the selection in `plan_rows`.
     let mut run_start: Option<usize> = None;
     let flush = |start: Option<usize>, end: usize, revealed: &mut BTreeSet<usize>| {
         if let Some(s) = start {
@@ -231,7 +265,7 @@ pub fn plan_rows_with_refs(
     for (i, b) in blocks.iter().enumerate() {
         let in_run = matches!(
             b,
-            Block::Table | Block::FrontMatter | Block::Math { .. } | Block::MathDelim { .. }
+            Block::FrontMatter | Block::Math { .. } | Block::MathDelim { .. }
         );
         if in_run && run_start.is_none() {
             run_start = Some(i);
@@ -315,6 +349,7 @@ mod tests {
             selection: None,
             focused: true,
             read_only: false,
+            show_source: false,
         }
     }
 
@@ -355,6 +390,7 @@ mod tests {
             selection: Some((Pos::new(0, 0), Pos::new(1, 0))),
             focused: true,
             read_only: false,
+            ..Default::default()
         };
         let rows = plan_document(&ls, r);
         assert!(rows[0].plan.revealed && rows[1].plan.revealed);
@@ -418,11 +454,17 @@ mod tests {
         assert!(!rows[1].plan.revealed);
     }
 
+    /// Tables are **not** revealed as a unit any more: the grid stays
+    /// rendered and the active cell reveals its own source, so clicking a
+    /// cell edits it in place (the whole-block source view is `Cmd+/`).
     #[test]
-    fn table_reveals_as_unit() {
+    fn table_does_not_reveal_as_unit() {
         let ls = lines("| a | b |\n|---|---|\n| 1 | 2 |\n\ntext");
         let rows = plan_document(&ls, reveal_at(2));
-        assert!(rows[0].plan.revealed && rows[1].plan.revealed && rows[2].plan.revealed);
+        assert!(
+            !rows[0].plan.revealed && !rows[1].plan.revealed && !rows[2].plan.revealed,
+            "表格必须保持网格渲染（活动格由 view 单独揭示）"
+        );
         assert!(!rows[4].plan.revealed);
     }
 
@@ -579,19 +621,22 @@ mod showcase_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
+                show_source: false,
             },
             Reveal {
                 cursor: Pos::new(lines.len() / 2, 0),
                 selection: None,
                 focused: true,
                 read_only: false,
-            },
+            ..Default::default()
+        },
             Reveal {
                 cursor: Pos::new(0, 0),
                 selection: Some((Pos::new(0, 0), Pos::new(lines.len().saturating_sub(1), 0))),
                 focused: true,
                 read_only: false,
-            },
+            ..Default::default()
+        },
         ];
         for reveal in configs {
             let rows = plan_document(&lines, reveal);
@@ -619,6 +664,7 @@ mod showcase_tests {
                 selection: None,
                 focused: true,
                 read_only: false,
+                show_source: false,
             };
             let merged = plan_document(&ls, reveal);
             let split = plan_rows(&ls, &classified, reveal);

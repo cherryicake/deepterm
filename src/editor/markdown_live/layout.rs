@@ -98,6 +98,30 @@ impl RowPlan {
   }
 }
 
+/// Plan one table cell's inline content (a sub-range of a source line).
+///
+/// This is [`Builder::inline`] driven over a cell instead of a whole line,
+/// so a cell gets exactly the same markup treatment as a paragraph — and,
+/// crucially, the same **`segs` mapping**. `segs[].src` stays absolute in
+/// the line (the cell's own byte offsets), so the existing
+/// [`vis_for_src`] / [`src_for_vis`] pair maps the caret and clicks
+/// between the rendered cell and the source with no new machinery.
+///
+/// `content` is the cell's trimmed content byte range in `line`; parsing
+/// stops at `content.end`, so neighbouring cells never leak in.
+/// `reveal` = true keeps the markup markers visible (the active cell shows
+/// the characters the user is typing); false hides them like the preview.
+pub fn plan_cell(
+  line: &str,
+  content: Range<usize>,
+  reveal: bool,
+  refs: &HashMap<String, String>,
+) -> RowPlan {
+  let mut b = Builder::new(line, reveal, refs);
+  b.inline_range(content, false);
+  b.finish(RowKind::Table)
+}
+
 /// How a row is sized. Both markdown renderers — the editor and the read-only
 /// [`Markdown`](super::Markdown) view — read this, because a document that
 /// changes size when you start editing it is a bug. They had two copies of
@@ -347,7 +371,16 @@ impl<'a> Builder<'a> {
 
   /// Parse and emit the line's content from `at`, with inline markup.
   fn inline(&mut self, at: usize, dim: bool) {
-    let content = &self.line[at..];
+    self.inline_range(at..self.line.len(), dim);
+  }
+
+  /// [`Builder::inline`] confined to `range`: only bytes inside it are
+  /// parsed and emitted. Used for table cells, whose content is a
+  /// sub-range of the line — parsing to end-of-line would swallow the
+  /// neighbouring cells (and their pipes) into this cell's plan.
+  fn inline_range(&mut self, range: Range<usize>, dim: bool) {
+    let at = range.start;
+    let content = &self.line[range.clone()];
     let inline = inline::parse_with_refs(content, self.refs);
     for span in &inline.spans {
       let src = at + span.range.start..at + span.range.end;
@@ -639,5 +672,73 @@ mod tests {
     // Headings carry the space above them; body copy doesn't.
     assert!(h1.pad_top > body.pad_top);
     assert_eq!(body.pad_top, 0.0);
+  }
+
+  // ---- 表格单元格规划（格内直接编辑的映射基础） --------------------------
+
+  #[test]
+  fn plan_cell_maps_cell_bytes_and_stops_at_the_boundary() {
+    // 真实一行的第一格：`| **粗** | b |` 的 `**粗**` 在字节 2..9。
+    let line = "| **粗** | b |";
+    let content = 2..9;
+    let plan = plan_cell(line, content.clone(), true, &HashMap::new());
+    // 揭示态：标记可见，可见文本就是这一格的内容（不含相邻格/管道）。
+    assert_eq!(plan.visible, "**粗**");
+    assert_eq!(plan.kind, RowKind::Table);
+    // segs 必须**行内绝对**且覆盖本格内容（不越界到邻格）。
+    let first = plan.segs.first().expect("有 seg");
+    let last = plan.segs.last().expect("有 seg");
+    assert_eq!(first.src.start, content.start);
+    assert_eq!(last.src.end, content.end);
+    for seg in &plan.segs {
+      assert!(
+        seg.src.start >= content.start && seg.src.end <= content.end,
+        "segs 不得越出本格：{seg:?} vs {content:?}"
+      );
+    }
+    // 双向映射在格内往返自洽。
+    for byte in content.clone() {
+      let vis = vis_for_src(&plan.segs, byte);
+      assert!(
+        vis <= plan.visible.len(),
+        "vis 越界：byte={byte} vis={vis} visible={:?}",
+        plan.visible
+      );
+    }
+    assert_eq!(src_for_vis(&plan.segs, 0), content.start);
+    assert_eq!(src_for_vis(&plan.segs, plan.visible.len()), content.end);
+  }
+
+  #[test]
+  fn plan_cell_hides_markers_when_not_revealed() {
+    let line = "| **粗** | b |";
+    let content = 2..9;
+    let plan = plan_cell(line, content.clone(), false, &HashMap::new());
+    // 非揭示态：标记隐藏，只剩内容（预览观感）。
+    assert_eq!(plan.visible, "粗");
+    // 隐藏的标记字节塌缩到内容起点，不会跑到邻格。
+    assert_eq!(vis_for_src(&plan.segs, content.start), 0);
+  }
+
+  #[test]
+  fn plan_cell_handles_links_inside_the_cell() {
+    let line = "| [docs](https://x.dev) | b |";
+    let content = 2..23;
+    let plan = plan_cell(line, content, true, &HashMap::new());
+    // 链接目标必须记录在**行内**绝对范围里（点击激活用）。
+    assert_eq!(plan.links.len(), 1);
+    let (r, target) = &plan.links[0];
+    assert_eq!(target, "https://x.dev");
+    assert!(r.start >= 2 && r.end <= 23, "链接范围必须在格内：{r:?}");
+    assert!(line[r.clone()].contains("docs"));
+  }
+
+  #[test]
+  fn plan_cell_of_escaped_pipe_cell_keeps_the_escape() {
+    // 转义管道格：`a\|b` 是一个格，反斜杠是内容的一部分。
+    let line = "| a\\|b | c |";
+    let plan = plan_cell(line, 2..6, true, &HashMap::new());
+    assert_eq!(plan.visible, "a\\|b");
+    assert_eq!(plan.segs.last().unwrap().src.end, 6);
   }
 }

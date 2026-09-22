@@ -17,7 +17,7 @@ use crate::components::input::cursor::{CursorLayout, CursorShape};
 
 use crate::editor::markdown::MarkdownStyle;
 use crate::editor::markdown_live::highlight::HighlightCache;
-use crate::editor::markdown_live::layout::{RowKind, RowPlan};
+use crate::editor::markdown_live::layout::{RowKind, RowPlan, Seg, col_for_byte, src_for_vis};
 use crate::editor::markdown_live::view::LiveMarkdownView;
 use crate::theme::AppTheme;
 
@@ -223,133 +223,6 @@ pub fn apply_task_done(mut runs: Vec<TextRun>, dim: Hsla, strike_color: Hsla) ->
     runs
 }
 
-/// Rendered text + runs for a table cell's raw source text.
-///
-/// The grid is preview-only (clicking it jumps into the block source), so
-/// markers hide exactly like the read-only preview: `**bold**` shows `bold`
-/// in bold, `` `code` `` shows `code` in a capsule, `[t](u)` shows `t` as a
-/// link. The old version kept every marker visible, so no inline syntax
-/// ever looked rendered inside tables.
-///
-/// Returns the rendered string alongside runs covering it exactly (emoji
-/// shortcodes swap for glyphs, footnotes render as `[label]`, both matching
-/// `markdown_element.rs`).
-pub fn inline_cell_runs(
-    text: &str,
-    base: &TextStyle,
-    colors: &LiveColors,
-    style: &MarkdownStyle,
-) -> (String, Vec<TextRun>) {
-    inline_cell_runs_with_refs(text, base, colors, style, &std::collections::HashMap::new())
-}
-
-/// [`inline_cell_runs`] with a document-wide reference table for
-/// `[text][ref]` / `[text]` shortcuts (pulldown resolves these inside table
-/// cells too; callers collect via `inline::collect_refdefs` with the same
-/// code/table/math skip as `reveal::plan_document`).
-pub fn inline_cell_runs_with_refs(
-    text: &str,
-    base: &TextStyle,
-    colors: &LiveColors,
-    style: &MarkdownStyle,
-    refs: &std::collections::HashMap<String, String>,
-) -> (String, Vec<TextRun>) {
-    use crate::editor::markdown_live::inline::parse_with_refs as parse_inline;
-    let inline = parse_inline(text, refs);
-    let mut out = String::with_capacity(text.len());
-    let mut runs = Vec::new();
-    // 上一段的解析后样式：用来判断能否并入前一个 run（标记符被吃掉后，
-    // `**a** **b**` 中间只剩一个空格，两段样式相同 → 合成一个 run）。
-    // 直接整体比较 `TextStyle`，而不是手工挑几个字段 —— 后者一旦 `TextRun`
-    // 新增字段就会静默漏判。
-    let mut last_style: Option<TextStyle> = None;
-    let push = |piece: &str,
-                s: TextStyle,
-                out: &mut String,
-                runs: &mut Vec<TextRun>,
-                last: &mut Option<TextStyle>| {
-        if piece.is_empty() {
-            return;
-        }
-        out.push_str(piece);
-        let run = s.to_run(piece.len());
-        if last.as_ref() == Some(&s) {
-            runs.last_mut().expect("last 为 Some 时必已有 run").len += run.len;
-        } else {
-            runs.push(run);
-            *last = Some(s);
-        }
-    };
-    for span in &inline.spans {
-        if span.marker {
-            continue;
-        }
-        let mut s = base.clone();
-        let st = &span.style;
-        if st.link {
-            s.refine(&style.link);
-        }
-        if st.code {
-            s.refine(&style.inline_code);
-        }
-        if st.highlight {
-            s.refine(&TextStyleRefinement {
-                background_color: Some(colors.highlight_bg),
-                ..Default::default()
-            });
-        }
-        if st.strike {
-            s.refine(&TextStyleRefinement {
-                strikethrough: Some(gpui::StrikethroughStyle {
-                    color: None,
-                    thickness: gpui::px(1.),
-                }),
-                ..Default::default()
-            });
-        }
-        if st.bold {
-            s.refine(&TextStyleRefinement {
-                font_weight: Some(gpui::FontWeight::BOLD),
-                ..Default::default()
-            });
-        }
-        if st.italic || st.math {
-            s.refine(&TextStyleRefinement {
-                font_style: Some(gpui::FontStyle::Italic),
-                ..Default::default()
-            });
-        }
-        if st.sup || st.footnote {
-            s.refine(&TextStyleRefinement {
-                color: Some(colors.accent),
-                ..Default::default()
-            });
-        }
-        if st.sub {
-            s.refine(&TextStyleRefinement {
-                color: Some(colors.accent.opacity(0.7)),
-                ..Default::default()
-            });
-        }
-        // Emoji swaps for the glyph like the preview (`replace_shortcodes`);
-        // the accent is a source-token style and must not tint the glyph.
-        // Footnotes render as `[label]` (preview `FootnoteRef` parity).
-        if st.emoji {
-            let raw = &text[span.range.clone()];
-            let glyph = super::emoji::find_shortcode(text, span.range.start)
-                .map(|(_, g)| g)
-                .unwrap_or(raw);
-            push(glyph, s, &mut out, &mut runs, &mut last_style);
-        } else if st.footnote {
-            let label = &text[span.range.clone()];
-            push(&format!("[{label}]"), s, &mut out, &mut runs, &mut last_style);
-        } else {
-            push(&text[span.range.clone()], s, &mut out, &mut runs, &mut last_style);
-        }
-    }
-    (out, runs)
-}
-
 /// Overlay find-match ranges (visible bytes) onto runs: each mark is
 /// `(start, end, current)`; the current match gets `current_bg`, the rest
 /// `bg`. Single pass over sorted cut points (same template walk as
@@ -519,6 +392,11 @@ pub struct LiveLine {
     /// positions outside every row's band (blank rows, margins), extending
     /// the selection to the nearest line — guise's continuous drag.
     pub drag_fallback: bool,
+    /// Table cell mode: the element renders **one cell's** content of
+    /// `line`, so mouse mapping must go through this cell's own `segs`
+    /// (absolute in the line) and clamp to the cell's content range instead
+    /// of the whole line. `None` = ordinary full-line row.
+    pub cell: Option<(Vec<Seg>, std::ops::Range<usize>)>,
 }
 
 impl LiveLine {
@@ -550,7 +428,19 @@ impl LiveLine {
             caret_width,
             line_height,
             drag_fallback: false,
+            cell: None,
         }
+    }
+
+    /// Render one table cell's content (see [`LiveLine::cell`]): mouse
+    /// mapping is confined to `content` and resolved through `segs`.
+    pub fn with_cell_segs(
+        mut self,
+        segs: Vec<Seg>,
+        content: std::ops::Range<usize>,
+    ) -> Self {
+        self.cell = Some((segs, content));
+        self
     }
 
     /// Enable the dead-zone drag fallback for this row (see field docs).
@@ -671,6 +561,9 @@ impl Element for LiveLine {
         let view = self.view.clone();
         let gutter = self.gutter;
         let layout_down = layout.clone();
+        // 表格单元格模式：把可见字节映射回**行内**字节时，要走本格的 segs
+        // 并把结果夹在本格内容范围内（否则点击会跑到相邻格/管道上）。
+        let cell_down = self.cell.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble || event.button != gpui::MouseButton::Left {
                 return;
@@ -705,6 +598,17 @@ impl Element for LiveLine {
                     Ok(ix) | Err(ix) => ix.min(text_len),
                 }
             };
+            // 单元格模式：可见字节 → 行内字节 → 行内 char 列。
+            if let Some((segs, _content)) = cell_down.clone() {
+                let src_byte = src_for_vis(&segs, raw);
+                let line_text = view.read(cx).line_text(line).unwrap_or_default();
+                let col = col_for_byte(&line_text, src_byte);
+                let shift = event.modifiers.shift;
+                view.update(cx, |v, cx| {
+                    v.on_table_cell_mouse_down(line, col, event.click_count, shift, window, cx)
+                });
+                return;
+            }
             let shift = event.modifiers.shift;
             let platform = event.modifiers.platform;
             view.update(cx, |v, cx| {
@@ -716,6 +620,7 @@ impl Element for LiveLine {
         let hitbox_move = hitbox.clone();
         let layout_move = layout.clone();
         let drag_fallback = self.drag_fallback;
+        let cell_drag = self.cell.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
@@ -742,6 +647,14 @@ impl Element for LiveLine {
             let raw = match layout_move.index_for_position(event.position) {
                 Ok(ix) | Err(ix) => ix.min(text_len),
             };
+            // 单元格模式：拖拽选择同样限制在本格内（segs 映射）。
+            if let Some((segs, _)) = cell_drag.clone() {
+                let src_byte = src_for_vis(&segs, raw);
+                let line_text = view.read(cx).line_text(line).unwrap_or_default();
+                let col = col_for_byte(&line_text, src_byte);
+                view.update(cx, |v, cx| v.on_table_cell_drag(line, col, cx));
+                return;
+            }
             view.update(cx, |v, cx| v.on_line_drag(line, raw, window, cx));
         });
 
@@ -807,49 +720,104 @@ mod tests {
         assert_eq!(apply_selection(runs, 4, Some((2, 2)), sel).len(), 1);
     }
 
-    fn cell_fixtures() -> (TextStyle, LiveColors, MarkdownStyle) {
-        let base = TextStyle::default();
-        let colors = LiveColors {
-            text: Hsla::default(),
-            marker: Hsla::default(),
-            dim: Hsla::default(),
-            accent: Hsla::default(),
-            caret: Hsla::default(),
-            selection: Hsla::default(),
-            find_bg: Hsla::default(),
-            find_current: Hsla::default(),
-            code_bg: Hsla::default(),
-            highlight_bg: Hsla::default(),
-            rule: Hsla::default(),
-            quote_bar: Hsla::default(),
-            code_border: Hsla::default(),
-            success: Hsla::default(),
-            elevated_bg: Hsla::default(),
-            panel_bg: Hsla::default(),
-            table_border: Hsla::default(),
-        };
-        let style = MarkdownStyle {
-            base_text_style: base.clone(),
-            container_style: Default::default(),
-            code_block: Default::default(),
-            inline_code: Default::default(),
-            block_quote: Default::default(),
-            link: Default::default(),
-            rule_color: Hsla::default(),
-            block_quote_border_color: Hsla::default(),
-            heading: Default::default(),
-            heading_level_styles: [None, None, None, None, None, None],
-            heading_border_color: None,
-        };
-        (base, colors, style)
+    /// 单元格可见文本（走 live 的 `plan_cell`，与非活动格渲染同源）。
+    fn rendered(cell: &str) -> String {
+        use crate::editor::markdown_live::layout::plan_cell;
+        let line = format!("| {cell} | c |");
+        let plan = plan_cell(&line, 2..2 + cell.len(), false, &Default::default());
+        plan.visible
     }
 
-    fn rendered(cell: &str) -> String {
-        let (base, colors, style) = cell_fixtures();
-        let (text, runs) = inline_cell_runs(cell, &base, &colors, &style);
-        let total: usize = runs.iter().map(|r| r.len).sum();
-        assert_eq!(total, text.len(), "runs must cover rendered text for {cell:?}");
-        text
+    #[test]
+    fn active_cell_plan_matches_inactive_cell_rendering() {
+        // 光标移进/移出格子时文字不能跳变：活动格与非活动格必须走**同一份**
+        // 规划器（`plan_cell`，标记隐藏），只是活动格多一个光标。
+        use crate::editor::markdown_live::block::table_cell_spans;
+        use crate::editor::markdown_live::layout::plan_cell;
+        for line in [
+            "| **bold** | c |",
+            "| `code` and *it* | c |",
+            "| [docs](https://x.dev) | c |",
+            "| ~~gone~~ ==mark== | c |",
+            "| E=mc^2^ H~2~O | c |",
+            "| plain text | c |",
+            "| a\\|b | c |",
+            "| :tada: party | c |",
+            "| [^note] | c |",
+        ] {
+            let spans = table_cell_spans(line);
+            let (s, e) = spans[0];
+            let cell = &line[s..e];
+            let lead = cell.len() - cell.trim_start().len();
+            let trail = cell.len() - cell.trim_end().len();
+            let content = (s + lead)..(e - trail).max(s + lead);
+            let inactive = plan_cell(line, content.clone(), false, &Default::default());
+            let active = plan_cell(line, content.clone(), true, &Default::default());
+            // 两条路径都是 plan_cell：非揭示态只隐藏标记，可见文本一致。
+            assert!(
+                !inactive.visible.is_empty(),
+                "非活动格必须有内容（line={line:?}）"
+            );
+            // 揭示态只是多出标记，内容字节仍在本格内。
+            for seg in &active.segs {
+                assert!(
+                    seg.src.start >= content.start && seg.src.end <= content.end,
+                    "活动格 segs 越界：{seg:?}（line={line:?}）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_cell_rendering_matches_paragraph_rendering() {
+        // 同一个源码片段，在段落里和在表格格里必须渲染成**同一种**样子
+        // （live 编辑器的规则：保留原文 + 上样式，因为映射要字节精确；
+        // 只有只读预览才把 `:tada:` 换成字形）。
+        use crate::editor::markdown_live::block::table_cell_spans;
+        use crate::editor::markdown_live::layout::{plan, plan_cell};
+        use crate::editor::markdown_live::block::{classify, DocState};
+        for src in [
+            "**bold**",
+            "`code` and *it*",
+            "[docs](https://x.dev)",
+            "~~gone~~ ==mark==",
+            "E=mc^2^ H~2~O",
+            ":tada: party",
+            "plain text",
+        ] {
+            // 段落：整行就是内容。
+            let mut st = DocState::default();
+            let block = classify(src, &mut st);
+            let para = plan(src, &block, None, false);
+            // 单元格：`| {src} | c |` 的第一格。
+            let line = format!("| {src} | c |");
+            let spans = table_cell_spans(&line);
+            let (s, e) = spans[0];
+            let cell = &line[s..e];
+            let lead = cell.len() - cell.trim_start().len();
+            let trail = cell.len() - cell.trim_end().len();
+            let content = (s + lead)..(e - trail).max(s + lead);
+            let in_cell = plan_cell(&line, content, false, &Default::default());
+            assert_eq!(
+                para.visible, in_cell.visible,
+                "段落与单元格的可见文本必须一致（src={src:?}）"
+            );
+            // 样式也必须一致（逐 run 对比）。
+            let para_runs: Vec<_> = para
+                .runs
+                .iter()
+                .map(|r| (r.len, r.style.bold, r.style.italic, r.style.code))
+                .collect();
+            let cell_runs: Vec<_> = in_cell
+                .runs
+                .iter()
+                .map(|r| (r.len, r.style.bold, r.style.italic, r.style.code))
+                .collect();
+            assert_eq!(
+                para_runs, cell_runs,
+                "段落与单元格的样式 run 必须一致（src={src:?}）"
+            );
+        }
     }
 
     #[test]
@@ -869,21 +837,27 @@ mod tests {
     }
 
     #[test]
-    fn table_cells_swap_emoji_and_bracket_footnotes() {
-        assert_eq!(rendered(":tada: party"), "\u{1f389} party");
-        assert_eq!(rendered("[^note]"), "[note]");
+    fn table_cells_keep_emoji_tokens_and_bracket_footnotes_like_live_rows() {
+        // live 编辑器（含表格格）保留 `:shortcode:` 原文并上色 —— 只有只读
+        // 预览才换字形（`markdown_element::replace_shortcodes`）。这样格内
+        // 编辑的字节映射才精确（与段落里的 emoji 行为一致）。
+        assert_eq!(rendered(":tada: party"), ":tada: party");
+        // 脚注引用：`[]` 是标记（隐藏），`^` 与标签内容保留 —— 与段落在
+        // live 里的渲染一致（`[^note]` → `note`）。
+        assert_eq!(rendered("[^note]"), "note");
     }
 
     #[test]
     fn table_cells_resolve_reference_links() {
+        use crate::editor::markdown_live::layout::plan_cell;
         use std::collections::HashMap;
-        let (base, colors, style) = cell_fixtures();
         let mut refs = HashMap::new();
         refs.insert("docs".to_string(), "https://x.dev".to_string());
-        let (text, runs) =
-            inline_cell_runs_with_refs("[docs]", &base, &colors, &style, &refs);
-        assert_eq!(text, "docs");
-        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        let line = "| [docs] | c |";
+        let plan = plan_cell(line, 2..8, false, &refs);
+        assert_eq!(plan.visible, "docs");
+        assert_eq!(plan.links.len(), 1, "引用链接必须解析出目标：{plan:?}");
+        assert_eq!(plan.links[0].1, "https://x.dev");
         // Without the table the shortcut stays literal.
         assert_eq!(rendered("[docs]"), "[docs]");
     }

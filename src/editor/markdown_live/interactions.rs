@@ -318,45 +318,7 @@ pub fn word_stats(text: &str) -> (usize, usize) {
 /// Splits on `|` outside code spans, honoring `\\|` escapes; the outer
 /// pipes may be absent (GFM pipeless rows) — each segment still counts.
 pub fn table_cell_bounds(line: &str) -> Vec<(usize, usize)> {
-    let bytes = line.as_bytes();
-    let mut bounds = Vec::new();
-    let mut start = 0usize;
-    let mut in_code = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            // Skip the escaped char (overshoot at EOL safely ends the loop;
-            // mid-UTF8 bytes never match ASCII below, so bounds stay valid).
-            b'\\' => i += 2,
-            b'`' => {
-                in_code = !in_code;
-                i += 1;
-            }
-            b'|' if !in_code => {
-                bounds.push((start, i));
-                start = i + 1;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    bounds.push((start, bytes.len()));
-    // Outer pipes produce zero-width edge cells (`| a |` scans as
-    // `(0,0),(1,4),(5,5)`): drop them so the count matches GFM columns.
-    if line.trim_start().starts_with('|')
-        && matches!(bounds.first(), Some((a, b)) if a == b)
-    {
-        bounds.remove(0);
-    }
-    if line.trim_end().ends_with('|')
-        && matches!(bounds.last(), Some((a, b)) if a == b)
-    {
-        bounds.pop();
-    }
-    if bounds.is_empty() {
-        bounds.push((0, line.len()));
-    }
-    bounds
+    crate::editor::markdown_live::block::table_cell_spans(line)
 }
 
 /// Char column of `byte` in `line` (interior offsets round down).
@@ -668,9 +630,15 @@ mod tests {
     fn table_cells_split_on_pipes() {
         assert_eq!(table_cell_bounds("| a | b |"), vec![(1, 4), (5, 8)]);
         assert_eq!(table_cell_bounds("a | b"), vec![(0, 2), (3, 5)]);
-        // `\\|` is not a boundary; code spans shield pipes.
+        // `\|` is not a boundary.
         assert_eq!(table_cell_bounds("| a\\|b | c |").len(), 2);
-        assert_eq!(table_cell_bounds("| `a|b` | c |").len(), 2);
+        // Code spans do NOT shield pipes: GFM splits on every unescaped `|`
+        // (the backslash is eaten by the table parser, not the code span) —
+        // verified against pulldown-cmark, which is what the preview uses.
+        assert_eq!(table_cell_bounds("| `a|b` | c |").len(), 3);
+        // A backslash *run* before the pipe keeps the parity rule: `\\|`
+        // is a literal backslash followed by a real boundary.
+        assert_eq!(table_cell_bounds("| a\\\\|b | c |").len(), 3);
     }
 
     #[test]

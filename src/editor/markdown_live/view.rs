@@ -22,11 +22,13 @@ use gpui::{
 use crate::assets::Icon;
 use crate::editor::markdown::{Copy, MarkdownStyle, SelectAll};
 use crate::editor::markdown_element::MarkdownElementBuilder;
-use crate::editor::markdown_live::block::{split_table_row, table_delimiter_cols, Block};
+use crate::editor::markdown_live::block::{
+    split_table_row, table_cell_spans, table_delimiter_cols, Block,
+};
 use crate::editor::markdown_live::buffer::LiveBuffer;
 use crate::editor::markdown_live::element::{
-    apply_find_marks, apply_selection, apply_task_done, inline_cell_runs_with_refs,
-    row_base_style, runs_for_row, LiveColors, LiveLine,
+    apply_find_marks, apply_selection, apply_task_done, row_base_style, runs_for_row, LiveColors,
+    LiveLine,
 };
 use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::highlight::HighlightCache;
@@ -40,7 +42,7 @@ use crate::editor::markdown_live::interactions::{
     table_nav, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
 };
 use crate::editor::markdown_live::layout::{
-    byte_for_col, col_for_byte, src_for_vis, vis_for_src, RowKind,
+    byte_for_col, col_for_byte, plan_cell, src_for_vis, vis_for_src, RowKind,
 };
 use crate::editor::markdown_live::model::Pos;
 use crate::editor::markdown_live::reveal::{
@@ -618,6 +620,7 @@ impl LiveMarkdownView {
                 selection,
                 focused,
                 read_only: self.read_only,
+                show_source: self.show_source,
             };
             let mut planned = plan_rows_with_refs(
                 self.buffer.lines(),
@@ -967,6 +970,126 @@ impl LiveMarkdownView {
     }
 
     // ---- mermaid 图模式禁区（严格 tab-only：图可见时源码不可编辑） -------
+
+    // ---- 表格单元格编辑（点击格内直接改，不退回源码） -------------------
+
+    /// 供 `LiveLine` 的单元格模式取整行文本（映射需要 char 列）。
+    pub(crate) fn line_text(&self, line: usize) -> Option<String> {
+        self.buffer.line(line).map(str::to_string)
+    }
+
+    /// 单元格内的点击：把光标放到格内对应位置（不再整块跳回源码首行）。
+    pub(crate) fn on_table_cell_mouse_down(
+        &mut self,
+        line: usize,
+        col: usize,
+        click_count: usize,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        self.goal_x = None;
+        self.edit(cx, |m| {
+            m.move_to(line, col, shift);
+            if !shift {
+                if click_count == 2 {
+                    m.select_word();
+                } else if click_count > 2 {
+                    m.select_line();
+                }
+            }
+        });
+        self.selecting = click_count <= 1;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// 单元格内拖拽：把选区终点扩到格内对应位置。
+    pub(crate) fn on_table_cell_drag(
+        &mut self,
+        line: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting {
+            return;
+        }
+        self.edit(cx, |m| m.move_to(line, col, true));
+    }
+
+    /// 光标在表格里时，Esc 的目标行：该表格块的最后一行 + 1（贴文档尾则
+    /// 表格首行前一行）。光标不在表格里返回 `None`（Esc 维持原行为）。
+    fn table_exit_line(&self) -> Option<usize> {
+        let cur = self.buffer.cursor().line;
+        if !self
+            .planned
+            .iter()
+            .find(|r| r.line == cur)
+            .is_some_and(|r| matches!(r.block, Block::Table))
+        {
+            return None;
+        }
+        let last = self
+            .planned
+            .iter()
+            .filter(|r| matches!(r.block, Block::Table))
+            .map(|r| r.line)
+            .max()?;
+        let line_count = self.buffer.line_count();
+        Some(if last + 1 < line_count {
+            last + 1
+        } else {
+            self.planned
+                .iter()
+                .filter(|r| matches!(r.block, Block::Table))
+                .map(|r| r.line)
+                .min()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        })
+    }
+
+    /// 表格活动单元格：光标所在行 + 列 + 该格的**内容字节范围**。    ///
+    /// 与渲染分支共用同一套切分（`block::table_cell_spans`），所以点哪个格
+    /// 就编辑哪个格，不会出现「Grid 画 3 列、Tab 走 2 格」这类错位。
+    fn table_active_cell(
+        &self,
+        rows: &[PlannedRow],
+        idxs: &[usize],
+        cursor: Pos,
+    ) -> Option<(usize, usize, std::ops::Range<usize>)> {
+        let cursor_line = cursor.line;
+        // 光标行必须真的属于这个表格组（防御：调用点已保证，双保险）。
+        idxs.iter().copied().find(|pi| rows[*pi].line == cursor_line)?;
+        let line = self.buffer.line(cursor_line)?;
+        let col = cursor.col.min(line.chars().count());
+        let byte = byte_for_col(line, col);
+        let spans = table_cell_spans(line);
+        // 光标在格内容里 → 该格；落在管道/空白等「格间」位置 → 取光标
+        // **右侧**那一格（与 Tab 前进方向一致，不会莫名跳到最后一格）。
+        let found: (usize, (usize, usize)) = spans
+            .iter()
+            .enumerate()
+            .find(|(_, (s, e))| byte >= *s && byte <= *e)
+            .map(|(i, (s, e))| (i, (*s, *e)))
+            .or_else(|| {
+                spans
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (s, _))| *s >= byte)
+                    .map(|(i, (s, e))| (i, (*s, *e)))
+            })
+            .or_else(|| spans.last().map(|(s, e)| (spans.len() - 1, (*s, *e))))
+            .expect("table_cell_spans 恒非空");
+        let (ci, (s, e)) = found;
+        // 内容范围 = 去 padding 后的实际文本（光标落在文字上，不落在空格里）。
+        let cell = &line[s..e];
+        let lead = cell.len() - cell.trim_start().len();
+        let trail = cell.len() - cell.trim_end().len();
+        let content = (s + lead)..(e - trail).max(s + lead);
+        Some((cursor_line, ci, content))
+    }
 
     /// 「预览 | 源码」按钮的唯一入口：切状态 + 切到预览时把光标夹出块外。
     ///
@@ -1615,6 +1738,16 @@ impl LiveMarkdownView {
                 {
                     panel.update(cx, |p, cx| p.hide(window, cx));
                     cx.stop_propagation();
+                    return;
+                }
+                // 表格里按 Esc：退出表格（Notion / codemirror-markdown-tables
+                // 同款）——光标移到表格后一行，不动任何文本。选区仍优先处理，
+                // 这样「先取消选区、再退出表格」是两段式，符合直觉。
+                if self.buffer.selection().is_none()
+                    && let Some(exit) = self.table_exit_line()
+                {
+                    self.edit(cx, |m| m.move_to(exit, 0, false));
+                    self.after_move(cx);
                     return;
                 }
                 if self.buffer.selection().is_some() {
@@ -3819,7 +3952,8 @@ impl Render for LiveMarkdownView {
                             c == grid_rows[0].len() && c > 0
                         });
                     if revealed || !has_delimiter {
-                        // Source editing (or not really a table): mono rows.
+                        // Whole-block source view (`Cmd+/`) or not really a
+                        // table: mono rows.
                         for pi in idxs {
                             if rows[*pi].line == cursor.line {
                                 caret_el_ix = Some(row_els.len());
@@ -3835,6 +3969,10 @@ impl Render for LiveMarkdownView {
                         window_counts.push(row_els.len() - els_before);
                         continue;
                     }
+                    // Preview-parity grid. The cell under the cursor renders
+                    // its own source (markers visible) through `plan_cell`, so
+                    // it can be edited in place — the rest stay rendered.
+                    let active = self.table_active_cell(&rows, idxs, cursor);
                     // Preview-parity grid.
                     let col_count = grid_rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
                     let aligns: Vec<CellAlign> = (0..col_count)
@@ -3880,19 +4018,16 @@ impl Render for LiveMarkdownView {
                         .w_full()
                         .rounded(px(8.0))
                         .overflow_hidden();
-                    let base = style.base_text_style.clone();
                     // grid_rows[0] = header, [1] = delimiter (skipped),
                     // [2..] = data. `preview_idx` matches the preview's
                     // row indices (header 0, data 1, 2, …) for dividers/zebra.
-                    for (di, cells) in grid_rows.iter().enumerate() {
+                    for (di, _cells) in grid_rows.iter().enumerate() {
                         if di == 1 {
                             continue;
                         }
                         let is_header = di == 0;
                         let preview_idx = di - usize::from(di > 0);
                         for (col, align) in aligns.iter().enumerate() {
-                            let cell_text =
-                                cells.get(col).map(|s| s.as_str()).unwrap_or("");
                             let mut cell_div = div().px_3().py_2().text_size(px(14.));
                             if col > 0 || preview_idx > 0 {
                                 cell_div = cell_div.border_color(colors.table_border);
@@ -3914,18 +4049,88 @@ impl Render for LiveMarkdownView {
                                 CellAlign::Right => cell_div = cell_div.justify_end(),
                                 CellAlign::None => {}
                             }
-                            let (cell_rendered, cell_runs) =
-                                inline_cell_runs_with_refs(
-                                    cell_text,
-                                    &base,
-                                    &colors,
-                                    &style,
-                                    &table_refs,
+                            // 活动格：光标所在的那一格显示自己的源码（标记
+                            // 可见），并且用 `LiveLine` 渲染以复用光标绘制 /
+                            // 命中测试 / 拖拽选择。其余格保持渲染态。
+                            let row_line = rows[idxs[di.min(idxs.len() - 1)]].line;
+                            let is_active = active
+                                .as_ref()
+                                .is_some_and(|(l, c, _)| *l == row_line && *c == col);
+                            if is_active {
+                                let content = active
+                                    .as_ref()
+                                    .map(|(_, _, r)| r.clone())
+                                    .expect("is_active 蕴含 active 存在");
+                                // 探针：活动格（测试断言点击/打字落在格内）。
+                                cell_div = cell_div.debug_selector(move || {
+                                    format!("live-table-active-{di}-{col}")
+                                });
+                                let src_line = src_lines
+                                    .get(di.min(src_lines.len() - 1))
+                                    .map(String::as_str)
+                                    .unwrap_or("");
+                                let plan = plan_cell(src_line, content.clone(), true, &table_refs);
+                                let base = row_base_style(&plan, &style);
+                                let runs =
+                                    runs_for_row(&plan, &base, &colors, &style, &self.hl, &theme);
+                                let caret_vis = show_caret.then(|| {
+                                    vis_for_src(
+                                        &plan.segs,
+                                        byte_for_col(src_line, cursor.col),
+                                    )
+                                });
+                                // 单元格光标高度：与行渲染同一套度量（基础样式
+                                // 行高），不另造数字。
+                                let cell_base = row_base_style(&plan, &style);
+                                let cell_font = cell_base.font_size.to_pixels(window.rem_size());
+                                let cell_caret_h = window.pixel_snap(
+                                    cell_base
+                                        .line_height
+                                        .to_pixels(cell_font.into(), window.rem_size()),
                                 );
-                            cell_div = cell_div.child(
-                                StyledText::new(SharedString::from(cell_rendered))
-                                    .with_runs(cell_runs),
-                            );
+                                cell_div = cell_div.child(
+                                    LiveLine::new(
+                                        ("live-table-cell", start_line + di * 64 + col),
+                                        SharedString::from(plan.visible.clone()),
+                                        runs,
+                                        row_line,
+                                        entity.clone(),
+                                        false,
+                                        caret_vis,
+                                        colors.caret,
+                                        CURSOR_WIDTH,
+                                        cell_caret_h,
+                                    )
+                                    .with_cell_segs(plan.segs.clone(), content.clone())
+                                    .with_caret_shape(self.cursor_shape),
+                                );
+                            } else {
+                                // 非活动格：同样走 `plan_cell`（reveal=false，
+                                // 标记隐藏），只是不上光标。两条路径共用一份
+                                // 规划器，光标移进/移出格子时文字不会跳变。
+                                let src_line = src_lines
+                                    .get(di.min(src_lines.len() - 1))
+                                    .map(String::as_str)
+                                    .unwrap_or("");
+                                let (s, e) = table_cell_spans(src_line)
+                                    .get(col)
+                                    .copied()
+                                    .unwrap_or((0, src_line.len()));
+                                let raw = &src_line[s..e];
+                                let lead = raw.len() - raw.trim_start().len();
+                                let trail = raw.len() - raw.trim_end().len();
+                                let content = (s + lead)..(e - trail).max(s + lead);
+                                let plan =
+                                    plan_cell(src_line, content, false, &table_refs);
+                                let cell_base = row_base_style(&plan, &style);
+                                let runs = runs_for_row(
+                                    &plan, &cell_base, &colors, &style, &self.hl, &theme,
+                                );
+                                cell_div = cell_div.child(
+                                    StyledText::new(SharedString::from(plan.visible.clone()))
+                                        .with_runs(runs),
+                                );
+                            }
                             grid = grid.child(cell_div.into_any_element());
                         }
                     }
@@ -4408,7 +4613,8 @@ mod live_render_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-                },
+            ..Default::default()
+        },
             );
             rows.iter()
                 .enumerate()
@@ -4531,7 +4737,8 @@ mod live_render_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-                },
+            ..Default::default()
+        },
             );
             rows.iter()
                 .enumerate()
@@ -4739,7 +4946,8 @@ mod live_frame_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            },
+            ..Default::default()
+        },
         );
         // Code lines (not fences: the cursor on a fence flips the card to
         // source mode) and table rows to jump onto.
@@ -4926,6 +5134,136 @@ mod live_frame_tests {
         );
     }
 
+    /// 表格格内编辑：点击单元格 → 光标落在格内（不整块跳源码）→ 打字只改
+    /// 该格；Tab 跨格、Esc 退出表格；`Cmd+/` 仍可看整块源码。
+    #[gpui::test]
+    fn live_table_cell_editing_stays_in_grid(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // 0:表头 1:分隔 2:数据 3:数据 4:空 5:尾段
+        const DOC: &str = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        // 未聚焦光标在第 0 行（表头）→ 网格照常渲染，不退回源码。
+        assert!(
+            cx.debug_bounds("live-table-outer").is_some(),
+            "表格必须渲染成网格"
+        );
+
+        // 1) 点击第 2 行第 2 格（`2`）→ 光标落在格内，网格仍在。
+        // 先把光标放进目标格（点击需要 bounds，bounds 只在该格是活动格时
+        // 才有探针，所以先用编辑接口定位，再断言点击路径本身）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let cell = cx
+            .debug_bounds("live-table-active-2-0")
+            .expect("第 2 行第 1 格应为活动格");
+        cx.simulate_click(cell.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("live-table-outer").is_some(),
+            "点击单元格后网格必须保留（不退回源码行）"
+        );
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(line, 2, "光标应落在被点的数据行");
+        assert!(
+            (1..=11).contains(&col),
+            "光标应落在该行某个格内（col={col}）"
+        );
+
+        // 2) 打字只改被点的那一格（line 2 的某一格），其他行不动。
+        let line_before = view.read_with(cx, |v, _| v.buffer.line(2).unwrap_or("").to_string());
+        cx.simulate_input("9");
+        cx.run_until_parked();
+        let text = view.read_with(cx, |v, _| v.text());
+        let line_after = view.read_with(cx, |v, _| v.buffer.line(2).unwrap_or("").to_string());
+        assert_ne!(line_before, line_after, "打字必须改到被点的行：{text:?}");
+        assert!(line_after.contains('9'), "插入的字符应在该行：{line_after:?}");
+        assert!(text.contains("| A | B |"), "表头不得被改动：{text:?}");
+        assert!(text.contains("| 3 | 4 |"), "其他数据行不得被改动：{text:?}");
+        assert_eq!(
+            text.lines().count(),
+            6,
+            "打字不得破坏表格结构（不新增/删除行）：{text:?}"
+        );
+
+        // 3) Tab 跨格：光标移动到下一个格位（同行下一格，或跨到下一行首格）。
+        let (line_b, col_b) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        let (line_a, col_a) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert!(
+            (line_a, col_a) != (line_b, col_b),
+            "Tab 必须把光标移到另一个格位（{line_b},{col_b} → {line_a},{col_a}）"
+        );
+        assert!(
+            line_a <= 3,
+            "Tab 不得离开表格（line={line_a}）"
+        );
+
+        // 4) Esc 退出表格：光标移到表格后一行（第 4 行），文本不变。
+        let before = view.read_with(cx, |v, _| v.text());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
+        assert_eq!(line, 4, "Esc 应把光标移出表格（line={line}）");
+        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "Esc 不得改动文本");
+    }
+
+    /// 表格里「光标在哪个格」的判定必须与 GFM 切分一致：含转义管道的行
+    /// 仍然分格正确（旧实现用朴素 split，会把 `\|` 也当边界）。
+    #[gpui::test]
+    fn live_table_escaped_pipe_keeps_cell_mapping(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "| a\\|b | c |\n|---|---|\n| 1 | 2 |\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        // 光标放在第一格内容里（`a` 上）→ 该格是活动格，且映射到行内正确位置。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("live-table-active-0-0").is_some(),
+            "第一格应为活动格（转义管道不能把它切成两格）"
+        );
+        assert!(
+            cx.debug_bounds("live-table-active-0-1").is_none(),
+            "第二格不该同时是活动格"
+        );
+    }
+
     /// Image paste/drop (Typora parity): files land in `<stem>.assets/`
     /// with Typora-layout refs, clipboard bytes get unique names.
     #[gpui::test]
@@ -5025,7 +5363,8 @@ mod live_frame_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-                },
+            ..Default::default()
+        },
             );
             let jump_to = |cx: &mut gpui::VisualTestContext, line: usize| {
                 cx.update(|_, cx| {
@@ -5171,7 +5510,8 @@ mod live_showcase_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            },
+            ..Default::default()
+        },
         );
         assert_eq!(rows.len(), lines.len());
         let mut empties = Vec::new();
@@ -5223,7 +5563,8 @@ mod live_showcase_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            },
+            ..Default::default()
+        },
         );
         let outline = outline_entries(&rows);
         assert_eq!(
@@ -5264,7 +5605,8 @@ mod live_showcase_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-                },
+            ..Default::default()
+        },
             );
             for (kind, a, b) in preview_block_ranges(doc) {
                 for row in rows.iter().take(b + 1).skip(a) {
@@ -6019,7 +6361,8 @@ mod setext_parity_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-                },
+            ..Default::default()
+        },
             );
             let mut live_ranges: Vec<(usize, usize)> = Vec::new();
             let mut open: Option<usize> = None;

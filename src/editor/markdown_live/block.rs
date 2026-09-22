@@ -304,12 +304,64 @@ fn setext_underline(line: &str) -> Option<u8> {
   Some(if first == b'=' { 1 } else { 2 })
 }
 
+/// Split a GFM table row into cells at the *untrimmed* pipe-delimited spans:
+/// `| a | b |` **and** `a | b` both yield two spans. Cell text keeps its
+/// padding (callers trim for display); byte offsets stay line-absolute.
+///
+/// GFM splits on **every** unescaped `|` — including inside code spans
+/// (`| `a|b` |` is *three* cells, verified against pulldown-cmark; the
+/// backslash is eaten by the table parser, not by the code span). Only a
+/// `|` preceded by an odd run of backslashes is literal, so escape
+/// awareness is a backslash-parity check rather than a code-span scan.
+///
+/// Outer pipes are dropped so the count matches GFM columns.
+pub fn table_cell_spans(line: &str) -> Vec<(usize, usize)> {
+  let bytes = line.as_bytes();
+  let mut bounds: Vec<(usize, usize)> = Vec::new();
+  let mut start = 0usize;
+  let mut i = 0usize;
+  while i < bytes.len() {
+    match bytes[i] {
+      // Backslash: skip the escaped char. A run of `\` is consumed one
+      // pair at a time, which is exactly the odd/even parity rule for
+      // "is this pipe escaped".
+      b'\\' => i += 2,
+      b'|' => {
+        bounds.push((start, i));
+        start = i + 1;
+        i += 1;
+      }
+      _ => i += 1,
+    }
+  }
+  bounds.push((start, bytes.len()));
+  // Outer pipes produce zero-width edge spans (`| a |` scans as
+  // `(0,0),(1,4),(5,5)`): drop them so the count matches GFM columns.
+  if line.trim_start().starts_with('|')
+    && matches!(bounds.first(), Some((a, b)) if a == b)
+  {
+    bounds.remove(0);
+  }
+  if line.trim_end().ends_with('|')
+    && matches!(bounds.last(), Some((a, b)) if a == b)
+  {
+    bounds.pop();
+  }
+  if bounds.is_empty() {
+    bounds.push((0, line.len()));
+  }
+  bounds
+}
+
 /// Split a GFM table row into trimmed cells: `| a | b |` **and** `a | b`.
+///
+/// Display-oriented wrapper over [`table_cell_spans`]; see there for the
+/// exact split rule (every unescaped `|`, code spans included).
 pub fn split_table_row(line: &str) -> Vec<String> {
-  let t = line.trim();
-  let t = t.strip_prefix('|').unwrap_or(t);
-  let t = t.strip_suffix('|').unwrap_or(t);
-  t.split('|').map(|c| c.trim().to_string()).collect()
+  table_cell_spans(line)
+    .into_iter()
+    .map(|(s, e)| line[s..e].trim().to_string())
+    .collect()
 }
 
 /// Is `cell` a delimiter cell (`-`, `---`, `:--`, `--:`, `:-:`)?
