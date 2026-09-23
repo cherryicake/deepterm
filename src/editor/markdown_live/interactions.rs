@@ -508,8 +508,9 @@ pub fn table_last_row_line(
 }
 
 /// Move the caret to the cell `row`/`col` of the table, landing at the
-/// **start** (`to_end = false`) or **end** of its content. `None` when that
-/// cell does not exist (caller then exits the table).
+/// **start** (`to_end = false`) or **end** of its content. `extend` keeps
+/// the selection anchor (shift 移动)。`None` when that cell does not exist
+/// (caller then exits the table).
 pub fn table_goto_cell(
     model: &mut EditorModel,
     lines: &[String],
@@ -518,6 +519,7 @@ pub fn table_goto_cell(
     row: usize,
     col: usize,
     to_end: bool,
+    extend: bool,
 ) -> bool {
     let Some(target) = table_row_line(lines, is_table, line, row) else {
         return false;
@@ -534,7 +536,7 @@ pub fn table_goto_cell(
     let trail = raw.len() - raw.trim_end().len();
     let cs = col_for_byte(text, s + lead);
     let ce = col_for_byte(text, (e - trail).max(s + lead));
-    model.move_to(target, if to_end { ce } else { cs }, false);
+    model.move_to(target, if to_end { ce } else { cs }, extend);
     true
 }
 

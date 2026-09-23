@@ -655,6 +655,7 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
         last_row,
         last_col,
         true,
+        false,
     );
     true
 }
