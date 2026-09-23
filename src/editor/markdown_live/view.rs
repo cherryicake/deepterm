@@ -2386,7 +2386,11 @@ impl LiveMarkdownView {
                         .is_some_and(|r| matches!(r.block, Block::Table))
                 {
                     if self.buffer.selection().is_some() {
-                        self.edit(cx, |m| m.delete_selection());
+                        // spec #6：跨格选区先结构化合并（同格走常规删除），
+                        // 否则 Enter 会按行拼接、毁掉表格。
+                        self.edit(cx, |m| {
+                            t::merge_cross_cell_selection(m, "") || m.delete_selection()
+                        });
                     }
                     if shift {
                         self.edit(cx, |m| m.insert("<br />"));
@@ -6627,7 +6631,7 @@ mod live_frame_tests {
     }
 
     /// 表格格内编辑：点击单元格 → 光标落在格内（不整块跳源码）→ 打字只改
-    /// 该格；Tab 跨格、Esc 退出表格；`Cmd+/` 仍可看整块源码。
+    /// 该格；Tab 跨格（末格加行）、Esc 不退出表格；`Cmd+/` 仍可看整块源码。
     #[gpui::test]
     fn live_table_cell_editing_stays_in_grid(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
