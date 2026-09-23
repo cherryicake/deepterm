@@ -9,35 +9,53 @@
 //!   行，不做全局 prettify（Typora 同款）。
 
 use crate::editor::markdown_live::block::{
-    is_delimiter_cell, split_table_row, table_cell_spans,
+    Block, is_delimiter_cell, split_table_row, table_cell_spans,
 };
 use crate::editor::markdown_live::interactions::cell_content_cols;
+use crate::editor::markdown_live::layout::col_for_byte as char_col;
 use crate::editor::markdown_live::model::{EditorModel, Pos};
+use crate::editor::markdown_live::reveal::classify_document;
 
 /// 表格块的范围：`(起始行, 结束行)`，闭区间。`None` = 该行不是表格。
+///
+/// 行的归属走**渲染器同一份分类**（`classify_document` 的 `Block::Table`），
+/// 再要求块内至少有一个分隔行（与渲染器「没有分隔行就不算表格、按源码行
+/// 渲染」一致）。此前这里用「行内出现 `|`」做邻接扩张，会把紧邻表格的、
+/// 只是恰好含 `|` 的普通段落行（如 `` 用 `a | b` 表示或运算 ``）也算进块，
+/// 于是删列/移列/重排会把它当表格行改写。
 pub fn table_block_range(lines: &[String], line: usize) -> Option<(usize, usize)> {
-    if line >= lines.len() || split_table_row(&lines[line]).is_empty() {
+    if line >= lines.len() {
         return None;
     }
-    // 往上/下扩到连续的可解析为表格行的范围（分隔行也算）。
-    let is_row = |i: usize| -> bool {
-        lines
-            .get(i)
-            .is_some_and(|l| l.trim_start().starts_with('|') || l.contains('|'))
-    };
-    if !is_row(line) {
+    let classified = classify_document(lines);
+    let flags: Vec<bool> = classified
+        .blocks
+        .iter()
+        .map(|b| matches!(b, Block::Table))
+        .collect();
+    table_block_range_flagged(lines, &flags, line)
+}
+
+/// [`table_block_range`] 的免分类版本：`flags[i]` = 第 i 行是否 `Block::Table`
+/// （调用方已有分类时用它避免重跑 O(n) 分类；拖拽等高频路径）。
+pub fn table_block_range_flagged(
+    lines: &[String],
+    flags: &[bool],
+    line: usize,
+) -> Option<(usize, usize)> {
+    if line >= flags.len() || !flags[line] {
         return None;
     }
     let mut start = line;
-    while start > 0 && is_row(start - 1) {
+    while start > 0 && flags[start - 1] {
         start -= 1;
     }
     let mut end = line;
-    while end + 1 < lines.len() && is_row(end + 1) {
+    while end + 1 < flags.len() && flags[end + 1] {
         end += 1;
     }
     // 至少要有一个分隔行才算表格。
-    if !(start..=end).any(|i| is_delimiter_row(&lines[i])) {
+    if !(start..=end).any(|i| lines.get(i).is_some_and(|l| is_delimiter_row(l))) {
         return None;
     }
     Some((start, end))
@@ -191,12 +209,22 @@ pub fn delete_row(model: &mut EditorModel) -> bool {
     if table_data_rows(&lines, block).first().copied() == Some(cur.line) {
         return false;
     }
-    // 选中「本行 + 行尾换行」，一次删干净（否则会留下空行）。
+    // 选中「本行 + 行尾换行」，一次删干净（否则会留下空行）。末行没有
+    // 下一行可借（文件末尾无换行时 `line + 1` 会被夹回本行、选区为空），
+    // 改为「上一行行尾 .. 本行行尾」——同样含本行前的换行。
     let end_col = lines[cur.line].chars().count();
-    model.move_to(cur.line, 0, false);
-    model.move_to(cur.line + 1, 0, true);
+    if cur.line + 1 < model.line_count() {
+        model.move_to(cur.line, 0, false);
+        model.move_to(cur.line + 1, 0, true);
+    } else {
+        let prev_len = lines
+            .get(cur.line.saturating_sub(1))
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        model.move_to(cur.line.saturating_sub(1), prev_len, false);
+        model.move_to(cur.line, end_col, true);
+    }
     model.delete_selection();
-    let _ = end_col;
     model.move_to(
         cur.line.min(model.line_count().saturating_sub(1)),
         0,
@@ -380,10 +408,15 @@ pub fn set_row_count(model: &mut EditorModel, target: usize) -> bool {
     };
     let mut changed = false;
     // 每轮增减一行，直到达标；块定位始终锚在块首行（行删后光标可能
-    // 落到表外，不能再靠光标重新找块）。
+    // 落到表外，不能再靠光标重新找块）。分类每轮只跑一次，两个用途共用。
     loop {
         let lines = model.lines().to_vec();
-        let Some(b) = table_block_range(&lines, block.0) else {
+        let flags: Vec<bool> = classify_document(&lines)
+            .blocks
+            .iter()
+            .map(|b| matches!(b, Block::Table))
+            .collect();
+        let Some(b) = table_block_range_flagged(&lines, &flags, block.0) else {
             break;
         };
         block = b;
@@ -434,7 +467,12 @@ pub fn set_col_count(model: &mut EditorModel, target: usize) -> bool {
     let mut changed = false;
     loop {
         let lines = model.lines().to_vec();
-        let Some(b) = table_block_range(&lines, block.0) else {
+        let flags: Vec<bool> = classify_document(&lines)
+            .blocks
+            .iter()
+            .map(|b| matches!(b, Block::Table))
+            .collect();
+        let Some(b) = table_block_range_flagged(&lines, &flags, block.0) else {
             return changed;
         };
         block = b;
@@ -557,9 +595,19 @@ pub fn delete_table(model: &mut EditorModel) -> bool {
     let Some(block) = table_block_range(&lines, cur.line) else {
         return false;
     };
-    // 选中「块首行 .. 块末行 + 换行」，一次删干净。
+    // 选中「块首行 .. 块末行 + 换行」，一次删干净。末行之后没有下一行可借
+    //（文件末尾无换行时会被夹回本行、选区为空、残留末行源码），改为
+    // 「块首行 .. 块末行行尾」。
     model.move_to(block.0, 0, false);
-    model.move_to(block.1 + 1, 0, true);
+    if block.1 + 1 < model.line_count() {
+        model.move_to(block.1 + 1, 0, true);
+    } else {
+        let end_col = lines
+            .get(block.1)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
+        model.move_to(block.1, end_col, true);
+    }
     model.delete_selection();
     model.move_to(
         block.0.min(model.line_count().saturating_sub(1)),
@@ -652,12 +700,20 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
     }
     let lines = model.lines().to_vec();
     let cur = model.cursor();
-    let Some(block) = table_block_range(&lines, cur.line) else {
+    // 分类只跑一次：块判定与 `is_table` 闭包共用（闭包逐行调用，
+    // 不能在里面重跑分类）。
+    let flags: Vec<bool> = classify_document(&lines)
+        .blocks
+        .iter()
+        .map(|b| matches!(b, Block::Table))
+        .collect();
+    let is_table = |l: usize| flags.get(l).copied().unwrap_or(false);
+    if table_block_range_flagged(&lines, &flags, cur.line).is_none() {
         return false;
-    };
+    }
     let Some((row, col, _)) = crate::editor::markdown_live::interactions::table_cell_at(
         &lines,
-        &|l| table_block_range(&lines, l).is_some(),
+        &is_table,
         cur.line,
         cur.col,
     ) else {
@@ -688,9 +744,19 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
     let need_cols = col + pasted.iter().map(Vec::len).max().unwrap_or(0);
     // 补足行数：先在块尾追加空行（用 insert_row 保证分隔行/表头结构正确）。
     let mut guard = 0;
-    while table_data_rows(model.lines(), table_block_range(model.lines(), model.cursor().line).unwrap_or(block)).len() < need_rows
-        && guard < 128
-    {
+    loop {
+        let lines = model.lines().to_vec();
+        let flags: Vec<bool> = classify_document(&lines)
+            .blocks
+            .iter()
+            .map(|b| matches!(b, Block::Table))
+            .collect();
+        let n = table_block_range_flagged(&lines, &flags, model.cursor().line)
+            .map(|b| table_data_rows(&lines, b).len())
+            .unwrap_or(0);
+        if n >= need_rows || guard >= 128 {
+            break;
+        }
         if !insert_row(model, false) {
             break;
         }
@@ -862,10 +928,17 @@ pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool 
         return false;
     }
     let lines = model.lines().to_vec();
-    let Some(block) = table_block_range(&lines, start.line) else {
+    // 两端点必须落在**同一个**表块内（分类只跑一次，两个端点共用）。
+    let classified = classify_document(&lines);
+    let flags: Vec<bool> = classified
+        .blocks
+        .iter()
+        .map(|b| matches!(b, Block::Table))
+        .collect();
+    let Some(block) = table_block_range_flagged(&lines, &flags, start.line) else {
         return false;
     };
-    if table_block_range(&lines, end.line) != Some(block) {
+    if table_block_range_flagged(&lines, &flags, end.line) != Some(block) {
         return false;
     }
     // 端点所在格列（字节落在管道上时归左格，随后截断会夹回内容内）。
@@ -984,14 +1057,6 @@ fn apply_row_edits(model: &mut EditorModel, lines: &[String], edits: &[(usize, S
     // 恢复光标（行号可能因增删行而漂移，这里夹到合法范围）。
     let line = saved.line.min(model.line_count().saturating_sub(1));
     model.move_to(line, saved.col, false);
-}
-
-/// char 列（`table_cell_spans` 返回字节，这里换算）。
-fn char_col(line: &str, byte: usize) -> usize {
-    line.get(..byte.min(line.len()))
-        .unwrap_or("")
-        .chars()
-        .count()
 }
 
 #[cfg(test)]
@@ -1281,5 +1346,57 @@ mod tests {
         assert!(!prettify_table(&mut m));
         assert!(!move_row(&mut m, false));
         assert!(!move_column(&mut m, true));
+    }
+
+    /// 回归：紧邻表格、只是恰好含 `|` 的普通段落行**不属于**表格块
+    ///（旧实现按「行内含 `|`」扩张，会把段落算进块，删列/移列/重排会
+    /// 把它当表格行改写；表头保护也会失效）。
+    ///
+    /// 判定与渲染器同源（`classify_document`）：GFM 里表格体之后的非空行
+    /// 会延续网格（pipeless 行），因此只有**表格之前**的段落行会被旧逻辑
+    /// 误吸 —— 也正是下面断言的情形。
+    #[test]
+    fn block_range_does_not_absorb_pipe_paragraphs() {
+        let lines: Vec<String> = "用 `a | b` 表示或运算\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾部 | 段落\n"
+            .split('\n')
+            .map(str::to_string)
+            .collect();
+        assert_eq!(table_block_range(&lines, 2), Some((1, 3)), "前导段落行不得进块");
+        // 块内数据行：表头 + 1 条数据（段落行不在其中）。
+        assert_eq!(table_data_rows(&lines, (1, 3)), vec![1, 3]);
+        // 表头保护仍然生效：对表头行删行 = 无操作。
+        let mut m = EditorModel::new(&lines.join("\n"));
+        m.move_to(1, 2, false);
+        assert!(!delete_row(&mut m), "表头不可删");
+        assert_eq!(m.text(), lines.join("\n"), "拒绝时不得改动文本");
+        // 块范围与渲染器分类一致（同源，不可能再出现「op 改了渲染器不认为
+        // 是表格的行」）。
+        let classified = classify_document(&lines);
+        let flags: Vec<bool> = classified
+            .blocks
+            .iter()
+            .map(|b| matches!(b, Block::Table))
+            .collect();
+        assert_eq!(
+            table_block_range(&lines, 2),
+            table_block_range_flagged(&lines, &flags, 2),
+        );
+    }
+
+    /// 回归：文件末尾无换行时，删除末行/删表也要真的删掉（旧实现选中
+    /// 「本行 + 下一行」会被夹回本行、选区为空，末行源码残留）。
+    #[test]
+    fn delete_at_eof_without_trailing_newline() {
+        // 末行是数据行：删行 → 只剩表头 + 分隔行。
+        let mut m = EditorModel::new("| a | b |\n|---|---|\n| 1 | 2 |");
+        m.move_to(2, 2, false);
+        assert!(delete_row(&mut m));
+        assert_eq!(m.text(), "| a | b |\n|---|---|");
+
+        // 末行是数据行：删表 → 整块消失。
+        let mut m = EditorModel::new("| a | b |\n|---|---|\n| 1 | 2 |");
+        m.move_to(2, 2, false);
+        assert!(delete_table(&mut m));
+        assert_eq!(m.text(), "", "末行无换行时删表不得残留源码");
     }
 }

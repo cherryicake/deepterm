@@ -321,27 +321,16 @@ pub fn table_cell_bounds(line: &str) -> Vec<(usize, usize)> {
     crate::editor::markdown_live::block::table_cell_spans(line)
 }
 
-/// Char column of `byte` in `line` (interior offsets round down).
-fn char_col(line: &str, byte: usize) -> usize {
-    line.get(..byte.min(line.len()))
-        .unwrap_or("")
-        .chars()
-        .count()
-}
-
 /// Content char-cols `(start, end)` of each cell: trimmed of padding, so
 /// the caret lands on text (empty cells land just before the right pipe).
+///
+/// 逐格委托 [`cell_content_cols`]（`table_nav` 与表格自动重排的光标重映射
+/// 共用同一份公式，避免两处各自演化出边界差异）。
 fn table_cell_contents(line: &str) -> Vec<(usize, usize)> {
     table_cell_bounds(line)
         .iter()
-        .map(|(s, e)| {
-            let cell = &line[*s..*e];
-            let lead = cell.len() - cell.trim_start().len();
-            let trail = cell.len() - cell.trim_end().len();
-            let cs = char_col(line, s + lead);
-            // Empty cells (`|  |`) would invert: clamp to the start.
-            (cs, char_col(line, e - trail).max(cs))
-        })
+        .enumerate()
+        .map(|(ci, _)| cell_content_cols(line, ci).unwrap_or((0, 0)))
         .collect()
 }
 
@@ -544,7 +533,8 @@ pub fn cell_content_cols(text: &str, ci: usize) -> Option<(usize, usize)> {
 
 /// [`Pos`] of full-text byte `off` (lines joined by single newlines).
 /// Interior offsets floor to the char start; past-end clamps to doc end.
-pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {    for (i, line) in lines.iter().enumerate() {
+pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {
+    for (i, line) in lines.iter().enumerate() {
         if off <= line.len() {
             return Pos::new(i, col_for_byte(line, off));
         }

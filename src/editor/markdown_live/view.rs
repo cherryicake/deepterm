@@ -1396,21 +1396,7 @@ impl LiveMarkdownView {
     /// 位置。只在光标已落在某个格内容里时保持不动，否则夹到相邻格内容。
     fn clamp_cursor_off_table_pipe(&mut self, cx: &mut Context<Self>) {
         let cur = self.buffer.cursor();
-        if !self
-            .planned
-            .iter()
-            .find(|r| r.line == cur.line)
-            .is_some_and(|r| matches!(r.block, Block::Table))
-        {
-            return;
-        }
-        // 光标不在表格行上：不处理。
-        if !self
-            .planned
-            .iter()
-            .find(|r| r.line == cur.line)
-            .is_some_and(|r| matches!(r.block, Block::Table))
-        {
+        if !self.line_is_table(cur.line) {
             return;
         }
         let Some((cs, ce)) = self.table_cell_content_at(cur.line, cur.col) else {
@@ -1430,12 +1416,10 @@ impl LiveMarkdownView {
     /// 无单元格监听的区域时选区自然冻结」的既有表现一致）。普通文字段落间
     /// 的拖拽（两端都不在表里）不受影响。
     fn drag_cross_table(&self, target_line: usize) -> bool {
-        // 无表格的文档：普通拖拽零额外开销。
-        if !self
-            .planned
-            .iter()
-            .any(|r| matches!(r.block, Block::Table))
-        {
+        // 用上一帧的 `planned` 分类（拖拽是每帧鼠标移动的热路径，不能在这里
+        // 重跑 O(n) 全文档分类）；无表格的文档直接零额外开销。
+        let flags = self.table_line_flags();
+        if !flags.iter().any(|f| *f) {
             return false;
         }
         let lines: Vec<String> = self.buffer.lines().to_vec();
@@ -1447,7 +1431,7 @@ impl LiveMarkdownView {
             .map(|p| p.line)
             .unwrap_or_else(|| self.buffer.cursor().line);
         let blk = |l: usize| {
-            crate::editor::markdown_live::table_ops::table_block_range(&lines, l)
+            crate::editor::markdown_live::table_ops::table_block_range_flagged(&lines, &flags, l)
         };
         let anchor_blk = blk(anchor_line);
         let target_blk = blk(target_line);
@@ -1472,9 +1456,15 @@ impl LiveMarkdownView {
         self.edit(cx, |m| m.move_to(line, col, true));
     }
 
-    /// Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容（不升级到整表/整文档）。
-    /// 返回 `true` 表示已处理。
-    fn select_table_cell_contents(&mut self, cx: &mut Context<Self>) -> bool {        let cur = self.buffer.cursor();
+    /// Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容（不升级到整表/整文档）；
+    /// 表格外返回 `false`，由调用方走整篇全选。返回 `true` 表示已处理。
+    fn select_table_cell_contents(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        // 必须真的在表格行上：`table_cell_content_at` 对普通行也会成功
+        //（无管道时退化成整行一个 span），不守卫会吞掉表格外的 Cmd+A。
+        if !self.line_is_table(cur.line) {
+            return false;
+        }
         let Some((cs, ce)) = self.table_cell_content_at(cur.line, cur.col) else {
             return false;
         };
@@ -1499,12 +1489,7 @@ impl LiveMarkdownView {
     /// 已处理（光标在表格里）。
     fn select_table_row(&mut self, cx: &mut Context<Self>) -> bool {
         let cur = self.buffer.cursor();
-        if !self
-            .planned
-            .iter()
-            .find(|r| r.line == cur.line)
-            .is_some_and(|r| matches!(r.block, Block::Table))
-        {
+        if !self.line_is_table(cur.line) {
             return false;
         }
         let len = self.buffer.line(cur.line).map(|l| l.chars().count()).unwrap_or(0);
@@ -1524,15 +1509,7 @@ impl LiveMarkdownView {
         let lines: Vec<String> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
-        let table_lines: Vec<bool> = {
-            let mut v = vec![false; self.buffer.line_count()];
-            for r in &self.planned {
-                if matches!(r.block, Block::Table) && r.line < v.len() {
-                    v[r.line] = true;
-                }
-            }
-            v
-        };
+        let table_lines = self.table_line_flags();
         let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
         let Some((row, col, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
             return false;
@@ -1634,7 +1611,8 @@ impl LiveMarkdownView {
     }
 
     /// 执行一个表格菜单动作。
-    fn run_table_menu_op(&mut self, op: TableMenuOp, cx: &mut Context<Self>) {        use crate::editor::markdown_live::table_ops as t;
+    fn run_table_menu_op(&mut self, op: TableMenuOp, cx: &mut Context<Self>) {
+        use crate::editor::markdown_live::table_ops as t;
         match op {
             TableMenuOp::RowAbove => {
                 self.run_table_op(cx, |m| t::insert_row(m, true));
@@ -1719,15 +1697,7 @@ impl LiveMarkdownView {
         let lines: Vec<String> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
-        let table_lines: Vec<bool> = {
-            let mut v = vec![false; self.buffer.line_count()];
-            for r in &self.planned {
-                if matches!(r.block, Block::Table) && r.line < v.len() {
-                    v[r.line] = true;
-                }
-            }
-            v
-        };
+        let table_lines = self.table_line_flags();
         let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
         let Some((row, col, _)) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
             return false;
@@ -1766,15 +1736,7 @@ impl LiveMarkdownView {
         let lines: Vec<String> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
-        let table_lines: Vec<bool> = {
-            let mut v = vec![false; self.buffer.line_count()];
-            for r in &self.planned {
-                if matches!(r.block, Block::Table) && r.line < v.len() {
-                    v[r.line] = true;
-                }
-            }
-            v
-        };
+        let table_lines = self.table_line_flags();
         let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
         let Some((row, col, (cs, ce))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
             return false;
@@ -1807,13 +1769,29 @@ impl LiveMarkdownView {
         true
     }
 
-    /// 光标是否落在表格块里（读上一帧的行分类，与 Tab/Enter 分支同源）。
-    fn cursor_in_table(&self) -> bool {
-        let line = self.buffer.cursor().line;
+    /// 某行是否属于表格块（读上一帧的行分类，与 Tab/Enter 分支同源）。
+    fn line_is_table(&self, line: usize) -> bool {
         self.planned
             .iter()
             .find(|r| r.line == line)
             .is_some_and(|r| matches!(r.block, Block::Table))
+    }
+
+    /// 全文档「哪些行是表格行」的位图。闭包持 `self` 的不可变借用会与
+    /// `self.edit` 的可变借用冲突，需要事先物化。
+    fn table_line_flags(&self) -> Vec<bool> {
+        let mut v = vec![false; self.buffer.line_count()];
+        for r in &self.planned {
+            if matches!(r.block, Block::Table) && r.line < v.len() {
+                v[r.line] = true;
+            }
+        }
+        v
+    }
+
+    /// 光标是否落在表格块里。
+    fn cursor_in_table(&self) -> bool {
+        self.line_is_table(self.buffer.cursor().line)
     }
 
     /// 表格里的 Enter（Typora）：移到**下方同列**格；没有下一行则退出表格。
@@ -1823,15 +1801,7 @@ impl LiveMarkdownView {
         let lines: Vec<String> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
-        let table_lines: Vec<bool> = {
-            let mut v = vec![false; self.buffer.line_count()];
-            for r in &self.planned {
-                if matches!(r.block, Block::Table) && r.line < v.len() {
-                    v[r.line] = true;
-                }
-            }
-            v
-        };
+        let table_lines = self.table_line_flags();
         let is_table = |l: usize| table_lines.get(l).copied().unwrap_or(false);
         let Some((row, col, _)) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
             return false;
@@ -1856,13 +1826,7 @@ impl LiveMarkdownView {
     /// 表格里的 Esc（Typora）：**不退出表格**，只关闭弹窗类 UI。
     /// 这里保留搜索面板关闭，其余情况清掉选区/不做动作。
     fn table_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        let cur = self.buffer.cursor();
-        if !self
-            .planned
-            .iter()
-            .find(|r| r.line == cur.line)
-            .is_some_and(|r| matches!(r.block, Block::Table))
-        {
+        if !self.cursor_in_table() {
             return false;
         }
         if self.buffer.selection().is_some() {
@@ -1872,7 +1836,8 @@ impl LiveMarkdownView {
         true
     }
 
-    /// 表格活动单元格：光标所在行 + 列 + 该格的**内容字节范围**。    ///
+    /// 表格活动单元格：光标所在行 + 列 + 该格的**内容字节范围**。
+    ///
     /// 与渲染分支共用同一套切分（`block::table_cell_spans`），所以点哪个格
     /// 就编辑哪个格，不会出现「Grid 画 3 列、Tab 走 2 格」这类错位。
     fn table_active_cell(
@@ -2583,13 +2548,7 @@ impl LiveMarkdownView {
                 //  - Shift+Enter → 插入 `<br />`（GFM 单元格不支持换行）
                 //  - Cmd/Ctrl+Enter → 在当前行下方插入空行
                 //  - Enter → 移到**下方同列**格；末行则退出表格
-                if !self.read_only
-                    && self
-                        .planned
-                        .iter()
-                        .find(|r| r.line == self.buffer.cursor().line)
-                        .is_some_and(|r| matches!(r.block, Block::Table))
-                {
+                if !self.read_only && self.cursor_in_table() {
                     if self.buffer.selection().is_some() {
                         // spec #6：跨格选区先结构化合并（同格走常规删除），
                         // 否则 Enter 会按行拼接、毁掉表格。
@@ -2653,13 +2612,7 @@ impl LiveMarkdownView {
                 let text = self.buffer.line(cur.line).map(str::to_string).unwrap_or_default();
                 let tab_size = self.tab_size;
                 // Typora Tab inside a table: grid navigation (no selection).
-                if self.buffer.selection().is_none()
-                    && self
-                        .planned
-                        .iter()
-                        .find(|r| r.line == cur.line)
-                        .is_some_and(|r| matches!(r.block, Block::Table))
-                {
+                if self.buffer.selection().is_none() && self.line_is_table(cur.line) {
                     let grid: HashSet<usize> = self
                         .planned
                         .iter()
@@ -3128,7 +3081,8 @@ fn attach_table_drag(
 
 /// 表格右键菜单的动作（Typora 的表格菜单项）。
 #[derive(Debug, Clone, Copy)]
-enum TableMenuOp {    RowAbove,
+enum TableMenuOp {
+    RowAbove,
     RowBelow,
     ColBefore,
     ColAfter,
@@ -9571,6 +9525,135 @@ mod live_ime_tests {
             (expect.0..=expect.1).contains(&idx),
             "格内点应映射到该格内容：idx={idx}，期望 {expect:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_table_regression_tests {
+    use super::*;
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.0.clone()
+        }
+    }
+
+    fn setup<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        doc: &str,
+    ) -> (gpui::Entity<LiveMarkdownView>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx
+            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// 回归（评审发现）：表格**外** Cmd+A 必须选中整篇文档 —— 修复前
+    /// `select_table_cell_contents` 没有表格守卫，`table_cell_content_at`
+    /// 对普通行也返回整行范围，于是 Cmd+A 只选当前行并吞掉按键。
+    #[gpui::test]
+    fn live_cmd_a_outside_table_selects_document(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "第一段\n\n第二段\n";
+        let (view, cx) = setup(cx, DOC);
+        // 光标放在第一段中间（非表格行）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-a");
+        cx.run_until_parked();
+        let sel = view.read_with(cx, |v, _| v.selected_source_text());
+        assert_eq!(
+            sel.as_deref(),
+            Some(DOC),
+            "表格外 Cmd+A 应选中整篇文档（不得只选当前行）"
+        );
+    }
+
+    /// 回归：表格外 Cmd+E 不得吞键（表内才拦截选格）。
+    #[gpui::test]
+    fn live_cmd_e_outside_table_not_consumed(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "第一段\n\n第二段\n";
+        let (view, cx) = setup(cx, DOC);
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-e");
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.buffer.selection()).is_none(),
+            "表格外 Cmd+E 不得产生整行选区"
+        );
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 2), "光标不应被移动");
+    }
+
+    /// 回归（评审发现）：紧邻表格前、只是恰好含 `|` 的段落行不得被表格
+    /// 结构操作改写 —— 修复前块范围按「行内含 `|`」扩张，删列会把该段
+    /// 落当成表格行切割。
+    #[gpui::test]
+    fn live_table_op_does_not_rewrite_pipe_paragraph(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "用 `a | b` 表示或运算\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (view, cx) = setup(cx, DOC);
+        // 光标进表格数据行 → 删除本列。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(3, 4, false));
+            v.after_move(cx);
+        });
+        view.update(cx, |v, cx| v.run_table_menu_op(TableMenuOp::DeleteColumn, cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line(0).unwrap().to_string()),
+            "用 `a | b` 表示或运算",
+            "段落行必须原样保留（不得被当成表格行改写）"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| {
+                let l = v.buffer.line(1).unwrap().to_string();
+                split_table_row(&l)
+            }),
+            vec!["b"],
+            "表头应只删掉被删列（宽度由自动重排补齐）"
+        );
+    }
+
+    /// 回归（评审发现）：文件末尾无换行时「删除本行」不得静默无操作。
+    #[gpui::test]
+    fn live_table_delete_row_at_eof_without_newline(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let (view, cx) = setup(cx, DOC);
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 4, false));
+            v.after_move(cx);
+        });
+        view.update(cx, |v, cx| v.run_table_menu_op(TableMenuOp::DeleteRow, cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            2,
+            "末行（文件无尾换行）应被真正删除"
+        );
+        let kept = view.read_with(cx, |v, _| v.text());
+        assert!(kept.contains("a"), "表头应保留：{kept:?}");
+        assert!(!kept.contains('1'), "被删行不得残留：{kept:?}");
     }
 }
 
