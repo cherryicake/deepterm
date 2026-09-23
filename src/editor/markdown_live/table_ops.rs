@@ -477,19 +477,14 @@ pub fn delete_table(model: &mut EditorModel) -> bool {
     true
 }
 
-/// 重排整张表的格式（Typora 的 "Prettify Source Code"）：按各列最宽内容
-/// 补齐空格、统一分隔行形态。显式操作，绝不自动触发。
-pub fn prettify_table(model: &mut EditorModel) -> bool {
-    let lines = model.lines().to_vec();
-    let cur = model.cursor();
-    let Some(block) = table_block_range(&lines, cur.line) else {
-        return false;
-    };
-    let cols = table_col_count(&lines, block);
+/// 计算 `block` 的重排行改写（数据行含表头 + 分隔行），纯函数、不动 model。
+/// 列宽 = 各列最宽内容（CJK 算 2 列），上限 60、下限 4（Typora 同款）。
+pub fn prettify_edits(lines: &[String], block: (usize, usize)) -> Option<Vec<(usize, String)>> {
+    let cols = table_col_count(lines, block);
     if cols == 0 {
-        return false;
+        return None;
     }
-    let aligns = table_aligns(&lines, block);
+    let aligns = table_aligns(lines, block);
     // 显示宽度（CJK 算 2 列），上限 60（Typora 同款）。
     let width = |s: &str| -> usize {
         s.chars()
@@ -497,7 +492,7 @@ pub fn prettify_table(model: &mut EditorModel) -> bool {
             .sum()
     };
     let mut widths = vec![4usize; cols];
-    let rows = table_data_rows(&lines, block);
+    let rows = table_data_rows(lines, block);
     for &i in &rows {
         for (c, cell) in split_table_row(&lines[i]).iter().enumerate().take(cols) {
             widths[c] = widths[c].max(width(cell).min(60));
@@ -523,7 +518,7 @@ pub fn prettify_table(model: &mut EditorModel) -> bool {
             .collect();
         edits.push((i, format!("| {} |", out.join(" | "))));
     }
-    if let Some(d) = delimiter_row(&lines, block) {
+    if let Some(d) = delimiter_row(lines, block) {
         let cells: Vec<String> = (0..cols)
             .map(|c| {
                 let a = aligns[c];
@@ -538,6 +533,21 @@ pub fn prettify_table(model: &mut EditorModel) -> bool {
             .collect();
         edits.push((d, format!("| {} |", cells.join(" | "))));
     }
+    Some(edits)
+}
+
+/// 重排整张表的格式（右键菜单「重排」= Typora 的 "Prettify Source Code"）。
+/// 编辑后的**自动**重排（spec #13）在视图层走 [`prettify_edits`] +
+/// `replace_rows_and_move`（带光标重映射与撤销合并）。
+pub fn prettify_table(model: &mut EditorModel) -> bool {
+    let lines = model.lines().to_vec();
+    let cur = model.cursor();
+    let Some(block) = table_block_range(&lines, cur.line) else {
+        return false;
+    };
+    let Some(edits) = prettify_edits(&lines, block) else {
+        return false;
+    };
     apply_row_edits(model, &lines, &edits);
     true
 }
@@ -931,7 +941,8 @@ mod tests {
 
     #[test]
     fn prettify_is_not_automatic() {
-        // 未显式 prettify 时，编辑只改字符、不动格式（Typora 语义）。
+        // model 层：insert 只改字符、绝不动格式——自动重排是**视图层** hook
+        //（spec #13，集成见 live_table_auto_prettify_after_typing_spec13）。
         let mut m = EditorModel::new("| a | b |\n|---|---|\n| 1 | 2 |\n");
         m.move_to(2, 2, false);
         m.insert("X");

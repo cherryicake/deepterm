@@ -663,6 +663,31 @@ impl EditorModel {
     self.goal_col = None;
   }
 
+  /// 整行批量改写 + 光标重映射，撤销**并入当前步**（`push_undo(true)` 语义：
+  /// 连续打字 run 中不插入额外撤销步，结尾的 `move_to` 也不打断 run）——
+  /// 表格自动重排（Typora spec #13）用它把「打字 + 重排」合成一步撤销；
+  /// 不在打字 run 中时则自成一步。
+  pub fn replace_rows_and_move(&mut self, edits: &[(usize, String)], to: Option<Pos>) {
+    if edits.is_empty() {
+      return;
+    }
+    let was_coalescing = self.coalescing;
+    self.push_undo(true);
+    self.anchor = None;
+    for (i, text) in edits {
+      let Some(len) = self.lines.get(*i).map(|l| l.chars().count()) else {
+        continue;
+      };
+      self.remove_range(Pos::new(*i, 0), Pos::new(*i, len));
+      self.insert_at_cursor(text);
+    }
+    if let Some(p) = to {
+      self.move_to(p.line, p.col, false);
+    }
+    self.coalescing = was_coalescing;
+    self.goal_col = None;
+  }
+
   pub fn can_undo(&self) -> bool {
     !self.undo.is_empty()
   }
@@ -1321,6 +1346,31 @@ mod tests {
     assert!(!m.undo());
     assert!(m.redo());
     assert_eq!(m.text(), "abc");
+  }
+
+  #[test]
+  fn replace_rows_and_move_merges_into_typing_run() {
+    // spec #13：表格自动重排与打字合成**一步**撤销（重排收尾的 move_to
+    // 不打断 run，行改写也不额外入栈）。
+    let mut m = EditorModel::new("| a |\n");
+    m.move_to(0, 2, false);
+    m.insert("x"); // 打字 run 开始（pre 状态入栈）
+    m.replace_rows_and_move(&[(0, "| xa |".to_string())], Some(Pos::new(0, 3)));
+    assert_eq!(m.text(), "| xa |\n");
+    assert_eq!(m.cursor(), at(0, 3));
+    assert!(m.undo(), "一步撤销应跨过打字+重排");
+    assert_eq!(m.text(), "| a |\n");
+    assert!(!m.undo(), "不应再有第二步");
+  }
+
+  #[test]
+  fn replace_rows_and_move_stands_alone_as_one_step() {
+    // 不在打字 run 中时，重排自成一步撤销。
+    let mut m = EditorModel::new("old\n");
+    m.replace_rows_and_move(&[(0, "new".to_string())], None);
+    assert_eq!(m.text(), "new\n");
+    assert!(m.undo());
+    assert_eq!(m.text(), "old\n");
   }
 
   #[test]

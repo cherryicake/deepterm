@@ -37,7 +37,7 @@ use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
 };
 use crate::editor::markdown_live::interactions::{
-    backspace_marker, classify_alone, insert_link, line_selection, list_cols,
+    backspace_marker, cell_content_cols, classify_alone, insert_link, line_selection, list_cols,
     on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_cell_at,
     table_cell_bounds, table_goto_cell, table_insert_row_below, table_last_row_line, table_nav,
     table_row_line, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
@@ -122,6 +122,8 @@ pub struct LiveMarkdownView {
     doc_path: Option<PathBuf>,
     /// 源码模式（`Cmd+/` / 状态条切换）：全文档显示源码标记（Typora 源码模式）。
     show_source: bool,
+    /// 撤销/重做进行中：跳过一次表格自动重排（spec #13，历史保持原样）。
+    skip_reformat: bool,
     /// Slash 菜单高亮项；`slash_suppress` 为 Esc 忽略中的查询（内容变化即恢复）。
     slash_index: usize,
     slash_suppress: Option<String>,
@@ -206,6 +208,7 @@ impl LiveMarkdownView {
             show_outline: false,
             doc_path: None,
             show_source: false,
+            skip_reformat: false,
             slash_index: 0,
             slash_suppress: None,
             search_panel: None,
@@ -675,7 +678,14 @@ impl LiveMarkdownView {
         self.slash_index = 0;
         let version = self.buffer.text_version();
         if version != self.emitted_version {
-            self.emitted_version = version;
+            // spec #13：表格内编辑后自动按 Typora 规则重排本表（列宽/对齐/
+            // 分隔行形态），光标重映射到同 (行, 格, 格内偏移)。撤销/重做
+            // 不触发（历史保持原样），「源码」模式不触发（保护裸编辑）。
+            if !self.skip_reformat {
+                self.auto_prettify_table(cx);
+            }
+            // 重排可能再次改文本：按**最终**版本记账/广播。
+            self.emitted_version = self.buffer.text_version();
             // 查找面板的匹配跟随文档（`InputState::update_search` parity）。
             if let Some(panel) = self.search_panel.clone() {
                 let text = Rope::from(self.buffer.text());
@@ -685,6 +695,49 @@ impl LiveMarkdownView {
         }
         cx.notify();
         cx.stop_propagation();
+    }
+
+    /// spec #13：表格内编辑后的自动重排——调 [`table_ops::prettify_edits`]
+    /// 算出目标形态，经 `replace_rows_and_move` 一次写回（撤销与本次打字
+    /// 合并为一步），光标重映射到同 (行, 格, 格内偏移)。已是目标格式时
+    /// 不动文本、不入撤销栈。
+    fn auto_prettify_table(&mut self, cx: &mut Context<Self>) {
+        use crate::editor::markdown_live::table_ops as t;
+        if self.read_only || self.show_source || self.buffer.selection().is_some() {
+            return;
+        }
+        self.edit(cx, |m| {
+            // 用**当前文本**判断（不读可能过期的 planned）。
+            let lines = m.lines().to_vec();
+            let cur = m.cursor();
+            let Some(block) = t::table_block_range(&lines, cur.line) else {
+                return;
+            };
+            let is_table = |l: usize| l >= block.0 && l <= block.1;
+            let Some((_, ci, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col)
+            else {
+                return;
+            };
+            let offset = cur.col.saturating_sub(cs);
+            let Some(edits) = t::prettify_edits(&lines, block) else {
+                return;
+            };
+            if edits.iter().all(|(i, text)| lines.get(*i).map(String::as_str) == Some(text.as_str()))
+            {
+                return; // 已是目标格式：不动文本、不入撤销栈。
+            }
+            // 新列位置：用改写后的该行文本算同 (行, 格) 的内容起点 + 偏移。
+            let Some(new_col) = edits
+                .iter()
+                .find(|(i, _)| *i == cur.line)
+                .map(|(_, text)| text.as_str())
+                .and_then(|text| cell_content_cols(text, ci))
+                .map(|(cs2, ce2)| (cs2 + offset).min(ce2))
+            else {
+                return;
+            };
+            m.replace_rows_and_move(&edits, Some(Pos::new(cur.line, new_col)));
+        });
     }
 
     fn after_move(&mut self, cx: &mut Context<Self>) {
@@ -2428,6 +2481,8 @@ impl LiveMarkdownView {
                     cx.stop_propagation();
                     return;
                 }
+                // spec #13：撤销/重做恢复历史原样，跳过一次自动重排。
+                self.skip_reformat = true;
                 let changed = self.edit(cx, |m| {
                     if shift {
                         m.redo()
@@ -2440,6 +2495,7 @@ impl LiveMarkdownView {
                 } else {
                     cx.stop_propagation();
                 }
+                self.skip_reformat = false;
                 return;
             }
             "f" if platform => {
@@ -2652,25 +2708,15 @@ enum TableMenuOp {    RowAbove,
 
 /// 表格块内所有数据格都为空吗（分隔行不计）——spec #12 的「空表退格删表」判定。
 fn table_block_all_empty(lines: &[String], block: (usize, usize)) -> bool {
-    // 分隔行的格形如 `---` / `:-:`，不算内容。
-    let is_delim_cell = |c: &str| {
-        let c = c.trim();
-        let c = c.strip_prefix(':').unwrap_or(c);
-        let c = c.strip_suffix(':').unwrap_or(c);
-        !c.is_empty() && c.bytes().all(|b| b == b'-')
-    };
+    use crate::editor::markdown_live::table_ops as t;
     for i in block.0..=block.1 {
         let Some(line) = lines.get(i) else {
             continue;
         };
-        let cells = split_table_row(line);
-        if cells.is_empty() {
-            continue;
+        if t::is_delimiter_row(line) {
+            continue; // 分隔行不是内容
         }
-        if cells.iter().all(|c| is_delim_cell(c)) {
-            continue; // 分隔行
-        }
-        if cells.iter().any(|c| !c.trim().is_empty()) {
+        if split_table_row(line).iter().any(|c| !c.trim().is_empty()) {
             return false;
         }
     }
@@ -6077,8 +6123,14 @@ mod live_frame_tests {
         let line_after = view.read_with(cx, |v, _| v.buffer.line(2).unwrap_or("").to_string());
         assert_ne!(line_before, line_after, "打字必须改到被点的行：{text:?}");
         assert!(line_after.contains('9'), "插入的字符应在该行：{line_after:?}");
-        assert!(text.contains("| A | B |"), "表头不得被改动：{text:?}");
-        assert!(text.contains("| 3 | 4 |"), "其他数据行不得被改动：{text:?}");
+        assert!(
+            text.contains("| A    | B    |"),
+            "表头结构不变，仅随 spec #13 自动重排列宽对齐：{text:?}"
+        );
+        assert!(
+            text.contains("| 3    | 4    |"),
+            "其他数据行结构不变，仅随 spec #13 对齐：{text:?}"
+        );
         assert_eq!(
             text.lines().count(),
             6,
@@ -6356,9 +6408,14 @@ mod live_frame_tests {
         cx.simulate_keystrokes("cmd-backspace");
         cx.run_until_parked();
         let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
-        assert_eq!(line2.as_deref(), Some("|   |  |"), "Cmd+退格只删格内容，保留管道");
+        // 删除后触发 spec #13 自动重排：结构（3 根管道）保留，列宽补齐为 4。
+        assert_eq!(
+            line2.as_deref(),
+            Some("|      |      |"),
+            "Cmd+退格只删格内容，保留管道（随后自动重排对齐）"
+        );
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
-        assert_eq!((c.line, c.col), (2, 6), "光标落在格内容首");
+        assert_eq!((c.line, c.col), (2, 14), "空格内容起点 = 右管道前");
 
         // 5) Cmd+Delete → 删到格内容尾。
         view.update(cx, |v, cx| {
@@ -6368,7 +6425,12 @@ mod live_frame_tests {
         cx.simulate_keystrokes("cmd-delete");
         cx.run_until_parked();
         let line3 = view.read_with(cx, |v, _| v.buffer.line(3).map(str::to_string));
-        assert_eq!(line3.as_deref(), Some("|  | 4 |"), "Cmd+Delete 只删到格内容尾");
+        // 删掉 `3` 后自动重排（spec #13）：col0 变空、补齐为宽 4。
+        assert_eq!(
+            line3.as_deref(),
+            Some("|      | 4    |"),
+            "Cmd+Delete 只删到格内容尾（随后自动重排对齐）"
+        );
     }
 
     /// spec #12 续：**整表为空**时，表格首格按退格 → 删除整张表。
@@ -6398,6 +6460,107 @@ mod live_frame_tests {
             "\ntail\n",
             "空表首格退格应删除整张表"
         );
+    }
+
+    /// spec #13：表格内打字后自动重排（列宽/对齐/分隔行），光标留在同
+    /// (行, 格, 格内偏移)；「打字 + 重排」合并成**一步**撤销；撤销/重做
+    /// 恢复历史原样、不再次重排。
+    #[gpui::test]
+    fn live_table_auto_prettify_after_typing_spec13(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "| a | bb |\n|---|---|\n| 1 | 2 |\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 1) 在第 1 条数据行第 1 格内容首输入 `x` → 整表按 Typora 规则重排，
+        //    光标保持 (行, 格, 格内偏移) = (2, 0格, 偏移1) → (2, 3)。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        let lines: Vec<String> = view.read_with(cx, |v, _| {
+            (0..3).filter_map(|i| v.buffer.line(i).map(str::to_string)).collect()
+        });
+        assert_eq!(lines[0], "| a    | bb   |", "表头列宽补齐");
+        assert_eq!(lines[1], "| ---- | ---- |", "分隔行统一形态");
+        assert_eq!(lines[2], "| x1   | 2    |", "数据行对齐");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (2, 3), "光标留在同格同偏移（x 与 1 之间）");
+
+        // 2) 再输入 `y`：内容变宽（仍在列宽内）→ 光标跟随。
+        cx.simulate_keystrokes("y");
+        cx.run_until_parked();
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
+        assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"));
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (2, 4), "光标继续跟在 xy 之后");
+
+        // 3) **一步**撤销跨过「打字 + 两次重排」→ 回到原始文档。
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            DOC,
+            "打字+重排必须是一步撤销"
+        );
+
+        // 4) 重做恢复到重排后的形态（撤销/重做不被自动重排破坏）。
+        cx.simulate_keystrokes("cmd-shift-z");
+        cx.run_until_parked();
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
+        assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"), "重做恢复重排后状态");
+    }
+
+    /// spec #13 续：「源码」模式里裸编辑**不**自动重排（保护手写格式）；
+    /// 退出源码模式后恢复正常。
+    #[gpui::test]
+    fn live_table_source_mode_skips_prettify_spec13(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "| a | bb |\n|---|---|\n| 1 | 2 |\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 源码模式里输入 → 保持裸源码，不重排。
+        view.update(cx, |v, cx| v.toggle_show_source(cx));
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+        let line0 = view.read_with(cx, |v, _| v.buffer.line(0).map(str::to_string));
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
+        assert_eq!(line0.as_deref(), Some("| a | bb |"), "源码模式：表头不动");
+        assert_eq!(line2.as_deref(), Some("| x1 | 2 |"), "源码模式：不自动重排");
+
+        // 退出源码模式后再输入 → 恢复自动重排。
+        view.update(cx, |v, cx| v.toggle_show_source(cx));
+        cx.simulate_keystrokes("y");
+        cx.run_until_parked();
+        let line0 = view.read_with(cx, |v, _| v.buffer.line(0).map(str::to_string));
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
+        assert_eq!(line0.as_deref(), Some("| a    | bb   |"), "退出源码模式恢复重排");
+        assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"));
     }
 
     /// 表格里方向键不应把光标停在管道或格间空格上（Typora 语义：只有格

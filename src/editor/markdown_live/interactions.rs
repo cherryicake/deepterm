@@ -449,13 +449,8 @@ pub fn table_cell_at(
             row += 1;
         }
     }
-    let (s, e) = *spans.get(ci)?;
-    let raw = &text[s..e];
-    let lead = raw.len() - raw.trim_start().len();
-    let trail = raw.len() - raw.trim_end().len();
-    let cs = col_for_byte(text, s + lead);
-    let ce = col_for_byte(text, (e - trail).max(s + lead));
-    Some((row, ci, (cs, ce.max(cs))))
+    let range = cell_content_cols(text, ci)?;
+    Some((row, ci, range))
 }
 
 /// The table row (line index) at `row` index within the block containing
@@ -527,17 +522,24 @@ pub fn table_goto_cell(
     let Some(text) = lines.get(target) else {
         return false;
     };
-    let spans = table_cell_bounds(text);
-    let Some((s, e)) = spans.get(col).copied() else {
+    let Some((cs, ce)) = cell_content_cols(text, col) else {
         return false;
     };
+    model.move_to(target, if to_end { ce } else { cs }, extend);
+    true
+}
+
+/// 第 `ci` 格的**内容** char 列范围 `(cs, ce)`（去两侧 padding；空格的格
+/// 落在 padding 末端）。`table_cell_at` / `table_goto_cell` 与表格自动
+/// 重排（spec #13 的光标重映射）共用这一份公式。
+pub fn cell_content_cols(text: &str, ci: usize) -> Option<(usize, usize)> {
+    let (s, e) = table_cell_bounds(text).get(ci).copied()?;
     let raw = &text[s..e];
     let lead = raw.len() - raw.trim_start().len();
     let trail = raw.len() - raw.trim_end().len();
     let cs = col_for_byte(text, s + lead);
     let ce = col_for_byte(text, (e - trail).max(s + lead));
-    model.move_to(target, if to_end { ce } else { cs }, extend);
-    true
+    Some((cs, ce.max(cs)))
 }
 
 /// [`Pos`] of full-text byte `off` (lines joined by single newlines).
