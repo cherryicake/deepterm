@@ -1292,7 +1292,7 @@ impl LiveMarkdownView {
                 Ok(ix) | Err(ix) => ix.min(hit.text_len),
             }
         };
-        let src_byte = src_for_vis(&hit.segs, raw);
+        let src_byte = src_for_vis(&hit.segs, raw).clamp(hit.content.start, hit.content.end);
         let out = col_for_byte(&self.line_text(line)?, src_byte);
         // 空格/映射越界时夹回本格内容（绝不允许光标停在管道上）。
         Some(match self.table_cell_content_at(line, out) {
@@ -7622,6 +7622,53 @@ mod live_frame_tests {
         );
         let text = view.read_with(cx, |v, _| v.text());
         assert!(!text.contains("tail"), "行文本应被删除：{text:?}");
+    }
+
+    /// 回归：菜单「下方插入行」出来的空白行，点击**非首格**应把光标落在
+    /// 被点格的内容里（此前空白格 `segs` 为空，`src_for_vis` 兜底 0 →
+    /// 经内容夹取后落回**首格**，只有 Tab 能过去）。
+    #[gpui::test]
+    fn live_table_blank_row_click_lands_in_clicked_cell(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 光标进数据行 → 「下方插入行」→ 新空白行（第 3 行，可能已被重排
+        // 补齐 padding，列位置按内容范围动态取）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        view.update(cx, |v, cx| v.run_table_menu_op(TableMenuOp::RowBelow, cx));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        let blank = view.read_with(cx, |v, _| v.buffer.line(3).unwrap_or("").to_string());
+        let (cs, ce) = cell_content_cols(&blank, 1).expect("新行应是表格行");
+        let nb = cx
+            .debug_bounds("live-table-cell-3-1")
+            .expect("新空白行的第 2 格应有探针与命中框");
+        cx.simulate_click(nb.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!(c.line, 3, "点击应落在新插入的空白行");
+        assert!(
+            (cs..=ce).contains(&c.col),
+            "光标应落在被点格（第 2 格）的内容内：col={}，格=[{cs},{ce}]，行={blank:?}",
+            c.col
+        );
     }
 
     /// spec #6：跨格选区全链路 —— ①点非活动格由该格认领（不再被活动格
