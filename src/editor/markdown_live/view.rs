@@ -1185,6 +1185,18 @@ impl LiveMarkdownView {
         true
     }
 
+    /// Typora spec #15：表格内光标**折叠**时 Cmd/Ctrl+C = `lineWiseCopyCut`
+    /// 整行复制——选中该行并把源码写进剪贴板；有选区/表外则原样复制选区。
+    fn copy_selection_or_table_row(&mut self, cx: &mut Context<Self>) {
+        if self.buffer.selection().is_none() && self.select_table_row(cx) {
+            if let Some(t) = self.selected_source_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(t));
+            }
+        } else if let Some(t) = self.selected_source_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
+        }
+    }
+
     /// Typora：Cmd/Ctrl+L 选**整行**（含所有格与管道）。返回 `true` 表示
     /// 已处理（光标在表格里）。
     fn select_table_row(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1331,6 +1343,15 @@ impl LiveMarkdownView {
             }
             TableMenuOp::DeleteColumn => {
                 self.run_table_op(cx, t::delete_column);
+            }
+            TableMenuOp::CopyTable => {
+                // spec #14 菜单「Copy Table」：整表源码进剪贴板（不动文本）。
+                let lines = self.buffer.lines().to_vec();
+                let cur = self.buffer.cursor();
+                if let Some(block) = t::table_block_range(&lines, cur.line) {
+                    let text = lines[block.0..=block.1].join("\n");
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
             }
             TableMenuOp::AlignLeft => {
                 self.run_table_op(cx, |m| t::set_column_align(m, Some(t::Align::Left)));
@@ -2375,6 +2396,43 @@ impl LiveMarkdownView {
                 }
             }
             "l" if platform => {
+                // spec #14 快捷键：Cmd+Shift+Alt+L = 删除行——表格里删除本行，
+                // 表格外删除光标整行（连同行尾换行）。
+                if shift && alt {
+                    if !self.read_only {
+                        if self.cursor_in_table() {
+                            self.run_table_op(cx, t::delete_row);
+                        } else {
+                            let line = self.buffer.cursor().line;
+                            let changed = self.edit(cx, |m| {
+                                let len =
+                                    m.line(line).map(|l| l.chars().count()).unwrap_or(0);
+                                if line + 1 < m.line_count() {
+                                    // 连同行尾换行一起删。
+                                    m.move_to(line, 0, false);
+                                    m.move_to(line + 1, 0, true);
+                                } else if line > 0 {
+                                    // 末行：连同上一行末尾的换行一起删。
+                                    let prev_len = m
+                                        .line(line - 1)
+                                        .map(|l| l.chars().count())
+                                        .unwrap_or(0);
+                                    m.move_to(line - 1, prev_len, false);
+                                    m.move_to(line, len, true);
+                                } else {
+                                    m.move_to(line, 0, false);
+                                    m.move_to(line, len, true);
+                                }
+                                m.delete_selection()
+                            });
+                            if changed {
+                                self.after_edit(cx);
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if self.select_table_row(cx) {
                     cx.stop_propagation();
                     return;
@@ -2423,9 +2481,7 @@ impl LiveMarkdownView {
                 return;
             }
             "c" if platform => {
-                if let Some(t) = self.selected_source_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(t));
-                }
+                self.copy_selection_or_table_row(cx);
                 cx.stop_propagation();
                 return;
             }
@@ -2698,6 +2754,7 @@ enum TableMenuOp {    RowAbove,
     ColRight,
     DeleteRow,
     DeleteColumn,
+    CopyTable,
     AlignLeft,
     AlignCenter,
     AlignRight,
@@ -5058,6 +5115,7 @@ impl Render for LiveMarkdownView {
                                         .separator()
                                         .item(mk("删除本行", TableMenuOp::DeleteRow))
                                         .item(mk("删除本列", TableMenuOp::DeleteColumn))
+                                        .item(mk("复制表格", TableMenuOp::CopyTable))
                                         .separator()
                                         .item(mk("左对齐", TableMenuOp::AlignLeft))
                                         .item(mk("居中", TableMenuOp::AlignCenter))
@@ -6561,6 +6619,86 @@ mod live_frame_tests {
         let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
         assert_eq!(line0.as_deref(), Some("| a    | bb   |"), "退出源码模式恢复重排");
         assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"));
+    }
+
+    /// spec #15/#14：表格内光标折叠 Cmd+C = 整行复制（选中该行 + 源码进剪贴板）；
+    /// 菜单「复制表格」复制整表源码；Cmd+Shift+Alt+L 删行（表内删本行、表外删整行）。
+    #[gpui::test]
+    fn live_table_copy_and_delete_line_spec15(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 1) 折叠光标 Cmd+C → 复制**整行源码**，该行进入选中态。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 6, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("cmd-c");
+        cx.run_until_parked();
+        let clip = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(clip.as_deref(), Some("| 1 | 2 |"), "折叠光标复制整行源码");
+        assert!(
+            view.read_with(cx, |v, _| v.buffer.selection()).is_some(),
+            "复制后该行应处于选中态（Typora lineWiseCopyCut）"
+        );
+
+        // 2) 菜单「复制表格」→ 整表源码，且不动文本。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 6, false));
+            v.after_move(cx);
+        });
+        view.update(cx, |v, cx| v.run_table_menu_op(TableMenuOp::CopyTable, cx));
+        cx.run_until_parked();
+        let clip = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(
+            clip.as_deref(),
+            Some("| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"),
+            "复制表格 = 整表源码"
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.text()), DOC, "复制不得改动文本");
+
+        // 3) Cmd+Shift+Alt+L 在表格里 → 删除本行（行数 -1）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 6, false));
+            v.after_move(cx);
+        });
+        let rows_before = view.read_with(cx, |v, _| v.buffer.line_count());
+        cx.simulate_keystrokes("cmd-shift-alt-l");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            rows_before - 1,
+            "表格里 Cmd+Shift+Alt+L 应删除本行"
+        );
+        let text = view.read_with(cx, |v, _| v.text());
+        assert!(!text.contains('1'), "被删行的文本不应残留：{text:?}");
+
+        // 4) Cmd+Shift+Alt+L 在表格外 → 删除光标整行（连同行尾换行）。
+        let rows_before = view.read_with(cx, |v, _| v.buffer.line_count());
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(4, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("cmd-shift-alt-l");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            rows_before - 1,
+            "表格外应删除整行"
+        );
+        let text = view.read_with(cx, |v, _| v.text());
+        assert!(!text.contains("tail"), "行文本应被删除：{text:?}");
     }
 
     /// 表格里方向键不应把光标停在管道或格间空格上（Typora 语义：只有格
