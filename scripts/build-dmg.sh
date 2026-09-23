@@ -81,12 +81,16 @@ else
 
     # Create the DMG
     echo "Creating DMG archive..."
+    # Size the temporary image from the actual payload plus headroom for
+    # HFS+ metadata, so it keeps working as the bundle grows.
+    APP_SIZE_MB=$(du -sm "${TEMP_DIR}" | cut -f1)
+    DMG_SIZE_MB=$((APP_SIZE_MB + 30))
     hdiutil create \
         -srcfolder "${TEMP_DIR}" \
         -volname "${APP_NAME}" \
         -fs HFS+ \
         -format UDZO \
-        -size 50m \
+        -size "${DMG_SIZE_MB}m" \
         -o "${PROJECT_DIR}/${DMG_NAME}.dmg"
 
     # Cleanup temp directory
