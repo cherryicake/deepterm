@@ -55,6 +55,7 @@ use crate::components::input::{
     cursor::CursorShape,
     search::{SearchPanel, SearchTarget},
 };
+use crate::components::menu::{ContextMenuExt, PopupMenuItem};
 use crate::theme::ActiveTheme;
 use ropey::Rope;
 
@@ -1122,12 +1123,29 @@ impl LiveMarkdownView {
 
     /// Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容（不升级到整表/整文档）。
     /// 返回 `true` 表示已处理。
-    fn select_table_cell_contents(&mut self, cx: &mut Context<Self>) -> bool {
-        let cur = self.buffer.cursor();
+    fn select_table_cell_contents(&mut self, cx: &mut Context<Self>) -> bool {        let cur = self.buffer.cursor();
         let Some((cs, ce)) = self.table_cell_content_at(cur.line, cur.col) else {
             return false;
         };
         self.edit(cx, |m| m.select_range(cs, ce));
+        cx.notify();
+        true
+    }
+
+    /// Typora：Cmd/Ctrl+L 选**整行**（含所有格与管道）。返回 `true` 表示
+    /// 已处理（光标在表格里）。
+    fn select_table_row(&mut self, cx: &mut Context<Self>) -> bool {
+        let cur = self.buffer.cursor();
+        if !self
+            .planned
+            .iter()
+            .find(|r| r.line == cur.line)
+            .is_some_and(|r| matches!(r.block, Block::Table))
+        {
+            return false;
+        }
+        let len = self.buffer.line(cur.line).map(|l| l.chars().count()).unwrap_or(0);
+        self.edit(cx, |m| m.select_range(0, len));
         cx.notify();
         true
     }
@@ -1184,6 +1202,94 @@ impl LiveMarkdownView {
             self.after_move(cx);
         }
         true
+    }
+
+    // ---- 表格结构操作（右键菜单 / 工具栏的入口） -------------------------
+
+    /// Typora 的表格粘贴：文本含 `|` 时按行列分发到从光标格开始的区域
+    /// （不够则自动补行/补列）；不含 `|` 返回 `false`，走普通插入。
+    fn paste_table_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        use crate::editor::markdown_live::table_ops as t;
+        let cur = self.buffer.cursor();
+        if !self
+            .planned
+            .iter()
+            .find(|r| r.line == cur.line)
+            .is_some_and(|r| matches!(r.block, Block::Table))
+        {
+            return false;
+        }
+        self.run_table_op(cx, |m| t::paste_into_table(m, text))
+    }
+
+    /// 执行一个表格菜单动作。
+    fn run_table_menu_op(&mut self, op: TableMenuOp, cx: &mut Context<Self>) {        use crate::editor::markdown_live::table_ops as t;
+        match op {
+            TableMenuOp::RowAbove => {
+                self.run_table_op(cx, |m| t::insert_row(m, true));
+            }
+            TableMenuOp::RowBelow => {
+                self.run_table_op(cx, |m| t::insert_row(m, false));
+            }
+            TableMenuOp::ColBefore => {
+                self.run_table_op(cx, |m| t::insert_column(m, true));
+            }
+            TableMenuOp::ColAfter => {
+                self.run_table_op(cx, |m| t::insert_column(m, false));
+            }
+            TableMenuOp::RowUp => {
+                self.run_table_op(cx, |m| t::move_row(m, true));
+            }
+            TableMenuOp::RowDown => {
+                self.run_table_op(cx, |m| t::move_row(m, false));
+            }
+            TableMenuOp::ColLeft => {
+                self.run_table_op(cx, |m| t::move_column(m, true));
+            }
+            TableMenuOp::ColRight => {
+                self.run_table_op(cx, |m| t::move_column(m, false));
+            }
+            TableMenuOp::DeleteRow => {
+                self.run_table_op(cx, t::delete_row);
+            }
+            TableMenuOp::DeleteColumn => {
+                self.run_table_op(cx, t::delete_column);
+            }
+            TableMenuOp::AlignLeft => {
+                self.run_table_op(cx, |m| t::set_column_align(m, Some(t::Align::Left)));
+            }
+            TableMenuOp::AlignCenter => {
+                self.run_table_op(cx, |m| t::set_column_align(m, Some(t::Align::Center)));
+            }
+            TableMenuOp::AlignRight => {
+                self.run_table_op(cx, |m| t::set_column_align(m, Some(t::Align::Right)));
+            }
+            TableMenuOp::AlignNone => {
+                self.run_table_op(cx, |m| t::set_column_align(m, None));
+            }
+            TableMenuOp::Prettify => {
+                self.run_table_op(cx, t::prettify_table);
+            }
+            TableMenuOp::DeleteTable => {
+                self.run_table_op(cx, t::delete_table);
+            }
+        }
+    }
+
+    /// 跑一个表格结构操作（纯函数）+ 事务收尾。返回是否真的改了东西。
+    fn run_table_op(
+        &mut self,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> bool,
+    ) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let changed = self.edit(cx, op);
+        if changed {
+            self.after_edit(cx);
+        }
+        changed
     }
 
     /// 表格里的上下移动（Typora）：按**列索引**换行，不是按像素 x。
@@ -2107,6 +2213,19 @@ impl LiveMarkdownView {
                 cx.stop_propagation();
                 return;
             }
+            // Typora 的表格选择快捷键：Cmd/Ctrl+E 选格、Cmd/Ctrl+L 选整行。
+            "e" if platform => {
+                if self.select_table_cell_contents(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+            "l" if platform => {
+                if self.select_table_row(cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
             "b" if platform => {
                 if !self.read_only {
                     let literal = self.cursor_is_source_only();
@@ -2188,6 +2307,12 @@ impl LiveMarkdownView {
                     if let Some(text) = item.text() {
                         let text = text.replace('\r', "");
                         if !text.is_empty() {
+                            // Typora：在表格格里粘贴含 `|` 的文本会按行列分发
+                            // 到相邻单元格（不拆则整块塞进当前格）。
+                            if self.paste_table_text(&text, cx) {
+                                self.after_edit(cx);
+                                return;
+                            }
                             self.edit(cx, |m| m.insert(&text));
                             self.after_edit(cx);
                             return;
@@ -2373,6 +2498,55 @@ fn outline_title(visible: &str) -> String {
     } else {
         one
     }
+}
+
+/// 表格拖拽负载：拖动行/列把手时携带（Typora 的 tracker 拖拽重排）。
+#[derive(Clone)]
+struct TableDrag {
+    /// 表格块首行（用于重新定位块）。
+    table_start: usize,
+    /// 被拖的行/列索引。
+    index: usize,
+    /// 行还是列。
+    is_row: bool,
+}
+
+impl gpui::Render for TableDrag {
+    /// 拖拽跟随光标的预览：一个小的「行/列」标签。
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = cx.theme().ui;
+        let label = if self.is_row { "行" } else { "列" };
+        div()
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .bg(ui.panel_background)
+            .border_1()
+            .border_color(ui.border)
+            .text_size(px(11.0))
+            .text_color(ui.text)
+            .child(format!("移动{label} {}", self.index + 1))
+    }
+}
+
+/// 表格右键菜单的动作（Typora 的表格菜单项）。
+#[derive(Debug, Clone, Copy)]
+enum TableMenuOp {    RowAbove,
+    RowBelow,
+    ColBefore,
+    ColAfter,
+    RowUp,
+    RowDown,
+    ColLeft,
+    ColRight,
+    DeleteRow,
+    DeleteColumn,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignNone,
+    Prettify,
+    DeleteTable,
 }
 
 /// If the whole line is a single `![alt](url)` image, return `(alt, url)`.
@@ -4332,6 +4506,9 @@ impl Render for LiveMarkdownView {
                     let start_line = rows[idxs[0]].line;
                     let is_first = start_line == 0;
                     let is_last = rows[*idxs.last().unwrap()].line == last_line;
+                    // Typora 的表格工具栏：光标在表内时浮在表格上方。
+                    // 左侧列×行计数、中间对齐按钮、右侧 More（同右键菜单）。
+                    let cursor_in_table = idxs.iter().any(|pi| rows[*pi].line == cursor.line);
                     let mut outer = div()
                         .id(("live-table", start_line))
                         .debug_selector(|| "live-table-outer".into())
@@ -4348,6 +4525,101 @@ impl Render for LiveMarkdownView {
                     }
                     if is_last {
                         outer = outer.mb_0();
+                    }
+                    if cursor_in_table {
+                        let toolbar_ent = entity.clone();
+                        let btn = |label: &'static str, op: TableMenuOp, ent: Entity<Self>| {
+                            div()
+                                .id(SharedString::from(format!("live-table-tb-{start_line}-{label}")))
+                                .debug_selector(move || format!("live-table-toolbar-{label}"))
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(ui.text_muted)
+                                .hover(|s| s.bg(ui.text.opacity(0.08)).text_color(ui.text))
+                                .child(label)
+                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                    ent.update(cx, |v, cx| v.run_table_menu_op(op, cx));
+                                })
+                        };
+                        // 当前列的对齐（高亮对应按钮）。
+                        let cur_col = crate::editor::markdown_live::table_ops::column_at(
+                            &src_lines,
+                            cursor.line.saturating_sub(start_line),
+                            cursor.col,
+                        )
+                        .unwrap_or(0);
+                        let cur_align = aligns.get(cur_col).copied().unwrap_or(CellAlign::None);
+                        let align_btn = |label: &'static str,
+                                         op: TableMenuOp,
+                                         want: CellAlign,
+                                         ent: Entity<Self>| {
+                            let on = cur_align == want;
+                            div()
+                                .id(SharedString::from(format!("live-table-tb-align-{start_line}-{label}")))
+                                .debug_selector(move || format!("live-table-toolbar-{label}"))
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(if on { ui.accent } else { ui.text_muted })
+                                .hover(|s| s.bg(ui.text.opacity(0.08)))
+                                .child(label)
+                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                    ent.update(cx, |v, cx| v.run_table_menu_op(op, cx));
+                                })
+                        };
+                        let row_count = crate::editor::markdown_live::table_ops::table_data_rows(
+                            &src_lines,
+                            (0, src_lines.len().saturating_sub(1)),
+                        )
+                        .len();
+                        outer = outer.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.0))
+                                .px(px(6.0))
+                                .py(px(3.0))
+                                .border_b(px(1.0))
+                                .border_color(colors.table_border)
+                                .child(
+                                    div()
+                                        .px(px(4.0))
+                                        .text_size(px(11.0))
+                                        .text_color(ui.text_muted)
+                                        .child(format!("{col_count} 列 × {row_count} 行")),
+                                )
+                                .child(
+                                    div().w(px(1.0)).h(px(12.0)).bg(colors.table_border),
+                                )
+                                .child(align_btn(
+                                    "左对齐",
+                                    TableMenuOp::AlignLeft,
+                                    CellAlign::Left,
+                                    toolbar_ent.clone(),
+                                ))
+                                .child(align_btn(
+                                    "居中",
+                                    TableMenuOp::AlignCenter,
+                                    CellAlign::Center,
+                                    toolbar_ent.clone(),
+                                ))
+                                .child(align_btn(
+                                    "右对齐",
+                                    TableMenuOp::AlignRight,
+                                    CellAlign::Right,
+                                    toolbar_ent.clone(),
+                                ))
+                                .child(div().w(px(1.0)).h(px(12.0)).bg(colors.table_border))
+                                .child(btn("+行", TableMenuOp::RowBelow, toolbar_ent.clone()))
+                                .child(btn("+列", TableMenuOp::ColAfter, toolbar_ent.clone()))
+                                .child(btn("重排", TableMenuOp::Prettify, toolbar_ent.clone()))
+                                .child(btn("删除表", TableMenuOp::DeleteTable, toolbar_ent)),
+                        );
                     }
                     // Click the grid to jump the cursor into the block source.
                     outer = outer.on_mouse_down(
@@ -4511,6 +4783,70 @@ impl Render for LiveMarkdownView {
                                         .with_runs(runs),
                                 );
                             }
+                            // Typora 的拖拽重排：**表头格**是列把手（左右拖换列
+                            // 序），**行首格**是行把手（上下拖换行序）。拖到目标
+                            // 格上放下即完成移动。
+                            let drag_payload = if is_header {
+                                Some(TableDrag {
+                                    table_start: start_line,
+                                    index: col,
+                                    is_row: false,
+                                })
+                            } else if col == 0 && preview_idx > 0 {
+                                Some(TableDrag {
+                                    table_start: start_line,
+                                    index: preview_idx - 1,
+                                    is_row: true,
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(payload) = drag_payload {
+                                // `on_drag` 来自 `StatefulInteractiveElement`，需要 id；
+                                // id 会把 `Div` 变成 `Stateful<Div>`，所以这一段用
+                                // 局部变量承接，最后统一转 AnyElement。
+                                let mut sd = cell_div.id((
+                                    "live-table-cell",
+                                    start_line + di * 64 + col,
+                                ));
+                                let p = payload.clone();
+                                sd = sd.on_drag(payload.clone(), move |_, _, _, cx| {
+                                    cx.new(|_| p.clone())
+                                });
+                                let ent = entity.clone();
+                                let drop_payload = payload.clone();
+                                let drop_color = ui.accent;
+                                let drop_border = ui.drop_target_border;
+                                sd = sd.drag_over::<TableDrag>(
+                                    move |style, dragged, _window, _cx| {
+                                        if dragged.table_start == drop_payload.table_start
+                                            && dragged.is_row == drop_payload.is_row
+                                            && dragged.index != drop_payload.index
+                                        {
+                                            style.bg(drop_color).border_color(drop_border)
+                                        } else {
+                                            style
+                                        }
+                                    },
+                                );
+                                let drop_payload2 = payload;
+                                sd = sd.on_drop(move |dragged: &TableDrag, _window, cx| {
+                                    let (from, to) = (dragged.index, drop_payload2.index);
+                                    let is_row = drop_payload2.is_row;
+                                    ent.update(cx, |v, cx| {
+                                        use crate::editor::markdown_live::table_ops as t;
+                                        v.run_table_op(cx, |m| {
+                                            if is_row {
+                                                t::drag_move_row(m, from, to)
+                                            } else {
+                                                t::drag_move_column(m, from, to)
+                                            }
+                                        });
+                                    });
+                                });
+                                grid = grid.child(sd.into_any_element());
+                                continue;
+                            }
                             grid = grid.child(cell_div.into_any_element());
                         }
                     }
@@ -4522,7 +4858,45 @@ impl Render for LiveMarkdownView {
                         rows[idxs[0]].line,
                         rows[*idxs.last().unwrap()].line,
                     ));
-                    row_els.push(outer.into_any_element());
+                    // 右键菜单（Typora 的表格菜单）：行列增删/移动/对齐/删除表/
+                    // 重排格式。菜单项在点击时按当前光标位置执行；`context_menu`
+                    // 会改变元素类型，所以必须是 `outer` 的最后一步。
+                    let menu_ent = entity.clone();                    let mk = move |label: &'static str, op: TableMenuOp| {
+                        let ent = menu_ent.clone();
+                        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            ent.update(cx, |v, cx| v.run_table_menu_op(op, cx));
+                        })
+                    };
+                    row_els.push(
+                        outer
+                            .context_menu(
+                                ("live-table-menu", start_line),
+                                move |menu, _window, _cx| {
+                                    menu.item(mk("上方插入行", TableMenuOp::RowAbove))
+                                        .item(mk("下方插入行", TableMenuOp::RowBelow))
+                                        .item(mk("左侧插入列", TableMenuOp::ColBefore))
+                                        .item(mk("右侧插入列", TableMenuOp::ColAfter))
+                                        .separator()
+                                        .item(mk("上移本行", TableMenuOp::RowUp))
+                                        .item(mk("下移本行", TableMenuOp::RowDown))
+                                        .item(mk("左移本列", TableMenuOp::ColLeft))
+                                        .item(mk("右移本列", TableMenuOp::ColRight))
+                                        .separator()
+                                        .item(mk("删除本行", TableMenuOp::DeleteRow))
+                                        .item(mk("删除本列", TableMenuOp::DeleteColumn))
+                                        .separator()
+                                        .item(mk("左对齐", TableMenuOp::AlignLeft))
+                                        .item(mk("居中", TableMenuOp::AlignCenter))
+                                        .item(mk("右对齐", TableMenuOp::AlignRight))
+                                        .separator()
+                                        .item(mk("清除对齐", TableMenuOp::AlignNone))
+                                        .item(mk("重排表格格式", TableMenuOp::Prettify))
+                                        .separator()
+                                        .item(mk("删除表格", TableMenuOp::DeleteTable))
+                                },
+                            )
+                            .into_any_element(),
+                    );
                 }
             }
             window_counts.push(row_els.len() - els_before);

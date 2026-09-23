@@ -22,6 +22,7 @@ pub mod layout;
 pub mod mermaid;
 pub mod model;
 pub mod reveal;
+pub mod table_ops;
 pub mod view;
 
 pub use block::{classify, indent_cols, Block, DocState};
