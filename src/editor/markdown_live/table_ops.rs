@@ -367,6 +367,97 @@ pub fn delete_column(model: &mut EditorModel) -> bool {
     true
 }
 
+/// 把数据行数（**含表头**）调整到 `target`（Typora 尺寸弹层的行数步进器，
+/// 2..=99）：不足在**末尾补空行**，超出从**末尾删行**（表头/分隔行不动）。
+/// 返回是否发生了改动。
+pub fn set_row_count(model: &mut EditorModel, target: usize) -> bool {
+    let target = target.clamp(2, 99);
+    let lines0 = model.lines().to_vec();
+    let cur0 = model.cursor();
+    let Some(mut block) = table_block_range(&lines0, cur0.line) else {
+        return false;
+    };
+    let mut changed = false;
+    // 每轮增减一行，直到达标；块定位始终锚在块首行（行删后光标可能
+    // 落到表外，不能再靠光标重新找块）。
+    loop {
+        let lines = model.lines().to_vec();
+        let Some(b) = table_block_range(&lines, block.0) else {
+            break;
+        };
+        block = b;
+        let rows = table_data_rows(&lines, b);
+        let Some(&last) = rows.last() else {
+            break;
+        };
+        if rows.len() == target {
+            break;
+        }
+        // 光标挪到末行，插入/删除都发生在表格末尾。
+        model.move_to(last, 0, false);
+        let ok = if rows.len() > target {
+            delete_row(model)
+        } else {
+            insert_row(model, false)
+        };
+        if !ok {
+            // 删到只剩表头（或块结构失效）：停在当前状态。
+            break;
+        }
+        changed = true;
+    }
+    // 收尾：删**末行**时 `delete_row` 会把光标留在表外的下一行（表工具栏/
+    // 尺寸弹层会随之消失）——有改动就统一拉回块内末行的首格内容起点。
+    if changed {
+        let lines = model.lines().to_vec();
+        if let Some(b) = table_block_range(&lines, block.0)
+            && let Some(&last) = table_data_rows(&lines, b).last()
+        {
+            let text = model.line(last).map(str::to_string).unwrap_or_default();
+            let (cs, _) = table_cell_spans(&text).first().copied().unwrap_or((0, 0));
+            model.move_to(last, char_col(&text, cs + 1), false);
+        }
+    }
+    changed
+}
+
+/// 把列数调整到 `target`（Typora 尺寸弹层的列数步进器，1..=40）：不足在
+/// **末尾补列**，超出从**末尾删列**（以分隔行为准）。返回是否发生了改动。
+pub fn set_col_count(model: &mut EditorModel, target: usize) -> bool {
+    let target = target.clamp(1, 40);
+    let lines0 = model.lines().to_vec();
+    let cur0 = model.cursor();
+    let Some(mut block) = table_block_range(&lines0, cur0.line) else {
+        return false;
+    };
+    let mut changed = false;
+    loop {
+        let lines = model.lines().to_vec();
+        let Some(b) = table_block_range(&lines, block.0) else {
+            return changed;
+        };
+        block = b;
+        let cols = table_col_count(&lines, b);
+        if cols == 0 {
+            return changed;
+        }
+        if cols == target {
+            return changed;
+        }
+        // 光标挪到行尾 → `column_at` 得到末列，插/删都发生在最右。
+        model.move_to(block.1, usize::MAX, false);
+        let ok = if cols > target {
+            delete_column(model)
+        } else {
+            insert_column(model, false)
+        };
+        if !ok {
+            return changed;
+        }
+        changed = true;
+    }
+}
+
 /// 设置光标列的对齐（`target` 为 `None` 时清除对齐）。
 pub fn set_column_align(model: &mut EditorModel, target: Option<Align>) -> bool {
     let lines = model.lines().to_vec();
