@@ -1150,8 +1150,12 @@ impl LiveMarkdownView {
         true
     }
 
-    /// Typora：格首退格不合并单元格——光标跳到上一格**末**（无文本改动）。
-    /// 首行首格则什么都不做。返回 `true` 表示事件已被表格消费。
+    /// Typora spec #12（哨兵退格）：光标在**格内容起点**按退格 ——
+    /// - **空**格 → 跳到流序上一格**末**（不删字符、不合并单元格）；
+    ///   表格首格且整表为空 → 删除整个表格；首格但表非空 → 原地消费；
+    /// - **非空**格 → 命中零宽哨兵，消费按键但**什么都不删**。
+    ///
+    /// 不在格内容起点、或不在表格 → 返回 `false`，走通用退格。
     fn table_backspace_at_start(&mut self, cx: &mut Context<Self>) -> bool {
         let cur = self.buffer.cursor();
         let lines: Vec<String> = self.buffer.lines().to_vec();
@@ -1173,14 +1177,34 @@ impl LiveMarkdownView {
         if cur.col > cs {
             return false;
         }
-        // 上一格（流序）：同行前一格，或上一行末格。
+        // 该格内容（去 padding）为空吗？
+        let cell_empty = lines
+            .get(cur.line)
+            .map(String::as_str)
+            .and_then(|text| {
+                table_cell_bounds(text)
+                    .get(col)
+                    .map(|&(s, e)| text[s..e].trim().is_empty())
+            })
+            .unwrap_or(false);
+        if !cell_empty {
+            // 非空格首：Typora 命中零宽哨兵 → 消费但无操作（不跳、不删）。
+            return true;
+        }
+        // 空格 → 流序上一格末：同行前一格，或上一行末格。
         let (prev_row, prev_col) = if col > 0 {
             (row, col - 1)
         } else {
             match row.checked_sub(1) {
                 Some(r) => (r, usize::MAX),
                 None => {
-                    // 表格最开头：消费事件但不移动（Typora 同款无操作）。
+                    // 表格首格：整表为空 → 删除整张表；否则原地消费。
+                    use crate::editor::markdown_live::table_ops as t;
+                    if let Some(block) = t::table_block_range(&lines, cur.line) {
+                        if table_block_all_empty(&lines, block) {
+                            self.run_table_op(cx, t::delete_table);
+                        }
+                    }
                     return true;
                 }
             }
@@ -2043,6 +2067,12 @@ impl LiveMarkdownView {
                 // Marker strip first (plain backspace, no selection).
                 let cur = self.buffer.cursor();
                 let sel_none = self.buffer.selection().is_none();
+                // spec #12：表格里 Cmd+Shift+退格 = 删除整行（无选区时）；
+                // 表格外保持原来的「删到行首」。
+                if sel_none && platform && shift && self.cursor_in_table() {
+                    self.run_table_op(cx, t::delete_row);
+                    return;
+                }
                 if sel_none && !platform && !alt {
                     let paired = self.edit(cx, |m| m.delete_pair());
                     if paired {
@@ -2063,12 +2093,28 @@ impl LiveMarkdownView {
                 if sel_none && !platform && !alt && self.table_backspace_at_start(cx) {
                     return;
                 }
+                // spec #12：表格里 Cmd+退格删到**格内容首**（不是行首，避免
+                // 把管道和同排格子一起切掉）。
+                let cell_cs = if sel_none && platform && !shift && self.cursor_in_table() {
+                    self.table_cell_content_at(cur.line, cur.col).map(|(cs, _)| cs)
+                } else {
+                    None
+                };
                 let changed = self.edit(cx, |m| {
                     if m.selection().is_some() {
                         m.delete_selection()
                     } else if platform {
-                        m.home(true);
-                        m.delete_selection()
+                        match cell_cs {
+                            Some(cs) if cur.col > cs => {
+                                m.move_to(cur.line, cs, true);
+                                m.delete_selection()
+                            }
+                            Some(_) => false, // 已在格首：原地消费
+                            None => {
+                                m.home(true);
+                                m.delete_selection()
+                            }
+                        }
                     } else if alt {
                         m.word_left(true);
                         m.delete_selection()
@@ -2087,12 +2133,34 @@ impl LiveMarkdownView {
                 if self.read_only {
                     return;
                 }
+                let cur = self.buffer.cursor();
+                let sel_none = self.buffer.selection().is_none();
+                // spec #12：光标在格内容**末尾** → 命中零宽哨兵，Delete 无操作；
+                // 表格外（或格中间）不受影响。同时给 Cmd+Delete 提供格尾边界。
+                let cell_ce = if sel_none && self.cursor_in_table() {
+                    self.table_cell_content_at(cur.line, cur.col).map(|(_, ce)| ce)
+                } else {
+                    None
+                };
+                if !platform && !alt && cell_ce.is_some_and(|ce| cur.col >= ce) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let changed = self.edit(cx, |m| {
                     if m.selection().is_some() {
                         m.delete_selection()
                     } else if platform {
-                        m.end(true);
-                        m.delete_selection()
+                        match cell_ce {
+                            Some(ce) if cur.col < ce => {
+                                m.move_to(cur.line, ce, true);
+                                m.delete_selection()
+                            }
+                            Some(_) => false, // 已在格尾：原地消费
+                            None => {
+                                m.end(true);
+                                m.delete_selection()
+                            }
+                        }
                     } else if alt {
                         m.word_right(true);
                         m.delete_selection()
@@ -2580,6 +2648,33 @@ enum TableMenuOp {    RowAbove,
     AlignNone,
     Prettify,
     DeleteTable,
+}
+
+/// 表格块内所有数据格都为空吗（分隔行不计）——spec #12 的「空表退格删表」判定。
+fn table_block_all_empty(lines: &[String], block: (usize, usize)) -> bool {
+    // 分隔行的格形如 `---` / `:-:`，不算内容。
+    let is_delim_cell = |c: &str| {
+        let c = c.trim();
+        let c = c.strip_prefix(':').unwrap_or(c);
+        let c = c.strip_suffix(':').unwrap_or(c);
+        !c.is_empty() && c.bytes().all(|b| b == b'-')
+    };
+    for i in block.0..=block.1 {
+        let Some(line) = lines.get(i) else {
+            continue;
+        };
+        let cells = split_table_row(line);
+        if cells.is_empty() {
+            continue;
+        }
+        if cells.iter().all(|c| is_delim_cell(c)) {
+            continue; // 分隔行
+        }
+        if cells.iter().any(|c| !c.trim().is_empty()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// If the whole line is a single `![alt](url)` image, return `(alt, url)`.
@@ -6090,7 +6185,8 @@ mod live_frame_tests {
             "Cmd+A 在表格里只选当前格内容（Typora）"
         );
 
-        // 2) 格首退格：跳到上一格末，不删字符、不合并。
+        // 2) spec #12 哨兵退格：**非空**格首按退格 → 消费但什么都不做
+        //    （不删字符、不合并、也不跳格）。
         let before = view.read_with(cx, |v, _| v.text());
         view.update(cx, |v, cx| {
             v.edit(cx, |m| m.move_to(2, 6, false));
@@ -6107,9 +6203,10 @@ mod live_frame_tests {
             before,
             "格首退格不得删字符/合并单元格"
         );
-        assert!(
-            line < 2 || (line == 2 && col < 6),
-            "格首退格应退到上一格（line={line}, col={col}）"
+        assert_eq!(
+            (line, col),
+            (2, 6),
+            "非空格首退格应原地消费（line={line}, col={col}）"
         );
 
         // 3) spec #8：「行即文本行」—— 格尾按右 → 同列下一格**首**；
@@ -6189,6 +6286,118 @@ mod live_frame_tests {
         });
         assert_eq!(line, 3, "下键应到下一行（line={line}）");
         assert_eq!(col, 6, "下键应保持**列索引**并落在下一格首（col={col}）");
+    }
+
+    /// spec #12（哨兵退格/删除）：**空**格首退格跳到流序上一格末；**非空**格
+    /// 首与格尾 Delete 原地消费；Cmd+退格 / Cmd+Delete 分别删到格内容首/尾，
+    /// 不切掉管道。
+    #[gpui::test]
+    fn live_table_sentinel_backspace_delete_spec12(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // 0:表头 1:分隔 2:数据(第1格空) 3:数据 4:空行 5:尾段
+        const DOC: &str = "| A | B |\n|---|---|\n|   | 2 |\n| 3 | 4 |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 1) **空**格首退格 → 跳到流序上一格（表头 B 格）**末**，文本不动。
+        let before = view.read_with(cx, |v, _| v.text());
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!(
+            (c.line, c.col),
+            (0, 7),
+            "空格首退格应到流序上一格末（line={}, col={}）",
+            c.line,
+            c.col
+        );
+        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "跳格不得改文本");
+
+        // 2) **非空**格首退格 → 原地消费。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 2), "非空格首退格原地消费");
+
+        // 3) 格内容**末尾**按 Delete → 哨兵命中，无操作。
+        let before = view.read_with(cx, |v, _| v.text());
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 7, false)); // `2` 的内容末
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("delete");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "格尾 Delete 不得删字符");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (2, 7), "格尾 Delete 原地消费");
+
+        // 4) Cmd+退格 → 删到格内容首（管道与同排格子保留）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 7, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("cmd-backspace");
+        cx.run_until_parked();
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
+        assert_eq!(line2.as_deref(), Some("|   |  |"), "Cmd+退格只删格内容，保留管道");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (2, 6), "光标落在格内容首");
+
+        // 5) Cmd+Delete → 删到格内容尾。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(3, 2, false)); // `3` 的内容首
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("cmd-delete");
+        cx.run_until_parked();
+        let line3 = view.read_with(cx, |v, _| v.buffer.line(3).map(str::to_string));
+        assert_eq!(line3.as_deref(), Some("|  | 4 |"), "Cmd+Delete 只删到格内容尾");
+    }
+
+    /// spec #12 续：**整表为空**时，表格首格按退格 → 删除整张表。
+    #[gpui::test]
+    fn live_table_empty_table_backspace_deletes_table(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "|  |  |\n|---|---|\n|  |  |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "\ntail\n",
+            "空表首格退格应删除整张表"
+        );
     }
 
     /// 表格里方向键不应把光标停在管道或格间空格上（Typora 语义：只有格
