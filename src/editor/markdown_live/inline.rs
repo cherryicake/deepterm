@@ -204,23 +204,56 @@ impl Inline {
     Some(self.spans[start].range.start..self.spans[end].range.end)
   }
 
-  /// Typora `.md-expand`: the element whose markers should be revealed for
-  /// a caret at byte `at`, or `None` to keep everything rendered.
-  ///
-  /// Rule: the caret is **inside** the element → that element's delimiters
-  /// show, everything else in the line stays rendered. This is Typora's
-  /// documented hybrid-editing behavior — "Moving the cursor to the middle
-  /// of a span element will expand that element into the Markdown source"
-  /// (support.typora.io, *Markdown Reference* §Span Elements).
-  ///
-  /// Plain text has no delimiters, so a caret there expands nothing.
-  pub fn expand_at(&self, at: usize) -> Option<Range<usize>> {
-    let el = self.element_at(at)?;
-    let has_marker = self
+  /// 元素 `r` 内是否存在标记 span（有标记才可能 `.md-expand`）。
+  fn has_marker_in(&self, r: &Range<usize>) -> bool {
+    self
       .spans
       .iter()
-      .any(|s| s.marker && el.start <= s.range.start && s.range.end <= el.end);
-    has_marker.then_some(el)
+      .any(|s| s.marker && r.start <= s.range.start && s.range.end <= r.end)
+  }
+
+  /// Typora `.md-expand`: the element whose markers should be revealed for a
+  /// caret at byte `at`, or `None` to keep everything rendered.
+  ///
+  /// 规格：`docs/research/typora-table-ux.md` #2（Typora 1.14.10 `frame.js`
+  /// `brush.expand()` 源码：`endOffset == node length || startOffset == 0`
+  /// 才加 `md-expand`）—— 光标**触到**词首/词尾（或落在标记字节上）才展开
+  /// `**bold**`，词中间保持渲染的 *bold*。纯文本没有标记，永不展开。
+  pub fn expand_at(&self, at: usize) -> Option<Range<usize>> {
+    let mut el = self.element_at(at)?;
+    if !self.has_marker_in(&el) {
+      // 点击词尾时，源映射会落在元素**后**的第一个字节（闭标记之后）：
+      // 若该字节恰是某无标记元素的起点，回看前一个字节所在的元素 —— 带
+      // 标记则展开它（词尾同样算边界，对应 startOffset == 0 的下一个节点）。
+      if at == el.start && at > 0 {
+        el = self.element_at(at - 1)?;
+        if !self.has_marker_in(&el) {
+          return None;
+        }
+      } else {
+        return None;
+      }
+    }
+    // 内容 = 元素去掉首尾标记 span。落在标记上、或在内容边界上 → 展开；
+    // 词中间（严格位于内容内部）→ 收起。
+    let mut content: Option<Range<usize>> = None;
+    let mut on_marker = false;
+    for s in &self.spans {
+      if el.start <= s.range.start && s.range.end <= el.end {
+        if s.marker {
+          on_marker |= s.range.contains(&at);
+        } else {
+          let r = content.get_or_insert_with(|| s.range.clone());
+          r.start = r.start.min(s.range.start);
+          r.end = r.end.max(s.range.end);
+        }
+      }
+    }
+    let Some(content) = content else {
+      // 全是标记（如 `****`）：任何位置都算边界。
+      return Some(el);
+    };
+    (on_marker || at <= content.start || at >= content.end).then_some(el)
   }
 }
 
@@ -1331,23 +1364,29 @@ mod element_at_tests {
   }
 
   #[test]
-  fn expand_at_only_for_elements_with_markers() {
-    // Typora `.md-expand`：只有「有标记可展开」的元素才展开。
-    // 纯文本没有标记 → 不展开（整行保持渲染）。
+  fn expand_at_only_at_element_boundary() {
+    // spec #2（typora-table-ux.md）：光标**触到**词首/词尾/标记才展开，
+    // 词中间保持渲染（frame.js `brush.expand()`：endOffset==len || startOffset==0）。
     let t = "plain **bold** tail";
     let inline = parse(t);
     assert_eq!(inline.expand_at(2), None, "纯文本不该展开");
+    // 内容 `bold` = 8..12：词中间不展开。
+    assert_eq!(inline.expand_at(9), None, "词中间不展开");
+    assert_eq!(inline.expand_at(11), None, "词中间不展开");
+    // 词首（内容起点）/开标记上 → 展开。
+    assert_eq!(inline.expand_at(8).map(|r| &t[r]), Some("**bold**"), "词首展开");
+    assert_eq!(inline.expand_at(6).map(|r| &t[r]), Some("**bold**"), "开标记上展开");
+    // 词尾（闭标记起点）/闭标记上 → 展开。
+    assert_eq!(inline.expand_at(12).map(|r| &t[r]), Some("**bold**"), "词尾展开");
+    assert_eq!(inline.expand_at(13).map(|r| &t[r]), Some("**bold**"), "闭标记上展开");
+    // 紧跟闭标记之后的一个字节（点击词尾的源映射落点）→ 展开左侧元素。
     assert_eq!(
-      inline.expand_at(9).map(|r| &t[r]),
+      inline.expand_at(14).map(|r| &t[r]),
       Some("**bold**"),
-      "粗体内部应展开"
+      "词尾后一字节展开"
     );
-    // 标记上也算「在里面」（用户正在编辑那些字符）。
-    assert_eq!(
-      inline.expand_at(6).map(|r| &t[r]),
-      Some("**bold**"),
-      "开标记上应展开"
-    );
+    // 再往右已是纯文本内部 → 不展开。
+    assert_eq!(inline.expand_at(15), None, "离开元素后不展开");
   }
 
   #[test]

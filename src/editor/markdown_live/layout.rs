@@ -768,12 +768,18 @@ mod tests {
     // 光标在纯文本里 → 整格渲染，**所有**标记都隐藏（含反引号）。
     assert_eq!(expand_at(1), "plain bold code");
     assert_eq!(expand_at(4), "plain bold code");
-    // 光标在粗体里 → 只展开粗体的 `**`，代码段的反引号仍隐藏。
-    // 切片内偏移：`**bold**` 是 6..14，内容 `bold` 是 8..12。
-    assert_eq!(expand_at(9), "plain **bold** code");
-    assert_eq!(expand_at(11), "plain **bold** code");
-    // 光标在代码段里 → 只展开代码段的反引号（`code` 在 15..21）。
-    assert_eq!(expand_at(18), format!("plain bold {bt}code{bt}"));
+    // spec #2：光标在词**中间**（`**bold**` 内容 = 切片 8..12）→ 不展开，保持渲染。
+    assert_eq!(expand_at(9), "plain bold code");
+    assert_eq!(expand_at(11), "plain bold code");
+    // 光标触到词首/词尾/标记（切片 6 = 开标记、8 = 内容首、12 = 内容尾/闭标记首）→
+    // 只展开粗体的 `**`，代码段的反引号仍隐藏。
+    assert_eq!(expand_at(6), "plain **bold** code");
+    assert_eq!(expand_at(8), "plain **bold** code");
+    assert_eq!(expand_at(12), "plain **bold** code");
+    // 代码段（`code` 内容 = 16..20，反引号 15 / 20）：词中间不展开，词首/词尾展开。
+    assert_eq!(expand_at(18), "plain bold code");
+    assert_eq!(expand_at(16), format!("plain bold {bt}code{bt}"));
+    assert_eq!(expand_at(20), format!("plain bold {bt}code{bt}"));
   }
 
   #[test]
