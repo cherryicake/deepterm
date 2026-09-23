@@ -7,10 +7,10 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, DispatchPhase, Element, ElementId, Entity, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, StyledText, TextRun, TextStyle,
-    TextStyleRefinement, Window,
+    App, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, StyledText,
+    TextRun, TextStyle, TextStyleRefinement, Window,
 };
 
 use crate::components::input::cursor::{CursorLayout, CursorShape};
@@ -556,6 +556,19 @@ impl Element for LiveLine {
             view.update(cx, |v, _| {
                 v.record_row_layout(self.line, layout, text_len);
             });
+        }
+
+        // 平台文本输入（中文 IME）注册：光标行每帧注册（候选框贴光标行），
+        // 其余行仅在本帧尚未注册时兜底一次。`render` 每帧复位认领标志。
+        if let Some(focus) = self
+            .view
+            .update(cx, |v, _| v.claim_input_registration(self.caret_vis.is_some(), window))
+        {
+            window.handle_input(
+                &focus,
+                ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
         }
 
         // Caret: `position_for_index` already returns window coordinates

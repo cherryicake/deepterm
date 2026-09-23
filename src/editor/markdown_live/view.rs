@@ -13,10 +13,10 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity,
-    EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
-    ShapedLine, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    TextRun, Window, div, px, rems, svg,
+    EntityInputHandler, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, TextRun, UTF16Selection, Window, div, px, rems, svg,
 };
 
 use crate::assets::Icon;
@@ -172,6 +172,12 @@ pub struct LiveMarkdownView {
     /// 已发出的 `Change` 对应的 `text_version`：`edit` 不再直接发射，
     /// 统一由 `after_edit`/`set_text` 按版本去重后发射，避免每键两次同步。
     emitted_version: u64,
+    /// IME 组字区间（**字节**偏移，非 UTF-16）：组字期间文本恒等于该区间，
+    /// 平台按 UTF-16 查询时经 [`Self::byte_to_utf16`] 换算。`None` = 无组字。
+    ime_marked_range: Option<std::ops::Range<usize>>,
+    /// 本帧是否已向 `Window` 注册 `EntityInputHandler`（`render` 每帧复位；
+    /// 光标行每帧认领，其余行仅在未注册时兜底一次）。
+    pub(crate) input_registered: bool,
     /// 测试探针：上帧 `(groups_total, groups_rendered, virtualized)`。
     #[cfg(test)]
     last_render_stats: (usize, usize, bool),
@@ -245,6 +251,8 @@ impl LiveMarkdownView {
             virt_top_off: 0,
             stat_cache: None,
             emitted_version: 0,
+            ime_marked_range: None,
+            input_registered: false,
             #[cfg(test)]
             last_render_stats: (0, 0, false),
         }
@@ -510,6 +518,140 @@ impl LiveMarkdownView {
         off
     }
 
+    /// UTF-16 偏移 → 字节偏移：floor 到所在字符（代理对中间 → 代理对起点），
+    /// 越界返回 `text.len()`。平台 IME 的 range 全是 UTF-16，落库前必须换算。
+    fn utf16_to_byte(text: &str, off: usize) -> usize {
+        let mut u = 0usize;
+        for (i, ch) in text.char_indices() {
+            if off < u + ch.len_utf16() {
+                return i;
+            }
+            u += ch.len_utf16();
+        }
+        text.len()
+    }
+
+    /// 字节偏移 → UTF-16 偏移：floor 到字符边界，越界 clamp 到末尾。
+    fn byte_to_utf16(text: &str, off: usize) -> usize {
+        let mut off = off.min(text.len());
+        while off > 0 && !text.is_char_boundary(off) {
+            off -= 1;
+        }
+        text[..off].encode_utf16().count()
+    }
+
+    /// [`Pos`] → 全文字节偏移（[`pos_of_offset`] 的逆，`search_caret_offset`
+    /// 的推广）。行号越界时 clamp 到文档末尾。
+    fn offset_of_pos(lines: &[String], pos: Pos) -> usize {
+        let mut off = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if i == pos.line {
+                return off + byte_for_col(line, pos.col);
+            }
+            off += line.len() + 1;
+        }
+        // 越界：循环多算了末行的换行符（空文档为 0，saturating 兜住）。
+        off.saturating_sub(1)
+    }
+
+    /// IME 请求的替换区间 → 全文字节区间 `(start, end)`：显式 UTF-16
+    /// 区间（平台权威）→ 组字区间（字节，直接可用）→ 选区/光标。
+    fn resolve_input_range(&self, range: Option<std::ops::Range<usize>>) -> (usize, usize) {
+        if let Some(r) = range {
+            let doc = self.buffer.text();
+            let s = Self::utf16_to_byte(&doc, r.start);
+            let e = Self::utf16_to_byte(&doc, r.end);
+            return (s.min(e), s.max(e));
+        }
+        if let Some(r) = self.ime_marked_range.clone() {
+            return (r.start, r.end);
+        }
+        match self.buffer.selection() {
+            Some((s, e)) => (
+                Self::offset_of_pos(self.buffer.lines(), s),
+                Self::offset_of_pos(self.buffer.lines(), e),
+            ),
+            None => {
+                let off = self.search_caret_offset();
+                (off, off)
+            }
+        }
+    }
+
+    /// 把模型选区预置到全文字节区间 `[start, end)`（IME 替换前定位，让
+    /// 后续 `insert`/`delete_selection` 走标准选区语义）。折叠区间只放
+    /// 光标；已在目标位置时**不动**（`move_to` 会打断撤销合并，逐字输入
+    /// 必须保持一步撤销）。
+    fn set_range_selection(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        let s = pos_of_offset(self.buffer.lines(), start);
+        if start == end {
+            if self.buffer.cursor() != s || self.buffer.selection().is_some() {
+                self.edit(cx, |m| m.move_to(s.line, s.col, false));
+            }
+            return;
+        }
+        let e = pos_of_offset(self.buffer.lines(), end);
+        self.edit(cx, |m| {
+            m.move_to(s.line, s.col, false);
+            m.move_to(e.line, e.col, true);
+        });
+    }
+
+    /// IME 候选框/组字下划线定位：某行的**行内字节** → 窗口坐标 bounds。
+    /// 表格行走格命中记录（内容包含该字节的格）；普通行走 `row_layouts`；
+    /// 跨行或未渲染时退回 `element_bounds`（平台只要求一个锚点）。
+    fn ime_point_bounds(
+        &self,
+        line: usize,
+        in_line: usize,
+        element_bounds: gpui::Bounds<Pixels>,
+    ) -> gpui::Bounds<Pixels> {
+        // 表格行：内容区间是闭区间（空格格为退化点），命中即用本格排版。
+        if self.cell_hits.keys().any(|(l, _)| *l == line) {
+            let hit = self
+                .cell_hits
+                .iter()
+                .find(|((l, _), hit)| {
+                    *l == line && in_line >= hit.content.start && in_line <= hit.content.end
+                })
+                .map(|(_, hit)| hit);
+            let Some(hit) = hit else {
+                return element_bounds;
+            };
+            let vis = vis_for_src(&hit.segs, in_line).min(hit.text_len);
+            let pos = hit
+                .layout
+                .position_for_index(vis)
+                .or_else(|| (hit.text_len == 0).then_some(hit.text_bounds.origin));
+            let Some(pos) = pos else {
+                return element_bounds;
+            };
+            let tb = hit.text_bounds;
+            return gpui::Bounds::new(
+                gpui::point(pos.x, tb.top()),
+                gpui::size((tb.right() - pos.x).max(px(0.)), tb.size.height),
+            );
+        }
+        // 普通行：可见字节 → 字形位置。
+        if let (Some(info), Some(row)) = (
+            self.row_layouts.get(&line),
+            self.planned.iter().find(|r| r.line == line),
+        ) {
+            let vis = vis_for_src(&row.plan.segs, in_line).min(info.text_len);
+            let pos = info
+                .layout
+                .position_for_index(vis)
+                .or_else(|| (info.text_len == 0).then_some(info.layout.bounds().origin));
+            if let Some(pos) = pos {
+                let b = info.layout.bounds();
+                return gpui::Bounds::new(
+                    gpui::point(pos.x, b.top()),
+                    gpui::size((b.right() - pos.x).max(px(0.)), b.size.height),
+                );
+            }
+        }
+        element_bounds
+    }
 
     fn caret_block_for(
         shape: CursorShape,
@@ -589,6 +731,27 @@ impl LiveMarkdownView {
         self.cell_hits.insert(key, hit);
     }
 
+    /// `LiveLine::paint` 认领本帧 `EntityInputHandler` 注册权（中文 IME 等
+    /// 平台文本输入的唯一写路径）：焦点在本视图，且**本行是光标行**或
+    /// 本帧尚未注册过时返回焦点句柄并置位；`render` 每帧复位
+    /// [`Self::input_registered`]。光标行每帧注册，保证 IME 候选框/组字
+    /// 下划线贴着光标行；其余行只在首帧兜底一次（输入法在首帧就可输入）。
+    pub(crate) fn claim_input_registration(
+        &mut self,
+        is_caret_line: bool,
+        window: &Window,
+    ) -> Option<FocusHandle> {
+        if !self.focus.is_focused(window) {
+            return None;
+        }
+        if is_caret_line || !self.input_registered {
+            self.input_registered = true;
+            Some(self.focus.clone())
+        } else {
+            None
+        }
+    }
+
     /// 内容视口（`#live-markdown-content`）的矩形范围。`LiveLine` 的
     /// 鼠标监听是窗口级全局的（不受命中测试约束），用它判断点击是否真的
     /// 落在本视图横向范围内 —— 右侧终端等兄弟面板的点击超出此范围，必须
@@ -607,6 +770,43 @@ impl LiveMarkdownView {
         let out = self.buffer.edit(f);
         cx.notify();
         out
+    }
+
+    /// 统一的可打印文本写入路径（平台 `EntityInputHandler` 与快捷键兜底
+    /// 共用；`on_key` 不再直接写文本）：
+    /// 控制字符（除 `\n \r \t`）整体丢弃 → spec #6 跨格选区合并 → 单字符
+    /// 自动配对（`autopair` 时）→ 常规插入，收尾统一走 [`Self::after_edit`]。
+    fn type_text(&mut self, text: &str, autopair: bool, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        // 控制字符残留（IME/平台异常输入）：不进 buffer。
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return;
+        }
+        use crate::editor::markdown_live::table_ops as t;
+        // spec #6：跨格选区的覆盖输入 = 合并首尾格并把 typed 写进合并点
+        //（一个撤销步）；同格/无选区落空，继续下面的自动配对/常规插入。
+        if self.edit(cx, |m| t::merge_cross_cell_selection(m, text)) {
+            self.after_edit(cx);
+            return;
+        }
+        if autopair {
+            let mut cs = text.chars();
+            if let (Some(ch), None) = (cs.next(), cs.next())
+                && self.try_autopair(ch, cx)
+            {
+                self.after_edit(cx);
+                return;
+            }
+        }
+        self.edit(cx, |m| {
+            m.insert(text);
+        });
+        self.after_edit(cx);
     }
 
     fn planned_rows(&mut self, focused: bool) -> &[PlannedRow] {
@@ -729,7 +929,12 @@ impl LiveMarkdownView {
     /// 不动文本、不入撤销栈。
     fn auto_prettify_table(&mut self, cx: &mut Context<Self>) {
         use crate::editor::markdown_live::table_ops as t;
-        if self.read_only || self.show_source || self.buffer.selection().is_some() {
+        // IME 组字期间不重排：组字区间按字节记账，重排会挪动区间前的字节。
+        if self.read_only
+            || self.show_source
+            || self.ime_marked_range.is_some()
+            || self.buffer.selection().is_some()
+        {
             return;
         }
         self.edit(cx, |m| {
@@ -2480,6 +2685,10 @@ impl LiveMarkdownView {
                         m.tab();
                     });
                     self.after_edit(cx);
+                } else {
+                    // 代码块 Shift+Tab：无操作也必须停传播 —— 否则平台
+                    // 回退路径会把 key_char（"\t"）当可打印文本再插一遍。
+                    cx.stop_propagation();
                 }
                 return;
             }
@@ -2732,31 +2941,10 @@ impl LiveMarkdownView {
             }
             _ => {}
         }
-        // Printable input.
-        if !self.read_only
-            && !platform
-            && !control
-            && !self.search_panel_focused(window, cx)
-            && let Some(text) = ks.key_char.as_deref().filter(|t| !t.is_empty())
-        {
-            let mut cs = text.chars();
-            // spec #6：跨格选区的覆盖输入 = 合并首尾格并把 typed 写进合并点
-            //（一个撤销步）；同格/无选区落空，继续下面的自动配对/常规插入。
-            if self.edit(cx, |m| t::merge_cross_cell_selection(m, text)) {
-                self.after_edit(cx);
-                return;
-            }
-            if let (Some(ch), None) = (cs.next(), cs.next())
-                && self.try_autopair(ch, cx)
-            {
-                self.after_edit(cx);
-                return;
-            }
-            self.edit(cx, |m| {
-                m.insert(text);
-            });
-            self.after_edit(cx);
-        }
+        // 可打印文本不再在这里写：统一走平台 `EntityInputHandler`
+        //（`replace_text_in_range` → [`Self::type_text`]）。本函数只处理
+        // 具名键；未消费的可打印键由平台回退到 input handler，中文 IME
+        // 的 `insertText` 与 ASCII 输入因此走同一条写路径。
     }
 
     /// Selected text as *source* markdown (markers included), for copy.
@@ -3150,6 +3338,229 @@ impl SearchTarget for LiveMarkdownView {
 impl Focusable for LiveMarkdownView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+/// 平台文本输入（中文 IME 组字 / `insertText`）的唯一写路径。ASCII 可打印
+/// 键也走这里：`on_key` 只处理具名键，未消费的键由平台回退到 input
+/// handler（`dispatch_keystroke` → `dispatch_input`）。范围全部是 UTF-16，
+/// 落库前经 [`LiveMarkdownView::utf16_to_byte`] 折成字节。
+impl EntityInputHandler for LiveMarkdownView {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let doc = self.buffer.text();
+        let s = Self::utf16_to_byte(&doc, range.start);
+        let e = Self::utf16_to_byte(&doc, range.end);
+        let (s, e) = (s.min(e), s.max(e));
+        // 回报**实际**取到的区间（floor 后的），平台据此记账。
+        *adjusted_range = Some(Self::byte_to_utf16(&doc, s)..Self::byte_to_utf16(&doc, e));
+        Some(doc[s..e].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let doc = self.buffer.text();
+        let (range, reversed) = match self.buffer.selection() {
+            Some((s, e)) => {
+                let sb = Self::offset_of_pos(self.buffer.lines(), s);
+                let eb = Self::offset_of_pos(self.buffer.lines(), e);
+                // 选区终点（光标）在区间起点 = 反向选择。
+                let reversed = self.buffer.model().anchor() == Some(e);
+                (
+                    Self::byte_to_utf16(&doc, sb)..Self::byte_to_utf16(&doc, eb),
+                    reversed,
+                )
+            }
+            None => {
+                let off = self.search_caret_offset();
+                let u = Self::byte_to_utf16(&doc, off);
+                (u..u, false)
+            }
+        };
+        Some(UTF16Selection { range, reversed })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        let r = self.ime_marked_range.clone()?;
+        let doc = self.buffer.text();
+        Some(Self::byte_to_utf16(&doc, r.start)..Self::byte_to_utf16(&doc, r.end))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.ime_marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 只读/搜索面板聚焦/失焦：静默丢弃（**不**置 stop，避免平台仍在
+        // 派发的 `on_key` 被吞）。
+        if self.read_only
+            || self.search_panel_focused(window, cx)
+            || !self.focus.is_focused(window)
+        {
+            return;
+        }
+        // 控制字符残留整体丢弃（与 type_text 同规），且不动选区。
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return;
+        }
+        // 提交语义在进入时判定：有组字区间 = 组字内的替换（不做自动配对），
+        // 无 = 真正的提交/普通输入（单字符走自动配对）。
+        let autopair = self.ime_marked_range.is_none();
+        let (start, end) = self.resolve_input_range(range);
+        self.ime_marked_range = None;
+        if text.is_empty() {
+            // 空提交 = 取消组字：删掉区间、光标塌缩在起点（折叠区间为 no-op）。
+            self.set_range_selection(start, end, cx);
+            self.edit(cx, |m| {
+                m.delete_selection();
+            });
+            self.after_edit(cx);
+            return;
+        }
+        self.set_range_selection(start, end, cx);
+        self.type_text(text, autopair, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only
+            || self.search_panel_focused(window, cx)
+            || !self.focus.is_focused(window)
+        {
+            return;
+        }
+        if new_text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return;
+        }
+        let (start, end) = self.resolve_input_range(range);
+        if new_text.is_empty() {
+            self.ime_marked_range = None;
+            self.set_range_selection(start, end, cx);
+            self.edit(cx, |m| {
+                m.delete_selection();
+            });
+            self.after_edit(cx);
+            return;
+        }
+        // 预置组字区间（组字期间文本恒等于该区间）：必须在插入**前**置位，
+        // 让本次 after_edit 跳过表格自动重排（重排会挪动区间前的字节）。
+        // 插入后按光标重算，覆盖跨格合并（写入点 ≠ 请求区间）的情况。
+        self.ime_marked_range = Some(start..start + new_text.len());
+        self.set_range_selection(start, end, cx);
+        self.type_text(new_text, false, cx);
+        let caret = self.search_caret_offset();
+        let marked_start = caret.saturating_sub(new_text.len());
+        self.ime_marked_range = Some(marked_start..caret);
+        // 新选区（UTF-16，相对**刚插入的文本**）→ 移动光标；组字态保持。
+        if let Some(r) = new_selected_range {
+            let cs = marked_start + Self::utf16_to_byte(new_text, r.start);
+            let ce = marked_start + Self::utf16_to_byte(new_text, r.end);
+            self.set_range_selection(cs, ce, cx);
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        element_bounds: gpui::Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        let doc = self.buffer.text();
+        let s = Self::utf16_to_byte(&doc, range_utf16.start);
+        let e = Self::utf16_to_byte(&doc, range_utf16.end);
+        let (s, e) = (s.min(e), s.max(e));
+        let ps = pos_of_offset(self.buffer.lines(), s);
+        let pe = pos_of_offset(self.buffer.lines(), e);
+        if ps.line != pe.line {
+            // 跨行区间没有单一锚点：退回元素盒。
+            return Some(element_bounds);
+        }
+        let text = self.buffer.line(ps.line)?;
+        let in_line = byte_for_col(text, ps.col);
+        Some(self.ime_point_bounds(ps.line, in_line, element_bounds))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let line = self.line_for_click(point)?;
+        // 表格行：优先指针所在的格（命中框含整格），否则通用映射兜底。
+        let cell = self
+            .cell_hits
+            .iter()
+            .find(|((l, _), hit)| *l == line && hit.text_bounds.contains(&point))
+            .map(|(key, _)| *key);
+        let col = match cell {
+            Some((l, c)) => self
+                .cell_col_at(l, c, point)
+                .unwrap_or_else(|| self.col_for_click(line, point)),
+            None => self.col_for_click(line, point),
+        };
+        // `col_for_click` 兜底给 usize::MAX（无布局）：`byte_for_col` 会
+        // clamp 到行尾。
+        let pos = Pos::new(line, col);
+        let byte = Self::offset_of_pos(self.buffer.lines(), pos);
+        let doc = self.buffer.text();
+        Some(Self::byte_to_utf16(&doc, byte))
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = self.buffer.text();
+        let s = Self::utf16_to_byte(&doc, range_utf16.start);
+        let e = Self::utf16_to_byte(&doc, range_utf16.end);
+        self.set_range_selection(s.min(e), s.max(e), cx);
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.buffer.text().encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.read_only && self.focus.is_focused(window)
     }
 }
 
@@ -3637,6 +4048,8 @@ impl Render for LiveMarkdownView {
         self.row_layouts.clear();
         self.cell_hits.clear();
         self.row_targets.clear();
+        // 本帧的输入法处理器注册权（LiveLine::paint 认领；光标行每帧注册）。
+        self.input_registered = false;
 
         // Plan rows (cached on version+cursor+selection+focus).
         let rows: Vec<PlannedRow> = self.planned_rows(focused).to_vec();
@@ -8741,6 +9154,376 @@ mod interaction_fallback_tests {
                 "点击兄弟面板必须把焦点切过去，live 编辑器不得抢回"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod live_ime_tests {
+    use super::*;
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.0.clone()
+        }
+    }
+
+    /// 建视图 + 聚焦 + 首帧（输入处理器注册与命中记录都发生在 paint）。
+    fn setup<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        doc: &str,
+    ) -> (gpui::Entity<LiveMarkdownView>, &'a mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx
+            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// 某格内容文本（去 padding）。
+    fn cell_text(v: &LiveMarkdownView, line: usize, ci: usize) -> String {
+        let text = v.buffer.line(line).unwrap_or("").to_string();
+        let (cs, ce) = cell_content_cols(&text, ci).expect("该行应是表格行");
+        text.chars().skip(cs).take(ce - cs).collect()
+    }
+
+    /// 中文 IME 全链路：拼音组字两帧 + 提交中文 —— 组字区间（UTF-16）与
+    /// 光标逐帧跟随，提交后标记清除、光标在提交文本之后。
+    #[gpui::test]
+    fn live_ime_composition_and_commit_cjk(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = setup(cx, "héllo\n");
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 5, false)); // 行尾（byte 6）
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        // 第 1 帧：平台无显式区间，插入拼音 `n`，相对插入文本的选区 1..1。
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllon\n", "组字文本应入 buffer");
+        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(marked, Some(5..6), "组字区间 = 刚插入的 n（UTF-16）");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 6), "光标应在组字文本末尾");
+
+        // 第 2 帧：显式区间（旧标记 5..6）替换为整段拼音 `nihao`。
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(Some(5..6), "nihao", Some(5..5), window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllonihao\n");
+        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(marked, Some(5..10), "组字区间跟随整段拼音");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 10), "光标在拼音末尾");
+
+        // 提交：显式区间 → 中文；标记清除，光标在提交文本后。
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(Some(5..10), "你好", window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllo你好\n", "提交文本应替换拼音");
+        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(marked, None, "提交后无组字标记");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 7), "光标在提交文本之后");
+    }
+
+    /// 跨行 UTF-16：`中` 占 1 个 UTF-16 单元，偏移 2 应落在换行后的 `文` 前。
+    #[gpui::test]
+    fn live_ime_utf16_multiline_commit(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = setup(cx, "中\n文");
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(Some(2..2), "好", window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "中\n好文");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (1, 1), "跨行 UTF-16 定位：换行后第 1 个字符");
+    }
+
+    /// 未聚焦 / 只读：IME 写路径静默丢弃（不落文本、不动选区）。
+    #[gpui::test]
+    fn live_ime_unfocused_and_read_only_drop(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str = "abc\n";
+        // 不聚焦：连处理器注册都不该认领。
+        let (host, cx) = cx
+            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |v, _| v.input_registered),
+            "未聚焦不得认领输入处理器注册权"
+        );
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), DOC, "未聚焦不得写入");
+
+        // 聚焦 + 只读：处理器注册但写路径丢弃。
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.input_registered),
+            "聚焦后光标行应认领注册权"
+        );
+        view.update(cx, |v, cx| v.set_read_only(true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), DOC, "只读不得写入");
+    }
+
+    /// 跨格选区 + IME 写路径（等价 `simulate_input("z")` 的平台回退）：
+    /// 合并首尾格、typed 写进合并点，与 spec #6 同款结果。
+    #[gpui::test]
+    fn live_ime_cross_cell_merge_via_handler(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "| aa | bb |\n|---|---|\n| cc | dd |\n| ee | ff |\n\ntail\n";
+        let (view, cx) = setup(cx, DOC);
+        // 拖出跨格选区：(2, cell0 内容首 + 1) → (3, cell1 内容首)。
+        let (a_col, b_col) = view.read_with(cx, |v, _| {
+            let l2 = v.buffer.line(2).unwrap().to_string();
+            let l3 = v.buffer.line(3).unwrap().to_string();
+            (
+                cell_content_cols(&l2, 0).unwrap().0 + 1,
+                cell_content_cols(&l3, 1).unwrap().0,
+            )
+        });
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, a_col, false));
+            v.after_move(cx);
+            v.selecting = true;
+            v.on_table_cell_drag(3, b_col, cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(None, "z", window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 2, 0)),
+            "czff",
+            "覆盖输入：首格 ← 前缀 + typed + 尾格后缀"
+        );
+        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 2, 1)), "", "同排后格应清空");
+        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 3, 0)), "", "尾格前的格应清空");
+        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 3, 1)), "", "尾格应清空");
+    }
+
+    /// 代码块里 Tab / Shift+Tab：普通 Tab 缩进一次（不得经 handler 再插一遍
+    /// 制表符）；Shift+Tab 无操作但**必须**停传播（否则平台回退把 "\t" 当
+    /// 可打印文本插入）。同时覆盖 Enter 不双插换行。
+    #[gpui::test]
+    fn live_ime_code_block_tab_and_enter_no_double_write(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = setup(cx, "```\ncode\n```\n");
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(1, 0, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line(1).unwrap().to_string()),
+            "    code",
+            "代码块 Tab 只缩进一次（on_key 消费，handler 不得再插）"
+        );
+
+        // Shift+Tab：代码行无操作（on_tab 的 outdent 对非列表不缩进）。
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line(1).unwrap().to_string()),
+            "    code",
+            "代码块 Shift+Tab 无操作，且不得插入字面制表符"
+        );
+
+        // Enter 换行一次（on_key 的 enter 分支消费，handler 不得再插 \n）。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(1, 8, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let lines_before = view.read_with(cx, |v, _| v.buffer.line_count());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            lines_before + 1,
+            "Enter 只换一行（不得双插）"
+        );
+    }
+
+    /// 空提交 = 取消组字：删掉标记文本、标记清除、光标塌缩回起点。
+    #[gpui::test]
+    fn live_ime_empty_commit_cancels_marked_text(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = setup(cx, "héllo\n");
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 5, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllon\n");
+
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(Some(5..6), "", None, window, cx);
+            });
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllo\n", "取消组字应删掉标记文本");
+        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(marked, None, "取消后无组字标记");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 5), "光标塌缩回组字起点");
+    }
+
+    /// ASCII 输入走同一条写路径且只写一次；单字符自动配对仍生效。
+    #[gpui::test]
+    fn live_ime_ascii_typing_single_write_with_autopair(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = setup(cx, "ab\n");
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.simulate_input("x");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "abx\n",
+            "ASCII 应经 handler 单次写入（on_key 不再直写）"
+        );
+        cx.simulate_input("(");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "abx()\n",
+            "handler 路径的单字符自动配对仍生效"
+        );
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!((c.line, c.col), (0, 4), "光标应在配对括号内");
+    }
+
+    /// 表格内组字不触发自动重排（组字区间按字节记账），提交后恢复重排。
+    #[gpui::test]
+    fn live_ime_table_composition_defers_prettify(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (view, cx) = setup(cx, DOC);
+        let cs = view.read_with(cx, |v, _| {
+            let l = v.buffer.line(2).unwrap().to_string();
+            cell_content_cols(&l, 0).unwrap().0
+        });
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, cs, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+            });
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line(0).unwrap().to_string()),
+            "| a | b |",
+            "组字期间不得重排表格（区间会错位）"
+        );
+
+        let marked = cx
+            .update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)))
+            .expect("应有组字区间");
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_text_in_range(Some(marked), "你", window, cx);
+            });
+        });
+        let line0 = view.read_with(cx, |v, _| v.buffer.line(0).unwrap().to_string());
+        assert!(
+            line0.len() > "| a | b |".len(),
+            "提交后应恢复自动重排：{line0:?}"
+        );
+        let line2 = view.read_with(cx, |v, _| v.buffer.line(2).unwrap().to_string());
+        assert!(line2.contains('你'), "提交文本应在格内：{line2:?}");
+    }
+
+    /// IME 锚点：普通行 `bounds_for_range` 有行高；格内点映射回该格内容。
+    #[gpui::test]
+    fn live_ime_bounds_and_point_mapping(cx: &mut gpui::TestAppContext) {
+        const DOC: &str = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let (view, cx) = setup(cx, DOC);
+        let fallback = gpui::Bounds::new(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(10.), px(10.)),
+        );
+        let b = cx
+            .update(|window, cx| {
+                view.update(cx, |v, cx| v.bounds_for_range(0..0, fallback, window, cx))
+            })
+            .expect("普通行应有 bounds");
+        assert!(b.size.height > px(0.), "bounds 应有行高：{b:?}");
+
+        // 表格第 2 格内的一点 → 应映射到该格内容的 UTF-16 区间内。
+        let nb = cx.debug_bounds("live-table-cell-2-1").expect("第 2 格探针");
+        let idx = cx
+            .update(|window, cx| {
+                view.update(cx, |v, cx| v.character_index_for_point(nb.center(), window, cx))
+            })
+            .expect("格内点应可映射");
+        let expect = view.read_with(cx, |v, _| {
+            let doc = v.text();
+            let l = v.buffer.line(4).unwrap().to_string();
+            let (cs, ce) = cell_content_cols(&l, 1).unwrap();
+            let sb = LiveMarkdownView::offset_of_pos(v.buffer.lines(), Pos::new(4, cs));
+            let eb = LiveMarkdownView::offset_of_pos(v.buffer.lines(), Pos::new(4, ce));
+            (
+                LiveMarkdownView::byte_to_utf16(&doc, sb),
+                LiveMarkdownView::byte_to_utf16(&doc, eb),
+            )
+        });
+        assert!(
+            (expect.0..=expect.1).contains(&idx),
+            "格内点应映射到该格内容：idx={idx}，期望 {expect:?}"
+        );
     }
 }
 
