@@ -15,7 +15,7 @@ use gpui::{
     Animation, AnimationExt, App, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
-    ShapedLine, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
+    ShapedLine, SharedString, StatefulInteractiveElement, Styled, Subscription,
     TextRun, Window, div, px, rems, svg,
 };
 
@@ -109,6 +109,10 @@ pub struct LiveMarkdownView {
     /// paint. Powers visual-row (soft-wrap) movement and the dead-zone
     /// click/drag fallbacks.
     row_layouts: std::collections::HashMap<usize, RowLayoutInfo>,
+    /// 每格的帧内命中记录（键 = 源行号 + 格列，见 [`CellHit`]）：
+    /// cell LiveLine 在 paint 时写入，`cell_div` 的元素级按下/移动监听
+    /// 用它把窗口坐标映射回本格行列（spec #6 跨格拖拽）。
+    cell_hits: std::collections::HashMap<(usize, usize), CellHit>,
     /// Fingerprint of the style inputs that bake colors into the highlight
     /// cache; a change (theme switch) clears it.
     hl_style_key: u64,
@@ -210,6 +214,7 @@ impl LiveMarkdownView {
             scroll_to_cursor: false,
             row_targets: Vec::new(),
             row_layouts: std::collections::HashMap::new(),
+            cell_hits: std::collections::HashMap::new(),
             hl_style_key: 0,
             blink,
             cursor_shape: CursorShape::Bar,
@@ -576,6 +581,12 @@ impl LiveMarkdownView {
     ) {
         self.row_layouts
             .insert(line, RowLayoutInfo { layout, text_len });
+    }
+
+    /// 记录某格的命中信息（cell LiveLine `paint` 调用；纯字段写入，不
+    /// notify —— 与 [`Self::record_row_layout`] 同款约定）。
+    pub(crate) fn record_cell_hit(&mut self, key: (usize, usize), hit: CellHit) {
+        self.cell_hits.insert(key, hit);
     }
 
     /// 内容视口（`#live-markdown-content`）的矩形范围。`LiveLine` 的
@@ -1038,6 +1049,10 @@ impl LiveMarkdownView {
         if self.line_in_mermaid_image(line) {
             return;
         }
+        // spec #6：锚点在表内、目标越出该表 → 不延伸（避免跨块选区毁表）。
+        if self.drag_cross_table(line) {
+            return;
+        }
         let col = self.col_for_click(line, position);
         self.edit(cx, |m| m.move_to(line, col, true));
     }
@@ -1049,6 +1064,36 @@ impl LiveMarkdownView {
     /// 供 `LiveLine` 的单元格模式取整行文本（映射需要 char 列）。
     pub(crate) fn line_text(&self, line: usize) -> Option<String> {
         self.buffer.line(line).map(str::to_string)
+    }
+
+    /// 窗口坐标 → `(line, col)` 格的行内 char 列（spec #6）。映射走本格
+    /// LiveLine 的帧内记录 [`CellHit`]：文本右侧空白 → 文本末、左侧空白
+    /// → 文本首、中间 → 字形位置，再经 segs 换回源列并夹进本格内容
+    /// （空格 segs 为空时防落回管道上）。格盒本身的认领由 `cell_div`
+    /// 的命中框负责（含内边距/未填满区域），这里不做格间判定。
+    pub(crate) fn cell_col_at(
+        &self,
+        line: usize,
+        col: usize,
+        position: gpui::Point<Pixels>,
+    ) -> Option<usize> {
+        let hit = self.cell_hits.get(&(line, col))?;
+        let raw = if position.x >= hit.text_bounds.right() {
+            hit.text_len
+        } else if position.x < hit.text_bounds.left() {
+            0
+        } else {
+            match hit.layout.index_for_position(position) {
+                Ok(ix) | Err(ix) => ix.min(hit.text_len),
+            }
+        };
+        let src_byte = src_for_vis(&hit.segs, raw);
+        let out = col_for_byte(&self.line_text(line)?, src_byte);
+        // 空格/映射越界时夹回本格内容（绝不允许光标停在管道上）。
+        Some(match self.table_cell_content_at(line, out) {
+            Some((cs, ce)) => out.clamp(cs, ce),
+            None => out,
+        })
     }
 
     /// 光标所在单元格的**内容 char 列范围**（去 padding），用于把双击选词
@@ -1174,8 +1219,39 @@ impl LiveMarkdownView {
         self.edit(cx, |m| m.move_to(cur.line, target, false));
     }
 
-    /// 单元格内拖拽：把选区终点扩到格内对应位置（**夹在本格内容范围内**，
-    /// 拖过格边界时不会把 `|` 和相邻格纳入选区）。
+    /// 拖拽延伸目标 `target_line` 是否越出锚点所在的表块（spec #6 的成形
+    /// 前提）：表外按下拖进格、表内拖到表外、或拖进另一张表都会形成**跨块**
+    /// 选区，而跨块删除会按行拼接、毁掉表格结构 —— 一律不延伸（与「拖到
+    /// 无单元格监听的区域时选区自然冻结」的既有表现一致）。普通文字段落间
+    /// 的拖拽（两端都不在表里）不受影响。
+    fn drag_cross_table(&self, target_line: usize) -> bool {
+        // 无表格的文档：普通拖拽零额外开销。
+        if !self
+            .planned
+            .iter()
+            .any(|r| matches!(r.block, Block::Table))
+        {
+            return false;
+        }
+        let lines: Vec<String> = self.buffer.lines().to_vec();
+        // 锚点 = 拖拽起点（退化为光标，覆盖 down 后尚未扩展的首帧）。
+        let anchor_line = self
+            .buffer
+            .model()
+            .anchor()
+            .map(|p| p.line)
+            .unwrap_or_else(|| self.buffer.cursor().line);
+        let blk = |l: usize| {
+            crate::editor::markdown_live::table_ops::table_block_range(&lines, l)
+        };
+        let anchor_blk = blk(anchor_line);
+        let target_blk = blk(target_line);
+        anchor_blk != target_blk && (anchor_blk.is_some() || target_blk.is_some())
+    }
+
+    /// 单元格内拖拽：把选区终点扩到**指针所在格**的对应位置（spec #6：
+    /// 端点由 `cell_div` 的元素级监听按命中格给出，不再夹回起点格 ——
+    /// 跨格选区由此成形；跨块延伸由 [`Self::drag_cross_table`] 拦下）。
     pub(crate) fn on_table_cell_drag(
         &mut self,
         line: usize,
@@ -1185,10 +1261,9 @@ impl LiveMarkdownView {
         if !self.selecting {
             return;
         }
-        let col = self
-            .table_cell_content_at(line, col)
-            .map(|(s, e)| col.clamp(s, e))
-            .unwrap_or(col);
+        if self.drag_cross_table(line) {
+            return;
+        }
         self.edit(cx, |m| m.move_to(line, col, true));
     }
 
@@ -1315,20 +1390,6 @@ impl LiveMarkdownView {
 
     /// Typora 的表格粘贴：文本含 `|` 时按行列分发到从光标格开始的区域
     /// （不够则自动补行/补列）；不含 `|` 返回 `false`，走普通插入。
-    fn paste_table_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
-        use crate::editor::markdown_live::table_ops as t;
-        let cur = self.buffer.cursor();
-        if !self
-            .planned
-            .iter()
-            .find(|r| r.line == cur.line)
-            .is_some_and(|r| matches!(r.block, Block::Table))
-        {
-            return false;
-        }
-        self.run_table_op(cx, |m| t::paste_into_table(m, text))
-    }
-
     /// 打开工具栏 More▾ 的表格菜单（与右键菜单共用 `table_menu_body` 条目）。
     /// 位置 = 点击点，向下展开；点别处/Esc 关闭由菜单自己的 DismissEvent 驱动。
     /// 焦点不在这儿贴：派发期同步 focus 会被丢弃，改由浮层渲染**逐帧贴**
@@ -1970,6 +2031,9 @@ impl LiveMarkdownView {
         if !self.selecting {
             return;
         }
+        if self.drag_cross_table(line) {
+            return;
+        }
         let (vis_len, segs, src_line) = match self.planned.iter().find(|r| r.line == line) {
             Some(row) => (
                 row.plan.visible.len(),
@@ -2232,7 +2296,9 @@ impl LiveMarkdownView {
                 };
                 let changed = self.edit(cx, |m| {
                     if m.selection().is_some() {
-                        m.delete_selection()
+                        // spec #6：跨格选区走结构化合并（首尾格合并、中间清空），
+                        // 同格选区仍走常规文本删除。
+                        t::merge_cross_cell_selection(m, "") || m.delete_selection()
                     } else if platform {
                         match cell_cs {
                             Some(cs) if cur.col > cs => {
@@ -2278,7 +2344,8 @@ impl LiveMarkdownView {
                 }
                 let changed = self.edit(cx, |m| {
                     if m.selection().is_some() {
-                        m.delete_selection()
+                        // spec #6：跨格选区合并删除，同格选区常规删除。
+                        t::merge_cross_cell_selection(m, "") || m.delete_selection()
                     } else if platform {
                         match cell_ce {
                             Some(ce) if cur.col < ce => {
@@ -2549,7 +2616,16 @@ impl LiveMarkdownView {
                     cx.stop_propagation();
                     return;
                 }
-                let cut = self.edit(cx, |m| m.cut());
+                let cut = self.edit(cx, |m| {
+                    // spec #6：跨格剪切 = 先取选区文本，再结构化合并删除
+                    // （m.cut 的 remove_selection 会按行拼接、毁掉表格）。
+                    let taken = m.selected_text();
+                    if t::merge_cross_cell_selection(m, "") {
+                        taken
+                    } else {
+                        m.cut()
+                    }
+                });
                 match cut {
                     Some(t) => {
                         cx.write_to_clipboard(ClipboardItem::new_string(t));
@@ -2573,9 +2649,16 @@ impl LiveMarkdownView {
                     if let Some(text) = item.text() {
                         let text = text.replace('\r', "");
                         if !text.is_empty() {
-                            // Typora：在表格格里粘贴含 `|` 的文本会按行列分发
-                            // 到相邻单元格（不拆则整块塞进当前格）。
-                            if self.paste_table_text(&text, cx) {
+                            // spec #6：跨格选区的粘贴 = 合并删除后从首格分发
+                            //（typed 先并入首格合并点，随后 paste 再按行列展开），
+                            // 合并与写入并成一个撤销步；无选区/同格照旧。
+                            let handled = self.run_table_op(cx, |m| {
+                                if t::merge_cross_cell_selection(m, &text) {
+                                    return true;
+                                }
+                                t::paste_into_table(m, &text)
+                            });
+                            if handled {
                                 self.after_edit(cx);
                                 return;
                             }
@@ -2653,6 +2736,12 @@ impl LiveMarkdownView {
             && let Some(text) = ks.key_char.as_deref().filter(|t| !t.is_empty())
         {
             let mut cs = text.chars();
+            // spec #6：跨格选区的覆盖输入 = 合并首尾格并把 typed 写进合并点
+            //（一个撤销步）；同格/无选区落空，继续下面的自动配对/常规插入。
+            if self.edit(cx, |m| t::merge_cross_cell_selection(m, text)) {
+                self.after_edit(cx);
+                return;
+            }
             if let (Some(ch), None) = (cs.next(), cs.next())
                 && self.try_autopair(ch, cx)
             {
@@ -3073,6 +3162,23 @@ struct RowPaint {
 
 /// A source line's last-frame text layout, recorded by `LiveLine::paint`.
 #[derive(Clone)]
+/// 单元格的帧内命中记录（spec #6）：cell LiveLine 在 `paint` 时写入，
+/// `cell_div` 的元素级按下/移动监听用它做坐标 → 格内行列的映射（与
+/// LiveLine 窗口监听同一套：文本三段夹取 + segs 可见列 → 源列换算）。
+pub(crate) struct CellHit {
+    /// 本格文本的排版（窗口坐标系，`position_for_index` 已折入原点）。
+    pub layout: gpui::TextLayout,
+    /// 本格可见文本字节数。
+    pub text_len: usize,
+    /// 本格文本的布局盒（≠ 格盒：格盒由 cell_div 命中框覆盖，这里只
+    /// 负责「右空白 → 文本末 / 左空白 → 文本首 / 中间 → 字形映射」）。
+    pub text_bounds: gpui::Bounds<gpui::Pixels>,
+    /// 可见字节 → 行内源字节的映射段（本格内容范围，绝对行内偏移）。
+    pub segs: Vec<crate::editor::markdown_live::layout::Seg>,
+    /// 本格内容的行内字节范围（去 padding）。
+    pub content: std::ops::Range<usize>,
+}
+
 pub(crate) struct RowLayoutInfo {
     pub layout: gpui::TextLayout,
     pub text_len: usize,
@@ -3525,6 +3631,7 @@ impl Render for LiveMarkdownView {
 
         // Fresh per-frame hit geometry (LiveLine::paint repopulates).
         self.row_layouts.clear();
+        self.cell_hits.clear();
         self.row_targets.clear();
 
         // Plan rows (cached on version+cursor+selection+focus).
@@ -5227,12 +5334,15 @@ impl Render for LiveMarkdownView {
                                         cell_caret_h,
                                     )
                                     .with_cell_segs(plan.segs.clone(), content.clone())
-                                    .with_caret_shape(self.cursor_shape),
+                                    .with_caret_shape(self.cursor_shape)
+                                    .with_cell_key(row_line, col),
                                 );
                             } else {
-                                // 非活动格：同样走 `plan_cell`（reveal=false，
+                                // 非活动格：与活动格同一套 LiveLine 规划（reveal=false，
                                 // 标记隐藏），只是不上光标。两条路径共用一份
-                                // 规划器，光标移进/移出格子时文字不会跳变。
+                                // 规划器，光标移进/移出格子时文字不会跳变；
+                                // 选区高亮同样渲染（spec #6 跨格选区要可见），
+                                // 且与活动格一致夹在本格内容范围内。
                                 let src_line = src_lines
                                     .get(di.min(src_lines.len() - 1))
                                     .map(String::as_str)
@@ -5246,16 +5356,96 @@ impl Render for LiveMarkdownView {
                                 let trail = raw.len() - raw.trim_end().len();
                                 let content = (s + lead)..(e - trail).max(s + lead);
                                 let plan =
-                                    plan_cell(src_line, content, None, &table_refs);
+                                    plan_cell(src_line, content.clone(), None, &table_refs);
                                 let cell_base = row_base_style(&plan, &style);
-                                let runs = runs_for_row(
+                                let mut runs = runs_for_row(
                                     &plan, &cell_base, &colors, &style, &self.hl, &theme,
                                 );
+                                // 选区高亮：与活动格同一套映射，夹在本格内容内
+                                //（选区外的格 line_selection 落空，不染色）。
+                                if let Some((s, e)) = selection {
+                                    let line_len = src_line.chars().count();
+                                    if let Some((cs, ce, _)) =
+                                        line_selection(s, e, row_line, line_len)
+                                    {
+                                        let bs = byte_for_col(src_line, cs).max(content.start);
+                                        let be = byte_for_col(src_line, ce).min(content.end);
+                                        if be > bs {
+                                            let vsel = (
+                                                vis_for_src(&plan.segs, bs),
+                                                vis_for_src(&plan.segs, be),
+                                            );
+                                            runs = apply_selection(
+                                                runs,
+                                                plan.visible.len(),
+                                                Some(vsel),
+                                                colors.selection,
+                                            );
+                                        }
+                                    }
+                                }
+                                // 探针：非活动格（测试断言点击落在该格）。
+                                cell_div = cell_div.debug_selector(move || {
+                                    format!("live-table-cell-{di}-{col}")
+                                });
                                 cell_div = cell_div.child(
-                                    StyledText::new(SharedString::from(plan.visible.clone()))
-                                        .with_runs(runs),
+                                    LiveLine::new(
+                                        ("live-table-cell", start_line + di * 64 + col),
+                                        SharedString::from(plan.visible.clone()),
+                                        runs,
+                                        row_line,
+                                        entity.clone(),
+                                        false,
+                                        None, // 光标只在活动格
+                                        colors.caret,
+                                        CURSOR_WIDTH,
+                                        px(0.0),
+                                    )
+                                    .with_cell_segs(plan.segs.clone(), content.clone())
+                                    .with_caret_shape(self.cursor_shape)
+                                    .with_cell_key(row_line, col),
                                 );
                             }
+                            // spec #6：元素级按下/移动认领 —— 命中框 = 整格
+                            //（含内边距/未填满区域），只有指针所在的格触发；
+                            // 坐标 → 行列的映射走本格 LiveLine 的帧内记录
+                            //（cell_hits；双击/Shift 语义仍走
+                            // on_table_cell_mouse_down）。
+                            let hit_key = (row_line, col);
+                            cell_div = cell_div.on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                    let Some(c) =
+                                        this.cell_col_at(hit_key.0, hit_key.1, event.position)
+                                    else {
+                                        return;
+                                    };
+                                    this.on_table_cell_mouse_down(
+                                        hit_key.0,
+                                        c,
+                                        event.click_count,
+                                        event.modifiers.shift,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            );
+                            cell_div = cell_div.on_mouse_move(cx.listener(
+                                move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                                    if !matches!(
+                                        event.pressed_button,
+                                        Some(gpui::MouseButton::Left)
+                                    ) {
+                                        return;
+                                    }
+                                    let Some(c) =
+                                        this.cell_col_at(hit_key.0, hit_key.1, event.position)
+                                    else {
+                                        return;
+                                    };
+                                    this.on_table_cell_drag(hit_key.0, c, cx);
+                                },
+                            ));
                             row_div = row_div.child(cell_div.into_any_element());
                         }
                         grid = grid.child(row_div);
@@ -7015,6 +7205,180 @@ mod live_frame_tests {
         );
         let text = view.read_with(cx, |v, _| v.text());
         assert!(!text.contains("tail"), "行文本应被删除：{text:?}");
+    }
+
+    /// spec #6：跨格选区全链路 —— ①点非活动格由该格认领（不再被活动格
+    /// 串认领整行后夹回）；②拖拽端点跟随指针所在格成形跨格选区；③覆盖
+    /// 输入 = 合并首尾格 + 写入 typed（一个动作）；④退格 = 同样的合并
+    /// 删除、中间格清空、结构不动；⑤粘贴 = 先合并删除、再按 `|` 分发。
+    #[gpui::test]
+    fn live_table_cross_cell_selection_merge_spec6(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // 0:表头 1:分隔 2:数据 3:数据 4:空 5:尾段
+        const DOC: &str = "| aa | bb |\n|---|---|\n| cc | dd |\n| ee | ff |\n\ntail\n";
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let line_count_before = view.read_with(cx, |v, _| v.buffer.line_count());
+
+        /// 某格的内容（去 padding）。`ci` 用探测列定位：0 → 第一格，
+        /// 其余 → 最后一格（映射兜底取末格），对重排后的宽度不敏感。
+        fn cell_text(v: &LiveMarkdownView, line: usize, ci: usize) -> String {
+            let text = v.buffer.line(line).unwrap_or("").to_string();
+            let (cs, ce) = v
+                .table_cell_content_at(line, if ci == 0 { 0 } else { 999 })
+                .expect("该行应是表格格");
+            let chars: Vec<char> = text.chars().collect();
+            chars
+                .get(cs..ce)
+                .map(|s| s.iter().collect())
+                .unwrap_or_default()
+        }
+        /// 某格的内容起点 char 列（空格 = 去 padding 后的空位）。
+        fn cell_cs(v: &LiveMarkdownView, line: usize, ci: usize) -> usize {
+            v.table_cell_content_at(line, if ci == 0 { 0 } else { 999 })
+                .expect("该行应是表格格")
+                .0
+        }
+        /// 拖出跨格选区：锚 = `(la, ca)` 格、终点 = `(lb, cb)` 格。
+        fn drag_range(
+            host: &gpui::Entity<Host>,
+            cx: &mut gpui::TestAppContext,
+            la: usize,
+            ca: usize,
+            lb: usize,
+            cb: usize,
+        ) {
+            let view = host.read_with(cx, |h, _| h.0.clone());
+            view.update(cx, |v, cx| {
+                v.edit(cx, |m| m.move_to(la, ca, false));
+                v.after_move(cx);
+                v.selecting = true;
+                v.on_table_cell_drag(lb, cb, cx);
+            });
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        }
+
+        // 1) 点非活动格：元素级认领 → 光标落进被点的格（line2 cell1），
+        //    而不是被活动格（cell0）的窗口监听夹回。
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let nb = cx
+            .debug_bounds("live-table-cell-2-1")
+            .expect("非活动格应有探针与命中框");
+        cx.simulate_click(nb.center(), gpui::Modifiers::none());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let (line, col) = view.read_with(cx, |v, _| {
+            let c = v.buffer.cursor();
+            (c.line, c.col)
+        });
+        assert_eq!(line, 2, "点击应落在被点的数据行");
+        let cs1 = view.read_with(cx, |v, _|cell_cs(v, 2, 1));
+        let ce1 = view.read_with(cx, |v, _|{
+            v.table_cell_content_at(2, 999).map(|(_, e)| e).unwrap()
+        });
+        assert!(
+            (cs1..=ce1).contains(&col),
+            "光标应落在被点的非活动格内容内（col={col}，格=[{cs1},{ce1}]）"
+        );
+
+        // 2) 覆盖输入：拖 (2, cs0+1) → (3, cell1 内容首)，输入 `z`
+        //    = 合并首尾格 + typed 写进合并点。
+        let prefix_col = view.read_with(cx, |v, _|cell_cs(v, 2, 0) + 1); // 前缀 = "c"
+        let end_col = view.read_with(cx, |v, _|cell_cs(v, 3, 1)); // 后缀 = "ff"
+        drag_range(&host, cx, 2, prefix_col, 3, end_col);
+        let sel = view.read_with(cx, |v, _| v.buffer.selection());
+        assert_eq!(
+            sel,
+            Some((Pos::new(2, prefix_col), Pos::new(3, end_col))),
+            "拖拽端点应跟随指针所在格（跨格选区成形）"
+        );
+        cx.simulate_input("z");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            "czff",
+            "覆盖输入：首格 ← 前缀 + typed + 尾格后缀"
+        );
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 2, 1)), "", "同排后格应清空");
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 0)), "", "尾格前的格应清空");
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 1)), "", "尾格应清空");
+        let c = view.read_with(cx, |v, _| v.buffer.cursor());
+        assert_eq!(
+            (c.line, c.col),
+            (2, view.read_with(cx, |v, _|cell_cs(v, 2, 0)) + 2), // "c" + "z" 之后
+            "光标应落在首格合并点"
+        );
+        assert!(view.read_with(cx, |v, _| v.buffer.selection()).is_none());
+
+        // 3) 退格：表头里拖同排跨格选区 → 合并删除（首格保留前缀 +
+        //    尾格后缀），数据行与结构不动。
+        let h0 = view.read_with(cx, |v, _|cell_cs(v, 0, 0) + 1); // 前缀 = "a"
+        let h1 = view.read_with(cx, |v, _|cell_cs(v, 0, 1)); // 后缀 = "bb"
+        drag_range(&host, cx, 0, h0, 0, h1);
+        cx.simulate_keystrokes("backspace");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _|cell_text(v, 0, 0)),
+            "abb",
+            "退格合并：首格 ← 前缀 + 尾格后缀"
+        );
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 0, 1)), "", "同排尾格应清空");
+        assert_eq!(
+            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            "czff",
+            "选区外的数据行不受影响"
+        );
+
+        // 4) 粘贴：跨格选区 + 含 `|` 的文本 = 先合并删除，再从首格分发。
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("P|Q".to_string()));
+        let p0 = view.read_with(cx, |v, _|cell_cs(v, 2, 0));
+        let p1 = view.read_with(cx, |v, _|cell_cs(v, 3, 1));
+        drag_range(&host, cx, 2, p0, 3, p1);
+        cx.simulate_keystrokes("cmd-v");
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            "P",
+            "粘贴分发：首格 ← 第一列"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _|cell_text(v, 2, 1)),
+            "Q",
+            "粘贴分发：同排次格 ← 第二列"
+        );
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 0)), "", "选区内尾行应已清空");
+        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 1)), "", "选区内尾行应已清空");
+
+        // 5) 结构始终完好：行数不变、表格块范围不变（分隔行仍是结构行）。
+        assert_eq!(
+            view.read_with(cx, |v, _| v.buffer.line_count()),
+            line_count_before,
+            "合并/分发都不得增删行"
+        );
+        let lines: Vec<String> = view.read_with(cx, |v, _| v.buffer.lines().to_vec());
+        assert_eq!(
+            crate::editor::markdown_live::table_ops::table_block_range(&lines, 0),
+            Some((0, 3)),
+            "表格块范围（含分隔行）应保持不变"
+        );
     }
 
     /// spec #14：工具栏 = 尺寸弹层（行 2..=99 / 列 1..=40 步进器）+ 对齐 ×3 +

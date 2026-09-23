@@ -383,6 +383,13 @@ impl EditorModel {
     })
   }
 
+  /// 选区锚点（拖拽/Shift 扩展的起点），`None` = 无选区意图。
+  /// 与 [`Self::selection`]（按文档序归一化）不同，这里保留原始方向，
+  /// 跨格拖拽的「起点是否在表内」判断需要它。
+  pub fn anchor(&self) -> Option<Pos> {
+    self.anchor
+  }
+
   pub fn clear_selection(&mut self) {
     self.anchor = None;
   }

@@ -17,7 +17,7 @@ use crate::components::input::cursor::{CursorLayout, CursorShape};
 
 use crate::editor::markdown::MarkdownStyle;
 use crate::editor::markdown_live::highlight::HighlightCache;
-use crate::editor::markdown_live::layout::{RowKind, RowPlan, Seg, col_for_byte, src_for_vis};
+use crate::editor::markdown_live::layout::{RowKind, RowPlan, Seg};
 use crate::editor::markdown_live::view::LiveMarkdownView;
 use crate::theme::AppTheme;
 
@@ -397,6 +397,10 @@ pub struct LiveLine {
     /// (absolute in the line) and clamp to the cell's content range instead
     /// of the whole line. `None` = ordinary full-line row.
     pub cell: Option<(Vec<Seg>, std::ops::Range<usize>)>,
+    /// 格键 `(源行, 格列)`：仅单元格模式设置。paint 时据此把本格命中信息
+    /// 写回视图（[`crate::editor::markdown_live::view::CellHit`]），
+    /// 供 `cell_div` 的元素级按下/移动监听映射坐标（spec #6）。
+    pub cell_key: Option<(usize, usize)>,
 }
 
 impl LiveLine {
@@ -429,6 +433,7 @@ impl LiveLine {
             line_height,
             drag_fallback: false,
             cell: None,
+            cell_key: None,
         }
     }
 
@@ -440,6 +445,13 @@ impl LiveLine {
         content: std::ops::Range<usize>,
     ) -> Self {
         self.cell = Some((segs, content));
+        self
+    }
+
+    /// 记录用的格键 `(源行, 格列)`（见 [`Self::cell_key`]；与
+    /// [`Self::with_cell_segs`] 成对使用）。
+    pub fn with_cell_key(mut self, line: usize, col: usize) -> Self {
+        self.cell_key = Some((line, col));
         self
     }
 
@@ -521,6 +533,21 @@ impl Element for LiveLine {
         let layout = styled.layout().clone();
         let text_len = self.text.len();
 
+        // 单元格模式：把本格命中信息记回视图（cell_div 的元素级按下/移动
+        // 监听据此映射坐标；spec #6）。与 row_layouts 同为帧内字段写入。
+        if let Some(key) = self.cell_key
+            && let Some((segs, content)) = self.cell.clone()
+        {
+            let hit = crate::editor::markdown_live::view::CellHit {
+                layout: layout.clone(),
+                text_len,
+                text_bounds: bounds,
+                segs,
+                content,
+            };
+            self.view.update(cx, |v, _| v.record_cell_hit(key, hit));
+        }
+
         // Record this row's layout for the view's visual-row movement and
         // dead-zone hit fallbacks (plain field write; no notify).
         {
@@ -560,103 +587,86 @@ impl Element for LiveLine {
         let line = self.line;
         let view = self.view.clone();
         let gutter = self.gutter;
-        let layout_down = layout.clone();
-        // 表格单元格模式：把可见字节映射回**行内**字节时，要走本格的 segs
-        // 并把结果夹在本格内容范围内（否则点击会跑到相邻格/管道上）。
-        let cell_down = self.cell.clone();
-        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble || event.button != gpui::MouseButton::Left {
-                return;
-            }
-            // 本监听是窗口级全局的、不受命中测试约束：先要求点击落在实时
-            // 编辑器内容视口的横向范围内。否则右侧终端面板的点击会命中下面
-            // 的 y 判定，被当成“行尾空白”认领 —— window.focus 会把焦点抢回
-            // live 编辑器并 stop_propagation，终端永远拿不到焦点。
-            let vp = view.read(cx).content_viewport_bounds();
-            if event.position.x < vp.left() || event.position.x > vp.right() {
-                return;
-            }
-            // Claim clicks anywhere on this row's horizontal band so the
-            // cursor can land past end-of-line on short lines — not just on
-            // glyphs. Left of the text maps to line start, except on task
-            // rows where the checkbox gutter owns that space.
-            if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
-                return;
-            }
-            let raw = if event.position.x >= bounds.right() {
-                // Empty area past EOL → line end.
-                text_len
-            } else if event.position.x < bounds.left() {
-                if gutter {
-                    // Interactive gutter (task checkbox) owns this space.
+        // spec #6：单元格模式的按下/移动由 `cell_div` 的**元素级**监听认领
+        // （命中框覆盖整格含内边距，且只有指针所在的格触发；坐标映射走
+        // paint 记录的 `cell_hits`），LiveLine 在格模式下不注册这两个窗口
+        // 监听，只保留 mouse-up 统一收尾（清 selecting）。普通行原样。
+        if self.cell.is_none() {
+            let layout_down = layout.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || event.button != gpui::MouseButton::Left {
                     return;
                 }
-                // Margin/padding left of plain text → line start.
-                0
-            } else {
-                match layout_down.index_for_position(event.position) {
-                    Ok(ix) | Err(ix) => ix.min(text_len),
+                // 本监听是窗口级全局的、不受命中测试约束：先要求点击落在实时
+                // 编辑器内容视口的横向范围内。否则右侧终端面板的点击会命中下面
+                // 的 y 判定，被当成“行尾空白”认领 —— window.focus 会把焦点抢回
+                // live 编辑器并 stop_propagation，终端永远拿不到焦点。
+                let vp = view.read(cx).content_viewport_bounds();
+                if event.position.x < vp.left() || event.position.x > vp.right() {
+                    return;
                 }
-            };
-            // 单元格模式：可见字节 → 行内字节 → 行内 char 列。
-            if let Some((segs, _content)) = cell_down.clone() {
-                let src_byte = src_for_vis(&segs, raw);
-                let line_text = view.read(cx).line_text(line).unwrap_or_default();
-                let col = col_for_byte(&line_text, src_byte);
+                // Claim clicks anywhere on this row's horizontal band so the
+                // cursor can land past end-of-line on short lines — not just on
+                // glyphs. Left of the text maps to line start, except on task
+                // rows where the checkbox gutter owns that space.
+                if event.position.y < bounds.top() || event.position.y > bounds.bottom() {
+                    return;
+                }
+                let raw = if event.position.x >= bounds.right() {
+                    // Empty area past EOL → line end.
+                    text_len
+                } else if event.position.x < bounds.left() {
+                    if gutter {
+                        // Interactive gutter (task checkbox) owns this space.
+                        return;
+                    }
+                    // Margin/padding left of plain text → line start.
+                    0
+                } else {
+                    match layout_down.index_for_position(event.position) {
+                        Ok(ix) | Err(ix) => ix.min(text_len),
+                    }
+                };
                 let shift = event.modifiers.shift;
+                let platform = event.modifiers.platform;
                 view.update(cx, |v, cx| {
-                    v.on_table_cell_mouse_down(line, col, event.click_count, shift, window, cx)
+                    v.on_line_mouse_down(line, raw, event.click_count, shift, platform, window, cx)
                 });
-                return;
-            }
-            let shift = event.modifiers.shift;
-            let platform = event.modifiers.platform;
-            view.update(cx, |v, cx| {
-                v.on_line_mouse_down(line, raw, event.click_count, shift, platform, window, cx)
             });
-        });
 
-        let view = self.view.clone();
-        let hitbox_move = hitbox.clone();
-        let layout_move = layout.clone();
-        let drag_fallback = self.drag_fallback;
-        let cell_drag = self.cell.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            if !matches!(event.pressed_button, Some(gpui::MouseButton::Left)) {
-                return;
-            }
-            // 同上：只认领落在内容视口横向范围内的拖拽，避免在终端面板上
-            // 拖动时被 live 的选择逻辑接管。
-            let vp = view.read(cx).content_viewport_bounds();
-            if event.position.x < vp.left() || event.position.x > vp.right() {
-                return;
-            }
-            if bounds.top() > event.position.y || event.position.y > bounds.bottom() {
-                // Out of this row's band: the designated fallback row maps
-                // the drag to the nearest line (blank rows, margins).
-                if drag_fallback {
-                    let position = event.position;
-                    view.update(cx, |v, cx| v.on_fallback_drag(position, cx));
+            let view = self.view.clone();
+            let hitbox_move = hitbox.clone();
+            let layout_move = layout.clone();
+            let drag_fallback = self.drag_fallback;
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
                 }
-                return;
-            }
-            let _ = hitbox_move;
-            let raw = match layout_move.index_for_position(event.position) {
-                Ok(ix) | Err(ix) => ix.min(text_len),
-            };
-            // 单元格模式：拖拽选择同样限制在本格内（segs 映射）。
-            if let Some((segs, _)) = cell_drag.clone() {
-                let src_byte = src_for_vis(&segs, raw);
-                let line_text = view.read(cx).line_text(line).unwrap_or_default();
-                let col = col_for_byte(&line_text, src_byte);
-                view.update(cx, |v, cx| v.on_table_cell_drag(line, col, cx));
-                return;
-            }
-            view.update(cx, |v, cx| v.on_line_drag(line, raw, window, cx));
-        });
+                if !matches!(event.pressed_button, Some(gpui::MouseButton::Left)) {
+                    return;
+                }
+                // 同上：只认领落在内容视口横向范围内的拖拽，避免在终端面板上
+                // 拖动时被 live 的选择逻辑接管。
+                let vp = view.read(cx).content_viewport_bounds();
+                if event.position.x < vp.left() || event.position.x > vp.right() {
+                    return;
+                }
+                if bounds.top() > event.position.y || event.position.y > bounds.bottom() {
+                    // Out of this row's band: the designated fallback row maps
+                    // the drag to the nearest line (blank rows, margins).
+                    if drag_fallback {
+                        let position = event.position;
+                        view.update(cx, |v, cx| v.on_fallback_drag(position, cx));
+                    }
+                    return;
+                }
+                let _ = hitbox_move;
+                let raw = match layout_move.index_for_position(event.position) {
+                    Ok(ix) | Err(ix) => ix.min(text_len),
+                };
+                view.update(cx, |v, cx| v.on_line_drag(line, raw, window, cx));
+            });
+        }
 
         let view = self.view.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {

@@ -11,6 +11,7 @@
 use crate::editor::markdown_live::block::{
     is_delimiter_cell, split_table_row, table_cell_spans,
 };
+use crate::editor::markdown_live::interactions::cell_content_cols;
 use crate::editor::markdown_live::model::{EditorModel, Pos};
 
 /// 表格块的范围：`(起始行, 结束行)`，闭区间。`None` = 该行不是表格。
@@ -843,6 +844,130 @@ fn move_column_at(model: &mut EditorModel, a: usize, b: usize) -> bool {
 
 /// 把 `edits`（行号 → 新文本）写回模型。从后往前替换，避免行号漂移。
 /// **保持光标不动**（否则连续操作会作用到错误的行列上）。
+/// 跨格选区的结构化删除 / 覆盖输入（Typora spec #6）。
+///
+/// 拖拽可以产生端点落在**不同单元格**的选区；Typora 把它当格范围处理：
+/// 删除/覆盖时「首格 ← 首格前缀 + `typed` + 尾格后缀」，首格之后到尾格
+/// 为止的所有格（含尾格本身）清空，行/列结构不动（GFM 无 colspan，
+/// 格子只清内容不合并结构）。光标落在首格的合并点，选区清除；`typed`
+/// 非空即覆盖输入（合并与写入同一个撤销步）。
+///
+/// 返回 `false` = 不是跨格选区（无选区 / 同格 / 端点不在同一表块），
+/// 调用方回退到常规文本删除 / 插入。
+pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool {
+    let Some((start, end)) = model.selection() else {
+        return false;
+    };
+    if start == end {
+        return false;
+    }
+    let lines = model.lines().to_vec();
+    let Some(block) = table_block_range(&lines, start.line) else {
+        return false;
+    };
+    if table_block_range(&lines, end.line) != Some(block) {
+        return false;
+    }
+    // 端点所在格列（字节落在管道上时归左格，随后截断会夹回内容内）。
+    let cell_col = |line: usize, col: usize| -> Option<usize> {
+        let text = lines.get(line)?;
+        let byte = byte_for_col(text, col);
+        let spans = table_cell_spans(text);
+        spans
+            .iter()
+            .position(|(s, e)| byte >= *s && byte <= *e)
+            .or_else(|| spans.iter().position(|(s, _)| *s >= byte))
+            .or_else(|| spans.len().checked_sub(1))
+    };
+    let Some(sc) = cell_col(start.line, start.col) else {
+        return false;
+    };
+    let Some(ec) = cell_col(end.line, end.col) else {
+        return false;
+    };
+    if start.line == end.line && sc == ec {
+        return false;
+    }
+    // 首/尾格的内容范围（char 列，去 padding）与端点截断。
+    let start_text = &lines[start.line];
+    let end_text = &lines[end.line];
+    let Some((s_cs, s_ce)) = cell_content_cols(start_text, sc) else {
+        return false;
+    };
+    let Some((e_cs, e_ce)) = cell_content_cols(end_text, ec) else {
+        return false;
+    };
+    let off1 = start.col.clamp(s_cs, s_ce);
+    let off2 = end.col.clamp(e_cs, e_ce);
+    let prefix = &start_text[byte_for_col(start_text, s_cs)..byte_for_col(start_text, off1)];
+    let suffix = &end_text[byte_for_col(end_text, off2)..byte_for_col(end_text, e_ce)];
+    let mut merged = String::with_capacity(prefix.len() + typed.len() + suffix.len());
+    merged.push_str(prefix);
+    merged.push_str(typed);
+    merged.push_str(suffix);
+    let merge_col = s_cs + prefix.chars().count() + typed.chars().count();
+
+    // 逐行重写（字节区间从右往左套用，前面的偏移不受影响）：
+    //  - 首行：首格 ← 合并文本；首格之后的格全部清空；
+    //  - 中间行：所有格清空；
+    //  - 尾行：尾格及其之前的格清空（尾格后缀已并入首格），之后的不动；
+    //  - 同行跨格：首尾之间清空（含尾格），首格写合并文本。
+    let mut edits: Vec<(usize, String)> = Vec::new();
+    let delim = delimiter_row(&lines, block);
+    for l in start.line..=end.line {
+        // 分隔行是结构不是数据行：不参与合并/清空。
+        if Some(l) == delim {
+            continue;
+        }
+        let text = &lines[l];
+        let spans = table_cell_spans(text);
+        let blank_from = if l == start.line { sc + 1 } else { 0 };
+        let blank_to = if l == end.line {
+            (ec + 1).min(spans.len())
+        } else {
+            spans.len()
+        };
+        // (字节起点, 字节终点, 替换文本)，按字节从大到小套用。
+        let mut ops: Vec<(usize, usize, &str)> = Vec::new();
+        for ci in (blank_from..blank_to).rev() {
+            let Some((cs, ce)) = cell_content_cols(text, ci) else {
+                continue;
+            };
+            ops.push((byte_for_col(text, cs), byte_for_col(text, ce), ""));
+        }
+        if l == start.line {
+            ops.push((
+                byte_for_col(text, s_cs),
+                byte_for_col(text, s_ce),
+                &merged,
+            ));
+        }
+        let mut new_text = text.clone();
+        for (bs, be, repl) in ops {
+            if bs <= be && be <= new_text.len() {
+                new_text.replace_range(bs..be, repl);
+            }
+        }
+        if new_text != *text {
+            edits.push((l, new_text));
+        }
+    }
+    if edits.is_empty() {
+        return false;
+    }
+    // 整行批量改写：一个撤销步；随后把光标放到首格的合并点。
+    let ranges: Vec<(Pos, Pos, String)> = edits
+        .iter()
+        .map(|(i, new)| {
+            let len = lines[*i].chars().count();
+            (Pos::new(*i, 0), Pos::new(*i, len), new.clone())
+        })
+        .collect();
+    model.replace_ranges_each(&ranges);
+    model.move_to(start.line, merge_col, false);
+    true
+}
+
 fn apply_row_edits(model: &mut EditorModel, lines: &[String], edits: &[(usize, String)]) {
     let mut sorted: Vec<(usize, String)> = edits.to_vec();
     sorted.sort_by_key(|(i, _)| *i);
@@ -879,6 +1004,68 @@ mod tests {
         let mut m = EditorModel::new(DOC);
         m.move_to(line, col, false);
         m
+    }
+
+    const DOC2: &str = "| abc | def |\n|---|---|\n| ghi | jkl |\n| mno | pqr |\n";
+
+    /// 跨格选区（拖拽成形：锚 (0,3) → 终 (2,10)）：合并首尾格、清空中间格。
+    #[test]
+    fn merge_cross_cell_blanks_between_and_merges_endpoints() {
+        let mut m = EditorModel::new(DOC2);
+        m.move_to(0, 3, false); // 首格 "abc" 的 'b'：前缀 = "a"
+        m.move_to(2, 10, true); // 尾格 "jkl" 的 'l'：后缀 = "l"
+        assert!(merge_cross_cell_selection(&mut m, ""));
+        let lines: Vec<&str> = m.lines().iter().map(String::as_str).collect();
+        // 首行：首格 ← "a"+"l"，同排其后的格清空；分隔行不动；
+        // 中间数据行整行清空；尾行到尾格为止全部清空（尾格之后无列）。
+        assert_eq!(lines[0], "| al |  |");
+        assert_eq!(lines[1], "|---|---|");
+        assert_eq!(lines[2], "|  |  |");
+        // 尾行之后的行不动（选区外）。
+        assert_eq!(lines[3], "| mno | pqr |");
+        // 行数（结构）不变；光标在首格合并点、选区清除。
+        assert_eq!(m.line_count(), 5);
+        assert_eq!(m.cursor(), Pos::new(0, 3));
+        assert!(m.selection().is_none());
+    }
+
+    /// 覆盖输入：合并点插入 typed（与删除同一撤销步语义）。
+    #[test]
+    fn merge_cross_cell_type_over_inserts_at_merge_point() {
+        let mut m = EditorModel::new(DOC2);
+        m.move_to(0, 3, false);
+        m.move_to(2, 10, true);
+        assert!(merge_cross_cell_selection(&mut m, "X"));
+        assert_eq!(m.lines()[0], "| aXl |  |");
+        assert_eq!(m.cursor(), Pos::new(0, 4)); // "a" + "X" 之后
+        assert!(m.selection().is_none());
+    }
+
+    /// 同格选区 / 无选区：不是跨格，回退常规路径（返回 false、零改动）。
+    #[test]
+    fn merge_cross_cell_ignores_same_cell_and_no_selection() {
+        let mut m = EditorModel::new(DOC2);
+        // 无选区。
+        m.move_to(0, 3, false);
+        assert!(!merge_cross_cell_selection(&mut m, ""));
+        // 同格选区（cell0 内 col2..col4）。
+        m.move_to(0, 2, false);
+        m.move_to(0, 4, true);
+        assert!(!merge_cross_cell_selection(&mut m, ""));
+        assert_eq!(m.lines()[0], "| abc | def |");
+        assert!(m.selection().is_some(), "同格选区应原样保留给常规删除");
+    }
+
+    /// 整个合并 = 一个撤销步。
+    #[test]
+    fn merge_cross_cell_is_one_undo_step() {
+        let mut m = EditorModel::new(DOC2);
+        m.move_to(0, 3, false);
+        m.move_to(2, 10, true);
+        assert!(merge_cross_cell_selection(&mut m, ""));
+        assert!(m.undo());
+        let lines: Vec<&str> = m.lines().iter().map(String::as_str).collect();
+        assert_eq!(lines, DOC2.split('\n').collect::<Vec<_>>());
     }
 
     #[test]
