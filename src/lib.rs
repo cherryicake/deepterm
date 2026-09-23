@@ -105,6 +105,9 @@ pub struct AppWindow {
     title_pad_end: f32,
     title_pad_ms: u64,
     last_sidebar_epoch: u32,
+    /// 上帧侧边栏宽度：拖拽右边缘时宽度连续变化但不换 epoch，用它算增量
+    /// 并让编辑器按比例分摊（显隐动画期间宽度不变，不会误触发）。
+    last_sidebar_width: f32,
     last_editor_epoch: u32,
     /// 编辑器 tab 栏左内边距动画纪元：与侧边栏/编辑器翻转同步递增。
     tab_pad_epoch: u32,
@@ -175,6 +178,7 @@ impl AppWindow {
             title_pad_end: 0.0,
             title_pad_ms: 0,
             last_sidebar_epoch: 0,
+            last_sidebar_width: 0.0,
             last_editor_epoch: 0,
             tab_pad_epoch: 0,
             last_fullscreen: window.is_fullscreen(),
@@ -1159,6 +1163,19 @@ impl AppWindow {
         cx.notify();
     }
 
+    /// 编辑器「窗口跟随」的宽度上限：窗口宽 − 侧边栏占位 − 主区最小宽。
+    /// `render` 与 `render_main_area` 共用（两处都要下发同一上限）。
+    fn editor_follow_limit(&self, window: &gpui::Window, cx: &gpui::App) -> f32 {
+        let win_w: f32 = window.viewport_size().width.into();
+        let sidebar = self.sidebar.read(cx);
+        let sidebar_occ = if sidebar.is_visible() {
+            sidebar.width() + 8.0
+        } else {
+            0.0
+        };
+        (win_w - sidebar_occ - MAIN_AREA_MIN_WIDTH).max(0.0)
+    }
+
     /// 渲染侧边栏切换按钮
     fn render_sidebar_toggle(
         &self,
@@ -1234,9 +1251,13 @@ impl AppWindow {
         }
 
         // 从 Sidebar / Editor Entity 读取状态
-        let (is_visible, sidebar_epoch) = {
+        let (is_visible, sidebar_epoch, sidebar_w) = {
             let sidebar = self.sidebar.read(cx);
-            (sidebar.is_visible(), sidebar.animation_epoch())
+            (
+                sidebar.is_visible(),
+                sidebar.animation_epoch(),
+                sidebar.width(),
+            )
         };
         let (editor_is_empty, editor_epoch) = {
             let editor = self.editor.read(cx);
@@ -1333,6 +1354,18 @@ impl AppWindow {
                     editor.set_tab_bar_pad_animation(epoch, before, tab_pad_target, ms, cx);
                 });
             }
+            // 侧边栏显隐释放/占用的宽度：编辑器按比例分摊，其余留给主区（终端）。
+            // 与侧边栏动画同时长同缓动，避免终端先跳变再被拉回。
+            let sidebar_delta = if is_visible { sidebar_w } else { -sidebar_w };
+            let ms = if is_visible {
+                SIDEBAR_ENTER_MS
+            } else {
+                SIDEBAR_EXIT_MS
+            };
+            let limit = self.editor_follow_limit(window, cx);
+            self.editor.update(cx, |editor, cx| {
+                editor.follow_sidebar_width(sidebar_delta, limit, ms, cx);
+            });
         } else if self.tab_pad_epoch == 0 {
             // 无翻转（初始状态/全屏切换等）：保持静态 pad 与目标同步
             if !editor_is_empty {
@@ -1341,6 +1374,19 @@ impl AppWindow {
                 });
             }
         }
+
+        // 侧边栏拖拽：宽度连续变化但不换 epoch（显隐动画只改渲染层，不动
+        // `width`），所以这里的增量只可能来自拖拽。与显隐走同一套分摊比例，
+        // 但不播动画（拖拽要 1:1 跟手，按当前鼠标位置立即结算）。
+        // 0.0 作为「尚未记录」的哨兵（宽度下限 220，不会与真实值冲突）。
+        if self.last_sidebar_width > 0.0 && (sidebar_w - self.last_sidebar_width).abs() > 0.5 {
+            let delta = sidebar_w - self.last_sidebar_width;
+            let limit = self.editor_follow_limit(window, cx);
+            self.editor.update(cx, |editor, cx| {
+                editor.follow_sidebar_width(delta, limit, 0, cx);
+            });
+        }
+        self.last_sidebar_width = sidebar_w;
 
         // 编辑器打开时，TitleBar 内部 left_padding 设为 3px，
         // 使终端 TabBar 与编辑器分割线统一保持 3px 间距；
@@ -1422,18 +1468,11 @@ impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
 
-        let sidebar_visible = self.sidebar.read(cx).is_visible();
         let editor_is_empty = self.editor.read(cx).is_empty();
 
         // 编辑器「窗口跟随」的宽度上限：窗口宽 − 侧边栏占位 − 主区最小宽。
         // 每帧下发，保证窗口缩窄时编辑器让位，不会把主区挤出窗口。
-        let sidebar_occ = if sidebar_visible {
-            self.sidebar.read(cx).width() + 8.0
-        } else {
-            0.0
-        };
-        let win_w: f32 = window.viewport_size().width.into();
-        let editor_limit = (win_w - sidebar_occ - MAIN_AREA_MIN_WIDTH).max(0.0);
+        let editor_limit = self.editor_follow_limit(window, cx);
         self.editor.update(cx, |editor, _cx| {
             editor.set_window_follow_limit(editor_limit);
         });

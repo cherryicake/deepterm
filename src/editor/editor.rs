@@ -291,12 +291,17 @@ pub struct Editor {
     tab_bar_pad_start: f32,
     tab_bar_pad_end: f32,
     tab_bar_pad_duration_ms: u64,
-    /// 编辑器展开/收起动画纪元：每次「空 ↔ 非空」转变 +1，作为 with_animation 的 key。
+    /// 编辑器「空 ↔ 非空」翻转纪元：每次转变 +1。AppWindow 用它同步标题栏
+    /// padding / tab 栏内边距动画，因此**不能**被侧边栏跟随（面板宽度动画）污染。
     open_anim_epoch: u32,
-    /// 展开/收起动画起始宽度
-    open_anim_start: f32,
-    /// 展开/收起动画目标宽度
-    open_anim_end: f32,
+    /// 面板宽度动画纪元：开合与侧边栏跟随共用，作为 with_animation 的 key。
+    panel_anim_epoch: u32,
+    /// 面板宽度动画起始宽度
+    panel_anim_start: f32,
+    /// 面板宽度动画目标宽度
+    panel_anim_end: f32,
+    /// 面板宽度动画时长（开合 120ms；侧边栏跟随与侧边栏动画等长）
+    panel_anim_ms: u64,
     /// 恢复文件树/会话状态期间为 true：禁止播放展开动画（避免切换标签页组/文件树时闪动）
     suppress_open_animation: bool,
     content_left_padding: f32,
@@ -359,8 +364,10 @@ impl Editor {
             tab_bar_pad_end: 6.0,
             tab_bar_pad_duration_ms: 0,
             open_anim_epoch: 0,
-            open_anim_start: 0.0,
-            open_anim_end: 0.0,
+            panel_anim_epoch: 0,
+            panel_anim_start: 0.0,
+            panel_anim_end: 0.0,
+            panel_anim_ms: EDITOR_OPEN_ANIMATION_MS,
             suppress_open_animation: false,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
@@ -400,15 +407,60 @@ impl Editor {
             return;
         }
         self.open_anim_epoch = self.open_anim_epoch.wrapping_add(1);
-        self.open_anim_start = 0.0;
-        self.open_anim_end = self.width;
+        self.panel_anim_epoch = self.panel_anim_epoch.wrapping_add(1);
+        self.panel_anim_start = 0.0;
+        self.panel_anim_end = self.width;
+        self.panel_anim_ms = EDITOR_OPEN_ANIMATION_MS;
     }
 
     /// 编辑器从打开 → 关闭（最后一个文件关闭）：记录收起动画（当前宽度 → 0）。
     fn begin_close_animation(&mut self) {
         self.open_anim_epoch = self.open_anim_epoch.wrapping_add(1);
-        self.open_anim_start = self.width;
-        self.open_anim_end = 0.0;
+        self.panel_anim_epoch = self.panel_anim_epoch.wrapping_add(1);
+        self.panel_anim_start = self.width;
+        self.panel_anim_end = 0.0;
+        self.panel_anim_ms = EDITOR_OPEN_ANIMATION_MS;
+    }
+
+    /// 侧边栏改变了宽度（显隐动画或拖拽）：编辑器按
+    /// `EDITOR_WINDOW_FOLLOW_RATIO` 分摊其中一部分，其余留给主区（终端）。
+    ///
+    /// `sidebar_delta` 是侧边栏宽度的变化量（正 = 侧边栏变宽、主区可用宽度
+    /// 变小）。`ms > 0` 时播放等长动画（显隐，由调用方与侧边栏动画对齐，
+    /// 保证两者同步插值、终端不会先跳变再被拉回）；`ms == 0` 时立即结算
+    /// （拖拽需要 1:1 跟手）。
+    ///
+    /// `width` 始终立即写为目标值（作为窗口跟随/拖拽的基准），动画只负责
+    /// 渲染插值；拖拽或窗口缩放一旦改动 `width`，渲染层的目标守卫会自动
+    /// 取消该动画，与开合动画同一套失效逻辑。
+    pub fn follow_sidebar_width(
+        &mut self,
+        sidebar_delta: f32,
+        limit: f32,
+        ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // 空编辑器不参与布局（宽度目标为 0），变化的宽度全部归主区。
+        if self.is_empty() {
+            return;
+        }
+        let max_w = limit.max(EDITOR_MIN_WIDTH);
+        let start = self.width;
+        let end = (self.width - sidebar_delta * EDITOR_WINDOW_FOLLOW_RATIO)
+            .clamp(EDITOR_MIN_WIDTH, max_w);
+        if (end - self.width).abs() <= 0.5 {
+            return;
+        }
+        // 立即结算（拖拽）时让起点=终点：渲染层的「起止无差」守卫会跳过动画，
+        // 既保证 1:1 跟手，也避免之后拖回旧目标宽度时重播一次过期的动画。
+        self.panel_anim_start = if ms > 0 { start } else { end };
+        self.panel_anim_end = end;
+        self.panel_anim_ms = ms;
+        if ms > 0 {
+            self.panel_anim_epoch = self.panel_anim_epoch.wrapping_add(1);
+        }
+        self.width = end;
+        cx.notify();
     }
 
     /// 获取当前活动文件 ID
@@ -3506,15 +3558,19 @@ impl Render for Editor {
             div().into_any_element()
         };
 
-        // 展开/收起动画：外层 wrapper 控制可见宽度（动画期间由 with_animation 从
-        // anim_start 驱动到 anim_end），内层 root 用 w_full() 填满 wrapper ——
-        // 否则内层固定在 anim_start(=0) 会导致内容/分割线全部 0 宽不可见。
-        // epoch == 0（从未播放过动画，如启动/恢复）或动画目标与当前状态不匹配
-        // （clear() 等状态突变但 epoch 未变）时直接应用目标宽度，避免残留旧动画终值。
-        let anim_epoch = self.open_anim_epoch;
-        let (anim_start, anim_end) = (self.open_anim_start, self.open_anim_end);
+        // 面板宽度动画（开合 / 侧边栏跟随）：外层 wrapper 控制可见宽度（动画
+        // 期间由 with_animation 从 anim_start 驱动到 anim_end），内层 root 用
+        // w_full() 填满 wrapper —— 否则内层固定在 anim_start(=0) 会导致内容/
+        // 分割线全部 0 宽不可见。
+        // epoch == 0（从未播放过动画，如启动/恢复）或动画目标与当前宽度不匹配
+        // （clear()/外部改写宽度等状态突变）时直接应用目标宽度，避免残留旧动画终值。
+        let anim_epoch = self.panel_anim_epoch;
+        let (anim_start, anim_end, anim_ms) =
+            (self.panel_anim_start, self.panel_anim_end, self.panel_anim_ms);
         let target_width = if is_empty { 0.0 } else { self.width };
-        let animating = anim_epoch > 0 && (anim_end - target_width).abs() <= 0.5;
+        let animating = anim_epoch > 0
+            && (anim_end - target_width).abs() <= 0.5
+            && (anim_end - anim_start).abs() > 0.5;
 
         let with_panel_actions = |panel: gpui::Div| {
             panel
@@ -3679,9 +3735,8 @@ impl Render for Editor {
         if animating {
             wrapper
                 .with_animation(
-                    ("editor-open-anim", anim_epoch),
-                    Animation::new(Duration::from_millis(EDITOR_OPEN_ANIMATION_MS))
-                        .with_easing(gpui::ease_in_out),
+                    ("editor-panel-anim", anim_epoch),
+                    Animation::new(Duration::from_millis(anim_ms)).with_easing(gpui::ease_in_out),
                     move |this, delta| this.w(px(anim_start + (anim_end - anim_start) * delta)),
                 )
                 .into_any_element()
@@ -4367,6 +4422,144 @@ mod tests {
             );
             e.window_follow_limit = f32::INFINITY;
             e.end_resize();
+        });
+    }
+
+    /// 侧边栏改变宽度（显隐/拖拽）时，编辑器必须按同一比例分摊，
+    /// 而不是让主区（终端）独吞全部增量。
+    #[gpui::test]
+    fn editor_shares_sidebar_width_change(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct WidthHost {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for WidthHost {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(self.editor.clone())
+                    .child(gpui::div().flex_1())
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(window, cx));
+            editor.update(cx, |e, _| e.suppress_open_animation = true);
+            WidthHost { editor }
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+        let info = EditorOpenFileInfo {
+            id: "a.txt".into(),
+            path: "a.txt".into(),
+            label: "a.txt".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("hello\n".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            diff_repo: None,
+        };
+        // 空编辑器不参与分摊：侧边栏宽度变化全部归主区。
+        editor.update(cx, |e, cx| {
+            e.open_files.clear();
+            e.active_file_id = None;
+            e.width = EDITOR_DEFAULT_WIDTH;
+            e.follow_sidebar_width(280.0, 10_000.0, 0, cx);
+            assert!(
+                (e.width - EDITOR_DEFAULT_WIDTH).abs() <= 0.5,
+                "empty editor must not take sidebar width, width={:.1}",
+                e.width
+            );
+        });
+
+        // 恢复文件（非空）后继续验证分摊数学。
+        cx.update(|window, cx| {
+            let cached = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("hello\n", window, cx);
+                state
+            });
+            editor.update(cx, |editor, cx| {
+                editor.restore_file_from_cache(&info, cached, window, cx);
+            });
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        editor.update(cx, |e, cx| {
+            e.width = 680.0;
+            // 收起侧边栏：delta = -280（侧边栏变窄）→ 编辑器 +140。
+            e.follow_sidebar_width(-280.0, 10_000.0, 0, cx);
+            assert!(
+                (e.width - 820.0).abs() <= 0.5,
+                "collapse must share half with editor, width={:.1}",
+                e.width
+            );
+            // 展开侧边栏：对称让回一半，来回切换可完全复原。
+            e.follow_sidebar_width(280.0, 10_000.0, 0, cx);
+            assert!(
+                (e.width - 680.0).abs() <= 0.5,
+                "expand must symmetrically give back, width={:.1}",
+                e.width
+            );
+            // 上限：侧边栏收起时也不能把主区挤到 MAIN_AREA_MIN_WIDTH 以下。
+            e.width = 680.0;
+            e.follow_sidebar_width(-280.0, 700.0, 0, cx);
+            assert!(
+                (e.width - 700.0).abs() <= 0.5,
+                "must respect limit, width={:.1}",
+                e.width
+            );
+            // 最小宽度：侧边栏大幅变宽时编辑器不会缩到 200 以下。
+            e.follow_sidebar_width(5000.0, 10_000.0, 0, cx);
+            assert!(
+                (e.width - EDITOR_MIN_WIDTH).abs() <= 0.5,
+                "must respect min width, width={:.1}",
+                e.width
+            );
+        });
+
+        // 显隐动画：宽度立即写为目标值（基准），渲染层插值由 panel 动画槽驱动。
+        editor.update(cx, |e, cx| {
+            e.width = 680.0;
+            e.follow_sidebar_width(-280.0, 10_000.0, 300, cx);
+            assert!((e.width - 820.0).abs() <= 0.5, "width is the target");
+            assert!(
+                (e.panel_anim_start - 680.0).abs() <= 0.5
+                    && (e.panel_anim_end - 820.0).abs() <= 0.5
+                    && e.panel_anim_ms == 300,
+                "animated branch must record start/end/ms, got {:.1}->{:.1} {}ms",
+                e.panel_anim_start,
+                e.panel_anim_end,
+                e.panel_anim_ms
+            );
+        });
+
+        // 拖拽（ms == 0）：立即结算且不记录动画（起止相等），保证 1:1 跟手；
+        // 同时不动 panel epoch，避免之后拖回旧目标时重播一次过期动画。
+        editor.update(cx, |e, cx| {
+            e.width = 680.0;
+            e.panel_anim_epoch = 0;
+            e.follow_sidebar_width(100.0, 10_000.0, 0, cx);
+            assert!(
+                (e.width - 630.0).abs() <= 0.5,
+                "drag must share half, width={:.1}",
+                e.width
+            );
+            assert!(
+                (e.panel_anim_start - e.panel_anim_end).abs() <= 0.5,
+                "immediate path must not record an animation"
+            );
+            assert_eq!(e.panel_anim_epoch, 0, "immediate path must not bump epoch");
         });
     }
 
