@@ -10621,9 +10621,10 @@ mod perf_diagnostics {
     ///
     /// 需要显式运行：`cargo test --lib typing_phase_breakdown -- --ignored --nocapture`
     ///
-    /// 判读：`classify` 与 `plan` 随行数线性增长 —— 这是**已知的剩余工作**
-    /// （增量规划，见 `docs/PERF_2026-09-24.md`）；`join` 是 `Change` 事件
-    /// 的全文 join；`edit` 含行起始索引重建（应为 O(行数) 但常数极小）。
+    /// 判读（release 口径，20k 行）：
+    /// - `plan` / `classify` 是**全量**口径，只用于对照；
+    /// - `incr_classify` 是击键实际走的增量分类，应与文档规模基本无关；
+    /// - `geometry` 是几何全量重建（仅在块结构变化时发生）。
     #[test]
     #[ignore = "diagnostic: run with --ignored --nocapture"]
     fn typing_phase_breakdown() {
@@ -10656,10 +10657,6 @@ mod perf_diagnostics {
             let classify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
-            let _ = refdefs_for_lines(buf.lines(), &classified.blocks);
-            let refs_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-            let t = Instant::now();
             let _ = crate::editor::markdown_live::reveal::plan_rows_with_refs(
                 buf.lines(),
                 &classified,
@@ -10672,87 +10669,39 @@ mod perf_diagnostics {
             buf.edit(|m| m.insert("x"));
             let edit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-            // 5b. line-start index rebuild (part of `buffer.edit`).
-            let t = Instant::now();
-            buf.force_rebuild_line_starts();
-            let idx_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-            // 5c. what the view's incremental path actually does per keystroke:
-            // classification + plan splice + geometry gate, on a real edit.
-            let lines_now = buf.lines();
-            let dirty = buf.dirty_range();
-            let t = Instant::now();
-            let (cls2, repro2) = crate::editor::markdown_live::reveal::classify_incremental(
-                lines_now,
-                Some(&classified),
-                dirty.as_ref().map_or(0, |r| r.start),
-            );
-            let incr2_ms = t.elapsed().as_secs_f64() * 1000.0;
-            let t = Instant::now();
-            let revealed2 =
-                crate::editor::markdown_live::reveal::reveal_set(&cls2.blocks, lines_now.len(), reveal);
-            let revset_ms = t.elapsed().as_secs_f64() * 1000.0;
-            let t = Instant::now();
-            let refs2 = refdefs_for_lines(lines_now, &cls2.blocks);
-            let refs2_ms = t.elapsed().as_secs_f64() * 1000.0;
-            let _ = (repro2, revealed2, refs2);
-
-            // 6. geometry rebuild (grouping + row->group + ordered numbers +
-            //    mermaid list) — currently rebuilt on every text version.
-            let planned: Vec<Rc<PlannedRow>> = crate::editor::markdown_live::reveal::plan_rows_with_refs(
-                buf.lines(),
-                &classified,
-                &refs,
-                reveal,
-            )
-            .into_iter()
-            .map(Rc::new)
-            .collect();
+            let planned: Vec<Rc<PlannedRow>> =
+                crate::editor::markdown_live::reveal::plan_rows_with_refs(
+                    buf.lines(),
+                    &classified,
+                    &refs,
+                    reveal,
+                )
+                .into_iter()
+                .map(Rc::new)
+                .collect();
             let t = Instant::now();
             let _ = PlanGeometry::build_owned(&planned, buf.lines());
             let geo_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-            // 6a. Rc::make_mut cost when a second reference exists (the
-            // render path may hold the plan while the next edit arrives).
-            let mut shared: Rc<Vec<Rc<PlannedRow>>> = Rc::new(planned.clone());
-            let _held = shared.clone();
+            // The path a keystroke actually takes: incremental classification
+            // from the model's tracked dirty range.
             let t = Instant::now();
-            let _ = Rc::make_mut(&mut shared);
-            let makemut_ms = t.elapsed().as_secs_f64() * 1000.0;
-            let _ = &mut shared;
-
-            // 6b. incremental classification (what a keystroke now costs).
-            let mut prev_classified = classify_document(buf.lines());
-            let t = Instant::now();
-            let (_, repro) =
-                crate::editor::markdown_live::reveal::classify_incremental(
-                    buf.lines(),
-                    Some(&prev_classified),
-                    buf.lines().len() / 2,
-                );
+            let (_, repro) = crate::editor::markdown_live::reveal::classify_incremental(
+                buf.lines(),
+                Some(&classified),
+                buf.dirty_range().map_or(0, |r| r.start),
+            );
             let incr_classify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-            // 6c. geometry rebuild is the suspected remainder.
-            let _ = &mut prev_classified;
-
-            // 7. one-line re-plan (the incremental target).
-            let t = Instant::now();
-            let _ = crate::editor::markdown_live::layout::plan_with_refs(buf.lines()[0].as_str(), &classified.blocks[0], None, false, &refs);
-            let one_ms = t.elapsed().as_secs_f64() * 1_000_000.0;
-
             println!(
-                "lines={lines:6} join={join_ms:7.3}ms classify={classify_ms:7.3}ms \
-                 refs={refs_ms:7.3}ms plan={plan_ms:8.3}ms edit={edit_ms:6.3}ms \
-                 geometry={geo_ms:7.3}ms one_line_plan={one_ms:6.1}us \
-                 index={idx_ms:6.3}ms incr2={incr2_ms:6.3}ms \
-                 revset={revset_ms:6.3}ms refs2={refs2_ms:6.3}ms \
-                 make_mut={makemut_ms:6.3}ms \
-                 incr_classify={incr_classify_ms:6.3}ms (reproc={repro})"
+                "lines={lines:6} join={join_ms:7.3}ms full_classify={classify_ms:7.3}ms \
+                 full_plan={plan_ms:8.3}ms edit={edit_ms:6.3}ms \
+                 geometry={geo_ms:7.3}ms incr_classify={incr_classify_ms:6.3}ms \
+                 (reproc={repro})"
             );
         }
     }
 }
-
 
 #[cfg(test)]
 mod incremental_plan_tests {
