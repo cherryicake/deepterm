@@ -264,6 +264,7 @@ impl LiveMarkdownView {
             planned_classified: Classified {
                 blocks: Vec::new(),
                 lang_before: Vec::new(),
+                changed: 0..0,
                 states: Vec::new(),
             },
             planned_classified_version: u64::MAX,
@@ -946,21 +947,43 @@ impl LiveMarkdownView {
         }
         let text_changed = self.planned_classified_version != self.buffer.text_version();
 
+        // The model's dirty range is *read* here and cleared only once a plan
+        // has actually been committed for this text version (see the clears
+        // below). `mark_dirty` merges ranges monotonically, so never clearing
+        // makes every later keystroke re-scan from the first line ever edited
+        // to the last: two distant edits were enough to pin the window at the
+        // whole document for the rest of the session (measured: ~8k `Arc` +
+        // ~8k block comparisons per keystroke on an 8k-line document), which
+        // silently defeated the incremental planner this module exists for.
+        //
+        // Clearing must not happen here, at read time: `after_edit` can mutate
+        // the document again (table auto-format) *after* a plan was computed
+        // but before the next one, and a read-time clear would drop the
+        // original edit's marks along with it. Clearing on commit keeps the
+        // merged range intact until the view has actually caught up.
+        //
+        // `None` (undo/redo/whole-document replace) means "unknown" and is
+        // handled as a full comparison below.
+        let dirty_range = self.buffer.dirty_range();
+
         // ---- classification / refdefs -------------------------------------
-        // Classification resumes from a checkpointed state at the first dirty
-        // line and stops when the state reconverges, so a keystroke only
+        // Classification resumes from a checkpointed state before the dirty
+        // range and stops when the state reconverges, so a keystroke only
         // re-classifies the affected run instead of the whole document.
         if text_changed {
-            let dirty_from = self
-                .buffer
-                .dirty_range()
-                .map_or(0, |r| r.start);
+            // The whole merged range is passed, not just its start: a single
+            // edit can touch several separated lines (replace-all, a coalesced
+            // undo), and the classifier must not reuse a tail containing any of
+            // them. `None` (unknown / whole-document replace) becomes `0..0`,
+            // which disables resumption and forces a full pass.
+            let dirty = dirty_range.clone().unwrap_or(0..0);
             let lines = self.buffer.lines();
-            let (classified, _reprocessed) = crate::editor::markdown_live::reveal::classify_incremental(
-                lines,
-                Some(&self.planned_classified),
-                dirty_from,
-            );
+            let (classified, _reprocessed) =
+                crate::editor::markdown_live::reveal::classify_incremental(
+                    lines,
+                    Some(&self.planned_classified),
+                    dirty,
+                );
             self.planned_classified = classified;
             self.planned_classified_version = self.buffer.text_version();
         }
@@ -1056,13 +1079,11 @@ impl LiveMarkdownView {
         // instead of comparing every line's `Arc`), widened by one line on
         // each side because a neighbouring line's classification can depend on
         // the edited text (one-line lookahead).
-        let mut text_window: Option<std::ops::Range<usize>> = None;
         if text_changed {
-            match self.buffer.dirty_range() {
+            match dirty_range {
                 Some(r) => {
                     let start = r.start.saturating_sub(1);
                     let end = (r.end + 1).min(lines.len());
-                    text_window = Some(start..end);
                     for i in start..end {
                         if !self
                             .plan_input_lines
@@ -1087,15 +1108,31 @@ impl LiveMarkdownView {
                 }
             }
         }
-        // Block kinds are only re-derived inside the classified window; a
-        // change there is what invalidates the geometry.
-        let kind_window = text_window
-            .clone()
-            .unwrap_or(0..lines.len());
-        for i in kind_window {
-            if self.plan_input_blocks.get(i) != blocks.get(i) {
-                blocks_changed = true;
-                dirty(i, &mut lo, &mut hi);
+        // Which lines' *block kind* changed. This drives both the re-plan
+        // window and the geometry gate, and it must be exact.
+        //
+        // It used to compare only inside the narrow ±1 text window, which is
+        // wrong in both directions: the setext restyle rewrites lines far
+        // above the edit, and fence/math state propagates far below it, so a
+        // genuine structural change could sit outside the window and leave the
+        // geometry gate stamping stale grouping as current. (That bug was
+        // masked while `mark_dirty` accumulated ranges forever, because the
+        // window eventually covered the whole document.)
+        //
+        // The span to compare comes from the classifier itself
+        // ([`Classified::changed`]), which is the only component that knows how
+        // far the edit actually propagated. Scanning the whole table instead
+        // would be correct but costs a full pass per keystroke — the exact
+        // thing the incremental classifier exists to avoid.
+        if text_changed {
+            let changed = self.planned_classified.changed.clone();
+            for i in changed.start.min(self.plan_input_blocks.len())
+                ..changed.end.min(self.plan_input_blocks.len())
+            {
+                if self.plan_input_blocks.get(i) != blocks.get(i) {
+                    blocks_changed = true;
+                    dirty(i, &mut lo, &mut hi);
+                }
             }
         }
         // Reveal changes are enumerated from the two (tiny) sets instead of
@@ -1111,6 +1148,19 @@ impl LiveMarkdownView {
             return self.planned.clone();
         }
         let (lo, hi) = self.expand_dirty_range(lines, blocks, lo, hi);
+        // The window above is deliberately narrow (±1 around the edit), but a
+        // text edit can flip the classification of lines outside it: the setext
+        // restyle reaches backward over a whole paragraph run, and fence/math
+        // state propagates forward. Those lines are inside the *expanded* range
+        // that is about to be re-planned, so also compare block kinds there —
+        // otherwise `blocks_changed` stays false and the geometry gate stamps
+        // the stale grouping/`has_table`/ordered numbers as current.
+        for i in lo..=hi.min(lines.len().saturating_sub(1)) {
+            if self.plan_input_blocks.get(i) != blocks.get(i) {
+                blocks_changed = true;
+                break;
+            }
+        }
 
         // Callout state entering the range: the row before `lo` carries it.
         let (mut prev_was_quote, mut callout_kind) = if lo == 0 {
@@ -1138,10 +1188,14 @@ impl LiveMarkdownView {
             strip_callout_prefix(row, lines.get(row.line).map(|l| l.as_str()).unwrap_or(""));
         }
 
-        // Snapshot the new kinds before consuming the rows: the geometry
-        // decision compares them against the cached ones.
-        let replanned_kinds: Vec<RowKind> =
-            replanned.iter().map(|r| r.plan.kind.clone()).collect();
+        // Snapshot the new kinds before consuming the rows, and the old kinds
+        // **before** the splice overwrites them. Reading the old kind back out
+        // of `self.planned` after splicing compares the new rows against
+        // themselves, which made this test vacuously false and left the
+        // geometry gate relying on `blocks_changed` alone.
+        let replanned_kinds: Vec<RowKind> = replanned.iter().map(|r| r.plan.kind.clone()).collect();
+        let previous_kinds: Vec<Option<RowKind>> =
+            (lo..=hi).map(|i| self.planned.get(i).map(|r| r.plan.kind.clone())).collect();
 
         // Splice in place. `make_mut` copies the pointer table only when the
         // previous frame still holds a clone; it never copies row contents.
@@ -1171,13 +1225,13 @@ impl LiveMarkdownView {
         // row in the range can shift the *display* numbers of every later
         // ordered item (the counter is sequential), even though those rows'
         // own kinds are unchanged.
-        let kinds_changed = replanned_kinds.iter().enumerate().any(|(off, kind)| {
-            self.planned
-                .get(lo + off)
-                .is_none_or(|old| old.plan.kind != *kind)
-        }) || replanned_kinds
+        let kinds_changed = replanned_kinds
             .iter()
-            .any(|k| matches!(k, RowKind::Ordered { .. }));
+            .zip(previous_kinds.iter())
+            .any(|(kind, old)| old.as_ref() != Some(kind))
+            || replanned_kinds
+                .iter()
+                .any(|k| matches!(k, RowKind::Ordered { .. }));
         // Mermaid sources live in the geometry, so any edit inside a mermaid
         // block's fence-to-close span invalidates it.
         let mermaid_touched = self.planned_geometry.mermaid_blocks.iter().any(|b| {
@@ -1202,6 +1256,13 @@ impl LiveMarkdownView {
         }
         self.planned_version = self.buffer.text_version();
         self.planned_key = key;
+        // Consume the marks: this plan accounted for all of them (the exact
+        // block comparison above covers the whole document, and the text scan
+        // covered the model's range). `mark_dirty` merges ranges monotonically,
+        // so without this the window grows to the span of every edit in the
+        // session — measured at ~8k `Arc` + ~8k block comparisons per keystroke
+        // on an 8k-line document, which defeats the incremental planner.
+        self.buffer.take_dirty_range();
         self.planned.clone()
     }
 
@@ -11146,7 +11207,7 @@ mod perf_diagnostics {
             let (_, repro) = crate::editor::markdown_live::reveal::classify_incremental(
                 buf.lines(),
                 Some(&classified),
-                buf.dirty_range().map_or(0, |r| r.start),
+                buf.dirty_range().unwrap_or(0..0),
             );
             let incr_classify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -11176,9 +11237,22 @@ mod incremental_plan_tests {
     /// neighbouring lines (the reason the dirty range must be widened):
     /// setext underlines, GFM tables with and without outer pipes, fences,
     /// `$$` math runs, frontmatter, callouts, quotes and ordered lists.
+    ///
+    /// It is deliberately **longer than `CLASSIFY_CHECKPOINT`** (padded with
+    /// prose runs) so the incremental classifier's checkpoint-resume path is
+    /// actually entered. The original fixture was ~30 lines, i.e. below the
+    /// checkpoint granularity, which meant every edit took the full-pass path
+    /// and the resume logic was never exercised by this differential test.
     fn tricky_doc() -> String {
         let mut d = String::new();
         d.push_str("---\ntitle: x\n---\n\n");
+        // Prose runs long enough to straddle checkpoint boundaries.
+        for i in 0..60 {
+            d.push_str(&format!("prose line {i} of a paragraph run\n"));
+            if i % 4 == 3 {
+                d.push('\n');
+            }
+        }
         d.push_str("Setext title\n===\n\n");
         d.push_str("multi line\nsetext run\n---\n\n");
         d.push_str("```rust\nfn a() {}\n```\n\n");
@@ -11193,6 +11267,13 @@ mod incremental_plan_tests {
     }
 
     /// Build the expected plan from scratch for the view's current state.
+    ///
+    /// The classification and refdefs are recomputed with a genuine full pass
+    /// ([`classify_document`]) rather than reused from `v.planned_classified`.
+    /// That reuse made this oracle blind by construction: it compared the
+    /// incremental plan against a plan built from the *same* incrementally
+    /// derived classification, so any error in the classification itself
+    /// cancelled out and the differential test stayed green.
     fn full_plan(v: &LiveMarkdownView, focused: bool) -> Vec<PlannedRow> {
         let last = v.buffer.lines().len().saturating_sub(1);
         let (cursor, selection) = if v.show_source {
@@ -11210,12 +11291,10 @@ mod incremental_plan_tests {
             read_only: v.read_only,
             show_source: v.show_source,
         };
-        let mut expected = plan_rows_with_refs(
-            v.buffer.lines(),
-            &v.planned_classified,
-            &v.planned_refs,
-            reveal,
-        );
+        let lines = v.buffer.lines();
+        let fresh = crate::editor::markdown_live::reveal::classify_document(lines);
+        let refs = crate::editor::markdown_live::reveal::refdefs_for_lines(lines, &fresh.blocks);
+        let mut expected = plan_rows_with_refs(lines, &fresh, &refs, reveal);
         for row in &mut expected {
             strip_callout_prefix(row, v.buffer.line(row.line).unwrap_or(""));
         }
@@ -11228,6 +11307,19 @@ mod incremental_plan_tests {
     fn assert_matches_full(v: &mut LiveMarkdownView, round: usize, what: &str) {
         let incremental = v.planned_rows(false);
         let expected = full_plan(v, false);
+        // The view's own classification is maintained incrementally, so it must
+        // be compared against the full pass explicitly — otherwise a stale
+        // classification would show up only as a mysterious plan difference
+        // (or not at all, if the oracle reuses it).
+        let truth = crate::editor::markdown_live::reveal::classify_document(v.buffer.lines());
+        assert_eq!(
+            v.planned_classified.blocks, truth.blocks,
+            "classification diverged from a full pass after round {round} edit {what:?}"
+        );
+        assert_eq!(
+            v.planned_classified.lang_before, truth.lang_before,
+            "classification lang_before diverged after round {round} edit {what:?}"
+        );
         // Geometry is cached separately and gated on "did the inputs change";
         // a wrong gate would render stale grouping/ordered numbers/mermaid
         // blocks while the plan itself looked right.
@@ -11369,7 +11461,7 @@ mod incremental_plan_tests {
             "```\n",
             "\n",
             "```\n",
-            "rust",       // fence info string: changes code rows' RowKind
+            "rust", // fence info string: changes code rows' RowKind
             "```\n",
             "$$\n",
             "y = 2\n",
@@ -11384,6 +11476,10 @@ mod incremental_plan_tests {
             for text in edits {
                 view.update(cx, |v, cx| {
                     let n = v.buffer.line_count();
+                    // Sweep the target across a full checkpoint period so the
+                    // resume path is entered at every offset, including the
+                    // exact multiples of `CLASSIFY_CHECKPOINT` that used to
+                    // freeze the line above the edit.
                     let target = (round * 7 + n / 3) % n.max(1);
                     v.edit(cx, |m| m.move_to(target, 0, false));
                     v.insert_text_for_bench(text, cx);
@@ -11395,5 +11491,115 @@ mod incremental_plan_tests {
                 });
             }
         }
+    }
+
+    /// Drive the view through **every line of a full checkpoint period**,
+    /// including the exact multiples of `CLASSIFY_CHECKPOINT`.
+    ///
+    /// The general stream above samples a single target per round, so the
+    /// boundary offsets were only hit by luck. This test walks the whole
+    /// period with a fresh view per offset and asserts the rendered plan still
+    /// matches a genuine full pass — the case that silently froze the line
+    /// above the edit before the resume point was pulled back one checkpoint.
+    ///
+    /// Two details make this actually exercise the resume path:
+    /// * each edit is a **pure in-line replacement** (select the line's
+    ///   content, type over it). Inserting a `\n` dirties the range to
+    ///   end-of-document and disables tail reuse entirely, which would hide
+    ///   the bug;
+    /// * the document is a single unbroken prose run, so the line *above*
+    ///   every checkpoint multiple is a paragraph. A blank line there would
+    ///   end the setext run and make the bug unreachable.
+    #[gpui::test]
+    fn checkpoint_boundary_edits_match_full_plan(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let period = crate::editor::markdown_live::reveal::CLASSIFY_CHECKPOINT;
+        // One unbroken paragraph run (no blank lines) several periods long.
+        let mut text = String::new();
+        for i in 0..(period * 4) {
+            text.push_str(&format!("prose line {i}\n"));
+        }
+        text.push_str("tail\n");
+        for off in 0..period {
+            let (host, cx) = cx
+                .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(&text, cx))));
+            let view = host.read_with(cx, |h, _| h.0.clone());
+            // Warm the cached plan/classification: a real screen has always
+            // rendered before the user types, and `classify_incremental` only
+            // takes the resume path when a previous classification exists.
+            view.update(cx, |v, _| {
+                let _ = v.planned_rows(false);
+            });
+            view.update(cx, |v, cx| {
+                let n = v.buffer.line_count();
+                // Land the edit on `off` modulo the checkpoint period. Start
+                // past line 0 so the line above is an ordinary prose line.
+                let target = period + off;
+                if target >= n {
+                    return;
+                }
+                let len = v
+                    .buffer
+                    .line(target)
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                v.edit(cx, |m| {
+                    m.move_to(target, 0, false);
+                    m.move_to(target, len, true);
+                });
+                v.insert_text_for_bench("===", cx);
+                assert_matches_full(v, off, "checkpoint-boundary setext edit");
+            });
+        }
+    }
+
+    /// The model's dirty accumulator must stay bounded to the *current* edit.
+    ///
+    /// `mark_dirty` merges ranges monotonically and nothing else clears them,
+    /// so before this was fixed two distant edits pinned the per-keystroke
+    /// window at the span between them — eventually the whole document — which
+    /// silently turned the incremental planner back into a full scan while
+    /// every functional test still passed.
+    #[gpui::test]
+    fn dirty_accumulator_stays_bounded_across_distant_edits(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let mut doc = String::new();
+        for i in 0..4000 {
+            doc.push_str(&format!("paragraph line {i} with some text\n\n"));
+        }
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(&doc, cx))));
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        view.update(cx, |v, cx| {
+            let _ = v.planned_rows(false);
+
+            let mut spans = Vec::new();
+            for &line in &[2usize, 7000, 6] {
+                let n = v.buffer.line_count();
+                let target = line.min(n - 2);
+                v.edit(cx, |m| m.move_to(target, 3, false));
+                v.insert_text_for_bench("A", cx);
+                let _ = v.planned_rows(false);
+                if let Some(r) = v.buffer.dirty_range() {
+                    spans.push((target, r.end - r.start));
+                }
+            }
+            // A settled plan consumes its marks; anything still pending must at
+            // least be scoped to the edit that produced it, never to the union
+            // of every edit so far.
+            for (line, span) in &spans {
+                assert!(
+                    *span < 200,
+                    "dirty range after the edit at line {line} spans {span} lines; \
+                     the accumulator is not being consumed (spans so far: {spans:?})"
+                );
+            }
+        });
     }
 }

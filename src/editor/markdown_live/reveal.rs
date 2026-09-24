@@ -192,6 +192,17 @@ fn detect_callout_open(line: &str, content: usize) -> Option<(CalloutKind, Strin
 pub struct Classified {
     pub blocks: Vec<Block>,
     pub lang_before: Vec<Option<String>>,
+    /// Lines this pass could have classified differently from the previous
+    /// one, as a half-open range.
+    ///
+    /// Callers that keep their own snapshot of `blocks` (the view caches the
+    /// previous plan's kinds to decide whether cached geometry is still valid)
+    /// must only compare inside this span. Comparing the whole table is
+    /// correct but costs a full pass per keystroke, which is exactly what the
+    /// incremental classifier exists to avoid.
+    ///
+    /// A full pass reports `0..lines.len()`.
+    pub changed: std::ops::Range<usize>,
     /// Classifier state entering every `CLASSIFY_CHECKPOINT`-th line
     /// (`states[k]` = state before line `k * CLASSIFY_CHECKPOINT`).
     ///
@@ -216,17 +227,24 @@ pub const CLASSIFY_CHECKPOINT: usize = 64;
 /// the checkpointed state saved alongside the previous classification, so
 /// there is no heuristic that a new `DocState` field could silently break.
 ///
-/// `dirty_from` is the first line whose text may have changed; `prev` is the
-/// previous classification (empty on the first call, forcing a full pass).
-/// Returns the classification and how many lines were actually re-classified
-/// (tests assert this stays small for a single-line edit).
+/// `dirty` is the range of lines whose text may have changed (exclusive end,
+/// matching [`EditorModel::dirty_range`](crate::editor::markdown_live::model::EditorModel::dirty_range));
+/// `prev` is the previous classification (empty on the first call, forcing a
+/// full pass). Returns the classification and how many lines were actually
+/// re-classified (tests assert this stays small for a single-line edit).
 pub fn classify_incremental(
     lines: &[Line],
     prev: Option<&Classified>,
-    dirty_from: usize,
+    dirty: std::ops::Range<usize>,
 ) -> (Classified, usize) {
     let n = lines.len();
     let prev = prev.filter(|p| p.blocks.len() == n && p.lang_before.len() == n);
+    let dirty_from = dirty.start;
+    // The reused tail must begin strictly after the last possibly-changed line.
+    // A single scalar `dirty_from` is not enough: one edit can touch several
+    // separated lines (replace-all, `replace_ranges_each`, a coalesced undo),
+    // and the merged range's *end* is what bounds the tail.
+    let tail_floor = dirty.end;
     let can_resume = prev.is_some() && dirty_from > 0 && dirty_from < n;
 
     let mut blocks: Vec<Block> = Vec::with_capacity(n);
@@ -237,8 +255,38 @@ pub fn classify_incremental(
     let mut reprocessed = 0usize;
 
     if let (true, Some(prev)) = (can_resume, prev) {
-        // Resume from the nearest checkpoint at or before `dirty_from`.
-        let ck = (dirty_from / CLASSIFY_CHECKPOINT).min(prev.states.len().saturating_sub(1));
+        // Resume from the checkpoint strictly *before* `dirty_from`.
+        //
+        // The copied prefix gets no lookahead, but line `from - 1` was
+        // originally classified with `next = lines[from]` — the line that just
+        // changed. Resuming *at* `dirty_from` (the old `dirty_from / CHECKPOINT`
+        // rounding) therefore froze a stale classification for the line before
+        // the edit whenever the edit landed on a checkpoint multiple: typing a
+        // setext underline on such a line left the heading above it rendered as
+        // a plain paragraph, permanently. One checkpoint of margin costs at
+        // most `CLASSIFY_CHECKPOINT - 1` extra lines and removes the whole
+        // boundary class.
+        let mut ck =
+            ((dirty_from - 1) / CLASSIFY_CHECKPOINT).min(prev.states.len().saturating_sub(1));
+        // The setext restyle at the end of this function rewrites *earlier*
+        // lines of the paragraph run ending at an underline, and those
+        // rewritten rows are what `prev.blocks` stores. When the resume point
+        // sits inside such a run, the underline justifying the artifacts may be
+        // exactly what the edit removed, so the prefix must not be copied:
+        // walk back to the run's start. `Heading { content: 0 }` is precisely
+        // the restyle marker (a `#` heading carries `content > 0`, and an
+        // untouched paragraph stays `Paragraph`), so this stops at the first
+        // line the restyle cannot have reached.
+        while ck > 0 {
+            let boundary = ck * CLASSIFY_CHECKPOINT;
+            if !matches!(
+                prev.blocks.get(boundary - 1),
+                Some(Block::Heading { content: 0, .. })
+            ) {
+                break;
+            }
+            ck -= 1;
+        }
         let from = ck * CLASSIFY_CHECKPOINT;
         state = prev.states[ck].clone();
         // Copy the saved prefix verbatim (no re-classification, no lookahead).
@@ -272,9 +320,12 @@ pub fn classify_incremental(
 
         // Exact convergence: the running state equals the state the previous
         // classification entered the next line with, and this line's own
-        // results already match. Everything from `i + 1` on is identical.
+        // results already match. Everything from `i + 1` on is identical —
+        // provided the reused tail starts after every line the edit touched
+        // (`tail_floor`); otherwise a later edited line would be copied stale.
         if let Some(prev) = prev
             && i + 1 < n
+            && i + 1 >= tail_floor
             && prev.blocks.get(i) == Some(&blocks[i])
             && prev.lang_before.get(i) == lang_before.get(i)
             && prev_state_at(prev, i + 1).is_some_and(|s| s.same_parse_state(&state))
@@ -306,6 +357,12 @@ pub fn classify_incremental(
     // the preview, so restyle the whole paragraph run backward. Only rows in
     // the re-classified window can change, but the run can start before it —
     // so this pass runs over the whole table (cheap, allocation-free).
+    //
+    // It can also reach *below* `start`: an underline in the reused tail whose
+    // run extends back into freshly-classified lines rewrites those earlier
+    // rows. `changed_lo` tracks the furthest such reach so the reported span
+    // stays a true superset of everything this pass touched.
+    let mut changed_lo = start;
     for i in (0..blocks.len()).rev() {
         if let Block::SetextUnderline { level, .. } = blocks[i] {
             let mut j = i;
@@ -321,8 +378,12 @@ pub fn classify_incremental(
                     content: 0,
                 };
             }
+            changed_lo = changed_lo.min(j);
         }
     }
+    // Everything from the resume point up to the convergence point was
+    // classified fresh; the restyle may have reached further back.
+    let changed = changed_lo..converged_at.unwrap_or(n);
 
     // Pad the checkpoint table to cover the whole document.
     while states.len() <= (n.saturating_sub(1)) / CLASSIFY_CHECKPOINT {
@@ -342,6 +403,7 @@ pub fn classify_incremental(
         Classified {
             blocks,
             lang_before,
+            changed,
             states,
         },
         reprocessed,
@@ -357,9 +419,10 @@ fn prev_state_at(prev: &Classified, i: usize) -> Option<&DocState> {
 }
 
 /// Classify every line in document order (full pass; the incremental variant
-/// lives in [`classify_incremental`]).
+/// is [`classify_incremental`]). Convenience wrapper for tests and the
+/// differential oracle.
 pub fn classify_document(lines: &[Line]) -> Classified {
-    classify_incremental(lines, None, 0).0
+    classify_incremental(lines, None, 0..0).0
 }
 
 /// Plan every row from a precomputed classification + reveal. Convenience
@@ -927,6 +990,27 @@ mod showcase_tests {
 mod incremental_classify_tests {
     use super::*;
 
+    /// Assert `changed` is a true superset of the lines whose block actually
+    /// differs from `prev`.
+    ///
+    /// The view compares only inside this span to decide whether cached
+    /// geometry is still valid, so an under-reported span silently renders
+    /// stale grouping. The span is deliberately allowed to be too wide; that
+    /// only costs a little extra comparison.
+    fn assert_changed_is_superset(prev: &Classified, inc: &Classified, what: &str) {
+        for i in 0..inc.blocks.len().min(prev.blocks.len()) {
+            if inc.blocks[i] != prev.blocks[i] {
+                assert!(
+                    inc.changed.contains(&i),
+                    "{what}: changed={:?} omits line {i}, whose block went {:?} -> {:?}",
+                    inc.changed,
+                    prev.blocks[i],
+                    inc.blocks[i]
+                );
+            }
+        }
+    }
+
     fn doc(n: usize) -> Vec<Line> {
         let mut text = String::new();
         for i in 0..n {
@@ -964,7 +1048,7 @@ mod incremental_classify_tests {
                     let mut t = lines[at].to_string();
                     t.push_str(edit);
                     lines[at] = std::sync::Arc::new(t);
-                    let (inc, _) = classify_incremental(&lines, Some(&prev), at);
+                    let (inc, _) = classify_incremental(&lines, Some(&prev), at..at + 1);
                     let full = classify_document(&lines);
                     assert_eq!(
                         inc.blocks, full.blocks,
@@ -973,6 +1057,11 @@ mod incremental_classify_tests {
                     assert_eq!(
                         inc.lang_before, full.lang_before,
                         "lang_before diverged (n={n} round={round} edit={edit:?} at={at})"
+                    );
+                    assert_changed_is_superset(
+                        &prev,
+                        &inc,
+                        &format!("n={n} round={round} edit={edit:?} at={at}"),
                     );
                     prev = inc;
                 }
@@ -997,7 +1086,7 @@ mod incremental_classify_tests {
             let mut t = lines[at].to_string();
             t.push('x');
             lines[at] = std::sync::Arc::new(t);
-            let (_, reprocessed) = classify_incremental(&lines, Some(&prev), at);
+            let (_, reprocessed) = classify_incremental(&lines, Some(&prev), at..at + 1);
             assert!(
                 reprocessed < bound,
                 "a one-line edit re-classified {reprocessed} lines of {n} \
@@ -1020,11 +1109,168 @@ mod incremental_classify_tests {
         let prev = classify_document(&lines);
         let at = 10;
         lines[at] = std::sync::Arc::new("```rust".to_string());
-        let (inc, reprocessed) = classify_incremental(&lines, Some(&prev), at);
+        let (inc, reprocessed) = classify_incremental(&lines, Some(&prev), at..at + 1);
         assert!(
             reprocessed > n / 2,
             "an unclosed fence must invalidate the tail (got {reprocessed} of {n})"
         );
         assert_eq!(inc.blocks, classify_document(&lines).blocks);
+    }
+
+    /// A prose document whose paragraph runs straddle checkpoint boundaries.
+    /// The old fixtures were all shorter than `CLASSIFY_CHECKPOINT` (or edited
+    /// at positions that never landed on a multiple of it), so the checkpoint
+    /// resume path was never exercised by the differential tests.
+    fn prose(n: usize) -> Vec<Line> {
+        let mut text = String::new();
+        for i in 0..n {
+            if i % 3 == 2 {
+                text.push('\n');
+            } else {
+                text.push_str(&format!("paragraph line {i} with some prose text\n"));
+            }
+        }
+        crate::editor::markdown_live::model::lines_from_text(&text)
+    }
+
+    /// Regression: an edit landing **exactly on** a checkpoint multiple must
+    /// not freeze the line above it.
+    ///
+    /// The resume point used to round down to `dirty_from` itself, but line
+    /// `from - 1` had been classified with `next = lines[from]` — the line that
+    /// just changed. Typing a setext underline on such a line therefore left
+    /// the heading above it rendered as a paragraph, permanently (later
+    /// unrelated edits did not repair it).
+    #[test]
+    fn setext_edit_on_checkpoint_multiple_reclassifies_the_line_above() {
+        for n in [CLASSIFY_CHECKPOINT * 3, 200] {
+            let base = prose(n);
+            let prev = classify_document(&base);
+            for multiple in 1..(n / CLASSIFY_CHECKPOINT) {
+                let at = multiple * CLASSIFY_CHECKPOINT;
+                // Make the line above the checkpoint a paragraph, then replace
+                // the checkpoint line itself with a setext underline.
+                let mut lines = base.clone();
+                lines[at - 1] = std::sync::Arc::new("Section title".to_string());
+                lines[at] = std::sync::Arc::new("===".to_string());
+                let (inc, _) = classify_incremental(&lines, Some(&prev), at..at + 1);
+                let full = classify_document(&lines);
+                assert_eq!(
+                    inc.blocks, full.blocks,
+                    "diverged with the edit exactly on checkpoint {at} (n={n})"
+                );
+                assert_eq!(inc.lang_before, full.lang_before, "lang_before at {at}");
+            }
+        }
+    }
+
+    /// Regression: deleting the underline of a paragraph run that **straddles a
+    /// checkpoint** must revert the whole run.
+    ///
+    /// The stored prefix is post-restyle: `a\nb\n===` rewrites the entire run
+    /// into `Heading { content: 0 }`. Copying that prefix verbatim re-introduced
+    /// headings whose justifying underline had just been deleted.
+    #[test]
+    fn deleting_underline_reverts_a_run_straddling_a_checkpoint() {
+        let n = 200;
+        for run_len in [8usize, 40, 70] {
+            let underline = run_len; // run occupies 0..run_len, underline follows
+            let mut text = String::new();
+            for i in 0..run_len {
+                text.push_str(&format!("para line {i}\n"));
+            }
+            text.push_str("===\n");
+            for i in 0..(n - run_len - 1) {
+                text.push_str(&format!("tail {i}\n"));
+            }
+            let mut lines = crate::editor::markdown_live::model::lines_from_text(&text);
+            let prev = classify_document(&lines);
+            assert!(
+                matches!(prev.blocks[0], Block::Heading { content: 0, .. }),
+                "fixture must start as a restyled heading run"
+            );
+            // Delete the underline.
+            lines[underline] = std::sync::Arc::new(String::new());
+            let (inc, _) = classify_incremental(&lines, Some(&prev), underline..underline + 1);
+            let full = classify_document(&lines);
+            assert_changed_is_superset(&prev, &inc, "setext at checkpoint");
+            assert_eq!(
+                inc.blocks, full.blocks,
+                "run of {run_len} lines diverged after deleting its underline"
+            );
+            assert_changed_is_superset(&prev, &inc, &format!("delete underline, run {run_len}"));
+        }
+    }
+
+    /// A newly created setext underline must report the whole paragraph run it
+    /// restyles as changed, even when the run starts far *above* the resume
+    /// point.
+    ///
+    /// The restyle pass rewrites earlier lines of the run (that is what makes
+    /// "a\nb\n===" one heading in the preview), and it walks back past the
+    /// checkpoint the classifier resumed from. `changed` is what tells the view
+    /// which rows to re-compare for cached-geometry validity, so if it started
+    /// at the resume point instead of the run start, those rows would keep
+    /// rendering as paragraphs.
+    #[test]
+    fn created_underline_reports_the_whole_restyled_run() {
+        let n = 300;
+        let run = 130; // spans two checkpoints, so the run starts before `start`
+        // One unbroken paragraph run: `prose` inserts blank lines, which would
+        // split the run and defeat the point of the test.
+        let mut text = String::new();
+        for i in 0..run {
+            text.push_str(&format!("paragraph line {i} with some prose text\n"));
+        }
+        for i in 0..(n - run - 1) {
+            text.push_str(&format!("tail {i}\n"));
+        }
+        let mut lines = crate::editor::markdown_live::model::lines_from_text(&text);
+        let prev = classify_document(&lines);
+        assert!(
+            matches!(prev.blocks[run - 1], Block::Paragraph),
+            "fixture must be a plain paragraph run, got {:?}",
+            prev.blocks[run - 1]
+        );
+        assert!(
+            matches!(prev.blocks[0], Block::Paragraph),
+            "the run must reach line 0 so the restyle walks back past the resume point"
+        );
+
+        // Turn the line after the run into a setext underline.
+        lines[run] = std::sync::Arc::new("===".to_string());
+        let (inc, _) = classify_incremental(&lines, Some(&prev), run..run + 1);
+        let full = classify_document(&lines);
+        assert_eq!(inc.blocks, full.blocks, "restyled run diverged");
+        // The run really was restyled...
+        assert!(
+            matches!(inc.blocks[0], Block::Heading { content: 0, .. }),
+            "line 0 must become part of the restyled heading run, got {:?}",
+            inc.blocks[0]
+        );
+        // ...and all of it is reported as changed.
+        assert_changed_is_superset(&prev, &inc, "created underline restyles the run above");
+    }
+
+    /// Regression: one edit touching **two separated lines** must not reuse a
+    /// tail containing the later one.
+    ///
+    /// `dirty_from` used to be a single scalar (the range start), so
+    /// classification converged inside the untouched gap and copied the second
+    /// edited line verbatim. This is the shape of replace-all and of a
+    /// coalesced undo.
+    #[test]
+    fn multi_region_edit_does_not_reuse_an_edited_tail() {
+        let n = 300;
+        let mut lines = prose(n);
+        let prev = classify_document(&lines);
+        let (first, second) = (20usize, 200usize);
+        lines[first] = std::sync::Arc::new("para tweaked".to_string());
+        lines[second] = std::sync::Arc::new("```rust".to_string());
+        let (inc, _) = classify_incremental(&lines, Some(&prev), first..second + 1);
+        let full = classify_document(&lines);
+        assert_changed_is_superset(&prev, &inc, "multi-region edit");
+        assert_eq!(inc.blocks, full.blocks, "multi-region edit diverged");
+        assert_eq!(inc.lang_before, full.lang_before);
     }
 }
