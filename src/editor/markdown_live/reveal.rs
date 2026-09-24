@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use crate::editor::markdown_live::block::{classify_with_next, Block, DocState};
 use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::layout::{plan_with_refs, RowPlan, RunAttrs, Seg};
-use crate::editor::markdown_live::model::Pos;
+use crate::editor::markdown_live::model::{Line, Pos};
 
 /// Five callout kinds (matches the existing read-only preview).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,14 +143,14 @@ pub struct Classified {
 }
 
 /// Classify every line in document order (P1 text-only half).
-pub fn classify_document(lines: &[String]) -> Classified {
+pub fn classify_document(lines: &[Line]) -> Classified {
     let mut state = DocState::default();
     let mut lang_before: Vec<Option<String>> = Vec::with_capacity(lines.len());
     let mut blocks: Vec<Block> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
         // Lookahead: GFM tables may drop the outer pipes, which is only
         // decidable together with the delimiter row below.
-        let next = lines.get(i + 1).map(String::as_str);
+        let next = lines.get(i + 1).map(|l| l.as_str());
         lang_before.push(state.fence_lang().map(str::to_string));
         blocks.push(classify_with_next(line, next, &mut state));
     }
@@ -185,7 +185,7 @@ pub fn classify_document(lines: &[String]) -> Classified {
 /// reveal. The heavy reveal-set / refdefs / per-line passes still run here,
 /// but the two O(n) classification passes are skipped when `classify_document`
 /// was cached (P1).
-pub fn plan_rows(lines: &[String], classified: &Classified, reveal: Reveal) -> Vec<PlannedRow> {
+pub fn plan_rows(lines: &[Line], classified: &Classified, reveal: Reveal) -> Vec<PlannedRow> {
     plan_rows_with_refs(
         lines,
         classified,
@@ -212,7 +212,7 @@ pub(crate) fn is_refdef_skipped(b: &Block) -> bool {
 /// A pure function of (`lines`, `blocks`) — both text-only — so the view caches
 /// it and skips this O(n) scan on cursor-only moves (P1).
 pub fn refdefs_for_lines(
-    lines: &[String],
+    lines: &[Line],
     blocks: &[Block],
 ) -> std::collections::HashMap<String, String> {
     collect_refdefs(lines, &|i| blocks.get(i).is_some_and(is_refdef_skipped))
@@ -222,7 +222,7 @@ pub fn refdefs_for_lines(
 /// (possibly cached) reference definitions. This is the variant the view uses
 /// so it can reuse `refdefs_for_lines` across cursor-only moves.
 pub fn plan_rows_with_refs(
-    lines: &[String],
+    lines: &[Line],
     classified: &Classified,
     refdefs: &std::collections::HashMap<String, String>,
     reveal: Reveal,
@@ -334,7 +334,7 @@ pub fn plan_rows_with_refs(
 /// (lines, reveal). Backwards-compatible wrapper: call sites that don't need
 /// the P1 classification cache keep using this. The view routes cursor-only
 /// moves through `plan_rows` with a cached `classify_document` result.
-pub fn plan_document(lines: &[String], reveal: Reveal) -> Vec<PlannedRow> {
+pub fn plan_document(lines: &[Line], reveal: Reveal) -> Vec<PlannedRow> {
     plan_rows(lines, &classify_document(lines), reveal)
 }
 
@@ -353,8 +353,8 @@ mod tests {
         }
     }
 
-    fn lines(s: &str) -> Vec<String> {
-        s.split('\n').map(str::to_string).collect()
+    fn lines(s: &str) -> Vec<Line> {
+        crate::editor::markdown_live::model::lines_from_text(s)
     }
 
     #[test]
@@ -613,7 +613,7 @@ mod showcase_tests {
 
     #[test]
     fn showcase_plans_cleanly_for_every_cursor_line() {
-        let lines: Vec<String> = SHOWCASE.split('\n').map(str::to_string).collect();
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(SHOWCASE);
         // Full preview (unfocused) + a few revealed variants.
         let configs = [
             Reveal {
@@ -654,7 +654,7 @@ mod showcase_tests {
     #[test]
     fn plan_document_equals_classify_then_plan_rows() {
         let doc = "# Heading\n\npara **bold**\n\n```rust\nfn f() {}\n```\n\n- item\n\n| a | b |\n|---|---|\n| 1 | 2 |";
-        let ls: Vec<String> = doc.split('\n').map(str::to_string).collect();
+        let ls: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(doc);
         let classified = classify_document(&ls);
         let refs = refdefs_for_lines(&ls, &classified.blocks);
         let n = ls.len();

@@ -8,7 +8,7 @@
 use crate::editor::markdown_live::block::{classify, table_delimiter_cols, Block, DocState};
 
 use crate::editor::markdown_live::layout::{byte_for_col, col_for_byte, RowKind};
-use crate::editor::markdown_live::model::{EditorModel, Pos};
+use crate::editor::markdown_live::model::{EditorModel, Line, Pos};
 
 /// Ordered-list display numbering (preview parity).
 ///
@@ -409,7 +409,7 @@ pub fn table_insert_row_below(model: &mut EditorModel) -> bool {
 /// Which table row/column the cursor sits in, for cross-cell navigation.
 /// Returns `(row_index_in_table, col_index, cell_content_char_cols)`.
 pub fn table_cell_at(
-    lines: &[String],
+    lines: &[Line],
     is_table: &dyn Fn(usize) -> bool,
     line: usize,
     col: usize,
@@ -445,7 +445,7 @@ pub fn table_cell_at(
 /// The table row (line index) at `row` index within the block containing
 /// `line`. `None` when the index falls outside the table.
 pub fn table_row_line(
-    lines: &[String],
+    lines: &[Line],
     is_table: &dyn Fn(usize) -> bool,
     line: usize,
     row: usize,
@@ -473,7 +473,7 @@ pub fn table_row_line(
 
 /// The last table row line of the block containing `line`.
 pub fn table_last_row_line(
-    lines: &[String],
+    lines: &[Line],
     is_table: &dyn Fn(usize) -> bool,
     line: usize,
 ) -> Option<usize> {
@@ -497,7 +497,7 @@ pub fn table_last_row_line(
 /// (caller then exits the table).
 pub fn table_goto_cell(
     model: &mut EditorModel,
-    lines: &[String],
+    lines: &[Line],
     is_table: &dyn Fn(usize) -> bool,
     line: usize,
     row: usize,
@@ -533,7 +533,7 @@ pub fn cell_content_cols(text: &str, ci: usize) -> Option<(usize, usize)> {
 
 /// [`Pos`] of full-text byte `off` (lines joined by single newlines).
 /// Interior offsets floor to the char start; past-end clamps to doc end.
-pub fn pos_of_offset(lines: &[String], mut off: usize) -> Pos {
+pub fn pos_of_offset(lines: &[Line], mut off: usize) -> Pos {
     for (i, line) in lines.iter().enumerate() {
         if off <= line.len() {
             return Pos::new(i, col_for_byte(line, off));
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn pos_of_offset_roundtrips_lines() {
-        let lines = vec!["ab".to_string(), "cde".to_string(), "".to_string()];
+        let lines = crate::editor::markdown_live::model::lines_from_text("ab\ncde\n");
         assert_eq!(pos_of_offset(&lines, 0), Pos::new(0, 0));
         assert_eq!(pos_of_offset(&lines, 2), Pos::new(0, 2));
         assert_eq!(pos_of_offset(&lines, 3), Pos::new(1, 0));

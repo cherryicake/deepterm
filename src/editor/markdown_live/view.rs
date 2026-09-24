@@ -46,7 +46,7 @@ use crate::editor::markdown_live::interactions::{
 use crate::editor::markdown_live::layout::{
     byte_for_col, col_for_byte, plan_cell, src_for_vis, vis_for_src, RowKind,
 };
-use crate::editor::markdown_live::model::Pos;
+use crate::editor::markdown_live::model::{Line, Pos};
 use crate::editor::markdown_live::reveal::{
     classify_document, plan_rows_with_refs, refdefs_for_lines, strip_plan_prefix, CalloutKind,
     Classified, PlannedRow, Reveal,
@@ -567,7 +567,7 @@ impl LiveMarkdownView {
 
     /// [`Pos`] → 全文字节偏移（[`pos_of_offset`] 的逆，`search_caret_offset`
     /// 的推广）。行号越界时 clamp 到文档末尾。
-    fn offset_of_pos(lines: &[String], pos: Pos) -> usize {
+    fn offset_of_pos(lines: &[Line], pos: Pos) -> usize {
         let mut off = 0usize;
         for (i, line) in lines.iter().enumerate() {
             if i == pos.line {
@@ -992,7 +992,7 @@ impl LiveMarkdownView {
             let Some(edits) = t::prettify_edits(&lines, block) else {
                 return;
             };
-            if edits.iter().all(|(i, text)| lines.get(*i).map(String::as_str) == Some(text.as_str()))
+            if edits.iter().all(|(i, text)| lines.get(*i).map(|l| l.as_str()) == Some(text.as_str()))
             {
                 return; // 已是目标格式：不动文本、不入撤销栈。
             }
@@ -1461,7 +1461,7 @@ impl LiveMarkdownView {
         if !flags.iter().any(|f| *f) {
             return false;
         }
-        let lines: Vec<String> = self.buffer.lines().to_vec();
+        let lines: Vec<Line> = self.buffer.lines().to_vec();
         // 锚点 = 拖拽起点（退化为光标，覆盖 down 后尚未扩展的首帧）。
         let anchor_line = self
             .buffer
@@ -1545,7 +1545,7 @@ impl LiveMarkdownView {
     /// 不在格内容起点、或不在表格 → 返回 `false`，走通用退格。
     fn table_backspace_at_start(&mut self, cx: &mut Context<Self>) -> bool {
         let cur = self.buffer.cursor();
-        let lines: Vec<String> = self.buffer.lines().to_vec();
+        let lines: Vec<Line> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
         let table_lines = self.table_line_flags();
@@ -1559,7 +1559,7 @@ impl LiveMarkdownView {
         // 该格内容（去 padding）为空吗？
         let cell_empty = lines
             .get(cur.line)
-            .map(String::as_str)
+            .map(|l| l.as_str())
             .and_then(|text| {
                 table_cell_bounds(text)
                     .get(col)
@@ -1592,7 +1592,7 @@ impl LiveMarkdownView {
             let Some(l) = table_row_line(&lines, &is_table, cur.line, prev_row) else {
                 return true;
             };
-            table_cell_bounds(lines.get(l).map(String::as_str).unwrap_or(""))
+            table_cell_bounds(lines.get(l).map(|l| l.as_str()).unwrap_or(""))
                 .len()
                 .saturating_sub(1)
         } else {
@@ -1688,7 +1688,11 @@ impl LiveMarkdownView {
                 let lines = self.buffer.lines().to_vec();
                 let cur = self.buffer.cursor();
                 if let Some(block) = t::table_block_range(&lines, cur.line) {
-                    let text = lines[block.0..=block.1].join("\n");
+                    let text = lines[block.0..=block.1]
+                        .iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
@@ -1733,7 +1737,7 @@ impl LiveMarkdownView {
     /// 越过表头/末行则退出表格。返回 `true` 表示已处理。
     fn table_move_vertical(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) -> bool {
         let cur = self.buffer.cursor();
-        let lines: Vec<String> = self.buffer.lines().to_vec();
+        let lines: Vec<Line> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
         let table_lines = self.table_line_flags();
@@ -1772,7 +1776,7 @@ impl LiveMarkdownView {
         cx: &mut Context<Self>,
     ) -> bool {
         let cur = self.buffer.cursor();
-        let lines: Vec<String> = self.buffer.lines().to_vec();
+        let lines: Vec<Line> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
         let table_lines = self.table_line_flags();
@@ -1898,7 +1902,7 @@ impl LiveMarkdownView {
     /// 返回 `true` 表示已处理。
     fn table_enter_down(&mut self, cx: &mut Context<Self>) -> bool {
         let cur = self.buffer.cursor();
-        let lines: Vec<String> = self.buffer.lines().to_vec();
+        let lines: Vec<Line> = self.buffer.lines().to_vec();
         // 预先算出「哪些行是表格行」，闭包不再借用 `self`（`self.edit`
         // 需要可变借用，闭包持不可变借用会冲突）。
         let table_lines = self.table_line_flags();
@@ -3344,7 +3348,7 @@ fn table_menu_body(menu: PopupMenu, ent: Entity<LiveMarkdownView>) -> PopupMenu 
 }
 
 /// 表格块内所有数据格都为空吗（分隔行不计）——spec #12 的「空表退格删表」判定。
-fn table_block_all_empty(lines: &[String], block: (usize, usize)) -> bool {
+fn table_block_all_empty(lines: &[Line], block: (usize, usize)) -> bool {
     use crate::editor::markdown_live::table_ops as t;
     for i in block.0..=block.1 {
         let Some(line) = lines.get(i) else {
@@ -3860,7 +3864,7 @@ pub(crate) struct MermaidBlockRef {
 impl PlanGeometry {
     /// Derive geometry from the planned rows. `lines` supplies the code text
     /// for the cached mermaid sources.
-    fn build(rows: &[PlannedRow], lines: &[String]) -> Self {
+    fn build(rows: &[PlannedRow], lines: &[Line]) -> Self {
         // ---- grouping: consecutive rows sharing one chrome container ----
         let mut groups: Vec<Group> = Vec::new();
         let mut i = 0;
@@ -3998,7 +4002,7 @@ impl PlanGeometry {
                 block_id: rows[*open].line,
                 source: Arc::from(
                     code.iter()
-                        .map(|c| lines.get(rows[*c].line).map(String::as_str).unwrap_or(""))
+                        .map(|c| lines.get(rows[*c].line).map(|l| l.as_str()).unwrap_or(""))
                         .collect::<Vec<_>>()
                         .join("\n")
                         .as_str(),
@@ -5680,9 +5684,9 @@ impl Render for LiveMarkdownView {
                 }
                 Group::Table(idxs) => {
                     let revealed = idxs.iter().any(|c| rows[*c].plan.revealed);
-                    let src_lines: Vec<String> = idxs
+                    let src_lines: Vec<Line> = idxs
                         .iter()
-                        .map(|c| self.buffer.line(rows[*c].line).unwrap_or("").to_string())
+                        .map(|c| Arc::new(self.buffer.line(rows[*c].line).unwrap_or("").to_string()))
                         .collect();
                     let grid_rows: Vec<Vec<String>> =
                         src_lines.iter().map(|l| split_table_row(l)).collect();
@@ -6013,7 +6017,7 @@ impl Render for LiveMarkdownView {
                                 });
                                 let src_line = src_lines
                                     .get(di.min(src_lines.len() - 1))
-                                    .map(String::as_str)
+                                    .map(|l| l.as_str())
                                     .unwrap_or("");
                                 // Typora `.md-expand`：整格保持渲染，只把光标
                                 // 所在的那个行内元素的标记展开（`**粗体**` 里的
@@ -6094,7 +6098,7 @@ impl Render for LiveMarkdownView {
                                 // 且与活动格一致夹在本格内容范围内。
                                 let src_line = src_lines
                                     .get(di.min(src_lines.len() - 1))
-                                    .map(String::as_str)
+                                    .map(|l| l.as_str())
                                     .unwrap_or("");
                                 let (s, e) = table_cell_spans(src_line)
                                     .get(col)
@@ -6846,7 +6850,7 @@ mod live_render_tests {
             let style = MarkdownStyle::themed(window, cx);
             let colors = LiveColors::resolve(&style, &theme);
             let hl = HighlightCache::new();
-            let lines: Vec<String> = SAMPLE.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(SAMPLE);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -6970,7 +6974,7 @@ mod live_render_tests {
             let style = MarkdownStyle::themed(window, cx);
             let colors = LiveColors::resolve(&style, &theme);
             let hl = HighlightCache::new();
-            let lines: Vec<String> = SHOWCASE.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(SHOWCASE);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -7179,7 +7183,7 @@ mod live_frame_tests {
             Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx)))
         });
         let view = host.read_with(cx, |h, _| h.0.clone());
-        let lines: Vec<String> = DOC.split('\n').map(str::to_string).collect();
+        let lines: Vec<Line> = DOC.split('\n').map(|l| Arc::new(l.to_string())).collect();
         let rows = plan_document(
             &lines,
             Reveal {
@@ -8169,7 +8173,7 @@ mod live_frame_tests {
             line_count_before,
             "合并/分发都不得增删行"
         );
-        let lines: Vec<String> = view.read_with(cx, |v, _| v.buffer.lines().to_vec());
+        let lines: Vec<Line> = view.read_with(cx, |v, _| v.buffer.lines().to_vec());
         assert_eq!(
             crate::editor::markdown_live::table_ops::table_block_range(&lines, 0),
             Some((0, 3)),
@@ -8583,7 +8587,7 @@ mod live_frame_tests {
             // block scrolled into the rendered window (jump the cursor onto
             // it); absence is decided at classification level (a grid/card
             // cannot render for rows that were never classified as such).
-            let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -8730,7 +8734,7 @@ mod live_showcase_tests {
     /// table row whose visible text is empty or suspiciously short.
     #[test]
     fn showcase_code_and_table_rows_have_visible_text() {
-        let lines: Vec<String> = SHOWCASE.split('\n').map(str::to_string).collect();
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(SHOWCASE);
         let rows = plan_document(
             &lines,
             Reveal {
@@ -8783,7 +8787,7 @@ mod live_showcase_tests {
     #[test]
     fn outline_collects_headings_in_order() {
         let doc = "# A\n\ntext\n\n## B\n\n### C\n\n## D\n";
-        let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
         let rows = plan_document(
             &lines,
             Reveal {
@@ -8825,7 +8829,7 @@ mod live_showcase_tests {
                 "| left | center | right |\n| :--- | :---: | ---: |\n| a | b | c |\n",
             ),
         ] {
-            let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -10080,7 +10084,7 @@ mod setext_parity_tests {
                     _ => {}
                 }
             }
-            let lines: Vec<String> = doc.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
             let rows = plan_document(
                 &lines,
                 Reveal {

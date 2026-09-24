@@ -12,6 +12,8 @@
 //! and unmatched delimiters stay literal text.
 
 use std::collections::HashMap;
+
+use crate::editor::markdown_live::model::Line;
 use std::ops::Range;
 
 /// Normalize a reference label (CommonMark: case-insensitive, inner
@@ -27,7 +29,7 @@ pub fn norm_label(label: &str) -> String {
 /// Collect `[label]: destination` definitions over whole lines: reference
 /// links resolve document-wide (pulldown parity for the preview).
 /// `skip(i)` shields fenced-code/frontmatter/table lines from registering.
-pub fn collect_refdefs(lines: &[String], skip: &dyn Fn(usize) -> bool) -> HashMap<String, String> {
+pub fn collect_refdefs(lines: &[Line], skip: &dyn Fn(usize) -> bool) -> HashMap<String, String> {
   let mut defs = HashMap::new();
   for (i, line) in lines.iter().enumerate() {
     if skip(i) {
@@ -1272,22 +1274,19 @@ mod tests {
   }
 
   fn parse_refs(text: &str) -> Inline {
-    let lines = vec![text.to_string(), "[docs]: https://x.dev".to_string()];
+    let lines =
+      crate::editor::markdown_live::model::lines_from_text(&format!("{text}\n[docs]: https://x.dev"));
     let refs = collect_refdefs(&lines, &|_| false);
     parse_with_refs(text, &refs)
   }
 
   #[test]
   fn refdefs_collect_first_wins() {
-    let lines = vec![
-      "[a]: /one".to_string(),
-      "   [A]: /two".to_string(),
-      "[^fn]: /note".to_string(),
-      "    [code]: /indented".to_string(),
-      "[empty]:".to_string(),
-    ];
+    let lines = crate::editor::markdown_live::model::lines_from_text(
+      "[a]: /one\n   [A]: /two\n[^fn]: /note\n    [code]: /indented\n[empty]:",
+    );
     let refs = collect_refdefs(&lines, &|i| i == 3);
-    assert_eq!(refs.get("a").map(String::as_str), Some("/one"));
+    assert_eq!(refs.get("a").map(|l| l.as_str()), Some("/one"));
     assert!(refs.get("code").is_none());
     assert!(refs.get("empty").is_none());
     assert!(refs.get("fn").is_none());

@@ -6,7 +6,7 @@
 //! highlight/image caches), the disk baseline for [`LiveBuffer::is_dirty`],
 //! and line-ending preservation for save.
 
-use crate::editor::markdown_live::model::{EditorModel, Pos};
+use crate::editor::markdown_live::model::{EditorModel, Line, Pos};
 
 /// Monotonic document revision. Bumped on every text mutation (never on pure
 /// cursor/selection moves) so observers and caches can cheaply detect edits.
@@ -145,7 +145,7 @@ impl LiveBuffer {
         self.model.line(i)
     }
 
-    pub fn lines(&self) -> &[String] {
+    pub fn lines(&self) -> &[Line] {
         self.model.lines()
     }
 
@@ -184,7 +184,7 @@ impl LiveBuffer {
         Pos::new(
             line,
             crate::editor::markdown_live::layout::col_for_byte(
-                lines.get(line).map(String::as_str).unwrap_or(""),
+                lines.get(line).map(|l| l.as_str()).unwrap_or(""),
                 local,
             ),
         )
@@ -273,7 +273,7 @@ mod tests {
         ];
         for text in texts {
             let mut b = LiveBuffer::new(text);
-            let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(text);
             let total: usize = lines.iter().map(|l| l.len() + 1).sum::<usize>();
             for off in 0..=total {
                 let fast = b.pos_of_offset(off);
@@ -299,7 +299,7 @@ mod tests {
             }
             // Edits must keep the index in sync.
             b.edit(|m| m.insert("X\nY"));
-            let lines: Vec<String> = b.text().split('\n').map(str::to_string).collect();
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&b.text());
             let total: usize = lines.iter().map(|l| l.len() + 1).sum::<usize>();
             for off in 0..=total {
                 let fast = b.pos_of_offset(off);

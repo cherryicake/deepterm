@@ -13,7 +13,7 @@ use crate::editor::markdown_live::block::{
 };
 use crate::editor::markdown_live::interactions::cell_content_cols;
 use crate::editor::markdown_live::layout::col_for_byte as char_col;
-use crate::editor::markdown_live::model::{EditorModel, Pos};
+use crate::editor::markdown_live::model::{EditorModel, Line, Pos};
 use crate::editor::markdown_live::reveal::classify_document;
 
 /// 表格块的范围：`(起始行, 结束行)`，闭区间。`None` = 该行不是表格。
@@ -23,7 +23,7 @@ use crate::editor::markdown_live::reveal::classify_document;
 /// 渲染」一致）。此前这里用「行内出现 `|`」做邻接扩张，会把紧邻表格的、
 /// 只是恰好含 `|` 的普通段落行（如 `` 用 `a | b` 表示或运算 ``）也算进块，
 /// 于是删列/移列/重排会把它当表格行改写。
-pub fn table_block_range(lines: &[String], line: usize) -> Option<(usize, usize)> {
+pub fn table_block_range(lines: &[Line], line: usize) -> Option<(usize, usize)> {
     if line >= lines.len() {
         return None;
     }
@@ -39,7 +39,7 @@ pub fn table_block_range(lines: &[String], line: usize) -> Option<(usize, usize)
 /// [`table_block_range`] 的免分类版本：`flags[i]` = 第 i 行是否 `Block::Table`
 /// （调用方已有分类时用它避免重跑 O(n) 分类；拖拽等高频路径）。
 pub fn table_block_range_flagged(
-    lines: &[String],
+    lines: &[Line],
     flags: &[bool],
     line: usize,
 ) -> Option<(usize, usize)> {
@@ -68,21 +68,21 @@ pub fn is_delimiter_row(line: &str) -> bool {
 }
 
 /// 分隔行在块内的行号（表头行 + 1 的常规形态；找不到返回 `None`）。
-pub fn delimiter_row(lines: &[String], block: (usize, usize)) -> Option<usize> {
+pub fn delimiter_row(lines: &[Line], block: (usize, usize)) -> Option<usize> {
     (block.0..=block.1).find(|i| is_delimiter_row(&lines[*i]))
 }
 
 /// 数据行（含表头，跳过其他分隔行）的行号列表。
-pub fn table_data_rows(lines: &[String], block: (usize, usize)) -> Vec<usize> {
+pub fn table_data_rows(lines: &[Line], block: (usize, usize)) -> Vec<usize> {
     (block.0..=block.1)
         .filter(|i| !is_delimiter_row(&lines[*i]))
         .collect()
 }
 
 /// 列数（以分隔行为准；没有分隔行时用第一行）。
-pub fn table_col_count(lines: &[String], block: (usize, usize)) -> usize {
+pub fn table_col_count(lines: &[Line], block: (usize, usize)) -> usize {
     let probe = delimiter_row(lines, block).unwrap_or(block.0);
-    table_cell_spans(lines.get(probe).map(String::as_str).unwrap_or("")).len()
+    table_cell_spans(lines.get(probe).map(|l| l.as_str()).unwrap_or("")).len()
 }
 
 
@@ -132,7 +132,7 @@ impl Align {
 }
 
 /// 读当前各列对齐。
-pub fn table_aligns(lines: &[String], block: (usize, usize)) -> Vec<Align> {
+pub fn table_aligns(lines: &[Line], block: (usize, usize)) -> Vec<Align> {
     let Some(d) = delimiter_row(lines, block) else {
         return vec![Align::None; table_col_count(lines, block)];
     };
@@ -143,7 +143,7 @@ pub fn table_aligns(lines: &[String], block: (usize, usize)) -> Vec<Align> {
 }
 
 /// 光标所在列（`None` = 该行不是表格行）。
-pub fn column_at(lines: &[String], line: usize, col: usize) -> Option<usize> {
+pub fn column_at(lines: &[Line], line: usize, col: usize) -> Option<usize> {
     let text = lines.get(line)?;
     let spans = table_cell_spans(text);
     let byte = byte_for_col(text, col);
@@ -348,7 +348,7 @@ pub fn insert_column(model: &mut EditorModel, before: bool) -> bool {
     }
     apply_row_edits(model, &lines, &edits);
     // 光标落到新列的第一个数据格。
-    let after: Vec<String> = model.lines().to_vec();
+    let after: Vec<Line> = model.lines().to_vec();
     let rows = table_block_range(&after, cur.line)
         .map(|b| table_data_rows(&after, b))
         .unwrap_or_default();
@@ -552,7 +552,10 @@ pub fn move_row(model: &mut EditorModel, up: bool) -> bool {
         }
     };
     // 与相邻数据行交换文本。
-    let edits = vec![(cur.line, lines[other].clone()), (other, lines[cur.line].clone())];
+    let edits = vec![
+        (cur.line, lines[other].to_string()),
+        (other, lines[cur.line].to_string()),
+    ];
     apply_row_edits(model, &lines, &edits);
     model.move_to(other, cur.col, false);
     true
@@ -619,7 +622,7 @@ pub fn delete_table(model: &mut EditorModel) -> bool {
 
 /// 计算 `block` 的重排行改写（数据行含表头 + 分隔行），纯函数、不动 model。
 /// 列宽 = 各列最宽内容（CJK 算 2 列），上限 60、下限 4（Typora 同款）。
-pub fn prettify_edits(lines: &[String], block: (usize, usize)) -> Option<Vec<(usize, String)>> {
+pub fn prettify_edits(lines: &[Line], block: (usize, usize)) -> Option<Vec<(usize, String)>> {
     let cols = table_col_count(lines, block);
     if cols == 0 {
         return None;
@@ -654,7 +657,7 @@ pub fn prettify_edits(lines: &[String], block: (usize, usize)) -> Option<Vec<(us
     for &i in &rows {
         let cells = split_table_row(&lines[i]);
         let out: Vec<String> = (0..cols)
-            .map(|c| pad(cells.get(c).map(String::as_str).unwrap_or(""), widths[c], aligns[c]))
+            .map(|c| pad(cells.get(c).map(|l| l.as_str()).unwrap_or(""), widths[c], aligns[c]))
             .collect();
         edits.push((i, format!("| {} |", out.join(" | "))));
     }
@@ -811,7 +814,7 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
     }
     apply_row_edits(model, &lines, &edits);
     // 光标落在粘贴区域右下角。
-    let after: Vec<String> = model.lines().to_vec();
+    let after: Vec<Line> = model.lines().to_vec();
     let is_t = |l: usize| table_block_range(&after, l).is_some();
     let last_row = row + pasted.len() - 1;
     let last_col = col + pasted.last().map(Vec::len).unwrap_or(1).saturating_sub(1);
@@ -1015,14 +1018,14 @@ pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool 
                 &merged,
             ));
         }
-        let mut new_text = text.clone();
+        let mut new_text = text.to_string();
         for (bs, be, repl) in ops {
             if bs <= be && be <= new_text.len() {
                 new_text.replace_range(bs..be, repl);
             }
         }
-        if new_text != *text {
-            edits.push((l, new_text));
+        if new_text.as_str() != text.as_str() {
+            edits.push((l, new_text.to_string()));
         }
     }
     if edits.is_empty() {
@@ -1041,13 +1044,13 @@ pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool 
     true
 }
 
-fn apply_row_edits(model: &mut EditorModel, lines: &[String], edits: &[(usize, String)]) {
+fn apply_row_edits(model: &mut EditorModel, lines: &[Line], edits: &[(usize, String)]) {
     let mut sorted: Vec<(usize, String)> = edits.to_vec();
     sorted.sort_by_key(|(i, _)| *i);
     sorted.dedup_by_key(|(i, _)| *i);
     let saved = model.cursor();
     for (i, new) in sorted.into_iter().rev() {
-        let old = lines.get(i).map(String::as_str).unwrap_or("");
+        let old = lines.get(i).map(|l| l.as_str()).unwrap_or("");
         if old == new {
             continue;
         }
@@ -1080,7 +1083,7 @@ mod tests {
         m.move_to(0, 3, false); // 首格 "abc" 的 'b'：前缀 = "a"
         m.move_to(2, 10, true); // 尾格 "jkl" 的 'l'：后缀 = "l"
         assert!(merge_cross_cell_selection(&mut m, ""));
-        let lines: Vec<&str> = m.lines().iter().map(String::as_str).collect();
+        let lines: Vec<&str> = m.lines().iter().map(|l| l.as_str()).collect();
         // 首行：首格 ← "a"+"l"，同排其后的格清空；分隔行不动；
         // 中间数据行整行清空；尾行到尾格为止全部清空（尾格之后无列）。
         assert_eq!(lines[0], "| al |  |");
@@ -1101,7 +1104,7 @@ mod tests {
         m.move_to(0, 3, false);
         m.move_to(2, 10, true);
         assert!(merge_cross_cell_selection(&mut m, "X"));
-        assert_eq!(m.lines()[0], "| aXl |  |");
+        assert_eq!(m.lines()[0].as_str(), "| aXl |  |");
         assert_eq!(m.cursor(), Pos::new(0, 4)); // "a" + "X" 之后
         assert!(m.selection().is_none());
     }
@@ -1117,7 +1120,7 @@ mod tests {
         m.move_to(0, 2, false);
         m.move_to(0, 4, true);
         assert!(!merge_cross_cell_selection(&mut m, ""));
-        assert_eq!(m.lines()[0], "| abc | def |");
+        assert_eq!(m.lines()[0].as_str(), "| abc | def |");
         assert!(m.selection().is_some(), "同格选区应原样保留给常规删除");
     }
 
@@ -1129,13 +1132,13 @@ mod tests {
         m.move_to(2, 10, true);
         assert!(merge_cross_cell_selection(&mut m, ""));
         assert!(m.undo());
-        let lines: Vec<&str> = m.lines().iter().map(String::as_str).collect();
+        let lines: Vec<&str> = m.lines().iter().map(|l| l.as_str()).collect();
         assert_eq!(lines, DOC2.split('\n').collect::<Vec<_>>());
     }
 
     #[test]
     fn block_range_and_rows_skip_delimiter() {
-        let lines: Vec<String> = DOC.split('\n').map(str::to_string).collect();
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(DOC);
         let block = table_block_range(&lines, 2).expect("是表格");
         assert_eq!(block, (0, 3));
         assert_eq!(delimiter_row(&lines, block), Some(1));
@@ -1222,15 +1225,15 @@ mod tests {
         let mut m = model_at(2, 2); // a 列
         assert!(set_column_align(&mut m, Some(Align::Left)));
         assert!(m.text().contains("|:---|---:|---:|") || m.text().contains(":---"));
-        let lines: Vec<String> = m.lines().to_vec();
+        let lines: Vec<Line> = m.lines().to_vec();
         assert_eq!(table_aligns(&lines, (0, 3))[0], Align::Left);
         // 再点同一个 → 清除。
         assert!(set_column_align(&mut m, Some(Align::Left)));
-        let lines: Vec<String> = m.lines().to_vec();
+        let lines: Vec<Line> = m.lines().to_vec();
         assert_eq!(table_aligns(&lines, (0, 3))[0], Align::None);
         // 右对齐。
         assert!(set_column_align(&mut m, Some(Align::Right)));
-        let lines: Vec<String> = m.lines().to_vec();
+        let lines: Vec<Line> = m.lines().to_vec();
         assert_eq!(table_aligns(&lines, (0, 3))[0], Align::Right);
     }
 
@@ -1357,18 +1360,17 @@ mod tests {
     /// 误吸 —— 也正是下面断言的情形。
     #[test]
     fn block_range_does_not_absorb_pipe_paragraphs() {
-        let lines: Vec<String> = "用 `a | b` 表示或运算\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾部 | 段落\n"
-            .split('\n')
-            .map(str::to_string)
-            .collect();
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(
+            "用 `a | b` 表示或运算\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾部 | 段落\n",
+        );
         assert_eq!(table_block_range(&lines, 2), Some((1, 3)), "前导段落行不得进块");
         // 块内数据行：表头 + 1 条数据（段落行不在其中）。
         assert_eq!(table_data_rows(&lines, (1, 3)), vec![1, 3]);
         // 表头保护仍然生效：对表头行删行 = 无操作。
-        let mut m = EditorModel::new(&lines.join("\n"));
+        let mut m = EditorModel::new(&crate::editor::markdown_live::model::join_lines(&lines));
         m.move_to(1, 2, false);
         assert!(!delete_row(&mut m), "表头不可删");
-        assert_eq!(m.text(), lines.join("\n"), "拒绝时不得改动文本");
+        assert_eq!(m.text(), crate::editor::markdown_live::model::join_lines(&lines), "拒绝时不得改动文本");
         // 块范围与渲染器分类一致（同源，不可能再出现「op 改了渲染器不认为
         // 是表格的行」）。
         let classified = classify_document(&lines);
