@@ -321,6 +321,7 @@ impl RenderOnce for Modal {
         let has_max_h = self.max_height.is_some();
         let panel = div()
             .id("modal-panel")
+            .debug_selector(|| "modal-panel-bounds".to_string())
             .flex()
             .flex_col()
             .items_center()

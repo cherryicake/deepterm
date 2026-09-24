@@ -635,6 +635,8 @@ impl NewHostForm {
             ("添加新主机", "添加 SSH 主机配置")
         };
         div()
+            .id("new-host-form-header")
+            .debug_selector(|| "new-host-form-header".to_string())
             .w_full()
             .pb(px(16.))
             .child(
@@ -830,7 +832,11 @@ impl NewHostForm {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            // 已配置规则之间排紧一点：6px 显得松散，3px 够区分各行即可。
+            .gap(px(3.))
+            // 与上方「地址 / 端口」标签文字的左边缘对齐：标签列 60px 内右对齐，
+            // text_sm 字号 14px、两个汉字 = 28px → 文字起点 60 - 28 = 32px。
+            .pl(px(32.))
             .children(rows)
             .child(draft)
             .child(
@@ -921,6 +927,8 @@ impl NewHostForm {
 
     fn render_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("new-host-form-footer")
+            .debug_selector(|| "new-host-form-footer".to_string())
             .mt_2()
             .flex()
             .gap(px(8.0))
@@ -960,99 +968,35 @@ impl Render for NewHostForm {
             .id("new-host-form-macos")
             .track_focus(&self.focus_handle)
             .w(px(480.))
+            // min_h_0：让表单本体可被弹窗 max_height 夹到 600 多像素。
+            // 不写的话它的自动最小尺寸 = 内容高度，整块不收缩，退化成
+            // 「整个面板一起滚」（标题和按钮跟着内容跑）。
+            .min_h_0()
             .p(px(20.))
             .flex()
             .flex_col()
             .gap(px(10.))
+            // ── 顶部标题固定 ──
+            // 表单被弹窗 max_height 夹住时，标题不参与滚动：滚动只发生在下面
+            // 那一段（flex_1 + min_h_0 把夹完之后的剩余高度全给它）。
             .child(self.render_header(cx))
-            .children(self.render_message(cx))
-            // ── Basic Info ──
-            .child(self.render_section_title("基本信息", cx))
-            // 分组行与认证行同构：select 直接作 flex 子项取自然宽度。
-            // 不能走 render_row 的 flex_1 包裹——那会把触发器拉满整列，
-            // 弹窗锚在触发器全宽的左上角，跑到列首去（认证行是对的，照它修）。
+            // ── 中间内容单独滚动 ──
             .child(
                 div()
-                    .w_full()
+                    .id("new-host-form-scroll")
+                    .debug_selector(|| "new-host-form-scroll".to_string())
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(10.))
+                    // ── Basic Info ──
+                    .child(self.render_section_title("基本信息", cx))
+                    // 分组行与认证行同构：select 直接作 flex 子项取自然宽度。
+                    // 不能走 render_row 的 flex_1 包裹——那会把触发器拉满整列，
+                    // 弹窗锚在触发器全宽的左上角，跑到列首去（认证行是对的，照它修）。
                     .child(
-                        div()
-                            .w(px(60.))
-                            .flex()
-                            .justify_end()
-                            .child(div().text_sm().text_color(theme.text).child("分组")),
-                    )
-                    .child(self.group_select.clone()),
-            )
-            .child(self.render_row("昵称", false, EditorInput::new(&self.nickname_input), cx))
-            .child(self.render_row("地址", false, EditorInput::new(&self.hostname_input), cx))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(16.))
-                    // Port group
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(12.))
-                            .w(px(140.))
-                            .child(
-                                div()
-                                    .w(px(60.))
-                                    .flex()
-                                    .justify_end()
-                                    .child(div().text_sm().text_color(theme.text).child("端口")),
-                            )
-                            .child(div().w(px(68.)).child(EditorInput::new(&self.port_input))),
-                    )
-                    // Username group (fixed width to align with above)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(12.))
-                            .w(px(324.))
-                            .child(
-                                div()
-                                    .w(px(60.))
-                                    .flex()
-                                    .justify_end()
-                                    .child(div().text_sm().text_color(theme.text).child("用户名")),
-                            )
-                            .child(div().flex_1().child(EditorInput::new(&self.username_input))),
-                    ),
-            )
-            // ── Authentication ──
-            .child(self.render_section_title("认证", cx))
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .w(px(60.))
-                            .flex()
-                            .justify_end()
-                            .child(div().text_sm().text_color(theme.text).child("方式")),
-                    )
-                    .child(self.auth_type_select.clone()),
-            )
-            .when(
-                matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey),
-                |this| {
-                    this.child(
                         div()
                             .w_full()
                             .flex()
@@ -1064,51 +1008,141 @@ impl Render for NewHostForm {
                                     .w(px(60.))
                                     .flex()
                                     .justify_end()
-                                    .child(div().text_sm().text_color(theme.text).child("钥匙串")),
+                                    .child(div().text_sm().text_color(theme.text).child("分组")),
                             )
-                            .child(self.keychain_select.clone()),
+                            .child(self.group_select.clone()),
                     )
-                },
-            )
-            .when(
-                matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey)
-                    && self.selected_keychain_id.is_none(),
-                |this| {
-                    this.child(self.render_row(
-                        "标签",
+                    .child(self.render_row(
+                        "昵称",
                         false,
-                        EditorInput::new(&self.credential_label_input),
+                        EditorInput::new(&self.nickname_input),
                         cx,
                     ))
-                },
-            )
-            .when(
-                matches!(self.auth_type, AuthType::Password) && self.selected_keychain_id.is_none(),
-                |this| {
-                    this.child(self.render_row(
-                        "密码",
+                    .child(self.render_row(
+                        "地址",
                         false,
-                        EditorInput::new(&self.password_input).mask_toggle(),
+                        EditorInput::new(&self.hostname_input),
                         cx,
                     ))
-                },
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(16.))
+                            // Port group
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .w(px(140.))
+                                    .child(div().w(px(60.)).flex().justify_end().child(
+                                        div().text_sm().text_color(theme.text).child("端口"),
+                                    ))
+                                    .child(
+                                        div().w(px(68.)).child(EditorInput::new(&self.port_input)),
+                                    ),
+                            )
+                            // Username group (fixed width to align with above)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .w(px(324.))
+                                    .child(div().w(px(60.)).flex().justify_end().child(
+                                        div().text_sm().text_color(theme.text).child("用户名"),
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child(EditorInput::new(&self.username_input)),
+                                    ),
+                            ),
+                    )
+                    // ── Authentication ──
+                    .child(self.render_section_title("认证", cx))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .w(px(60.))
+                                    .flex()
+                                    .justify_end()
+                                    .child(div().text_sm().text_color(theme.text).child("方式")),
+                            )
+                            .child(self.auth_type_select.clone()),
+                    )
+                    .when(
+                        matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey),
+                        |this| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().w(px(60.)).flex().justify_end().child(
+                                        div().text_sm().text_color(theme.text).child("钥匙串"),
+                                    ))
+                                    .child(self.keychain_select.clone()),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(self.auth_type, AuthType::Password | AuthType::PrivateKey)
+                            && self.selected_keychain_id.is_none(),
+                        |this| {
+                            this.child(self.render_row(
+                                "标签",
+                                false,
+                                EditorInput::new(&self.credential_label_input),
+                                cx,
+                            ))
+                        },
+                    )
+                    .when(
+                        matches!(self.auth_type, AuthType::Password)
+                            && self.selected_keychain_id.is_none(),
+                        |this| {
+                            this.child(self.render_row(
+                                "密码",
+                                false,
+                                EditorInput::new(&self.password_input).mask_toggle(),
+                                cx,
+                            ))
+                        },
+                    )
+                    .when(
+                        matches!(self.auth_type, AuthType::PrivateKey)
+                            && self.selected_keychain_id.is_none(),
+                        |this| {
+                            this.child(self.render_row(
+                                "密钥路径",
+                                false,
+                                EditorInput::new(&self.key_path_input),
+                                cx,
+                            ))
+                        },
+                    )
+                    // ── Port forward ──
+                    .child(self.render_section_title("端口转发（把本机服务暴露到远端）", cx))
+                    .child(self.render_port_forwards(cx)),
             )
-            .when(
-                matches!(self.auth_type, AuthType::PrivateKey)
-                    && self.selected_keychain_id.is_none(),
-                |this| {
-                    this.child(self.render_row(
-                        "密钥路径",
-                        false,
-                        EditorInput::new(&self.key_path_input),
-                        cx,
-                    ))
-                },
-            )
-            // ── Port forward ──
-            .child(self.render_section_title("端口转发（把本机服务暴露到远端）", cx))
-            .child(self.render_port_forwards(cx))
-            // ── Footer ──
+            // ── 底部固定 ──
+            // 提示与按钮都留在滚动区之外：内容再长，取消/保存也始终可见，
+            // 校验错误（如「主机地址不能为空」）不用滚回顶部才发现。
+            .children(self.render_message(cx))
             .child(self.render_buttons(cx))
     }
 }
@@ -1288,5 +1322,163 @@ mod view_tests {
                 cx.notify();
             });
         });
+    }
+
+    /// 与真实弹窗同款宿主：`HostView::build_modal` 就是 max_height 700 的 Modal。
+    struct ModalHost {
+        form: Entity<NewHostForm>,
+    }
+
+    impl Render for ModalHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(
+                crate::components::modal::Modal::new("test-host-modal")
+                    .width(px(540.))
+                    .max_height(px(700.))
+                    .top_padding(px(120.))
+                    .child(self.form.clone()),
+            )
+        }
+    }
+
+    /// 弹窗被 `max_height(700)` 夹住时：标题固定在顶、按钮固定在底，
+    /// 只有中间内容区滚动。
+    ///
+    /// 把端口转发规则堆到远超 700px：
+    /// - 旧实现整个面板一起滚，按钮会被内容顶到面板可视区之外；
+    /// - 新实现滚动区被夹在标题与按钮之间，超出的内容只在中间滚。
+    #[gpui::test]
+    fn overflow_scrolls_middle_only(cx: &mut TestAppContext) {
+        cx.update(crate::theme::init);
+
+        let slot: std::rc::Rc<std::cell::RefCell<Option<Entity<NewHostForm>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot_for_window = slot.clone();
+        let window = cx.open_window(size(px(760.), px(1000.)), move |window, cx| {
+            let form = NewHostForm::new(window, cx);
+            *slot_for_window.borrow_mut() = Some(form.clone());
+            ModalHost { form }
+        });
+        cx.run_until_parked();
+        let form = slot.borrow().clone().expect("表单应已构造");
+
+        // 15 条规则把内容撑到远超 660px（700 - 上下 padding），逼出滚动。
+        cx.update(|cx| {
+            form.update(cx, |form, cx| {
+                form.port_forwards = (0..15u16)
+                    .map(|i| crate::ssh::port_forward::PortForwardRule {
+                        bind_host: DEFAULT_BIND_HOST.to_string(),
+                        bind_port: 3801 + i,
+                        target_host: "127.0.0.1".to_string(),
+                        target_port: 8080 + i,
+                        description: String::new(),
+                    })
+                    .collect();
+                cx.notify();
+            });
+        });
+
+        // 真正画一帧：布局断言只有渲染后才成立。
+        let handle: gpui::AnyWindowHandle = window.into();
+        let _ = cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        let mut visual = gpui::VisualTestContext::from_window(handle, cx);
+        visual.run_until_parked();
+
+        let panel = visual
+            .debug_bounds("modal-panel-bounds")
+            .expect("弹窗面板应有布局");
+        let header = visual
+            .debug_bounds("new-host-form-header")
+            .expect("标题应有布局");
+        let middle = visual
+            .debug_bounds("new-host-form-scroll")
+            .expect("滚动区应有布局");
+        let footer = visual
+            .debug_bounds("new-host-form-footer")
+            .expect("按钮区应有布局");
+        let draft = visual
+            .debug_bounds("forward-bind-host-input")
+            .expect("草稿行应有布局");
+
+        assert!(
+            panel.size.height <= px(701.),
+            "面板高度应被 max_height 夹住: {:?}",
+            panel.size.height
+        );
+        assert!(middle.size.height > px(0.), "滚动区必须有高度");
+        assert!(
+            header.bottom() <= middle.top() + px(1.),
+            "标题固定在滚动区上方: 标题底 {:?}，滚动区顶 {:?}",
+            header.bottom(),
+            middle.top()
+        );
+        assert!(
+            footer.top() >= middle.bottom() - px(1.),
+            "按钮固定在滚动区下方: 按钮顶 {:?}，滚动区底 {:?}",
+            footer.top(),
+            middle.bottom()
+        );
+        assert!(
+            footer.bottom() <= panel.bottom() + px(1.),
+            "内容再多按钮也不能被顶出面板: 按钮底 {:?}，面板底 {:?}",
+            footer.bottom(),
+            panel.bottom()
+        );
+        // 草稿行在内容底部附近：它落在滚动区可视范围之外，说明内容确实
+        // 高于视口（超出部分只能靠中间滚动区滚），而不是被裁掉。
+        assert!(
+            draft.top() > middle.bottom() - px(1.),
+            "内容应溢出滚动区（否则测不到滚动）: 草稿顶 {:?}，滚动区底 {:?}",
+            draft.top(),
+            middle.bottom()
+        );
+
+        // ── 反向场景：内容不超高 ──
+        // 表单应回到自然紧凑高度（不被拉满 700），草稿行等底部内容完整
+        // 落在滚动区内，按钮紧跟在内容下方。
+        cx.update(|cx| {
+            form.update(cx, |form, cx| {
+                form.port_forwards.clear();
+                cx.notify();
+            });
+        });
+        let _ = cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+
+        let panel = visual
+            .debug_bounds("modal-panel-bounds")
+            .expect("面板应有布局");
+        let middle = visual
+            .debug_bounds("new-host-form-scroll")
+            .expect("滚动区应有布局");
+        let footer = visual
+            .debug_bounds("new-host-form-footer")
+            .expect("按钮区应有布局");
+        let draft = visual
+            .debug_bounds("forward-bind-host-input")
+            .expect("草稿行应有布局");
+
+        assert!(
+            panel.size.height < px(700.),
+            "内容不超高时弹窗应是紧凑高度，而不是拉满: {:?}",
+            panel.size.height
+        );
+        assert!(
+            draft.bottom() <= middle.bottom() + px(1.),
+            "内容不超高时底部内容应完整可见: 草稿底 {:?}，滚动区底 {:?}",
+            draft.bottom(),
+            middle.bottom()
+        );
+        assert!(
+            footer.top() >= middle.bottom() - px(1.),
+            "按钮应紧跟滚动区下方: 按钮顶 {:?}，滚动区底 {:?}",
+            footer.top(),
+            middle.bottom()
+        );
     }
 }
