@@ -128,7 +128,7 @@ pub struct LiveMarkdownView {
     /// 后台 + 防抖渲染；详见 `mermaid` 模块）。
     mermaid: MermaidState,
     /// Bring the caret's row into view on the next render (set by every
-    /// edit/move; consumed by `scroll_to_item` on the rows column).
+    /// edit/move; consumed by the row-precise scroll in `render`).
     scroll_to_cursor: bool,
     /// Source-line range per rendered row element (dead-zone hit fallback:
     /// clicks between/around rows map to the nearest element, then to a
@@ -817,9 +817,18 @@ impl LiveMarkdownView {
         line: usize,
         layout: gpui::TextLayout,
         text_len: usize,
+        doc_top: f32,
+        doc_bottom: f32,
     ) {
-        self.row_layouts
-            .insert(line, RowLayoutInfo { layout, text_len });
+        self.row_layouts.insert(
+            line,
+            RowLayoutInfo {
+                layout,
+                text_len,
+                doc_top,
+                doc_bottom,
+            },
+        );
     }
 
     /// 记录某格的命中信息（cell LiveLine `paint` 调用；纯字段写入，不
@@ -4222,6 +4231,15 @@ pub(crate) struct CellHit {
 pub(crate) struct RowLayoutInfo {
     pub layout: gpui::TextLayout,
     pub text_len: usize,
+    /// The row's text rect in **document space** (window space minus the
+    /// scroll offset in effect at paint time).
+    ///
+    /// This is what makes the caret scroll row-precise: it tells the view
+    /// whether the caret's *own line* is visible, independent of how tall its
+    /// container is (a table grid or code card is a single element holding
+    /// many rows).
+    pub doc_top: f32,
+    pub doc_bottom: f32,
 }
 
 /// 行虚拟化调参：超过该 group 数即只建视口内元素（`OVERSCAN_GROUPS`
@@ -4237,6 +4255,15 @@ const FIRST_WINDOW_GROUPS: usize = 80;
 /// 保证跨滚动滚过大量 group 时缓存大小恒定（与文档规模无关）；淘汰的项
 /// 读取时回退到估算并由下一帧实测自修正，因此是安全的（见 M3）。
 const GROUP_HEIGHT_KEEP_MARGIN: usize = 128;
+/// How many post-layout frames the caret scroll may spend correcting itself.
+///
+/// The element-level scroll aligns a whole container; the correction then moves
+/// the caret's *row* into view. Each pass can shift the layout (revealing a
+/// table grid also reveals its toolbar above it, changing the grid's height),
+/// so a few passes are allowed to settle. Bounded to keep a pathological
+/// layout from looping.
+const CARET_SCROLL_CORRECTION_PASSES: u8 = 3;
+
 /// 未实测 group 的高度估算：单行高 + 各容器 chrome。
 const EST_LINE_H: f32 = 26.0;
 /// Pitch 回填时代的默认行高：含组间 margin（标题 pitch 62.5、空白 38~58、
@@ -4934,10 +4961,10 @@ impl LiveMarkdownView {
                 hi = ohi;
             }
         }
-        // Caret edits/moves must land inside the window (scroll_to_item
-        // consumes the mapped child index in the same frame's prepaint).
-        // `ginfo` is ordered by line range, so the containing group is a
-        // binary search (the old linear scan ran every caret frame).
+        // Caret edits/moves must land inside the window: the caret row has to
+        // be *built* so the scroll logic can measure and reveal it (and so the
+        // caret paints). `ginfo` is ordered by line range, so the containing
+        // group is a binary search (the old linear scan ran every caret frame).
         if want_caret {
             let gc = match ginfo.binary_search_by(|(_, _, (a, b))| {
                 if cursor_line < *a {
@@ -4977,6 +5004,88 @@ impl LiveMarkdownView {
             self.virt_prefix[lo],
             total - self.virt_prefix[hi + 1],
         ))
+    }
+
+    /// Whether the caret's own row is already inside the viewport.
+    ///
+    /// `None` when the row's geometry is unknown (not painted yet) — the caller
+    /// then falls back to element-level scrolling.
+    fn caret_row_in_view(&self) -> Option<bool> {
+        let line = self.buffer.cursor().line;
+        let info = self.row_layouts.get(&line)?;
+        let vp_h = f32::from(self.scroll.bounds().size.height);
+        if vp_h <= 0.0 {
+            return None;
+        }
+        let vp_top = -f32::from(self.scroll.offset().y);
+        let vp_bottom = vp_top + vp_h;
+        Some(info.doc_top >= vp_top - 1.0 && info.doc_bottom <= vp_bottom + 1.0)
+    }
+
+    /// Re-measure the caret row after the frame's layout and correct the scroll
+    /// if it ended up outside the viewport.
+    ///
+    /// This is the row-precise half of the caret scroll (see the call site in
+    /// `render`): the element-level scroll can only align a whole container, so
+    /// a caret on a late row of a tall table/code card would be left off-screen.
+    /// Here the container's measured child bounds are available, so the caret
+    /// row's own rect can be derived and the view nudged by the smallest amount.
+    ///
+    /// Bounded to [`CARET_SCROLL_CORRECTION_PASSES`] frames, one pass each:
+    /// moving the scroll changes the row's rect, so a second pass in the same
+    /// frame would compute from stale geometry. Re-arming per frame lets the
+    /// layout settle (a table toolbar appearing above the grid changes its
+    /// height) while keeping each decision exact.
+    fn schedule_caret_scroll_correction(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = weak.update(cx, |view, cx| {
+                if !view.scroll_to_cursor {
+                    return;
+                }
+                if view.correct_caret_scroll() {
+                    view.schedule_caret_scroll_correction(cx);
+                }
+            });
+        });
+    }
+
+    /// One correction pass over the freshly measured caret row.
+    ///
+    /// Returns `true` when another pass (next frame) could help.
+    fn correct_caret_scroll(&mut self) -> bool {
+        let line = self.buffer.cursor().line;
+        let vp = self.scroll.bounds();
+        let vp_h = f32::from(vp.size.height);
+        if vp_h <= 0.0 {
+            return false;
+        }
+        // The caret row's rect, in the same space the scroll handle uses:
+        // derive it from the row's layout (recorded during paint, which ran
+        // with the *current* offset) rather than from stale element bounds.
+        let Some(info) = self.row_layouts.get(&line) else {
+            return false;
+        };
+        let (row_top, row_bottom) = (info.doc_top, info.doc_bottom);
+        let vp_top = -f32::from(self.scroll.offset().y);
+        let vp_bottom = vp_top + vp_h;
+        let row_h = (row_bottom - row_top).max(1.0);
+        let target_top = if row_h >= vp_h || row_top < vp_top {
+            row_top
+        } else if row_bottom > vp_bottom {
+            row_bottom - vp_h
+        } else {
+            self.scroll_to_cursor = false;
+            return false; // Already fully visible: never scroll.
+        };
+        let want = -target_top;
+        let cur = self.scroll.offset();
+        if (f32::from(cur.y) - want).abs() <= 0.5 {
+            self.scroll_to_cursor = false;
+            return false;
+        }
+        self.scroll.set_offset(gpui::point(cur.x, px(want)));
+        true
     }
 
     /// 滚动窗口化：只保留当前窗口 `lo..=hi` ± 余量内的实测高度，其余淘汰。
@@ -5074,7 +5183,7 @@ impl Render for LiveMarkdownView {
             geometry.row_in_window(pi, v_lo, v_hi)
         };
         // The caret's row must paint even when it sits just outside the window
-        // (scroll_to_item target + caret height).
+        // (it is the scroll target and carries the caret).
         let caret_row: Option<usize> = if virtualized {
             rows.iter().position(|r| r.line == cursor.line)
         } else {
@@ -5268,9 +5377,10 @@ impl Render for LiveMarkdownView {
         // preceding list item to number correctly). The per-frame cost is a
         // `Vec<Option<u64>>` lookup instead of a scan from line 0.
         let display_numbers = &geometry.display_numbers;
-        // row_els index of the element containing the caret's source line,
-        // for `scroll_to_item` (the rows column registers every direct
-        // child's bounds with the scroll handle).
+        // `row_els` index of the element containing the caret's source line.
+        // Used only as the *fallback* scroll target when the caret row's own
+        // rect is unknown (see `scroll_caret_row_into_view`); the precise path
+        // never scrolls by element, because that mis-handles tall containers.
         let mut caret_el_ix: Option<usize> = None;
         let mut row_els: Vec<gpui::AnyElement> = Vec::new();
         // The first row element's LiveLine also carries the dead-zone drag
@@ -6886,7 +6996,6 @@ impl Render for LiveMarkdownView {
             } else if rows.is_empty() {
                 let ent = entity.clone();
                 if show_caret {
-                    caret_el_ix = Some(row_els.len());
                 }
                 self.row_targets.push((0, 0));
                 row_els.push(
@@ -6920,18 +7029,44 @@ impl Render for LiveMarkdownView {
             }
         }
 
-        // Scroll-to-caret: the rows column (`live-markdown-content`) tracks
-        // every direct child with the scroll handle, so `scroll_to_item`
-        // scrolls the minimal amount to bring the caret's element into view
-        // (guise `ensure_cursor_visible` parity). Consumed by the column's
-        // prepaint in this same frame.
+        // Scroll-to-caret: bring the caret's *own row* into view, minimally.
+        //
+        // The rows column registers one child per group with the scroll
+        // handle, and a group can be far taller than the viewport (a table
+        // grid, a code card, a quote/paragraph run). GPUI's element-level
+        // `scroll_to_item` resolves that case by pinning the child's **top**
+        // edge to the viewport top (`scroll_handle_aligns_tall_children_to_top_edge`),
+        // which yanks the view up to the block's first row whenever the caret
+        // sits on a later row — pushing the row being edited off-screen and
+        // making it permanently unreachable. That is the bug this fixes.
+        //
+        // Two steps, because a scroll can only be computed from bounds that
+        // already exist:
+        //
+        // 1. *here* (before layout): if the caret row's element is known, ask
+        //    the scroll handle to bring that element into view — but only when
+        //    the caret row is not already inside the viewport, so typing in a
+        //    tall table never scrolls at all;
+        // 2. *next frame* (`correct_caret_scroll`): re-measure the caret row's
+        //    own rect (now exact, post-layout) and, if the block-level scroll
+        //    of step 1 left it outside the viewport, nudge by the minimal
+        //    amount. This is what makes a tall container behave like a normal
+        //    line: the container's top edge is never the final resting place.
         if self.scroll_to_cursor {
-            self.scroll_to_cursor = false;
-            if let Some(ix) = caret_el_ix {
-                self.scroll.scroll_to_item(ix);
+            match caret_el_ix {
+                Some(ix) => {
+                    // Skip the element-level scroll when the caret row is
+                    // already visible (the common typing case: no movement at
+                    // all). Unknown geometry (row not painted yet) must still
+                    // scroll, otherwise a long jump never reaches its target.
+                    if self.caret_row_in_view() != Some(true) {
+                        self.scroll.scroll_to_item(ix);
+                    }
+                    self.schedule_caret_scroll_correction(cx);
+                }
+                None => self.scroll_to_cursor = false,
             }
         }
-
 
         // Outline (Typora Outline parity) + current section highlight.
         // Hidden panel: skip the O(rows) scan entirely (large docs pay it
@@ -9504,6 +9639,241 @@ mod scroll_to_caret_tests {
     impl gpui::Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
             self.0.clone()
+        }
+    }
+
+    /// Editing a **tall container's later rows** must not scroll the view to
+    /// the container's top.
+    ///
+    /// A table grid / code card / quote run is ONE rendered element holding
+    /// many rows. GPUI's `ScrollHandle::scroll_to_item` pins an oversized
+    /// child's top edge to the viewport top, so a caret on the last table row
+    /// used to yank the view up to the table header — pushing the row being
+    /// edited off-screen and making it permanently unreachable.
+    ///
+    /// This asserts the caret's own row stays visible (and that the view did
+    /// not jump to the block's top) for a table taller than the viewport.
+    #[gpui::test]
+    fn tall_table_last_row_stays_visible(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // A table with many rows: the grid is far taller than the 300px window.
+        let mut doc = String::from("intro paragraph\n\n");
+        doc.push_str("| col a | col b |\n|---|---|\n");
+        for i in 0..40 {
+            doc.push_str(&format!("| row {i} | value {i} |\n"));
+        }
+        doc.push_str("\nafter\n");
+
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        vc.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+
+        // Put the caret on the table's LAST data row (line index: 2 intro
+        // lines + 2 header lines + 40 rows → the last row is line 43).
+        let last_row = 2 + 2 + 39;
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(last_row, 3, false));
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        // The caret row must be inside the viewport.
+        let (offset, vp_h, row_top, row_bottom) = view.read_with(&vc, |v, _| {
+            let line = v.buffer.cursor().line;
+            let info = v
+                .row_layouts
+                .get(&line)
+                .unwrap_or_else(|| panic!("caret row {line} has no recorded layout"));
+            (
+                v.scroll_offset_y(),
+                f32::from(v.scroll.bounds().size.height),
+                info.doc_top,
+                info.doc_bottom,
+            )
+        });
+        let vp_top = -offset;
+        let vp_bottom = vp_top + vp_h;
+        assert!(
+            row_top >= vp_top - 1.0 && row_bottom <= vp_bottom + 1.0,
+            "caret row must be visible: row {row_top:.1}..{row_bottom:.1} \
+             viewport {vp_top:.1}..{vp_bottom:.1}"
+        );
+        // And the view must NOT have jumped to the table's first line: the
+        // header (line 2) must be above the viewport top.
+        let header_bottom = view.read_with(&vc, |v, _| {
+            v.row_layouts.get(&2).map(|i| i.doc_bottom).unwrap_or(f32::MAX)
+        });
+        assert!(
+            header_bottom <= vp_top + 1.0,
+            "view must not scroll back to the table header \
+             (header bottom {header_bottom:.1} vs viewport top {vp_top:.1})"
+        );
+    }
+
+    /// Same guarantee for a code card: editing a late code line must not jump
+    /// the view to the card's first line.
+    #[gpui::test]
+    fn tall_code_card_late_line_stays_visible(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let mut doc = String::from("intro\n\n```rust\n");
+        for i in 0..60 {
+            doc.push_str(&format!("let x{i} = {i};\n"));
+        }
+        doc.push_str("```\n\nafter\n");
+
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        vc.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+
+        // A late code line (inside the card).
+        let late = 2 + 1 + 55;
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(late, 3, false));
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+
+        let (offset, vp_h, row_top, row_bottom) = view.read_with(&vc, |v, _| {
+            let line = v.buffer.cursor().line;
+            let info = v
+                .row_layouts
+                .get(&line)
+                .unwrap_or_else(|| panic!("caret row {line} has no recorded layout"));
+            (
+                v.scroll_offset_y(),
+                f32::from(v.scroll.bounds().size.height),
+                info.doc_top,
+                info.doc_bottom,
+            )
+        });
+        let vp_top = -offset;
+        let vp_bottom = vp_top + vp_h;
+        assert!(
+            row_top >= vp_top - 1.0 && row_bottom <= vp_bottom + 1.0,
+            "caret row must be visible: row {row_top:.1}..{row_bottom:.1} \
+             viewport {vp_top:.1}..{vp_bottom:.1}"
+        );
+        let first_code_bottom = view.read_with(&vc, |v, _| {
+            v.row_layouts
+                .get(&3)
+                .map(|i| i.doc_bottom)
+                .unwrap_or(f32::MAX)
+        });
+        assert!(
+            first_code_bottom <= vp_top + 1.0,
+            "view must not scroll back to the card's first line \
+             (first line bottom {first_code_bottom:.1} vs viewport top {vp_top:.1})"
+        );
+    }
+
+    /// The same guarantee for the remaining multi-row containers: a tall
+    /// blockquote run and a tall paragraph run. Both are one element holding
+    /// many rows, so the element-level scroll would pin their first row to the
+    /// viewport top and push a late row's caret off-screen.
+    #[gpui::test]
+    fn tall_quote_and_paragraph_late_rows_stay_visible(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        // `(label, doc, caret line)` — each container is far taller than the
+        // 300px window.
+        let mut quote = String::from("intro\n\n");
+        for i in 0..40 {
+            quote.push_str(&format!("> quoted line {i}\n"));
+        }
+        quote.push_str("\nafter\n");
+
+        // A single paragraph run (no blank lines) is one `Group::Para`.
+        let mut para = String::from("intro\n\n");
+        for i in 0..40 {
+            para.push_str(&format!("paragraph line {i}\n"));
+        }
+        para.push_str("\nafter\n");
+
+        for (label, doc, caret_line) in [
+            ("quote", quote, 2 + 39),
+            ("paragraph", para, 2 + 39),
+        ] {
+            let cell = std::cell::RefCell::new(None);
+            let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+                let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+                *cell.borrow_mut() = Some(view.clone());
+                Host(view)
+            });
+            let view = cell.into_inner().unwrap();
+            let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            vc.update(|window, cx| {
+                window.focus(&view.read(cx).focus_handle(), cx);
+            });
+
+            view.update(&mut vc, |v, cx| {
+                v.edit(cx, |m| m.move_to(caret_line, 2, false));
+            });
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+
+            let (offset, vp_h, row_top, row_bottom) = view.read_with(&vc, |v, _| {
+                let line = v.buffer.cursor().line;
+                let info = v
+                    .row_layouts
+                    .get(&line)
+                    .unwrap_or_else(|| panic!("{label}: caret row {line} has no layout"));
+                (
+                    v.scroll_offset_y(),
+                    f32::from(v.scroll.bounds().size.height),
+                    info.doc_top,
+                    info.doc_bottom,
+                )
+            });
+            let vp_top = -offset;
+            let vp_bottom = vp_top + vp_h;
+            assert!(
+                row_top >= vp_top - 1.0 && row_bottom <= vp_bottom + 1.0,
+                "{label}: caret row must be visible: row {row_top:.1}..{row_bottom:.1} \
+                 viewport {vp_top:.1}..{vp_bottom:.1}"
+            );
+            // The container's first row must be scrolled past (not pinned to
+            // the viewport top).
+            let first_row_bottom = view.read_with(&vc, |v, _| {
+                v.row_layouts
+                    .get(&2)
+                    .map(|i| i.doc_bottom)
+                    .unwrap_or(f32::MAX)
+            });
+            assert!(
+                first_row_bottom <= vp_top + 1.0,
+                "{label}: view must not scroll back to the container's first row \
+                 (first row bottom {first_row_bottom:.1} vs viewport top {vp_top:.1})"
+            );
         }
     }
 

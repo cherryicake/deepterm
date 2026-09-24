@@ -477,9 +477,19 @@ impl LiveLine {
     }
 }
 
+/// What `LiveLine`'s prepaint hands to paint: the hitbox plus the scroll
+/// translation in effect (`window.element_offset()`), captured while gpui
+/// allows reading it.
+pub struct LiveLinePrepaint {
+    hitbox: Hitbox,
+    /// Scroll offset applied to this row when painted; subtract it from the
+    /// painted bounds to get content-space coordinates.
+    element_offset: gpui::Point<Pixels>,
+}
+
 impl Element for LiveLine {
     type RequestLayoutState = StyledText;
-    type PrepaintState = Hitbox;
+    type PrepaintState = LiveLinePrepaint;
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
@@ -511,7 +521,14 @@ impl Element for LiveLine {
     ) -> Self::PrepaintState {
         let _ = cx;
         styled.prepaint(_id, _inspector_id, bounds, &mut (), window, cx);
-        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+        // `element_offset` is only readable during layout/prepaint, so capture
+        // it here for the paint-time row rect (used by the caret scroll).
+        let element_offset = window.element_offset();
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        LiveLinePrepaint {
+            hitbox,
+            element_offset,
+        }
     }
 
     fn paint(
@@ -520,12 +537,12 @@ impl Element for LiveLine {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         styled: &mut Self::RequestLayoutState,
-        hitbox: &mut Self::PrepaintState,
+        prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         styled.paint(_id, _inspector_id, bounds, &mut (), &mut (), window, cx);
-        window.set_cursor_style(gpui::CursorStyle::IBeam, hitbox);
+        window.set_cursor_style(gpui::CursorStyle::IBeam, &prepaint.hitbox);
 
         #[cfg(test)]
         record_paint(self.line, self.text.len());
@@ -550,11 +567,22 @@ impl Element for LiveLine {
 
         // Record this row's layout for the view's visual-row movement and
         // dead-zone hit fallbacks (plain field write; no notify).
+        //
+        // `bounds` is in window space; the caret scroll logic needs **content
+        // space** so it can compare against the viewport in the same units the
+        // scroll offset uses. The window's element offset *is* that scroll
+        // translation (gpui applies the tracked handle's offset through
+        // `with_element_offset` while painting children), so subtracting it
+        // yields offset-independent coordinates — no dependence on when this
+        // paint happens relative to a scroll this frame.
         {
             let view = self.view.clone();
             let layout = layout.clone();
+            let offset = prepaint.element_offset;
+            let doc_top = f32::from(bounds.top()) - f32::from(offset.y);
+            let doc_bottom = f32::from(bounds.bottom()) - f32::from(offset.y);
             view.update(cx, |v, _| {
-                v.record_row_layout(self.line, layout, text_len);
+                v.record_row_layout(self.line, layout, text_len, doc_top, doc_bottom);
             });
         }
 
@@ -648,7 +676,7 @@ impl Element for LiveLine {
             });
 
             let view = self.view.clone();
-            let hitbox_move = hitbox.clone();
+            let hitbox_move = prepaint.hitbox.clone();
             let layout_move = layout.clone();
             let drag_fallback = self.drag_fallback;
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
