@@ -130,6 +130,24 @@ pub struct LiveMarkdownView {
     /// Bring the caret's row into view on the next render (set by every
     /// edit/move; consumed by the row-precise scroll in `render`).
     scroll_to_cursor: bool,
+    /// The caret row's rect **from the last completed frame** (document space),
+    /// as `(caret_line, text_version, doc_top, doc_bottom)`, kept across the
+    /// per-frame `row_layouts` clear.
+    ///
+    /// `row_layouts` is emptied at the top of `render` and repopulated during
+    /// paint, so it is always empty at the point the scroll decision is made.
+    /// This field carries the previous frame's measurement forward, which is
+    /// what lets the element-level `scroll_to_item` be skipped when the caret
+    /// row is already visible (the common typing case).
+    ///
+    /// Both stamps matter: the text version catches an edit that reflowed the
+    /// row, and the caret line catches a **cursor move**, which changes which
+    /// row this rect describes without touching the text at all.
+    caret_row_rect: Option<(usize, u64, f32, f32)>,
+    /// Remaining post-layout correction passes for the current scroll request.
+    /// Bounds `schedule_caret_scroll_correction` to
+    /// [`CARET_SCROLL_CORRECTION_PASSES`] frames.
+    caret_scroll_passes: u8,
     /// Source-line range per rendered row element (dead-zone hit fallback:
     /// clicks between/around rows map to the nearest element, then to a
     /// line within it via the recorded layouts).
@@ -275,6 +293,8 @@ impl LiveMarkdownView {
             copied_code_blocks: HashSet::new(),
             mermaid: MermaidState::new(),
             scroll_to_cursor: false,
+            caret_row_rect: None,
+            caret_scroll_passes: 0,
             row_targets: Vec::new(),
             row_layouts: std::collections::HashMap::new(),
             cell_hits: std::collections::HashMap::new(),
@@ -821,6 +841,15 @@ impl LiveMarkdownView {
         doc_top: f32,
         doc_bottom: f32,
     ) {
+        // Carry the caret row's rect across frames: `row_layouts` is cleared at
+        // the top of `render`, so the scroll decision (which runs before paint)
+        // needs a separately retained copy to know whether a scroll is needed.
+        // Stamped with the caret line and text version so an edit or a cursor
+        // move invalidates it.
+        if line == self.buffer.cursor().line {
+            self.caret_row_rect =
+                Some((line, self.buffer.text_version(), doc_top, doc_bottom));
+        }
         self.row_layouts.insert(
             line,
             RowLayoutInfo {
@@ -877,6 +906,45 @@ impl LiveMarkdownView {
         let out = self.buffer.edit(f);
         cx.notify();
         out
+    }
+
+    /// [`Self::edit`] for **pointer-driven** caret placement: never scrolls.
+    ///
+    /// A click or drag can only land on a row that is on screen at that moment
+    /// (the pointer has to be over it), so the row is visible by construction
+    /// and there is nothing to scroll to. Requesting a scroll anyway is what
+    /// produced the reported bug: `scroll_to_item` targets the caret's whole
+    /// *group*, and GPUI resolves a group taller than the viewport by pinning
+    /// its **top edge** to the viewport top. So clicking the last row of a tall
+    /// table/code card yanked the view back up to the container's first row
+    /// (the table header, the opening fence) — pushing the clicked row off
+    /// screen and making it impossible to edit. The row-precise correction pass
+    /// only recovers when the clicked row is still painted; once it falls out
+    /// of the virtualization window `row_layouts` has no entry for it and the
+    /// view stays stuck at the container top.
+    ///
+    /// Clearing the request here (rather than teaching `caret_row_in_view`
+    /// about the new line) also avoids a wasted `scroll_to_item` +
+    /// correction-pass cycle on every single click.
+    pub fn edit_no_scroll<R>(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> R,
+    ) -> R {
+        let out = self.edit(cx, f);
+        self.cancel_caret_scroll();
+        out
+    }
+
+    /// Drop any pending scroll-to-caret request and stop the correction passes.
+    ///
+    /// `edit` arms `scroll_to_cursor`; the render loop then consumes it (and
+    /// re-arms `caret_scroll_passes`). Both must be cleared together, otherwise
+    /// a stale budget lets a later frame's deferred correction move the view
+    /// after the user has already positioned the caret themselves.
+    fn cancel_caret_scroll(&mut self) {
+        self.scroll_to_cursor = false;
+        self.caret_scroll_passes = 0;
     }
 
     /// 统一的可打印文本写入路径（平台 `EntityInputHandler` 与快捷键兜底
@@ -1733,7 +1801,8 @@ impl LiveMarkdownView {
         let col = self.col_for_click(line, ev.position);
         let shift = ev.modifiers.shift;
         let click_count = ev.click_count;
-        self.edit(cx, |m| {
+        // Pointer-driven: never scroll (see `edit_no_scroll`).
+        self.edit_no_scroll(cx, |m| {
             m.move_to(line, col, shift);
             if !shift {
                 if click_count == 2 {
@@ -1766,7 +1835,7 @@ impl LiveMarkdownView {
             return;
         }
         let col = self.col_for_click(line, position);
-        self.edit(cx, |m| m.move_to(line, col, true));
+        self.edit_no_scroll(cx, |m| m.move_to(line, col, true));
     }
 
     // ---- mermaid 图模式禁区（严格 tab-only：图可见时源码不可编辑） -------
@@ -1874,7 +1943,8 @@ impl LiveMarkdownView {
         // 双击选词 / 三击选格：都夹在本格内容范围内（Typora 表格语义：
         // 双击选格内的词，三击选整个单元格内容，而不是整行含管道）。
         let cell_range = self.table_cell_content_at(line, col);
-        self.edit(cx, |m| {
+        // Pointer-driven: never scroll (see `edit_no_scroll`).
+        self.edit_no_scroll(cx, |m| {
             m.move_to(line, col, shift);
             if !shift {
                 if click_count == 2 {
@@ -1960,7 +2030,7 @@ impl LiveMarkdownView {
         if self.drag_cross_table(line) {
             return;
         }
-        self.edit(cx, |m| m.move_to(line, col, true));
+        self.edit_no_scroll(cx, |m| m.move_to(line, col, true));
     }
 
     /// Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容（不升级到整表/整文档）；
@@ -2754,7 +2824,9 @@ impl LiveMarkdownView {
             return;
         }
         let col = col_for_byte(&src_line, src);
-        self.edit(cx, |m| {
+        // Pointer-driven: the clicked row is on screen by construction, so
+        // never scroll (see `edit_no_scroll`).
+        self.edit_no_scroll(cx, |m| {
             // `move_to` clamps, and `extend` anchors a selection even when
             // none exists yet (shift-click starts a selection like guise).
             m.move_to(line, col, shift);
@@ -2788,7 +2860,7 @@ impl LiveMarkdownView {
         };
         let vis = raw.min(vis_len);
         let col = col_for_byte(&src_line, src_for_vis(&segs, vis));
-        self.edit(cx, |m| m.move_to(line, col, true));
+        self.edit_no_scroll(cx, |m| m.move_to(line, col, true));
         // Claim the drag so the dead-zone fallback doesn't also run.
         cx.stop_propagation();
     }
@@ -2807,7 +2879,7 @@ impl LiveMarkdownView {
         let Some(text) = self.buffer.line(line).map(str::to_string) else {
             return;
         };
-        let changed = self.edit(cx, |m| toggle_task(m, &text, line));
+        let changed = self.edit_no_scroll(cx, |m| toggle_task(m, &text, line));
         if changed {
             self.after_edit(cx);
         }
@@ -5069,18 +5141,40 @@ impl LiveMarkdownView {
 
     /// Whether the caret's own row is already inside the viewport.
     ///
-    /// `None` when the row's geometry is unknown (not painted yet) — the caller
-    /// then falls back to element-level scrolling.
+    /// Uses [`Self::caret_row_rect`] — the rect recorded by the **previous**
+    /// frame's paint. `row_layouts` cannot be consulted here: it is cleared at
+    /// the top of `render` and only repopulated during paint, i.e. after this
+    /// decision is made, so looking it up always returned `None` and the
+    /// caller's "already visible → do not scroll" fast path never engaged.
+    ///
+    /// The rect is accepted whenever it describes the **same caret line**,
+    /// including after an edit changed the text version. Requiring a matching
+    /// version was a mistake: it invalidated the rect on every single keystroke,
+    /// so typing in a tall container re-armed the element-level scroll and
+    /// jumped to the container's top edge on each character — the same
+    /// jump-to-header bug as clicking, just triggered by the keyboard. The
+    /// rect being one frame old is fine, because staleness is exactly what
+    /// [`Self::correct_caret_scroll`] is for: it re-measures the caret row from
+    /// the freshly painted layout and nudges by the minimal amount, so an edit
+    /// that genuinely reflowed the row still ends up visible. Suppressing the
+    /// element-level scroll only ever removes the *gross* jump; the precise
+    /// correction still runs.
+    ///
+    /// `None` when no rect has been recorded yet, or when it describes a
+    /// different caret line — a cursor move (arrow keys, Enter, a long jump)
+    /// genuinely needs the element-level scroll to reach the new row.
     fn caret_row_in_view(&self) -> Option<bool> {
-        let line = self.buffer.cursor().line;
-        let info = self.row_layouts.get(&line)?;
+        let (line, _version, doc_top, doc_bottom) = self.caret_row_rect?;
+        if line != self.buffer.cursor().line {
+            return None;
+        }
         let vp_h = f32::from(self.scroll.bounds().size.height);
         if vp_h <= 0.0 {
             return None;
         }
         let vp_top = -f32::from(self.scroll.offset().y);
         let vp_bottom = vp_top + vp_h;
-        Some(info.doc_top >= vp_top - 1.0 && info.doc_bottom <= vp_bottom + 1.0)
+        Some(doc_top >= vp_top - 1.0 && doc_bottom <= vp_bottom + 1.0)
     }
 
     /// Re-measure the caret row after the frame's layout and correct the scroll
@@ -5098,6 +5192,12 @@ impl LiveMarkdownView {
     /// layout settle (a table toolbar appearing above the grid changes its
     /// height) while keeping each decision exact.
     fn schedule_caret_scroll_correction(&mut self, cx: &mut Context<Self>) {
+        // Budget is per scroll request, re-armed by `scroll_to_cursor`; without
+        // this the re-arm would loop for as long as the row stayed off-screen.
+        if self.caret_scroll_passes == 0 {
+            return;
+        }
+        self.caret_scroll_passes -= 1;
         let weak = cx.entity().downgrade();
         cx.defer(move |cx| {
             let _ = weak.update(cx, |view, cx| {
@@ -5574,7 +5674,9 @@ impl Render for LiveMarkdownView {
                                         // Col clamps to the line end, like
                                         // guise's hit() (whitespace-only
                                         // lines land at their end, not col 0).
-                                        this.edit(cx, |m| m.move_to(line, usize::MAX, false));
+                                        this.edit_no_scroll(cx, |m| {
+                                            m.move_to(line, usize::MAX, false)
+                                        });
                                         cx.notify();
                                         cx.stop_propagation();
                                     }),
@@ -5611,7 +5713,7 @@ impl Render for LiveMarkdownView {
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, window, cx| {
                                             window.focus(&this.focus, cx);
-                                            this.edit(cx, |m| {
+                                            this.edit_no_scroll(cx, |m| {
                                                 m.move_to(line, usize::MAX, false)
                                             });
                                             cx.notify();
@@ -5813,7 +5915,7 @@ impl Render for LiveMarkdownView {
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, window, cx| {
                                             window.focus(&this.focus, cx);
-                                            this.edit(cx, |m| {
+                                            this.edit_no_scroll(cx, |m| {
                                                 m.move_to(line, usize::MAX, false)
                                             });
                                             cx.notify();
@@ -5856,7 +5958,7 @@ impl Render for LiveMarkdownView {
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, window, cx| {
                                             window.focus(&this.focus, cx);
-                                            this.edit(cx, |m| {
+                                            this.edit_no_scroll(cx, |m| {
                                                 m.move_to(line, usize::MAX, false)
                                             });
                                             cx.notify();
@@ -6545,7 +6647,7 @@ impl Render for LiveMarkdownView {
                     outer = outer.on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _e, _w, cx| {
-                            this.edit(cx, |m| m.move_to(start_line, 0, false));
+                            this.edit_no_scroll(cx, |m| m.move_to(start_line, 0, false));
                             cx.notify();
                         }),
                     );
@@ -6623,7 +6725,7 @@ impl Render for LiveMarkdownView {
                         gutter = gutter.on_click(cx.listener(
                             move |this, _event, _window, cx| {
                                 if let Some((cs, _)) = this.table_cell_content_at(g_line, 0) {
-                                    this.edit(cx, |m| m.move_to(g_line, cs, false));
+                                    this.edit_no_scroll(cx, |m| m.move_to(g_line, cs, false));
                                     this.after_move(cx);
                                 }
                             },
@@ -7123,6 +7225,7 @@ impl Render for LiveMarkdownView {
                     if self.caret_row_in_view() != Some(true) {
                         self.scroll.scroll_to_item(ix);
                     }
+                    self.caret_scroll_passes = CARET_SCROLL_CORRECTION_PASSES;
                     self.schedule_caret_scroll_correction(cx);
                 }
                 None => self.scroll_to_cursor = false,
@@ -9715,6 +9818,270 @@ mod scroll_to_caret_tests {
     /// This asserts the caret's own row stays visible (and that the view did
     /// not jump to the block's top) for a table taller than the viewport.
     #[gpui::test]
+    /// Every container taller than the viewport must leave the scroll alone
+    /// when the user clicks a row that is already on screen.
+    ///
+    /// `scroll_to_item` targets the caret's whole *group*, and GPUI resolves a
+    /// group taller than the viewport by pinning its **top edge** to the
+    /// viewport top. So a click on a late row of any such container used to
+    /// yank the view back to the container's first row — pushing the clicked
+    /// row off screen and making it uneditable. The correction pass only
+    /// rescues the case where the clicked row is still painted; once it falls
+    /// out of the virtualization window the view stays stuck at the top.
+    ///
+    /// The group kinds that can exceed the viewport are exactly
+    /// [`Group::Table`] (grid), [`Group::Fence`] (code card), [`Group::Quote`]
+    /// and [`Group::Para`] (unbroken runs); [`Group::One`] is a single row and
+    /// cannot. This covers all four.
+    #[gpui::test]
+    fn clicking_visible_row_of_any_tall_container_does_not_scroll(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        // Each fixture: (label, document, first line of the tall container).
+        // 60 rows/lines is comfortably taller than the 300px window.
+        let mut table = String::from("intro paragraph\n\n| col a | col b |\n|---|---|\n");
+        for i in 0..40 {
+            table.push_str(&format!("| row {i} | value {i} |\n"));
+        }
+        table.push_str("\nafter\n");
+
+        let mut fence = String::from("intro paragraph\n\n```rust\n");
+        for i in 0..60 {
+            fence.push_str(&format!("let x{i} = {i};\n"));
+        }
+        fence.push_str("```\n\nafter\n");
+
+        // One quote run and one unbroken paragraph run: no blank lines inside,
+        // so each collapses into a single group.
+        let mut quote = String::from("intro paragraph\n\n");
+        for i in 0..60 {
+            quote.push_str(&format!("> quoted line {i}\n"));
+        }
+        quote.push_str("\nafter\n");
+
+        let mut para = String::from("intro paragraph\n\n");
+        for i in 0..60 {
+            para.push_str(&format!("paragraph line {i} with some prose text\n"));
+        }
+        para.push_str("\nafter\n");
+
+        let mut failures: Vec<String> = Vec::new();
+        for (label, doc) in [
+            ("table", table),
+            ("code card", fence),
+            ("quote run", quote),
+            ("paragraph run", para),
+        ] {
+            let cell = std::cell::RefCell::new(None);
+            let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+                let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+                *cell.borrow_mut() = Some(view.clone());
+                Host(view)
+            });
+            let view = cell.into_inner().unwrap();
+            let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            vc.update(|window, cx| {
+                window.focus(&view.read(cx).focus_handle(), cx);
+            });
+
+            // Park the caret on line 0, then scroll well past the container's
+            // top so its first line is off screen — the state the bug needs.
+            view.update(&mut vc, |v, cx| {
+                v.edit(cx, |m| m.move_to(0, 0, false));
+            });
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            view.update(&mut vc, |v, _| {
+                v.scroll.set_offset(gpui::point(px(0.), px(-900.)));
+            });
+            for _ in 0..2 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+            }
+
+            // Precondition for the bug: the caret's own row is off screen, so
+            // the "already visible → do not scroll" guard does *not* suppress
+            // the element-level scroll. (A container's individual rows may not
+            // have a recorded layout — a code card paints as one element — so
+            // this is checked on the caret row, which always has one.)
+            let (offset_before, guard) =
+                view.read_with(&vc, |v, _| (v.scroll_offset_y(), v.caret_row_in_view()));
+            assert_eq!(
+                guard,
+                Some(false),
+                "{label}: setup: the caret row must be off screen so the guard does not \
+                 suppress the scroll (offset {offset_before:.1})"
+            );
+
+            // Click a window point inside the viewport (and therefore over the
+            // visible part of the tall container).
+            let vp_win = view.read_with(&vc, |v, _| v.scroll.bounds());
+            let click_at = gpui::point(
+                vp_win.origin.x + px(100.),
+                vp_win.origin.y + vp_win.size.height / 2.0,
+            );
+            let cursor_before = view.read_with(&vc, |v, _| v.buffer.cursor().line);
+            vc.simulate_click(click_at, gpui::Modifiers::none());
+            for _ in 0..6 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+            }
+            let (cursor_after, offset_after) =
+                view.read_with(&vc, |v, _| (v.buffer.cursor().line, v.scroll_offset_y()));
+
+            assert_ne!(
+                cursor_after, cursor_before,
+                "{label}: setup: the click must move the caret into the container"
+            );
+            if (offset_after - offset_before).abs() > 1.0 {
+                failures.push(format!(
+                    "{label}: click moved the view: offset {offset_before:.1} -> \
+                     {offset_after:.1} (caret line {cursor_before} -> {cursor_after})"
+                ));
+            }
+
+            // ...and typing the first character must not scroll either. This is
+            // the same requirement one frame later: a keystroke re-arms
+            // `scroll_to_cursor`, and if the clicked row's rect was never
+            // recorded (a code card paints as one element, so its inner rows
+            // may have no layout entry) the guard degrades to "unknown" and the
+            // element-level scroll fires again — jumping to the container top
+            // exactly when the user starts editing.
+            view.update(&mut vc, |v, cx| {
+                v.insert_text_for_bench("x", cx);
+            });
+            for _ in 0..6 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+            }
+            let offset_typed = view.read_with(&vc, |v, _| v.scroll_offset_y());
+            if (offset_typed - offset_after).abs() > 1.0 {
+                failures.push(format!(
+                    "{label}: typing after the click moved the view: offset \
+                     {offset_after:.1} -> {offset_typed:.1}"
+                ));
+            }
+        }
+
+        // Report every failing container, not just the first: they exercise
+        // different group kinds and can regress independently.
+        assert!(
+            failures.is_empty(),
+            "clicking an already-visible row must not scroll the view, but these \
+             containers moved:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// Clicking a visible row of a tall table must not scroll the view.
+    ///
+    /// The reported bug: with the table's header scrolled out of view, clicking
+    /// a late row scrolls the view to the container's **first** row (GPUI's
+    /// element-level `scroll_to_item` pins a tall child's top edge to the
+    /// viewport top). That pushes the clicked row off-screen, so the user can
+    /// never edit the data they clicked on. Code cards and every other
+    /// container taller than the viewport behave the same way.
+    #[gpui::test]
+    fn clicking_visible_row_of_tall_table_does_not_scroll(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let mut doc = String::from("intro paragraph\n\n| col a | col b |\n|---|---|\n");
+        for i in 0..40 {
+            doc.push_str(&format!("| row {i} | value {i} |\n"));
+        }
+        doc.push_str("\nafter\n");
+
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        vc.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 0, false));
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        view.update(&mut vc, |v, _| {
+            v.scroll.set_offset(gpui::point(px(0.), px(-900.)));
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+
+        let (offset_before, vp_h, header_top) = view.read_with(&vc, |v, _| {
+            (
+                v.scroll_offset_y(),
+                f32::from(v.scroll.bounds().size.height),
+                v.row_layouts.get(&2).map(|i| i.doc_top).unwrap_or(f32::MAX),
+            )
+        });
+        let vp_top_before = -offset_before;
+        assert!(
+            header_top < vp_top_before,
+            "setup: the table header (top {header_top:.1}) must be scrolled out of \
+             view (viewport top {vp_top_before:.1})"
+        );
+
+        let table = vc
+            .debug_bounds("live-table-outer")
+            .expect("table grid must be rendered");
+        let vp_win = view.read_with(&vc, |v, _| v.scroll.bounds());
+        let click_at = gpui::point(
+            vp_win.origin.x + px(100.),
+            vp_win.origin.y + vp_win.size.height / 2.0,
+        );
+        let (click_y, tbl_top, tbl_bottom) = (
+            f32::from(click_at.y),
+            f32::from(table.origin.y),
+            f32::from(table.origin.y + table.size.height),
+        );
+        assert!(
+            click_y >= tbl_top && click_y <= tbl_bottom,
+            "the click point must be over the table grid (y {click_y:.1}, \
+             table {tbl_top:.1}..{tbl_bottom:.1})"
+        );
+
+        let cursor_before = view.read_with(&vc, |v, _| v.buffer.cursor().line);
+        vc.simulate_click(click_at, gpui::Modifiers::none());
+        for _ in 0..6 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let (cursor_after, offset_after) =
+            view.read_with(&vc, |v, _| (v.buffer.cursor().line, v.scroll_offset_y()));
+
+        assert_ne!(
+            cursor_after, cursor_before,
+            "setup: the click must actually move the caret into the table"
+        );
+        assert!(
+            (offset_after - offset_before).abs() <= 1.0,
+            "clicking a visible row of a tall table must not scroll the view: \
+             offset {offset_before:.1} -> {offset_after:.1} (caret line {cursor_before} -> \
+             {cursor_after}, viewport height {vp_h:.1})"
+        );
+    }
+
+    #[gpui::test]
     fn tall_table_last_row_stays_visible(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             crate::theme::init(cx);
@@ -9936,6 +10303,250 @@ mod scroll_to_caret_tests {
                  (first row bottom {first_row_bottom:.1} vs viewport top {vp_top:.1})"
             );
         }
+    }
+
+    /// The "caret row already visible → do not scroll at all" fast path must
+    /// actually engage, and must be reachable when the scroll decision is made.
+    ///
+    /// `caret_row_in_view` used to read `row_layouts`, which `render` clears at
+    /// its top and only repopulates during paint — so the lookup always returned
+    /// `None`, the guard was dead, and the element-level `scroll_to_item` (the
+    /// very call that yanks a tall container's top edge to the viewport top)
+    /// ran on every caret frame. The rect now comes from the previous frame, so
+    /// this asserts the state the guard depends on is genuinely available at the
+    /// point of use, not just that the end position is right.
+    #[gpui::test]
+    fn caret_row_rect_is_available_for_the_scroll_decision(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        // Tall table: a single element containing many rows.
+        let mut doc = String::from("intro paragraph\n\n| col a | col b |\n|---|---|\n");
+        for i in 0..40 {
+            doc.push_str(&format!("| row {i} | value {i} |\n"));
+        }
+        doc.push_str("\nafter\n");
+
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        vc.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+
+        // Put the caret on a middle table row and let the scroll settle.
+        let caret_line = 2 + 2 + 20;
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(caret_line, 3, false));
+        });
+        for _ in 0..6 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+
+        // The retained rect must exist, match the caret row, and be stamped
+        // with the current text version — otherwise the guard degrades to
+        // `None` and the fast path is dead again.
+        //
+        // Crucially this is asserted with `row_layouts` **cleared**, which is
+        // the state `render` leaves it in when the scroll decision is made
+        // (`render` empties it at the top; `LiveLine::paint` refills it later
+        // in the same frame). Asserting from outside a frame without clearing
+        // would observe the post-paint map and pass even with the dead lookup.
+        let (rect, in_view) = view.update(&mut vc, |v, _| {
+            v.row_layouts.clear();
+            (v.caret_row_rect, v.caret_row_in_view())
+        });
+        let (_line, _version, doc_top, doc_bottom) =
+            rect.expect("caret row rect must be retained across the per-frame clear");
+        assert!(
+            doc_bottom > doc_top,
+            "retained rect must be a real measurement ({doc_top}..{doc_bottom})"
+        );
+        assert_eq!(
+            in_view,
+            Some(true),
+            "with `row_layouts` cleared (the state at the scroll decision), the guard \
+             must still report caret row {caret_line} visible from the retained rect \
+             {doc_top:.1}..{doc_bottom:.1} — `Some(true)` is what suppresses the \
+             element-level scroll on the next typing frame"
+        );
+
+        // The guard must survive an intervening edit. Keying it on the text
+        // version made every keystroke invalidate the rect, so typing in a tall
+        // container re-armed `scroll_to_item` on each character and jumped to
+        // the container's top edge — the same jump-to-header bug as clicking,
+        // from the keyboard. Staleness is handled by the correction pass, which
+        // re-measures and nudges minimally.
+        // Deliberately NO refresh between the edit and the check: `render` makes
+        // this decision *before* paint, so at that moment the text version has
+        // already advanced while `caret_row_rect` still carries the previous
+        // frame's stamp. That is precisely the state a typing frame sees.
+        let (stale_version, in_view_after_edit) = view.update(&mut vc, |v, cx| {
+            v.insert_text_for_bench("y", cx);
+            v.row_layouts.clear();
+            let stale = v.caret_row_rect.map(|(_, ver, _, _)| ver) != Some(v.buffer.text_version());
+            (stale, v.caret_row_in_view())
+        });
+        assert!(
+            stale_version,
+            "setup: the rect must still carry the pre-edit version at this point"
+        );
+        assert_eq!(
+            in_view_after_edit,
+            Some(true),
+            "an edit that did not move the caret must not invalidate the rect: the \
+             guard has to stay `Some(true)` so typing does not re-arm the scroll"
+        );
+
+        // Typing one character must not move the view at all: the caret row is
+        // visible, so the fast path suppresses `scroll_to_item`.
+        let before = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        view.update(&mut vc, |v, cx| {
+            v.insert_text_for_bench("x", cx);
+        });
+        for _ in 0..6 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let after = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        assert!(
+            (after - before).abs() <= 1.0,
+            "typing in a visible tall container must not scroll: {before:.1} -> {after:.1}"
+        );
+    }
+
+    /// Starting to edit must not scroll the view, for every tall container.
+    ///
+    /// This is the keyboard half of the reported bug. A keystroke goes through
+    /// `edit`, which arms `scroll_to_cursor`; the render loop then resolves it
+    /// with the element-level `scroll_to_item`, and GPUI pins a group taller
+    /// than the viewport by its **top edge** — so the first character typed on
+    /// a late row of a tall table/code card/quote/paragraph jumped the view
+    /// back to the container's first row, off the row being edited. Typing on
+    /// an already-visible row must move nothing at all.
+    #[gpui::test]
+    fn typing_in_visible_tall_container_does_not_scroll(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let mut table = String::from("intro paragraph\n\n| col a | col b |\n|---|---|\n");
+        for i in 0..40 {
+            table.push_str(&format!("| row {i} | value {i} |\n"));
+        }
+        table.push_str("\nafter\n");
+
+        let mut fence = String::from("intro paragraph\n\n```rust\n");
+        for i in 0..60 {
+            fence.push_str(&format!("let x{i} = {i};\n"));
+        }
+        fence.push_str("```\n\nafter\n");
+
+        let mut quote = String::from("intro paragraph\n\n");
+        for i in 0..60 {
+            quote.push_str(&format!("> quoted line {i}\n"));
+        }
+        quote.push_str("\nafter\n");
+
+        let mut para = String::from("intro paragraph\n\n");
+        for i in 0..60 {
+            para.push_str(&format!("paragraph line {i} with some prose text\n"));
+        }
+        para.push_str("\nafter\n");
+
+        let mut failures: Vec<String> = Vec::new();
+        for (label, doc, caret_line) in [
+            ("table", table, 2 + 2 + 30usize),
+            ("code card", fence, 2 + 1 + 40),
+            ("quote run", quote, 2 + 40),
+            ("paragraph run", para, 2 + 40),
+        ] {
+            let cell = std::cell::RefCell::new(None);
+            let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
+                let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
+                *cell.borrow_mut() = Some(view.clone());
+                Host(view)
+            });
+            let view = cell.into_inner().unwrap();
+            let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            vc.update(|window, cx| {
+                window.focus(&view.read(cx).focus_handle(), cx);
+            });
+
+            // Put the caret on a late row of the container and let the scroll
+            // settle, then confirm the row is on screen and the container's
+            // first line is not.
+            view.update(&mut vc, |v, cx| {
+                v.edit(cx, |m| m.move_to(caret_line, 2, false));
+            });
+            for _ in 0..4 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+            }
+            let (offset_before, guard) =
+                view.read_with(&vc, |v, _| (v.scroll_offset_y(), v.caret_row_in_view()));
+            assert_eq!(
+                guard,
+                Some(true),
+                "{label}: setup: the caret row must be visible before typing"
+            );
+
+            // The decision that matters is made in `render`, *before* paint:
+            // `scroll_to_item` runs only when this guard is not `Some(true)`.
+            // Check it immediately after the edit, with no repaint in between —
+            // that is exactly the state a typing frame sees. (Sampling the
+            // offset alone cannot detect the defect: the element-level scroll
+            // pins the container's top edge for one prepaint and the deferred
+            // correction pass restores it inside the same refresh, so the
+            // observable offset barely moves. In a large document the
+            // correction cannot recover at all — the jumped-away row is
+            // virtualized out, so `row_layouts` has no entry and the view stays
+            // stuck at the container top.)
+            let guard_during_typing = view.update(&mut vc, |v, cx| {
+                v.insert_text_for_bench("x", cx);
+                v.caret_row_in_view()
+            });
+            if guard_during_typing != Some(true) {
+                failures.push(format!(
+                    "{label}: typing re-armed the element-level scroll (guard \
+                     {guard_during_typing:?} instead of Some(true)), which pins the \
+                     container's top edge to the viewport top (caret line {caret_line})"
+                ));
+            }
+            // ...and the view must stay put across every frame of the repaint.
+            let mut worst = 0.0f32;
+            for _ in 0..6 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+                let off = view.read_with(&vc, |v, _| v.scroll_offset_y());
+                worst = worst.max((off - offset_before).abs());
+            }
+            if worst > 1.0 {
+                failures.push(format!(
+                    "{label}: typing moved the view by up to {worst:.1}px \
+                     (settled at {offset_before:.1}, caret line {caret_line})"
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "typing on a visible row must not scroll the view, but these containers \
+             moved:\n  {}",
+            failures.join("\n  ")
+        );
     }
 
     /// Moving the caret below the viewport must scroll it into view
