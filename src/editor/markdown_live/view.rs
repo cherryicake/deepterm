@@ -182,6 +182,12 @@ pub struct LiveMarkdownView {
     /// 缺失时用实测均值校准后的行数估算，绘制后逐帧自我修正）。
     group_heights: std::collections::HashMap<usize, f32>,
     heights_version: u64,
+    /// Whether `virt_prefix` must be recomputed this frame. The prefix sum
+    /// covers every group (O(groups)), so on an idle frame — a blink tick, or
+    /// a scroll that did not move the window — the previous one is still
+    /// exact and is reused. Set by anything that changes `group_heights` or
+    /// the group list.
+    prefix_dirty: bool,
     /// 上一帧视口宽：换行随宽度变化，变宽即清空 `group_heights`。
     last_vp_width: f32,
     /// 上一帧渲染的 group 窗口（含占位映射），供本帧回填实测高度。
@@ -292,6 +298,7 @@ impl LiveMarkdownView {
             _subscriptions,
             group_heights: std::collections::HashMap::new(),
             heights_version: u64::MAX,
+            prefix_dirty: true,
             last_vp_width: 0.0,
             last_window: None,
             last_window_counts: Vec::new(),
@@ -1262,7 +1269,7 @@ impl LiveMarkdownView {
         // it depends on the run's *opening* state, so editing the opener
         // changes the code lines' `RowKind::Code { lang }` (which drives
         // tree-sitter) and editing a code line can change where the run ends.
-        (self.run_bounds(blocks, lo, hi))
+        self.run_bounds(blocks, lo, hi)
     }
 
     /// Widen `lo..=hi` to cover any fence / math / frontmatter run it touches.
@@ -4684,6 +4691,9 @@ impl LiveMarkdownView {
         let text_changed = text_version != self.heights_version;
         if text_changed {
             self.heights_version = text_version;
+            // The group list is rebuilt by `plan_rows`; its geometry is cached
+            // by text version, so a text change may alter the group count.
+            self.prefix_dirty = true;
         }
         // 上帧几何快照（锚定补偿用）：prefix 逐帧重算会漂，`lo` 越大顶部占位
         // 跳变越大；用同一 anchor 的新旧差修正 scroll offset，视口内容不动。
@@ -4697,6 +4707,7 @@ impl LiveMarkdownView {
         let vp_w = f32::from(vp.size.width);
         if vp_w > 0.0 && (self.last_vp_width - vp_w).abs() > 1.0 {
             self.group_heights.clear();
+            self.prefix_dirty = true;
         }
         self.last_vp_width = vp_w;
         // Feed back last frame's measured heights. Children are
@@ -4754,7 +4765,17 @@ impl LiveMarkdownView {
                             continue;
                         };
                         if h > 0.0 {
-                            self.group_heights.insert(plo + k, h);
+                            // Only a *changed* height invalidates the prefix
+                            // sum. Re-measuring the same value (the steady
+                            // state for every settled group) must not force a
+                            // full O(groups) rebuild every frame.
+                            match self.group_heights.get(&(plo + k)) {
+                                Some(&old) if (old - h).abs() < 0.01 => {}
+                                _ => {
+                                    self.group_heights.insert(plo + k, h);
+                                    self.prefix_dirty = true;
+                                }
+                            }
                         }
                         first_of += *c;
                     }
@@ -4781,9 +4802,15 @@ impl LiveMarkdownView {
                 (vals[n / 2 - 1] + vals[n / 2]) * 0.5
             }
         }
+        // The rate samples only feed the prefix sum below, so they are skipped
+        // together with it on an unchanged frame.
+        let need_rates = self.prefix_dirty || old_prefix.len() != g + 1;
         let mut kind_vals: Vec<Vec<f32>> = vec![Vec::new(); 20];
         let mut all_vals: Vec<f32> = Vec::new();
         for (i, (r, b, _)) in ginfo.iter().enumerate() {
+            if !need_rates {
+                break;
+            }
             if let Some(h) = self.group_heights.get(&i) {
                 // The last group is measured border-box (no next top, no
                 // trailing margin) and trailing blanks collapse their
@@ -4824,17 +4851,33 @@ impl LiveMarkdownView {
                 Some(10..=19)
             )
         };
+        // Reuse the previous prefix sum when nothing that feeds it changed
+        // (an idle/blink frame, or a scroll that did not move the window).
+        // The scan covers every group, so skipping it is what keeps the frame
+        // cost independent of document size. `old_prefix` was `mem::take`n
+        // above, so it is ours to reuse or drop.
+        // `prefix` is the freshly computed sum; `old_prefix` is last frame's
+        // (used by the anchor compensation to detect drift).
         let mut prefix = Vec::with_capacity(g + 1);
-        prefix.push(0.0f32);
-        for (i, (rows, b, _)) in ginfo.iter().enumerate() {
-            let h = self.group_heights.get(&i).copied().unwrap_or_else(|| {
-                if is_trailing_blank(i) {
-                    (*rows as f32) * EST_LINE_H
-                } else {
-                    (*rows as f32) * kind_rate[*b as usize]
-                }
-            });
-            prefix.push(prefix[i] + h);
+        if need_rates {
+            prefix.clear();
+            prefix.push(0.0f32);
+            for (i, (rows, b, _)) in ginfo.iter().enumerate() {
+                let h = self.group_heights.get(&i).copied().unwrap_or_else(|| {
+                    if is_trailing_blank(i) {
+                        (*rows as f32) * EST_LINE_H
+                    } else {
+                        (*rows as f32) * kind_rate[*b as usize]
+                    }
+                });
+                prefix.push(prefix[i] + h);
+            }
+            self.prefix_dirty = false;
+        } else {
+            // Unchanged inputs: last frame's sum is still exact. Copy it (the
+            // values, not the allocation — `old_prefix` is still borrowed by
+            // the anchor compensation below).
+            prefix.extend_from_slice(&old_prefix);
         }
         // Viewport window in content pixels (scroll-anchored).
         let vp_h = f32::from(vp.size.height);
@@ -4914,11 +4957,14 @@ impl LiveMarkdownView {
             }
         }
         self.virt_prefix = prefix;
-        // Reuse the previous `virt_group_lines` allocation (same length when
-        // the document shape is unchanged; a resize is a cheap realloc).
-        self.virt_group_lines.clear();
-        self.virt_group_lines
-            .extend(ginfo.iter().map(|(_, _, lr)| *lr));
+        // `virt_group_lines` mirrors the cached geometry's line ranges; only
+        // copy it when the geometry changed (otherwise the existing copy is
+        // already exact, and this loop is O(groups) per frame).
+        if self.prefix_dirty || self.virt_group_lines.len() != g {
+            self.virt_group_lines.clear();
+            self.virt_group_lines
+                .extend(ginfo.iter().map(|(_, _, lr)| *lr));
+        }
         self.virt_lo = lo;
         self.virt_hi = hi;
         self.virt_top_off = usize::from(lo > 0);
@@ -4938,11 +4984,15 @@ impl LiveMarkdownView {
     /// 估算兜底），下一帧进入窗口时实测自修正；因此保留内存从「随滚动遍历
     /// 整个大文档持续增长」变为与文档规模无关的常数窗口（M3）。
     fn prune_group_heights(&mut self, lo: usize, hi: usize) {
+        let before = self.group_heights.len();
         self.group_heights.retain(|&gi, _| {
             hi < lo
                 || (gi >= lo.saturating_sub(GROUP_HEIGHT_KEEP_MARGIN)
                     && gi <= hi + GROUP_HEIGHT_KEEP_MARGIN)
         });
+        if self.group_heights.len() != before {
+            self.prefix_dirty = true;
+        }
     }
 }
 
@@ -5004,6 +5054,7 @@ impl Render for LiveMarkdownView {
         // visibility test O(1) instead of an O(rows) bitmap rebuild.
         let geometry: Rc<PlanGeometry> = self.planned_geometry.clone();
         let ginfo = &geometry.ginfo;
+
 
         // Row virtualization window, computed BEFORE per-row paint so
         // `code_runs` / `find_marks` / `paints` / `display_numbers` only pay
