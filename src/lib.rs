@@ -998,6 +998,10 @@ impl AppWindow {
 
         // 清空当前文件树标识符
         self.current_file_tree_key = None;
+        // 切换标签页组时丢弃侧边栏拖拽基线：下一帧按当前宽度重新建立基线，
+        // 避免把跨组的宽度差当成一次拖拽增量分摊给编辑器（编辑器宽度是
+        // 全局的，而基线属于上一组的状态）。
+        self.last_sidebar_width = 0.0;
 
         if group_id == DEFAULT_TAB_GROUP_ID {
             self.bind_active_workspace(self.default_workspace.clone(), window, cx);
@@ -1303,7 +1307,19 @@ impl AppWindow {
             tab_pad_closed
         };
 
-        if editor_epoch != self.last_editor_epoch {
+        // 恢复（切标签页组/文件树）请求：内容被整体替换，`open_anim_epoch` 与
+        // `sidebar_epoch` 都不变，下面三条同步路径都不进，残留的旧 epoch 会在
+        // 下次渲染带着旧起点重播一次滑动动画（文件 tab 从中间滑到左侧）。
+        // 无条件消费，避免请求滞留到之后某帧误触发。
+        let pad_snap = self
+            .editor
+            .update(cx, |editor, _cx| editor.take_tab_bar_pad_snap_request());
+        // 本帧是否有真实翻转：分支体会更新 `last_*`，必须在进入分支前判定
+        // （否则恢复时的静态对齐会覆盖同帧真实的侧边栏 pad 动画）。
+        let editor_flipped = editor_epoch != self.last_editor_epoch;
+        let sidebar_flipped = sidebar_epoch != self.last_sidebar_epoch;
+
+        if editor_flipped {
             self.last_editor_epoch = editor_epoch;
             self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
             // 编辑器翻转前的目标：打开侧恒为 0；空侧取决于侧边栏是否可见
@@ -1320,7 +1336,7 @@ impl AppWindow {
                     editor.set_tab_bar_pad_animation(0, tab_pad_target, tab_pad_target, 0, cx);
                 });
             }
-        } else if sidebar_epoch != self.last_sidebar_epoch {
+        } else if sidebar_flipped {
             self.last_sidebar_epoch = sidebar_epoch;
             self.title_pad_epoch = self.title_pad_epoch.wrapping_add(1);
             // 翻转前侧边栏处于相反可见状态
@@ -1373,6 +1389,14 @@ impl AppWindow {
                     editor.set_tab_bar_pad_animation(0, tab_pad_target, tab_pad_target, 0, cx);
                 });
             }
+        }
+
+        // 恢复后的静态对齐：放在翻转分支之后，避免覆盖同帧真实的侧边栏/开合动画。
+        // 仅在「本帧无翻转」时生效（有翻转时 pad 已由上面分支同步到目标）。
+        if pad_snap && !editor_is_empty && !editor_flipped && !sidebar_flipped {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_tab_bar_pad_animation(0, tab_pad_target, tab_pad_target, 0, cx);
+            });
         }
 
         // 侧边栏拖拽：宽度连续变化但不换 epoch（显隐动画只改渲染层，不动

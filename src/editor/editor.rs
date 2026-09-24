@@ -304,6 +304,12 @@ pub struct Editor {
     panel_anim_ms: u64,
     /// 恢复文件树/会话状态期间为 true：禁止播放展开动画（避免切换标签页组/文件树时闪动）
     suppress_open_animation: bool,
+    /// 恢复（切标签页组/文件树）后请求 AppWindow 静态对齐 tab 栏 pad。
+    ///
+    /// 恢复期间编辑器内容被整体替换，pad 的目标值（随「编辑器空满 × 侧边栏
+    /// 显隐」变化）无人同步；残留的旧 epoch 会在下次渲染时带着旧起点重播一次
+    /// 滑动动画。AppWindow 消费此标志后按当前目标静态应用。
+    tab_bar_pad_snap_request: bool,
     content_left_padding: f32,
     content_bottom_padding: f32,
     watcher_subscription: Option<Subscription>,
@@ -369,6 +375,7 @@ impl Editor {
             panel_anim_end: 0.0,
             panel_anim_ms: EDITOR_OPEN_ANIMATION_MS,
             suppress_open_animation: false,
+            tab_bar_pad_snap_request: false,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
             watcher_subscription: None,
@@ -420,6 +427,28 @@ impl Editor {
         self.panel_anim_start = self.width;
         self.panel_anim_end = 0.0;
         self.panel_anim_ms = EDITOR_OPEN_ANIMATION_MS;
+    }
+
+    /// 内容被整体替换（恢复文件树/标签页组状态）后，把面板宽度动画槽钉死为
+    /// 「当前宽度 → 当前宽度」：渲染层的「起止无差」守卫会跳过插值，恢复后
+    /// 第一帧就是最终宽度。
+    ///
+    /// 不做这一步的话，恢复前残留的 `panel_anim_*`（旧起点）会与新内容一起
+    /// 渲染，表现为编辑器/终端整体滑动一下。
+    fn snap_panel_width(&mut self) {
+        self.panel_anim_epoch = 0;
+        self.panel_anim_start = self.width;
+        self.panel_anim_end = self.width;
+        self.panel_anim_ms = 0;
+    }
+
+    /// AppWindow 取走「恢复后需要静态对齐 tab 栏 pad」的请求（取走即清除）。
+    ///
+    /// 恢复期间 `open_anim_epoch` 不 bump（`suppress_open_animation`），
+    /// `sidebar_epoch` 也不变，pad 的三条同步路径都不进；若不显式对齐，
+    /// `tab_bar_pad_end` 会保持旧值并在下次渲染重播一次滑动动画。
+    pub fn take_tab_bar_pad_snap_request(&mut self) -> bool {
+        std::mem::take(&mut self.tab_bar_pad_snap_request)
     }
 
     /// 侧边栏改变了宽度（显隐动画或拖拽）：编辑器按
@@ -568,6 +597,10 @@ impl Editor {
         self.clear(cx);
         // 恢复期间不播放展开动画（编辑器宽度保持原值，标题栏 padding 同步保持瞬时）
         self.suppress_open_animation = true;
+        // 内容整体替换：面板宽度动画槽钉死为当前宽度（不滑动），并请求
+        // AppWindow 在本帧渲染时静态对齐 tab 栏 pad（见字段注释）。
+        self.snap_panel_width();
+        self.tab_bar_pad_snap_request = true;
         for file_info in &files_info {
             // diff tab：优先复用缓存的 DiffView 实体（保留未保存编辑/滚动/折叠），
             // 无缓存时用保存的仓库后台重载；走纯文本恢复会得到空白页。
@@ -4561,6 +4594,180 @@ mod tests {
             );
             assert_eq!(e.panel_anim_epoch, 0, "immediate path must not bump epoch");
         });
+    }
+
+    /// 回归：恢复（切标签页组/文件树）后不得残留面板宽度动画与 tab 栏 pad 动画。
+    ///
+    /// 恢复期间 `open_anim_epoch` 不 bump、`sidebar_epoch` 也不变，pad 的三条
+    /// 同步路径都不进；残留的旧起点会在下次渲染重播一次滑动动画（用户可见：
+    /// 文件 tab 从中间滑到左侧、终端整体左移）。
+    #[gpui::test]
+    fn restore_does_not_replay_stale_animations(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct Host {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .child(self.editor.clone())
+                    .child(gpui::div().flex_1())
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(window, cx));
+            Host { editor }
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+        let info = EditorOpenFileInfo {
+            id: "a.txt".into(),
+            path: "a.txt".into(),
+            label: "a.txt".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("hello\n".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            diff_repo: None,
+        };
+        let open_one = |editor: &gpui::Entity<Editor>, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let cached = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx).multi_line(true);
+                    state.set_value("hello\n", window, cx);
+                    state
+                });
+                editor.update(cx, |editor, cx| {
+                    editor.restore_file_from_cache(&info, cached, window, cx);
+                });
+            });
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+        };
+
+        open_one(&editor, cx);
+        // 造出「残留旧动画 + 已播完的 pad 动画」：面板槽指向一个过期的目标，
+        // pad 槽带着非零 epoch 与旧起点。
+        editor.update(cx, |e, _| {
+            e.panel_anim_epoch = 7;
+            e.panel_anim_start = 100.0;
+            e.panel_anim_end = 900.0;
+            e.panel_anim_ms = 300;
+            e.tab_bar_pad_epoch = 5;
+            e.tab_bar_pad_start = 124.0;
+            e.tab_bar_pad_end = 6.0;
+            e.tab_bar_pad_duration_ms = 300;
+        });
+
+        // 走真实的「保存 → 恢复」链路（切标签页组/文件树所走的那条）。
+        let state = editor.update(cx, |e, cx| e.save_to_file_tree_state(cx));
+        assert!(
+            state.open_files_info.len() == 1,
+            "save must capture the open file"
+        );
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.restore_from_file_tree_state(state, window, cx);
+            });
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        editor.update(cx, |e, _| {
+            assert_eq!(
+                e.panel_anim_epoch, 0,
+                "restore must reset the panel width animation slot"
+            );
+            assert!(
+                (e.panel_anim_start - e.panel_anim_end).abs() <= 0.5,
+                "restore must pin the panel slot to the current width, got {:.1}->{:.1}",
+                e.panel_anim_start,
+                e.panel_anim_end
+            );
+            assert!(
+                (e.panel_anim_end - e.width).abs() <= 0.5,
+                "panel slot must target the restored width, got {:.1} vs {:.1}",
+                e.panel_anim_end,
+                e.width
+            );
+            assert!(
+                e.tab_bar_pad_snap_request,
+                "restore must request a static tab bar pad sync"
+            );
+        });
+
+        // 消费请求：取走即清除，且重复调用不再触发。
+        assert!(
+            editor.update(cx, |e, _| e.take_tab_bar_pad_snap_request()),
+            "first take must observe the request"
+        );
+        assert!(
+            !editor.update(cx, |e, _| e.take_tab_bar_pad_snap_request()),
+            "request must be cleared after being taken"
+        );
+    }
+
+    /// 恢复请求只能把 pad 静态对齐到目标值；目标由「编辑器空满 × 侧边栏显隐」
+    /// 决定，恢复后若编辑器为空则不应写任何 pad 状态（AppWindow 侧有对应守卫）。
+    #[gpui::test]
+    fn snap_request_clears_when_editor_empty(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(window, cx));
+            struct Host {
+                editor: gpui::Entity<Editor>,
+            }
+            impl gpui::Render for Host {
+                fn render(
+                    &mut self,
+                    _: &mut Window,
+                    _: &mut Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div().size_full().child(self.editor.clone())
+                }
+            }
+            Host { editor }
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+
+        // 空编辑器恢复：请求仍会被消费（不滞留），但 AppWindow 不会写 pad。
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.restore_from_file_tree_state(
+                    FileTreeEditorState {
+                        open_files_info: Vec::new(),
+                        cached_editor_states: HashMap::new(),
+                        cached_diff_views: HashMap::new(),
+                        active_file_id: None,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(
+            editor.update(cx, |e, _| e.take_tab_bar_pad_snap_request()),
+            "request must be raised even for an empty restore"
+        );
+        assert!(
+            !editor.update(cx, |e, _| e.take_tab_bar_pad_snap_request()),
+            "request must be cleared after being taken"
+        );
     }
 
     #[test]
