@@ -234,6 +234,7 @@ impl LiveMarkdownView {
                 group_of_row: Vec::new(),
                 ginfo: Vec::new(),
                 display_numbers: Vec::new(),
+                has_table: false,
                 mermaid_blocks: Vec::new(),
             }),
             planned_geometry_version: u64::MAX,
@@ -3947,6 +3948,9 @@ pub(crate) struct PlanGeometry {
     pub(crate) ginfo: Vec<(usize, u8, (usize, usize))>,
     /// Ordered-list display numbers per row (`None` outside ordered lists).
     display_numbers: Vec<Option<u64>>,
+    /// Whether any group is a table. Precomputed so the render path doesn't
+    /// scan every group to answer this.
+    pub(crate) has_table: bool,
     /// Mermaid blocks in document order.
     pub(crate) mermaid_blocks: Vec<MermaidBlockRef>,
 }
@@ -4112,11 +4116,13 @@ impl PlanGeometry {
             });
         }
 
+        let has_table = groups.iter().any(|g| matches!(g, Group::Table(_)));
         Self {
             groups,
             group_of_row,
             ginfo,
             display_numbers,
+            has_table,
             mermaid_blocks,
         }
     }
@@ -4932,8 +4938,7 @@ impl Render for LiveMarkdownView {
         // 缓存键只需要 `text_version`：跳过谓词读的是每行的 `Block`，而它来自
         // 纯文本的分类结果（`planned_classified`），与光标/选区/源码模式无关。
         // 早先把整个「规划键」放进 key，导致每次方向键移动都要重扫全文。
-        let has_table = (0..geometry.group_count()).any(|gi| geometry.group_is_table(gi));
-        let table_refs = if has_table {
+        let table_refs = if geometry.has_table {
             let key = self.buffer.text_version();
             if self.table_refs_key != Some(key) {
                 let buf_lines = self.buffer.lines();

@@ -3037,6 +3037,14 @@ impl Editor {
         self.open_files[idx].editor_state.update(cx, |st, cx| {
             st.set_text(text, cx);
         });
+        // 影子状态已是最新 → 脏标记可以按精确口径重算。
+        // `is_dirty_fast` 只看版本号，打字后又撤销回原样会误报「已修改」；
+        // 这里文本已经拿到，顺手用精确比较把标记收敛回来。
+        let dirty = live.read(cx).is_dirty();
+        if self.open_files[idx].dirty != dirty {
+            self.open_files[idx].dirty = dirty;
+            self.sync_tab_modified(tab_id, dirty, cx);
+        }
     }
 
     /// 立即把所有待同步的 live 影子 `InputState` 落盘到最新文本。
