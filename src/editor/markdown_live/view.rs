@@ -148,6 +148,18 @@ pub struct LiveMarkdownView {
     /// Bounds `schedule_caret_scroll_correction` to
     /// [`CARET_SCROLL_CORRECTION_PASSES`] frames.
     caret_scroll_passes: u8,
+    /// The table whose toolbar was revealed by the gesture currently in
+    /// progress, as `(start_line, was_visible_at_press)`.
+    ///
+    /// A pointer gesture is hit-tested against the layout that existed when it
+    /// started. The table toolbar is laid out at the table's **top**, so
+    /// revealing it mid-gesture (which happens the instant the cursor enters
+    /// the table) makes the table taller and slides every row down — the rows
+    /// then move out from under the pointer, and a drag that began on one row
+    /// continues against the row above it. Freezing the decision for the
+    /// duration of the gesture keeps the geometry the pointer is being mapped
+    /// against stable; it re-evaluates on the next gesture.
+    toolbar_frozen: Option<(usize, bool)>,
     /// Source-line range per rendered row element (dead-zone hit fallback:
     /// clicks between/around rows map to the nearest element, then to a
     /// line within it via the recorded layouts).
@@ -295,6 +307,7 @@ impl LiveMarkdownView {
             scroll_to_cursor: false,
             caret_row_rect: None,
             caret_scroll_passes: 0,
+            toolbar_frozen: None,
             row_targets: Vec::new(),
             row_layouts: std::collections::HashMap::new(),
             cell_hits: std::collections::HashMap::new(),
@@ -1819,6 +1832,16 @@ impl LiveMarkdownView {
 
     /// Fallback for drags through zones no `LiveLine` covers (blank rows,
     /// margins): keep the selection extending to the nearest line.
+    ///
+    /// Table rows need care. A cell's `cell_div` claims drags over its own box,
+    /// but this fallback also fires for pointer positions outside the *first*
+    /// row element's band — which includes the whole grid below that first row.
+    /// Mapping such a position with [`Self::col_for_click`] uses whole-line
+    /// geometry (the rendered row, not the cell), so it lands on column 0 and
+    /// **overwrites** the precise column the cell drag just set. The user sees
+    /// the caret refuse to follow the mouse and the selection snap back to the
+    /// start of the row. So when the drag is already inside a table, defer to
+    /// the cell path: extend within the pointer's own cell only.
     pub(crate) fn on_fallback_drag(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
@@ -1834,8 +1857,44 @@ impl LiveMarkdownView {
         if self.drag_cross_table(line) {
             return;
         }
+        // In-table: map through the pointer's cell when one owns this position,
+        // so the endpoint stays cell-precise instead of collapsing to column 0.
+        // (`cell_hits` is written during paint for every rendered cell.)
+        if self.line_is_table(line)
+            && let Some(col) = self.cell_col_at_any(line, position)
+        {
+            self.edit_no_scroll(cx, |m| m.move_to(line, col, true));
+            return;
+        }
         let col = self.col_for_click(line, position);
         self.edit_no_scroll(cx, |m| m.move_to(line, col, true));
+    }
+
+    /// The cell column under `position` on `line`, whichever cell of that row
+    /// contains it.
+    ///
+    /// [`Self::cell_col_at`] needs the cell's own `(line, col)` key, which the
+    /// fallback path does not know; this finds the owning cell by hit box.
+    fn cell_col_at_any(&self, line: usize, position: gpui::Point<Pixels>) -> Option<usize> {
+        // Try each recorded cell of this row; their text boxes do not overlap.
+        let mut keys: Vec<usize> = self
+            .cell_hits
+            .keys()
+            .filter(|(l, _)| *l == line)
+            .map(|(_, c)| *c)
+            .collect();
+        keys.sort_unstable();
+        for col in keys {
+            let hit = self.cell_hits.get(&(line, col))?;
+            if position.y >= hit.text_bounds.top()
+                && position.y <= hit.text_bounds.bottom()
+                && position.x >= hit.text_bounds.left()
+                && position.x <= hit.text_bounds.right()
+            {
+                return self.cell_col_at(line, col, position);
+            }
+        }
+        None
     }
 
     // ---- mermaid 图模式禁区（严格 tab-only：图可见时源码不可编辑） -------
@@ -1940,6 +1999,11 @@ impl LiveMarkdownView {
     ) {
         window.focus(&self.focus, cx);
         self.goal_x = None;
+        // Pin the toolbar's visibility *before* the caret enters the table.
+        // This press is hit-tested against the current layout, and revealing
+        // the toolbar now would grow the table and slide the rows down under
+        // the pointer, so the following drag moves would map to the row above.
+        self.freeze_table_toolbar_for_line(line);
         // 双击选词 / 三击选格：都夹在本格内容范围内（Typora 表格语义：
         // 双击选格内的词，三击选整个单元格内容，而不是整行含管道）。
         let cell_range = self.table_cell_content_at(line, col);
@@ -2866,10 +2930,74 @@ impl LiveMarkdownView {
     }
 
     pub fn on_line_mouse_up(&mut self, cx: &mut Context<Self>) {
+        // The gesture is over: let the table toolbar re-evaluate from the
+        // caret's new position on the next frame.
+        self.toolbar_frozen = None;
         if self.selecting {
             self.selecting = false;
             cx.notify();
         }
+    }
+
+    /// Whether to lay out `table_start`'s toolbar on this frame.
+    ///
+    /// Normally this follows "is the caret inside the table". While a pointer
+    /// gesture is in progress the answer is pinned to what it was when the
+    /// gesture started, because the toolbar sits at the table's top: revealing
+    /// it mid-drag grows the table, slides the rows down, and leaves the
+    /// pointer over the wrong row (see [`Self::toolbar_frozen`]).
+    fn table_toolbar_visible(&self, table_start: usize, cursor_in_table: bool) -> bool {
+        match self.toolbar_frozen {
+            Some((frozen_start, was_visible)) if frozen_start == table_start => was_visible,
+            _ => cursor_in_table,
+        }
+    }
+
+    /// Pin the toolbar state of the table containing `line` for the gesture
+    /// that just started.
+    ///
+    /// Must be called **before** the caret moves into the table, so the frozen
+    /// value describes the layout the press was hit-tested against. A no-op for
+    /// lines that are not in a table.
+    fn freeze_table_toolbar_for_line(&mut self, line: usize) {
+        if !self.line_is_table(line) {
+            return;
+        }
+        let flags = self.table_line_flags();
+        let Some((start, _)) = crate::editor::markdown_live::table_ops::table_block_range_flagged(
+            self.buffer.lines(),
+            &flags,
+            line,
+        ) else {
+            return;
+        };
+        let was_visible = self.toolbar_visible_now(start);
+        self.toolbar_frozen = Some((start, was_visible));
+    }
+
+    /// The toolbar state currently on screen for `table_start`, honouring an
+    /// existing freeze.
+    fn toolbar_visible_now(&self, table_start: usize) -> bool {
+        if let Some((frozen_start, was_visible)) = self.toolbar_frozen
+            && frozen_start == table_start
+        {
+            return was_visible;
+        }
+        // No freeze: the toolbar is shown exactly when the caret is in this
+        // table — the same predicate `render` uses (`cursor_in_table`). The
+        // membership test reads the version-cached geometry, so this stays off
+        // the classification path.
+        let cur = self.buffer.cursor().line;
+        if !self.line_is_table(cur) {
+            return false;
+        }
+        let flags = self.table_line_flags();
+        crate::editor::markdown_live::table_ops::table_block_range_flagged(
+            self.buffer.lines(),
+            &flags,
+            cur,
+        )
+        .is_some_and(|(s, _)| s == table_start)
     }
 
     pub fn toggle_task_at(&mut self, line: usize, cx: &mut Context<Self>) {
@@ -6520,7 +6648,10 @@ impl Render for LiveMarkdownView {
                     if is_last {
                         outer = outer.mb_0();
                     }
-                    if cursor_in_table {
+                    // Pinned for the duration of a pointer gesture: revealing
+                    // the toolbar mid-drag slides the rows down under the
+                    // pointer (see `toolbar_frozen`).
+                    if self.table_toolbar_visible(start_line, cursor_in_table) {
                         // 当前列的对齐（高亮对应按钮）。
                         let cur_col = crate::editor::markdown_live::table_ops::column_at(
                             &src_lines,
@@ -10821,6 +10952,76 @@ mod interaction_fallback_tests {
         vc.refresh().unwrap();
         vc.run_until_parked();
         (view, vc)
+    }
+
+    /// Dragging inside one table cell must track the pointer, even though the
+    /// table's toolbar appears as the gesture starts.
+    ///
+    /// The toolbar is laid out at the table's **top**, so revealing it (which
+    /// happens as soon as the cursor enters the table) makes the table taller
+    /// and slides every row down. When that happens between the press and the
+    /// drag moves, the rows move out from under the pointer: the endpoint lands
+    /// on the row above and the drag spans two rows — reported as "the caret
+    /// doesn't follow the mouse, it selects a whole table row".
+    #[gpui::test]
+    fn dragging_in_a_cell_tracks_the_pointer_despite_the_toolbar(cx: &mut gpui::TestAppContext) {
+        const D: &str = "intro paragraph above\n\n| alpha bravo charlie | second cell |\n|---|---|\n| delta echo foxtrot | golf hotel |\n| india juliet | kilo lima |\n\ntail\n";
+        let (view, mut vc) = setup(cx, D);
+        // Park the caret OUTSIDE the table so the toolbar starts hidden.
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(0, 3, false));
+            v.after_move(cx);
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+
+        // `di` is the `grid_rows` index: 0 = header, 1 = delimiter,
+        // 2 = source line 4, 3 = source line 5 (the last data row).
+        let cell = vc
+            .debug_bounds("live-table-cell-3-0")
+            .expect("the last data row's cell must render");
+        let y = cell.center().y;
+        let x0 = cell.left() + px(30.);
+        vc.simulate_mouse_down(
+            point(x0, y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vc.run_until_parked();
+        let pressed = view.read_with(&vc, |v, _| v.buffer.cursor());
+        assert_eq!(
+            pressed.line, 5,
+            "setup: the press must land on the intended row, got {pressed:?}"
+        );
+
+        // Drag rightwards across the same cell, sampling the endpoint.
+        let mut ends = Vec::new();
+        for step in 1..=6 {
+            let x = x0 + px(step as f32 * 15.);
+            vc.simulate_mouse_move(
+                point(x, y),
+                gpui::MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            vc.run_until_parked();
+            let (cursor, sel) =
+                view.read_with(&vc, |v, _| (v.buffer.cursor(), v.buffer.selection()));
+            // Sample the selection's *end* when there is one (the drag's moving
+            // end), else the caret.
+            ends.push((step, sel.map(|(_, e)| e).unwrap_or(cursor)));
+        }
+        for (step, end) in &ends {
+            assert_eq!(
+                end.line, 5,
+                "step{step}: the drag endpoint must stay on the pressed row, got {end:?} \
+                 (all samples: {ends:?})"
+            );
+        }
+        let cols: Vec<usize> = ends.iter().map(|(_, e)| e.col).collect();
+        assert!(
+            cols.windows(2).all(|w| w[0] <= w[1]) && cols.last() > cols.first(),
+            "the endpoint must follow the pointer across the cell text, got {cols:?}"
+        );
     }
 
     /// B4: a click on live text is claimed by the LiveLine and lands a
