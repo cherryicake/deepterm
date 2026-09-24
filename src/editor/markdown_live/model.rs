@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 /// A document line. `Arc<String>` (not `String`) is what keeps undo history
 /// affordable: a snapshot clones the *line table* (one refcount bump per
-/// line) instead of the text, so 200 retained steps cost ~`lines × 16` bytes
-/// rather than `200 × document`. Editing a line that a snapshot still
-/// references copies just that one line (copy-on-write via `Arc::make_mut`).
+/// line) instead of the text, so 200 retained steps cost ~`lines × 8` bytes
+/// (one `Arc` pointer per line) rather than `200 × document`. Editing a line
+/// that a snapshot still references copies just that one line (copy-on-write
+/// via `Arc::make_mut`).
 pub type Line = Arc<String>;
 
 /// A position in the document: `line` index plus `col` as a **char** index
