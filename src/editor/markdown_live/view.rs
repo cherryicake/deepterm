@@ -1257,6 +1257,42 @@ impl LiveMarkdownView {
             }
             hi = next;
         }
+        // A partially included self-delimiting run (fence / `$$` math /
+        // frontmatter) must be widened to cover the whole run: every line in
+        // it depends on the run's *opening* state, so editing the opener
+        // changes the code lines' `RowKind::Code { lang }` (which drives
+        // tree-sitter) and editing a code line can change where the run ends.
+        (self.run_bounds(blocks, lo, hi))
+    }
+
+    /// Widen `lo..=hi` to cover any fence / math / frontmatter run it touches.
+    fn run_bounds(&self, blocks: &[Block], lo: usize, hi: usize) -> (usize, usize) {
+        let in_run = |b: Option<&Block>| {
+            matches!(
+                b,
+                Some(
+                    Block::Fence { .. }
+                        | Block::CodeLine
+                        | Block::Math { .. }
+                        | Block::MathDelim { .. }
+                        | Block::FrontMatter
+                )
+            )
+        };
+        // Only widen when the range actually touches such a run.
+        let touches = (lo..=hi).any(|i| in_run(blocks.get(i)));
+        if !touches {
+            return (lo, hi);
+        }
+        let mut lo = lo;
+        let mut hi = hi;
+        // A run's boundaries are the nearest lines that are *not* part of it.
+        while lo > 0 && in_run(blocks.get(lo - 1)) {
+            lo -= 1;
+        }
+        while hi + 1 < blocks.len() && in_run(blocks.get(hi + 1)) {
+            hi += 1;
+        }
         (lo, hi)
     }
 
@@ -10838,6 +10874,51 @@ mod incremental_plan_tests {
         }
     }
 
+    /// Editing a fence's *info string* changes every code line's
+    /// `RowKind::Code { lang }` (which drives tree-sitter highlighting) even
+    /// though those lines' `Block` stays `CodeLine`. The dirty range must
+    /// therefore cover the whole fence, not just the edited fence line.
+    #[gpui::test]
+    fn fence_language_edit_replans_its_code_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let doc = "para\n\n```\nfn a() {}\nfn b() {}\n```\n\ntail\n";
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx)))
+        });
+        let view = host.read_with(cx, |h, _| h.0.clone());
+        // Warm the plan.
+        view.update(cx, |v, _| {
+            v.planned_rows(false);
+        });
+        // Type the language into the opening fence (line 2).
+        view.update(cx, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 3, false));
+        });
+        view.update(cx, |v, cx| {
+            v.insert_text_for_bench("rust", cx);
+        });
+        view.update(cx, |v, _| {
+            assert_matches_full(v, 0, "fence lang");
+            // The code rows must carry the new language.
+            let row = v
+                .planned
+                .iter()
+                .find(|r| matches!(r.plan.kind, RowKind::Code { .. }))
+                .expect("code row present");
+            match &row.plan.kind {
+                RowKind::Code { lang } => assert_eq!(
+                    lang.as_deref(),
+                    Some("rust"),
+                    "code row kept a stale language"
+                ),
+                other => panic!("unexpected kind {other:?}"),
+            }
+        });
+    }
+
     /// The incremental planner must produce *exactly* the same rows as a full
     /// re-plan, for an arbitrary edit stream.
     ///
@@ -10867,11 +10948,15 @@ mod incremental_plan_tests {
             "```\n",
             "\n",
             "```\n",
+            "rust",       // fence info string: changes code rows' RowKind
+            "```\n",
             "$$\n",
             "y = 2\n",
             "$$\n",
             "[!TIP]\n",
-            "\n",
+            "> [!WARNING]\n", // callout kind change inside a quote run
+            "1. item\n",
+            "    indented\n",
         ];
 
         for round in 0..3 {
