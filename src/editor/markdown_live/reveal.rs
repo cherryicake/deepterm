@@ -97,7 +97,7 @@ impl Default for Reveal {
 }
 
 impl Reveal {
-    fn line_set(&self, line_count: usize) -> BTreeSet<usize> {
+    pub(crate) fn line_set(&self, line_count: usize) -> BTreeSet<usize> {
         if !self.focused || self.read_only || line_count == 0 {
             return BTreeSet::new();
         }
@@ -120,120 +120,15 @@ impl Reveal {
     }
 }
 
-/// Detect `> [!TAG]` on a quote source line. `content` is the block's content
-/// byte offset; the tag must be the first non-space token there.
-fn detect_callout_open(line: &str, content: usize) -> Option<(CalloutKind, String)> {
-    let after = line.get(content..)?.trim_start();
-    if !after.starts_with("[!") {
-        return None;
-    }
-    let end = after.find(']')?;
-    let kind = CalloutKind::parse(&after[..end + 1])?;
-    let rest = after[end + 1..].trim_start().to_string();
-    Some((kind, rest))
-}
-
-/// The text-only half of planning: document-order block classification
-/// (fence/frontmatter state threading) plus the setext backward restyle.
-/// Depends only on `lines`, **not** on the cursor/reveal — so the view can
-/// cache it and skip these two O(n) passes on cursor-only moves (P1).
-pub struct Classified {
-    pub blocks: Vec<Block>,
-    pub lang_before: Vec<Option<String>>,
-}
-
-/// Classify every line in document order (P1 text-only half).
-pub fn classify_document(lines: &[Line]) -> Classified {
-    let mut state = DocState::default();
-    let mut lang_before: Vec<Option<String>> = Vec::with_capacity(lines.len());
-    let mut blocks: Vec<Block> = Vec::with_capacity(lines.len());
-    for (i, line) in lines.iter().enumerate() {
-        // Lookahead: GFM tables may drop the outer pipes, which is only
-        // decidable together with the delimiter row below.
-        let next = lines.get(i + 1).map(|l| l.as_str());
-        lang_before.push(state.fence_lang().map(str::to_string));
-        blocks.push(classify_with_next(line, next, &mut state));
-    }
-
-    // 1.5 Setext runs: the lookahead only styles the paragraph line that
-    // directly precedes the underline; a multi-line run ("a\nb\n===") is
-    // one heading in the preview, so restyle the whole paragraph run
-    // backward. (Each source line still renders as its own heading row —
-    // a line-based live editor cannot join them; the styling matches.)
-    for i in (0..blocks.len()).rev() {
-        if let Block::SetextUnderline { level, .. } = blocks[i] {
-            let mut j = i;
-            while j > 0
-                && (matches!(blocks[j - 1], Block::Paragraph)
-                    // Setext-created headings (content: 0) are earlier lines
-                    // of the same run; `#` headings (content > 0) end it.
-                    || matches!(blocks[j - 1], Block::Heading { content: 0, .. }))
-            {
-                j -= 1;
-                blocks[j] = Block::Heading {
-                    level,
-                    content: 0,
-                };
-            }
-        }
-    }
-
-    Classified { blocks, lang_before }
-}
-
-/// Plan every row from a precomputed classification + a (cursor-dependent)
-/// reveal. The heavy reveal-set / refdefs / per-line passes still run here,
-/// but the two O(n) classification passes are skipped when `classify_document`
-/// was cached (P1).
-pub fn plan_rows(lines: &[Line], classified: &Classified, reveal: Reveal) -> Vec<PlannedRow> {
-    plan_rows_with_refs(
-        lines,
-        classified,
-        &refdefs_for_lines(lines, &classified.blocks),
-        reveal,
-    )
-}
-
-/// Whether a block's lines are exempt from registering reference definitions
-/// (`[label]: dest`); their text is literal content.
-pub(crate) fn is_refdef_skipped(b: &Block) -> bool {
-    matches!(
-        b,
-        Block::CodeLine
-            | Block::Fence { .. }
-            | Block::FrontMatter
-            | Block::Table
-            | Block::Math { .. }
-            | Block::MathDelim { .. }
-    )
-}
-
-/// Reference definitions (`[label]: dest`) for document-wide link resolution.
-/// A pure function of (`lines`, `blocks`) — both text-only — so the view caches
-/// it and skips this O(n) scan on cursor-only moves (P1).
-pub fn refdefs_for_lines(
-    lines: &[Line],
-    blocks: &[Block],
-) -> std::collections::HashMap<String, String> {
-    collect_refdefs(lines, &|i| blocks.get(i).is_some_and(is_refdef_skipped))
-}
-
-/// Plan every row from a precomputed classification + reveal, using the given
-/// (possibly cached) reference definitions. This is the variant the view uses
-/// so it can reuse `refdefs_for_lines` across cursor-only moves.
-pub fn plan_rows_with_refs(
-    lines: &[Line],
-    classified: &Classified,
-    refdefs: &std::collections::HashMap<String, String>,
-    reveal: Reveal,
-) -> Vec<PlannedRow> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    let blocks = &classified.blocks;
-
-    // 2. Line reveal set, then block expansion over source-only runs.
-    let mut revealed = reveal.line_set(lines.len());
+/// The full line-reveal set for a document: cursor/selection lines plus the
+/// block-level expansion over source-only runs (`FrontMatter` / math).
+///
+/// Extracted from [`plan_rows_with_refs`] so the incremental planner can
+/// compute the set on its own and diff it against the previous frame's — a
+/// cursor move only changes a handful of lines, and those are exactly the
+/// rows whose plan needs recomputing.
+pub fn reveal_set(blocks: &[Block], line_count: usize, reveal: Reveal) -> BTreeSet<usize> {
+    let mut revealed = reveal.line_set(line_count);
     // Table rows never take part in line-level reveal: the grid stays
     // rendered and the *cell* under the cursor reveals its own source (see
     // `Group::Table`), so clicking a cell edits it in place instead of
@@ -273,61 +168,368 @@ pub fn plan_rows_with_refs(
             flush(run_start.take(), i, &mut revealed);
         }
     }
-    flush(run_start.take(), lines.len(), &mut revealed);
+    flush(run_start.take(), blocks.len(), &mut revealed);
+    revealed
+}
 
-    // 3. Plan each line + track callout cards across quote runs.
-    let mut rows = Vec::with_capacity(lines.len());
-    let mut callout_kind: Option<CalloutKind> = None;
-    let mut prev_was_quote = false;
-    for (i, (line, block)) in lines.iter().zip(blocks.iter()).enumerate() {
-        let is_quote = matches!(block, Block::Quote { .. });
-        if !is_quote {
-            callout_kind = None;
+/// Detect `> [!TAG]` on a quote source line. `content` is the block's content
+/// byte offset; the tag must be the first non-space token there.
+fn detect_callout_open(line: &str, content: usize) -> Option<(CalloutKind, String)> {
+    let after = line.get(content..)?.trim_start();
+    if !after.starts_with("[!") {
+        return None;
+    }
+    let end = after.find(']')?;
+    let kind = CalloutKind::parse(&after[..end + 1])?;
+    let rest = after[end + 1..].trim_start().to_string();
+    Some((kind, rest))
+}
+
+/// The text-only half of planning: document-order block classification
+/// (fence/frontmatter state threading) plus the setext backward restyle.
+/// Depends only on `lines`, **not** on the cursor/reveal — so the view can
+/// cache it and skip these two O(n) passes on cursor-only moves (P1).
+pub struct Classified {
+    pub blocks: Vec<Block>,
+    pub lang_before: Vec<Option<String>>,
+    /// Classifier state entering every `CLASSIFY_CHECKPOINT`-th line
+    /// (`states[k]` = state before line `k * CLASSIFY_CHECKPOINT`).
+    ///
+    /// Storing every line's state would cost ~80 B/line; checkpointing keeps
+    /// the memory at `lines / 64 × 80 B` (25 KB on a 20k-line document) while
+    /// still allowing an exact resume: replay at most 63 lines from the
+    /// nearest checkpoint to reach any line.
+    pub states: Vec<DocState>,
+}
+
+/// Lines between classifier-state checkpoints. See [`Classified::states`].
+pub const CLASSIFY_CHECKPOINT: usize = 64;
+
+/// Incremental document classification.
+///
+/// Classification is a forward state machine (`DocState`), so an edit only
+/// affects lines from the edit point until the running state **converges**
+/// with the previously saved state — after that every later line classifies
+/// identically and the old tail is reused verbatim.
+///
+/// The convergence test is exact: the resumed run's state is compared with
+/// the checkpointed state saved alongside the previous classification, so
+/// there is no heuristic that a new `DocState` field could silently break.
+///
+/// `dirty_from` is the first line whose text may have changed; `prev` is the
+/// previous classification (empty on the first call, forcing a full pass).
+/// Returns the classification and how many lines were actually re-classified
+/// (tests assert this stays small for a single-line edit).
+pub fn classify_incremental(
+    lines: &[Line],
+    prev: Option<&Classified>,
+    dirty_from: usize,
+) -> (Classified, usize) {
+    let n = lines.len();
+    let prev = prev.filter(|p| p.blocks.len() == n && p.lang_before.len() == n);
+    let can_resume = prev.is_some() && dirty_from > 0 && dirty_from < n;
+
+    let mut blocks: Vec<Block> = Vec::with_capacity(n);
+    let mut lang_before: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut states: Vec<DocState> = Vec::with_capacity(n / CLASSIFY_CHECKPOINT + 2);
+    let mut state = DocState::default();
+    let mut start = 0usize;
+    let mut reprocessed = 0usize;
+
+    if let (true, Some(prev)) = (can_resume, prev) {
+        // Resume from the nearest checkpoint at or before `dirty_from`.
+        let ck = (dirty_from / CLASSIFY_CHECKPOINT).min(prev.states.len().saturating_sub(1));
+        let from = ck * CLASSIFY_CHECKPOINT;
+        state = prev.states[ck].clone();
+        // Copy the saved prefix verbatim (no re-classification, no lookahead).
+        blocks.extend_from_slice(&prev.blocks[..from]);
+        lang_before.extend_from_slice(&prev.lang_before[..from]);
+        states.extend(prev.states[..ck].iter().cloned());
+        // Re-derive the state for the checkpoint line itself, so `states`
+        // stays aligned with `blocks`.
+        if from % CLASSIFY_CHECKPOINT == 0 {
+            states.push(state.clone());
         }
-        let callout = match block {
-            Block::Quote { content, .. } => {
-                if !prev_was_quote || callout_kind.is_none() {
-                    // Possible card opener.
-                    match detect_callout_open(line, *content) {
-                        Some((kind, rest)) => {
-                            callout_kind = Some(kind);
-                            Some(Callout {
-                                kind,
-                                rest,
-                                is_first: true,
-                            })
-                        }
-                        None => {
-                            callout_kind = None;
-                            None
-                        }
-                    }
-                } else {
-                    // Continuation line inside an open card.
-                    callout_kind.map(|kind| Callout {
-                        kind,
-                        rest: String::new(),
-                        is_first: false,
-                    })
+        start = from;
+    } else {
+        states.push(DocState::default());
+    }
+
+    // Classify forward from `start`, stopping as soon as the state matches the
+    // saved state at the same line (the tail is then provably identical).
+    let mut converged_at: Option<usize> = None;
+    let mut i = start;
+    while i < n {
+        if i > start && i % CLASSIFY_CHECKPOINT == 0 {
+            states.push(state.clone());
+        }
+        let next = lines.get(i + 1).map(|l| l.as_str());
+        let lang_here = state.fence_lang().map(str::to_string);
+        let block = classify_with_next(&lines[i], next, &mut state);
+        blocks.push(block);
+        lang_before.push(lang_here);
+        reprocessed += 1;
+
+        // Exact convergence: the running state equals the state the previous
+        // classification entered the next line with, and this line's own
+        // results already match. Everything from `i + 1` on is identical.
+        if let Some(prev) = prev
+            && i + 1 < n
+            && prev.blocks.get(i) == Some(&blocks[i])
+            && prev.lang_before.get(i) == lang_before.get(i)
+            && prev_state_at(prev, i + 1).is_some_and(|s| s.same_parse_state(&state))
+        {
+            converged_at = Some(i + 1);
+            break;
+        }
+        i += 1;
+    }
+
+    if let (Some(at), Some(prev)) = (converged_at, prev) {
+        if at < n {
+            blocks.extend_from_slice(&prev.blocks[at..]);
+            lang_before.extend_from_slice(&prev.lang_before[at..]);
+            // Checkpoints for the reused tail come straight from the old table.
+            let first_ck = at.div_ceil(CLASSIFY_CHECKPOINT);
+            let last_ck = (n - 1) / CLASSIFY_CHECKPOINT;
+            for k in first_ck..=last_ck {
+                if let Some(s) = prev.states.get(k) {
+                    states.truncate(k);
+                    states.push(s.clone());
                 }
             }
-            _ => None,
-        };
-        prev_was_quote = is_quote;
+        }
+    }
 
-        let lang = match block {
-            Block::CodeLine => classified.lang_before[i].as_deref(),
-            _ => None,
-        };
-        let row_plan = plan_with_refs(line, block, lang, revealed.contains(&i), &refdefs);
-        rows.push(PlannedRow {
+    // Setext runs: the lookahead only styles the paragraph line that directly
+    // precedes the underline; a multi-line run ("a\nb\n===") is one heading in
+    // the preview, so restyle the whole paragraph run backward. Only rows in
+    // the re-classified window can change, but the run can start before it —
+    // so this pass runs over the whole table (cheap, allocation-free).
+    for i in (0..blocks.len()).rev() {
+        if let Block::SetextUnderline { level, .. } = blocks[i] {
+            let mut j = i;
+            while j > 0
+                && (matches!(blocks[j - 1], Block::Paragraph)
+                    // Setext-created headings (content: 0) are earlier lines
+                    // of the same run; `#` headings (content > 0) end it.
+                    || matches!(blocks[j - 1], Block::Heading { content: 0, .. }))
+            {
+                j -= 1;
+                blocks[j] = Block::Heading {
+                    level,
+                    content: 0,
+                };
+            }
+        }
+    }
+
+    // Pad the checkpoint table to cover the whole document.
+    while states.len() <= (n.saturating_sub(1)) / CLASSIFY_CHECKPOINT {
+        // Should be unreachable for the full-pass path (states are pushed in
+        // the loop); the guard keeps the table well-formed if `n` grew.
+        let k = states.len();
+        let from = k * CLASSIFY_CHECKPOINT;
+        let mut st = states[k - 1].clone();
+        for j in from.saturating_sub(CLASSIFY_CHECKPOINT)..from.min(n) {
+            let next = lines.get(j + 1).map(|l| l.as_str());
+            classify_with_next(&lines[j], next, &mut st);
+        }
+        states.push(st);
+    }
+
+    (
+        Classified {
+            blocks,
+            lang_before,
+            states,
+        },
+        reprocessed,
+    )
+}
+
+/// The checkpointed classifier state entering line `i`, if recorded.
+fn prev_state_at(prev: &Classified, i: usize) -> Option<&DocState> {
+    if i % CLASSIFY_CHECKPOINT != 0 {
+        return None;
+    }
+    prev.states.get(i / CLASSIFY_CHECKPOINT)
+}
+
+/// Classify every line in document order (full pass; the incremental variant
+/// lives in [`classify_incremental`]).
+pub fn classify_document(lines: &[Line]) -> Classified {
+    classify_incremental(lines, None, 0).0
+}
+
+/// Plan every row from a precomputed classification + reveal. Convenience
+/// wrapper that collects refdefs on the fly; the view uses
+/// [`plan_rows_with_refs`] with its cached table instead.
+pub fn plan_rows(lines: &[Line], classified: &Classified, reveal: Reveal) -> Vec<PlannedRow> {
+    plan_rows_with_refs(
+        lines,
+        classified,
+        &refdefs_for_lines(lines, &classified.blocks),
+        reveal,
+    )
+}
+
+/// Whether a block's lines are exempt from registering reference definitions
+/// (`[label]: dest`); their text is literal content.
+pub(crate) fn is_refdef_skipped(b: &Block) -> bool {
+    matches!(
+        b,
+        Block::CodeLine
+            | Block::Fence { .. }
+            | Block::FrontMatter
+            | Block::Table
+            | Block::Math { .. }
+            | Block::MathDelim { .. }
+    )
+}
+
+/// Reference definitions (`[label]: dest`) for document-wide link resolution.
+/// A pure function of (`lines`, `blocks`) — both text-only — so the view caches
+/// it and skips this O(n) scan on cursor-only moves (P1).
+pub fn refdefs_for_lines(
+    lines: &[Line],
+    blocks: &[Block],
+) -> std::collections::HashMap<String, String> {
+    collect_refdefs(lines, &|i| blocks.get(i).is_some_and(is_refdef_skipped))
+}
+
+/// Plan a single row, including callout-card tracking and the callout-opener
+/// prefix strip.
+///
+/// `prev_was_quote`/`callout_kind` carry the callout run state from the
+/// preceding row, exactly as the whole-document loop threads it. Returns the
+/// planned row plus the state for the next line.
+///
+/// This is the incremental unit: a keystroke only changes a contiguous run of
+/// rows, and everything outside it keeps its previous [`PlannedRow`] verbatim.
+///
+/// The `[!TAG] ` prefix strip lives here (not in the caller) so the
+/// whole-document and incremental planners cannot diverge on it.
+#[allow(clippy::too_many_arguments)]
+fn plan_one(
+    lines: &[Line],
+    blocks: &[Block],
+    lang_before: &[Option<String>],
+    refs: &std::collections::HashMap<String, String>,
+    revealed: &BTreeSet<usize>,
+    i: usize,
+    prev_was_quote: bool,
+    callout_kind: Option<CalloutKind>,
+) -> (PlannedRow, bool, Option<CalloutKind>) {
+    let line = &lines[i];
+    let block = &blocks[i];
+    let is_quote = matches!(block, Block::Quote { .. });
+    let mut next_kind = callout_kind;
+    if !is_quote {
+        next_kind = None;
+    }
+    let callout = match block {
+        Block::Quote { content, .. } => {
+            if !prev_was_quote || callout_kind.is_none() {
+                // Possible card opener.
+                match detect_callout_open(line, *content) {
+                    Some((kind, rest)) => {
+                        next_kind = Some(kind);
+                        Some(Callout {
+                            kind,
+                            rest,
+                            is_first: true,
+                        })
+                    }
+                    None => {
+                        next_kind = None;
+                        None
+                    }
+                }
+            } else {
+                // Continuation line inside an open card.
+                callout_kind.map(|kind| Callout {
+                    kind,
+                    rest: String::new(),
+                    is_first: false,
+                })
+            }
+        }
+        _ => None,
+    };
+
+    let lang = match block {
+        Block::CodeLine => lang_before.get(i).and_then(|l| l.as_deref()),
+        _ => None,
+    };
+    let row_plan = plan_with_refs(line, block, lang, revealed.contains(&i), refs);
+    (
+        PlannedRow {
             line: i,
             block: block.clone(),
             plan: row_plan,
             callout,
-        });
+        },
+        is_quote,
+        next_kind,
+    )
+}
+
+/// Plan a contiguous row range `start..end` given the reveal set and the
+/// callout state entering the range.
+///
+/// Used by [`plan_rows_with_refs`] for the whole document and by the view's
+/// incremental planner for the dirty range.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_range(
+    lines: &[Line],
+    classified: &Classified,
+    refs: &std::collections::HashMap<String, String>,
+    revealed: &BTreeSet<usize>,
+    start: usize,
+    end: usize,
+    mut prev_was_quote: bool,
+    mut callout_kind: Option<CalloutKind>,
+) -> Vec<PlannedRow> {
+    let blocks = &classified.blocks;
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end.min(lines.len()) {
+        let (row, was_quote, kind) = plan_one(
+            lines,
+            blocks,
+            &classified.lang_before,
+            refs,
+            revealed,
+            i,
+            prev_was_quote,
+            callout_kind,
+        );
+        prev_was_quote = was_quote;
+        callout_kind = kind;
+        rows.push(row);
     }
     rows
+}
+
+/// Plan every row from a precomputed classification + reveal, using the given
+/// (possibly cached) reference definitions. This is the variant the view uses
+/// so it can reuse `refdefs_for_lines` across cursor-only moves.
+pub fn plan_rows_with_refs(
+    lines: &[Line],
+    classified: &Classified,
+    refdefs: &std::collections::HashMap<String, String>,
+    reveal: Reveal,
+) -> Vec<PlannedRow> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let blocks = &classified.blocks;
+
+    // 2. Line reveal set + block-level expansion over source-only runs.
+    let revealed = reveal_set(blocks, lines.len(), reveal);
+
+    // 3. Plan each line + track callout cards across quote runs.
+    plan_range(lines, classified, refdefs, &revealed, 0, lines.len(), false, None)
 }
 
 /// Plan the whole document: classify then plan rows. Pure function of
@@ -508,6 +710,37 @@ mod tests {
 /// `n_vis` visible bytes and `n_src` source bytes are dropped from the front;
 /// runs, segments and link ranges shift accordingly so caret/selection
 /// mapping keeps working on the trimmed row.
+/// Hide a callout opener's `[!TAG] ` prefix (preview parity: the preview
+/// consumes the tag). Applied by the view after planning so that the planner
+/// itself keeps emitting rows whose segments cover the source line exactly
+/// (`showcase_plans_cleanly_for_every_cursor_line` pins that invariant).
+///
+/// `line` is the row's source text; no-op unless the row opens a callout card
+/// and is not revealed.
+pub fn strip_callout_prefix(row: &mut PlannedRow, line: &str) {
+    let Some(callout) = row.callout.as_ref().filter(|c| c.is_first) else {
+        return;
+    };
+    if row.plan.revealed {
+        return;
+    }
+    let tag_len = callout.kind.label().len() + 3; // `[!TAG]`
+    let content_off = match &row.block {
+        Block::Quote { content, .. } => *content,
+        _ => 0,
+    };
+    let after_tag = line
+        .get(content_off + tag_len..)
+        .unwrap_or("")
+        .strip_prefix(' ')
+        .map(|_| tag_len + 1)
+        .unwrap_or(tag_len);
+    if after_tag <= row.plan.visible.len() {
+        let src_off = (content_off + after_tag).min(line.len());
+        row.plan = strip_plan_prefix(&row.plan, after_tag, src_off);
+    }
+}
+
 pub fn strip_plan_prefix(plan: &RowPlan, n_vis: usize, n_src: usize) -> RowPlan {
     let mut out = plan.clone();
     out.visible = out.visible.get(n_vis..).unwrap_or("").to_string();
@@ -687,5 +920,111 @@ mod showcase_tests {
                 assert_eq!(a.plan.revealed, b.plan.revealed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod incremental_classify_tests {
+    use super::*;
+
+    fn doc(n: usize) -> Vec<Line> {
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!("# H{i}\n\npara {i} text\n\n"));
+        }
+        crate::editor::markdown_live::model::lines_from_text(&text)
+    }
+
+    /// Incremental classification must equal a full pass, for edits that open
+    /// and close every stateful construct (fences, math, frontmatter, tables,
+    /// setext runs) at various positions.
+    #[test]
+    fn incremental_classify_matches_full_pass() {
+        let edits: &[&str] = &[
+            "x",
+            "```",
+            "```rust",
+            "$$",
+            "| a | b |",
+            "|---|",
+            "===",
+            "---",
+            "> quote",
+            "[!NOTE]",
+            "1. item",
+            "    indented",
+        ];
+        for n in [5usize, 40, 200] {
+            let mut lines = doc(n);
+            let mut prev = classify_document(&lines);
+            for round in 0..6 {
+                for edit in edits {
+                    let at = (round * 5 + 3) % lines.len();
+                    // Append to a line (the common keystroke shape).
+                    let mut t = lines[at].to_string();
+                    t.push_str(edit);
+                    lines[at] = std::sync::Arc::new(t);
+                    let (inc, _) = classify_incremental(&lines, Some(&prev), at);
+                    let full = classify_document(&lines);
+                    assert_eq!(
+                        inc.blocks, full.blocks,
+                        "blocks diverged (n={n} round={round} edit={edit:?} at={at})"
+                    );
+                    assert_eq!(
+                        inc.lang_before, full.lang_before,
+                        "lang_before diverged (n={n} round={round} edit={edit:?} at={at})"
+                    );
+                    prev = inc;
+                }
+            }
+        }
+    }
+
+    /// A single-line edit must re-classify a bounded window whose size does
+    /// **not** grow with the document.
+    ///
+    /// The bound is the checkpoint granularity (replay from the nearest saved
+    /// state) plus the convergence run; both are constants, so the same edit
+    /// costs the same on a 500-line and a 20k-line document.
+    #[test]
+    fn incremental_classify_window_is_document_independent() {
+        let bound = CLASSIFY_CHECKPOINT + 4;
+        let mut measured = Vec::new();
+        for n in [500usize, 5_000, 20_000] {
+            let mut lines = doc(n);
+            let prev = classify_document(&lines);
+            let at = n / 2;
+            let mut t = lines[at].to_string();
+            t.push('x');
+            lines[at] = std::sync::Arc::new(t);
+            let (_, reprocessed) = classify_incremental(&lines, Some(&prev), at);
+            assert!(
+                reprocessed < bound,
+                "a one-line edit re-classified {reprocessed} lines of {n} \
+                 (bound {bound}); convergence is not working"
+            );
+            measured.push(reprocessed);
+        }
+        assert!(
+            measured.iter().all(|&m| m == measured[0]),
+            "re-classified window grew with document size: {measured:?}"
+        );
+    }
+
+    /// Opening a fence must invalidate the tail (no false convergence), and
+    /// closing it must let the tail converge again.
+    #[test]
+    fn fence_open_and_close_re_classify_the_tail() {
+        let n = 300;
+        let mut lines = doc(n);
+        let prev = classify_document(&lines);
+        let at = 10;
+        lines[at] = std::sync::Arc::new("```rust".to_string());
+        let (inc, reprocessed) = classify_incremental(&lines, Some(&prev), at);
+        assert!(
+            reprocessed > n / 2,
+            "an unclosed fence must invalidate the tail (got {reprocessed} of {n})"
+        );
+        assert_eq!(inc.blocks, classify_document(&lines).blocks);
     }
 }

@@ -48,8 +48,8 @@ use crate::editor::markdown_live::layout::{
 };
 use crate::editor::markdown_live::model::{Line, Pos};
 use crate::editor::markdown_live::reveal::{
-    classify_document, plan_rows_with_refs, refdefs_for_lines, strip_plan_prefix, CalloutKind,
-    Classified, PlannedRow, Reveal,
+    plan_range, refdefs_for_lines, reveal_set, strip_callout_prefix,
+    CalloutKind, Classified, PlannedRow, Reveal,
 };
 use crate::components::input::{
     blink_cursor::{BlinkCursor, CURSOR_WIDTH},
@@ -83,11 +83,24 @@ pub struct LiveMarkdownView {
     goal_x: Option<f32>,
     planned_version: u64,
     planned_key: (Pos, Option<(Pos, Pos)>, bool, bool, bool),
-    /// Planned rows. `Rc` so a frame can borrow the whole plan without a
-    /// deep copy: the render loop used to `to_vec()` this every frame
-    /// (including on 500 ms blink ticks), which copied every row's visible
-    /// text, runs and segments.
-    planned: Rc<Vec<PlannedRow>>,
+    /// Planned rows, one `Rc` per row. The per-row indirection is what makes
+    /// incremental planning possible: re-planning a single row replaces one
+    /// `Rc` instead of rebuilding (and re-allocating) the whole plan. The
+    /// outer `Rc` lets `render` hold the plan while mutating `self`; because
+    /// the previous frame's clone is dropped by then, `Rc::make_mut` is O(1)
+    /// on the common path (it only copies the pointer table).
+    planned: Rc<Vec<Rc<PlannedRow>>>,
+    /// Per-row inputs the current `planned` was computed from, for the
+    /// incremental diff: line text (compared by `Arc` pointer), block kind,
+    /// and reveal flag. Cheap to keep (`lines × 8 B` for the pointer table)
+    /// and turns a keystroke's re-plan into "the rows that actually changed".
+    plan_input_lines: Vec<Line>,
+    plan_input_blocks: Vec<Block>,
+    plan_revealed: std::collections::BTreeSet<usize>,
+    /// Reference definitions the current `planned` was built with, compared by
+    /// value (refdefs are usually empty, so this is free) — a content change
+    /// means link resolution changed and every row may need re-planning.
+    plan_refs: HashMap<String, String>,
     /// Cursor-independent document geometry (grouping, buckets, ordered
     /// numbers, mermaid block list), cached by text version. See
     /// [`PlanGeometry`].
@@ -229,6 +242,10 @@ impl LiveMarkdownView {
             planned_version: u64::MAX,
             planned_key: (Pos::default(), None, false, false, false),
             planned: Rc::new(Vec::new()),
+            plan_input_lines: Vec::new(),
+            plan_input_blocks: Vec::new(),
+            plan_revealed: std::collections::BTreeSet::new(),
+            plan_refs: HashMap::new(),
             planned_geometry: Rc::new(PlanGeometry {
                 groups: Vec::new(),
                 group_of_row: Vec::new(),
@@ -241,6 +258,7 @@ impl LiveMarkdownView {
             planned_classified: Classified {
                 blocks: Vec::new(),
                 lang_before: Vec::new(),
+                states: Vec::new(),
             },
             planned_classified_version: u64::MAX,
             planned_refs: Rc::new(HashMap::new()),
@@ -881,7 +899,25 @@ impl LiveMarkdownView {
         self.after_edit(cx);
     }
 
-    fn planned_rows(&mut self, focused: bool) -> Rc<Vec<PlannedRow>> {
+    /// Plan rows, reusing everything that did not change.
+    ///
+    /// A keystroke or cursor move changes a contiguous run of rows; the rest
+    /// keep their previous `Rc<PlannedRow>` verbatim. Three diffs drive it:
+    ///
+    /// * **text**: rows whose `Arc<Line>` pointer differs from the previous
+    ///   plan's input (line edits replace the `Arc`, so pointer identity is an
+    ///   exact change test). A changed line can also move a block boundary, so
+    ///   the dirty range is extended to the enclosing block run — bounded by
+    ///   the next blank line for paragraphs, or by the fence/math/frontmatter
+    ///   run for those constructs.
+    /// * **reveal**: rows whose revealed flag differs (cursor/selection move).
+    /// * **refdefs**: a content change invalidates link resolution document
+    ///   wide, so the whole plan is rebuilt (refdefs are almost always empty,
+    ///   making this the rare path).
+    ///
+    /// Correctness is pinned by a differential test against the full planner
+    /// (`incremental_matches_full_plan`) over a random edit stream.
+    fn planned_rows(&mut self, focused: bool) -> Rc<Vec<Rc<PlannedRow>>> {
         let key = (
             self.buffer.cursor(),
             self.buffer.selection(),
@@ -889,88 +925,273 @@ impl LiveMarkdownView {
             self.read_only,
             self.show_source,
         );
-        if self.planned_version != self.buffer.text_version() || self.planned_key != key {
-            // P1: 只有文本变更才重新分类；仅光标/选区移动时直接复用缓存，
-            // 跳过两个 O(n) 的分类（classify）+ setext 反向 pass。
-            // 分类结果按文本版本刷新（见 P1）。
-            if self.planned_classified_version != self.buffer.text_version() {
-                let classified = classify_document(self.buffer.lines());
-                self.planned_classified = classified;
-                self.planned_classified_version = self.buffer.text_version();
-            }
-            // 引用定义按文本版本刷新（依赖分类结果，同样纯文本相关，见 P1）。
-            if self.planned_refs_version != self.buffer.text_version() {
-                let refs = Rc::new(refdefs_for_lines(
-                    self.buffer.lines(),
-                    &self.planned_classified.blocks,
-                ));
-                self.planned_refs = refs;
-                self.planned_refs_version = self.buffer.text_version();
-            }
-            // 源码模式：用覆盖全文档的选区迫使 `line_set` 揭示每一行
-            //（`Reveal` 不变，所有调用点零改动）。
-            let last = self.buffer.lines().len().saturating_sub(1);
-            let (cursor, selection) = if self.show_source {
-                (
-                    self.buffer.cursor(),
-                    Some((Pos::new(0, 0), Pos::new(last, usize::MAX))),
-                )
-            } else {
-                (self.buffer.cursor(), self.buffer.selection())
-            };
-            let reveal = Reveal {
-                cursor,
-                selection,
-                focused,
-                read_only: self.read_only,
-                show_source: self.show_source,
-            };
-            let mut planned = plan_rows_with_refs(
+        if self.planned_version == self.buffer.text_version() && self.planned_key == key {
+            return self.planned.clone();
+        }
+        let text_changed = self.planned_classified_version != self.buffer.text_version();
+
+        // ---- classification / refdefs -------------------------------------
+        // Classification resumes from a checkpointed state at the first dirty
+        // line and stops when the state reconverges, so a keystroke only
+        // re-classifies the affected run instead of the whole document.
+        if text_changed {
+            let lines = self.buffer.lines();
+            let dirty_from = self.first_dirty_line(lines);
+            let (classified, _reprocessed) = crate::editor::markdown_live::reveal::classify_incremental(
+                lines,
+                Some(&self.planned_classified),
+                dirty_from,
+            );
+            self.planned_classified = classified;
+            self.planned_classified_version = self.buffer.text_version();
+        }
+        if self.planned_refs_version != self.buffer.text_version() {
+            self.planned_refs = Rc::new(refdefs_for_lines(
                 self.buffer.lines(),
+                &self.planned_classified.blocks,
+            ));
+            self.planned_refs_version = self.buffer.text_version();
+        }
+
+        // ---- reveal set for this frame -----------------------------------
+        // 源码模式：用覆盖全文档的选区迫使 `line_set` 揭示每一行
+        //（`Reveal` 不变，所有调用点零改动）。
+        let last = self.buffer.lines().len().saturating_sub(1);
+        let (cursor, selection) = if self.show_source {
+            (
+                self.buffer.cursor(),
+                Some((Pos::new(0, 0), Pos::new(last, usize::MAX))),
+            )
+        } else {
+            (self.buffer.cursor(), self.buffer.selection())
+        };
+        let reveal = Reveal {
+            cursor,
+            selection,
+            focused,
+            read_only: self.read_only,
+            show_source: self.show_source,
+        };
+        let blocks = &self.planned_classified.blocks;
+        let lines = self.buffer.lines();
+        let revealed = reveal_set(blocks, lines.len(), reveal);
+
+        // ---- decide the dirty range --------------------------------------
+        // Structural change (line count, block kinds, refdefs) or the very
+        // first plan → rebuild everything. Otherwise splice the changed run.
+        let structural = self.planned.is_empty()
+            || self.plan_input_lines.len() != lines.len()
+            || self.plan_input_blocks.len() != blocks.len()
+            || self.plan_refs != *self.planned_refs;
+
+        if structural {
+            let mut planned = plan_range(
+                lines,
                 &self.planned_classified,
                 &self.planned_refs,
-                reveal,
+                &revealed,
+                0,
+                lines.len(),
+                false,
+                None,
             );
-            // Callout openers hide their `[!TAG] ` prefix when not revealed,
-            // matching the preview which consumes the tag. Stripped here so
-            // paint and hit-testing share one mapping.
+            // Callout openers hide their `[!TAG] ` prefix unless revealed
+            // (preview parity). Applied here, not in the planner, so the
+            // planner keeps emitting source-exact segments.
             for row in &mut planned {
-                let is_opener = row.callout.as_ref().is_some_and(|c| c.is_first);
-                if !is_opener || row.plan.revealed {
-                    continue;
-                }
-                let Some(callout) = row.callout.as_ref() else {
-                    continue;
-                };
-                let tag_len = callout.kind.label().len() + 3; // `[!TAG]`
-                let src_line = self.buffer.line(row.line).unwrap_or("");
-                let content_off = match &row.block {
-                    Block::Quote { content, .. } => *content,
-                    _ => 0,
-                };
-                let after_tag = src_line
-                    .get(content_off + tag_len..)
-                    .unwrap_or("")
-                    .strip_prefix(' ')
-                    .map(|_| tag_len + 1)
-                    .unwrap_or(tag_len);
-                if after_tag <= row.plan.visible.len() {
-                    let src_off = (content_off + after_tag).min(src_line.len());
-                    row.plan = strip_plan_prefix(&row.plan, after_tag, src_off);
-                }
+                strip_callout_prefix(row, lines.get(row.line).map(|l| l.as_str()).unwrap_or(""));
             }
-            // Geometry is reveal-independent (block kinds + line texts only):
-            // rebuild it on text change, reuse across cursor-only moves.
+            self.planned = Rc::new(planned.into_iter().map(Rc::new).collect());
+            self.plan_input_lines = lines.to_vec();
+            self.plan_input_blocks = blocks.to_vec();
+            self.plan_revealed = revealed;
+            self.plan_refs = (*self.planned_refs).clone();
             if self.planned_geometry_version != self.buffer.text_version() {
-                self.planned_geometry =
-                    Rc::new(PlanGeometry::build(&planned, self.buffer.lines()));
+                self.planned_geometry = Rc::new(PlanGeometry::build_owned(
+                    &self.planned,
+                    lines,
+                ));
                 self.planned_geometry_version = self.buffer.text_version();
             }
-            self.planned = Rc::new(planned);
             self.planned_version = self.buffer.text_version();
             self.planned_key = key;
+            return self.planned.clone();
         }
+
+        // Dirty rows: text pointer changed, block kind changed, or the reveal
+        // flag changed. Extend the range to a block-safe boundary (see the
+        // doc comment): a line edit can flip a neighbouring line's
+        // classification (lookahead: setext underlines, GFM tables) or the
+        // fence/math state that runs after it.
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        let dirty = |i: usize, lo: &mut usize, hi: &mut usize| {
+            *lo = (*lo).min(i);
+            *hi = (*hi).max(i);
+        };
+        for i in 0..lines.len() {
+            let text_same = self
+                .plan_input_lines
+                .get(i)
+                .is_some_and(|l| Arc::ptr_eq(l, &lines[i]));
+            let block_same = self.plan_input_blocks.get(i) == blocks.get(i);
+            let reveal_same = self.plan_revealed.contains(&i) == revealed.contains(&i);
+            if !text_same || !block_same || !reveal_same {
+                dirty(i, &mut lo, &mut hi);
+            }
+        }
+        if lo > hi {
+            // Nothing to re-plan (e.g. a cursor move that changed no line's
+            // reveal state, like moving inside an already-revealed line).
+            self.planned_key = key;
+            return self.planned.clone();
+        }
+        let (lo, hi) = self.expand_dirty_range(lines, blocks, lo, hi);
+
+        // Callout state entering the range: the row before `lo` carries it.
+        let (mut prev_was_quote, mut callout_kind) = if lo == 0 {
+            (false, None)
+        } else {
+            let prev = &self.planned[lo - 1];
+            (
+                matches!(prev.block, Block::Quote { .. }),
+                prev.callout.as_ref().map(|c| c.kind),
+            )
+        };
+        let _ = &mut prev_was_quote;
+        let _ = &mut callout_kind;
+        let mut replanned = plan_range(
+            lines,
+            &self.planned_classified,
+            &self.planned_refs,
+            &revealed,
+            lo,
+            hi + 1,
+            prev_was_quote,
+            callout_kind,
+        );
+        for row in &mut replanned {
+            strip_callout_prefix(row, lines.get(row.line).map(|l| l.as_str()).unwrap_or(""));
+        }
+
+        // Splice in place. `make_mut` copies the pointer table only when the
+        // previous frame still holds a clone; it never copies row contents.
+        let planned = Rc::make_mut(&mut self.planned);
+        for (off, row) in replanned.into_iter().enumerate() {
+            if let Some(slot) = planned.get_mut(lo + off) {
+                *slot = Rc::new(row);
+            }
+        }
+        // Refresh the input snapshot for the spliced rows only.
+        for i in lo..=hi {
+            if let Some(l) = self.plan_input_lines.get_mut(i) {
+                l.clone_from(&lines[i]);
+            }
+            if let Some(b) = self.plan_input_blocks.get_mut(i) {
+                b.clone_from(&blocks[i]);
+            }
+        }
+        self.plan_revealed = revealed;
+
+        // Geometry depends on block kinds + line texts; a spliced range means
+        // both may have changed, so rebuild it (1.2 ms at 20k rows, vs 15 ms
+        // for a full plan — and it only runs on real edits).
+        if self.planned_geometry_version != self.buffer.text_version() {
+            self.planned_geometry = Rc::new(PlanGeometry::build_owned(&self.planned, lines));
+            self.planned_geometry_version = self.buffer.text_version();
+        }
+        self.planned_version = self.buffer.text_version();
+        self.planned_key = key;
         self.planned.clone()
+    }
+
+    /// First line whose text differs from the previous plan's input, compared
+    /// by `Arc` pointer identity (a text edit replaces the line's `Arc`).
+    ///
+    /// Returns 0 when there is no previous plan or the line count changed —
+    /// both force a full classification pass. Returns `lines.len()` when
+    /// nothing changed (a cursor-only move).
+    fn first_dirty_line(&self, lines: &[Line]) -> usize {
+        if self.plan_input_lines.len() != lines.len() {
+            return 0;
+        }
+        for (i, (prev, cur)) in self.plan_input_lines.iter().zip(lines.iter()).enumerate() {
+            if !Arc::ptr_eq(prev, cur) {
+                return i;
+            }
+        }
+        lines.len()
+    }
+
+    /// Widen a dirty row range to the smallest range that can be re-planned
+    /// without depending on rows outside it.
+    ///
+    /// Block classification has one line of lookahead (setext underlines, GFM
+    /// table headers) and threads fence/math/frontmatter state forward, so:
+    ///
+    /// * a **line edit** (`lo..=hi` came from a text change) must extend to the
+    ///   enclosing "run" — the maximal span with no blank line and no
+    ///   fence/math/frontmatter boundary — because that is the largest region
+    ///   whose block kinds can flip from one line's text.
+    /// * a **reveal-only** change affects just the flagged rows.
+    fn expand_dirty_range(
+        &self,
+        lines: &[Line],
+        blocks: &[Block],
+        lo: usize,
+        hi: usize,
+    ) -> (usize, usize) {
+        let text_changed = self.planned_version != self.buffer.text_version();
+        if !text_changed {
+            // Reveal-only: the block kinds are unchanged, so only the flagged
+            // rows need re-planning.
+            return (lo, hi);
+        }
+        let mut lo = lo;
+        let mut hi = hi;
+        // Backwards over the preceding run.
+        while lo > 0 {
+            let prev = lo - 1;
+            if lines.get(prev).is_none_or(|l| l.trim().is_empty()) {
+                break;
+            }
+            // A fence/math/frontmatter boundary is self-delimiting: stop
+            // before it (its own plan does not depend on this run's text).
+            if matches!(
+                blocks.get(prev),
+                Some(
+                    Block::Fence { .. }
+                        | Block::CodeLine
+                        | Block::Math { .. }
+                        | Block::MathDelim { .. }
+                        | Block::FrontMatter
+                )
+            ) {
+                break;
+            }
+            lo = prev;
+        }
+        // Forwards over the following run.
+        while hi + 1 < lines.len() {
+            let next = hi + 1;
+            if lines.get(next).is_none_or(|l| l.trim().is_empty()) {
+                break;
+            }
+            if matches!(
+                blocks.get(next),
+                Some(
+                    Block::Fence { .. }
+                        | Block::CodeLine
+                        | Block::Math { .. }
+                        | Block::MathDelim { .. }
+                        | Block::FrontMatter
+                )
+            ) {
+                break;
+            }
+            hi = next;
+        }
+        (lo, hi)
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
@@ -2014,7 +2235,7 @@ impl LiveMarkdownView {
     /// 就编辑哪个格，不会出现「Grid 画 3 列、Tab 走 2 格」这类错位。
     fn table_active_cell(
         &self,
-        rows: &[PlannedRow],
+        rows: &[&PlannedRow],
         idxs: &[usize],
         cursor: Pos,
     ) -> Option<(usize, usize, std::ops::Range<usize>)> {
@@ -3287,7 +3508,7 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
 }
 
 /// Outline entries `(source line, level, title)` in document order.
-fn outline_entries(rows: &[PlannedRow]) -> Vec<(usize, u8, String)> {
+fn outline_entries(rows: &[&PlannedRow]) -> Vec<(usize, u8, String)> {
     rows
         .iter()
         .filter_map(|r| match &r.block {
@@ -3970,7 +4191,13 @@ pub(crate) struct MermaidBlockRef {
 impl PlanGeometry {
     /// Derive geometry from the planned rows. `lines` supplies the code text
     /// for the cached mermaid sources.
-    fn build(rows: &[PlannedRow], lines: &[Line]) -> Self {
+    /// [`Self::build`] over `Rc`-wrapped rows (the view's storage).
+    fn build_owned(rows: &[Rc<PlannedRow>], lines: &[Line]) -> Self {
+        let borrowed: Vec<&PlannedRow> = rows.iter().map(|r| r.as_ref()).collect();
+        Self::build_refs(&borrowed, lines)
+    }
+
+    fn build_refs(rows: &[&PlannedRow], lines: &[Line]) -> Self {
         // ---- grouping: consecutive rows sharing one chrome container ----
         let mut groups: Vec<Group> = Vec::new();
         let mut i = 0;
@@ -4259,7 +4486,7 @@ impl Group {
     /// predecessor: 10 + prev_base (11 = after blank/unknown-first, ...).
     /// Each sub-bucket is unimodal; median then resists the margin-less
     /// trailing 26px outliers.
-    fn cal_bucket(&self, rows: &[PlannedRow]) -> u8 {
+    fn cal_bucket(&self, rows: &[&PlannedRow]) -> u8 {
         match self {
             Group::Para(_) => 1,
             Group::Quote(_) => 3,
@@ -4281,7 +4508,7 @@ impl Group {
     }
 
     /// (first, last) source line covered (click mapping for virtualization).
-    fn line_range(&self, rows: &[PlannedRow]) -> (usize, usize) {
+    fn line_range(&self, rows: &[&PlannedRow]) -> (usize, usize) {
         match self {
             Group::One(pi) => {
                 let l = rows.get(*pi).map(|r| r.line).unwrap_or(0);
@@ -4659,7 +4886,7 @@ impl Render for LiveMarkdownView {
 
         // Plan rows (cached on version+cursor+selection+focus). `Rc` clone:
         // no per-frame deep copy of the document's planned rows.
-        let rows: Rc<Vec<PlannedRow>> = self.planned_rows(focused);
+        let rows: Rc<Vec<Rc<PlannedRow>>> = self.planned_rows(focused);
         let last_line = rows.len().saturating_sub(1);
         let entity = cx.entity();
 
@@ -5825,7 +6052,8 @@ impl Render for LiveMarkdownView {
                     // Preview-parity grid. The cell under the cursor renders
                     // its own source (markers visible) through `plan_cell`, so
                     // it can be edited in place — the rest stay rendered.
-                    let active = self.table_active_cell(&rows, idxs, cursor);
+                    let row_refs: Vec<&PlannedRow> = rows.iter().map(|r| r.as_ref()).collect();
+                    let active = self.table_active_cell(&row_refs, idxs, cursor);
                     // Preview-parity grid.
                     let col_count = grid_rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
                     let aligns: Vec<CellAlign> = (0..col_count)
@@ -6551,7 +6779,8 @@ impl Render for LiveMarkdownView {
         // Hidden panel: skip the O(rows) scan entirely (large docs pay it
         // per frame otherwise).
         let (outline, current_section) = if self.show_outline {
-            let outline = outline_entries(&rows);
+            let row_refs: Vec<&PlannedRow> = rows.iter().map(|r| r.as_ref()).collect();
+            let outline = outline_entries(&row_refs);
             let current = outline
                 .iter()
                 .filter(|(line, _, _)| *line <= cursor.line)
@@ -8905,7 +9134,8 @@ mod live_showcase_tests {
             ..Default::default()
         },
         );
-        let outline = outline_entries(&rows);
+        let row_refs: Vec<&PlannedRow> = rows.iter().collect();
+        let outline = outline_entries(&row_refs);
         assert_eq!(
             outline
                 .iter()
@@ -10312,6 +10542,7 @@ mod e2e_smoke_tests {
 #[cfg(test)]
 mod perf_diagnostics {
     use super::*;
+    use crate::editor::markdown_live::reveal::classify_document;
     use std::time::Instant;
 
     /// 诊断（非断言）：按文档规模拆解「每次击键」各阶段耗时，用于定位
@@ -10358,17 +10589,194 @@ mod perf_diagnostics {
             let refs_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
-            let _ = plan_rows_with_refs(buf.lines(), &classified, &refs, reveal);
+            let _ = crate::editor::markdown_live::reveal::plan_rows_with_refs(
+                buf.lines(),
+                &classified,
+                &refs,
+                reveal,
+            );
             let plan_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let t = Instant::now();
             buf.edit(|m| m.insert("x"));
             let edit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+            // 6. geometry rebuild (grouping + row->group + ordered numbers +
+            //    mermaid list) — currently rebuilt on every text version.
+            let planned: Vec<Rc<PlannedRow>> = crate::editor::markdown_live::reveal::plan_rows_with_refs(
+                buf.lines(),
+                &classified,
+                &refs,
+                reveal,
+            )
+            .into_iter()
+            .map(Rc::new)
+            .collect();
+            let t = Instant::now();
+            let _ = PlanGeometry::build_owned(&planned, buf.lines());
+            let geo_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // 7. one-line re-plan (the incremental target).
+            let t = Instant::now();
+            let _ = crate::editor::markdown_live::layout::plan_with_refs(buf.lines()[0].as_str(), &classified.blocks[0], None, false, &refs);
+            let one_ms = t.elapsed().as_secs_f64() * 1_000_000.0;
+
             println!(
                 "lines={lines:6} join={join_ms:7.3}ms classify={classify_ms:7.3}ms \
-                 refs={refs_ms:7.3}ms plan={plan_ms:8.3}ms edit(+index)={edit_ms:6.3}ms"
+                 refs={refs_ms:7.3}ms plan={plan_ms:8.3}ms edit={edit_ms:6.3}ms \
+                 geometry={geo_ms:7.3}ms one_line_plan={one_ms:6.1}us"
             );
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod incremental_plan_tests {
+    use super::*;
+    use crate::editor::markdown_live::reveal::plan_rows_with_refs;
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+
+    /// A document exercising every construct whose block kind depends on
+    /// neighbouring lines (the reason the dirty range must be widened):
+    /// setext underlines, GFM tables with and without outer pipes, fences,
+    /// `$$` math runs, frontmatter, callouts, quotes and ordered lists.
+    fn tricky_doc() -> String {
+        let mut d = String::new();
+        d.push_str("---\ntitle: x\n---\n\n");
+        d.push_str("Setext title\n===\n\n");
+        d.push_str("multi line\nsetext run\n---\n\n");
+        d.push_str("```rust\nfn a() {}\n```\n\n");
+        d.push_str("| h1 | h2 |\n|---|---|\n| a | b |\n\n");
+        d.push_str("no pipes a | b\n--- | ---\n1 | 2\n\n");
+        d.push_str("$$\nx = 1\n$$\n\n");
+        d.push_str("> [!NOTE]\n> card body\n> more\n\n");
+        d.push_str("> plain quote\n\n");
+        d.push_str("1. one\n2. two\n\n");
+        d.push_str("tail paragraph\n");
+        d
+    }
+
+    /// Build the expected plan from scratch for the view's current state.
+    fn full_plan(v: &LiveMarkdownView, focused: bool) -> Vec<PlannedRow> {
+        let last = v.buffer.lines().len().saturating_sub(1);
+        let (cursor, selection) = if v.show_source {
+            (
+                v.buffer.cursor(),
+                Some((Pos::new(0, 0), Pos::new(last, usize::MAX))),
+            )
+        } else {
+            (v.buffer.cursor(), v.buffer.selection())
+        };
+        let reveal = Reveal {
+            cursor,
+            selection,
+            focused,
+            read_only: v.read_only,
+            show_source: v.show_source,
+        };
+        let mut expected = plan_rows_with_refs(
+            v.buffer.lines(),
+            &v.planned_classified,
+            &v.planned_refs,
+            reveal,
+        );
+        for row in &mut expected {
+            strip_callout_prefix(row, v.buffer.line(row.line).unwrap_or(""));
+        }
+        expected
+    }
+
+    /// Compare the view's incrementally-maintained plan against a from-scratch
+    /// plan for the same text and reveal state.
+    fn assert_matches_full(v: &mut LiveMarkdownView, round: usize, what: &str) {
+        let incremental = v.planned_rows(false);
+        let expected = full_plan(v, false);
+        assert_eq!(
+            incremental.len(),
+            expected.len(),
+            "row count diverged after round {round} edit {what:?}"
+        );
+        for (i, (got, want)) in incremental.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got.line, want.line,
+                "row {i} line index diverged after round {round} edit {what:?}"
+            );
+            assert_eq!(
+                got.block, want.block,
+                "row {i} block diverged after round {round} edit {what:?}\n\
+                 text: {:?}",
+                v.buffer.line(got.line).unwrap_or("")
+            );
+            assert_eq!(
+                got.plan, want.plan,
+                "row {i} plan diverged after round {round} edit {what:?}\n\
+                 text: {:?}",
+                v.buffer.line(got.line).unwrap_or("")
+            );
+            assert_eq!(
+                got.callout, want.callout,
+                "row {i} callout diverged after round {round} edit {what:?}"
+            );
+        }
+    }
+
+    /// The incremental planner must produce *exactly* the same rows as a full
+    /// re-plan, for an arbitrary edit stream.
+    ///
+    /// This is the correctness contract of the whole optimization: the frame
+    /// path now reuses untouched rows, and any divergence (a stale block kind,
+    /// a missed callout transition, a stale reveal flag) would show up here.
+    /// The comparison is on the full `PlannedRow` (block, plan, callout), not
+    /// just the rendered text.
+    #[gpui::test]
+    fn incremental_matches_full_plan(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| LiveMarkdownView::with_text(&tricky_doc(), cx)))
+        });
+        let view = host.read_with(cx, |h, _| h.0.clone());
+
+        let edits: &[&str] = &[
+            "x",
+            "# ",
+            "\n",
+            "===\n",
+            "| a | b |\n",
+            "|---|---|\n",
+            "```\n",
+            "\n",
+            "```\n",
+            "$$\n",
+            "y = 2\n",
+            "$$\n",
+            "[!TIP]\n",
+            "\n",
+        ];
+
+        for round in 0..3 {
+            for text in edits {
+                view.update(cx, |v, cx| {
+                    let n = v.buffer.line_count();
+                    let target = (round * 7 + n / 3) % n.max(1);
+                    v.edit(cx, |m| m.move_to(target, 0, false));
+                    v.insert_text_for_bench(text, cx);
+                    assert_matches_full(v, round, text);
+                    // Pure cursor moves (reveal-only changes).
+                    let n = v.buffer.line_count();
+                    v.edit(cx, |m| m.move_to(n / 2, 0, false));
+                    assert_matches_full(v, round, "<cursor>");
+                });
+            }
         }
     }
 }

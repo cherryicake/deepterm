@@ -63,7 +63,7 @@ pub enum Block {
 
 /// Classifier state carried from one line to the next. Start each document
 /// pass with `DocState::default()`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocState {
   line_no: usize,
   frontmatter: bool,
@@ -88,6 +88,25 @@ pub struct DocState {
 }
 
 impl DocState {
+  /// Whether two states agree on everything that affects *future*
+  /// classification. `line_no` is excluded: it only feeds the "is this the
+  /// document's first line" frontmatter check, so once both states are past
+  /// line 0 their `line_no` values are irrelevant to later results.
+  ///
+  /// This is the convergence test for incremental classification: once a
+  /// re-classification run reaches a line whose state matches the previously
+  /// saved state, every later line classifies identically, so the old tail
+  /// can be reused verbatim.
+  pub fn same_parse_state(&self, other: &Self) -> bool {
+    self.frontmatter == other.frontmatter
+      && self.fence == other.fence
+      && self.math == other.math
+      && self.prev_paragraph == other.prev_paragraph
+      && self.in_table == other.in_table
+      && self.list_content == other.list_content
+      && self.setext_pending == other.setext_pending
+  }
+
   /// The language of the fenced code block the *next* line would belong to.
   pub fn fence_lang(&self) -> Option<&str> {
     self.fence.as_ref().and_then(|(_, _, lang)| lang.as_deref())
