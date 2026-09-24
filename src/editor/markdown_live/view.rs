@@ -935,8 +935,11 @@ impl LiveMarkdownView {
         // line and stops when the state reconverges, so a keystroke only
         // re-classifies the affected run instead of the whole document.
         if text_changed {
+            let dirty_from = self
+                .buffer
+                .dirty_range()
+                .map_or(0, |r| r.start);
             let lines = self.buffer.lines();
-            let dirty_from = self.first_dirty_line(lines);
             let (classified, _reprocessed) = crate::editor::markdown_live::reveal::classify_incremental(
                 lines,
                 Some(&self.planned_classified),
@@ -1025,20 +1028,65 @@ impl LiveMarkdownView {
         // fence/math state that runs after it.
         let mut lo = usize::MAX;
         let mut hi = 0usize;
+        // Whether any row's *block kind* changed. Grouping and the calibration
+        // buckets are functions of the block kinds, so an unchanged kind list
+        // means the cached geometry is still valid.
+        let mut blocks_changed = false;
         let dirty = |i: usize, lo: &mut usize, hi: &mut usize| {
             *lo = (*lo).min(i);
             *hi = (*hi).max(i);
         };
-        for i in 0..lines.len() {
-            let text_same = self
-                .plan_input_lines
-                .get(i)
-                .is_some_and(|l| Arc::ptr_eq(l, &lines[i]));
-            let block_same = self.plan_input_blocks.get(i) == blocks.get(i);
-            let reveal_same = self.plan_revealed.contains(&i) == revealed.contains(&i);
-            if !text_same || !block_same || !reveal_same {
+        // Text changes come from the model's tracked dirty range (O(changed)
+        // instead of comparing every line's `Arc`), widened by one line on
+        // each side because a neighbouring line's classification can depend on
+        // the edited text (one-line lookahead).
+        let mut text_window: Option<std::ops::Range<usize>> = None;
+        if text_changed {
+            match self.buffer.dirty_range() {
+                Some(r) => {
+                    let start = r.start.saturating_sub(1);
+                    let end = (r.end + 1).min(lines.len());
+                    text_window = Some(start..end);
+                    for i in start..end {
+                        if !self
+                            .plan_input_lines
+                            .get(i)
+                            .is_some_and(|l| Arc::ptr_eq(l, &lines[i]))
+                        {
+                            dirty(i, &mut lo, &mut hi);
+                        }
+                    }
+                }
+                // Unknown range (undo/redo/whole-document replace): compare all.
+                None => {
+                    for i in 0..lines.len() {
+                        if !self
+                            .plan_input_lines
+                            .get(i)
+                            .is_some_and(|l| Arc::ptr_eq(l, &lines[i]))
+                        {
+                            dirty(i, &mut lo, &mut hi);
+                        }
+                    }
+                }
+            }
+        }
+        // Block kinds are only re-derived inside the classified window; a
+        // change there is what invalidates the geometry.
+        let kind_window = text_window
+            .clone()
+            .unwrap_or(0..lines.len());
+        for i in kind_window {
+            if self.plan_input_blocks.get(i) != blocks.get(i) {
+                blocks_changed = true;
                 dirty(i, &mut lo, &mut hi);
             }
+        }
+        // Reveal changes are enumerated from the two (tiny) sets instead of
+        // testing every line: `BTreeSet::contains` is O(log n) per row, which
+        // made this loop O(rows × log rows) on a keystroke.
+        for l in self.plan_revealed.symmetric_difference(&revealed) {
+            dirty(*l, &mut lo, &mut hi);
         }
         if lo > hi {
             // Nothing to re-plan (e.g. a cursor move that changed no line's
@@ -1074,6 +1122,11 @@ impl LiveMarkdownView {
             strip_callout_prefix(row, lines.get(row.line).map(|l| l.as_str()).unwrap_or(""));
         }
 
+        // Snapshot the new kinds before consuming the rows: the geometry
+        // decision compares them against the cached ones.
+        let replanned_kinds: Vec<RowKind> =
+            replanned.iter().map(|r| r.plan.kind.clone()).collect();
+
         // Splice in place. `make_mut` copies the pointer table only when the
         // previous frame still holds a clone; it never copies row contents.
         let planned = Rc::make_mut(&mut self.planned);
@@ -1093,34 +1146,47 @@ impl LiveMarkdownView {
         }
         self.plan_revealed = revealed;
 
-        // Geometry depends on block kinds + line texts; a spliced range means
-        // both may have changed, so rebuild it (1.2 ms at 20k rows, vs 15 ms
-        // for a full plan — and it only runs on real edits).
-        if self.planned_geometry_version != self.buffer.text_version() {
+        // Geometry inputs are the block kinds, the per-row `RowKind`
+        // (ordered-list numbers, list indent columns) and the mermaid block
+        // sources. A plain paragraph edit changes none of them, so the cached
+        // geometry stays valid — rebuilding it is ~0.8 ms at 20k rows, which
+        // would otherwise dominate the remaining keystroke cost.
+        // A kind change invalidates the calibration buckets; an ordered-list
+        // row in the range can shift the *display* numbers of every later
+        // ordered item (the counter is sequential), even though those rows'
+        // own kinds are unchanged.
+        let kinds_changed = replanned_kinds.iter().enumerate().any(|(off, kind)| {
+            self.planned
+                .get(lo + off)
+                .is_none_or(|old| old.plan.kind != *kind)
+        }) || replanned_kinds
+            .iter()
+            .any(|k| matches!(k, RowKind::Ordered { .. }));
+        // Mermaid sources live in the geometry, so any edit inside a mermaid
+        // block's fence-to-close span invalidates it.
+        let mermaid_touched = self.planned_geometry.mermaid_blocks.iter().any(|b| {
+            let start = b.block_id;
+            let end = b
+                .code_rows
+                .last()
+                .copied()
+                .map_or(start, |last| last.max(start))
+                + 1;
+            lo <= end && hi >= start
+        });
+        if self.planned_geometry_version != self.buffer.text_version()
+            && (blocks_changed || kinds_changed || mermaid_touched)
+        {
             self.planned_geometry = Rc::new(PlanGeometry::build_owned(&self.planned, lines));
+            self.planned_geometry_version = self.buffer.text_version();
+        } else if self.planned_geometry_version != self.buffer.text_version() {
+            // Inputs unchanged: keep the geometry but re-stamp the version so
+            // the next edit still sees a fresh cache.
             self.planned_geometry_version = self.buffer.text_version();
         }
         self.planned_version = self.buffer.text_version();
         self.planned_key = key;
         self.planned.clone()
-    }
-
-    /// First line whose text differs from the previous plan's input, compared
-    /// by `Arc` pointer identity (a text edit replaces the line's `Arc`).
-    ///
-    /// Returns 0 when there is no previous plan or the line count changed —
-    /// both force a full classification pass. Returns `lines.len()` when
-    /// nothing changed (a cursor-only move).
-    fn first_dirty_line(&self, lines: &[Line]) -> usize {
-        if self.plan_input_lines.len() != lines.len() {
-            return 0;
-        }
-        for (i, (prev, cur)) in self.plan_input_lines.iter().zip(lines.iter()).enumerate() {
-            if !Arc::ptr_eq(prev, cur) {
-                return i;
-            }
-        }
-        lines.len()
     }
 
     /// Widen a dirty row range to the smallest range that can be re-planned
@@ -2147,8 +2213,10 @@ impl LiveMarkdownView {
     /// `table_block_range` 内部无条件 `classify_document`）。
     fn cursor_line_is_table(&self) -> bool {
         if self.planned_geometry_version == self.buffer.text_version() {
-            let geo = &self.planned_geometry;
-            if (0..geo.group_count()).all(|gi| !geo.group_is_table(gi)) {
+            // `has_table` is precomputed in the geometry: scanning every group
+            // here was O(groups) on every keystroke, which is exactly the kind
+            // of per-edit document-scale work this optimization removes.
+            if !self.planned_geometry.has_table {
                 return false;
             }
         }
@@ -4181,6 +4249,8 @@ pub(crate) struct PlanGeometry {
 pub(crate) struct MermaidBlockRef {
     /// Source line of the opening fence (the mermaid cache key id).
     pub(crate) block_id: usize,
+    /// Row indices of the code lines (used to detect edits inside the block).
+    pub(crate) code_rows: Vec<usize>,
     /// The block's joined source text. Cached here so a frame never has to
     /// re-join the code lines just to look the block up in the render cache
     /// (the source only changes when the text does, i.e. when this geometry is
@@ -4333,6 +4403,7 @@ impl PlanGeometry {
             }
             mermaid_blocks.push(MermaidBlockRef {
                 block_id: rows[*open].line,
+                code_rows: code.clone(),
                 source: Arc::from(
                     code.iter()
                         .map(|c| lines.get(rows[*c].line).map(|l| l.as_str()).unwrap_or(""))
@@ -10601,6 +10672,31 @@ mod perf_diagnostics {
             buf.edit(|m| m.insert("x"));
             let edit_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+            // 5b. line-start index rebuild (part of `buffer.edit`).
+            let t = Instant::now();
+            buf.force_rebuild_line_starts();
+            let idx_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // 5c. what the view's incremental path actually does per keystroke:
+            // classification + plan splice + geometry gate, on a real edit.
+            let lines_now = buf.lines();
+            let dirty = buf.dirty_range();
+            let t = Instant::now();
+            let (cls2, repro2) = crate::editor::markdown_live::reveal::classify_incremental(
+                lines_now,
+                Some(&classified),
+                dirty.as_ref().map_or(0, |r| r.start),
+            );
+            let incr2_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let revealed2 =
+                crate::editor::markdown_live::reveal::reveal_set(&cls2.blocks, lines_now.len(), reveal);
+            let revset_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let refs2 = refdefs_for_lines(lines_now, &cls2.blocks);
+            let refs2_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = (repro2, revealed2, refs2);
+
             // 6. geometry rebuild (grouping + row->group + ordered numbers +
             //    mermaid list) — currently rebuilt on every text version.
             let planned: Vec<Rc<PlannedRow>> = crate::editor::markdown_live::reveal::plan_rows_with_refs(
@@ -10616,6 +10712,29 @@ mod perf_diagnostics {
             let _ = PlanGeometry::build_owned(&planned, buf.lines());
             let geo_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+            // 6a. Rc::make_mut cost when a second reference exists (the
+            // render path may hold the plan while the next edit arrives).
+            let mut shared: Rc<Vec<Rc<PlannedRow>>> = Rc::new(planned.clone());
+            let _held = shared.clone();
+            let t = Instant::now();
+            let _ = Rc::make_mut(&mut shared);
+            let makemut_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = &mut shared;
+
+            // 6b. incremental classification (what a keystroke now costs).
+            let mut prev_classified = classify_document(buf.lines());
+            let t = Instant::now();
+            let (_, repro) =
+                crate::editor::markdown_live::reveal::classify_incremental(
+                    buf.lines(),
+                    Some(&prev_classified),
+                    buf.lines().len() / 2,
+                );
+            let incr_classify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // 6c. geometry rebuild is the suspected remainder.
+            let _ = &mut prev_classified;
+
             // 7. one-line re-plan (the incremental target).
             let t = Instant::now();
             let _ = crate::editor::markdown_live::layout::plan_with_refs(buf.lines()[0].as_str(), &classified.blocks[0], None, false, &refs);
@@ -10624,7 +10743,11 @@ mod perf_diagnostics {
             println!(
                 "lines={lines:6} join={join_ms:7.3}ms classify={classify_ms:7.3}ms \
                  refs={refs_ms:7.3}ms plan={plan_ms:8.3}ms edit={edit_ms:6.3}ms \
-                 geometry={geo_ms:7.3}ms one_line_plan={one_ms:6.1}us"
+                 geometry={geo_ms:7.3}ms one_line_plan={one_ms:6.1}us \
+                 index={idx_ms:6.3}ms incr2={incr2_ms:6.3}ms \
+                 revset={revset_ms:6.3}ms refs2={refs2_ms:6.3}ms \
+                 make_mut={makemut_ms:6.3}ms \
+                 incr_classify={incr_classify_ms:6.3}ms (reproc={repro})"
             );
         }
     }
@@ -10694,10 +10817,49 @@ mod incremental_plan_tests {
     }
 
     /// Compare the view's incrementally-maintained plan against a from-scratch
-    /// plan for the same text and reveal state.
+    /// plan for the same text and reveal state, and the cached geometry
+    /// against a from-scratch build.
     fn assert_matches_full(v: &mut LiveMarkdownView, round: usize, what: &str) {
         let incremental = v.planned_rows(false);
         let expected = full_plan(v, false);
+        // Geometry is cached separately and gated on "did the inputs change";
+        // a wrong gate would render stale grouping/ordered numbers/mermaid
+        // blocks while the plan itself looked right.
+        let expected_geo = PlanGeometry::build_owned(
+            &expected.iter().cloned().map(Rc::new).collect::<Vec<_>>(),
+            v.buffer.lines(),
+        );
+        assert_eq!(
+            v.planned_geometry.ginfo, expected_geo.ginfo,
+            "geometry ginfo diverged after round {round} edit {what:?}"
+        );
+        assert_eq!(
+            v.planned_geometry.group_of_row, expected_geo.group_of_row,
+            "geometry group_of_row diverged after round {round} edit {what:?}"
+        );
+        assert_eq!(
+            v.planned_geometry.display_numbers, expected_geo.display_numbers,
+            "geometry display_numbers diverged after round {round} edit {what:?}"
+        );
+        assert_eq!(
+            v.planned_geometry.has_table, expected_geo.has_table,
+            "geometry has_table diverged after round {round} edit {what:?}"
+        );
+        let got_mermaid: Vec<(usize, &str)> = v
+            .planned_geometry
+            .mermaid_blocks
+            .iter()
+            .map(|b| (b.block_id, b.source.as_ref()))
+            .collect();
+        let want_mermaid: Vec<(usize, &str)> = expected_geo
+            .mermaid_blocks
+            .iter()
+            .map(|b| (b.block_id, b.source.as_ref()))
+            .collect();
+        assert_eq!(
+            got_mermaid, want_mermaid,
+            "geometry mermaid blocks diverged after round {round} edit {what:?}"
+        );
         assert_eq!(
             incremental.len(),
             expected.len(),

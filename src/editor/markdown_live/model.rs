@@ -71,6 +71,14 @@ pub struct EditorModel {
   /// Lets `LiveBuffer::edit` detect text changes in O(1) without joining
   /// the full document on every keystroke / cursor move.
   text_version: u64,
+  /// Line range touched since the last [`Self::take_dirty_range`] call.
+  ///
+  /// The incremental planner needs to know *which* lines changed so it can
+  /// re-classify and re-plan only those. Deriving it by comparing every line's
+  /// `Arc` against the previous plan costs O(rows) per keystroke, which is
+  /// exactly what this optimization removes — the mutation sites know the
+  /// range for free.
+  dirty: Option<std::ops::Range<usize>>,
 }
 
 impl Default for EditorModel {
@@ -102,6 +110,7 @@ impl EditorModel {
       coalescing: false,
       tab_size: 4,
       text_version: 0,
+      dirty: None,
     }
   }
 
@@ -131,6 +140,27 @@ impl EditorModel {
     self.text_version = self.text_version.wrapping_add(1);
   }
 
+  /// Record that lines `range` may have changed. Merged with any pending
+  /// range; callers pass the *pre-edit* indices they touched.
+  fn mark_dirty(&mut self, range: std::ops::Range<usize>) {
+    self.dirty = Some(match self.dirty.take() {
+      None => range,
+      Some(prev) => prev.start.min(range.start)..prev.end.max(range.end),
+    });
+  }
+
+  /// Take (and clear) the lines touched since the last call. `None` means
+  /// "unknown" (a whole-document replacement), which callers must treat as
+  /// "everything changed".
+  pub fn take_dirty_range(&mut self) -> Option<std::ops::Range<usize>> {
+    self.dirty.take()
+  }
+
+  /// Lines touched since the last [`Self::take_dirty_range`], without clearing.
+  pub fn dirty_range(&self) -> Option<std::ops::Range<usize>> {
+    self.dirty.clone()
+  }
+
   /// Replace the whole document, resetting cursor, selection, and history.
   pub fn set_text(&mut self, text: &str) {
     self.lines = split_lines(text);
@@ -140,6 +170,7 @@ impl EditorModel {
     self.undo.clear();
     self.redo.clear();
     self.coalescing = false;
+    self.dirty = None; // whole document replaced: unknown
     self.bump_text();
   }
 
@@ -730,6 +761,7 @@ impl EditorModel {
     let Some(snap) = self.undo.pop_back() else {
       return false;
     };
+    self.dirty = None; // whole document restored
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     let cursor = self.cursor;
@@ -746,6 +778,7 @@ impl EditorModel {
     let Some(snap) = self.redo.pop_back() else {
       return false;
     };
+    self.dirty = None; // whole document restored
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     let cursor = self.cursor;
@@ -857,6 +890,7 @@ impl EditorModel {
       return;
     }
     self.bump_text();
+    self.mark_dirty(start.line..end.line + 1);
     if start.line == end.line {
       let line = Arc::make_mut(&mut self.lines[start.line]);
       let a = byte_idx(line, start.col);
@@ -883,10 +917,13 @@ impl EditorModel {
     let Pos { line, col } = self.cursor;
     let at = byte_idx(&self.lines[line], col);
     if !s.contains('\n') {
+      self.mark_dirty(line..line + 1);
       Arc::make_mut(&mut self.lines[line]).insert_str(at, s);
       self.cursor.col += s.chars().count();
       return;
     }
+    // A newline splits the line: everything from here on shifts.
+    self.mark_dirty(line..self.lines.len());
     let tail = Arc::make_mut(&mut self.lines[line]).split_off(at);
     let mut parts = s.split('\n');
     if let Some(first) = parts.next() {

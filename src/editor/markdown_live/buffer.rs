@@ -93,6 +93,12 @@ impl LiveBuffer {
         buf
     }
 
+    /// Diagnostics/bench: rebuild the index unconditionally.
+    #[cfg(test)]
+    pub fn force_rebuild_line_starts(&mut self) {
+        self.rebuild_line_starts();
+    }
+
     /// Recompute the line-start prefix table from the current line table.
     fn rebuild_line_starts(&mut self) {
         let lines = self.model.lines();
@@ -178,6 +184,18 @@ impl LiveBuffer {
 
     pub fn cursor(&self) -> Pos {
         self.model.cursor()
+    }
+
+    /// Lines touched since the last call (see [`EditorModel::take_dirty_range`]).
+    /// `None` = unknown (whole-document replacement / undo / redo), which the
+    /// incremental planner treats as "everything changed".
+    pub fn take_dirty_range(&mut self) -> Option<std::ops::Range<usize>> {
+        self.model.take_dirty_range()
+    }
+
+    /// Lines touched since the last `take_dirty_range`, without clearing.
+    pub fn dirty_range(&self) -> Option<std::ops::Range<usize>> {
+        self.model.dirty_range()
     }
 
     /// Byte offset of `pos` in the joined document (`lines` joined by `\n`).
