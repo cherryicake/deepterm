@@ -1029,6 +1029,13 @@ impl Editor {
         encoding: FileEncoding,
         cx: &mut Context<Self>,
     ) {
+        // 影子 `InputState` 是 250ms 防抖同步的，而下面的「有没有本地修改」判据
+        // 正是读它。不先落盘的话，刚打完字（防抖未到期）就遇到外部写入时，
+        // `current` 还是旧文本 → `no_local_edits` 误判为真 → 分支 1 直接用磁盘
+        // 内容覆盖 live 视图，而 `EditorModel::set_text` 会清空撤销栈，用户刚输入
+        // 的内容既无提示也无法撤销。这里必须先对齐，判据才是当下的真实状态。
+        self.flush_all_live_shadows(cx);
+
         let matched_ids: Vec<SharedString> = self
             .open_files
             .iter()
@@ -2337,6 +2344,10 @@ impl Editor {
                         return;
                     };
                     let _ = weak.update(cx, |this, cx| {
+                        // 与 `apply_external_reload` 同理：`file.dirty` 与影子
+                        // `InputState` 都是防抖滞后的，不先对齐就会把「刚打过字」
+                        // 误判成「无本地修改」，随后用磁盘内容覆盖 live 视图。
+                        this.flush_all_live_shadows(cx);
                         let Some(file) =
                             this.open_files.iter_mut().find(|f| f.id.as_str() == tab_id)
                         else {
