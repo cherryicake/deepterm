@@ -390,7 +390,12 @@ fn inject_inline_fill(tag: &str, fill: &str) -> String {
 // 缓存 / 异步 / tab 状态
 // ---------------------------------------------------------------------------
 
-type MermaidKey = (String, u64);
+/// Mermaid cache key: the block source (shared, not copied) + theme fingerprint.
+/// `Arc<str>` lets `body()`/`ensure()` probe the cache and record frame slots
+/// without allocating a fresh `String` on every call — the render path calls
+/// `body()` per visible mermaid card, and the old `source.to_string()` per call
+/// was pure garbage on the hot path.
+type MermaidKey = (Arc<str>, u64);
 
 /// 一块 mermaid 的渲染体（渲染分支据此决定画图还是回退源码）。
 #[derive(Clone)]
@@ -455,7 +460,7 @@ impl MermaidState {
     /// 保证 `block_id` 块有渲染 entry（没有则防抖后台渲染一张）。
     ///
     /// 幂等：同键已存在直接记帧位后返回。新 entry 的回退图取「上一帧同位置」
-    /// 块的成品图（按文档序对齐，滚动/虚拟化不影响 —— pass1 遍历全部组）。
+    /// 块的成品图（按文档序对齐，滚动/虚拟化不影响 —— pass1 遍历全部块）。
     pub(crate) fn ensure(
         &mut self,
         block_id: usize,
@@ -464,13 +469,17 @@ impl MermaidState {
         cx: &mut Context<LiveMarkdownView>,
     ) {
         // 指纹用 `begin_frame` 存下的那份：每块重算 15 字段哈希纯属浪费。
-        let key: MermaidKey = (source.to_string(), self.theme_fp);
+        let key: MermaidKey = (Arc::from(source), self.theme_fp);
         let pos = self.frame_keys.len();
-        self.frame_keys.push(key.clone());
-        self.frame_ids.push(block_id);
         if self.entries.contains_key(&key) {
+            // Already rendered (or in flight): record the frame slot with the
+            // *cached* key so pruning compares shared pointers, not contents.
+            self.frame_keys.push(key.clone());
+            self.frame_ids.push(block_id);
             return;
         }
+        self.frame_keys.push(key.clone());
+        self.frame_ids.push(block_id);
         let fallback = self
             .prev_keys
             .get(pos)
@@ -519,8 +528,9 @@ impl MermaidState {
 
     /// 查块渲染体（渲染分支与光标禁区判定共用，保证两者永远一致）。
     pub(crate) fn body(&self, source: &str) -> MermaidBody {
-        let key: MermaidKey = (source.to_string(), self.theme_fp);
-        let Some(entry) = self.entries.get(&key) else {
+        // Probe without allocating: the map's `Hash`/`Eq` for `Arc<str>` works
+        // on the pointed-to string, so a borrowed `&str` key suffices.
+        let Some(entry) = self.entries.get(&(Arc::from(source), self.theme_fp)) else {
             // pass1 尚未跑过（首帧/异常路径）：按渲染中回退源码。
             return MermaidBody::Source { error: None };
         };

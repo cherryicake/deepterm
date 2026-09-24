@@ -47,6 +47,19 @@ pub struct LiveBuffer {
     /// Disk baseline (`original_content`): `is_dirty = text() != original`.
     original: String,
     pub line_ending: LineEnding,
+    /// Byte offset of every line start, plus the total text length at the
+    /// end (`len == line_count + 1`). A pure function of the text, rebuilt
+    /// on every text mutation.
+    ///
+    /// This turns offset ↔ [`Pos`] conversion from an O(lines) scan into an
+    /// O(log lines) binary search. That matters on the hot paths: search
+    /// highlighting converts *every* match range (O(matches × lines) before,
+    /// which is what made a 10k-line document stutter while typing with the
+    /// find panel open), and the IME path asks for the caret offset
+    /// repeatedly. The rebuild itself is one linear pass of additions over
+    /// the line table — no allocation beyond reusing this `Vec` — and it
+    /// replaces several O(n) scans per keystroke.
+    line_starts: Vec<usize>,
 }
 
 impl LiveBuffer {
@@ -56,12 +69,28 @@ impl LiveBuffer {
         // dirty compares like-for-like and save re-applies the ending.
         let model = EditorModel::new(text);
         let original = model.text();
-        Self {
+        let mut buf = Self {
             model,
             version: 0,
             original,
             line_ending: ending,
+            line_starts: Vec::new(),
+        };
+        buf.rebuild_line_starts();
+        buf
+    }
+
+    /// Recompute the line-start prefix table from the current line table.
+    fn rebuild_line_starts(&mut self) {
+        let lines = self.model.lines();
+        self.line_starts.clear();
+        self.line_starts.reserve(lines.len() + 1);
+        let mut off = 0usize;
+        for line in lines {
+            self.line_starts.push(off);
+            off += line.len() + 1;
         }
+        self.line_starts.push(off);
     }
 
     /// Load from disk bytes already decoded to UTF-8. Resets history, version
@@ -70,6 +99,7 @@ impl LiveBuffer {
         self.line_ending = LineEnding::detect(text);
         self.model.set_text(text);
         self.original = self.model.text();
+        self.rebuild_line_starts();
         self.bump();
     }
 
@@ -123,6 +153,43 @@ impl LiveBuffer {
         self.model.cursor()
     }
 
+    /// Byte offset of `pos` in the joined document (`lines` joined by `\n`).
+    /// O(log lines).
+    pub fn offset_of_pos(&self, pos: Pos) -> usize {
+        let line = pos.line.min(self.model.lines().len().saturating_sub(1));
+        let start = self
+            .line_starts
+            .get(line)
+            .copied()
+            .unwrap_or(0);
+        start + crate::editor::markdown_live::layout::byte_for_col(
+            self.model.line(line).unwrap_or(""),
+            pos.col,
+        )
+    }
+
+    /// [`Pos`] of a joined-document byte offset. O(log lines).
+    /// Interior offsets floor to the char start; past-end clamps to the end.
+    pub fn pos_of_offset(&self, off: usize) -> Pos {
+        let lines = self.model.lines();
+        let total = self.line_starts.last().copied().unwrap_or(0);
+        let off = off.min(total);
+        // `partition_point` finds the first line start strictly after `off`;
+        // the line before it contains the offset. `off == line_starts[i]`
+        // (line start) must land on line `i`, hence `<=`.
+        let idx = self.line_starts.partition_point(|&s| s <= off);
+        let line = idx.saturating_sub(1).min(lines.len().saturating_sub(1));
+        let start = self.line_starts.get(line).copied().unwrap_or(0);
+        let local = off.saturating_sub(start);
+        Pos::new(
+            line,
+            crate::editor::markdown_live::layout::col_for_byte(
+                lines.get(line).map(String::as_str).unwrap_or(""),
+                local,
+            ),
+        )
+    }
+
     pub fn selection(&self) -> Option<(Pos, Pos)> {
         self.model.selection()
     }
@@ -139,6 +206,7 @@ impl LiveBuffer {
         let before = self.model.text_version();
         let out = f(&mut self.model);
         if self.model.text_version() != before {
+            self.rebuild_line_starts();
             self.bump();
         }
         out
@@ -186,5 +254,62 @@ mod tests {
         b.set_text("a");
         assert!(!b.is_dirty());
         assert!(b.text_version() > v, "reload must invalidate caches");
+    }
+
+    /// The offset index must agree with the naive scan it replaces, for every
+    /// byte offset of a document with mixed line lengths and multibyte text.
+    #[test]
+    fn offset_index_matches_naive_scan() {
+        use crate::editor::markdown_live::interactions::pos_of_offset;
+        let texts = [
+            "",
+            "a",
+            "a\nb",
+            "a\n\nb",
+            "hello\nworld\n",
+            "\n\n\n",
+            "中文行\nsecond line\n第三行有 emoji 🎉\n",
+            "trailing newline\n",
+        ];
+        for text in texts {
+            let mut b = LiveBuffer::new(text);
+            let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            let total: usize = lines.iter().map(|l| l.len() + 1).sum::<usize>();
+            for off in 0..=total {
+                let fast = b.pos_of_offset(off);
+                let slow = pos_of_offset(&lines, off);
+                assert_eq!(
+                    (fast.line, fast.col),
+                    (slow.line, slow.col),
+                    "pos_of_offset({off}) diverged for {text:?}"
+                );
+            }
+            // Round-trip through `offset_of_pos` for real positions.
+            for (li, line) in lines.iter().enumerate() {
+                for col in 0..=line.chars().count() {
+                    let pos = Pos::new(li, col);
+                    let off = b.offset_of_pos(pos);
+                    let back = b.pos_of_offset(off);
+                    assert_eq!(
+                        (back.line, back.col),
+                        (li, col),
+                        "round trip failed for {pos:?} in {text:?}"
+                    );
+                }
+            }
+            // Edits must keep the index in sync.
+            b.edit(|m| m.insert("X\nY"));
+            let lines: Vec<String> = b.text().split('\n').map(str::to_string).collect();
+            let total: usize = lines.iter().map(|l| l.len() + 1).sum::<usize>();
+            for off in 0..=total {
+                let fast = b.pos_of_offset(off);
+                let slow = pos_of_offset(&lines, off);
+                assert_eq!(
+                    (fast.line, fast.col),
+                    (slow.line, slow.col),
+                    "post-edit pos_of_offset({off}) diverged for {text:?}"
+                );
+            }
+        }
     }
 }
