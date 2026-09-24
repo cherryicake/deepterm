@@ -62,7 +62,12 @@ use ropey::Rope;
 
 #[derive(Debug, Clone)]
 pub enum LiveViewEvent {
-    Change(String),
+    /// The document text changed. Carries only the new [`TextVersion`] — the
+    /// text itself is fetched from the view on demand (`text()`), so a
+    /// keystroke no longer pays a full-document `join` just to build an event
+    /// nobody may consume. Subscribers that need the text (dirty check, save)
+    /// read it explicitly; the shadow-`InputState` sync is debounced.
+    Change { version: u64 },
     LinkClick(String),
 }
 
@@ -155,6 +160,8 @@ pub struct LiveMarkdownView {
     /// 代码编辑器同款 `SearchPanel`（`Cmd+F` 懒建）：匹配引擎、面板 UI、
     /// 跳转与替换逻辑全部复用，不再自实现（`SearchTarget` 桥接行列缓冲）。
     search_panel: Option<Entity<SearchPanel<LiveMarkdownView>>>,
+    /// 已登记待同步的文本版本（`Some` = 防抖中）。避免连续击键起多个任务。
+    search_sync_version: Option<u64>,
     _subscriptions: Vec<Subscription>,
     /// 行虚拟化（大文档）：每帧只建视口内 group 的元素，其余以占位撑高。
     /// group 粒度保证代码卡片/引用/表格不被拦腰截断；小文档走全量老路。
@@ -262,6 +269,7 @@ impl LiveMarkdownView {
             slash_index: 0,
             slash_suppress: None,
             search_panel: None,
+            search_sync_version: None,
             _subscriptions,
             group_heights: std::collections::HashMap::new(),
             heights_version: u64::MAX,
@@ -339,7 +347,9 @@ impl LiveMarkdownView {
             let text = Rope::from(self.buffer.text());
             panel.update(cx, |p, _| p.sync_text(&text));
         }
-        cx.emit(LiveViewEvent::Change(self.buffer.text()));
+        cx.emit(LiveViewEvent::Change {
+            version: self.buffer.text_version(),
+        });
         cx.notify();
     }
 
@@ -349,6 +359,13 @@ impl LiveMarkdownView {
 
     pub fn is_dirty(&self) -> bool {
         self.buffer.is_dirty()
+    }
+
+    /// O(1) dirty check: `false` means "no text mutation since the last save /
+    /// load" (see [`LiveBuffer::is_dirty_fast`]). Used by the editor's
+    /// per-keystroke tab-marker update, which must not join the document.
+    pub fn is_dirty_fast(&self) -> bool {
+        self.buffer.is_dirty_fast()
     }
 
     pub fn text_version(&self) -> u64 {
@@ -974,11 +991,32 @@ impl LiveMarkdownView {
             // 重排可能再次改文本：按**最终**版本记账/广播。
             self.emitted_version = self.buffer.text_version();
             // 查找面板的匹配跟随文档（`InputState::update_search` parity）。
+            //
+            // 面板关着时**完全跳过**：没有面板就没有匹配要维护，全文
+            // `Rope::from(text)` + 重扫纯属浪费（这是每击键一次的 O(文档)）。
+            // 面板开着时也走防抖：连续打字只在停顿后重扫一次最终文本，
+            // 高亮延迟一帧不影响「边打字边看匹配」的体感。
             if let Some(panel) = self.search_panel.clone() {
-                let text = Rope::from(self.buffer.text());
-                panel.update(cx, |p, _| p.sync_text(&text));
+                let panel_open = panel.read(cx).is_open();
+                if panel_open {
+                    let version = self.buffer.text_version();
+                    if self.search_sync_version != Some(version) {
+                        self.search_sync_version = Some(version);                        let weak = cx.entity().downgrade();
+                        cx.spawn(async move |_this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(Self::SEARCH_SYNC_DEBOUNCE_MS))
+                                .await;
+                            let _ = weak.update(cx, |view, cx| {
+                                view.flush_search_sync(cx);
+                            });
+                        })
+                        .detach();
+                    }
+                }
             }
-            cx.emit(LiveViewEvent::Change(self.buffer.text()));
+            cx.emit(LiveViewEvent::Change {
+                version: self.buffer.text_version(),
+            });
         }
         cx.notify();
         cx.stop_propagation();
@@ -3167,8 +3205,37 @@ impl LiveMarkdownView {
         Some((None, (0, 0)))
     }
 
+    /// 把当前文本同步进查找面板（防抖落地点）。
+    ///
+    /// 面板已关时跳过（没有匹配要维护）。`SearchMatcher::update` 内部有
+    /// `Rope` 相等性早退，因此这里无需自己判重。
+    fn flush_search_sync(&mut self, cx: &mut Context<Self>) {
+        self.search_sync_version = None;
+        let Some(panel) = self.search_panel.clone() else {
+            return;
+        };
+        if !panel.read(cx).is_open() {
+            return;
+        }
+        let text = Rope::from(self.buffer.text());
+        panel.update(cx, |p, _| p.sync_text(&text));
+    }
+
+    /// 立即把文本同步进查找面板（打开面板 / 跳转 / 替换前调用，保证匹配
+    /// 与当前文本一致）。
+    fn sync_search_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.search_panel.clone() {
+            let text = Rope::from(self.buffer.text());
+            panel.update(cx, |p, _| p.sync_text(&text));
+        }
+    }
+
+    /// 查找面板匹配同步的防抖窗口（面板开着时）。
+    const SEARCH_SYNC_DEBOUNCE_MS: u64 = 120;
+
     /// Copy-button feedback for fenced code cards (mirrors `Markdown`).
-    pub fn mark_code_block_copied(&mut self, id: usize, cx: &mut Context<Self>) {        self.copied_code_blocks.insert(id);
+    pub fn mark_code_block_copied(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.copied_code_blocks.insert(id);
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
@@ -3456,6 +3523,8 @@ impl SearchTarget for LiveMarkdownView {
     }
 
     fn reveal_match(&mut self, range: std::ops::Range<usize>, _w: &mut Window, cx: &mut Context<Self>) {
+        // 防抖可能让面板的匹配落后于当前文本：跳转前先对齐。
+        self.sync_search_now(cx);
         let lines = self.buffer.lines().to_vec();
         let s = pos_of_offset(&lines, range.start);
         let e = pos_of_offset(&lines, range.end);
@@ -3477,6 +3546,8 @@ impl SearchTarget for LiveMarkdownView {
         if self.read_only {
             return;
         }
+        // 替换前对齐匹配，避免按过期的偏移改写文本。
+        self.sync_search_now(cx);
         let lines = self.buffer.lines().to_vec();
         let s = pos_of_offset(&lines, range.start);
         let e = pos_of_offset(&lines, range.end);
@@ -3495,6 +3566,8 @@ impl SearchTarget for LiveMarkdownView {
         if self.read_only {
             return;
         }
+        // 全量替换前对齐匹配（同 `replace_match`）。
+        self.sync_search_now(cx);
         let lines = self.buffer.lines().to_vec();
         let ranges: Vec<(Pos, Pos, String)> = pairs
             .iter()

@@ -322,6 +322,11 @@ pub struct Editor {
     editor_state_subscriptions: HashMap<SharedString, Subscription>,
     /// tab_id -> in-flight load generation (supersedes stale tasks after tab-group swap).
     loading_gens: HashMap<String, u64>,
+    /// live tab 的影子 `InputState` 待同步集合：live 编辑器不再每次击键
+    /// 都把全文写进影子 `InputState`（那是 `Rope` 重建 + 整篇软换行，纯浪费
+    /// —— live tab 根本不渲染它，只有保存/切标签页组/关闭确认才读）。
+    /// 击键只登记版本号并起一个防抖任务，真正同步时取最终文本。
+    pending_live_sync: HashMap<SharedString, u64>,
     /// tab_id -> pending `Cmd+Click` line/col jump (applied after async load).
     pending_jumps: HashMap<String, (u32, Option<u32>)>,
     /// 跳转到行面板（cmd-l / ctrl-g 切换）。
@@ -338,6 +343,10 @@ impl Editor {
     const MARKDOWN_EDIT_SUFFIX: &str = "#edit";
     /// Markdown 实时预览编辑 tab 的 id 后缀：同屏所见即所得，直接编辑渲染后的文档。
     const MARKDOWN_LIVE_SUFFIX: &str = "#live";
+
+    /// live tab 影子 `InputState` 同步的防抖窗口。影子状态只服务于
+    /// 保存/切组/关闭确认，不参与渲染；连续打字只在停顿后同步一次最终文本。
+    const LIVE_SHADOW_SYNC_DEBOUNCE_MS: u64 = 250;
 
     /// md 文档默认走实时渲染：与 `open_file_with_content` 的 live 门控保持一致（仅 `.md`）。
     /// 显式指定的 `edit_mode` 不会被劫持；`live_mode` 已为 true 时直接透传。
@@ -382,6 +391,7 @@ impl Editor {
             remote_watcher_subscription: None,
             editor_state_subscriptions: HashMap::new(),
             loading_gens: HashMap::new(),
+            pending_live_sync: HashMap::new(),
             pending_jumps: HashMap::new(),
             goto_line_panel: None,
             language_menu: None,
@@ -551,6 +561,9 @@ impl Editor {
 
     /// 保存当前编辑器状态到文件树状态
     pub fn save_to_file_tree_state(&mut self, cx: &mut Context<Self>) -> FileTreeEditorState {
+        // 切标签页组会缓存影子 InputState：先把防抖中的 live 文本落盘，
+        // 否则切回来会看到滞后的内容。
+        self.flush_all_live_shadows(cx);
         let open_files_info = self.get_open_files_info();
         let cached_editor_states = self.take_cached_editor_states();
         let cached_diff_views = self.take_cached_diff_views();
@@ -743,27 +756,18 @@ impl Editor {
                 restored_tab_id.clone(),
                 cx.subscribe(
                     &live,
-                    move |this, live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                    move |this, _live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
                         if !matches!(
                             event,
-                            crate::editor::markdown_live::LiveViewEvent::Change(_)
+                            crate::editor::markdown_live::LiveViewEvent::Change { .. }
                         ) {
                             return;
                         }
-                        let idx =
-                            this.open_files.iter().position(|f| f.id == live_tab_id);
-                        if let Some(idx) = idx {
-                            // 影子 InputState 与 live 同步：文件树切换时缓存的是
-                            // InputState，保证未保存内容不丢失；脏检查/保存沿用旧路径。
-                            let text = live_entity.read(cx).text();
-                            this.open_files[idx].editor_state.update(cx, |st, cx| {
-                                st.set_text(text, cx);
-                            });
-                            let dirty = this.file_is_dirty(&this.open_files[idx], cx);
-                            this.open_files[idx].dirty = dirty;
-                            this.sync_tab_modified(&live_tab_id, dirty, cx);
-                        }
-                        cx.notify();
+                        let crate::editor::markdown_live::LiveViewEvent::Change { version } = event
+                        else {
+                            return;
+                        };
+                        this.on_live_change(&live_tab_id.clone().into(), *version, cx);
                     },
                 ),
             );
@@ -2646,27 +2650,18 @@ impl Editor {
                 sync_tab_id.clone().into(),
                 cx.subscribe(
                     &live,
-                    move |this, live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                    move |this, _live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
                         if !matches!(
                             event,
-                            crate::editor::markdown_live::LiveViewEvent::Change(_)
+                            crate::editor::markdown_live::LiveViewEvent::Change { .. }
                         ) {
                             return;
                         }
-                        let idx = this
-                            .open_files
-                            .iter()
-                            .position(|f| f.id.as_ref() == live_tab_id.as_str());
-                        if let Some(idx) = idx {
-                            let text = live_entity.read(cx).text();
-                            this.open_files[idx].editor_state.update(cx, |st, cx| {
-                                st.set_text(text, cx);
-                            });
-                            let dirty = this.file_is_dirty(&this.open_files[idx], cx);
-                            this.open_files[idx].dirty = dirty;
-                            this.sync_tab_modified(&live_tab_id, dirty, cx);
-                        }
-                        cx.notify();
+                        let crate::editor::markdown_live::LiveViewEvent::Change { version } = event
+                        else {
+                            return;
+                        };
+                        this.on_live_change(&live_tab_id.clone().into(), *version, cx);
                     },
                 ),
             );
@@ -2965,6 +2960,114 @@ impl Editor {
         });
     }
 
+    /// live tab 的 `Change` 事件处理（两个订阅点共用）。
+    ///
+    /// 每击键只做 O(1) 的事：更新标签页的未保存标记（`is_dirty_fast`，不
+    /// join 全文），并把「影子 `InputState` 需要同步」登记进
+    /// [`Self::pending_live_sync`] + 起一个防抖任务。真正的全文同步在
+    /// [`Self::flush_live_shadow`] 里做 —— 影子 `InputState` 只服务于
+    /// 保存/切标签页组/关闭确认，live tab 渲染时完全不读它，因此不必跟手。
+    fn on_live_change(
+        &mut self,
+        live_tab_id: &SharedString,
+        version: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = self
+            .open_files
+            .iter()
+            .position(|f| f.id == *live_tab_id)
+        else {
+            return;
+        };
+        // O(1)：版本号对比，绝不 join 全文。
+        let dirty = self.open_files[idx]
+            .live
+            .as_ref()
+            .is_some_and(|live| live.read(cx).is_dirty_fast());
+        if self.open_files[idx].dirty != dirty {
+            self.open_files[idx].dirty = dirty;
+            self.sync_tab_modified(live_tab_id, dirty, cx);
+        }
+        self.schedule_live_shadow_sync(live_tab_id, version, cx);
+        cx.notify();
+    }
+
+    /// 登记待同步的影子 `InputState` 版本，并起一个防抖任务。
+    ///
+    /// 连续击键只会在防抖窗口后同步一次最终文本（中间版本直接跳过）：
+    /// 这正是省掉「每次击键一次 `Rope` 重建 + 整篇软换行」的关键。
+    fn schedule_live_shadow_sync(
+        &mut self,
+        tab_id: &SharedString,
+        version: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_live_sync.insert(tab_id.clone(), version);
+        let tab_id = tab_id.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(Self::LIVE_SHADOW_SYNC_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.flush_live_shadow(&tab_id, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 把 live 文档的最终文本同步进影子 `InputState`（防抖落地点）。
+    ///
+    /// 已经是登记时的版本就跳过：说明期间没有新编辑，同步已完成或不需要。
+    fn flush_live_shadow(&mut self, tab_id: &SharedString, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_live_sync.remove(tab_id) else {
+            return;
+        };
+        let Some(idx) = self.open_files.iter().position(|f| f.id == *tab_id) else {
+            return;
+        };
+        let Some(live) = self.open_files[idx].live.clone() else {
+            return;
+        };
+        if live.read(cx).text_version() != pending {
+            // 期间又有编辑：让那次编辑的防抖任务负责（它已重新登记）。
+            return;
+        }
+        let text = live.read(cx).text();
+        self.open_files[idx].editor_state.update(cx, |st, cx| {
+            st.set_text(text, cx);
+        });
+    }
+
+    /// 立即把所有待同步的 live 影子 `InputState` 落盘到最新文本。
+    ///
+    /// 在「保存 / 切标签页组 / 关闭确认」这些真的会读影子 `InputState` 的
+    /// 路径前调用，保证防抖不改变可观测行为。
+    ///
+    /// 只处理 live tab（数量等于打开的 live 标签数，通常 0~2），且文本相同
+    /// 时跳过写入 —— 这些路径都在用户操作上，不在帧路径上。
+    pub fn flush_all_live_shadows(&mut self, cx: &mut Context<Self>) {
+        // 先兑现登记过的（防抖任务可能还没跑）。
+        let ids: Vec<SharedString> = self.pending_live_sync.keys().cloned().collect();
+        for id in ids {
+            self.flush_live_shadow(&id, cx);
+        }
+        // 再兜底对齐：登记表为空但 live 文本与影子不一致时（例如防抖任务
+        // 在切组时被丢弃）也要写回，保证保存/关闭读到的是最新内容。
+        for file in &mut self.open_files {
+            let Some(live) = file.live.clone() else {
+                continue;
+            };
+            let text = live.read(cx).text();
+            if file.editor_state.read(cx).value().as_ref() == text {
+                continue;
+            }
+            file.editor_state.update(cx, |st, cx| {
+                st.set_text(text, cx);
+            });
+        }
+    }
+
     /// 保存当前激活的标签页（普通编辑文件 / diff 视图）。
     fn save_active_file(&mut self, cx: &mut Context<Self>) {
         let Some(active_id) = self.active_file_id.clone() else {
@@ -2978,6 +3081,8 @@ impl Editor {
     /// 保存失败时绝不关闭标签页，也绝不清除脏标记：编辑器内容必须保留，
     /// 并通过通知提示用户重试，避免静默丢数据。
     fn save_file_by_id(&mut self, tab_id: &str, cx: &mut Context<Self>, close_after_save: bool) {
+        // 影子 InputState 可能是防抖滞后的：保存前先落盘最新文本。
+        self.flush_all_live_shadows(cx);
         let idx = self.open_files.iter().position(|f| f.id.as_ref() == tab_id);
         let Some(idx) = idx else {
             return;
@@ -3077,6 +3182,9 @@ impl Editor {
 
     fn close_file(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.loading_gens.remove(id);
+        // 关闭确认读的是影子 InputState 的脏状态：先落盘防抖中的 live 文本，
+        // 否则刚打完字立刻关闭会漏掉「有未保存更改」的提示。
+        self.flush_all_live_shadows(cx);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
             // 保存进行中：不允许关闭，否则保存结束前的额外编辑可能丢失；

@@ -46,6 +46,18 @@ pub struct LiveBuffer {
     version: TextVersion,
     /// Disk baseline (`original_content`): `is_dirty = text() != original`.
     original: String,
+    /// `text_version` at which `original` was last synchronized with the
+    /// document (load / save / external reload). Comparing versions is O(1),
+    /// which is what lets the editor skip per-keystroke full-document dirty
+    /// comparisons — the old path joined the whole document to compare
+    /// against `original` on every edit.
+    ///
+    /// A version match guarantees the text is unchanged since the baseline was
+    /// taken (versions only advance on real text mutations), so `is_dirty` can
+    /// answer `false` without touching the text. A mismatch falls back to the
+    /// full comparison, keeping the answer exact even if the text was edited
+    /// back to its original content (which must read as *not* dirty).
+    clean_version: TextVersion,
     pub line_ending: LineEnding,
     /// Byte offset of every line start, plus the total text length at the
     /// end (`len == line_count + 1`). A pure function of the text, rebuilt
@@ -73,6 +85,7 @@ impl LiveBuffer {
             model,
             version: 0,
             original,
+            clean_version: 0,
             line_ending: ending,
             line_starts: Vec::new(),
         };
@@ -101,6 +114,7 @@ impl LiveBuffer {
         self.original = self.model.text();
         self.rebuild_line_starts();
         self.bump();
+        self.clean_version = self.version;
     }
 
     /// External reload that becomes the new clean baseline.
@@ -111,6 +125,7 @@ impl LiveBuffer {
     /// Mark the current text as saved (clears dirty without touching history).
     pub fn mark_saved(&mut self) {
         self.original = self.model.text();
+        self.clean_version = self.version;
     }
 
     /// Text with the file's line ending applied (for save).
@@ -126,7 +141,19 @@ impl LiveBuffer {
     }
 
     pub fn is_dirty(&self) -> bool {
+        // O(1) fast path: no text mutation since the baseline was taken.
+        if self.version == self.clean_version {
+            return false;
+        }
+        // Text changed (or changed and changed back): compare exactly.
         self.model.text() != self.original
+    }
+
+    /// O(1) dirty check that may answer `false` when the text was edited back
+    /// to its baseline. Only for callers that re-check on the next edit (the
+    /// tab's modified marker); `is_dirty` remains exact.
+    pub fn is_dirty_fast(&self) -> bool {
+        self.version != self.clean_version
     }
 
     pub fn is_empty(&self) -> bool {
