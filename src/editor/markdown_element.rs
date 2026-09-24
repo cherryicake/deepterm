@@ -1189,10 +1189,37 @@ impl MarkdownElementBuilder {
 
     /// Notion 风格的图片卡片（含 caption）：预览与实时编辑共用，保证两处样式一致。
     /// `alt` 为空时回退显示 url；`alt_runs` 保留 alt 文本的加粗/斜体（若有）。
+    ///
+    /// 同步读盘路径：**只读预览**（`Markdown`）用它；实时编辑器改走
+    /// [`Self::image_card_with_image`]（视图侧缓存 + 后台加载）。
     pub(crate) fn image_card(
         url: &str,
         alt_text: &str,
         alt_runs: Option<Vec<TextRun>>,
+        cx: &mut gpui::App,
+    ) -> AnyElement {
+        let maybe_image = Self::load_local_image(url);
+        Self::image_card_inner(url, alt_text, alt_runs, maybe_image, cx)
+    }
+
+    /// [`Self::image_card`] with an already-resolved image: the live editor
+    /// caches decoded images and loads them off-thread, so the card must be
+    /// buildable without touching the filesystem.
+    pub(crate) fn image_card_with_image(
+        url: &str,
+        alt_text: &str,
+        image: std::sync::Arc<gpui::Image>,
+        size: (u32, u32),
+        cx: &mut gpui::App,
+    ) -> AnyElement {
+        Self::image_card_inner(url, alt_text, None, Some((image, size)), cx)
+    }
+
+    fn image_card_inner(
+        url: &str,
+        alt_text: &str,
+        alt_runs: Option<Vec<TextRun>>,
+        maybe_image: Option<(std::sync::Arc<gpui::Image>, (u32, u32))>,
         cx: &mut gpui::App,
     ) -> AnyElement {
         let alt = if alt_text.is_empty() {
@@ -1204,7 +1231,6 @@ impl MarkdownElementBuilder {
         let border = cx.theme().ui.border.opacity(0.18);
         let url_for_click = url.to_string();
         let url_for_id = SharedString::from(url.to_string());
-        let maybe_image = Self::load_local_image(url);
         let image_card: AnyElement = {
             // 外壳统一样式，内部按是否加载成功分支
             let shell = div()
@@ -1322,18 +1348,21 @@ impl MarkdownElementBuilder {
         }
     }
 
-    fn load_local_image(url: &str) -> Option<(std::sync::Arc<gpui::Image>, (u32, u32))> {
+    /// Validate a markdown image URL and resolve it to a local file path.
+    ///
+    /// Security gates (shared by the synchronous loader and the live view's
+    /// background loader, so both enforce exactly the same policy):
+    /// 1. only image extensions — `![](../../.ssh/id_rsa)` must not read
+    ///    arbitrary files into memory;
+    /// 2. reject `..` components and empty/overlong paths;
+    /// 3. no remote URLs.
+    ///
+    /// Size/pixel limits are enforced later by
+    /// [`crate::editor::image_viewer::load_image_from_bytes`].
+    pub(crate) fn local_image_path(url: &str) -> Option<std::path::PathBuf> {
         if url.starts_with("http://") || url.starts_with("https://") {
             return None;
         }
-        // 关键安全修复：
-        // 1. 仅允许图片扩展名，避免 `![](../../.ssh/id_rsa)` 触发任意文件读入内存；
-        // 2. 先经 metadata 预检大小（>20MB 直接拒绝），避免大文件同步读卡死 render；
-        // 3. 拒绝 `..` 跨目录逃逸与空路径；移除 `CARGO_MANIFEST_DIR` 兜底（仅开发期有效，
-        //    生产包中会误读包内路径）。
-        // TODO(性能)：仍在 render 同步读文件，应迁移至 `cx.spawn + background_executor`
-        // + `Arc` 缓存 + 像素上限，此处先以大小/扩展名收敛风险。
-        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
         let trimmed = url.trim().trim_start_matches("file://");
         if trimmed.is_empty() || trimmed.len() > 1024 {
             return None;
@@ -1359,25 +1388,26 @@ impl MarkdownElementBuilder {
         if !ext_ok {
             return None;
         }
-        // 仅尝试相对当前工作目录的直接路径（不再拼接 MANIFEST_DIR），并预检大小。
-        let candidates = [p.to_path_buf()];
-        for cand in candidates {
-            let Ok(meta) = std::fs::metadata(&cand) else {
-                continue;
-            };
-            if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES || meta.len() == 0 {
-                continue;
-            }
-            if let Ok(bytes) = std::fs::read(&cand) {
-                if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                    continue;
-                }
-                if let Ok(img) = crate::editor::image_viewer::load_image_from_bytes(&bytes, &cand) {
-                    return Some(img);
-                }
-            }
+        Some(p.to_path_buf())
+    }
+
+    fn load_local_image(url: &str) -> Option<(std::sync::Arc<gpui::Image>, (u32, u32))> {
+        // 安全校验（扩展名 / `..` 逃逸 / 远程 URL）统一走 `local_image_path`。
+        // 注意：这条同步路径仍被**只读预览**（`Markdown`）使用；实时编辑器已改为
+        // 后台加载 + 缓存（`LiveMarkdownView::image_slot`），不再在 render 里读盘。
+        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        let cand = Self::local_image_path(url)?;
+        let Ok(meta) = std::fs::metadata(&cand) else {
+            return None;
+        };
+        if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES || meta.len() == 0 {
+            return None;
         }
-        None
+        let bytes = std::fs::read(&cand).ok()?;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return None;
+        }
+        crate::editor::image_viewer::load_image_from_bytes(&bytes, &cand).ok()
     }
 
     fn parse_callout(text: &str) -> Option<(CalloutKind, Option<String>)> {

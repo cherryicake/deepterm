@@ -197,3 +197,7 @@ path = "src/main.rs"
 [[bench]]
 name = "terminal_render"
 harness = false
+
+[[bench]]
+name = "markdown_live"
+harness = false

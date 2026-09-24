@@ -8,6 +8,14 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// A document line. `Arc<String>` (not `String`) is what keeps undo history
+/// affordable: a snapshot clones the *line table* (one refcount bump per
+/// line) instead of the text, so 200 retained steps cost ~`lines × 16` bytes
+/// rather than `200 × document`. Editing a line that a snapshot still
+/// references copies just that one line (copy-on-write via `Arc::make_mut`).
+pub type Line = Arc<String>;
 
 /// A position in the document: `line` index plus `col` as a **char** index
 /// (not bytes) in `0..=line_len`. Ordering is document order.
@@ -24,28 +32,30 @@ impl Pos {
 }
 
 /// One undo/redo step: the document and cursor as they were before an edit.
+///
+/// `lines` holds shared line text, so cloning this is O(lines) pointer copies
+/// (no text bytes). See [`Line`].
 #[derive(Debug, Clone)]
 struct Snapshot {
-  lines: Vec<String>,
+  lines: Vec<Line>,
   cursor: Pos,
 }
 
-/// Bounds `undo`/`redo` retention. Each snapshot is a full copy of the
-/// document, so unbounded retention makes large-document editing accumulate
-/// `steps × document` memory. Capping the history bounds that to a fixed
-/// multiple of the document size (dropping the oldest step is O(1) on a
-/// `VecDeque`), with no effect on undo semantics for the retained steps.
+/// Bounds `undo`/`redo` retention. Each snapshot shares line text with the
+/// live document and with every other snapshot, so retained memory is bounded
+/// by `steps × lines` pointer slots plus the text of the lines that were
+/// actually edited. Dropping the oldest step is O(1) on a `VecDeque`.
 const MAX_UNDO_STEPS: usize = 200;
 
 /// A multiline editing model with cursor, selection, and undo history.
 ///
-/// The document is a `Vec<String>` of lines (no trailing `\n` stored); an
-/// empty document is one empty line. All columns are char indices, so
-/// multibyte text (é, 日本語) edits correctly. Runs of single-char typing
-/// coalesce into one undo step; any other edit or movement breaks the run.
+/// The document is a `Vec<Line>` (no trailing `\n` stored); an empty document
+/// is one empty line. All columns are char indices, so multibyte text (é,
+/// 日本語) edits correctly. Runs of single-char typing coalesce into one undo
+/// step; any other edit or movement breaks the run.
 #[derive(Debug, Clone)]
 pub struct EditorModel {
-  lines: Vec<String>,
+  lines: Vec<Line>,
   cursor: Pos,
   /// Selection anchor; the selection spans anchor..cursor in either order.
   anchor: Option<Pos>,
@@ -61,6 +71,14 @@ pub struct EditorModel {
   /// Lets `LiveBuffer::edit` detect text changes in O(1) without joining
   /// the full document on every keystroke / cursor move.
   text_version: u64,
+  /// Line range touched since the last [`Self::take_dirty_range`] call.
+  ///
+  /// The incremental planner needs to know *which* lines changed so it can
+  /// re-classify and re-plan only those. Deriving it by comparing every line's
+  /// `Arc` against the previous plan costs O(rows) per keystroke, which is
+  /// exactly what this optimization removes — the mutation sites know the
+  /// range for free.
+  dirty: Option<std::ops::Range<usize>>,
 }
 
 impl Default for EditorModel {
@@ -92,13 +110,25 @@ impl EditorModel {
       coalescing: false,
       tab_size: 4,
       text_version: 0,
+      dirty: None,
     }
   }
 
   // ---- document access ----
 
   pub fn text(&self) -> String {
-    self.lines.join("\n")
+    // `Vec<Arc<String>>` has no `join`, and building the separator-joined
+    // string directly avoids an intermediate `Vec<&str>` per call.
+    let mut out = String::with_capacity(
+      self.lines.iter().map(|l| l.len() + 1).sum::<usize>().saturating_sub(1),
+    );
+    for (i, line) in self.lines.iter().enumerate() {
+      if i > 0 {
+        out.push('\n');
+      }
+      out.push_str(line);
+    }
+    out
   }
 
   /// O(1) text revision for cheap edit detection (`LiveBuffer::edit`).
@@ -110,6 +140,27 @@ impl EditorModel {
     self.text_version = self.text_version.wrapping_add(1);
   }
 
+  /// Record that lines `range` may have changed. Merged with any pending
+  /// range; callers pass the *pre-edit* indices they touched.
+  fn mark_dirty(&mut self, range: std::ops::Range<usize>) {
+    self.dirty = Some(match self.dirty.take() {
+      None => range,
+      Some(prev) => prev.start.min(range.start)..prev.end.max(range.end),
+    });
+  }
+
+  /// Take (and clear) the lines touched since the last call. `None` means
+  /// "unknown" (a whole-document replacement), which callers must treat as
+  /// "everything changed".
+  pub fn take_dirty_range(&mut self) -> Option<std::ops::Range<usize>> {
+    self.dirty.take()
+  }
+
+  /// Lines touched since the last [`Self::take_dirty_range`], without clearing.
+  pub fn dirty_range(&self) -> Option<std::ops::Range<usize>> {
+    self.dirty.clone()
+  }
+
   /// Replace the whole document, resetting cursor, selection, and history.
   pub fn set_text(&mut self, text: &str) {
     self.lines = split_lines(text);
@@ -119,6 +170,7 @@ impl EditorModel {
     self.undo.clear();
     self.redo.clear();
     self.coalescing = false;
+    self.dirty = None; // whole document replaced: unknown
     self.bump_text();
   }
 
@@ -132,11 +184,11 @@ impl EditorModel {
 
   /// The text of line `i`, if it exists.
   pub fn line(&self, i: usize) -> Option<&str> {
-    self.lines.get(i).map(String::as_str)
+    self.lines.get(i).map(|l| l.as_str())
   }
 
   /// All lines, for rendering.
-  pub fn lines(&self) -> &[String] {
+  pub fn lines(&self) -> &[Line] {
     &self.lines
   }
 
@@ -709,6 +761,7 @@ impl EditorModel {
     let Some(snap) = self.undo.pop_back() else {
       return false;
     };
+    self.dirty = None; // whole document restored
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     let cursor = self.cursor;
@@ -725,6 +778,7 @@ impl EditorModel {
     let Some(snap) = self.redo.pop_back() else {
       return false;
     };
+    self.dirty = None; // whole document restored
     self.bump_text();
     let lines = std::mem::replace(&mut self.lines, snap.lines);
     let cursor = self.cursor;
@@ -836,15 +890,16 @@ impl EditorModel {
       return;
     }
     self.bump_text();
+    self.mark_dirty(start.line..end.line + 1);
     if start.line == end.line {
-      let line = &mut self.lines[start.line];
+      let line = Arc::make_mut(&mut self.lines[start.line]);
       let a = byte_idx(line, start.col);
       let b = byte_idx(line, end.col);
       line.replace_range(a..b, "");
     } else {
       let last = &self.lines[end.line];
       let tail = last[byte_idx(last, end.col)..].to_string();
-      let first = &mut self.lines[start.line];
+      let first = Arc::make_mut(&mut self.lines[start.line]);
       first.truncate(byte_idx(first, start.col));
       first.push_str(&tail);
       self.lines.drain(start.line + 1..=end.line);
@@ -862,22 +917,25 @@ impl EditorModel {
     let Pos { line, col } = self.cursor;
     let at = byte_idx(&self.lines[line], col);
     if !s.contains('\n') {
-      self.lines[line].insert_str(at, s);
+      self.mark_dirty(line..line + 1);
+      Arc::make_mut(&mut self.lines[line]).insert_str(at, s);
       self.cursor.col += s.chars().count();
       return;
     }
-    let tail = self.lines[line].split_off(at);
+    // A newline splits the line: everything from here on shifts.
+    self.mark_dirty(line..self.lines.len());
+    let tail = Arc::make_mut(&mut self.lines[line]).split_off(at);
     let mut parts = s.split('\n');
     if let Some(first) = parts.next() {
-      self.lines[line].push_str(first);
+      Arc::make_mut(&mut self.lines[line]).push_str(first);
     }
     let mut last = line;
     for part in parts {
       last += 1;
-      self.lines.insert(last, part.to_string());
+      self.lines.insert(last, Arc::new(part.to_string()));
     }
     self.cursor = Pos::new(last, self.line_len(last));
-    self.lines[last].push_str(&tail);
+    Arc::make_mut(&mut self.lines[last]).push_str(&tail);
   }
 }
 
@@ -891,9 +949,29 @@ fn byte_idx(line: &str, col: usize) -> usize {
 }
 
 /// Document text as lines, normalizing CRLF.
-fn split_lines(text: &str) -> Vec<String> {
+fn split_lines(text: &str) -> Vec<Line> {
   let text = text.replace('\r', "");
-  text.split('\n').map(str::to_string).collect()
+  text.split('\n').map(|l| Arc::new(l.to_string())).collect()
+}
+
+/// Test/bench helper: build a `Line` table from a document string, mirroring
+/// [`split_lines`]. Kept public so the other `markdown_live` modules and the
+/// integration tests can construct the same shape without duplicating the
+/// normalization rules.
+#[cfg(any(test, feature = "alloc-probe"))]
+pub fn lines_from_text(text: &str) -> Vec<Line> {
+  split_lines(text)
+}
+
+/// Join a line table back into document text (the inverse of
+/// [`lines_from_text`]). Test/bench helper.
+#[cfg(any(test, feature = "alloc-probe"))]
+pub fn join_lines(lines: &[Line]) -> String {
+  lines
+    .iter()
+    .map(|l| l.as_str())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Word characters for word-wise navigation — mirrors `input::edit`.
@@ -1589,8 +1667,7 @@ mod tests {
   /// document history is retained, at the cost of losing the most ancient
   /// undo steps (a deliberate product trade-off).
   #[test]
-  fn undo_history_is_bounded_and_drops_oldest() {
-    let mut m = EditorModel::new("");
+  fn undo_history_is_bounded_and_drops_oldest() {    let mut m = EditorModel::new("");
     // Volume far above the cap on purpose: the retained depth must stay flat
     // (memory ≤ cap × doc) no matter how many edits accumulate.
     let n = MAX_UNDO_STEPS + 2000;
@@ -1620,5 +1697,87 @@ mod tests {
     assert_eq!(redone, MAX_UNDO_STEPS);
     assert!(!m.redo());
     assert_eq!(m.text(), "xx".repeat(n));
+  }
+
+  /// Undo snapshots share line text with the live document (`Arc<String>`),
+  /// so retained history is bounded by *pointer tables*, not by
+  /// `steps × document bytes`.
+  ///
+  /// This is the memory fix for the live editor's large-document blow-up.
+  /// The remaining per-step cost is inherent to whole-document snapshots:
+  /// `lines × 8` bytes for the `Vec<Arc<String>>` table. So the win over the
+  /// old full copy is a factor of `document_bytes / (lines × 8)` — i.e. the
+  /// average line length over 8 — which for prose is ~5-6x, and grows with
+  /// line length (long paragraphs, CJK text, base64/URL-heavy lines).
+  ///
+  /// Measured with the test allocator's live-byte high-water mark, so it
+  /// proves *retained* memory rather than allocation counts.
+  #[test]
+  fn undo_snapshots_share_line_text_instead_of_copying_it() {
+    use crate::utils::alloc_probe::AllocObserver;
+
+    const LINES: usize = 2000;
+    let mut doc = String::new();
+    for i in 0..LINES {
+      // ~56 B/line: a realistic prose line.
+      doc.push_str(&format!("line {i:04} with some filler text to make it long\n"));
+    }
+    let doc_bytes = doc.len() as u64;
+    let mut m = EditorModel::new(&doc);
+
+    // One edit per step, each non-coalesced, so every snapshot is retained
+    // until the cap. `insert_pair` never coalesces.
+    let ((), stats) = AllocObserver::scope(|| {
+      for _ in 0..MAX_UNDO_STEPS {
+        m.insert_pair('z', 'z');
+      }
+    });
+
+    // A full-copy implementation retains ≈ MAX_UNDO_STEPS × doc_bytes
+    // (≈ 19 MB here). Sharing retains one pointer table per step
+    // (MAX_UNDO_STEPS × LINES × 8 ≈ 3.2 MB) plus the edited line text.
+    let full_copy = doc_bytes * MAX_UNDO_STEPS as u64;
+    let pointer_tables = LINES as u64 * 8 * MAX_UNDO_STEPS as u64;
+    // Generous slack for the edited lines' text and allocator bookkeeping.
+    let budget = pointer_tables * 2;
+    assert!(
+      stats.live_bytes_high_water < budget,
+      "undo history retained {} bytes for a {} byte document \
+       (budget {}): snapshots are copying line text instead of sharing it",
+      stats.live_bytes_high_water,
+      doc_bytes,
+      budget
+    );
+    assert!(
+      stats.live_bytes_high_water < full_copy / 4,
+      "sharing must beat the old full-copy cost by a wide margin: \
+       {} vs {} bytes",
+      stats.live_bytes_high_water,
+      full_copy
+    );
+
+    // Sharing must not break undo semantics: the retained steps still walk
+    // back correctly, and the untouched lines are byte-identical.
+    let mut steps = 0usize;
+    while m.undo() {
+      steps += 1;
+    }
+    assert_eq!(steps, MAX_UNDO_STEPS);
+    assert!(m.text().starts_with("line 0000 with some filler text"));
+    assert!(m.text().contains("line 1999 with some filler text"));
+  }
+
+  /// Copy-on-write must not alias: editing a line after a snapshot was taken
+  /// must not mutate the snapshot's copy (the classic `Arc` sharing bug).
+  #[test]
+  fn snapshot_lines_are_isolated_from_later_edits() {
+    let mut m = EditorModel::new("alpha\nbeta\ngamma");
+    m.move_to(1, 4, false);
+    m.insert("!"); // snapshot now holds "beta"
+    assert_eq!(m.text(), "alpha\nbeta!\ngamma");
+    m.undo();
+    assert_eq!(m.text(), "alpha\nbeta\ngamma", "snapshot text was mutated in place");
+    m.redo();
+    assert_eq!(m.text(), "alpha\nbeta!\ngamma");
   }
 }

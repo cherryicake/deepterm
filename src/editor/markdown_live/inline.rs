@@ -12,6 +12,8 @@
 //! and unmatched delimiters stay literal text.
 
 use std::collections::HashMap;
+
+use crate::editor::markdown_live::model::Line;
 use std::ops::Range;
 
 /// Normalize a reference label (CommonMark: case-insensitive, inner
@@ -27,7 +29,7 @@ pub fn norm_label(label: &str) -> String {
 /// Collect `[label]: destination` definitions over whole lines: reference
 /// links resolve document-wide (pulldown parity for the preview).
 /// `skip(i)` shields fenced-code/frontmatter/table lines from registering.
-pub fn collect_refdefs(lines: &[String], skip: &dyn Fn(usize) -> bool) -> HashMap<String, String> {
+pub fn collect_refdefs(lines: &[Line], skip: &dyn Fn(usize) -> bool) -> HashMap<String, String> {
   let mut defs = HashMap::new();
   for (i, line) in lines.iter().enumerate() {
     if skip(i) {
@@ -287,8 +289,64 @@ pub fn parse(text: &str) -> Inline {
   parse_with_refs(text, &HashMap::new())
 }
 
+/// Whether `b` can start (or participate in) any inline construct. See the
+/// fast path in [`parse_with_refs`]: a line with none of these bytes cannot
+/// contain markup, so it skips the whole multi-pass parser.
+///
+/// This must stay a superset of every byte the marker passes inspect:
+/// escapes `\`, code `` ` ``, links/footnotes `[` `!`, autolinks `<` plus the
+/// bare-URL prefixes (`h`/`w`), emoji `:`, math `$`, and the emphasis family
+/// `*` `_` `~` `=` `^`. Over-triggering is safe (slow path, same result);
+/// missing a trigger would be a correctness bug.
+#[inline]
+fn is_inline_trigger(b: u8) -> bool {
+  matches!(
+    b,
+    b'\\' | b'`' | b'[' | b'!' | b'<' | b'h' | b'H' | b'w' | b'W'
+      | b':' | b'$' | b'*' | b'_' | b'~' | b'=' | b'^'
+  )
+}
+
 /// Parse with a document-wide reference table from [`collect_refdefs`].
 pub fn parse_with_refs(text: &str, refs: &HashMap<String, String>) -> Inline {
+  let n = text.len();
+
+  // Fast path: no byte that any marker pass can act on means the whole line
+  // is one plain span — the common case for prose. This skips 14 `Vec<bool>`
+  // allocations plus ten full-line scans per line, which is what made
+  // planning a 10k-line document cost ~140k small allocations per keystroke.
+  //
+  // The trigger set is every byte any pass keys on:
+  //   `\` (escapes)  `` ` `` (code)      `[` `]` `!` (links/footnotes)
+  //   `<` (autolinks) `h` `w` (bare URL prefixes, matched via `http`/`www`)
+  //   `:` (emoji)    `$` (math)          `*` `_` `~` `=` (emphasis family)
+  //   `^` (super)    `|` (wikilink pipe — harmless to over-trigger)
+  // Over-triggering is safe (it only means we take the slow path); missing a
+  // trigger would be a correctness bug, so the list is deliberately generous.
+  if !text.bytes().any(is_inline_trigger) {
+    // Empty input yields no spans (matching the coalescing loop below, which
+    // has nothing to emit); non-empty plain text is one default-styled span.
+    let spans = if n == 0 {
+      Vec::new()
+    } else {
+      vec![InlineSpan {
+        range: 0..n,
+        marker: false,
+        style: InlineStyle::default(),
+        link: None,
+      }]
+    };
+    return Inline {
+      spans,
+      links: Vec::new(),
+    };
+  }
+  parse_slow(text, refs)
+}
+
+/// The full multi-pass parser, without the no-trigger fast path. Kept
+/// separate so tests can differentially verify the fast path against it.
+fn parse_slow(text: &str, refs: &HashMap<String, String>) -> Inline {
   let n = text.len();
   let mut a = Attrs {
     marker: vec![false; n],
@@ -1005,6 +1063,71 @@ fn find_outside_code(text: &str, a: &Attrs, from: usize, needle: &str) -> Option
 mod tests {
   use super::*;
 
+  /// The no-trigger fast path must be *exactly* equivalent to the full
+  /// multi-pass parser, not merely close: it may only be taken when no
+  /// trigger byte is present, and then the result must match byte for byte.
+  ///
+  /// The corpus below is adversarial: it pairs plain text with lines that
+  /// contain each trigger byte in a variety of positions, plus lines where a
+  /// trigger is only present in an ASCII-art / URL / emoji-ish shape. Any
+  /// byte the passes inspect but `is_inline_trigger` forgets would show up
+  /// here as a fast/slow divergence.
+  #[test]
+  fn fast_path_matches_slow_path_exactly() {
+    let long_line = "a very long line ".repeat(20);
+    let corpus: &[&str] = &[
+      "",
+      "plain words only",
+      "   leading and trailing   ",
+      "中文纯文本，没有标记",
+      "digits 12345 and punctuation . , ; ?",
+      // Each trigger byte, alone and embedded.
+      "\\", "a\\*b", "`", "a `code` b", "[]", "a [b](c) d", "!", "![img](x.png)",
+      "<", "<https://x.dev>", ">", "h", "http://x.dev", "H", "HTTP://X.DEV",
+      "w", "www.x.dev", "W", "WWW.X.DEV", ":", ":smile:", "$", "$x$", "$$y$$",
+      "*", "**bold**", "_", "_it_", "~", "~~s~~", "=", "==hl==", "^", "a^b^",
+      // Trigger present but *not* forming a construct (still must match).
+      "a:b", "cost $5", "5 * 3", "a_b", "1~2", "a=b", "x^2", "h: w:",
+      "not a url http:/", "email me@example.com",
+      // Mixed content resembling real prose.
+      "# Heading with `code`",
+      "- [ ] task item",
+      "| a | b |",
+      "> quote with **bold**",
+      "text with an emoji :tada: inside",
+      "see [docs][ref] and [^note]",
+      long_line.as_str(),
+    ];
+    for text in corpus {
+      let fast = parse_with_refs(text, &HashMap::new());
+      let slow = parse_slow(text, &HashMap::new());
+      assert_eq!(
+        fast, slow,
+        "fast/slow parse diverged for {text:?}; missing trigger byte?"
+      );
+    }
+  }
+
+  /// Every byte that any marker pass can act on must be in the trigger set.
+  /// This guards against adding a new pass (or a new delimiter) without
+  /// updating `is_inline_trigger`.
+  #[test]
+  fn trigger_set_covers_every_marker_byte() {
+    // Delimiters the passes key on, as literal ASCII bytes.
+    let required: &[u8] = b"\\`[!<:$*_~=^";
+    for &b in required {
+      assert!(
+        is_inline_trigger(b),
+        "trigger set is missing {:?}; the fast path would skip real markup",
+        b as char
+      );
+    }
+    // Bare-URL prefixes (http/https/www).
+    for &b in b"hHwW" {
+      assert!(is_inline_trigger(b), "trigger set is missing {:?}", b as char);
+    }
+  }
+
   /// (text, marker) fragments, in order — the readable spine of a parse.
   fn frags(text: &str) -> Vec<(String, bool)> {
     parse(text)
@@ -1151,22 +1274,19 @@ mod tests {
   }
 
   fn parse_refs(text: &str) -> Inline {
-    let lines = vec![text.to_string(), "[docs]: https://x.dev".to_string()];
+    let lines =
+      crate::editor::markdown_live::model::lines_from_text(&format!("{text}\n[docs]: https://x.dev"));
     let refs = collect_refdefs(&lines, &|_| false);
     parse_with_refs(text, &refs)
   }
 
   #[test]
   fn refdefs_collect_first_wins() {
-    let lines = vec![
-      "[a]: /one".to_string(),
-      "   [A]: /two".to_string(),
-      "[^fn]: /note".to_string(),
-      "    [code]: /indented".to_string(),
-      "[empty]:".to_string(),
-    ];
+    let lines = crate::editor::markdown_live::model::lines_from_text(
+      "[a]: /one\n   [A]: /two\n[^fn]: /note\n    [code]: /indented\n[empty]:",
+    );
     let refs = collect_refdefs(&lines, &|i| i == 3);
-    assert_eq!(refs.get("a").map(String::as_str), Some("/one"));
+    assert_eq!(refs.get("a").map(|l| l.as_str()), Some("/one"));
     assert!(refs.get("code").is_none());
     assert!(refs.get("empty").is_none());
     assert!(refs.get("fn").is_none());
