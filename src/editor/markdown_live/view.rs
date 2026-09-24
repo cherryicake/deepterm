@@ -738,6 +738,35 @@ impl LiveMarkdownView {
         f32::from(self.scroll.offset().y)
     }
 
+    /// Scroll by `dy` pixels (negative scrolls down). Diagnostics/bench helper:
+    /// exercises the same `ScrollHandle` offset mutation the wheel listener
+    /// performs, so a benchmark measures a real scroll frame.
+    pub fn scroll_by_y(&mut self, dy: f32, cx: &mut Context<Self>) {
+        let cur = self.scroll.offset();
+        self.scroll.set_offset(gpui::point(cur.x, cur.y + px(dy)));
+        cx.notify();
+    }
+
+    /// Insert `text` at the cursor through the full editing path
+    /// (`insert` → `after_edit`: table re-format gate, search sync, `Change`
+    /// emission, notify). Bench/diagnostic helper.
+    pub fn insert_text_for_bench(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.type_text(text, false, cx);
+    }
+
+    /// Delete one char before the cursor through the full editing path.
+    /// Bench/diagnostic helper (pairs with [`Self::insert_text_for_bench`] to
+    /// keep a benchmark's document size stable across iterations).
+    pub fn backspace_for_bench(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.edit(cx, |m| {
+            m.backspace();
+        });
+        self.after_edit(cx);
+    }
+
     /// Record a row's layout from `LiveLine::paint` (element.rs): powers
     /// visual-row movement and the dead-zone hit fallbacks.
     pub(crate) fn record_row_layout(
@@ -10199,5 +10228,69 @@ mod e2e_smoke_tests {
         vc.run_until_parked();
         let line = view.read_with(&vc, |v, _| v.buffer.cursor().line);
         assert!(line >= 10, "blank click lands near the end, got line {line}");
+    }
+}
+
+#[cfg(test)]
+mod perf_diagnostics {
+    use super::*;
+    use std::time::Instant;
+
+    /// 诊断（非断言）：按文档规模拆解「每次击键」各阶段耗时，用于定位
+    /// 大文档下打字变慢的残余 O(文档) 环节。
+    ///
+    /// 需要显式运行：`cargo test --lib typing_phase_breakdown -- --ignored --nocapture`
+    ///
+    /// 判读：`classify` 与 `plan` 随行数线性增长 —— 这是**已知的剩余工作**
+    /// （增量规划，见 `docs/PERF_2026-09-24.md`）；`join` 是 `Change` 事件
+    /// 的全文 join；`edit` 含行起始索引重建（应为 O(行数) 但常数极小）。
+    #[test]
+    #[ignore = "diagnostic: run with --ignored --nocapture"]
+    fn typing_phase_breakdown() {
+        for lines in [1_000usize, 5_000, 20_000] {
+            let mut doc = String::new();
+            let mut i = 0;
+            while i < lines {
+                doc.push_str(&format!("# H{i}\n\npara {i} **b** `c`\n\n"));
+                i += 3;
+            }
+            let mut buf = LiveBuffer::new(&doc);
+            let classified = classify_document(buf.lines());
+            let refs = refdefs_for_lines(buf.lines(), &classified.blocks);
+            let reveal = Reveal {
+                cursor: Pos::new(0, 0),
+                selection: None,
+                focused: true,
+                read_only: false,
+                show_source: false,
+            };
+
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = buf.text();
+            }
+            let join_ms = t.elapsed().as_secs_f64() * 100.0;
+
+            let t = Instant::now();
+            let _ = classify_document(buf.lines());
+            let classify_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = Instant::now();
+            let _ = refdefs_for_lines(buf.lines(), &classified.blocks);
+            let refs_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = Instant::now();
+            let _ = plan_rows_with_refs(buf.lines(), &classified, &refs, reveal);
+            let plan_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = Instant::now();
+            buf.edit(|m| m.insert("x"));
+            let edit_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            println!(
+                "lines={lines:6} join={join_ms:7.3}ms classify={classify_ms:7.3}ms \
+                 refs={refs_ms:7.3}ms plan={plan_ms:8.3}ms edit(+index)={edit_ms:6.3}ms"
+            );
+        }
     }
 }
