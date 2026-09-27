@@ -22,6 +22,7 @@ pub mod layout;
 pub mod mermaid;
 pub mod model;
 pub mod reveal;
+pub mod scrollbar;
 pub mod table_ops;
 pub mod view;
 

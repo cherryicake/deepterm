@@ -33,7 +33,13 @@ use crate::editor::markdown_live::element::{
 };
 use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::highlight::HighlightCache;
-use crate::editor::markdown_live::mermaid::{MermaidBody, MermaidColors, MermaidState};
+use crate::editor::markdown_live::mermaid::{
+    MAX_DISPLAY_W, ZOOM_MAX, ZOOM_STEP, zoom_label, zoomed_size, MermaidBody, MermaidColors,
+    MermaidState,
+};
+use crate::editor::markdown_live::scrollbar::{
+    ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
+};
 use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
 };
@@ -127,6 +133,18 @@ pub struct LiveMarkdownView {
     /// Mermaid 图渲染缓存 +「预览 | 源码」按钮状态（缓存键 = 块源码 + 主题指纹，
     /// 后台 + 防抖渲染；详见 `mermaid` 模块）。
     mermaid: MermaidState,
+    /// 表格 / mermaid 卡片的横向滚动状态（`块首行 → 拖拽态 + 滚动位置`）。
+    /// 滚动位置必须跨帧保持，所以存在视图上（见 `scrollbar` 模块）。
+    h_scroll: ScrollBarMap,
+    /// 编辑器自身的纵向滚动条状态（与代码编辑器同款，自绘常显）。
+    v_scroll: Option<Entity<ScrollBarState>>,
+    /// 窗口失活监听（惰性注册，见 [`Self::ensure_activation_observer`]）。
+    activation_observer: Option<Subscription>,
+    /// 「全宽显示」的块集合：表格/mermaid 卡片在 780px 窄栏里太挤时，
+    /// 点卡片上的「全宽」按钮即可占据整个编辑器宽度（Typora 的宽表体验）。
+    /// 键是块首行号（与 `h_scroll` 同款，文本编辑会让行号漂移，收帧时按
+    /// 当前块集合裁剪）。
+    wide_blocks: HashSet<usize>,
     /// Bring the caret's row into view on the next render (set by every
     /// edit/move; consumed by the row-precise scroll in `render`).
     scroll_to_cursor: bool,
@@ -289,6 +307,7 @@ impl LiveMarkdownView {
                 display_numbers: Vec::new(),
                 has_table: false,
                 mermaid_blocks: Vec::new(),
+                wide_anchors: Vec::new(),
             }),
             planned_geometry_version: u64::MAX,
             planned_classified: Classified {
@@ -304,6 +323,10 @@ impl LiveMarkdownView {
             table_refs_key: None,
             copied_code_blocks: HashSet::new(),
             mermaid: MermaidState::new(),
+            h_scroll: ScrollBarMap::default(),
+            v_scroll: None,
+            activation_observer: None,
+            wide_blocks: HashSet::new(),
             scroll_to_cursor: false,
             caret_row_rect: None,
             caret_scroll_passes: 0,
@@ -401,6 +424,12 @@ impl LiveMarkdownView {
         self.pause_caret(cx);
         self.hl.clear();
         self.copied_code_blocks.clear();
+        // 按块首行记账的 UI 状态只对**上一份文档**有意义：新文本在同一个行号
+        // 上可能是另一个块，留着旧状态会把它错误地撑成全宽/缩放。收帧裁剪挡不住
+        // 这种情况（行号仍命中某个锚点），只有这里能兜住。
+        self.wide_blocks.clear();
+        self.mermaid.clear_block_state();
+        self.h_scroll.clear();
         self.scroll_to_cursor = true;
         self.emitted_version = self.buffer.text_version();
         if let Some(panel) = self.search_panel.clone() {
@@ -1846,6 +1875,12 @@ impl LiveMarkdownView {
         if !self.selecting {
             return;
         }
+        // 正在拖滚动条（表格/图的横向条）：不扩展选区。滚动条的按下监听会
+        // `stop_propagation`，但拖拽起点若落在行上（行监听先注册、先跑），
+        // `selecting` 已经被置位，这里必须让行。
+        if self.h_scroll.any_dragging(cx) {
+            return;
+        }
         let Some(line) = self.line_for_click(position) else {
             return;
         };
@@ -2611,6 +2646,138 @@ impl LiveMarkdownView {
             self.clamp_cursor_out_of_image_blocks(cx);
         }
         cx.notify();
+    }
+
+    /// 切换某块（表格 / mermaid 卡片）的「全宽显示」。
+    ///
+    /// 全宽 = 卡片脱离 780px 阅读窄栏，占满编辑器可用宽度。窄栏对宽表是
+    /// 灾难：列数一多每列只剩几十像素，内容全被压成一列一个字。全宽之外
+    /// 还有横向滚动（`scrollbar` 模块）兜底。
+    pub(crate) fn toggle_wide_block(&mut self, block_id: usize, cx: &mut Context<Self>) {
+        if !self.wide_blocks.insert(block_id) {
+            self.wide_blocks.remove(&block_id);
+        }
+        cx.notify();
+    }
+
+    /// 收尾所有进行中的滚动条拖拽（窗口失活时调用）。
+    ///
+    /// 拖拽状态由窗口级 MouseUp 清除，而失活后窗口收不到该事件：拖到一半
+    /// Cmd-Tab 会让 `grab` 永久留在 `Some`，`on_fallback_drag` 之后每次拖拽
+    /// 都让行，静默禁用该路径下的选区扩展。
+    fn end_scroll_drags(&mut self, cx: &mut Context<Self>) {
+        self.h_scroll.clear_drags(cx);
+        if let Some(v) = self.v_scroll.clone() {
+            v.update(cx, |s, _| s.clear_drag());
+        }
+    }
+
+    /// 注册「窗口失活 → 收尾拖拽」监听（每窗口一次）。
+    ///
+    /// `observe_window_activation` 需要 `&mut Window`，而视图构造时拿不到窗口，
+    /// 所以在 render 里惰性注册。
+    fn ensure_activation_observer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activation_observer.is_some() {
+            return;
+        }
+        self.activation_observer = Some(cx.observe_window_activation(window, |view, window, cx| {
+            if !window.is_window_active() {
+                view.end_scroll_drags(cx);
+            }
+        }));
+    }
+
+    /// 某块是否处于「全宽显示」。
+    pub(crate) fn is_wide_block(&self, block_id: usize) -> bool {
+        self.wide_blocks.contains(&block_id)
+    }
+
+    /// 某 mermaid 块的**显式**缩放倍率（`None` = 按适配宽度展示）。
+    #[cfg(test)]
+    pub(crate) fn mermaid_zoom(&self, block_id: usize) -> Option<f32> {
+        self.mermaid.zoom(block_id)
+    }
+
+    /// 放大 / 缩小 / 还原某 mermaid 块（`+` / `−` / 百分比按钮）。
+    ///
+    /// `+` / `−` 从**当前实际显示**的倍率出发，而不是从 100%：默认展示可能是
+    /// 「阅读态 640 上限」或「全宽适配宽度」，其等效倍率通常不是 1（大图远小于
+    /// 1，小图可能大于 1）。从 100% 出发会让第一次点击跳变（例如 0.6 → 1.25，
+    /// 或 4.0 → 5.0 直接被夹住毫无反应），从当前值出发才是连续缩放。
+    ///
+    /// 基准必须与百分比标签同源（[`Self::mermaid_display_scale`]），否则标签
+    /// 显示的和 `+` 实际跳到的位置会对不上。
+    pub(crate) fn mermaid_zoom_by(
+        &mut self,
+        block_id: usize,
+        action: MermaidZoom,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            MermaidZoom::Reset => self.mermaid.clear_zoom(block_id),
+            MermaidZoom::In | MermaidZoom::Out => {
+                let cur = self.mermaid.zoom(block_id).unwrap_or_else(|| {
+                    self.mermaid_display_scale(block_id, self.is_wide_block(block_id))
+                });
+                let next = match action {
+                    MermaidZoom::In => cur * ZOOM_STEP,
+                    _ => cur / ZOOM_STEP,
+                };
+                self.mermaid.set_zoom(block_id, next);
+            }
+        }
+        cx.notify();
+    }
+
+    /// **无显式缩放时**图的实际显示倍率（相对自然尺寸）。
+    ///
+    /// 与渲染分支的取尺寸逻辑一一对应（`display_size` / `fit_width` 都是等比
+    /// 缩放），所以百分比标签与图的实际大小永远一致 —— 两处各写一套比例是
+    /// 标签撒谎的直接原因。
+    pub(crate) fn mermaid_display_scale(&self, block_id: usize, wide: bool) -> f32 {
+        let Some(nat_w) = self.mermaid_natural_width(block_id) else {
+            return 1.0;
+        };
+        if nat_w <= 0.0 {
+            return 1.0;
+        }
+        if wide {
+            match self.mermaid_viewport_w(block_id) {
+                Some(vp) => (vp / nat_w).clamp(1.0 / ZOOM_MAX, ZOOM_MAX),
+                None => 1.0,
+            }
+        } else {
+            // 阅读态：`MAX_DISPLAY_W / nat_w`，且只缩不放。
+            (MAX_DISPLAY_W / nat_w).min(1.0)
+        }
+    }
+
+    /// 某块滚动视口的实测宽度（上一帧；`None` = 还没测到）。
+    fn mermaid_viewport_w(&self, block_id: usize) -> Option<f32> {
+        let w = f32::from(self.h_scroll.handle(block_id)?.bounds().size.width);
+        (w > 1.0).then_some(w)
+    }
+
+    /// 某块图的自然宽度（渲染未完成时为 `None`）。
+    fn mermaid_natural_width(&self, block_id: usize) -> Option<f32> {
+        let src = self.planned_geometry.mermaid_source(block_id)?;
+        match self.mermaid.body(src) {
+            MermaidBody::Image { image, .. } => Some(image.natural_size().0),
+            MermaidBody::Source { .. } => None,
+        }
+    }
+
+    /// 收帧：把「全宽」状态裁剪到本帧仍存在的块。
+    ///
+    /// 行号会随编辑漂移（在表格上方插一行，整块锚点就变了），不裁剪的话
+    /// 一个残留行号可能命中另一个块、把它意外撑成全宽。裁剪是保守的：漂移后
+    /// 拿不到原锚点的块回到窄栏，而不是赌它还是同一个块。
+    fn prune_wide_blocks(&mut self) {
+        if self.wide_blocks.is_empty() {
+            return;
+        }
+        let anchors = &self.planned_geometry.wide_anchors;
+        self.wide_blocks.retain(|b| anchors.binary_search(b).is_ok());
     }
 
     /// `line` 是否落在某个「正在画图」的 mermaid 块源码区间内。
@@ -3915,6 +4082,14 @@ fn outline_title(visible: &str) -> String {
     }
 }
 
+/// mermaid 图卡片的缩放动作（`+` / `-` / 百分比还原按钮）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MermaidZoom {
+    In,
+    Out,
+    Reset,
+}
+
 /// 表格拖拽负载：拖动行/列把手时携带（Typora 的 tracker 拖拽重排）。
 #[derive(Clone)]
 struct TableDrag {
@@ -4573,6 +4748,11 @@ pub(crate) struct PlanGeometry {
     pub(crate) has_table: bool,
     /// Mermaid blocks in document order.
     pub(crate) mermaid_blocks: Vec<MermaidBlockRef>,
+    /// 可作为「全宽」目标的块首行（表格组首行 + mermaid 围栏行），升序去重。
+    ///
+    /// 「全宽」状态按块首行号记账，而行号会随编辑漂移：收帧时用它裁剪，
+    /// 保证一个块被删/改类型后，旧行号不会把别的块意外撑成全宽。
+    pub(crate) wide_anchors: Vec<usize>,
 }
 
 /// A mermaid fence as located by [`PlanGeometry`].
@@ -4746,6 +4926,18 @@ impl PlanGeometry {
         }
 
         let has_table = groups.iter().any(|g| matches!(g, Group::Table(_)));
+        // 「全宽」锚点：表格组首行 + mermaid 围栏行（`mermaid_blocks` 的
+        // block_id 就是围栏首行）。两者都在文档序里，直接归并去重。
+        let mut wide_anchors: Vec<usize> = groups
+            .iter()
+            .filter_map(|g| match g {
+                Group::Table(v) => v.first().map(|pi| rows[*pi].line),
+                _ => None,
+            })
+            .chain(mermaid_blocks.iter().map(|b| b.block_id))
+            .collect();
+        wide_anchors.sort_unstable();
+        wide_anchors.dedup();
         Self {
             groups,
             group_of_row,
@@ -4753,6 +4945,7 @@ impl PlanGeometry {
             display_numbers,
             has_table,
             mermaid_blocks,
+            wide_anchors,
         }
     }
 
@@ -5422,6 +5615,7 @@ impl Render for LiveMarkdownView {
         // disable otherwise. `enable` is idempotent; `disable` is guarded by
         // `blink_on` so unfocused frames don't notify-loop.
         let window_active = window.is_window_active();
+        self.ensure_activation_observer(window, cx);
         let want_blink = focused && window_active && !self.read_only;
         if want_blink && !self.blink_on {
             self.blink.update(cx, |b, cx| b.enable(cx));
@@ -5672,6 +5866,10 @@ impl Render for LiveMarkdownView {
         // never scrolls by element, because that mis-handles tall containers.
         let mut caret_el_ix: Option<usize> = None;
         let mut row_els: Vec<gpui::AnyElement> = Vec::new();
+        // 「全宽」块的下标：这些行元素要脱离 780px 阅读窄栏、占满编辑器宽度。
+        // 下标是 `row_els` 内的下标，与「滚动列的子元素」一一对应（顶部占位
+        // 已经先 push 进 `row_els`，所以下标无需再加偏移）。
+        let mut wide_rows: HashSet<usize> = HashSet::new();
         // The first row element's LiveLine also carries the dead-zone drag
         // fallback (exactly one handler per frame); the closure consumes
         // the flag so call sites stay unchanged.
@@ -5760,6 +5958,13 @@ impl Render for LiveMarkdownView {
             }
             self.mermaid.end_frame();
         }
+        // 横向滚动条（表格 / 图）与纵向滚动条的状态帧：`slot` 记录本帧用到的
+        // 块，`end_frame` 淘汰其余（删块后不留垃圾）。
+        self.h_scroll.begin_frame();
+        let v_state = self
+            .v_scroll
+            .get_or_insert_with(|| cx.new(|_| ScrollBarState::default()))
+            .clone();
         let mut window_counts: Vec<usize> = Vec::new();
         for gi in 0..geometry.group_count() {
             if virtualized && (gi < v_lo || gi > v_hi) {
@@ -6188,6 +6393,28 @@ impl Render for LiveMarkdownView {
                     // 源码 tab / 渲染中无旧图）都画源码行。
                     let show_image =
                         !showing_code && matches!(&mm_body, Some(MermaidBody::Image { .. }));
+                    // 「全宽」：图卡片脱离 780px 窄栏。结构图（flowchart 等）
+                    // 在窄栏里被压到 640px 上限，节点文字挤成一团 —— 全宽让图
+                    // 用满编辑器宽度（**只缩不放**，见下），横向滚动再兜底超宽图。
+                    let wide = self.is_wide_block(block_id);
+                    // 缩放：`None` = 没按过 `+`/`−`，按「适配宽度」展示。
+                    let zoom = self.mermaid.zoom(block_id);
+                    // 百分比标签显示**实际显示**的倍率：没设过显式倍率时，展示
+                    // 是「适配宽度」（或阅读态 640 上限），其等效倍率就是标签值，
+                    // 否则用户看到的数字会与图的实际大小不符。
+                    let zoom_pct = zoom_label(zoom.unwrap_or_else(|| {
+                        if show_image {
+                            self.mermaid_display_scale(block_id, wide)
+                        } else {
+                            1.0
+                        }
+                    }));
+                    let (mm_h_state, mm_h_handle) = if show_image {
+                        let (s, h) = self.h_scroll.slot(block_id, cx);
+                        (Some(s), Some(h))
+                    } else {
+                        (None, None)
+                    };
                     let mut outer = div()
                         .group("live-code")
                         .relative()
@@ -6215,11 +6442,21 @@ impl Render for LiveMarkdownView {
                         });
                     }
                     let mut inner = if show_image {
-                        // 图体：固定尺寸图片，裁剪而非横向滚动条。
+                        // 图体：图片保持自然尺寸，视口装不下时左右滚动查看。
+                        // gpui 的滚轮在「只开 x 轴」时会把纵向增量喂给 x 轴，
+                        // 所以限制到实际轴（纵向继续冒泡给文档滚动）。
                         div()
                             .id(("live-code-inner", block_id))
                             .debug_selector(|| "live-code-inner".into())
-                            .overflow_hidden()
+                            .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
+                    } else if is_mermaid {
+                        // mermaid 源码同样限制到 x 轴：纵向滚动不该被卡片截胡。
+                        div()
+                            .id(("live-code-inner", block_id))
+                            .debug_selector(|| "live-code-inner".into())
+                            .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                     } else {
                         div()
                             .id(("live-code-inner", block_id))
@@ -6231,12 +6468,34 @@ impl Render for LiveMarkdownView {
                     if lang.is_some() {
                         inner = inner.pt(px(24.0));
                     }
+                    if let Some(h_handle) = &mm_h_handle {
+                        inner = inner.track_scroll(h_handle);
+                    }
                     if show_image {
                         if let Some(MermaidBody::Image { image, pending }) = &mm_body {
-                            let (dw, dh) = image.display_size();
+                            let (nat_w, nat_h) = image.natural_size();
+                            // 展示尺寸：
+                            // - 有显式缩放 → 自然尺寸 × 倍率（100% = 自然尺寸）；
+                            // - 无显式缩放 → 全宽时**适配卡片宽度**（图占据整个
+                            //   宽度，既不溢出也不放大到自然尺寸）；否则沿用阅读
+                            //   态尺寸（最多 640）。
+                            //
+                            // 视口宽取滚动句柄的实测值（gpui 在 prepaint 回填，
+                            // 与 `max_offset` 同源）：宽度只在窗口 resize 时变，
+                            // 一帧滞后看不出来；首帧为 0 → 回退阅读尺寸，下一帧
+                            // 收敛。
+                            let (dw, dh) = match zoom {
+                                Some(z) => zoomed_size((nat_w, nat_h), z),
+                                None if wide => match self.mermaid_viewport_w(block_id) {
+                                    Some(vp) => image.fit_width(vp),
+                                    None => image.display_size(),
+                                },
+                                None => image.display_size(),
+                            };
                             let img = gpui::img(image.image().clone())
                                 .w(px(dw))
                                 .h(px(dh))
+                                .flex_shrink_0()
                                 .object_fit(gpui::ObjectFit::Contain);
                             // 重渲染中：旧图继续显示 + 呼吸提示（不闪回源码）。
                             let fig = if *pending {
@@ -6251,8 +6510,16 @@ impl Render for LiveMarkdownView {
                             } else {
                                 img.into_any_element()
                             };
+                            // 图比视口窄时居中；比视口宽时 `min_w` 顶开内容宽度
+                            //（`justify_center` 在溢出时自然退化为从左开始 ——
+                            //  flex 的居中只在有剩余空间时生效），滚动才有意义。
                             inner = inner.child(
-                                div().w_full().flex().justify_center().child(fig),
+                                div()
+                                    .flex()
+                                    .flex_shrink_0()
+                                    .min_w(px(dw))
+                                    .justify_center()
+                                    .child(fig),
                             );
                         }
                     } else {
@@ -6390,6 +6657,106 @@ impl Render for LiveMarkdownView {
                                     true,
                                     entity.clone(),
                                 ))
+                                // 「全宽」：图卡片撑满编辑器宽度。结构图在
+                                // 780px 窄栏里被压到 640px 上限，节点文字挤成
+                                // 一团；全宽让图用满可用宽度，超宽图再横向滚动。
+                                .child({
+                                    let wide_ent = entity.clone();
+                                    div()
+                                        .id(("live-mm-tab-wide", block_id))
+                                        .debug_selector(|| "live-mm-tab-wide".into())
+                                        .px(px(9.0))
+                                        .py(px(2.0))
+                                        .rounded(px(5.0))
+                                        .cursor_pointer()
+                                        .bg(if wide {
+                                            ui.accent.opacity(0.18)
+                                        } else {
+                                            ui.text.opacity(0.05)
+                                        })
+                                        .text_size(px(10.0))
+                                        .line_height(px(14.0))
+                                        .font_weight(gpui::FontWeight(600.))
+                                        .text_color(if wide { ui.accent } else { ui.text_muted })
+                                        .child(if wide { "全宽 ✓" } else { "全宽" })
+                                        .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                            wide_ent.update(cx, |v, cx| {
+                                                v.toggle_wide_block(block_id, cx)
+                                            });
+                                        })
+                                })
+                                // 缩放：`−` / 百分比（点=还原默认展示）/ `+`。
+                                // 没按过时标签显示**当前实际**的显示倍率
+                                // （适配宽度 / 阅读尺寸），不是 100%。
+                                .child({
+                                    let zoom_ent = entity.clone();
+                                    let step = |glyph: &'static str,
+                                                action: MermaidZoom,
+                                                sel: &'static str| {
+                                        let ent = zoom_ent.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "live-mm-zoom-{sel}-{block_id}"
+                                            )))
+                                            .debug_selector(move || sel.to_string())
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(5.0))
+                                            .cursor_pointer()
+                                            .bg(ui.text.opacity(0.05))
+                                            .text_size(px(10.0))
+                                            .line_height(px(14.0))
+                                            .font_weight(gpui::FontWeight(600.))
+                                            .text_color(ui.text_muted)
+                                            .hover(|s| {
+                                                s.bg(ui.text.opacity(0.12)).text_color(ui.text)
+                                            })
+                                            .child(glyph)
+                                            .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                                ent.update(cx, |v, cx| {
+                                                    v.mermaid_zoom_by(block_id, action, cx)
+                                                });
+                                            })
+                                    };
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .child(step("−", MermaidZoom::Out, "live-mm-zoom-out"))
+                                        .child({
+                                            let ent = zoom_ent.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "live-mm-zoom-pct-{block_id}"
+                                                )))
+                                                .debug_selector(|| "live-mm-zoom-pct".into())
+                                                .px(px(5.0))
+                                                .py(px(2.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .text_size(px(10.0))
+                                                .line_height(px(14.0))
+                                                .font_weight(gpui::FontWeight(600.))
+                                                .text_color(ui.text_muted)
+                                                // 点百分比 = 还原（回到适配宽度 /
+                                                // 阅读尺寸）。
+                                                .hover(|s| {
+                                                    s.bg(ui.text.opacity(0.12))
+                                                        .text_color(ui.text)
+                                                })
+                                                .child(zoom_pct)
+                                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                                    ent.update(cx, |v, cx| {
+                                                        v.mermaid_zoom_by(
+                                                            block_id,
+                                                            MermaidZoom::Reset,
+                                                            cx,
+                                                        )
+                                                    });
+                                                })
+                                        })
+                                        .child(step("+", MermaidZoom::In, "live-mm-zoom-in"))
+                                })
                                 .into_any_element(),
                         );
                     }
@@ -6429,6 +6796,19 @@ impl Render for LiveMarkdownView {
                         };
                         card = card.child(foot_el);
                     }
+                    // 图体的横向滚动条：独立条带（排在滚动容器之后 —— 轨道挂
+                    // 在视口坐标上，不跟着内容滚走）。只在画图时出现。
+                    if let (Some(h_state), Some(h_handle)) = (mm_h_state, mm_h_handle) {
+                        card = card.child(h_bar_strip(
+                            ("live-mm-hbar", block_id),
+                            h_state,
+                            h_handle.clone(),
+                            px(6.0),
+                            ui.border.opacity(0.75),
+                            ui.border_strong,
+                            h_handle.max_offset().x > px(0.5),
+                        ));
+                    }
                     let group_last_line = close
                         .map(|c| rows[c].line)
                         .unwrap_or_else(|| rows[*code.last().unwrap()].line);
@@ -6446,6 +6826,9 @@ impl Render for LiveMarkdownView {
                         rows[*code.first().unwrap()].line,
                         group_last_line,
                     ));
+                    if wide {
+                        wide_rows.insert(row_els.len());
+                    }
                     row_els.push(card.into_any_element());
                 }
                 Group::Para(idxs) => {
@@ -6630,10 +7013,19 @@ impl Render for LiveMarkdownView {
                     // Typora 的表格工具栏：光标在表内时浮在表格上方。
                     // 左侧列×行计数、中间对齐按钮、右侧 More（同右键菜单）。
                     let cursor_in_table = idxs.iter().any(|pi| rows[*pi].line == cursor.line);
+                    // 「全宽」状态：卡片脱离 780px 窄栏、占满编辑器宽度。
+                    // 宽表（列多/内容长）在窄栏里每列只剩几十像素，必须能撑开。
+                    let wide = self.is_wide_block(start_line);
+                    // 横向滚动：表格列是 `flex_1`（无自然宽度），这里给内容一个
+                    // 「列数 × 每列可读最小宽」的下界 —— 视口更宽时列平分不滚动，
+                    // 更窄时才横向滚动，而不是把每列压到不可读。
+                    let (h_state, h_handle) = self.h_scroll.slot(start_line, cx);
+                    let table_min_w = table_natural_width(col_count);
                     let mut outer = div()
                         .id(("live-table", start_line))
                         .debug_selector(|| "live-table-outer".into())
-                        .w_full()
+                        // 全宽：脱离窄栏（由 `wide_blocks` 驱动，见 render 尾部）。
+                        .when(!wide, |this| this.w_full())
                         .relative()
                         .flex_shrink_0()
                         .mt_6()
@@ -6771,7 +7163,32 @@ impl Render for LiveMarkdownView {
                                                 this.open_table_menu(position, window, cx);
                                             },
                                         )),
-                                ),
+                                )
+                                // 「全宽」：占满编辑器宽度（窄栏里的宽表只能看到
+                                // 前几列）。放在最右、与 More▾ 同款样式，激活时
+                                // 用 accent 高亮 —— 状态可见，再点一次还原。
+                                .child(div().w(px(1.0)).h(px(12.0)).bg(colors.table_border))
+                                .child({
+                                    let wide_ent = entity.clone();
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "live-table-tb-wide-{start_line}"
+                                        )))
+                                        .debug_selector(|| "live-table-toolbar-wide".into())
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(if wide { ui.accent } else { ui.text_muted })
+                                        .hover(|s| s.bg(ui.text.opacity(0.08)).text_color(ui.text))
+                                        .child(if wide { "全宽 ✓" } else { "全宽" })
+                                        .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                            wide_ent.update(cx, |v, cx| {
+                                                v.toggle_wide_block(start_line, cx)
+                                            });
+                                        })
+                                }),
                         );
                     }
                     // Click the grid to jump the cursor into the block source.
@@ -7100,7 +7517,40 @@ impl Render for LiveMarkdownView {
                         }
                         grid = grid.child(row_div);
                     }
-                    outer = outer.child(grid);
+                    // 横向滚动：grid 用 `overflow_x_scroll` 承载溢出（gpui 负责
+                    // 钳制与滚轮），内容下界 `table_min_w` 保证列不会被压到不可读。
+                    // 滚动条是**兄弟节点**、排在滚动容器之后：轨道挂在视口坐标上，
+                    // 不跟着内容滚走（否则拖到右端就摸不到 thumb）。
+                    //
+                    // `restrict_scroll_to_axis` 必须开：gpui 的
+                    // `paint_scroll_listener` 在「只开 x 轴」时会把纵向滚轮增量
+                    // 喂给 x 轴，普通上下滚动会被表格截胡。
+                    let grid_scroll = div()
+                        .id(("live-table-scroll", start_line))
+                        .debug_selector(|| "live-table-scroll".into())
+                        .w_full()
+                        .overflow_x_scroll()
+                        .track_scroll(&h_handle)
+                        .restrict_scroll_to_axis()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_shrink_0()
+                                .min_w(table_min_w)
+                                .child(grid),
+                        );
+                    outer = outer.child(grid_scroll);
+                    // 滚动条条带：独立占位（不是覆盖层），永远不会压住最后一行。
+                    outer = outer.child(h_bar_strip(
+                        ("live-table-hbar", start_line),
+                        h_state,
+                        h_handle.clone(),
+                        px(6.0),
+                        ui.border.opacity(0.75),
+                        ui.border_strong,
+                        h_handle.max_offset().x > px(0.5),
+                    ));
                     // 尺寸弹层（Typora 的 resize popover，spec #14）：行/列数
                     // 步进器（行 2..=99、列 1..=40，超限由 `set_*_count` 内部
                     // 夹紧 → 点到头就是无变化）。必须排在 grid **之后**（否则
@@ -7245,6 +7695,9 @@ impl Render for LiveMarkdownView {
                     // `table_menu_body` 一套条目，两处行为天然一致；`context_menu`
                     // 会改变元素类型，所以必须是 `outer` 的最后一步。
                     let menu_ent = entity.clone();
+                    if wide {
+                        wide_rows.insert(row_els.len());
+                    }
                     row_els.push(
                         outer
                             .context_menu(
@@ -7650,6 +8103,12 @@ impl Render for LiveMarkdownView {
             window.focus(&self.focus, cx);
         }
 
+        // 横向滚动条收帧：淘汰文档里已不存在的块（`wide_anchors` 就是全部
+        // 可能带横向条的块）。滚出窗口/切源码视图的块保留句柄与滚动位置。
+        self.h_scroll.end_frame(&geometry.wide_anchors);
+        // 「全宽」状态按块首行记账，行号会随编辑漂移 —— 收帧时裁到仍存在的块。
+        self.prune_wide_blocks();
+
         // Preview-parity container: centered 780px column, no editor chrome.
         div()
             .id("live-markdown")
@@ -7705,35 +8164,104 @@ impl Render for LiveMarkdownView {
                             .flex()
                             .flex_col()
                             .w_full()
-                            .max_w(px(780.))
-                            .px_8()
                             .pt_8()
                             .pb_2()
                             .h_full()
                             .overflow_hidden()
+                            // 查找面板 / slash 菜单 / 状态条跟随阅读窄栏
+                            //（780px 居中）；正文行各自决定宽度，见下面的
+                            // 「全宽」包装。
                             .when_some(self.search_panel.clone(), |this, panel| {
-                                this.child(panel)
+                                this.child(center_narrow(panel.into_any_element()))
                             })
                             .child(
                                 div()
-                                    .id("live-markdown-content")
-                                    .debug_selector(|| "live-markdown-content".into())
-                                    .flex()
-                                    .flex_col()
+                                    .relative()
                                     .w_full()
                                     .flex_1()
                                     .min_h_0()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.scroll)
-                                    .children(row_els),
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .id("live-markdown-content")
+                                            .debug_selector(|| "live-markdown-content".into())
+                                            .flex()
+                                            .flex_col()
+                                            .w_full()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scroll()
+                                            .track_scroll(&self.scroll)
+                                            // 每行一个包装：默认居中在 780px
+                                            // 阅读窄栏里，「全宽」块（`wide_rows`）
+                                            // 占满编辑器宽度。逐行包装而不是整列定宽，
+                                            // 是为了让宽表/大图真正撑开而不拉伸正文。
+                                            .children(row_els.into_iter().enumerate().map(
+                                                |(ix, el)| {
+                                                    if wide_rows.contains(&ix) {
+                                                        div()
+                                                            .w_full()
+                                                            .flex_shrink_0()
+                                                            .px_4()
+                                                            .debug_selector(|| {
+                                                                "live-wide-row".into()
+                                                            })
+                                                            .child(el)
+                                                            .into_any_element()
+                                                    } else {
+                                                        center_narrow(el)
+                                                    }
+                                                },
+                                            )),
+                                    )
+                                    // 纵向滚动条：贴内容区右缘的覆盖层（与代码编辑器
+                                    // 同款）。挂在滚动容器**外面** —— 挂进内容里会跟着
+                                    // 内容一起滚走。
+                                    .child(
+                                        div()
+                                            .id("live-vscroll-bar")
+                                            .debug_selector(|| "live-vscroll-bar".into())
+                                            .absolute()
+                                            .top_0()
+                                            .bottom_0()
+                                            .right_0()
+                                            .w(px(10.0))
+                                            .child(scroll_bar(
+                                                gpui::Axis::Vertical,
+                                                v_state,
+                                                self.scroll.clone(),
+                                                ui.border.opacity(0.7),
+                                                ui.border_strong,
+                                                // 只认 thumb：轨道压在内容右缘，
+                                                // 轨道点击会把「点行尾」吃掉。
+                                                false,
+                                            )),
+                                    ),
                             )
-                            .when_some(slash_bar, |this, bar| this.child(bar))
-                            .child(status),
+                            .when_some(slash_bar, |this, bar| {
+                                this.child(center_narrow(bar.into_any_element()))
+                            })
+                            .child(center_narrow(status.into_any_element())),
                     ),
             )
             .when_some(outline_panel, |this, panel| this.child(panel))
             .when_some(table_menu_overlay, |this, menu| this.child(menu))
     }
+}
+
+/// 把一行元素居中放进 780px 阅读窄栏（正文的默认版式）。
+///
+/// 与只读预览（`Markdown` 的 `max_w(px(780.))`）保持同一套宽度，两处渲染
+/// 切换时正文不会跳版。
+fn center_narrow(el: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .justify_center()
+        .child(div().w_full().max_w(px(780.)).px_8().child(el))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -9860,6 +10388,107 @@ mod live_screenshot_tests {
         let shot = cx.capture_screenshot(window.into()).unwrap();
         shot.save("/tmp/live_code.png").unwrap();
         eprintln!("saved /tmp/live_code.png");
+    }
+
+    /// 人工验收用：宽表 + 结构图在窄栏 / 全宽两种状态下的对照截图。
+    ///
+    /// `cargo test --lib live_wide_and_graph_screenshot -- --ignored --nocapture`
+    const SHOT_WIDE: &str = "\
+## 宽表（12 列，窄栏里应能横向滚动）
+
+| 环境 | 区域 | 实例 | 规格 | 镜像 | 状态 | 负责人 | 创建时间 | 到期时间 | 成本 | 标签 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| prod | cn-north | i-0a1b2c3d | 8C16G | registry/app:1.4.2 | running | 张三 | 2026-01-04 | 2026-12-31 | ¥1,240 | team-a | 主力 |
+| stage | cn-south | i-4e5f6a7b | 4C8G | registry/app:1.4.2-rc1 | stopped | 李四 | 2026-02-11 | 2026-06-30 | ¥420 | team-b | 灰度 |
+| dev | cn-east | i-8c9d0e1f | 2C4G | registry/app:dev | running | 王五 | 2026-03-02 | — | ¥96 | team-c | 临时 |
+
+## 结构图（flowchart，窄栏里节点会挤）
+
+```mermaid
+flowchart TD
+    A[\"改 my_policy/policy.py<br/>或 v1-SKILL.md\"] --> B
+    B[\"探活端点<br/>probe_endpoint.py\"] --> C{模型可用?}
+    C -->|\"否\"| B1[\"换端点 / 等配额<br/>改 .env.local\"]
+    B1 --> B
+    C -->|\"是\"| D[\"离线自检<br/>test_my_policy.py\"] --> E{通过?}
+    E -->|\"否\"| A
+    E -->|\"是\"| F[\"构建 pack<br/>trajectoryrl-miner build\"] --> G[\"同步到服务器\"]
+    G --> H[\"真场景评测<br/>eval_local.py\"] --> I{分数提升?}
+    I -->|\"否\"| K[\"看 transcript<br/>定位 agent 死因\"]
+    I -->|\"是\"| L[\"保留 · 更新 README\"]
+    K --> A
+```
+
+尾段文字，用于确认正文仍居中在阅读窄栏里。
+";
+
+    #[test]
+    #[ignore]
+    fn live_wide_and_graph_screenshot() {
+        let mut cx = gpui::VisualTestAppContext::new(gpui_platform::current_platform(false));
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let cell = std::cell::RefCell::new(None);
+        let window = cx
+            .open_offscreen_window(gpui::size(px(1200.), px(900.)), |_, cx| {
+                let v = cx.new(|cx| LiveMarkdownView::with_text(SHOT_WIDE, cx));
+                *cell.borrow_mut() = Some(v.clone());
+                cx.new(|_| ShotHost(v))
+            })
+            .unwrap();
+        let view = cell.into_inner().unwrap();
+        let handle: gpui::AnyWindowHandle = window.into();
+        // 等 mermaid 后台渲染：防抖 200ms 走假时钟，必须推进；渲染完成的
+        // 判据取自视图状态本身（`MermaidState::body`），不依赖窗口内部字段。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            cx.update_window(handle, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            ready = cx.read(|cx| {
+                view.read(cx)
+                    .planned_geometry
+                    .mermaid_blocks
+                    .iter()
+                    .any(|b| {
+                        matches!(
+                            view.read(cx).mermaid.body(&b.source),
+                            MermaidBody::Image { pending: false, .. }
+                        )
+                    })
+            });
+            if ready {
+                break;
+            }
+        }
+        eprintln!("mermaid ready: {ready}");
+        cx.update_window(handle, |_, window, _| window.refresh())
+            .unwrap();
+        cx.run_until_parked();
+        let shot = cx.capture_screenshot(handle).unwrap();
+        shot.save("/tmp/live_wide_narrow.png").unwrap();
+        eprintln!("saved /tmp/live_wide_narrow.png");
+
+        // 切全宽：表格首行 = 2（标题 + 空行），mermaid 围栏行 = 14。
+        cx.update(|cx| {
+            view.update(cx, |v, cx| {
+                v.toggle_wide_block(2, cx);
+                v.toggle_wide_block(14, cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let shot = cx.capture_screenshot(handle).unwrap();
+        shot.save("/tmp/live_wide_full.png").unwrap();
+        eprintln!("saved /tmp/live_wide_full.png");
     }
 }
 
@@ -12413,5 +13042,953 @@ mod incremental_plan_tests {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod hscroll_and_wide_tests {
+    use super::*;
+    use crate::editor::markdown_live::scrollbar::{
+        scroll_for_drag, table_natural_width, thumb_metrics,
+    };
+    use gpui::{point, size};
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.0.clone()
+        }
+    }
+
+    fn setup<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        window: gpui::Size<Pixels>,
+        doc: &str,
+    ) -> (gpui::Entity<LiveMarkdownView>, gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(window, |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(doc, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        (view, vc)
+    }
+
+    /// thumb 几何：内容不溢出 → 无条；溢出 → 条长按比例、位置随偏移走。
+    #[test]
+    fn thumb_metrics_scale_and_follow_offset() {
+        // 视口 1000、内容 1000：不溢出。
+        assert!(thumb_metrics(px(1000.), px(1000.), px(0.)).is_none());
+        // 内容 2000（可滚 1000）：条长 = 轨道一半。
+        let (start, len) = thumb_metrics(px(1000.), px(2000.), px(0.)).expect("溢出应有条");
+        assert_eq!(start, px(2.)); // TRACK_INSET
+        assert!(
+            (f32::from(len) - (1000.0 - 4.0) / 2.0).abs() < 1.0,
+            "条长应约为轨道一半，实际 {len:?}"
+        );
+        // 滚到底：条贴轨道右端。
+        let (start_bottom, _) = thumb_metrics(px(1000.), px(2000.), px(-1000.)).expect("溢出应有条");
+        assert!(
+            f32::from(start_bottom) > f32::from(start),
+            "滚到底后条应右移（{start:?} → {start_bottom:?}）"
+        );
+        // 极长内容：条不小于 MIN_THUMB（抓得住）。
+        let (_, tiny) = thumb_metrics(px(1000.), px(100_000.), px(0.)).expect("溢出应有条");
+        assert!(f32::from(tiny) >= 28.0 - 0.01, "条长有下限，实际 {tiny:?}");
+    }
+
+    /// 窄视口：轨道比 MIN_THUMB 还短时条长压到轨道，不得 panic。
+    ///
+    /// `Pixels::clamp` 是 `Ord::clamp`（断言 `min <= max`），纵向条在矮分屏里
+    /// 会走到这条路径。
+    #[test]
+    fn thumb_metrics_survives_track_shorter_than_min_thumb() {
+        for viewport in [px(6.), px(20.), px(31.), px(34.)] {
+            let (_, len) = thumb_metrics(viewport, px(2000.), px(0.))
+                .unwrap_or_else(|| panic!("视口 {viewport:?} 溢出时应有条"));
+            let track = viewport - px(4.);
+            let min_thumb = px(28.).min(track);
+            assert!(
+                len >= min_thumb - px(0.01) && len <= track,
+                "条长应落在 [min(MIN_THUMB, 轨道), 轨道]，视口 {viewport:?} 实际 {len:?}"
+            );
+        }
+    }
+
+    /// 拖动换算：thumb 位移按 `max_scroll / travel` 放大，并夹在 `[0, max]`。
+    #[test]
+    fn drag_maps_thumb_travel_to_scroll_range() {
+        // 视口 1000、内容 2000、条长 500 → travel 496、max_scroll 1000。
+        let half = scroll_for_drag(px(0.), px(248.), px(1000.), px(2000.), px(500.));
+        assert!(
+            (f32::from(half) - 500.0).abs() < 2.0,
+            "拖到轨道中点应滚到一半，实际 {half:?}"
+        );
+        // 超程夹紧。
+        assert_eq!(
+            scroll_for_drag(px(0.), px(9999.), px(1000.), px(2000.), px(500.)),
+            px(1000.)
+        );
+        assert_eq!(
+            scroll_for_drag(px(100.), px(-9999.), px(1000.), px(2000.), px(500.)),
+            px(0.)
+        );
+        // 不可滚：不动。
+        assert_eq!(
+            scroll_for_drag(px(0.), px(50.), px(1000.), px(1000.), px(500.)),
+            px(0.)
+        );
+    }
+
+    /// 表格自然宽度下界随列数增长（列多 → 下界大 → 更容易触发横向滚动）。
+    #[test]
+    fn table_natural_width_grows_with_columns() {
+        assert!(table_natural_width(1) < table_natural_width(4));
+        assert!(table_natural_width(4) < table_natural_width(12));
+        // 单列也要有可读下界（不是 0）。
+        assert!(f32::from(table_natural_width(1)) >= 96.0);
+    }
+
+    /// 窄窗口里的宽表：横向滚动容器存在、可滚（`max_offset.x > 0`），
+    /// 且滚动条条带画出来了。
+    #[gpui::test]
+    fn wide_table_in_narrow_pane_scrolls_horizontally(cx: &mut gpui::TestAppContext) {
+        // 12 列 × 每列 96px ≈ 1168px 下界，窗口只有 700px。
+        let mut doc = String::from("intro\n\n|");
+        for c in 0..12 {
+            doc.push_str(&format!(" 列{c} 标题 |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..12 {
+            doc.push_str("---|");
+        }
+        doc.push('\n');
+        for r in 0..3 {
+            doc.push('|');
+            for c in 0..12 {
+                doc.push_str(&format!(" r{r}c{c} |"));
+            }
+            doc.push('\n');
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(600.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let outer = vc.debug_bounds("live-table-outer").expect("表格应渲染");
+        assert!(
+            f32::from(outer.size.width) > 600.0,
+            "表格卡片应占据可用宽，实际 {outer:?}"
+        );
+        // 横向可滚：容器的 max_offset.x > 0（内容比视口宽）。
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(2) // 表格首行 = 2（intro + 空行）
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            max_x > 1.0,
+            "12 列宽表在 700px 窗口里应横向可滚，实际 max_offset.x = {max_x}"
+        );
+        // 滚动条条带（独立占位）应存在。
+        assert!(
+            vc.debug_bounds("live-hscroll-bar").is_some(),
+            "横向滚动条应画出来"
+        );
+    }
+
+    /// 窄栏里的表格在「全宽」后占满编辑器宽度（比窄栏宽）。
+    #[gpui::test]
+    fn wide_toggle_breaks_table_out_of_narrow_column(cx: &mut gpui::TestAppContext) {
+        let mut doc = String::from("|");
+        for c in 0..6 {
+            doc.push_str(&format!(" 列{c} |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..6 {
+            doc.push_str("---|");
+        }
+        doc.push_str("\n|");
+        for c in 0..6 {
+            doc.push_str(&format!(" v{c} |"));
+        }
+        doc.push_str("\n\ntail\n");
+        let (view, mut vc) = setup(cx, size(px(1400.), px(600.)), &doc);
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let narrow = vc.debug_bounds("live-table-outer").expect("表格应渲染");
+        // 窄栏 = 780 - px_8(32) 两侧 = 716 内容宽。
+        assert!(
+            f32::from(narrow.size.width) <= 720.0,
+            "默认应落在 780px 阅读窄栏里，实际 {narrow:?}"
+        );
+        // 切「全宽」：直接调状态（等价于点按钮），再断言宽度撑开。
+        view.update(&mut vc, |v, cx| v.toggle_wide_block(0, cx));
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let wide = vc.debug_bounds("live-table-outer").expect("表格应仍在");
+        assert!(
+            f32::from(wide.size.width) > 1000.0,
+            "「全宽」后表格应占满 1400px 窗口（含边距），实际 {wide:?}"
+        );
+        assert!(
+            f32::from(wide.size.width) > f32::from(narrow.size.width) + 200.0,
+            "全宽应显著宽于窄栏：{narrow:?} → {wide:?}"
+        );
+        // 再点一次还原。
+        view.update(&mut vc, |v, cx| v.toggle_wide_block(0, cx));
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let back = vc.debug_bounds("live-table-outer").expect("表格应仍在");
+        assert!(
+            f32::from(back.size.width) <= 720.0,
+            "取消全宽应回到窄栏，实际 {back:?}"
+        );
+    }
+
+    /// 编辑器自身的纵向滚动条：长文档下出现，且贴内容区右侧。
+    #[gpui::test]
+    fn editor_has_vertical_scrollbar_on_long_doc(cx: &mut gpui::TestAppContext) {
+        let mut doc = String::new();
+        for i in 0..200 {
+            doc.push_str(&format!("paragraph line {i}\n\n"));
+        }
+        let (view, mut vc) = setup(cx, size(px(900.), px(400.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let bar = vc
+            .debug_bounds("live-vscroll-bar")
+            .expect("长文档应有纵向滚动条");
+        let content = vc
+            .debug_bounds("live-markdown-content")
+            .expect("内容区应有实体");
+        // 条贴在内容区右侧。
+        assert!(
+            f32::from(bar.right()) >= f32::from(content.right()) - 2.0,
+            "滚动条应贴内容区右缘：bar={bar:?} content={content:?}"
+        );
+        assert!(bar.size.height > px(50.), "滚动条应占满内容区高度");
+        // 文档确实可滚（否则上面的断言没有意义）。
+        let max_y = view.read_with(&vc, |v, _| f32::from(v.scroll.max_offset().y));
+        assert!(max_y > 100.0, "长文档应可纵向滚动，实际 {max_y}");
+    }
+
+    /// 换文档（`set_text`）必须丢弃按行号记账的 UI 状态。
+    ///
+    /// 新文本在同一行号上可能是另一个块：留着旧的全宽/缩放/滚动位置会把它们
+    /// 错误地套到无关的块上，而收帧裁剪挡不住（行号仍命中某个锚点）。
+    #[gpui::test]
+    fn set_text_resets_per_block_ui_state(cx: &mut gpui::TestAppContext) {
+        // 表格（行 0）+ mermaid（行 4）：两类状态各有一个真实锚点。
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\n```mermaid\nflowchart LR\n    A --> B\n```\n";
+        let (view, mut vc) = setup(cx, size(px(1000.), px(500.)), doc);
+        view.update(&mut vc, |v, cx| {
+            v.toggle_wide_block(0, cx);
+            v.mermaid.set_zoom(4, 2.0);
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, _| v.is_wide_block(0) && v.mermaid_zoom(4).is_some()),
+            "setup：全宽与缩放状态应已置位"
+        );
+
+        // 换文档：同样的行号上仍是表格 + mermaid，但都是**另一个**文档的块。
+        view.update(&mut vc, |v, cx| {
+            v.set_text(
+                "| x | y |\n|---|---|\n| 3 | 4 |\n\n```mermaid\nflowchart LR\n    C --> D\n```\n",
+                cx,
+            )
+        });
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "换文档后不得保留上一个文档的全宽状态"
+        );
+        assert_eq!(
+            view.read_with(&vc, |v, _| v.mermaid_zoom(4)),
+            None,
+            "换文档后不得保留上一个文档的缩放倍率"
+        );
+    }
+
+    /// 滚出虚拟化窗口的块：横向滚动位置必须留住（滚回来不能跳回最左）。
+    ///
+    /// 句柄被 `end_frame` 淘汰就等于把偏移归零 —— 这跟「删块后不留垃圾」
+    /// 是两件事，判据必须是「文档里还有没有这个块」。
+    #[gpui::test]
+    fn hscroll_survives_virtualization_window_exit(cx: &mut gpui::TestAppContext) {
+        // 宽表 + 大量填充行：窗口足够矮时表格会被虚拟化排除在窗口外。
+        let mut doc = String::from("|");
+        for c in 0..12 {
+            doc.push_str(&format!(" 列{c} 标题 |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..12 {
+            doc.push_str("---|");
+        }
+        doc.push('\n');
+        for r in 0..3 {
+            doc.push('|');
+            for c in 0..12 {
+                doc.push_str(&format!(" r{r}c{c} |"));
+            }
+            doc.push('\n');
+        }
+        for i in 0..300 {
+            doc.push_str(&format!("填充段落 {i}\n\n"));
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(400.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let groups = view.read_with(&vc, |v, _| v.planned_geometry.group_count());
+        assert!(
+            groups > 200,
+            "setup：文档分组数应超过虚拟化阈值（{groups}）"
+        );
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(max_x > 1.0, "setup：宽表应可横向滚动（max_x={max_x}）");
+        // 直接改偏移（模拟用户横向滚动后离开）。
+        view.update(&mut vc, |v, cx| {
+            if let Some(h) = v.h_scroll.handle(0) {
+                let mut off = h.offset();
+                off.x = px(-80.);
+                h.set_offset(off);
+            }
+            cx.notify();
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let scrolled = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(scrolled < -1.0, "setup：横向偏移应已生效（{scrolled}）");
+
+        // 滚到文档底部：表格滚出虚拟化窗口。
+        view.update(&mut vc, |v, cx| {
+            v.scroll_by_y(-100_000.0, cx);
+        });
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let offscreen = vc.debug_bounds("live-table-scroll").is_none();
+        assert!(offscreen, "setup：表格应已滚出虚拟化窗口");
+        let kept = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.offset().x))
+        });
+        assert_eq!(
+            kept.map(|x| (x - scrolled).abs() < 1.0),
+            Some(true),
+            "滚出窗口后横向滚动位置必须保留（{scrolled} → {kept:?}）"
+        );
+    }
+
+    /// 窗口失活：进行中的滚动条拖拽必须收尾。
+    ///
+    /// 拖拽状态由窗口级 MouseUp 清除，而失活后窗口收不到该事件；不清的话
+    /// `on_fallback_drag` 之后每次都让行，静默禁用该路径下的选区扩展。
+    #[gpui::test]
+    fn window_deactivation_ends_scroll_drag(cx: &mut gpui::TestAppContext) {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail\n";
+        let (view, mut vc) = setup(cx, size(px(1000.), px(500.)), doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        // 直接置位拖拽状态（等价于按下 thumb 后的状态）。
+        view.update(&mut vc, |v, cx| {
+            let (state, _) = v.h_scroll.slot(0, cx);
+            state.update(cx, |s, _| s.set_drag_for_test(px(0.), px(0.)));
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, cx| v.h_scroll.any_dragging(cx)),
+            "setup：拖拽状态应已置位"
+        );
+        // `deactivate_window` 只对「当前活跃窗口」生效，测试窗口默认不活跃：
+        // 先激活，再失活，走完整的平台回调链路。
+        vc.update(|window, _| window.activate_window());
+        vc.run_until_parked();
+        vc.deactivate_window();
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, cx| v.h_scroll.any_dragging(cx)),
+            "窗口失活后不得残留拖拽状态"
+        );
+    }
+
+    /// 全宽状态裁剪：块被删掉后，残留的行号不得把别的块意外撑开。
+    #[gpui::test]
+    fn wide_state_pruned_when_block_disappears(cx: &mut gpui::TestAppContext) {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail\n";
+        let (view, mut vc) = setup(cx, size(px(1000.), px(500.)), doc);
+        view.update(&mut vc, |v, cx| v.toggle_wide_block(0, cx));
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "全宽状态应在"
+        );
+        // 把表格整块删掉（首行 + 后三行）：状态必须被裁剪，不留悬空行号。
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| {
+                m.move_to(0, 0, false);
+                m.select_all();
+                m.insert("plain text\n");
+            });
+            v.after_edit(cx);
+        });
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "表格删除后全宽状态应被裁剪"
+        );
+    }
+
+    /// 横向滚轮（触控板双指左右滑）能滚宽表，且**纵向**滚轮不被表格截胡
+    /// （`restrict_scroll_to_axis` 的意义所在）。
+    #[gpui::test]
+    fn table_scroll_container_is_x_only(cx: &mut gpui::TestAppContext) {
+        // 12 列 ≈ 1168px 下界，窗口 700px → 可横向滚动；正文够长 → 可纵向滚动。
+        let mut doc = String::from("|");
+        for c in 0..12 {
+            doc.push_str(&format!(" 列{c} 标题 |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..12 {
+            doc.push_str("---|");
+        }
+        doc.push('\n');
+        for r in 0..3 {
+            doc.push('|');
+            for c in 0..12 {
+                doc.push_str(&format!(" r{r}c{c} |"));
+            }
+            doc.push('\n');
+        }
+        for i in 0..80 {
+            doc.push_str(&format!("尾巴行 {i}\n"));
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(500.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let grid = vc.debug_bounds("live-table-scroll").expect("表格滚动容器");
+        let (max_x, h_before, v_before) = view.read_with(&vc, |v, _| {
+            (
+                v.h_scroll
+                    .handle_for(0)
+                    .map(|h| f32::from(h.max_offset().x))
+                    .unwrap_or(0.0),
+                v.h_scroll
+                    .handle_for(0)
+                    .map(|h| f32::from(h.offset().x))
+                    .unwrap_or(0.0),
+                v.scroll_offset_y(),
+            )
+        });
+        assert!(max_x > 1.0, "setup：宽表应可横向滚动（max_x={max_x}）");
+        assert!(
+            v_before.abs() < 1.0,
+            "setup：文档应从顶部开始（offset.y={v_before}）"
+        );
+
+        // 纵向滚轮落在表格网格上：必须滚的是文档，不是表格的 x 轴
+        // （`restrict_scroll_to_axis` 的全部意义）。指针必须落在**窗口内**：
+        // 表格高度是内容高度（远超视口），`grid.center()` 会落到窗口外、命中失败。
+        vc.simulate_event(gpui::ScrollWheelEvent {
+            position: point(grid.center().x, grid.top() + px(20.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-60.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let (h_after, v_after) = view.read_with(&vc, |v, _| {
+            (
+                v.h_scroll
+                    .handle_for(0)
+                    .map(|h| f32::from(h.offset().x))
+                    .unwrap_or(0.0),
+                v.scroll_offset_y(),
+            )
+        });
+        assert!(
+            v_after < v_before - 1.0,
+            "纵向滚轮应滚文档（offset.y {v_before} → {v_after}）"
+        );
+        assert!(
+            (h_after - h_before).abs() < 1.0,
+            "纵向滚轮不得改动表格横向偏移（offset.x {h_before} → {h_after}）"
+        );
+    }
+
+    /// 拖动横向滚动条 thumb：内容真的跟着滚，松手后停住。
+    ///
+    /// 这是「过宽内容能左右滚动查看」的核心交互 —— 只断言容器可滚是不够的，
+    /// 必须验证按下/拖动/松开整条链路真的改到了滚动偏移。
+    #[gpui::test]
+    fn dragging_hscroll_thumb_moves_table_content(cx: &mut gpui::TestAppContext) {
+        // 12 列 ≈ 1168px 下界，窗口 700px → 可滚。
+        let mut doc = String::from("|");
+        for c in 0..12 {
+            doc.push_str(&format!(" 列{c} 标题 |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..12 {
+            doc.push_str("---|");
+        }
+        doc.push('\n');
+        for r in 0..3 {
+            doc.push('|');
+            for c in 0..12 {
+                doc.push_str(&format!(" r{r}c{c} |"));
+            }
+            doc.push('\n');
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(600.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let table_start = 0usize;
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(table_start)
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(max_x > 1.0, "setup：宽表应可横向滚动（max_x={max_x}）");
+
+        // 条带（含 thumb）的窗口坐标。
+        let bar = vc.debug_bounds("live-hscroll-bar").expect("滚动条应画出来");
+        let before = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(table_start)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        // 从条带左侧按下并向右拖 → 内容右移（offset.x 变小 / 更负）。
+        let start = point(bar.left() + px(10.), bar.center().y);
+        let end = point(bar.left() + px(120.), bar.center().y);
+        vc.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        vc.simulate_mouse_move(end, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        vc.simulate_mouse_move(
+            point(end.x + px(60.), end.y),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        vc.run_until_parked();
+        let during = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(table_start)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            during < before - 1.0,
+            "向右拖 thumb 应让内容右移（offset.x {before} → {during}）"
+        );
+        vc.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        vc.run_until_parked();
+        let after = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(table_start)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            (after - during).abs() < 1.0,
+            "松开后不应继续滚动（{during} → {after}）"
+        );
+        // 拖拽结束后不能还挂着「拖动中」状态（否则点击/选择会被永久让行）。
+        assert!(
+            !view.read_with(&vc, |v, cx| v.h_scroll.any_dragging(cx)),
+            "松开后拖拽状态必须清空"
+        );
+    }
+
+    /// mermaid 图卡片的「全宽」：图脱离 780px 窄栏、占满编辑器宽度。
+    ///
+    /// 全宽**不**把图放大到自然尺寸：图按视口宽度等比适配，因此全宽后反而
+    /// 不出现横向滚动（自然宽大于视口时也不溢出）。
+    #[gpui::test]
+    fn mermaid_wide_toggle_enlarges_graph_and_scrolls(cx: &mut gpui::TestAppContext) {
+        // 宽图：flowchart 横向铺开，自然宽度明显超过 640。
+        let mut doc = String::from("```mermaid\nflowchart LR\n");
+        for i in 0..14 {
+            doc.push_str(&format!("    N{i}[\"节点{i}\"] --> N{}\n", i + 1));
+        }
+        doc.push_str("```\n");
+        let (view, mut vc) = setup(cx, size(px(900.), px(700.)), &doc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            vc.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            ready = view.read_with(&vc, |v, _cx| {
+                v.planned_geometry
+                    .mermaid_blocks
+                    .iter()
+                    .any(|b| {
+                        matches!(
+                            v.mermaid.body(&b.source),
+                            MermaidBody::Image { pending: false, .. }
+                        )
+                    })
+                    && v.planned_geometry.mermaid_blocks.len() == 1
+            }) && vc.debug_bounds("live-mm-graph").is_some();
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "mermaid 图应在若干帧内渲染完成");
+        // `live-mm-graph` 是**卡片**；图的滚动视口是 `live-code-inner`，
+        // 全宽与否要对比同一元素。
+        let narrow = vc.debug_bounds("live-code-inner").expect("图卡片内层");
+        // 阅读态：图最多 640px 宽（`MAX_DISPLAY_W`）。
+        let (img_narrow, img_natural) = view.read_with(&vc, |v, _| {
+            v.planned_geometry
+                .mermaid_blocks
+                .iter()
+                .find_map(|b| match v.mermaid.body(&b.source) {
+                    MermaidBody::Image { image, .. } => {
+                        Some((image.display_size().0, image.natural_size().0))
+                    }
+                    _ => None,
+                })
+                .unwrap_or((0.0, 0.0))
+        });
+        assert!(
+            img_narrow <= 640.0 + 0.5,
+            "阅读态图宽应不超过 640 上限，实际 {img_narrow}"
+        );
+        assert!(
+            img_natural > 640.0 + 50.0,
+            "setup：本用例的图自然宽应明显超过 640（{img_natural}），否则断言没有意义"
+        );
+        // 切全宽 → 图占据整个宽度。**不放大到自然尺寸**：自然宽比全宽视口还
+        // 大，若按自然尺寸展示就会溢出并可横向滚动 —— 现在应当「只占据宽度、
+        // 不溢出」。
+        view.update(&mut vc, |v, cx| v.toggle_wide_block(0, cx));
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let wide = vc.debug_bounds("live-code-inner").expect("图卡片内层");
+        assert!(
+            f32::from(wide.size.width) > f32::from(narrow.size.width) + 50.0,
+            "全宽后图的视口应明显变宽：{narrow:?} → {wide:?}"
+        );
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            max_x <= 0.5,
+            "全宽只让图占据整个宽度，不应溢出到需要横向滚动（max_x={max_x}）"
+        );
+    }
+
+    /// 缩放：`+` 放大、`−` 缩小、点百分比还原 100%，且长宽比不变。
+    #[gpui::test]
+    fn mermaid_zoom_in_out_and_reset(cx: &mut gpui::TestAppContext) {
+        let doc = "```mermaid\nflowchart LR\n    A[开始] --> B[结束]\n```\n";
+        let (view, mut vc) = setup(cx, size(px(900.), px(700.)), doc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            vc.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            if vc.debug_bounds("live-mm-zoom-in").is_some() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "缩放控件应在图渲染后出现");
+        // 初始：没设过缩放（按适配宽度 / 阅读尺寸展示）。
+        assert_eq!(
+            view.read_with(&vc, |v, _| v.mermaid_zoom(0)),
+            None,
+            "初始不应有显式缩放倍率"
+        );
+        let (nat_w, nat_h) = view.read_with(&vc, |v, _| {
+            v.planned_geometry
+                .mermaid_blocks
+                .iter()
+                .find_map(|b| match v.mermaid.body(&b.source) {
+                    MermaidBody::Image { image, .. } => Some(image.natural_size()),
+                    _ => None,
+                })
+                .unwrap_or((1.0, 1.0))
+        });
+
+        // 点两次 `+`：从**当前显示倍率**出发连续放大（不是从 100% 跳变），
+        // 每次 × 1.25。当前显示倍率 = 阅读态尺寸 / 自然尺寸。
+        let base = view.read_with(&vc, |v, _| v.mermaid_display_scale(0, false));
+        for _ in 0..2 {
+            let btn = vc.debug_bounds("live-mm-zoom-in").expect("+ 按钮");
+            vc.simulate_click(btn.center(), gpui::Modifiers::none());
+            for _ in 0..2 {
+                vc.refresh().unwrap();
+                vc.run_until_parked();
+            }
+        }
+        let z = view.read_with(&vc, |v, _| v.mermaid_zoom(0)).expect("放大后应有倍率");
+        let want = (base * 1.25 * 1.25).min(4.0);
+        assert!(
+            (z - want).abs() < 0.01,
+            "两次放大应为当前倍率 × 1.5625（{base} → {want}），实际 {z}"
+        );
+        // 尺寸按倍率走，且长宽比不变。
+        let (dw, dh) = zoomed_size((nat_w, nat_h), z);
+        assert!(
+            (dw / dh - nat_w / nat_h).abs() < 0.01,
+            "缩放必须保持长宽比：({dw}, {dh}) vs ({nat_w}, {nat_h})"
+        );
+
+        // 点百分比 → 还原：清掉显式倍率，回到「适配宽度 / 阅读尺寸」。
+        let pct = vc.debug_bounds("live-mm-zoom-pct").expect("百分比按钮");
+        vc.simulate_click(pct.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert_eq!(
+            view.read_with(&vc, |v, _| v.mermaid_zoom(0)),
+            None,
+            "点百分比应还原（清除显式倍率）"
+        );
+        // 点 `−`：从当前显示倍率缩小一档。
+        let base = view.read_with(&vc, |v, _| v.mermaid_display_scale(0, false));
+        let btn = vc.debug_bounds("live-mm-zoom-out").expect("− 按钮");
+        vc.simulate_click(btn.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let z = view.read_with(&vc, |v, _| v.mermaid_zoom(0)).expect("缩小后应有倍率");
+        let want = (base / 1.25).max(0.25);
+        assert!(
+            (z - want).abs() < 0.01,
+            "一次缩小应为当前倍率 ÷ 1.25（{base} → {want}），实际 {z}"
+        );
+    }
+
+    /// 点击表格工具栏的「全宽」按钮：走真实点击链路（不是直接调状态），
+    /// 并且再点一次能还原。
+    #[gpui::test]
+    fn clicking_table_wide_button_toggles_full_width(cx: &mut gpui::TestAppContext) {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail\n";
+        let (view, mut vc) = setup(cx, size(px(1200.), px(600.)), doc);
+        // 光标进表 → 工具栏出现。
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let btn = vc
+            .debug_bounds("live-table-toolbar-wide")
+            .expect("「全宽」按钮应随工具栏出现");
+        let before = vc.debug_bounds("live-table-outer").expect("表格");
+        vc.simulate_click(btn.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        // 表格的块 id 是**块首行**（0），不是光标所在行。
+        assert!(
+            view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "点击「全宽」按钮应置位该表格块的全宽状态"
+        );
+        let after = vc.debug_bounds("live-table-outer").expect("表格");
+        assert!(
+            f32::from(after.size.width) > f32::from(before.size.width) + 200.0,
+            "点击后表格应明显变宽：{before:?} → {after:?}"
+        );
+        // 再点一次还原。
+        let btn = vc.debug_bounds("live-table-toolbar-wide").expect("按钮仍在");
+        vc.simulate_click(btn.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "再点一次应取消全宽"
+        );
+        let back = vc.debug_bounds("live-table-outer").expect("表格");
+        assert!(
+            f32::from(back.size.width) < f32::from(after.size.width) - 200.0,
+            "取消后应回到窄栏：{after:?} → {back:?}"
+        );
+    }
+
+    /// 横向滚轮（触控板双指左右滑）能滚宽表。
+    ///
+    /// 「纵向滚轮不被表格截胡」由 `table_scroll_container_is_x_only` 覆盖。
+    #[gpui::test]
+    fn horizontal_wheel_scrolls_table_without_hijacking_vertical(cx: &mut gpui::TestAppContext) {
+        let mut doc = String::from("|");
+        for c in 0..12 {
+            doc.push_str(&format!(" 列{c} 标题 |"));
+        }
+        doc.push_str("\n|");
+        for _ in 0..12 {
+            doc.push_str("---|");
+        }
+        doc.push('\n');
+        for r in 0..3 {
+            doc.push('|');
+            for c in 0..12 {
+                doc.push_str(&format!(" r{r}c{c} |"));
+            }
+            doc.push('\n');
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(600.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(max_x > 1.0, "setup：宽表应可横向滚动（max_x={max_x}）");
+
+        // 指针落在表格网格上，发一个横向滚轮事件。
+        let grid = vc.debug_bounds("live-table-scroll").expect("滚动容器");
+        let at = grid.center();
+        let before = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        vc.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(-60.), px(0.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+        let after = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            after < before - 1.0,
+            "横向滚轮应让表格内容右移（offset.x {before} → {after}）"
+        );
+    }
+
+    /// 点击 mermaid 卡片的「全宽」按钮：同样走真实点击链路。
+    #[gpui::test]
+    fn clicking_mermaid_wide_button_toggles_full_width(cx: &mut gpui::TestAppContext) {
+        let doc = "```mermaid\nflowchart TD\n    A[开始] --> B[结束]\n```\n";
+        let (view, mut vc) = setup(cx, size(px(1200.), px(700.)), doc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            vc.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            if vc.debug_bounds("live-mm-tab-wide").is_some() {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "mermaid 卡片（含「全宽」tab）应在若干帧内出现");
+        let btn = vc.debug_bounds("live-mm-tab-wide").expect("全宽按钮");
+        vc.simulate_click(btn.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "点击 mermaid「全宽」应置位状态"
+        );
+        let wide = vc.debug_bounds("live-mm-graph").expect("图卡片");
+        assert!(
+            f32::from(wide.size.width) > 900.0,
+            "全宽后图卡片应占满 1200px 窗口，实际 {wide:?}"
+        );
+        let btn = vc.debug_bounds("live-mm-tab-wide").expect("全宽按钮");
+        vc.simulate_click(btn.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "再点一次应取消"
+        );
     }
 }

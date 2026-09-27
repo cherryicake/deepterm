@@ -40,7 +40,7 @@ use crate::theme::AppTheme;
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// 图片展示最大宽度（`image_card` 同款上限；卡片 `overflow_hidden` 兜底裁剪）。
-const MAX_DISPLAY_W: f32 = 640.0;
+pub(crate) const MAX_DISPLAY_W: f32 = 640.0;
 
 /// 栅格化尺寸上限（与 `image_viewer` 同款防 viewBox 膨胀炸弹）。
 const MAX_DIM: f32 = 8000.0;
@@ -200,7 +200,8 @@ pub(crate) struct RenderedMermaid {
 }
 
 impl RenderedMermaid {
-    /// 按 `MAX_DISPLAY_W` 等比缩放后的展示尺寸（保底 1×1 防零尺寸）。
+    /// 阅读态展示尺寸：按 `MAX_DISPLAY_W` 等比缩放，**只缩不放**（保底 1×1
+    /// 防零尺寸）。图本身比 640 窄时保持原尺寸。
     pub(crate) fn display_size(&self) -> (f32, f32) {
         let w = self.width.max(1.0);
         let h = self.height.max(1.0);
@@ -208,9 +209,52 @@ impl RenderedMermaid {
         (w * s, h * s)
     }
 
+    /// 不缩放的自然尺寸（宽 + 高）：缩放百分比与「还原」都以此为 100%。
+    pub(crate) fn natural_size(&self) -> (f32, f32) {
+        (self.width.max(1.0), self.height.max(1.0))
+    }
+
+    /// 适配给定视口宽度的展示尺寸（保持长宽比，宽高恰好等于视口宽）。
+    ///
+    /// 全宽模式用它：图**占据整个宽度** —— 比视口宽就缩小，比视口窄就放大
+    /// 到铺满（放大上限 [`ZOOM_MAX`]，避免小图被撑成巨幅）。这与「放大到自然
+    /// 尺寸」是两件事：自然尺寸会让宽图溢出到需要横向滚动，而这里永不溢出。
+    pub(crate) fn fit_width(&self, viewport_w: f32) -> (f32, f32) {
+        let (w, h) = self.natural_size();
+        let vp = viewport_w.max(1.0);
+        let s = (vp / w).clamp(1.0 / ZOOM_MAX, ZOOM_MAX);
+        ((w * s).max(1.0), (h * s).max(1.0))
+    }
+
     pub(crate) fn image(&self) -> &Arc<Image> {
         &self.image
     }
+}
+
+// ---------------------------------------------------------------------------
+// 缩放
+// ---------------------------------------------------------------------------
+
+/// 缩放百分比下限 / 上限。
+///
+/// 范围给得很宽，是为了让「适配宽度」的等效倍率（小图铺满视口时可能 > 1）
+/// 落不到边界上 —— 否则 `+` 会变成按不动的死按钮。真实结构图的自然宽度都在
+/// 数百像素量级，`0.1`/`16` 实际不可达，但仍然是有限值（极端尺寸的图不会
+/// 被撑成无限大）。
+pub(crate) const ZOOM_MIN: f32 = 0.1;
+pub(crate) const ZOOM_MAX: f32 = 16.0;
+/// `+` / `-` 的档位步进（乘除，保证「放大再缩小」回到同一尺寸）。
+pub(crate) const ZOOM_STEP: f32 = 1.25;
+
+/// 缩放百分比显示：`100%` / `125%`，去掉多余小数。
+pub(crate) fn zoom_label(zoom: f32) -> String {
+    format!("{}%", (zoom * 100.0).round() as i32)
+}
+
+/// 按百分比缩放自然尺寸（长宽比不变，尺寸保底 1px）。
+pub(crate) fn zoomed_size(natural: (f32, f32), zoom: f32) -> (f32, f32) {
+    let z = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+    ((natural.0 * z).max(1.0), (natural.1 * z).max(1.0))
 }
 
 /// 构建 deepterm 主题的 merman host profile：
@@ -430,6 +474,11 @@ pub(crate) struct MermaidState {
     prev_keys: Vec<MermaidKey>,
     /// 「源码」tab 状态：围栏首行 → 是否显示源码。
     showing_code: HashSet<usize>,
+    /// 缩放百分比：围栏首行 → 倍率（1.0 = 100% = 自然尺寸）。
+    ///
+    /// 只在用户按过 `+` / `-` 后才有条目（`None` 时按「适配宽度」展示）。
+    /// 与 `showing_code` 同款：按块首行记账，`end_frame` 时裁到仍存在的块。
+    zoom: HashMap<usize, f32>,
     /// 本帧主题指纹（`begin_frame` 写入；帧间查询用上一帧值）。
     theme_fp: u64,
 }
@@ -442,12 +491,22 @@ impl MermaidState {
             frame_ids: Vec::new(),
             prev_keys: Vec::new(),
             showing_code: HashSet::new(),
+            zoom: HashMap::new(),
             theme_fp: 0,
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// 丢弃所有「按块首行记账」的 UI 状态（换文档时用）。
+    ///
+    /// 行号只在一份文档内有意义：重载后同一行号可能落在别的块上，留着旧
+    /// 缩放/源码 tab 会把它们套到无关的块上。
+    pub(crate) fn clear_block_state(&mut self) {
+        self.showing_code.clear();
+        self.zoom.clear();
     }
 
     /// 开帧：写主题指纹、清空本帧键槽（`prev_keys` 保留上一帧，供 ensure 取回退图）。
@@ -513,7 +572,7 @@ impl MermaidState {
     }
 
     /// 收帧：prune 不再出现的键（保留本帧 + 上一帧，上一帧是回退图来源），
-    /// 推进帧位、清理越界的 tab 状态。
+    /// 推进帧位、清理越界的 tab / 缩放状态。
     pub(crate) fn end_frame(&mut self) {
         let old_prev = std::mem::take(&mut self.prev_keys);
         // 本帧 → `prev_keys`（下帧 ensure 的回退取图处），再对新旧两帧 prune。
@@ -524,6 +583,25 @@ impl MermaidState {
             .retain(|k, _| cur.contains(k) || old.contains(k));
         let ids = std::mem::take(&mut self.frame_ids);
         self.showing_code.retain(|id| ids.contains(id));
+        self.zoom.retain(|id, _| ids.contains(id));
+    }
+
+    // ---- 缩放 -----------------------------------------------------------
+
+    /// 某块的**显式**缩放倍率（`None` = 没按过 `+`/`-`，按适配宽度展示）。
+    pub(crate) fn zoom(&self, block_id: usize) -> Option<f32> {
+        self.zoom.get(&block_id).copied()
+    }
+
+    /// 设为显式倍率（`+` / `-` 的落点，已夹在 [`ZOOM_MIN`]/[`ZOOM_MAX`] 内）。
+    pub(crate) fn set_zoom(&mut self, block_id: usize, zoom: f32) {
+        self.zoom
+            .insert(block_id, zoom.clamp(ZOOM_MIN, ZOOM_MAX));
+    }
+
+    /// 清除显式倍率：回到「适配宽度 / 阅读尺寸」的默认展示。
+    pub(crate) fn clear_zoom(&mut self, block_id: usize) {
+        self.zoom.remove(&block_id);
     }
 
     /// 查块渲染体（渲染分支与光标禁区判定共用，保证两者永远一致）。
@@ -884,5 +962,90 @@ mod tests {
             height: 200.0,
         };
         assert_eq!(small.display_size(), (300.0, 200.0));
+    }
+
+    /// 适配宽度：图宽恰好等于视口宽（宽图缩小、小图放大到铺满），长宽比不变。
+    ///
+    /// 「全宽只占据整个宽度、不放大到自然尺寸」这条要求的落点就在这里。
+    #[test]
+    fn fit_width_fills_viewport_without_changing_ratio() {
+        let img = |w: f32, h: f32| RenderedMermaid {
+            image: Arc::new(Image::from_bytes(ImageFormat::Png, vec![0])),
+            width: w,
+            height: h,
+        };
+        // 宽图：缩到视口宽。
+        let (w, h) = img(2000.0, 1000.0).fit_width(800.0);
+        assert!((w - 800.0).abs() < 0.01, "宽图应缩到视口宽，实际 {w}");
+        assert!((h - 400.0).abs() < 0.01, "高度按比例，实际 {h}");
+        // 小图：放大到铺满视口（不是保持原尺寸）。
+        let (w, h) = img(200.0, 100.0).fit_width(800.0);
+        assert!((w - 800.0).abs() < 0.01, "小图应放大到视口宽，实际 {w}");
+        assert!((h - 400.0).abs() < 0.01, "高度按比例，实际 {h}");
+        // 长宽比在所有档位都保持不变。
+        for (nw, nh) in [(2000.0, 1000.0), (300.0, 900.0), (50.0, 25.0)] {
+            let (w, h) = img(nw, nh).fit_width(640.0);
+            assert!(
+                (w / h - nw / nh).abs() < 0.01,
+                "({nw}, {nh}) 适配后长宽比变了：({w}, {h})"
+            );
+        }
+        // 极端小图：放大倍数夹在 ZOOM_MAX 内（不被撑成巨幅）。
+        let (w, _) = img(10.0, 10.0).fit_width(100_000.0);
+        assert!(
+            w <= 10.0 * ZOOM_MAX + 0.01,
+            "放大倍数应夹在 {ZOOM_MAX} 内，实际 {w}"
+        );
+        // 零尺寸视口不炸（首帧 bounds 为 0 的路径）。
+        let (w, h) = img(500.0, 250.0).fit_width(0.0);
+        assert!(w >= 1.0 && h >= 1.0, "尺寸不得归零：({w}, {h})");
+    }
+
+    /// 缩放的纯函数：档位乘除可逆、夹紧、百分比文案无多余小数。
+    #[test]
+    fn zoom_math_is_reversible_and_clamped() {
+        // 乘除可逆（夹紧前）：放大再缩小回到原值。
+        let step_in = |z: f32| z * ZOOM_STEP;
+        let step_out = |z: f32| z / ZOOM_STEP;
+        assert!((step_out(step_in(1.0)) - 1.0).abs() < 1e-6);
+        assert!((step_out(step_in(0.5)) - 0.5).abs() < 1e-6);
+        // 夹紧（`set_zoom` 的落点）。
+        let clamp = |z: f32| z.clamp(ZOOM_MIN, ZOOM_MAX);
+        assert_eq!(clamp(100.0), ZOOM_MAX);
+        assert_eq!(clamp(0.001), ZOOM_MIN);
+        let mut z = 1.0;
+        for _ in 0..40 {
+            z = clamp(step_in(z));
+        }
+        assert_eq!(z, ZOOM_MAX, "反复放大应停在上限");
+        let mut z = 1.0;
+        for _ in 0..40 {
+            z = clamp(step_out(z));
+        }
+        assert_eq!(z, ZOOM_MIN, "反复缩小应停在下限");
+        // 文案。
+        assert_eq!(zoom_label(1.0), "100%");
+        assert_eq!(zoom_label(1.25), "125%");
+        assert_eq!(zoom_label(0.8), "80%");
+        // 尺寸：长宽比不变 + 保底 1px。
+        assert_eq!(zoomed_size((1000.0, 500.0), 2.0), (2000.0, 1000.0));
+        let (w, h) = zoomed_size((1.0, 1.0), ZOOM_MIN);
+        assert!(w >= 1.0 && h >= 1.0, "尺寸不得归零：({w}, {h})");
+    }
+
+    /// 状态机：`+`/`−` 记显式倍率，「还原」清掉它回到适配宽度。
+    #[test]
+    fn zoom_state_records_and_clears() {
+        let mut st = MermaidState::new();
+        assert_eq!(st.zoom(0), None, "初始无显式倍率");
+        st.set_zoom(0, 2.0);
+        assert_eq!(st.zoom(0), Some(2.0));
+        st.clear_zoom(0);
+        assert_eq!(st.zoom(0), None, "还原应回到适配宽度");
+        // 夹紧。
+        st.set_zoom(0, 999.0);
+        assert_eq!(st.zoom(0), Some(ZOOM_MAX));
+        st.set_zoom(0, 0.0);
+        assert_eq!(st.zoom(0), Some(ZOOM_MIN));
     }
 }
