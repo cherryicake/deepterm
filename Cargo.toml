@@ -114,6 +114,10 @@ tree-sitter-yaml = "0.7"
 tree-sitter-java = "0.23"
 tree-sitter-xml = "0.7"
 merman = { version = "0.7.0", features = ["render"] }
+# 项目级搜索与模糊查找器的文件遍历层：尊重 .gitignore/.ignore 的并行 walker。
+# 不用 walkdir 自己实现——忽略规则的层级语义（父目录规则约束子目录、
+# 白名单 `!` 反选、`.git/info/exclude`、全局 gitignore）极易写错。
+ignore = "0.4.32"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

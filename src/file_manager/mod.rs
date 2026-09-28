@@ -14,6 +14,7 @@ pub mod types;
 mod upload_download;
 mod utils;
 mod view;
+pub mod walk;
 pub mod watcher;
 
 pub use conflict::{
@@ -33,3 +34,6 @@ pub use view::{
     endpoint_label, quick_total_size, render_transfer_panel, transfer_item_name, transfer_label,
 };
 pub use watcher::{FsChangeEvent, FsChangeKind, FsWatcher, RemoteFsWatcher, WatcherContext};
+pub use walk::{
+    FileEntry, MAX_WALK_ENTRIES, WalkCancellation, WalkOptions, WalkOutcome, walk, walk_streaming,
+};
