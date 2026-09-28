@@ -2746,6 +2746,13 @@ impl Terminal {
         if !escape_scan::is_kitty_graphics(content) {
             return;
         }
+        // 同步更新（`CSI ?2026h`）期间 vte 把字节攒在 processor 的同步缓冲
+        // 里不解析，grid 停在块开始前——锚点（CSI 定位）会取到旧光标。
+        // 取光标前先回灌，语义与本地路径的 `ScanCtx::flush_sync_update` 一致。
+        if self.vte_processor.sync_bytes_count() > 0 {
+            let mut term = self.term.lock();
+            self.vte_processor.stop_sync(&mut *term);
+        }
         let (cursor, visible) = {
             let term = self.term.lock();
             let grid = term.grid();

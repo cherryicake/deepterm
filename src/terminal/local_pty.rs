@@ -499,6 +499,25 @@ impl ScanCtx<'_> {
         }
     }
 
+    /// 取网格状态前强制回灌同步更新（`CSI ?2026h`…`CSI ?2026l`）的缓冲。
+    ///
+    /// vte 0.15 在同步块期间**不解析**收到的字节，全部攒进
+    /// `sync_state.buffer`，直到 ESU 或超时/超限才回灌——期间 `grid`
+    /// 完全停在块开始前的状态。grok 的帧恰好是
+    /// `2026h + 绘制 + CSI 定位 + 图像分片 + 2026l`：分片 APC 在本层立即
+    /// 执行，可它前面的 CSI 还在缓冲里，锚点会取到**旧光标**（实测取到
+    /// 帧首的 prompt 行，图像因此渲染到输入框上）。与 kitty/ghostty 的
+    /// 语义（序列立即生效、同步只推迟**渲染**）对齐：取锚点前把缓冲解析掉。
+    ///
+    /// 副作用：本帧剩余部分失去 vte 的「同步块内不通知重绘」保护——仅
+    /// 在同步块里出现图形 APC（即传图）时发生一次，换来锚点正确。
+    /// grok 随后的 ESU 到达时同步态已被清掉，按普通序列忽略，无副作用。
+    fn flush_sync_update(&mut self) {
+        if self.processor.sync_bytes_count() > 0 {
+            self.processor.stop_sync(self.terminal);
+        }
+    }
+
     /// 当前网格状态：光标绝对位置 + 可见行窗口。
     ///
     /// 一次取全（而不是分成两个闭包）是因为两者必须来自**同一时刻**的 `grid`
@@ -577,7 +596,11 @@ fn pty_read(
                 terminal,
             });
             let mut emit = |bytes: &[u8]| ctx.borrow_mut().emit(bytes);
-            let mut grid = || ctx.borrow().grid_state();
+            let mut grid = || {
+                let mut ctx = ctx.borrow_mut();
+                ctx.flush_sync_update();
+                ctx.grid_state()
+            };
             scanner.scan(&buf[..unprocessed], pending, &mut emit, &mut grid);
         }
 
@@ -1404,6 +1427,332 @@ mod tests {
             item.size,
             gpui::Size::new(px(COLS as f32 * 9.0), px(ROWS as f32 * 18.0)),
             "c=12,r=6 应按格子铺满（视口内不触发 shrink-to-fit）"
+        );
+
+        parts.reader.sender().shutdown();
+    }
+
+    /// 回放**真实抓取的 grok 1.0.41 原始输出**（`GROK_CAPTURE` 指向的
+    /// 字节文件），断言放置锚点落在 CSI 定位处。
+    ///
+    /// 合成流（上一个测试）只能证明「我猜的字节顺序」没问题；本测试用
+    /// 真机抓的完整会话——含帧重绘、17 次 `a=d`、`CSI 5;19H` 定位、
+    /// 146 片 594KB 分片、以及所有探测查询——排除「真实字节形态与合成
+    /// 假设不一致」这一整类可能。环境变量缺失时直接跳过（CI 无此文件）。
+    #[test]
+    fn grok_real_capture_stream_places_at_csi_anchor() {
+        use crate::terminal::kitty::render::{CellMetrics, Viewport, plan};
+        use crate::terminal::kitty::scanner::KittyGraphicsScanner;
+
+        let Ok(capture) = std::env::var("GROK_CAPTURE") else {
+            return;
+        };
+        let bounds = crate::terminal::TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            gpui::Bounds {
+                origin: Point::default(),
+                size: gpui::Size::new(px(1620.0), px(720.0)),
+            },
+        );
+
+        // 真实流的锚点：CSI 5;19H → 0-based (4, 18)；首片 c=143,r=32,z=1。
+        let script = format!("cat '{}'; printf SENTINEL", capture.replace('\'', "'\\''"));
+        let options = alacritty_terminal::tty::Options {
+            shell: Some(alacritty_terminal::tty::Shell::new(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), script],
+            )),
+            working_directory: None,
+            drain_on_exit: true,
+            env: std::collections::HashMap::new(),
+        };
+
+        let pty =
+            alacritty_terminal::tty::new(&options, bounds.into(), 0).expect("创建本地 PTY 失败");
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let listener = ZedListener(events_tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &bounds,
+            listener.clone(),
+        )));
+
+        // 真实 PNG 445KB → RGBA ~8.3MB，缓存必须放得下，否则解码即淘汰。
+        let storage = Arc::new(StdMutex::new(
+            crate::terminal::kitty::storage::Storage::new(64 * 1024 * 1024),
+        ));
+        let replies = Arc::new(StdMutex::new(Vec::new()));
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct SharedSink {
+            replies: Arc<StdMutex<Vec<u8>>>,
+            changes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::terminal::kitty::scanner::ReplySink for SharedSink {
+            fn reply(&mut self, bytes: &[u8]) {
+                self.replies.lock().unwrap().extend_from_slice(bytes);
+            }
+            fn images_changed(&mut self) {
+                self.changes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let scanner = KittyGraphicsScanner::with_storage(
+            storage.clone(),
+            true,
+            Box::new(SharedSink {
+                replies: replies.clone(),
+                changes: changes.clone(),
+            }),
+        );
+
+        let parts = LocalReader::spawn(
+            pty,
+            term.clone(),
+            listener,
+            Box::new(scanner),
+            bounds.into(),
+        )
+        .expect("启动读线程失败");
+
+        let ran = wait_until(
+            || grid_text(&term).contains("SENTINEL"),
+            Duration::from_secs(10),
+        );
+        assert!(ran, "回放脚本未跑到 SENTINEL");
+
+        let done = wait_until(
+            || {
+                let s = storage.lock().unwrap();
+                s.get(1).is_some_and(|img| img.placements.len() == 1)
+            },
+            Duration::from_secs(20),
+        );
+        assert!(
+            done,
+            "超时：真实 grok 流未完成传输+放置；应答: {:?}",
+            String::from_utf8_lossy(&replies.lock().unwrap())
+        );
+
+        {
+            let s = storage.lock().unwrap();
+            let stored = s.get(1).expect("图像 1 应落进存储");
+            assert_eq!(
+                (stored.image.width, stored.image.height),
+                (2148, 962),
+                "应解出抓取时所用 PNG 的真实尺寸"
+            );
+            let placement = &stored.placements[&1];
+            assert_eq!(
+                (placement.row, placement.col),
+                (4, 18),
+                "放置锚点必须来自 CSI 5;19H（框内），实际落在 {:?}",
+                (placement.row, placement.col)
+            );
+            assert_eq!(
+                (placement.columns, placement.rows),
+                (Some(143), Some(32)),
+                "首片 c=/r= 应被末片合并保留"
+            );
+            assert_eq!(placement.z, 1, "z=1");
+        }
+
+        assert!(
+            changes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "传输应标记图像已变化"
+        );
+
+        let placed = {
+            let s = storage.lock().unwrap();
+            plan(
+                &s,
+                CellMetrics {
+                    cell_width: px(9.0),
+                    line_height: px(24.0),
+                },
+                Viewport {
+                    origin: Point::new(px(0.0), px(0.0)),
+                    display_offset: 0,
+                    rows: 45,
+                    cols: 180,
+                },
+            )
+        };
+        assert_eq!(placed.len(), 1, "plan() 应产出恰好 1 个绘制项");
+        let item = &placed[0];
+        assert_eq!(
+            item.origin,
+            Point::new(px(18.0 * 9.0), px(4.0 * 24.0)),
+            "绘制原点必须在框内 (row=4, col=18)，实际 {:?}",
+            item.origin
+        );
+
+        parts.reader.sender().shutdown();
+    }
+
+    /// 同步更新块（`CSI ?2026h`…`CSI ?2026l`）内的「CSI 定位 + 图像
+    /// 传输」必须仍按 CSI 锚定。
+    ///
+    /// 回归自 grok 真机形态：vte 0.15 在同步块期间不解析字节（攒进
+    /// `sync_state.buffer`，ESU 才回灌），而 grok 的帧恰是
+    /// `2026h + 绘制 + CSI + 分片 + 2026l`——分片 APC 在读线程立即执行，
+    /// 它前面的 CSI 却还在缓冲里，修复前锚点取到块开始前的旧光标
+    ///（prompt 行），图像被渲染到输入框上。取锚点前必须强制回灌
+    /// （`ScanCtx::flush_sync_update`）。
+    #[test]
+    fn sync_update_block_keeps_csi_anchor_for_image_transmit() {
+        use crate::terminal::kitty::render::{CellMetrics, Viewport, plan};
+        use crate::terminal::kitty::scanner::KittyGraphicsScanner;
+
+        let bounds = crate::terminal::TerminalBounds::default();
+
+        // 8×8 灰度 PNG（约百字节，单分片即可：锚点问题与分片数无关）。
+        const PNG_8X8_GRAY: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0xe1, 0x64, 0xe1, 0x57, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x68, 0x80, 0x02, 0x06, 0xca, 0x18, 0x00, 0x80, 0x84, 0x20, 0x01, 0x0d,
+            0x80, 0x24, 0x61, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+            0x82,
+        ];
+        let b64 = base64_encode(PNG_8X8_GRAY);
+
+        const COLS: u32 = 12;
+        const ROWS: u32 = 6;
+
+        // 真实 grok 帧形态：同步块开始 → 帧文本把光标停在 prompt 行 →
+        // 删除旧放置 → CSI 定位到框内 → 分片传输（m=0 单片）→ 同步块结束。
+        let mut script = String::new();
+        script.push_str(
+            r"printf '\033[?2026h\033[41;23HPROMPT\033_Ga=d,d=i,i=1,q=2\033\\\033[7;10H'; ",
+        );
+        script.push_str(&format!(
+            "printf '\\033_Ga=T,f=100,t=d,q=2,C=1,z=1,i=1,p=1,c={COLS},r={ROWS},m=0;{b64}\\033\\\\'; "
+        ));
+        script.push_str(r"printf '\033[?2026l'; printf SENTINEL");
+
+        let options = alacritty_terminal::tty::Options {
+            shell: Some(alacritty_terminal::tty::Shell::new(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), script],
+            )),
+            working_directory: None,
+            drain_on_exit: true,
+            env: std::collections::HashMap::new(),
+        };
+
+        let pty =
+            alacritty_terminal::tty::new(&options, bounds.into(), 0).expect("创建本地 PTY 失败");
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let listener = ZedListener(events_tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &bounds,
+            listener.clone(),
+        )));
+
+        let storage = Arc::new(StdMutex::new(
+            crate::terminal::kitty::storage::Storage::new(1024 * 1024),
+        ));
+        let replies = Arc::new(StdMutex::new(Vec::new()));
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct SharedSink {
+            replies: Arc<StdMutex<Vec<u8>>>,
+            changes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::terminal::kitty::scanner::ReplySink for SharedSink {
+            fn reply(&mut self, bytes: &[u8]) {
+                self.replies.lock().unwrap().extend_from_slice(bytes);
+            }
+            fn images_changed(&mut self) {
+                self.changes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let scanner = KittyGraphicsScanner::with_storage(
+            storage.clone(),
+            true,
+            Box::new(SharedSink {
+                replies: replies.clone(),
+                changes: changes.clone(),
+            }),
+        );
+
+        let parts = LocalReader::spawn(
+            pty,
+            term.clone(),
+            listener,
+            Box::new(scanner),
+            bounds.into(),
+        )
+        .expect("启动读线程失败");
+
+        let ran = wait_until(
+            || grid_text(&term).contains("SENTINEL"),
+            Duration::from_secs(5),
+        );
+        assert!(ran, "子进程未跑到 SENTINEL");
+
+        let done = wait_until(
+            || {
+                let s = storage.lock().unwrap();
+                s.get(1).is_some_and(|img| img.placements.len() == 1)
+            },
+            Duration::from_secs(10),
+        );
+        assert!(
+            done,
+            "超时：同步块内的 a=T 未完成传输+放置；应答: {:?}",
+            String::from_utf8_lossy(&replies.lock().unwrap())
+        );
+
+        {
+            let s = storage.lock().unwrap();
+            let stored = s.get(1).expect("图像 1 应落进存储");
+            let placement = &stored.placements[&1];
+            assert_eq!(
+                (placement.row, placement.col),
+                (6, 9),
+                "同步块内 CSI 7;10H 必须先于锚点生效（修复前取到 prompt 行 40;22），实际 {:?}",
+                (placement.row, placement.col)
+            );
+            assert_eq!(
+                (placement.columns, placement.rows),
+                (Some(COLS), Some(ROWS)),
+                "c=/r= 应落位"
+            );
+            assert_eq!(placement.z, 1, "z=1");
+        }
+        assert!(
+            changes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "传输应标记图像已变化"
+        );
+
+        let placed = {
+            let s = storage.lock().unwrap();
+            plan(
+                &s,
+                CellMetrics {
+                    cell_width: px(9.0),
+                    line_height: px(18.0),
+                },
+                Viewport {
+                    origin: Point::new(px(0.0), px(0.0)),
+                    display_offset: 0,
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+        };
+        assert_eq!(placed.len(), 1, "plan() 应产出恰好 1 个绘制项");
+        assert_eq!(
+            placed[0].origin,
+            Point::new(px(9.0 * 9.0), px(6.0 * 18.0)),
+            "绘制原点应为 CSI 7;10H 定位后的光标位置"
         );
 
         parts.reader.sender().shutdown();
