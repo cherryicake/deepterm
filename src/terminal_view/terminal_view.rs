@@ -498,6 +498,12 @@ pub struct TerminalView {
     /// 动画，所以这里记住"下次该换帧的时刻"，只有到点才请求重绘——否则
     /// 只要有动画在跑，`render` 就会自己把自己无限地重新调度下去。
     pub kitty_animation_clock: crate::terminal::kitty::AnimationClock,
+    // ── Cursor animation ────────────────────────────────────────────────────
+    /// 光标弹簧动画状态（四角独立弹簧 + 形状 morph + 滚动同步）。
+    ///
+    /// 与行缓存 / Kitty 缓存同处视图上：元素是每帧新建的临时对象，
+    /// 弹簧必须跨帧存活才有意义。元素在 prepaint 里借它推进一帧。
+    pub cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator,
     // ── Scrollbar thumb animation ───────────────────────────────────────────
     /// Current animated thumb Y offset (relative to track top).
     pub scrollbar_thumb_y: Pixels,
@@ -749,16 +755,16 @@ impl TerminalView {
         self.blink_manager.update(cx, |blink, cx| blink.pause(cx));
     }
 
-    /// Returns whether the cursor should currently be painted. Failing the
-    /// focused check renders the hollow/outline form of the cursor; the
-    /// blink manager only runs while focused.
-    fn should_show_cursor(&self, focused: bool, cx: &App) -> bool {
+    /// Returns the cursor's current draw opacity (0.0 = hidden, 1.0 = solid).
+    /// Failing the focused check renders the hollow/outline form of the cursor;
+    /// the blink manager only runs while focused.
+    fn cursor_opacity(&self, focused: bool, cx: &App) -> f32 {
         if !focused {
             // When unfocused we always draw the hollow outline; element
             // maps Block->Hollow unconditionally.
-            return true;
+            return 1.0;
         }
-        self.blink_manager.read(cx).visible()
+        self.blink_manager.read(cx).opacity()
     }
 
     /// Reacts to focus edges. Enables blinking on focus-in (subject to
@@ -970,6 +976,7 @@ impl TerminalView {
             scratch_dirty_row_bounds: Vec::new(),
             kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
             kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
+            cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator::new(),
             scrollbar_thumb_y: px(0.0),
             scrollbar_target_y: px(0.0),
             scrollbar_anim_from_y: px(0.0),
@@ -1227,6 +1234,7 @@ impl TerminalView {
                 scratch_dirty_row_bounds: Vec::new(),
                 kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
                 kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
+                cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator::new(),
                 scrollbar_thumb_y: px(0.0),
                 scrollbar_target_y: px(0.0),
                 scrollbar_anim_from_y: px(0.0),
@@ -2678,6 +2686,23 @@ impl TerminalView {
             })
             .ok();
         }));
+    }
+
+    /// 平滑闪烁淡入淡出窗口的帧驱动。
+    ///
+    /// 与 [`Self::tick_kitty_animations`] 同一套约定：只有确实需要连续帧
+    /// （渐变窗口内）才请求下一帧，相位中间静止即停，不会让渲染循环空转。
+    /// 请求走 `Window::on_next_frame`，由平台帧源（macOS 上 `CVDisplayLink`）
+    /// 按显示器刷新率驱动——比 `background_executor` 的定时器更准、
+    /// 与 vsync 对齐，观感更顺。
+    ///
+    /// 光标弹簧的推进在 `TerminalElement::prepaint` 里做（那里才有光标目标
+    /// 与元素坐标），推进完若仍在运动，同样请求下一帧。
+    fn tick_cursor_animations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blink_manager.read(cx).needs_repaint() {
+            let view_id = cx.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(view_id));
+        }
     }
 
     /// Calculate the scrollbar thumb Y offset (relative to track top) from
@@ -4776,7 +4801,7 @@ impl Render for TerminalView {
 
         // React to focus edges so we can start/stop blinking.
         self.on_focus_changed(is_focused, cx);
-        let cursor_visible = self.should_show_cursor(is_focused, cx);
+        let cursor_opacity = self.cursor_opacity(is_focused, cx);
         let show_scrollbar = self.should_show_scrollbar(cx);
 
         // ── Kitty 动画帧推进 ──────────────────────────────────────────────────
@@ -4785,6 +4810,11 @@ impl Render for TerminalView {
         // 让渲染循环空转。换帧会 bump 图像代际，元素 prepaint 的
         // `take_kitty_damage()` 随后认出来并全量重绘。
         self.tick_kitty_animations(cx);
+
+        // ── 光标动画 / 平滑闪烁的帧推进 ────────────────────────────────────────
+        // 弹簧本身在元素 prepaint 里推进；这里只决定「还要不要下一帧」，
+        // 收敛后立刻停止重绘请求。
+        self.tick_cursor_animations(window, cx);
 
         // Pre-read terminal state needed below to avoid redundant entity locks.
         let (scrollbar_drag_offset, last_scroll_time) = {
@@ -5116,7 +5146,7 @@ impl Render for TerminalView {
                             terminal.clone(),
                             focus_handle,
                             is_focused,
-                            cursor_visible,
+                            cursor_opacity,
                             view_entity,
                         ),
                     )

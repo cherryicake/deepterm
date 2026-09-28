@@ -4,6 +4,7 @@ use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
+use crate::terminal_view::cursor_animation::{CursorQuad, CursorShape, CursorTarget};
 use crate::terminal_view::terminal_view::TerminalView;
 use crate::theme::{ActiveTheme, TerminalTheme};
 #[cfg(test)]
@@ -66,10 +67,7 @@ fn paint_decoration(
     let span_w = cell_width * dec.width as f32;
     let x0 = origin.x + cell_width * dec.start_col as f32;
     let mut line = |y: Pixels, x: Pixels, w: Pixels| {
-        window.paint_quad(fill(
-            Bounds::new(point(x, y), size(w, px(1.0))),
-            dec.color,
-        ));
+        window.paint_quad(fill(Bounds::new(point(x, y), size(w, px(1.0))), dec.color));
     };
 
     match dec.kind {
@@ -323,12 +321,42 @@ pub struct FlattenedRenderCache {
     pub metrics: Option<RenderMetricsSignature>,
 }
 
+/// 按形状把光标画进窗口。
+///
+/// 全部形状都基于四角四边形绘制（与 neovide 相同，移动时剪切形变）：
+/// Block / Bar / Underline 走路径填充，Hollow 走空心描边
+/// （对应 neovide 的 `draw_rectangle` / `draw_rectangular_outline`）。
+fn paint_cursor_shape(
+    window: &mut Window,
+    shape: CursorShape,
+    quad: &CursorQuad,
+    thickness: Pixels,
+    color: Hsla,
+) {
+    match shape {
+        CursorShape::Hollow => {
+            quad.paint_outline(window, thickness.as_f32(), color);
+        }
+        _ => {
+            quad.paint_fill(window, color);
+        }
+    }
+}
+
 /// CursorLayout - simplified implementation inspired by Zed's CursorLayout
 /// Computed during prepaint phase, rendered during paint phase
 pub struct CursorLayout {
-    origin: Point<Pixels>,
-    block_width: Pixels,
-    line_height: Pixels,
+    /// 本帧绘制四边形（四角，已含弹簧动画的位置与形状形变）。
+    ///
+    /// 与 neovide 相同：四个角各跑各的弹簧，移动过程中被剪切成平行四边形。
+    /// 静止时退化为轴对齐矩形。
+    quad: CursorQuad,
+    /// 静止目标（格子左上角，像素）：反白字符与盒字符按它定位
+    /// （neovide 同样在静止 `destination` 上画字符，动画只影响光标背景）。
+    destination: Point<Pixels>,
+    /// 静止宽度（未动画），用于判断形状 morph 是否收敛。
+    settled_width: Pixels,
+    settled_height: Pixels,
     thickness: Pixels,
     color: gpui::Hsla,
     shape: CursorShape,
@@ -343,12 +371,50 @@ pub struct CursorLayout {
     block_box_drawing: Option<(char, Hsla)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CursorShape {
-    Block,
-    Hollow,
-    Bar,
-    Underline,
+impl CursorLayout {
+    fn paint(&self, window: &mut Window, cx: &mut gpui::App) {
+        paint_cursor_shape(window, self.shape, &self.quad, self.thickness, self.color);
+
+        // 反白字符：与 neovide 一致，画在**静止目标**上（不是动画中的四边形），
+        // 并裁剪到四边形的包围盒内——移动过程中字形随光标逐步显露，
+        // 而不是先于光标浮现在目标位置。
+        //
+        // neovide 用 `clip_path` 做精确的平行四边形裁剪；GPUI 只有矩形
+        // content mask，这里用四边形的包围盒近似（略宽松，不会漏画）。
+        if self.block_text.is_some() || self.block_box_drawing.is_some() {
+            let clip = gpui::ContentMask {
+                bounds: self.quad.bounding_box(),
+            };
+            window.with_content_mask(Some(clip), |window| {
+                // Paint character on block cursor with inverted colors
+                if let Some(block_text) = &self.block_text {
+                    let _ = block_text.paint(
+                        self.destination,
+                        self.settled_height,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+
+                // Paint inverted box-drawing glyph on top of a Block cursor.
+                // `block_width` may be wider than `cell_width` for wide chars, but
+                // box-drawing characters are never wide (U+2500–U+259F); use the
+                // cell_width implicit from `block_width` when it equals 1 cell.
+                if let Some((ch, color)) = self.block_box_drawing {
+                    box_drawing::paint_box_drawing(
+                        ch,
+                        self.destination,
+                        self.settled_width,
+                        self.settled_height,
+                        color,
+                        window,
+                    );
+                }
+            });
+        }
+    }
 }
 
 pub struct LocalOverlayLayout {
@@ -360,8 +426,11 @@ pub struct LocalOverlayLayout {
     cursor_row: usize,
     cursor_col: usize,
     cursor_shape: CursorShape,
-    cursor_color: Hsla,
+    /// 本帧覆盖层光标的绘制四边形（已含弹簧动画位置/形状）。
+    /// 由 prepaint 的动画器算出；`None` = 本帧不绘制（闪烁灭相）。
+    cursor_quad: Option<CursorQuad>,
     cursor_thickness: Pixels,
+    cursor_color: Hsla,
 }
 
 pub struct OverlayRow {
@@ -376,98 +445,6 @@ pub struct ShapedSegment {
     shaped_line: gpui::ShapedLine,
     /// 段起始列（grid 列）。
     start_col: usize,
-}
-
-impl CursorLayout {
-    fn paint(&self, window: &mut Window, cx: &mut gpui::App) {
-        match self.shape {
-            CursorShape::Bar => {
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: self.origin,
-                        size: size(self.thickness, self.line_height),
-                    },
-                    self.color,
-                ));
-            }
-            CursorShape::Block => {
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: self.origin,
-                        size: size(self.block_width, self.line_height),
-                    },
-                    self.color,
-                ));
-            }
-            CursorShape::Underline => {
-                window.paint_quad(fill(
-                    Bounds {
-                        origin: self.origin + point(px(0.0), self.line_height - self.thickness),
-                        size: size(self.block_width, self.thickness),
-                    },
-                    self.color,
-                ));
-            }
-            CursorShape::Hollow => {
-                let vertical_height = if self.line_height > self.thickness * 2.0 {
-                    self.line_height - self.thickness * 2.0
-                } else {
-                    Pixels::ZERO
-                };
-
-                let quads = [
-                    Bounds {
-                        origin: self.origin,
-                        size: size(self.block_width, self.thickness),
-                    },
-                    Bounds {
-                        origin: self.origin + point(px(0.0), self.line_height - self.thickness),
-                        size: size(self.block_width, self.thickness),
-                    },
-                    Bounds {
-                        origin: self.origin + point(px(0.0), self.thickness),
-                        size: size(self.thickness, vertical_height),
-                    },
-                    Bounds {
-                        origin: self.origin
-                            + point(self.block_width - self.thickness, self.thickness),
-                        size: size(self.thickness, vertical_height),
-                    },
-                ];
-
-                for quad in quads {
-                    window.paint_quad(fill(quad, self.color));
-                }
-            }
-        }
-
-        // Paint character on block cursor with inverted colors
-        if let Some(block_text) = &self.block_text {
-            let _ = block_text.paint(
-                self.origin,
-                self.line_height,
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
-        }
-
-        // Paint inverted box-drawing glyph on top of a Block cursor.
-        // `block_width` may be wider than `cell_width` for wide chars, but
-        // box-drawing characters are never wide (U+2500–U+259F); use the
-        // cell_width implicit from `block_width` when it equals 1 cell.
-        if let Some((ch, color)) = self.block_box_drawing {
-            box_drawing::paint_box_drawing(
-                ch,
-                self.origin,
-                self.block_width,
-                self.line_height,
-                color,
-                window,
-            );
-        }
-    }
 }
 
 /// 一行里的一段同款式文本，带已排版好的 `ShapedLine`。
@@ -486,12 +463,7 @@ pub struct BatchedTextRun {
 }
 
 impl BatchedTextRun {
-    fn new(
-        row: usize,
-        col: usize,
-        cell_count: usize,
-        shaped_line: gpui::ShapedLine,
-    ) -> Self {
+    fn new(row: usize, col: usize, cell_count: usize, shaped_line: gpui::ShapedLine) -> Self {
         BatchedTextRun {
             start_col: col,
             start_row: row,
@@ -559,9 +531,7 @@ pub enum DecorationKind {
 
 /// 从 cell flags 派生下划线种类（不含 URL 悬停状态）。
 #[inline]
-fn underline_kind_from_flags(
-    flags: &alacritty_terminal::term::cell::Flags,
-) -> UnderlineKind {
+fn underline_kind_from_flags(flags: &alacritty_terminal::term::cell::Flags) -> UnderlineKind {
     use alacritty_terminal::term::cell::Flags;
     if flags.contains(Flags::UNDERLINE) {
         UnderlineKind::Single
@@ -647,7 +617,9 @@ pub struct TerminalElement {
     terminal: Entity<Terminal>,
     focus: FocusHandle,
     focused: bool,
-    cursor_visible: bool,
+    /// 闪烁不透明度：1.0 = 实心，0.0 = 不绘制。
+    /// 淡入淡出窗口内由 `BlinkCursor::opacity` 给出中间值。
+    cursor_opacity: f32,
     view: Entity<TerminalView>,
 }
 
@@ -698,14 +670,14 @@ impl TerminalElement {
             }),
             // URL 悬停：主题蓝色单下划线（颜色不取 cell 前景，保持链接语义）
             UnderlineKind::HoverLink => Some(gpui::UnderlineStyle {
-                color: Some(
-                    theme.named_color(alacritty_terminal::vte::ansi::NamedColor::Blue),
-                ),
+                color: Some(theme.named_color(alacritty_terminal::vte::ansi::NamedColor::Blue)),
                 thickness: px(1.0),
                 wavy: false,
             }),
             // Double/Dotted/Dashed 走自绘；None 无装饰。
-            UnderlineKind::Double | UnderlineKind::Dotted | UnderlineKind::Dashed
+            UnderlineKind::Double
+            | UnderlineKind::Dotted
+            | UnderlineKind::Dashed
             | UnderlineKind::None => None,
         };
         TextRun {
@@ -776,12 +748,10 @@ impl TerminalElement {
             terminal_theme,
             palette,
         );
-        let full_boxes =
-            Self::box_cells_for_row(row_idx, row_cells, terminal_theme, palette);
+        let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme, palette);
         let full_backgrounds =
             Self::background_spans_for_row(row_idx, row_cells, terminal_theme, palette);
-        let full_selection_spans =
-            selection_spans_for_row(row_idx, row_cells, selection_range);
+        let full_selection_spans = selection_spans_for_row(row_idx, row_cells, selection_range);
 
         if Self::run_signature(row_runs) != Self::run_signature(&full_entry.runs) {
             log::warn!("row {row_idx} run mismatch");
@@ -801,14 +771,14 @@ impl TerminalElement {
         terminal: Entity<Terminal>,
         focus: FocusHandle,
         focused: bool,
-        cursor_visible: bool,
+        cursor_opacity: f32,
         view: Entity<TerminalView>,
     ) -> Self {
         Self {
             terminal,
             focus,
             focused,
-            cursor_visible,
+            cursor_opacity,
             view,
         }
     }
@@ -1007,9 +977,7 @@ impl TerminalElement {
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
     ) -> Vec<BackgroundSpan> {
-        Self::background_spans_for_range(
-            row_idx, cells, (0, usize::MAX), terminal_theme, palette,
-        )
+        Self::background_spans_for_range(row_idx, cells, (0, usize::MAX), terminal_theme, palette)
     }
 
     fn background_spans_for_range(
@@ -1167,8 +1135,7 @@ impl TerminalElement {
     ) -> Vec<BoxDrawingCell> {
         let mut box_cells = Vec::new();
         for cell in cells {
-            if let Some(box_cell) =
-                Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
             {
                 box_cells.push(box_cell);
             }
@@ -1196,8 +1163,7 @@ impl TerminalElement {
             if col < left || col > right {
                 continue;
             }
-            if let Some(box_cell) =
-                Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
             {
                 box_cells.push(box_cell);
             }
@@ -1374,8 +1340,9 @@ impl TerminalElement {
             cursor_row: wrapped.cursor_row,
             cursor_col: wrapped.cursor_col,
             cursor_shape,
-            cursor_color,
+            cursor_quad: None,
             cursor_thickness: cursor_thickness(cell_width),
+            cursor_color,
         })
     }
 }
@@ -1871,6 +1838,24 @@ impl Element for TerminalElement {
             AlacCursorShape::HollowBlock => CursorShape::Hollow,
             AlacCursorShape::Hidden => CursorShape::Bar,
         };
+        // beam / underline 的粗细比例（对应 neovide 的 `cell_percentage`）。
+        //
+        // nvim 通过 `mode_info_set` 的 `cell_percentage` 给出该值，alacritty
+        // 没有这个概念；这里按 DeepTerm 原有的 `cursor_thickness`（cell_width
+        // 的 15%，至少 1px）反推，保持改动前的视觉：
+        // - Bar 的宽度按 **cell 宽**缩放 → 比例 = thickness / cell_width；
+        // - Underline 的高度按 **行高**缩放 → 比例 = thickness / line_height；
+        //   两者分母不同，所以必须分别算，否则下划线会粗一倍。
+        let cursor_thickness_px = cursor_thickness(cell_width);
+        let overlay_cell_percentage = match overlay_cursor_shape {
+            CursorShape::Bar => {
+                (cursor_thickness_px.as_f32() / cell_width.as_f32()).clamp(0.0, 1.0)
+            }
+            CursorShape::Underline => {
+                (cursor_thickness_px.as_f32() / line_height.as_f32()).clamp(0.0, 1.0)
+            }
+            _ => CURSOR_THICKNESS_RATIO,
+        };
 
         // 光标色走调色板（OSC 12 改色 / 主题切换实时生效）。
         let cursor_color = palette.resolve(
@@ -1880,95 +1865,14 @@ impl Element for TerminalElement {
             &terminal_theme,
         );
 
-        // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
-        // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
-        // 终端不渲染光标，让应用程序自己处理
-        // IME 输入时也隐藏光标，由 preedit overlay 替代显示
-        let cursor = if self.cursor_visible
-            && cursor_in_viewport
-            && cursor_shape != AlacCursorShape::Hidden
-            && !has_local_overlay_input
-        {
-            let cursor_x = terminal_bounds.bounds.left()
-                + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
-            let cursor_y = terminal_bounds.bounds.top()
-                + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
-
-            let cursor_char = cursor_cell.c;
-            let cursor_cells_wide = if cursor_cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
-            {
-                2.0
-            } else {
-                char_cell_width(cursor_char) as f32
-            };
-            let cursor_block_width = cell_width * cursor_cells_wide;
-            let block_text_color = terminal_theme.background;
-
-            // Preserve bold/italic so the inverted glyph matches the cell.
-            let cursor_font = {
-                let mut f = text_style.font();
-                if cursor_cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::BOLD)
-                {
-                    f.weight = FontWeight::BOLD;
-                }
-                if cursor_cell
-                    .flags
-                    .contains(alacritty_terminal::term::cell::Flags::ITALIC)
-                {
-                    f.style = FontStyle::Italic;
-                }
-                f
-            };
-
-            // Block cursor draws the glyph on top in the inverted (background)
-            // color. For box-drawing chars we bypass the font rasterizer and
-            // re-run our rect-based painter so the lines stay aligned.
-            let (block_text, block_box_drawing) =
-                if matches!(overlay_cursor_shape, CursorShape::Block) {
-                    if box_drawing::is_box_drawing_char(cursor_char) {
-                        (None, Some((cursor_char, block_text_color)))
-                    } else if cursor_char != '\0' && cursor_char != ' ' {
-                        let char_str = cursor_char.to_string();
-                        let len = cursor_char.len_utf8();
-                        let shaped = window.text_system().shape_line(
-                            char_str.into(),
-                            font_size,
-                            &[TextRun {
-                                len,
-                                font: cursor_font,
-                                color: block_text_color,
-                                ..Default::default()
-                            }],
-                            Some(cursor_block_width),
-                        );
-                        (Some(shaped), None)
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
-
-            Some(CursorLayout {
-                origin: point(cursor_x, cursor_y),
-                block_width: cursor_block_width,
-                line_height,
-                thickness: cursor_thickness(cell_width),
-                color: cursor_color,
-                shape: overlay_cursor_shape,
-                block_text,
-                block_box_drawing,
-            })
-        } else {
-            None
-        };
+        // 闪烁不透明度：1.0 = 实心；淡入淡出窗口内线性变化。
+        // 同一因子同时作用于光标矩形与反白字符，避免半透明块上浮着
+        // 一个实心反白字。
+        let cursor_opacity = self.cursor_opacity.clamp(0.0, 1.0);
+        let cursor_color = cursor_color.opacity(cursor_opacity);
 
         // Shape local overlay text for rendering at the shell prompt position.
-        let input_overlay: Option<LocalOverlayLayout> = if cursor_in_viewport {
+        let mut input_overlay: Option<LocalOverlayLayout> = if cursor_in_viewport {
             let (builtin_text, ime_text, builtin_cursor) = {
                 let view = self.view.read(cx);
                 // 借用而非拷贝：空 builtin/IME 是绝大多数帧的常态，
@@ -1998,6 +1902,186 @@ impl Element for TerminalElement {
             )
         } else {
             None
+        };
+
+        // ── 光标弹簧动画 ────────────────────────────────────────────────────
+        // 四个角各跑各的弹簧（与 neovide 相同），移动过程中光标被剪切成
+        // 平行四边形；滚动（display_offset 变化）由动画器整体平移，不产生动画。
+        let cursor_thickness_px = cursor_thickness(cell_width);
+        let layout_origin = terminal_bounds.bounds.origin;
+
+        // 主光标目标。形状为 Hidden（应用自绘光标）或视口外 / 覆盖层接管
+        // 时为 None —— 动画器据此复位，下次出现直接就位而不是从中途飞入。
+        let main_target: Option<CursorTarget> = if cursor_in_viewport
+            && cursor_shape != AlacCursorShape::Hidden
+            && !has_local_overlay_input
+        {
+            // 宽字符只在 Block 形状下加宽（与 neovide `double_width` 一致：
+            // 那里同样只在 `shape == Block` 时把 `cursor_width` 翻倍）。
+            // Bar / Underline 的尺寸由自身定义决定，与字符宽度无关。
+            let wide_scale = if cursor_cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
+            {
+                2.0
+            } else {
+                char_cell_width(cursor_cell.c) as f32
+            };
+            let cursor_cells_wide = if overlay_cursor_shape == CursorShape::Block {
+                wide_scale
+            } else {
+                1.0
+            };
+            let x = terminal_bounds.bounds.left()
+                + px((cursor_display_col as f32 * cell_width.as_f32()).floor());
+            let y = terminal_bounds.bounds.top()
+                + px((cursor_line_in_viewport as f32 * line_height.as_f32()).floor());
+
+            Some(CursorTarget {
+                destination: Point::new(x.as_f32(), y.as_f32()),
+                cell: (
+                    cell_width.as_f32() * cursor_cells_wide,
+                    line_height.as_f32(),
+                ),
+                // beam / underline 的粗细取「单格」比例，与 cell 是否加宽无关。
+                shape_span: (cell_width.as_f32(), line_height.as_f32()),
+                display_offset: display_offset as i32,
+                shape: overlay_cursor_shape,
+                cell_percentage: overlay_cell_percentage,
+                metrics: (cell_width, line_height),
+                layout_origin,
+            })
+        } else {
+            None
+        };
+
+        // 覆盖层光标目标：与主光标互斥，坐标同为窗口绝对像素。
+        let overlay_target: Option<CursorTarget> = input_overlay.as_ref().map(|overlay| {
+            let x = overlay.origin.x + cell_width * overlay.cursor_col as f32;
+            let y = overlay.origin.y + line_height * overlay.cursor_row as f32;
+            CursorTarget {
+                destination: Point::new(x.as_f32(), y.as_f32()),
+                cell: (cell_width.as_f32(), line_height.as_f32()),
+                shape_span: (cell_width.as_f32(), line_height.as_f32()),
+                display_offset: display_offset as i32,
+                shape: overlay.cursor_shape,
+                cell_percentage: overlay_cell_percentage,
+                metrics: (cell_width, line_height),
+                layout_origin,
+            }
+        });
+
+        let animated_quad = {
+            let target = if cursor_opacity > 0.0 {
+                overlay_target.or(main_target)
+            } else {
+                None
+            };
+            let reduce_motion = cx.reduce_motion();
+            // 用 GPUI 调度器的时钟：测试里 `advance_clock` 能推进它，
+            // 生产里与 `std::time::Instant` 同为单调墙钟。
+            let now = cx.background_executor().now();
+            let (quad, animating) = self.view.update(cx, |view, _cx| {
+                // 「减少动态效果」下不做光标动画：每帧复位即每帧瞬移。
+                if reduce_motion {
+                    view.cursor_animator.reset();
+                }
+                let quad = view.cursor_animator.step(target, now);
+                (quad, view.cursor_animator.is_animating())
+            });
+            // 仍在运动 → 请求下一帧。
+            //
+            // 走 `Window::on_next_frame`（平台帧源驱动：macOS 上是
+            // CVDisplayLink，与显示器刷新率同步，ProMotion 下就是 120Hz），
+            // 而不是 `background_executor` 的定时器——定时器不参与 vsync
+            // 对齐，逐帧抖动会让弹簧的连续运动看起来发涩。
+            //
+            // 不用 `Window::request_animation_frame`：它内部按
+            // `window.current_view()` 找要 notify 的实体，而 element 的
+            // prepaint 不一定在 view 的 render 栈里（测试/复用路径下会 panic）。
+            // 这里显式指定本 view 的实体，语义相同且更稳。
+            if animating {
+                let view_id = self.view.entity_id();
+                window.on_next_frame(move |_, cx| cx.notify(view_id));
+            }
+            quad
+        };
+
+        if let Some(overlay) = input_overlay.as_mut() {
+            overlay.cursor_quad = animated_quad;
+        }
+
+        // 计算光标布局 - 如果光标形状为Hidden则跳过（由应用程序自己处理光标渲染）
+        // 这是光标委托机制：当应用程序（如Claude Code）设置光标为Hidden时，
+        // 终端不渲染光标，让应用程序自己处理
+        // IME 输入时也隐藏光标，由 preedit overlay 替代显示
+        let cursor = match (main_target, animated_quad) {
+            (Some(target), Some(quad)) => {
+                let cursor_char = cursor_cell.c;
+                let block_text_color = terminal_theme.background.opacity(cursor_opacity);
+
+                // Preserve bold/italic so the inverted glyph matches the cell.
+                let cursor_font = {
+                    let mut f = text_style.font();
+                    if cursor_cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::BOLD)
+                    {
+                        f.weight = FontWeight::BOLD;
+                    }
+                    if cursor_cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::ITALIC)
+                    {
+                        f.style = FontStyle::Italic;
+                    }
+                    f
+                };
+
+                // 与 neovide 一致：反白字符**始终**绘制，由 `paint` 里的
+                // content mask 裁剪到当前四边形内。neovide 用 `clip_path`
+                // 做同样的裁剪，字符不会溢出、也不会在动画中消失。
+                let settled_width = px(target.cell.0);
+                let settled_height = px(target.cell.1);
+                let (block_text, block_box_drawing) =
+                    if matches!(overlay_cursor_shape, CursorShape::Block) {
+                        if box_drawing::is_box_drawing_char(cursor_char) {
+                            (None, Some((cursor_char, block_text_color)))
+                        } else if cursor_char != '\0' && cursor_char != ' ' {
+                            let char_str = cursor_char.to_string();
+                            let len = cursor_char.len_utf8();
+                            let shaped = window.text_system().shape_line(
+                                char_str.into(),
+                                font_size,
+                                &[TextRun {
+                                    len,
+                                    font: cursor_font,
+                                    color: block_text_color,
+                                    ..Default::default()
+                                }],
+                                Some(settled_width),
+                            );
+                            (Some(shaped), None)
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                Some(CursorLayout {
+                    quad,
+                    destination: point(px(target.destination.x), px(target.destination.y)),
+                    settled_width,
+                    settled_height,
+                    thickness: cursor_thickness_px,
+                    color: cursor_color,
+                    shape: overlay_cursor_shape,
+                    block_text,
+                    block_box_drawing,
+                })
+            }
+            _ => None,
         };
 
         // ── Search highlight spans ─────────────────────────────────────────────────
@@ -2206,14 +2290,7 @@ impl Element for TerminalElement {
                 // GPUI TextRun 仅支持单线 / wavy，这三种在 layout 阶段归集为
                 // DecorationSpan，这里以矩形图元绘制。
                 for dec in &layout.decorations {
-                    paint_decoration(
-                        dec,
-                        origin,
-                        row_idx,
-                        *cell_width,
-                        *line_height,
-                        window,
-                    );
+                    paint_decoration(dec, origin, row_idx, *cell_width, *line_height, window);
                 }
             }
 
@@ -2231,10 +2308,7 @@ impl Element for TerminalElement {
                 .unwrap_or(false);
             if let Some(box_cells) = row_cache.box_cells.as_ref() {
                 for cell in box_cells {
-                    if skip_cursor_box
-                        && cell.col == *cursor_col
-                        && cell.row == row_idx
-                    {
+                    if skip_cursor_box && cell.col == *cursor_col && cell.row == row_idx {
                         continue;
                     }
                     let cell_origin = point(
@@ -2335,73 +2409,16 @@ impl Element for TerminalElement {
                 }
             }
 
-            // 在视觉光标位置画光标矩形
-            if self.cursor_visible {
-                let cursor_origin = input_overlay.origin
-                    + point(
-                        *cell_width * input_overlay.cursor_col as f32,
-                        *line_height * input_overlay.cursor_row as f32,
-                    );
-                let block_width = *cell_width;
-                let thickness = input_overlay.cursor_thickness;
-
-                match input_overlay.cursor_shape {
-                    CursorShape::Bar => {
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: cursor_origin,
-                                size: size(thickness, *line_height),
-                            },
-                            input_overlay.cursor_color,
-                        ));
-                    }
-                    CursorShape::Block => {
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: cursor_origin,
-                                size: size(block_width, *line_height),
-                            },
-                            input_overlay.cursor_color,
-                        ));
-                    }
-                    CursorShape::Underline => {
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: cursor_origin + point(px(0.0), *line_height - thickness),
-                                size: size(block_width, thickness),
-                            },
-                            input_overlay.cursor_color,
-                        ));
-                    }
-                    CursorShape::Hollow => {
-                        let vertical_height = if *line_height > thickness * 2.0 {
-                            *line_height - thickness * 2.0
-                        } else {
-                            Pixels::ZERO
-                        };
-                        let quads = [
-                            Bounds {
-                                origin: cursor_origin,
-                                size: size(block_width, thickness),
-                            },
-                            Bounds {
-                                origin: cursor_origin + point(px(0.0), *line_height - thickness),
-                                size: size(block_width, thickness),
-                            },
-                            Bounds {
-                                origin: cursor_origin + point(px(0.0), thickness),
-                                size: size(thickness, vertical_height),
-                            },
-                            Bounds {
-                                origin: cursor_origin + point(block_width - thickness, thickness),
-                                size: size(thickness, vertical_height),
-                            },
-                        ];
-                        for quad in quads {
-                            window.paint_quad(fill(quad, input_overlay.cursor_color));
-                        }
-                    }
-                }
+            // 在视觉光标位置画光标（与主光标同一份形状绘制实现；
+            // 四边形来自动画器，覆盖层出现 / 消失直接就位）。
+            if let Some(quad) = input_overlay.cursor_quad.as_ref() {
+                paint_cursor_shape(
+                    window,
+                    input_overlay.cursor_shape,
+                    quad,
+                    input_overlay.cursor_thickness,
+                    input_overlay.cursor_color,
+                );
             }
 
             // IME 下划线（每行单独一段）
@@ -2637,4 +2654,494 @@ mod tests {
         assert_eq!(updated[1].width, 2);
         assert!(updated.iter().all(|span| span.color == color));
     }
+
+    // ── 光标动画接线（端到端） ────────────────────────────────────────────
+
+    /// 通过真实的 `TerminalElement::prepaint` 驱动，验证：
+    /// 1. 首帧光标直接就位（不从中途飞入）；
+    /// 2. 同行一格移动产生动画，本帧矩形落在起止之间；
+    /// 3. 动画收敛后精确落在目标格。
+    #[gpui::test]
+    fn cursor_animation_through_element_prepaint(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            terminal.update(cx, |terminal, cx| {
+                terminal.handle_remote_data(b"abc", cx);
+            });
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        let draw_once = |cx: &mut gpui::VisualTestContext| {
+            // 推进一步模拟时钟：`prepaint` 用 `background_executor().now()`
+            // 取帧间隔，GPUI 测试时钟不推进的话弹簧会一直看到 dt = 0。
+            cx.executor().advance_clock(Duration::from_millis(16));
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view.clone();
+            cx.draw(point(px(0.0), px(0.0)), bounds, move |_, _| {
+                TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+            })
+            .1
+        };
+
+        // 首帧：光标直接就位，无动画。
+        let first = draw_once(cx);
+        let cursor = first.7.as_ref().expect("首帧应绘制光标");
+        let origin = cursor.quad.corners[0];
+        assert!(!view.read_with(cx, |v, _| v.cursor_animator.is_animating()));
+
+        // 光标右移一格（打字）：产生动画，矩形整体平滑右移。
+        terminal.update(cx, |terminal, cx| {
+            terminal.handle_remote_data(b"\x1b[C", cx);
+        });
+        let moved = draw_once(cx);
+        let moved_cursor = moved.7.as_ref().expect("移动后应绘制光标");
+        assert!(
+            view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "一格水平移动应产生动画"
+        );
+        let moving = moved_cursor.quad.corners;
+        assert!(
+            moving[0].0 > origin.0,
+            "动画中四边形应已离开起点: {:?} -> {:?}",
+            origin.0,
+            moving[0].0
+        );
+        // 与 neovide 一致：≤2 格的「打字跳」四角时长相同 → 保持规整矩形
+        // （形状不变、整体平移），宽度恒为一个 cell。
+        let width = moving[1].0 - moving[0].0;
+        let cell_width = cursor.quad.corners[1].0 - cursor.quad.corners[0].0;
+        assert!(
+            (width - cell_width).abs() < 0.5,
+            "打字跳不应改变光标宽度: {:?} (cell={cell_width})",
+            moving
+        );
+
+        // 反复重绘直至收敛：最终精确落在目标格且恢复规整矩形。
+        let mut settled = moved_cursor.quad.corners;
+        for _ in 0..120 {
+            if !view.read_with(cx, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+            let state = draw_once(cx);
+            settled = state.7.as_ref().expect("收敛帧应绘制光标").quad.corners;
+        }
+        assert!(
+            !view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "动画应在合理帧数内收敛"
+        );
+        // 目标格 x = 起点 + 1 个 cell 宽（行内位移，y 不变）。
+        let cell = settled[1].0 - settled[0].0;
+        assert!(
+            (settled[0].0 - origin.0 - cell).abs() < 0.5,
+            "应收敛到右移一格: origin={:?} settled={:?} cell={:?}",
+            origin.0,
+            settled[0].0,
+            cell
+        );
+        assert!(
+            (settled[0].1 - origin.1).abs() < 0.01,
+            "行内移动不应改变 y: {:?} -> {:?}",
+            origin.1,
+            settled[0].1
+        );
+    }
+
+    /// 端到端复现用户场景：**停顿后打字时光标应滑动**，而不是瞬移。
+    ///
+    /// 终端只在内容变化时重绘，两次重绘之间可能隔着任意长的空闲。若把空闲
+    /// 时长算作已流逝的动画时间，首帧就会把 40ms 的短动画一次性播完。
+    #[gpui::test]
+    fn typing_after_idle_glides_through_element_prepaint(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        // `step_clock` 控制本帧推进多少模拟时间，用于复现「长时间空闲」。
+        let draw_after = |cx: &mut gpui::VisualTestContext, step_clock: Duration| {
+            cx.executor().advance_clock(step_clock);
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view.clone();
+            cx.draw(point(px(0.0), px(0.0)), bounds, move |_, _| {
+                TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+            })
+            .1
+        };
+
+        // 首帧就位。
+        let first = draw_after(cx, Duration::from_millis(16));
+        let origin = first.7.as_ref().expect("首帧应绘制光标").quad.corners[0];
+
+        // 用户停顿 3 秒后敲第一个字符。
+        terminal.update(cx, |terminal, cx| {
+            terminal.handle_remote_data(b"a", cx);
+        });
+        let typed = draw_after(cx, Duration::from_secs(3));
+        let cursor = typed.7.as_ref().expect("打字后应绘制光标");
+        let x = cursor.quad.corners[0].0;
+
+        assert!(
+            view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "停顿后打字应起动画"
+        );
+        // 光标从第 0 列滑向第 1 列。起始帧应落在**前半程**——若把 3 秒空闲
+        // 算作已流逝的动画时间，首帧就会推进到 ~96%，落在末段甚至到位。
+        let cell_width = origin_width(&cursor.quad);
+        let progress = (x - origin.0) / cell_width;
+        assert!(
+            (0.2..0.8).contains(&progress),
+            "首帧进度应在前半程（滑动而非瞬移）: origin={} x={} cell={} progress={:.0}%",
+            origin.0,
+            x,
+            cell_width,
+            progress * 100.0
+        );
+    }
+
+    /// 帧驱动回路：动画进行中必须**自己**续订下一帧（`on_next_frame` →
+    /// `notify`），否则弹簧只走一帧就停住。
+    ///
+    /// 这条覆盖「驱动」而不是「插值」——弹簧算得再对，没有下一帧也不会动。
+    #[gpui::test]
+    fn animation_requests_follow_up_frames(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        let draw = |cx: &mut gpui::VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view.clone();
+            cx.draw(point(px(0.0), px(0.0)), bounds, move |_, _| {
+                TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+            })
+            .1
+        };
+
+        // 首帧就位，此时不应有待处理帧。
+        draw(cx, Duration::from_millis(16));
+        let pending_idle = cx.update(|window, app| window.simulate_next_frame(app));
+        assert_eq!(pending_idle, 0, "静止时不应请求下一帧");
+
+        // 打字起动画：必须留下一个待处理的 next-frame 回调。
+        terminal.update(cx, |terminal, cx| {
+            terminal.handle_remote_data(b"a", cx);
+        });
+        draw(cx, Duration::from_millis(16));
+        assert!(
+            view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "应起动画"
+        );
+        let pending = cx.update(|window, app| window.simulate_next_frame(app));
+        assert!(pending > 0, "动画中必须请求下一帧（否则只走一帧就停）");
+
+        // 一路推进到收敛。
+        for _ in 0..200 {
+            if !view.read_with(cx, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+            draw(cx, Duration::from_millis(16));
+        }
+        assert!(
+            !view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "动画应收敛"
+        );
+
+        // 排空动画期间累积的待处理帧（生产环境由平台帧循环每帧消费，
+        // 测试里需要手动 `simulate_next_frame`）。
+        while cx.update(|window, app| window.simulate_next_frame(app)) > 0 {}
+
+        // 收敛后再画一帧：不应再请求新帧（静止即停，不空转）。
+        draw(cx, Duration::from_millis(16));
+        let pending_after = cx.update(|window, app| window.simulate_next_frame(app));
+        assert_eq!(pending_after, 0, "收敛后不应再请求帧（避免空转）");
+    }
+
+    /// 端到端：形状切换（Block → Bar / Underline）时，四角从旧形状平滑
+    /// 过渡到新形状，且最终几何与静止布局一致。
+    #[gpui::test]
+    fn shape_switch_morphs_through_element_prepaint(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        let draw = |cx: &mut gpui::VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view.clone();
+            cx.draw(point(px(0.0), px(0.0)), bounds, move |_, _| {
+                TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+            })
+            .1
+        };
+
+        // Block 就位。
+        let block_state = draw(cx, Duration::from_millis(16));
+        let block = block_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let block_w = block[1].0 - block[0].0;
+        assert!(block_w > 0.0);
+        // 静止的 beam 宽度：`cursor_thickness`（cell 宽的 15%，至少 1px）。
+        let beam_target = (block_w * 0.15).round().max(1.0);
+
+        // DECSCUSR 切到 beam（CSI 5 SP q）：应产生 morph，宽度收窄。
+        terminal.update(cx, |terminal, cx| {
+            terminal.handle_remote_data(b"\x1b[5 q", cx);
+        });
+        let morph = draw(cx, Duration::from_millis(16));
+        let morph_quad = morph.7.as_ref().expect("morph 中应绘制光标").quad.corners;
+        let morph_w = morph_quad[1].0 - morph_quad[0].0;
+        assert!(
+            morph_w < block_w,
+            "beam 应比 block 窄: {morph_w} vs {block_w}"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
+            "形状切换应起 morph 动画: block={block:?} morph={morph_quad:?}"
+        );
+
+        // 收敛后宽度应等于静止 beam 宽度（约 cell 宽的 15%，至少 1px）。
+        for _ in 0..200 {
+            if !view.read_with(cx, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+            draw(cx, Duration::from_millis(16));
+        }
+        let settled_state = draw(cx, Duration::from_millis(16));
+        let settled = settled_state
+            .7
+            .as_ref()
+            .expect("收敛后应绘制光标")
+            .quad
+            .corners;
+        let settled_w = settled[1].0 - settled[0].0;
+        assert!(
+            (settled_w - beam_target).abs() < 0.6,
+            "beam 宽度应收窄到 {beam_target}px，实际 {settled_w}"
+        );
+        // 高度不变（beam 占满行高）。
+        let settled_h = settled[2].1 - settled[1].1;
+        assert!(
+            (settled_h - (block[2].1 - block[1].1)).abs() < 0.5,
+            "beam 高度应与 block 相同"
+        );
+    }
+
+    /// 端到端：宽字符 Block 的宽度翻倍，但切到 Bar 后粗细恢复单格比例。
+    #[gpui::test]
+    fn wide_char_bar_keeps_thin_through_element_prepaint(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+        use std::time::Duration;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            // "a中" 然后回到第 2 列（1-based）——即宽字符所在格，让光标的
+            // 单元格带 WIDE_CHAR 标志。
+            terminal.update(cx, |terminal, cx| {
+                terminal.handle_remote_data("a中\x1b[2G".as_bytes(), cx);
+            });
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        let draw = |cx: &mut gpui::VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view.clone();
+            cx.draw(point(px(0.0), px(0.0)), bounds, move |_, _| {
+                TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+            })
+            .1
+        };
+
+        // 宽字符 Block：宽度应为 2 个 cell。
+        let block_state = draw(cx, Duration::from_millis(16));
+        let block = block_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let block_w = block[1].0 - block[0].0;
+
+        // 先切到 beam 拿到「单格粗细」基准，再切回 block 比较——两者用
+        // 同一个 `cell_width`，避免测试对绝对像素值的假设。
+        terminal.update(cx, |terminal, cx| {
+            terminal.handle_remote_data(b"\x1b[5 q", cx);
+        });
+        // 先画一帧让动画器看到新形状（起 morph），再推进到收敛。
+        draw(cx, Duration::from_millis(16));
+        for _ in 0..200 {
+            if !view.read_with(cx, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+            draw(cx, Duration::from_millis(16));
+        }
+        let beam_state = draw(cx, Duration::from_millis(16));
+        let beam = beam_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let beam_w = beam[1].0 - beam[0].0;
+
+        // 宽字符 Block 应是单格粗细基准的 2 倍左右（宽度翻倍）；
+        // beam 则保持单格粗细，不应跟着翻倍。
+        let single_cell_thickness = (block_w / 2.0 * 0.15).round().max(1.0);
+        assert!(
+            (beam_w - single_cell_thickness).abs() < 0.6,
+            "宽字符下 beam 粗细应为单格比例（{single_cell_thickness}px），\
+             实际 {beam_w}px（block={block_w}px）; block={block:?} beam={beam:?}"
+        );
+        // 高度都占满行高。
+        let block_h = block[2].1 - block[1].1;
+        let beam_h = beam[2].1 - beam[1].1;
+        assert!(
+            (block_h - beam_h).abs() < 0.5,
+            "beam 高度应与 block 相同: {beam_h} vs {block_h}"
+        );
+    }
+}
+
+/// 光标四边形的静止宽度（右缘 − 左缘）。
+fn origin_width(quad: &crate::terminal_view::cursor_animation::CursorQuad) -> f32 {
+    quad.corners[1].0 - quad.corners[0].0
 }

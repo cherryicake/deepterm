@@ -216,7 +216,7 @@ fn terminal_view_prepaint_frame_allocations(cx: &mut TestAppContext) {
     let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
     let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
     let make_element =
-        || TerminalElement::new(terminal.clone(), focus_handle.clone(), true, true, view.clone());
+        || TerminalElement::new(terminal.clone(), focus_handle.clone(), true, 1.0, view.clone());
     cx.draw(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)), |_, _| {
         make_element()
     });
