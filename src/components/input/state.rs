@@ -44,7 +44,7 @@ use crate::components::input::rope_ext::Position;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
-use crate::editor::syntax::DiagnosticSet;
+use crate::editor::syntax::{DiagnosticSet, syntax_diagnostics_opt};
 #[cfg(not(target_family = "wasm"))]
 use crate::editor::syntax::LanguageRegistry;
 
@@ -4424,10 +4424,22 @@ impl InputState {
                     h.apply_background_tree(new_tree, &text_for_apply, injection_layers);
                 }
 
-                // Trigger re-render so the new highlights are displayed.
-                _ = entity.update(cx, |_, cx| {
-                    cx.notify();
-                });
+                // 后台解析落地：同步刷新语法诊断。同步解析超时的那次
+                // 没有更新诊断（保留旧值避免闪烁），这里是补上的时机。
+                entity
+                    .update(cx, |state, cx| {
+                        let items = syntax_diagnostics_opt(
+                            highlighter_rc
+                                .borrow()
+                                .as_ref()
+                                .and_then(|h| h.tree()),
+                        );
+                        if let Some(diagnostics) = state.mode.diagnostics_mut() {
+                            diagnostics.set(items, &state.text);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
             }
         });
 

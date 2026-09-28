@@ -3365,6 +3365,15 @@ impl Element for TextElement {
         if let Some(line_numbers) = prepaint.line_numbers.as_ref() {
             offset_y += invisible_top_padding;
 
+            // 诊断 gutter 标记的数据源。在循环外取一次：循环里每行都去
+            // `self.state.read(cx)` 会把渲染路径变成 O(可见行) 次实体读锁。
+            let diagnostics_for_gutter = self
+                .state
+                .read(cx)
+                .diagnostics()
+                .filter(|d| !d.is_empty())
+                .cloned();
+
             window.paint_quad(fill(
                 Bounds {
                     origin: input_bounds.origin,
@@ -3399,6 +3408,14 @@ impl Element for TextElement {
                     .diff_line_colors
                     .get(&(buffer_line as u32))
                     .copied();
+                // 该行的最高诊断级别（gutter 标记）。行区间用**内容区间**
+                // （不含换行符）：否则行尾诊断会把下一行的换行符也算进来。
+                let diagnostic_severity_for_line = diagnostics_for_gutter.as_ref().and_then(|d| {
+                    let state = self.state.read(cx);
+                    let line_range =
+                        state.text.line_start_offset(buffer_line)..state.text.line_content_end_offset(buffer_line);
+                    d.max_severity_for_range(&line_range)
+                });
                 let row_selected = selected_byte_range.as_ref().is_some_and(|sel| {
                     let state = self.state.read(cx);
                     let row_start = state.text.line_start_offset(buffer_line);
@@ -3467,10 +3484,24 @@ impl Element for TextElement {
                     }
                 }
 
+                // 诊断 gutter 标记：贴行号区**右缘**，与左缘的 git 色条分离，
+                // 两者可同时存在（改一行且该行有语法错误）。
+                if let Some(severity) = diagnostic_severity_for_line {
+                    let gutter_w =
+                        prepaint.last_layout.line_number_width - LINE_NUMBER_RIGHT_MARGIN;
+                    let mark_w = px(2.);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(p.x + gutter_w - mark_w, p.y),
+                            size(mark_w, height),
+                        ),
+                        severity.color(cx),
+                    ));
+                }
+
                 for line in lines {
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
-                    offset_y += line_height;
-                }
+                    offset_y += line_height;                }
 
                 // Paint git 行首色条：新增绿 / 修改蓝 / 删除红（行顶小短条）。
                 // 必须画在行号区背景之后（背景全高后涂会盖住先画的色条），

@@ -773,3 +773,69 @@ fn indent_level_bounds(line_text: &str) -> Vec<usize> {
         });
     }
 
+    // ==================== 语法诊断（tree-sitter ERROR/MISSING） ====================
+
+    /// 端到端：语法错误的文本经同步解析后，诊断集合应被填充，
+    /// 且 `for_offset` / `max_severity_for_range` 在编辑器路径上可用。
+    ///
+    /// 回归背景：`DiagnosticSet` 曾是空壳（`for_offset` 恒 `None`），
+    /// 渲染管线虽已接通但数据源恒空 —— 用户在编辑器里看不到任何错误。
+    #[gpui::test]
+    fn syntax_diagnostics_populate_after_edit(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input
+            .downgrade()
+            .update_in(cx, |state, window, cx| {
+                // 先切到 json：语法错误的判定依赖具体语法。
+                state.set_language("json", window, cx);
+                state.set_value(r#"{"a": }"#, window, cx);
+
+                let diagnostics = state.diagnostics().expect("code editor has diagnostics");
+                assert!(
+                    !diagnostics.is_empty(),
+                    "未闭合的 json 值应产出语法诊断"
+                );
+
+                let items = diagnostics.items();
+                let first = &items[0];
+                assert!(
+                    first.range.end <= state.text.len(),
+                    "诊断区间必须在文本范围内：{:?}",
+                    first.range
+                );
+                assert!(
+                    state.text.is_char_boundary(first.range.start)
+                        && state.text.is_char_boundary(first.range.end),
+                    "诊断区间必须落在字符边界上：{:?}",
+                    first.range
+                );
+
+                // 行区间查询（gutter 标记的路径）应能取到级别。
+                let line_range = state.text.line_start_offset(0)
+                    ..state.text.line_content_end_offset(0);
+                assert!(
+                    diagnostics.max_severity_for_range(&line_range).is_some(),
+                    "第一行应报告诊断级别"
+                );
+            })
+            .unwrap();
+    }
+
+    /// 无语法错误的文本不应产出诊断（避免满屏假阳性下划线）。
+    #[gpui::test]
+    fn syntax_diagnostics_empty_for_valid_source(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = build_fold_input(cx);
+        input
+            .downgrade()
+            .update_in(cx, |state, window, cx| {
+                state.set_language("json", window, cx);
+                state.set_value(r#"{"a": 1}"#, window, cx);
+                let diagnostics = state.diagnostics().expect("code editor has diagnostics");
+                assert!(
+                    diagnostics.is_empty(),
+                    "合法 json 不应产出诊断，实际 {:?}",
+                    diagnostics.items()
+                );
+            })
+            .unwrap();
+    }

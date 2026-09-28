@@ -7,7 +7,7 @@ use ropey::Rope;
 
 use super::display_map::DisplayMap;
 use crate::components::input::{InputEdit, RopeExt as _};
-use crate::editor::syntax::{DiagnosticSet, SyntaxHighlighter};
+use crate::editor::syntax::{DiagnosticSet, SyntaxHighlighter, syntax_diagnostics_opt};
 
 pub(crate) struct PendingBackgroundParse {
     pub highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
@@ -195,11 +195,12 @@ impl InputMode {
         force: bool,
         _cx: &mut App,
     ) -> Option<PendingBackgroundParse> {
-        match &self {
+        match &mut *self {
             InputMode::CodeEditor {
                 language,
                 highlighter,
                 parse_task,
+                diagnostics,
                 ..
             } => {
                 if !force && highlighter.borrow().is_some() {
@@ -241,6 +242,10 @@ impl InputMode {
                 const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(30);
                 let completed = h.update(Some(edit), text, Some(SYNC_PARSE_TIMEOUT));
                 if completed {
+                    // 语法诊断与高亮共用同一棵树：同步解析成功时立即刷新。
+                    // 超时时**保留旧诊断**（后台解析落地后会再刷一次），
+                    // 否则每次击键都会让下划线闪一下。
+                    diagnostics.set(syntax_diagnostics_opt(h.tree()), text);
                     // Sync parse succeeded, cancel any pending background parse.
                     parse_task.borrow_mut().take();
                     None
