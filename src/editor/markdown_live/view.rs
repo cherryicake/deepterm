@@ -203,6 +203,10 @@ pub struct LiveMarkdownView {
     doc_path: Option<PathBuf>,
     /// 源码模式（`Cmd+/` / 状态条切换）：全文档显示源码标记（Typora 源码模式）。
     show_source: bool,
+    /// 文档级宽度：`true` = 全宽（所有行脱离 780px 阅读窄栏、占满编辑器宽度），
+    /// `false` = 标宽。状态条「全宽」按钮切换，是**视图偏好**：
+    /// 换文档（`set_text`）不重置，与 `show_source` / `show_outline` 一致。
+    wide_doc: bool,
     /// 撤销/重做进行中：跳过一次表格自动重排（spec #13，历史保持原样）。
     skip_reformat: bool,
     /// 表格工具栏「尺寸」弹层是否展开（Typora 的 resize popover，spec #14）。
@@ -342,6 +346,7 @@ impl LiveMarkdownView {
             show_outline: false,
             doc_path: None,
             show_source: false,
+            wide_doc: false,
             skip_reformat: false,
             table_resize_open: false,
             table_menu: None,
@@ -2660,6 +2665,18 @@ impl LiveMarkdownView {
         cx.notify();
     }
 
+    /// 全文档宽度切换（状态条「全宽」按钮）：`false` = 780px 阅读窄栏，
+    /// `true` = 所有行占满编辑器宽度。
+    ///
+    /// 宽度变了，每行的换行位置随之改变：上一帧实测的组高全部作废，
+    /// 否则虚拟化会拿旧高度估算滚动总高（大文档滚动条跳变）。
+    pub(crate) fn toggle_wide_doc(&mut self, cx: &mut Context<Self>) {
+        self.wide_doc = !self.wide_doc;
+        self.group_heights.clear();
+        self.prefix_dirty = true;
+        cx.notify();
+    }
+
     /// 收尾所有进行中的滚动条拖拽（窗口失活时调用）。
     ///
     /// 拖拽状态由窗口级 MouseUp 清除，而失活后窗口收不到该事件：拖到一半
@@ -2692,6 +2709,13 @@ impl LiveMarkdownView {
         self.wide_blocks.contains(&block_id)
     }
 
+    /// 某块实际是否按「全宽」渲染：**文档级全宽**下所有块都是全宽，否则按
+    /// 逐块状态。渲染分支与缩放基准必须走这个（而不是 `is_wide_block`），
+    /// 否则文档全宽时 mermaid 图仍按阅读态 640 上限展示、表格卡片也不撑开。
+    pub(crate) fn block_is_wide(&self, block_id: usize) -> bool {
+        self.wide_doc || self.is_wide_block(block_id)
+    }
+
     /// 某 mermaid 块的**显式**缩放倍率（`None` = 按适配宽度展示）。
     #[cfg(test)]
     pub(crate) fn mermaid_zoom(&self, block_id: usize) -> Option<f32> {
@@ -2717,7 +2741,7 @@ impl LiveMarkdownView {
             MermaidZoom::Reset => self.mermaid.clear_zoom(block_id),
             MermaidZoom::In | MermaidZoom::Out => {
                 let cur = self.mermaid.zoom(block_id).unwrap_or_else(|| {
-                    self.mermaid_display_scale(block_id, self.is_wide_block(block_id))
+                    self.mermaid_display_scale(block_id, self.block_is_wide(block_id))
                 });
                 let next = match action {
                     MermaidZoom::In => cur * ZOOM_STEP,
@@ -5625,6 +5649,9 @@ impl Render for LiveMarkdownView {
             self.blink_on = false;
         }
         let show_caret = self.show_caret(window, cx);
+        // 文档级宽度：本帧全宽（所有行脱离 780px 窄栏）。逐块「全宽」按钮在
+        // 此状态下隐藏（见 mermaid 卡片 / 表格工具栏）。
+        let wide_doc = self.wide_doc;
 
         // Fresh per-frame hit geometry (LiveLine::paint repopulates).
         self.row_layouts.clear();
@@ -6396,7 +6423,7 @@ impl Render for LiveMarkdownView {
                     // 「全宽」：图卡片脱离 780px 窄栏。结构图（flowchart 等）
                     // 在窄栏里被压到 640px 上限，节点文字挤成一团 —— 全宽让图
                     // 用满编辑器宽度（**只缩不放**，见下），横向滚动再兜底超宽图。
-                    let wide = self.is_wide_block(block_id);
+                    let wide = self.block_is_wide(block_id);
                     // 缩放：`None` = 没按过 `+`/`−`，按「适配宽度」展示。
                     let zoom = self.mermaid.zoom(block_id);
                     // 百分比标签显示**实际显示**的倍率：没设过显式倍率时，展示
@@ -6660,30 +6687,41 @@ impl Render for LiveMarkdownView {
                                 // 「全宽」：图卡片撑满编辑器宽度。结构图在
                                 // 780px 窄栏里被压到 640px 上限，节点文字挤成
                                 // 一团；全宽让图用满可用宽度，超宽图再横向滚动。
-                                .child({
-                                    let wide_ent = entity.clone();
-                                    div()
-                                        .id(("live-mm-tab-wide", block_id))
-                                        .debug_selector(|| "live-mm-tab-wide".into())
-                                        .px(px(9.0))
-                                        .py(px(2.0))
-                                        .rounded(px(5.0))
-                                        .cursor_pointer()
-                                        .bg(if wide {
-                                            ui.accent.opacity(0.18)
-                                        } else {
-                                            ui.text.opacity(0.05)
-                                        })
-                                        .text_size(px(10.0))
-                                        .line_height(px(14.0))
-                                        .font_weight(gpui::FontWeight(600.))
-                                        .text_color(if wide { ui.accent } else { ui.text_muted })
-                                        .child(if wide { "全宽 ✓" } else { "全宽" })
-                                        .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
-                                            wide_ent.update(cx, |v, cx| {
-                                                v.toggle_wide_block(block_id, cx)
-                                            });
-                                        })
+                                // 文档级全宽（状态条「全宽」芯片）时该按钮没有
+                                // 可切换的效果（已全宽），隐藏；按块状态保留，
+                                // 切回标宽后原样恢复。
+                                .when(!wide_doc, |bar| {
+                                    bar.child({
+                                        let wide_ent = entity.clone();
+                                        div()
+                                            .id(("live-mm-tab-wide", block_id))
+                                            .debug_selector(|| "live-mm-tab-wide".into())
+                                            .px(px(9.0))
+                                            .py(px(2.0))
+                                            .rounded(px(5.0))
+                                            .cursor_pointer()
+                                            .bg(if wide {
+                                                ui.accent.opacity(0.18)
+                                            } else {
+                                                ui.text.opacity(0.05)
+                                            })
+                                            .text_size(px(10.0))
+                                            .line_height(px(14.0))
+                                            .font_weight(gpui::FontWeight(600.))
+                                            .text_color(if wide {
+                                                ui.accent
+                                            } else {
+                                                ui.text_muted
+                                            })
+                                            .child(if wide { "全宽 ✓" } else { "全宽" })
+                                            .on_click(
+                                                move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                                    wide_ent.update(cx, |v, cx| {
+                                                        v.toggle_wide_block(block_id, cx)
+                                                    });
+                                                },
+                                            )
+                                    })
                                 })
                                 // 缩放：`−` / 百分比（点=还原默认展示）/ `+`。
                                 // 没按过时标签显示**当前实际**的显示倍率
@@ -7015,7 +7053,7 @@ impl Render for LiveMarkdownView {
                     let cursor_in_table = idxs.iter().any(|pi| rows[*pi].line == cursor.line);
                     // 「全宽」状态：卡片脱离 780px 窄栏、占满编辑器宽度。
                     // 宽表（列多/内容长）在窄栏里每列只剩几十像素，必须能撑开。
-                    let wide = self.is_wide_block(start_line);
+                    let wide = self.block_is_wide(start_line);
                     // 横向滚动：表格列是 `flex_1`（无自然宽度），这里给内容一个
                     // 「列数 × 每列可读最小宽」的下界 —— 视口更宽时列平分不滚动，
                     // 更窄时才横向滚动，而不是把每列压到不可读。
@@ -7167,26 +7205,38 @@ impl Render for LiveMarkdownView {
                                 // 「全宽」：占满编辑器宽度（窄栏里的宽表只能看到
                                 // 前几列）。放在最右、与 More▾ 同款样式，激活时
                                 // 用 accent 高亮 —— 状态可见，再点一次还原。
-                                .child(div().w(px(1.0)).h(px(12.0)).bg(colors.table_border))
-                                .child({
-                                    let wide_ent = entity.clone();
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "live-table-tb-wide-{start_line}"
-                                        )))
-                                        .debug_selector(|| "live-table-toolbar-wide".into())
-                                        .px(px(6.0))
-                                        .py(px(2.0))
-                                        .rounded(px(4.0))
-                                        .cursor_pointer()
-                                        .text_size(px(11.0))
-                                        .text_color(if wide { ui.accent } else { ui.text_muted })
-                                        .hover(|s| s.bg(ui.text.opacity(0.08)).text_color(ui.text))
-                                        .child(if wide { "全宽 ✓" } else { "全宽" })
-                                        .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
-                                            wide_ent.update(cx, |v, cx| {
-                                                v.toggle_wide_block(start_line, cx)
-                                            });
+                                // 文档级全宽时隐藏（已全宽，无可切换效果）；
+                                // 按块状态保留，切回标宽后原样恢复。
+                                .when(!wide_doc, |bar| {
+                                    bar.child(div().w(px(1.0)).h(px(12.0)).bg(colors.table_border))
+                                        .child({
+                                            let wide_ent = entity.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "live-table-tb-wide-{start_line}"
+                                                )))
+                                                .debug_selector(|| "live-table-toolbar-wide".into())
+                                                .px(px(6.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(if wide {
+                                                    ui.accent
+                                                } else {
+                                                    ui.text_muted
+                                                })
+                                                .hover(|s| {
+                                                    s.bg(ui.text.opacity(0.08)).text_color(ui.text)
+                                                })
+                                                .child(if wide { "全宽 ✓" } else { "全宽" })
+                                                .on_click(
+                                                    move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                                        wide_ent.update(cx, |v, cx| {
+                                                            v.toggle_wide_block(start_line, cx)
+                                                        });
+                                                    },
+                                                )
                                         })
                                 }),
                         );
@@ -7857,6 +7907,8 @@ impl Render for LiveMarkdownView {
         let show_outline = self.show_outline;
         let show_source = self.show_source;
         let status = div()
+            .id("live-status-bar")
+            .debug_selector(|| "live-status".into())
             .flex_shrink_0()
             .flex()
             .flex_row()
@@ -7891,9 +7943,33 @@ impl Render for LiveMarkdownView {
                     .flex_row()
                     .items_center()
                     .gap(px(4.))
+                    // 全宽：单个按钮切换整个文档的渲染宽度（未选中 = 标宽
+                    // 780px 阅读窄栏，选中 = 所有行铺满编辑器宽度）。选中态
+                    // 高亮，与「源码」「大纲」同款样式。
+                    .child(
+                        div()
+                            .id("live-width-toggle")
+                            .debug_selector(|| "live-width-toggle".into())
+                            .cursor_pointer()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(6.))
+                            .text_color(if wide_doc { ui.accent } else { ui.text_muted })
+                            .hover(|this| this.bg(ui.tab_hover_background))
+                            .child("全宽")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _e, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    this.toggle_wide_doc(cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .id("live-source-toggle")
+                            .debug_selector(|| "live-source-toggle".into())
                             .cursor_pointer()
                             .px(px(8.))
                             .py(px(2.))
@@ -7904,7 +7980,7 @@ impl Render for LiveMarkdownView {
                                 ui.text_muted
                             })
                             .hover(|this| this.bg(ui.tab_hover_background))
-                            .child(if show_source { "源码 ✓" } else { "源码" })
+                            .child("源码")
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _e, window, cx| {
@@ -7917,6 +7993,7 @@ impl Render for LiveMarkdownView {
                     .child(
                         div()
                             .id("live-outline-toggle")
+                            .debug_selector(|| "live-outline-toggle".into())
                             .cursor_pointer()
                             .px(px(8.))
                             .py(px(2.))
@@ -7927,7 +8004,7 @@ impl Render for LiveMarkdownView {
                                 ui.text_muted
                             })
                             .hover(|this| this.bg(ui.tab_hover_background))
-                            .child(if show_outline { "大纲 ✓" } else { "大纲" })
+                            .child("大纲")
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _e, window, cx| {
@@ -8170,9 +8247,13 @@ impl Render for LiveMarkdownView {
                             .overflow_hidden()
                             // 查找面板 / slash 菜单 / 状态条跟随阅读窄栏
                             //（780px 居中）；正文行各自决定宽度，见下面的
-                            // 「全宽」包装。
+                            // 「全宽」包装。文档级全宽时三者同样铺满。
                             .when_some(self.search_panel.clone(), |this, panel| {
-                                this.child(center_narrow(panel.into_any_element()))
+                                this.child(if wide_doc {
+                                    wide_row(center_narrow(panel.into_any_element()))
+                                } else {
+                                    center_narrow(panel.into_any_element())
+                                })
                             })
                             .child(
                                 div()
@@ -8197,18 +8278,11 @@ impl Render for LiveMarkdownView {
                                             // 阅读窄栏里，「全宽」块（`wide_rows`）
                                             // 占满编辑器宽度。逐行包装而不是整列定宽，
                                             // 是为了让宽表/大图真正撑开而不拉伸正文。
+                                            // 文档级全宽时**所有行**都走全宽包装。
                                             .children(row_els.into_iter().enumerate().map(
                                                 |(ix, el)| {
-                                                    if wide_rows.contains(&ix) {
-                                                        div()
-                                                            .w_full()
-                                                            .flex_shrink_0()
-                                                            .px_4()
-                                                            .debug_selector(|| {
-                                                                "live-wide-row".into()
-                                                            })
-                                                            .child(el)
-                                                            .into_any_element()
+                                                    if wide_doc || wide_rows.contains(&ix) {
+                                                        wide_row(el)
                                                     } else {
                                                         center_narrow(el)
                                                     }
@@ -8240,9 +8314,17 @@ impl Render for LiveMarkdownView {
                                     ),
                             )
                             .when_some(slash_bar, |this, bar| {
-                                this.child(center_narrow(bar.into_any_element()))
+                                this.child(if wide_doc {
+                                    wide_row(bar.into_any_element())
+                                } else {
+                                    center_narrow(bar.into_any_element())
+                                })
                             })
-                            .child(center_narrow(status.into_any_element())),
+                            .child(if wide_doc {
+                                wide_row(status.into_any_element())
+                            } else {
+                                center_narrow(status.into_any_element())
+                            }),
                     ),
             )
             .when_some(outline_panel, |this, panel| this.child(panel))
@@ -8261,6 +8343,20 @@ fn center_narrow(el: gpui::AnyElement) -> gpui::AnyElement {
         .flex()
         .justify_center()
         .child(div().w_full().max_w(px(780.)).px_8().child(el))
+        .into_any_element()
+}
+
+/// 把一行元素铺满编辑器宽度（「全宽」版式）。
+///
+/// 与逐块「全宽」（表格 / mermaid 卡片）同一套包装：`px_4` 留出与窄栏
+/// `px_8` 相称的呼吸空间。文档级全宽时所有行都走这里。
+fn wide_row(el: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .px_4()
+        .debug_selector(|| "live-wide-row".into())
+        .child(el)
         .into_any_element()
 }
 
@@ -10489,6 +10585,24 @@ flowchart TD
         let shot = cx.capture_screenshot(handle).unwrap();
         shot.save("/tmp/live_wide_full.png").unwrap();
         eprintln!("saved /tmp/live_wide_full.png");
+
+        // 文档级全宽（状态条「全宽」按钮）：全部行铺满，状态条同样铺满，
+        // 表格工具栏与 mermaid 卡片的单块「全宽」按钮隐藏。
+        cx.update(|cx| {
+            view.update(cx, |v, cx| {
+                v.toggle_wide_block(2, cx);
+                v.toggle_wide_block(14, cx);
+                v.toggle_wide_doc(cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.update_window(handle, |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+        }
+        let shot = cx.capture_screenshot(handle).unwrap();
+        shot.save("/tmp/live_doc_wide.png").unwrap();
+        eprintln!("saved /tmp/live_doc_wide.png");
     }
 }
 
@@ -13258,6 +13372,195 @@ mod hscroll_and_wide_tests {
         assert!(
             f32::from(back.size.width) <= 720.0,
             "取消全宽应回到窄栏，实际 {back:?}"
+        );
+    }
+
+    /// 状态条「全宽」按钮：整个文档脱离 780px 窄栏（含正文段落），
+    /// 再点一次回到标宽。走真实点击链路（不是直接调状态）。
+    #[gpui::test]
+    fn clicking_width_chip_toggles_doc_wide(cx: &mut gpui::TestAppContext) {
+        let doc = "第一段正文，用来量宽度。\n\n第二段正文，同样要脱离窄栏。\n";
+        let (view, mut vc) = setup(cx, size(px(1400.), px(600.)), doc);
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        // 标宽：正文落在 780px 窄栏里（px_8 两侧 → 716）。
+        let narrow = vc.debug_bounds("live-para").expect("段落应渲染");
+        assert!(
+            f32::from(narrow.size.width) <= 720.0,
+            "默认标宽应落在 780px 阅读窄栏里，实际 {narrow:?}"
+        );
+        // 按钮文案恒定「全宽」（不随状态变），顺序为 全宽 < 源码 < 大纲。
+        let chip = vc
+            .debug_bounds("live-width-toggle")
+            .expect("「全宽」按钮应渲染");
+        let src = vc.debug_bounds("live-source-toggle").expect("源码芯片");
+        let outline = vc.debug_bounds("live-outline-toggle").expect("大纲芯片");
+        assert!(
+            chip.left() < src.left() && src.left() < outline.left(),
+            "三个芯片应依次为 全宽 / 源码 / 大纲：{chip:?} {src:?} {outline:?}"
+        );
+        // 点一下 → 全宽。
+        vc.simulate_click(chip.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, _| v.wide_doc),
+            "点击「全宽」按钮应置位文档级全宽"
+        );
+        let wide = vc.debug_bounds("live-para").expect("段落应仍在");
+        assert!(
+            f32::from(wide.size.width) > 1000.0,
+            "全宽后正文应占满 1400px 窗口（含边距），实际 {wide:?}"
+        );
+        assert!(
+            f32::from(wide.size.width) > f32::from(narrow.size.width) + 200.0,
+            "全宽应显著宽于窄栏：{narrow:?} → {wide:?}"
+        );
+        // 状态条本身也铺满（两端贴内容区）。
+        let status = vc.debug_bounds("live-status").expect("状态条");
+        assert!(
+            f32::from(status.size.width) > 1000.0,
+            "全宽时状态条应铺满，实际 {status:?}"
+        );
+        // 再点一次 → 标宽。
+        let chip = vc.debug_bounds("live-width-toggle").expect("按钮仍在");
+        vc.simulate_click(chip.center(), gpui::Modifiers::none());
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            !view.read_with(&vc, |v, _| v.wide_doc),
+            "再点一次应回到标宽"
+        );
+        let back = vc.debug_bounds("live-para").expect("段落应仍在");
+        assert!(
+            f32::from(back.size.width) <= 720.0,
+            "取消全宽应回到窄栏，实际 {back:?}"
+        );
+    }
+
+    /// 文档级全宽时，逐块「全宽」按钮（表格工具栏 / mermaid 卡片）隐藏 ——
+    /// 已全宽，单块按钮没有可切换的效果；切回标宽后按钮恢复，按块状态保留。
+    #[gpui::test]
+    fn doc_wide_hides_per_block_wide_button(cx: &mut gpui::TestAppContext) {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail\n";
+        let (view, mut vc) = setup(cx, size(px(1200.), px(600.)), doc);
+        // 光标进表 → 工具栏出现（含「全宽」按钮）。
+        view.update(&mut vc, |v, cx| {
+            v.edit(cx, |m| m.move_to(2, 2, false));
+            v.after_move(cx);
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            vc.debug_bounds("live-table-toolbar-wide").is_some(),
+            "setup：标宽时表格工具栏的「全宽」按钮应在"
+        );
+        // 先置位按块全宽：切到文档全宽再切回来，状态必须保留。
+        view.update(&mut vc, |v, cx| v.toggle_wide_block(0, cx));
+        view.update(&mut vc, |v, cx| v.toggle_wide_doc(cx));
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            vc.debug_bounds("live-table-toolbar-wide").is_none(),
+            "文档全宽时按块「全宽」按钮应隐藏"
+        );
+        view.update(&mut vc, |v, cx| v.toggle_wide_doc(cx));
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            vc.debug_bounds("live-table-toolbar-wide").is_some(),
+            "切回标宽后按钮应恢复"
+        );
+        assert!(
+            view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "切回标宽后按块全宽状态应保留"
+        );
+    }
+
+    /// 换文档（`set_text`）：文档级宽度是视图偏好，保留；按块状态照旧清空。
+    #[gpui::test]
+    fn set_text_keeps_doc_wide_but_resets_block_state(cx: &mut gpui::TestAppContext) {
+        let doc = "| a | b |\n|---|---|\n| 1 | 2 |\n\ntail\n";
+        let (view, mut vc) = setup(cx, size(px(1000.), px(500.)), doc);
+        view.update(&mut vc, |v, cx| {
+            v.toggle_wide_doc(cx);
+            v.toggle_wide_block(0, cx);
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        view.update(&mut vc, |v, cx| {
+            v.set_text("| x | y |\n|---|---|\n| 3 | 4 |\n\n别的文档\n", cx)
+        });
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        assert!(
+            view.read_with(&vc, |v, _| v.wide_doc),
+            "文档级宽度是视图偏好，换文档后应保留"
+        );
+        assert!(
+            !view.read_with(&vc, |v, _| v.is_wide_block(0)),
+            "换文档后不得保留上一个文档的按块全宽状态"
+        );
+    }
+
+    /// 文档级全宽下 mermaid 图按全宽适配（不再是阅读态 640 上限），且不溢出。
+    #[gpui::test]
+    fn doc_wide_mermaid_fits_width(cx: &mut gpui::TestAppContext) {
+        let mut doc = String::from("```mermaid\nflowchart LR\n");
+        for i in 0..14 {
+            doc.push_str(&format!("    N{i}[\"节点{i}\"] --> N{}\n", i + 1));
+        }
+        doc.push_str("```\n");
+        let (view, mut vc) = setup(cx, size(px(1200.), px(700.)), &doc);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            vc.executor()
+                .advance_clock(std::time::Duration::from_millis(300));
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+            ready = vc.debug_bounds("live-mm-graph").is_some();
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "mermaid 图应在若干帧内渲染完成");
+        let narrow = vc.debug_bounds("live-code-inner").expect("图卡片内层");
+        view.update(&mut vc, |v, cx| v.toggle_wide_doc(cx));
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let wide = vc.debug_bounds("live-code-inner").expect("图卡片内层");
+        assert!(
+            f32::from(wide.size.width) > f32::from(narrow.size.width) + 50.0,
+            "文档全宽后图的视口应明显变宽：{narrow:?} → {wide:?}"
+        );
+        let max_x = view.read_with(&vc, |v, _| {
+            v.h_scroll
+                .handle_for(0)
+                .map(|h| f32::from(h.max_offset().x))
+                .unwrap_or(0.0)
+        });
+        assert!(
+            max_x <= 0.5,
+            "全宽适配不应溢出到需要横向滚动（max_x={max_x}）"
         );
     }
 
