@@ -447,6 +447,37 @@ impl AppWindow {
                         }
                     });
                 }
+                SidebarEvent::OpenFileAt {
+                    path,
+                    line,
+                    column,
+                    ssh_config,
+                } => {
+                    let editor = editor_for_open.clone();
+                    let path = path.clone();
+                    let config = ssh_config.clone();
+                    let (line, column) = (*line, *column);
+                    window.defer(cx, move |window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                if let Some(config) = config {
+                                    e.open_remote_file_at_line_col_no_notify(
+                                        path.to_string_lossy().to_string(),
+                                        *config,
+                                        line,
+                                        column,
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    e.open_file_at_line_col_no_notify(
+                                        path, line, column, window, cx,
+                                    );
+                                }
+                            });
+                        }
+                    });
+                }
                 SidebarEvent::StartTransfer { request } => {
                     // 文件树发起的传输（右键下载 / 拖拽上传）：交给当前激活 workspace
                     // 的传输协调器，复用统一的进度 / 冲突 / 取消链路。

@@ -137,6 +137,14 @@ pub enum SidebarEvent {
         path: PathBuf,
         ssh_config: Option<Box<SshConnectionConfig>>,
     },
+    /// 打开文件并跳到指定行列（项目搜索结果点击）。
+    /// `line` 为 1 起行号，`column` 为 0 起字符列。
+    OpenFileAt {
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
     /// 发起一次文件传输（文件树下载/拖拽上传），交给 workspace 传输协调器执行。
     /// `TransferRequest` 较大，装箱保持事件枚举小体积。
     StartTransfer {
@@ -179,6 +187,11 @@ impl std::fmt::Debug for SidebarEvent {
         match self {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
+            Self::OpenFileAt { path, line, .. } => f
+                .debug_struct("OpenFileAt")
+                .field("path", path)
+                .field("line", line)
+                .finish(),
             Self::StartTransfer { .. } => write!(f, "StartTransfer"),
             Self::PathRenamed { from, to, .. } => f
                 .debug_struct("PathRenamed")
@@ -255,6 +268,9 @@ pub struct MacosSidebar {
     file_tree_panel_tabs: FileTreePanelTabs,
     git_panel: Option<Entity<crate::sidebar_view::git_panel::GitPanel>>,
     git_panel_subscription: Option<Subscription>,
+    /// 项目级搜索面板（侧栏「搜索」tab）。懒建，与 git_panel 同款生命周期。
+    search_panel: Option<Entity<crate::sidebar_view::project_search_panel::ProjectSearchPanel>>,
+    search_panel_subscription: Option<Subscription>,
     width: f32,
     resize_drag_x: Option<gpui::Pixels>,
     dragging: bool,
@@ -319,6 +335,8 @@ impl MacosSidebar {
             file_tree_panel_tabs: FileTreePanelTabs::new(),
             git_panel: None,
             git_panel_subscription: None,
+            search_panel: None,
+            search_panel_subscription: None,
             width: 280.0,
             resize_drag_x: None,
             dragging: false,

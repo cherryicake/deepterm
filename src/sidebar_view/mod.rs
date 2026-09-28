@@ -11,5 +11,6 @@ pub mod hosts_view;
 pub mod keychain_editor;
 pub mod keychain_view;
 pub mod open_path;
+pub mod project_search_panel;
 pub mod style;
 pub mod theme_view;
