@@ -139,7 +139,15 @@ __deepterm_shell_name="${__deepterm_shell##*/}"
 # 这样装进 agent 配置里的插件在**别的终端**里是无害的（见 `agent::hooks`）。
 # 本地路径在 `terminal::mappings` 里同样设置，两条路径必须一致。
 export DEEPTERM=true
-case "$__deepterm_shell_name" in
+"#,
+    );
+    // kitty 图形能力标记。SSH 不透传本地进程环境，远端 shell 只能在这里
+    // 显式导出；作用与取值理由同 `terminal::mappings::default_terminal_env`
+    // 里 `KITTY_WINDOW_ID` 的注释——缺了它，远端跑的图片类客户端会判定
+    // 「不支持 kitty 图形协议」而直接关闭图片渲染。值是纯数字，安全注入。
+    script.push_str(&format!("export KITTY_WINDOW_ID={}\n", std::process::id()));
+    script.push_str(
+        r#"case "$__deepterm_shell_name" in
   zsh)
     if [ -n "${ZDOTDIR+x}" ]; then
       export DEEPTERM_ZSH_ZDOTDIR="$ZDOTDIR"
@@ -389,6 +397,23 @@ mod tests {
         assert!(command.contains("__deepterm_initial_cwd='/tmp/deepterm cwd'"));
         assert!(!command.contains("__deepterm_precmd(){"));
         assert!(!command.contains("add-zsh-hook precmd __deepterm_precmd"));
+    }
+
+    /// 远端 shell 拿不到本地进程环境（SSH 不透传 `default_terminal_env`），
+    /// kitty 图形能力标记必须在 bootstrap 里显式导出，否则远端跑的图片类
+    /// 客户端会判定「不支持 kitty 图形协议」而关掉图片渲染。
+    #[test]
+    fn remote_shell_tracking_command_exports_kitty_marker() {
+        let command = remote_shell_tracking_command(None);
+        let needle = format!("export KITTY_WINDOW_ID={}", std::process::id());
+        let at = command
+            .find(&needle)
+            .unwrap_or_else(|| panic!("bootstrap 缺少 {needle:?}"));
+        // 必须在 `case ... esac`（真正 exec 交互 shell）之前，否则不生效。
+        let exec_case = command
+            .find("case \"$__deepterm_shell_name\"")
+            .expect("bootstrap 应有 case 分支");
+        assert!(at < exec_case, "KITTY_WINDOW_ID 的导出必须发生在 exec 之前");
     }
 
     #[test]

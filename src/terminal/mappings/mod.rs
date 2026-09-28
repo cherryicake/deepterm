@@ -139,6 +139,26 @@ pub fn default_terminal_env() -> HashMap<String, String> {
     env.insert("TERM".to_string(), term.to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
 
+    // kitty 图形能力标记。
+    //
+    // 大量客户端判定「终端是否支持 kitty 图形协议」时**不发探测**，只查
+    // 环境变量/终端名（kitty 自己的 `KITTY_WINDOW_ID`、`TERM` 含 `kitty`、
+    // `TERM_PROGRAM` 品牌表……）。这些品牌表里没有 "deepterm"，缺这个标记
+    // 时它们会直接判定不支持、关掉图片渲染——即使协议本身实现得完全正确
+    // （实测 grok pager 的 `protocol_for_brand(brand)` 即如此）。
+    //
+    // 选 `KITTY_WINDOW_ID` 而不是改 `TERM`/`TERM_PROGRAM`：后两者是系统级
+    // 身份（terminfo 查表、shell integration、遥测都依赖），谎报成
+    // `xterm-kitty` 会让缺该 terminfo 的 ncurses 程序直接启动失败；而这个
+    // 标记的客户端侧语义基本都是**存在性判断**。
+    //
+    // 值取进程 id：单值、纯数字、同一进程内所有终端会话一致（kitty 自身
+    // 是窗口 id，客户端不关心具体数值）。
+    env.insert(
+        "KITTY_WINDOW_ID".to_string(),
+        std::process::id().to_string(),
+    );
+
     // Set a comprehensive PATH that includes system and Homebrew paths
     // This ensures shell initialization works correctly when launched from Finder
     let path = get_macos_system_path().to_string();
@@ -150,4 +170,39 @@ pub fn default_terminal_env() -> HashMap<String, String> {
     env.insert("LC_ALL".to_string(), "en_US.UTF-8".to_string());
 
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 按标记识别 kitty 图形能力的客户端（grok pager、image.nvim、viuer 等）
+    /// 只做**存在性判断**，但值必须是纯数字——kitty 自身的窗口 id 是数值，
+    /// 个别客户端会真的解析它。
+    #[test]
+    fn default_env_advertises_kitty_graphics_marker() {
+        let env = default_terminal_env();
+        let id = env.get("KITTY_WINDOW_ID").expect(
+            "缺 KITTY_WINDOW_ID：按环境变量识别 kitty 图形协议的客户端会判定\
+             「不支持」并直接关闭图片渲染（协议实现得再正确也不会被调用）",
+        );
+        assert!(
+            id.parse::<u32>().is_ok(),
+            "KITTY_WINDOW_ID 应为数值字符串，实际 {id:?}"
+        );
+    }
+
+    /// 这个标记只补能力位，不顶掉品牌身份：TERM_PROGRAM 仍自称 deepterm。
+    #[test]
+    fn kitty_marker_does_not_replace_brand_identity() {
+        let env = default_terminal_env();
+        assert_eq!(
+            env.get("TERM_PROGRAM").map(String::as_str),
+            Some("deepterm")
+        );
+        // TERM 也不允许被谎报成 xterm-kitty（多数系统没有这条 terminfo，
+        // ncurses 程序会直接启动失败）。
+        let term = env.get("TERM").map(String::as_str).unwrap_or_default();
+        assert!(!term.contains("kitty"), "TERM 不应谎报成 kitty：{term}");
+    }
 }

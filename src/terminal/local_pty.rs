@@ -1480,6 +1480,90 @@ mod tests {
         reader.sender().shutdown();
     }
 
+    /// `CSI > 0 q`（XTVERSION）的完整往返。
+    ///
+    /// grok pager 启动即发这条（其 `xtversion.rs`，探测发的是 `\x1b[>0q`），
+    /// 而 vte-0.15 的 CSI `q` 分派只有 DECSCUSR（`'q'` 配 SP 中间字节）——
+    /// 这条会落进 `unhandled!()` 且**一个字节都不回**，探测方只能等到超时、
+    /// 把 deepterm 当成不认识的终端。
+    ///
+    /// 断言取应答里不含 ESC 的中段：回显走行规程，ESC 被 ECHOCTL 编成 `^[`。
+    #[test]
+    fn xtversion_probe_reply_round_trips_to_child() {
+        let geometry = escape_scan::TermGeometry {
+            rows: 24,
+            cols: 80,
+            cell_width: 9,
+            cell_height: 18,
+        };
+
+        let script = concat!(r"printf '\033[>0q';", r"sleep 3");
+        let (reader, term) = spawn_probe_child(script, geometry);
+
+        let reply = escape_scan::xtversion_reply();
+        assert!(
+            reply.starts_with("\x1bP>|deepterm ") && reply.ends_with("\x1b\\"),
+            "XTVERSION 应答须是 `DCS > | deepterm <版本> ST`，实际 {reply:?}"
+        );
+        // 只留可打印中段：回显走行规程，ESC 被 ECHOCTL 编成 `^[`。
+        // `P>|` 是 DCS 头，留在断言里才能钉死「回的是 DCS 载荷」而非别的文本。
+        let printable = reply
+            .trim_start_matches('\x1b')
+            .trim_end_matches("\x1b\\")
+            .to_string();
+
+        let done = wait_until(
+            || grid_text(&term).contains(printable.as_str()),
+            Duration::from_secs(10),
+        );
+        let grid = grid_text(&term);
+        assert!(
+            done,
+            "XTVERSION 应答未写回 PTY：网格里应出现 `{printable}`，实际：{grid:?}"
+        );
+
+        reader.sender().shutdown();
+    }
+
+    /// DA2（`CSI > 0 c`）的完整往返。
+    ///
+    /// 不在这一层拦截的话，应答由 alacritty 的 `identify_terminal` 产出，版本号
+    /// 是 `alacritty_terminal` 库的（`\x1b[>0;2600;1c`）——客户端会据此把
+    /// deepterm 报成 alacritty。这里必须回 deepterm 自己的打包版本。
+    #[test]
+    fn da2_probe_reply_round_trips_to_child() {
+        let geometry = escape_scan::TermGeometry {
+            rows: 24,
+            cols: 80,
+            cell_width: 9,
+            cell_height: 18,
+        };
+
+        let script = concat!(r"printf '\033[>0c';", r"sleep 3");
+        let (reader, term) = spawn_probe_child(script, geometry);
+
+        // 回显后 ESC 变 `^[`，取 `>0;{Pv};1c` 这段（Pv 见 `escape_scan`）。
+        let printable = escape_scan::da2_reply()
+            .trim_start_matches('\x1b')
+            .to_string();
+
+        let done = wait_until(
+            || grid_text(&term).contains(printable.as_str()),
+            Duration::from_secs(10),
+        );
+        let grid = grid_text(&term);
+        assert!(
+            done,
+            "DA2 应答未写回 PTY：网格里应出现 `{printable}`，实际：{grid:?}"
+        );
+        assert!(
+            !grid.contains(";2600;"),
+            "应答里泄漏了 alacritty_terminal 的库版本：{grid:?}"
+        );
+
+        reader.sender().shutdown();
+    }
+
     /// 几何在**任何 resize 之前**就可用：terminal-browser 的探测往往早于首次
     /// layout。这条测试全程不发 `LocalMsg::Resize`，几何完全来自构造时的注入。
     #[test]

@@ -2458,11 +2458,11 @@ impl Terminal {
         self.vte_processor.advance(&mut *term, bytes);
     }
 
-    /// 喂给 vte 之前，先按 `removals`（相对**整块** `data` 的偏移）把尺寸序列摘下。
+    /// 喂给 vte 之前，先按 `removals`（相对**整块** `data` 的偏移）把探测类序列摘下。
     ///
     /// `slice` 是整块中 `[base, base + slice.len())` 这一段；`removals` 沿用
     /// 整块的坐标系，因此这里用 `base` 换算。
-    fn advance_vte_without_size_sequences(
+    fn advance_vte_without_removals(
         &mut self,
         slice: &[u8],
         base: usize,
@@ -2501,13 +2501,21 @@ impl Terminal {
     /// 返回需要从字节流中摘除的区间（相对 `data` 的偏移，升序）。
     /// 应答经 `write_raw` 立刻回写——与 `TextAreaSizeRequest` 走同一通道。
     ///
-    /// 只处理 vte/alacritty 都不支持的两种：
+    /// 处理 vte/alacritty 要么不应答、要么答错的探测序列：
     /// - `CSI 16 t`：cell 像素尺寸 → `\x1b[6;{cell_height};{cell_width}t`
     /// - `DECSET/DECRST ?2048`：in-band size reports → 置位时立即上报几何
+    /// - `CSI > {Ps} q`（XTVERSION）：终端自报 → `\x1bP>|deepterm {版本}\x1b\\`；
+    ///   vte 只认 DECSCUSR，对它**无应答**
+    /// - `CSI > {Ps} c`（DA2）：→ `\x1b[>0;{Pv};1c`；不摘的话 alacritty 会
+    ///   代答它自己的库版本号，把 deepterm 报成 alacritty
+    ///
+    /// 与本地读线程路径的分工：本地字节在 `KittyGraphicsScanner` 里拦截，
+    /// 远程（SSH）字节在 UI 线程这里就地判定；两边用同一组
+    /// `escape_scan` 查找器与应答构造函数，保证行为一致。
     ///
     /// `CSI 14 t` / `CSI 18 t` **不在此列**：vte 已能正确应答（格式与 ghostty
     /// 一致），在这里再拦一次会造成双重应答。
-    fn handle_size_sequences(
+    fn handle_probe_sequences(
         &mut self,
         data: &[u8],
         _cx: &mut Context<Self>,
@@ -2574,6 +2582,30 @@ impl Terminal {
             search_from = start + len;
         }
 
+        // `CSI > {Ps} q`（XTVERSION）：终端自报名称/版本。
+        //
+        // 必须摘除：vte-0.15 只认 DECSCUSR（`('q', [b' '])`），这条会落进
+        // `unhandled!()` 且不产生任何应答，探测方只能等到超时。
+        let mut search_from = 0;
+        while let Some((offset, len)) = escape_scan::find_xtversion(&data[search_from..]) {
+            let start = search_from + offset;
+            self.write_raw(escape_scan::xtversion_reply().as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
+        // `CSI > {Ps} c`（DA2）：回 deepterm 自己的版本号。
+        //
+        // 必须摘除：不摘的话 alacritty 的 `identify_terminal` 会代答它自己的
+        // 库版本（`\x1b[>0;2600;1c`），在客户端把 deepterm 报成 alacritty。
+        let mut search_from = 0;
+        while let Some((offset, len)) = escape_scan::find_da2(&data[search_from..]) {
+            let start = search_from + offset;
+            self.write_raw(escape_scan::da2_reply().as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
         removals.sort_unstable();
         removals
     }
@@ -2618,15 +2650,17 @@ impl Terminal {
             return;
         }
 
-        // 尺寸上报类序列（`CSI 16 t` / DECSET 2048）就地摘除并应答。
+        // 探测类序列（`CSI 16 t` / DECSET 2048 / XTVERSION / DA2）就地摘除
+        // 并应答。
         //
-        // vte 对 `CSI 16 t` 是 `unhandled!()`、alacritty 把 2048 视为未知模式，
-        // 因此必须在这一层处理。几何直接取 `self.terminal_bounds`（UI 线程，
-        // 恒为最新），无须像本地路径那样经过扫描器缓存。
-        let size_removals = self.handle_size_sequences(data, cx);
+        // vte 对 `CSI 16 t` 与 XTVERSION 是 `unhandled!()`、alacritty 把 2048
+        // 视为未知模式、DA2 又会被它代答成 alacritty 的库版本，因此必须在
+        // 这一层处理。几何直接取 `self.terminal_bounds`（UI 线程，恒为最新），
+        // 无须像本地路径那样经过扫描器缓存。
+        let probe_removals = self.handle_probe_sequences(data, cx);
         if next_osc.is_none() && next_apc.is_none() {
-            // 只有尺寸序列：喂入剩余文本即可。
-            self.advance_vte_without_size_sequences(data, 0, &size_removals);
+            // 只有探测序列：喂入剩余文本即可。
+            self.advance_vte_without_removals(data, 0, &probe_removals);
             return;
         }
 
@@ -2651,7 +2685,7 @@ impl Terminal {
 
             // 先喂入序列之前的普通文本，使光标反映这些内容。
             // 尺寸序列只出现在这些"普通文本"里，逐段摘下。
-            self.advance_vte_without_size_sequences(&data[pos..seq_pos], pos, &size_removals);
+            self.advance_vte_without_removals(&data[pos..seq_pos], pos, &probe_removals);
 
             if is_apc {
                 match escape_scan::extract_apc(&data[seq_pos..]) {
@@ -2698,7 +2732,7 @@ impl Terminal {
         }
 
         if pos < data.len() {
-            self.advance_vte_without_size_sequences(&data[pos..], pos, &size_removals);
+            self.advance_vte_without_removals(&data[pos..], pos, &probe_removals);
         }
     }
 
@@ -3079,7 +3113,7 @@ impl Terminal {
                 // 响应窗口大小查询 (CSI t) —— 这里是 `CSI 14 t` 的主路径
                 // （alacritty 在 `term/mod.rs:2258` 用闭包算 `num_lines *
                 // cell_height` / `num_cols * cell_width`，即 grid 的像素范围）。
-                // cell 尺寸同样必须是物理像素，理由同 `handle_size_sequences`。
+                // cell 尺寸同样必须是物理像素，理由同 `handle_probe_sequences`。
                 let window_size = self.terminal_bounds.window_size(self.display_scale);
                 let response = format(window_size);
                 self.write_raw(response.as_bytes());
@@ -3887,7 +3921,7 @@ impl Terminal {
         self.sync_remote_scanner_geometry();
 
         // in-band size reports（`?2048`）在远程路径上由本层应答并**摘除**，
-        // 序列进不到扫描器（见 `handle_size_sequences`），所以扫描器的
+        // 序列进不到扫描器（见 `handle_probe_sequences`），所以扫描器的
         // `set_geometry` 重报不会发生——必须用本层自己的 `remote_mode_2048`
         // 补一次。ghostty `stream_terminal.zig` 的 `resize()` 同样是在模式
         // 启用期间每次尺寸变化都主动上报。
@@ -6379,7 +6413,7 @@ mod tests {
     /// 不到任何东西。
     ///
     /// 不用尺寸上报做观察点：远程路径的 `CSI 16 t` 与 `?2048` 都由
-    /// `handle_size_sequences` 在 `terminal.rs` 里直接应答，且序列在进扫描器前
+    /// `handle_probe_sequences` 在 `terminal.rs` 里直接应答，且序列在进扫描器前
     /// 就被摘除，看不到扫描器自己的状态。
     #[gpui::test]
     fn remote_resize_pushes_geometry_to_scanner(cx: &mut TestAppContext) {
@@ -6454,7 +6488,7 @@ mod tests {
     /// 对齐 ghostty `stream_terminal.zig` 的 `resize()`：模式启用期间每次尺寸
     /// 变化都要主动告知客户端，否则它只能靠 `CSI 14 t` 轮询。
     ///
-    /// 远程路径的 2048 开关由 `Terminal` 自己在 `handle_size_sequences` 里观察，
+    /// 远程路径的 2048 开关由 `Terminal` 自己在 `handle_probe_sequences` 里观察，
     /// 序列随即被摘除——进不到扫描器，所以扫描器的 `set_geometry` 重报不会发生，
     /// 必须由 `apply_pending_resize` 用 `remote_mode_2048` 自己补报一次。
     #[gpui::test]

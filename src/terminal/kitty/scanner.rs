@@ -288,19 +288,24 @@ impl KittyGraphicsScanner {
         }
     }
 
-    /// 处理字节流里的尺寸上报类序列。
+    /// 处理字节流里的**探测类序列**（终端应用用来查询能力/尺寸/模式的那些）。
     ///
     /// 返回需要从字节流中**摘除**的区间（`(起始偏移, 长度)`，按偏移升序、
     /// 互不重叠）。调用方负责把其余片段按序 `emit` 给 vte。
     ///
-    /// 涵盖两类序列（都由本层实现，因为 vte 完全不支持）：
+    /// 涵盖四类序列（都由本层实现，因为 vte/alacritty 要么不应答、要么答错）：
     /// - `CSI 16 t`：cell 像素尺寸查询 → 以 `\x1b[6;{cell_height};{cell_width}t` 应答。
     /// - `DECSET/DECRST ?2048`：in-band size reports 开关 → 置位时立即上报几何。
+    /// - `CSI > {Ps} q`（XTVERSION）：终端自报 → 以 [`escape_scan::xtversion_reply`] 应答；
+    ///   vte 只认 DECSCUSR，对它**无应答**。
+    /// - `CSI > {Ps} c`（DA2）：以 [`escape_scan::da2_reply`] 应答；不摘的话
+    ///   alacritty 会代答**它自己的库版本号**，把 deepterm 说成 alacritty。
     ///
-    /// 两者都必须**摘除**：`CSI 16 t` 在 vte 里会落到 `unhandled!()`（日志噪音），
-    /// 而 2048 在 alacritty 里是未知模式。ghostty 自己实现了这两条分支，因此
-    /// 摘除正是对齐 ghostty 的行为。
-    fn handle_size_sequences(&mut self, data: &[u8]) -> Vec<(usize, usize)> {
+    /// 这几条都必须**摘除**：`CSI 16 t` 与 XTVERSION 在 vte 里会落到
+    /// `unhandled!()`（只剩日志噪音，**没有应答**）；2048 在 alacritty 里是
+    /// 未知模式；DA2 更会被它答成自家库版本。ghostty 自己实现了这几条
+    /// 分支，因此摘除正是对齐 ghostty 的行为。
+    fn handle_probe_sequences(&mut self, data: &[u8]) -> Vec<(usize, usize)> {
         let mut removals = Vec::new();
 
         // `CSI 16 t`：可能有多条，逐条摘除并应答。
@@ -363,6 +368,33 @@ impl KittyGraphicsScanner {
             let start = search_from + offset;
             let state = if self.mode_1016 { 2 } else { 1 };
             self.sink.reply(format!("\x1b[?1016;{state}$y").as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
+        // `CSI > {Ps} q`（XTVERSION）：终端自报名称/版本。
+        //
+        // 必须摘除：vte-0.15 的 CSI `q` 分派只有 DECSCUSR（`('q', [b' '])`），
+        // 这条会落进 `unhandled!()` 且**不产生任何应答**，探测方只能等到超时、
+        // 从而把 deepterm 当成一个不认识的终端（grok 启动即发这条，见其
+        // `xtversion.rs:33`）。
+        let mut search_from = 0;
+        while let Some((offset, len)) = escape_scan::find_xtversion(&data[search_from..]) {
+            let start = search_from + offset;
+            self.sink.reply(escape_scan::xtversion_reply().as_bytes());
+            removals.push((start, len));
+            search_from = start + len;
+        }
+
+        // `CSI > {Ps} c`（DA2）：回 deepterm 自己的版本号。
+        //
+        // 必须摘除：不摘的话序列进 vte，由 alacritty 的 `identify_terminal`
+        // 应答——回的是 `alacritty_terminal` 的库版本（`\x1b[>0;2600;1c`），
+        // 会在客户端的终端识别/遥测里把 deepterm 报成 alacritty。
+        let mut search_from = 0;
+        while let Some((offset, len)) = escape_scan::find_da2(&data[search_from..]) {
+            let start = search_from + offset;
+            self.sink.reply(escape_scan::da2_reply().as_bytes());
             removals.push((start, len));
             search_from = start + len;
         }
@@ -457,7 +489,8 @@ impl PtyScanner for KittyGraphicsScanner {
             joined.as_slice()
         };
 
-        // 尺寸上报类序列（`CSI 16 t` / `DECSET ?2048`）先处理并摘除。
+        // 探测类序列（`CSI 16 t` / `DECSET ?2048` / XTVERSION / DA2）先处理
+        // 并摘除。
         //
         // 必须在这里、且覆盖 fast path：终端应用的探测通常单独成块、附近没有
         // APC（terminal-browser 启动时正是如此），而 fast path 会直接整段
@@ -465,7 +498,7 @@ impl PtyScanner for KittyGraphicsScanner {
         //
         // 在**整块** `data` 上一次性扫描（而非按切片），因此不存在「序列被两个
         // emit 切片切开」的连续性隐患。
-        let removals = self.handle_size_sequences(data);
+        let removals = self.handle_probe_sequences(data);
 
         // OSC 与 APC 必须**单趟按位置推进**处理，不能「先把 OSC 全摘掉、
         // 再走 APC 循环」：两条序列可能交替出现，两趟扫描会让某一趟看到的位置
@@ -783,6 +816,69 @@ mod tests {
 
         assert_eq!(emitted, input, "14/18 必须原样透传给 vte");
         assert!(replies.is_empty(), "14/18 的应答由 vte 负责，本层不得插手");
+    }
+
+    /// XTVERSION：探测通常单独成块（走 fast path），必须应答并摘除——
+    /// 摘除失败的话 vte 落进 `unhandled!()` 且不回一个字节，探测方只会
+    /// 等到超时、把 deepterm 当成不认识的终端。
+    #[test]
+    fn xtversion_answered_on_fast_path() {
+        let mut scanner = scanner_with_geometry();
+        let (emitted, replies) = run_scan(&mut scanner, b"intro\x1b[>0q");
+
+        assert_eq!(replies, escape_scan::xtversion_reply().as_bytes());
+        assert_eq!(emitted, b"intro", "探测序列必须被摘掉，不进 vte");
+    }
+
+    /// DA2：不摘的话 alacritty 会跟着再答一条**它自己的库版本号**，
+    /// 客户端会收到两条应答、且版本是 alacritty 的。
+    #[test]
+    fn da2_answered_with_deepterm_version() {
+        let mut scanner = scanner_with_geometry();
+        let (emitted, replies) = run_scan(&mut scanner, b"\x1b[>0c");
+
+        assert_eq!(replies, escape_scan::da2_reply().as_bytes());
+        assert!(emitted.is_empty(), "DA2 必须被摘掉，否则会收到两条应答");
+        let text = String::from_utf8_lossy(&replies);
+        assert!(
+            !text.contains(";2600;"),
+            "不得泄漏 alacritty_terminal 的库版本：{text}"
+        );
+    }
+
+    /// DA1 归 alacritty 应答（`Term::identify_terminal`），本层不得插手。
+    #[test]
+    fn da1_still_answered_by_alacritty() {
+        let mut scanner = scanner_with_geometry();
+        let input = b"\x1b[c";
+        let (emitted, replies) = run_scan(&mut scanner, input);
+
+        assert_eq!(emitted, input);
+        assert!(replies.is_empty());
+    }
+
+    /// 自己的 DA2 应答（三段 `0;Pv;1`）回流时，本层**不得**再答一次——
+    /// 否则一问一答会滚成死循环。查询/应答的分界是参数形态：空参或单 `0`
+    /// 才是查询（[`escape_scan::find_da2`] 的文档有完整说明）。
+    #[test]
+    fn da2_report_form_is_not_answered_again() {
+        let mut scanner = scanner_with_geometry();
+        let input = b"\x1b[>0;100;1c";
+        let (emitted, replies) = run_scan(&mut scanner, input);
+
+        assert!(replies.is_empty(), "应答形态不得引发第二次应答");
+        assert_eq!(emitted, input, "应答形态应原样透传");
+    }
+
+    /// DECSCUSR（`CSI Ps SP q`）不是 XTVERSION，仍由 vte 设光标样式。
+    #[test]
+    fn decscusr_still_forwarded_to_vte() {
+        let mut scanner = scanner_with_geometry();
+        let input = b"\x1b[2 q";
+        let (emitted, replies) = run_scan(&mut scanner, input);
+
+        assert_eq!(emitted, input);
+        assert!(replies.is_empty());
     }
 
     #[test]

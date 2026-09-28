@@ -153,6 +153,46 @@ pub fn encode_size_report(style: SizeReport, geometry: TermGeometry) -> String {
     }
 }
 
+/// XTVERSION 应答：`DCS > | deepterm {version} ST`。
+///
+/// 载荷形态对齐 ghostty（`stream_terminal.zig:1404` 的
+/// `\x1BP>|{s}\x1B\\`，s 为 `"ghostty 1.2.3"`）与 kitty（`"kitty 0.35.2"`）
+/// ——都是「名称 + 空格 + 版本」。客户端侧（grok `xtversion.rs`、timg 等）
+/// 把载荷按纯文本识别终端身份，不需要进一步结构化。
+pub fn xtversion_reply() -> String {
+    format!("\x1bP>|deepterm {}\x1b\\", env!("CARGO_PKG_VERSION"))
+}
+
+/// DA2 应答：`CSI > 0 ; {Pv} ; 1 c`，`Pv` = `major*10000 + minor*100 + patch`。
+///
+/// 形状（`Pp=0`、`Pc=1`）与 alacritty 保持一致——客户端普遍按这个形状解析
+/// （grok `da2.rs::parse_version` 只认 `0;{Pv};1`），只把 `Pv` 从
+/// alacritty 的库版本号换成 deepterm 自己的版本。
+pub fn da2_reply() -> String {
+    format!("\x1b[>0;{};1c", packed_version(env!("CARGO_PKG_VERSION")))
+}
+
+/// 把 `x.y.z[-suffix]` 打包成 DA2 的 `Pv`（`major*10000 + minor*100 + patch`）。
+///
+/// 与 alacritty `version_number()` 同算法，但对每个字段钳到 99：再大的分量
+/// 会让 `Pv` 溢出到解析方按别的语义解码（如 grok 的 `packed / 10000`）。
+fn packed_version(version: &str) -> u32 {
+    // 去掉 `-alpha.1` 之类预发布后缀。
+    let core = version.split('-').next().unwrap_or("0");
+    let mut parts = core.split('.');
+    let mut field = || {
+        parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(99)
+    };
+    let major = field();
+    let minor = field();
+    let patch = field();
+    major * 10_000 + minor * 100 + patch
+}
+
 /// CSI 起始符 `ESC [`。
 pub const CSI_START: &[u8] = b"\x1b[";
 
@@ -169,6 +209,87 @@ pub fn find_csi_16_t(data: &[u8]) -> Option<(usize, usize)> {
     const NEEDLE: &[u8] = b"\x1b[16t";
 
     memchr::memmem::find(data, NEEDLE).map(|offset| (offset, NEEDLE.len()))
+}
+
+/// 在 `data` 中查找 XTVERSION 查询：`CSI > {Ps} q`（终端自报名称/版本）。
+///
+/// 返回 `(起始偏移, 总长度)`。受理 `ESC [ > q` 与 `ESC [ > 0 q` 两种形态
+/// （grok 的探测发的是后者，`xtversion.rs:33`）。
+///
+/// 为什么必须在这一层拦：vte-0.15 的 CSI `q` 分派只有 `('q', [b' '])`
+/// （DECSCUSR 设光标样式），带 `>` 中间字节的形态落到 `unhandled!()`、
+/// **不产生任何应答**。ghostty 自己实现（`stream.zig:2262`），这里照做。
+/// 序列由调用方摘除，不进 vte。
+///
+/// 注意中间字节必须紧跟 `ESC [`：`CSI Ps SP q` 是 DECSCUSR，仍然归 vte。
+pub fn find_xtversion(data: &[u8]) -> Option<(usize, usize)> {
+    find_csi_with_intermediate(data, b'>', b'q')
+}
+
+/// 在 `data` 中查找 DA2（二次设备属性）**查询**：`CSI > c` / `CSI > 0 c`。
+///
+/// 返回 `(起始偏移, 总长度)`。
+///
+/// 为什么必须摘除并自答：不摘的话序列会进 vte，由 alacritty 的
+/// `Term::identify_terminal` 应答——回的是 **alacritty_terminal 库的版本号**
+/// （`\x1b[>0;2600;1c`，见 `alacritty_terminal/src/term/mod.rs:1257`），
+/// 把 deepterm 说成了 alacritty。摘掉后按同一格式回 deepterm 自己的版本
+/// （[`da2_reply`]），字段数不变，按形状解析的客户端不受影响。
+///
+/// **只认查询形态**（参数为空或单个 `0`）：`CSI > Pp ; Pv ; Pc c`（三段）是
+/// 别家终端的**应答**。若把它也当查询，应答回显回流（PTY echo）时会被自己
+/// 再答一次、答个不停；顺带也别在嵌套/转发场景里替别家终端抢答。
+///
+/// DA1（`CSI c`，无中间字节）与 DA3（`CSI = c`）**不在其列**：前者由
+/// alacritty 照常应答，后者的中间字节不是 `>`。
+pub fn find_da2(data: &[u8]) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    while let Some((offset, len)) = find_csi_with_intermediate(&data[search_from..], b'>', b'c') {
+        let start = search_from + offset;
+        // 跳过 `ESC [ >`，参数区间是 [start + 3, start + len - 1)。
+        let params = &data[start + 3..start + len - 1];
+        // 空参数（`CSI > c`）或单个 0（`CSI > 0 c`）= 查询；
+        // 三段的 `0;100;1` 是应答，放行给 vte。
+        let is_query = params.is_empty()
+            || std::str::from_utf8(params)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                == Some(0);
+        if is_query {
+            return Some((start, len));
+        }
+        search_from = start + len;
+    }
+    None
+}
+
+/// `ESC [` + 单字节中间字节 + 参数（数字/`;`）+ 指定最终字节的通用查找。
+///
+/// 返回 `(起始偏移, 总长度)`。未命中时从中间字节之后继续找——`ESC` 不可能
+/// 与 `ESC [ {intermediate}` 重叠，前进 3 字节不会跳过任何候选。
+fn find_csi_with_intermediate(
+    data: &[u8],
+    intermediate: u8,
+    final_byte: u8,
+) -> Option<(usize, usize)> {
+    let mut needle = [0u8; 3];
+    needle[..CSI_START.len()].copy_from_slice(CSI_START);
+    needle[CSI_START.len()] = intermediate;
+
+    let mut search_from = 0;
+    while let Some(offset) = memchr::memmem::find(&data[search_from..], &needle) {
+        let start = search_from + offset;
+        let mut i = start + needle.len();
+        // 参数字节：数字与分号；其余（中间字节/最终字节）在此止步。
+        while i < data.len() && matches!(data[i], b'0'..=b'9' | b';') {
+            i += 1;
+        }
+        if i < data.len() && data[i] == final_byte {
+            return Some((start, i + 1 - start));
+        }
+        search_from = start + needle.len();
+    }
+    None
 }
 
 /// 在 `data` 中查找 DECSET/DECRST 形式的私有模式 `?{mode}`。
@@ -486,6 +607,94 @@ mod tests {
         assert_eq!(find_csi_16_t(b"\x1b[14t"), None);
         assert_eq!(find_csi_16_t(b"\x1b[18t"), None);
         assert_eq!(find_csi_16_t(b"no escapes here"), None);
+    }
+
+    /// XTVERSION：grok 的探测发 `\x1b[>0q`（`xtversion.rs:33`），
+    /// kitty/其它实现也会发不带参数的 `\x1b[>q`，两种都要认。
+    #[test]
+    fn finds_xtversion_query() {
+        assert_eq!(find_xtversion(b"\x1b[>0q"), Some((0, 5)));
+        assert_eq!(find_xtversion(b"\x1b[>q"), Some((0, 4)));
+        assert_eq!(find_xtversion(b"pre\x1b[>0qpost"), Some((3, 5)));
+    }
+
+    /// DECSCUSR（`CSI Ps SP q`）必须原样交给 vte 设光标样式；
+    /// kitty 键盘协议的 `CSI > 1 u`、DA2 的 `CSI > 0 c` 也都不是 XTVERSION。
+    #[test]
+    fn xtversion_ignores_decscusr_and_other_sequences() {
+        assert_eq!(find_xtversion(b"\x1b[2 q"), None);
+        assert_eq!(find_xtversion(b"\x1b[>1u"), None);
+        assert_eq!(find_xtversion(b"\x1b[>0c"), None);
+        assert_eq!(find_xtversion(b"no escapes here"), None);
+    }
+
+    #[test]
+    fn finds_da2_query() {
+        assert_eq!(find_da2(b"\x1b[>0c"), Some((0, 5)));
+        assert_eq!(find_da2(b"\x1b[>c"), Some((0, 4)));
+        assert_eq!(find_da2(b"x\x1b[>0cy"), Some((1, 5)));
+    }
+
+    /// DA1（无中间字节）、DA3（`=` 中间字节）都不归 DA2 管——前者由
+    /// alacritty 照常应答，后者本来就无人应答，摘了反而丢信息。
+    #[test]
+    fn da2_ignores_da1_and_da3() {
+        assert_eq!(find_da2(b"\x1b[c"), None);
+        assert_eq!(find_da2(b"\x1b[0c"), None);
+        assert_eq!(find_da2(b"\x1b[=0c"), None);
+        assert_eq!(find_da2(b"\x1b[>0d"), None);
+    }
+
+    /// DA2 的**应答**（三段 `0;Pv;1`）不是查询。
+    ///
+    /// 两层理由：应答回显回流时不能把自己再答一次（答个不停）；嵌套/转发
+    /// 场景里它代表别家终端的自报，也不该由 deepterm 代答。
+    #[test]
+    fn da2_ignores_report_form() {
+        assert_eq!(find_da2(b"\x1b[>0;2600;1c"), None);
+        assert_eq!(find_da2(b"\x1b[>0;100;1c"), None);
+        assert_eq!(find_da2(b"\x1b[>1;2;3c"), None);
+        // 应答之后的**查询**仍要被找到（放行应答 ≠ 放行整段）。
+        // `ESC [ > 0 ; 1 0 0 ; 1 c` 占 [0, 11)，查询从 11 起。
+        assert_eq!(find_da2(b"\x1b[>0;100;1c\x1b[>0c"), Some((11, 5)));
+    }
+
+    #[test]
+    fn xtversion_reply_shape() {
+        let reply = xtversion_reply();
+        assert!(
+            reply.starts_with("\x1bP>|deepterm "),
+            "载荷须是「名称 空格 版本」，实际 {reply:?}"
+        );
+        assert!(reply.ends_with("\x1b\\"), "须以 ST 收尾：{reply:?}");
+        assert!(reply.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// DA2 的 `Pv` 要能按 `Pv = major*10000 + minor*100 + patch` 解回版本，
+    /// 且仍是 `0;{Pv};1` 三段形状（按形状解析的客户端才不会拒绝）。
+    #[test]
+    fn da2_reply_shape() {
+        let reply = da2_reply();
+        let params = reply
+            .strip_prefix("\x1b[>0;")
+            .and_then(|s| s.strip_suffix(";1c"))
+            .unwrap_or_else(|| panic!("形状须为 `\\x1b[>0;{{Pv}};1c`，实际 {reply:?}"));
+        let packed: u32 = params.parse().expect("Pv 应为纯数字");
+        assert_eq!(
+            packed,
+            packed_version(env!("CARGO_PKG_VERSION")),
+            "Pv 未与本 crate 版本对应"
+        );
+    }
+
+    #[test]
+    fn packed_version_follows_da2_packing() {
+        assert_eq!(packed_version("0.26.0"), 2600);
+        assert_eq!(packed_version("1.2.3"), 10203);
+        assert_eq!(packed_version("0.1.0-alpha.1"), 100);
+        assert_eq!(packed_version("garbage"), 0);
+        // 分量钳到 99：再大会让解析方按别的语义解出版本。
+        assert_eq!(packed_version("100.0.0"), 990_000);
     }
 
     /// 单参数私有模式：可整条摘除。
