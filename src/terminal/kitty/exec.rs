@@ -4,7 +4,8 @@ use super::animation::{
     self, Animation, Background, CompositionMode, DEFAULT_GAP_MS, Frame, State,
 };
 use super::command::{
-    Action, Command, Compression, DeleteTarget, Format, Medium, ParseError, Quiet, decode_base64,
+    Action, Command, Compression, ControlPairs, DeleteTarget, Format, Medium, ParseError, Quiet,
+    decode_base64,
 };
 use super::image::{self, DecodeError, ImageId};
 use super::storage::{CellGeometry, GridRect, Placement, PlacementLocation, Storage, VisibleRows};
@@ -86,6 +87,13 @@ struct LoadingImage {
     medium: Medium,
     width: Option<u32>,
     height: Option<u32>,
+    /// 首片的控制对与动作。
+    ///
+    /// 末片只带 `m`/`q`（kitty 规范），但显示语义全在首片：`a=T` 决定要不要
+    /// 建立放置，`p`/`c`/`r`/`z`/`C` 决定放置的 id、尺寸与层级。只按末片
+    /// 自己的键执行会退化成默认动作 `a=t`——图像进了存储却永远不显示。
+    control: ControlPairs,
+    action: Action,
     /// 已拼接的 base64 文本（各片首尾相接）。
     ///
     /// 对 `t=f`/`t=t` 而言这是**路径**的 base64，而非像素数据。
@@ -379,8 +387,9 @@ impl ImageStore {
                     images_changed: false,
                 })
             }
-            Action::Transmit => self.transmit(cmd, cursor, false),
-            Action::TransmitAndDisplay => self.transmit(cmd, cursor, true),
+            // 两种传输动作汇入同一条路径：是否显示由**合并后的动作**决定
+            // （见 `transmit` 里对分片末片的处理）。
+            Action::Transmit | Action::TransmitAndDisplay => self.transmit(cmd, cursor),
             Action::Display => self.display(cmd, cursor),
             Action::Delete => self.delete(cmd, cursor),
             Action::TransmitAnimationFrame => self.transmit_animation_frame(cmd),
@@ -525,12 +534,13 @@ impl ImageStore {
     }
 
     /// 处理传输（`a=t` / `a=T`）。
-    fn transmit(
-        &mut self,
-        cmd: &Command,
-        cursor: (i32, u32),
-        display: bool,
-    ) -> Result<Response, ExecutionError> {
+    ///
+    /// 分片传输时**显示语义来自首片**：末片只带 `m`/`q`（kitty："only the
+    /// first escape code needs to have the full set of control codes"），
+    /// 动作 `a` 与放置键 `p`/`c`/`r`/`z`/`C` 都要回溯首片，末片显式给出的键
+    /// 覆盖首片。只按末片自己的键执行会退化成默认动作 `a=t`——图像进了
+    /// 存储却永远不建立放置（grok 悬浮预览"一直 Loading"的根因）。
+    fn transmit(&mut self, cmd: &Command, cursor: (i32, u32)) -> Result<Response, ExecutionError> {
         let (medium, format, compression, width, height) = self.transmission_params(cmd)?;
 
         // 是否还有后续分片（仅直传介质支持）。
@@ -564,6 +574,8 @@ impl ImageStore {
                         medium,
                         width,
                         height,
+                        control: cmd.control.clone(),
+                        action: cmd.action,
                         encoded: cmd.encoded.clone(),
                         frame: None,
                     });
@@ -573,6 +585,7 @@ impl ImageStore {
         }
 
         // 末片（或单片）：拼接累积的 base64 文本后解码。
+        let mut first: Option<(ControlPairs, Action)> = None;
         let (id, payload, format, width, height, number) = match self.loading.take() {
             Some(mut loading) => {
                 if let Some(explicit) = explicit_id
@@ -583,14 +596,18 @@ impl ImageStore {
                 // 末片同样计入累积上限（`loading` 是 take 出来的 owned 值，
                 // `?` 失败时它随栈释放，部分缓冲即被丢弃）。
                 loading.push_chunk(&cmd.encoded)?;
-                (
+                let payload =
+                    self.payload_for_medium(&loading.encoded, loading.medium, loading.compression)?;
+                let tuple = (
                     loading.id,
-                    self.payload_for_medium(&loading.encoded, loading.medium, loading.compression)?,
+                    payload,
                     loading.format,
                     loading.width,
                     loading.height,
                     loading.number,
-                )
+                );
+                first = Some((loading.control, loading.action));
+                tuple
             }
             None => {
                 let id = explicit_id
@@ -606,6 +623,23 @@ impl ImageStore {
             }
         };
 
+        // 控制对：分片末片以首片为底、末片显式键覆盖；单片直接用自己。
+        let (control, action) = match first {
+            Some((first_control, first_action)) => {
+                let mut control = first_control;
+                control.overlay(&cmd.control);
+                let action = if cmd.control.contains(b'a') {
+                    cmd.action
+                } else {
+                    first_action
+                };
+                (control, action)
+            }
+            None => (cmd.control.clone(), cmd.action),
+        };
+        let display = action == Action::TransmitAndDisplay;
+        let explicit_id = control.u32(b'i').filter(|v| *v != 0);
+
         let decoded = image::decode(&payload, format, width, height)?;
 
         // 首次传输同一 id 时清除旧数据；`transient = !display`。
@@ -618,7 +652,7 @@ impl ImageStore {
         };
 
         if display {
-            self.place_at_cursor(id, cmd, cursor)?;
+            self.place_at_cursor(id, &control, cursor)?;
         } else if explicit_id.is_none() {
             // 隐式 id 必须回报，供客户端后续引用。
             response.reply = self.ok_reply_with_id(id);
@@ -636,7 +670,7 @@ impl ImageStore {
             // 图像不存在：静默成功（kitty 对未知 id 的显示不报错）。
             return Ok(Response::default());
         }
-        self.place_at_cursor(id, cmd, cursor)?;
+        self.place_at_cursor(id, &cmd.control, cursor)?;
         Ok(Response {
             reply: self.ok_reply(cmd.control.u32(b'i')),
             images_changed: true,
@@ -644,30 +678,33 @@ impl ImageStore {
     }
 
     /// 在光标处建立一个放置。
+    ///
+    /// 只吃控制对：分片传输的末片自身不带 `p`/`c`/`r`/`z`，由调用方把首片
+    /// 的控制对合并后传来（见 [`Self::transmit`]）。
     fn place_at_cursor(
         &mut self,
         id: ImageId,
-        cmd: &Command,
+        control: &ControlPairs,
         cursor: (i32, u32),
     ) -> Result<(), ExecutionError> {
-        let placement_id = cmd.control.u32(b'p').unwrap_or(0);
+        let placement_id = control.u32(b'p').unwrap_or(0);
 
         // `X=`/`Y=` 是单元格内偏移，必须落在单个单元格内。
-        let x_offset = cmd.control.u32(b'X').unwrap_or(0);
-        let y_offset = cmd.control.u32(b'Y').unwrap_or(0);
+        let x_offset = control.u32(b'X').unwrap_or(0);
+        let y_offset = control.u32(b'Y').unwrap_or(0);
 
         let placement = Placement {
             row: cursor.0,
             col: cursor.1,
-            columns: cmd.control.u32(b'c').filter(|v| *v != 0),
-            rows: cmd.control.u32(b'r').filter(|v| *v != 0),
+            columns: control.u32(b'c').filter(|v| *v != 0),
+            rows: control.u32(b'r').filter(|v| *v != 0),
             x_offset,
             y_offset,
-            z: cmd.control.i32(b'z').unwrap_or(0),
+            z: control.i32(b'z').unwrap_or(0),
             // `U=1` 建虚拟放置：图像不落在光标处，而是等网格里出现 U+10EEEE
             // 占位符时按占位符的位置绘制。行列数在这里只作为"铺进网格多大"
             // 的尺寸说明（见 `unicode` / `render::placeholder_rect`）。
-            location: if cmd.control.u32(b'U') == Some(1) {
+            location: if control.u32(b'U') == Some(1) {
                 PlacementLocation::Virtual
             } else {
                 PlacementLocation::Anchor
@@ -695,7 +732,7 @@ impl ImageStore {
         if let Some(loading) = self.loading.as_mut() {
             // 首帧（图像本体）的加载走普通传输逻辑。
             if loading.frame.is_none() {
-                return self.transmit(cmd, (0, 0), false);
+                return self.transmit(cmd, (0, 0));
             }
             if let Err(e) = loading.push_chunk(&cmd.encoded) {
                 // 超限：丢弃未完成的帧加载并报错（见 push_chunk 注释）。
@@ -723,7 +760,7 @@ impl ImageStore {
                 // 图像不存在。这只有在 `r` 未指定或指定为 1（即"这是根帧"）
                 // 时才合法——此时按普通传输创建图像。其余帧号无图像可依附。
                 if edit_frame == 0 || edit_frame == 1 {
-                    return self.transmit(cmd, (0, 0), false);
+                    return self.transmit(cmd, (0, 0));
                 }
                 return Err(ExecutionError::Animation("ENOENT: image not found"));
             }
@@ -755,6 +792,8 @@ impl ImageStore {
             medium,
             width,
             height,
+            control: cmd.control.clone(),
+            action: cmd.action,
             encoded: cmd.encoded.clone(),
             frame: Some(frame),
         });
@@ -1562,6 +1601,75 @@ mod tests {
         assert_eq!(stored.image.rgba, raw);
     }
 
+    /// 分片 `a=T` 的**末片只带 `m`/`q`**（kitty："only the first escape code
+    /// needs to have the full set of control codes"）：动作 `a=T` 与放置键
+    /// `p`/`c`/`r`/`z` 必须回溯首片。
+    ///
+    /// 回归背景：此前末片按自己的控制对执行，`a` 缺省退化成 `a=t`——图像
+    /// 进了存储却不建立放置，且 `q=2` 下全程无应答，客户端只能表现为
+    /// 「一直 Loading」（grok 悬浮预览实测踩中）。
+    #[test]
+    fn chunked_transmit_and_display_merges_first_chunk_keys() {
+        let mut store = ImageStore::new(1024 * 1024);
+        // 2×2 RGBA，切两片；首片带全套控制码，末片只有 m/q（grok 形态）。
+        let raw: Vec<u8> = (0..16).map(|i| i as u8).collect();
+        let payload = crate::terminal::kitty::command::encode_base64(&raw);
+        let (a, b) = payload.split_at(payload.len() / 2);
+
+        run(
+            &mut store,
+            &format!("a=T,f=32,s=2,v=2,i=1,p=7,c=12,r=6,z=1,m=1;{a}"),
+            (6, 9),
+        )
+        .unwrap();
+        let r = run(&mut store, &format!("q=2,m=0;{b}"), (6, 9)).unwrap();
+        assert!(r.images_changed, "末片完成传输应标记图像已变化");
+
+        let guard = store.lock_storage();
+        let stored = guard.get(1).expect("分片 a=T 应把图像送进存储");
+        assert_eq!(stored.image.rgba, raw, "分片应正确拼接解码");
+        // 放置必须存在，且完全沿用**首片**的 p/c/r/z。
+        let placement = stored
+            .placements
+            .get(&7)
+            .expect("末片不带 a=/p=，放置仍须按首片的 a=T、p=7 建立");
+        assert_eq!(
+            (placement.row, placement.col),
+            (6, 9),
+            "锚点取末片接收时的光标位置（规范要求）"
+        );
+        assert_eq!(
+            (placement.columns, placement.rows),
+            (Some(12), Some(6)),
+            "c=/r= 只在首片出现，必须被记住"
+        );
+        assert_eq!(placement.z, 1, "z= 只在首片出现，必须被记住");
+        assert!(
+            !stored.transient,
+            "a=T 不是临时图像（transient 应按首片动作判定）"
+        );
+    }
+
+    /// 末片**显式**给出 `a=t` 时以末片为准：只传输、不显示。
+    /// 首片为底、末片显式键覆盖，是合并规则的另一半。
+    #[test]
+    fn chunked_final_chunk_action_overrides_first_chunk() {
+        let mut store = ImageStore::new(1024 * 1024);
+        let raw: Vec<u8> = (0..16).map(|i| i as u8).collect();
+        let payload = crate::terminal::kitty::command::encode_base64(&raw);
+        let (a, b) = payload.split_at(payload.len() / 2);
+
+        run(&mut store, &format!("a=T,f=32,s=2,v=2,i=1,m=1;{a}"), (0, 0)).unwrap();
+        run(&mut store, &format!("a=t,m=0;{b}"), (0, 0)).unwrap();
+
+        let guard = store.lock_storage();
+        let stored = guard.get(1).expect("图像应入存储");
+        assert!(
+            stored.placements.is_empty(),
+            "末片显式 a=t 覆盖首片的 a=T，不应建立放置"
+        );
+    }
+
     #[test]
     fn zlib_invalid_value_is_rejected_at_parse() {
         // o=q 非法：解析阶段即报 InvalidFormat（对齐 ghostty）。
@@ -2057,6 +2165,8 @@ mod tests {
                 medium: Medium::Direct,
                 width: Some(1),
                 height: Some(1),
+                control: ControlPairs::default(),
+                action: Action::Transmit,
                 encoded: vec![0u8; encoded_len],
                 frame: None,
             }

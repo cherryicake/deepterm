@@ -200,6 +200,18 @@ impl ControlPairs {
         self.map.contains_key(&key)
     }
 
+    /// 用 `newer` 的同名键覆盖自身。
+    ///
+    /// 分片传输的**末片只带 `m`/`q`**（kitty："only the first escape code
+    /// needs to have the full set of control codes"），动作与放置键
+    /// （`a`/`i`/`p`/`c`/`r`/`z`/`C`…）都要回溯首片；末片若显式重发了某键，
+    /// 则以末片为准。
+    pub fn overlay(&mut self, newer: &ControlPairs) {
+        for (&k, &v) in &newer.map {
+            self.map.insert(k, v);
+        }
+    }
+
     fn put(&mut self, key: u8, value: u32) {
         // 只接受单个 ASCII 字母作为键。
         if key.is_ascii_alphabetic() {

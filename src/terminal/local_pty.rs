@@ -1180,6 +1180,235 @@ mod tests {
         parts.reader.sender().shutdown();
     }
 
+    /// 复刻 grok 悬浮预览发出的**完整字节流**，一路验证到渲染计划。
+    ///
+    /// grok 的形态与 terminal-browser 有几处关键差异，此前没有测试覆盖：
+    /// - 每帧先 `a=d,d=i,i=1`（删同 id 旧图）再 `a=T`；
+    /// - 显式 `p=1`（放置 id）、`z=1`（画在文字之上）、`C=1`（不动光标）；
+    /// - 负载是 **PNG**（`f=100`，不带 `s=`/`v=`），base64 按 **4096 字符**
+    ///   分片（grok 的 445 KB 截图约 146 片）；
+    /// - 全程 `q=2`：**零应答**——出错也无声，失败只表现为「屏幕上什么
+    ///   都没有」，正是用户报的「一直 Loading」。
+    ///
+    /// 因此断言落在「图像进存储 + 放置锚点/尺寸/层级正确 + `plan()` 真的
+    /// 算出可见矩形」，并额外钉住「`q=2` 不产生任何应答」。
+    #[test]
+    fn grok_overlay_shaped_stream_reaches_render_plan() {
+        use crate::terminal::kitty::render::{CellMetrics, Viewport, plan};
+        use crate::terminal::kitty::scanner::KittyGraphicsScanner;
+
+        let bounds = crate::terminal::TerminalBounds::default();
+
+        // 160×90 噪声 RGBA → PNG：噪声压不动，base64 必然超过单片 4096，
+        // 逼出 grok 的多分片路径。
+        const W: u32 = 160;
+        const H: u32 = 90;
+        let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+        let mut lcg: u32 = 0x9E37_79B9;
+        for _ in 0..W * H {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = (lcg >> 24) as u8;
+            rgba.extend_from_slice(&[v, v.wrapping_mul(3), v.wrapping_mul(7), 255]);
+        }
+        let img = image::RgbaImage::from_raw(W, H, rgba.clone()).expect("构造 RGBA 失败");
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("PNG 编码失败");
+        let b64 = base64_encode(&png);
+        assert!(b64.len() > 4096, "需要多分片，实际 {} 字符", b64.len());
+
+        // 光标定位到 0-based (row=6, col=9)：CSI 7;10H（grok 的
+        // `\x1b[{y+1};{x+1}H` 同形）。c=12,r=6 是 grok 的「按格铺满」语义。
+        const COLS: u32 = 12;
+        const ROWS: u32 = 6;
+        let chunks: Vec<&str> = b64
+            .as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).expect("base64 分片应是 ASCII"))
+            .collect();
+
+        let mut script = String::new();
+        script.push_str(r"printf '\033_Ga=d,d=i,i=1,q=2\033\\'; ");
+        script.push_str(r"printf '\033[7;10H'; ");
+        for (i, chunk) in chunks.iter().enumerate() {
+            let m = usize::from(i + 1 < chunks.len());
+            if i == 0 {
+                script.push_str(&format!(
+                    "printf '\\033_Ga=T,f=100,t=d,q=2,C=1,z=1,i=1,p=1,c={COLS},r={ROWS},m={m};{chunk}\\033\\\\'; "
+                ));
+            } else {
+                script.push_str(&format!("printf '\\033_Gq=2,m={m};{chunk}\\033\\\\'; "));
+            }
+        }
+        script.push_str("printf SENTINEL");
+        let chunk_count = b64.len().div_ceil(4096);
+
+        let options = alacritty_terminal::tty::Options {
+            shell: Some(alacritty_terminal::tty::Shell::new(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), script],
+            )),
+            working_directory: None,
+            drain_on_exit: true,
+            env: std::collections::HashMap::new(),
+        };
+
+        let pty =
+            alacritty_terminal::tty::new(&options, bounds.into(), 0).expect("创建本地 PTY 失败");
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let listener = ZedListener(events_tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &bounds,
+            listener.clone(),
+        )));
+
+        let storage = Arc::new(StdMutex::new(
+            crate::terminal::kitty::storage::Storage::new(1024 * 1024),
+        ));
+        let replies = Arc::new(StdMutex::new(Vec::new()));
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        struct SharedSink {
+            replies: Arc<StdMutex<Vec<u8>>>,
+            changes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::terminal::kitty::scanner::ReplySink for SharedSink {
+            fn reply(&mut self, bytes: &[u8]) {
+                self.replies.lock().unwrap().extend_from_slice(bytes);
+            }
+            fn images_changed(&mut self) {
+                self.changes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let scanner = KittyGraphicsScanner::with_storage(
+            storage.clone(),
+            true,
+            Box::new(SharedSink {
+                replies: replies.clone(),
+                changes: changes.clone(),
+            }),
+        );
+
+        let parts = LocalReader::spawn(
+            pty,
+            term.clone(),
+            listener,
+            Box::new(scanner),
+            bounds.into(),
+        )
+        .expect("启动读线程失败");
+
+        // 先确认脚本真的跑完（脚本本身失败与协议失败是两回事）。
+        let ran = wait_until(
+            || grid_text(&term).contains("SENTINEL"),
+            Duration::from_secs(5),
+        );
+        assert!(
+            ran,
+            "子进程未跑到 SENTINEL：脚本本身失败（分片 {} 片）",
+            chunk_count
+        );
+
+        let done = wait_until(
+            || {
+                let s = storage.lock().unwrap();
+                s.get(1).is_some_and(|img| img.placements.len() == 1)
+            },
+            Duration::from_secs(15),
+        );
+        assert!(
+            done,
+            "超时：grok 形态的 a=T 分片流未完成传输+放置；应答: {:?}",
+            String::from_utf8_lossy(&replies.lock().unwrap())
+        );
+
+        {
+            let s = storage.lock().unwrap();
+            let stored = s.get(1).expect("图像 1 应落进存储");
+            assert_eq!(
+                (stored.image.width, stored.image.height),
+                (W, H),
+                "f=100 不带 s=/v= 时应按 PNG 头解出尺寸"
+            );
+            assert_eq!(
+                stored.image.rgba, rgba,
+                "解出的像素应与送进 PNG 的原图一致（分片重组不能错位）"
+            );
+
+            // 放置：`p=1` 的放置 id、锚点取自 CSI 7;10H 的光标、c=/r=/z= 落位。
+            assert!(
+                stored.placements.contains_key(&1),
+                "p=1 的放置应以放置 id 1 记账，实际 {:?}",
+                stored.placements.keys().collect::<Vec<_>>()
+            );
+            let placement = &stored.placements[&1];
+            assert_eq!(
+                (placement.row, placement.col),
+                (6, 9),
+                "放置锚点应为 CSI 7;10H 定位后的光标位置"
+            );
+            assert_eq!(
+                (placement.columns, placement.rows),
+                (Some(COLS), Some(ROWS)),
+                "c=/r= 应记为显式行列数"
+            );
+            assert_eq!(placement.z, 1, "z=1 应记为文字之上");
+        }
+
+        // `q=2` = 全部静默：连 OK 都不该有。若这里出现字节，说明静默级别
+        // 被错误降级，客户端会收到它没请求的应答。
+        assert!(
+            replies.lock().unwrap().is_empty(),
+            "q=2 不应产生任何应答，实际: {:?}",
+            String::from_utf8_lossy(&replies.lock().unwrap())
+        );
+        assert!(
+            changes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "传输应标记图像已变化（否则渲染层不知道要重画）"
+        );
+
+        // 关键：把存储喂给渲染层，确认真的算出可见矩形——「进存储但屏幕
+        // 空白」正是用户看到的现象，只测到存储是查不出来的。
+        let placed = {
+            let s = storage.lock().unwrap();
+            plan(
+                &s,
+                CellMetrics {
+                    cell_width: px(9.0),
+                    line_height: px(18.0),
+                },
+                Viewport {
+                    origin: Point::new(px(0.0), px(0.0)),
+                    display_offset: 0,
+                    rows: 24,
+                    cols: 80,
+                },
+            )
+        };
+        assert_eq!(placed.len(), 1, "plan() 应产出恰好 1 个绘制项");
+        let item = &placed[0];
+        assert_eq!(item.id, 1, "绘制项应指向图像 1");
+        assert!(
+            !item.below_text,
+            "z=1 必须画在文字之上（画在下面会被不透明的盒子背景盖住）"
+        );
+        assert_eq!(
+            item.origin,
+            Point::new(px(9.0 * 9.0), px(6.0 * 18.0)),
+            "绘制原点应为 CSI 7;10H 定位后的光标位置"
+        );
+        assert_eq!(
+            item.size,
+            gpui::Size::new(px(COLS as f32 * 9.0), px(ROWS as f32 * 18.0)),
+            "c=12,r=6 应按格子铺满（视口内不触发 shrink-to-fit）"
+        );
+
+        parts.reader.sender().shutdown();
+    }
+
     /// 复刻 terminal-browser 能力探测的**完整往返**。
     ///
     /// 这是之前所有测试都没覆盖的一环：既有测试把应答收进测试自己的 sink，
