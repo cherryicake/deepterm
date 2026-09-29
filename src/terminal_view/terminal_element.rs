@@ -3150,6 +3150,7 @@ mod tests {
 }
 
 /// 光标四边形的静止宽度（右缘 − 左缘）。
+#[cfg(test)]
 fn origin_width(quad: &crate::components::cursor_animation::CursorQuad) -> f32 {
     quad.corners[1].0 - quad.corners[0].0
 }

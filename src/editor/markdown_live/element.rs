@@ -388,6 +388,13 @@ pub struct LiveLine {
     pub caret_block_width: Pixels,
     pub caret_block_text: Option<ShapedLine>,
     pub line_height: Pixels,
+    /// 闪烁不透明度（相位末尾淡出 / 淡入；1.0 = 实心）。
+    pub caret_opacity: f32,
+    /// 光标动画名义行高（**固定**，与行类型无关）。
+    ///
+    /// 用基础字号行高而不是本行实际行高：标题/代码/表格行高各不相同，
+    /// 若把它作为动画度量，跨块移动会被误判为「布局变化」而瞬移。
+    pub caret_metric_height: Pixels,
     /// Set on the first rendered row only: its drag handler also covers
     /// positions outside every row's band (blank rows, margins), extending
     /// the selection to the nearest line — guise's continuous drag.
@@ -421,6 +428,8 @@ impl LiveLine {
             caret_shape: CursorShape::Bar,
             caret_block_width: caret_width,
             caret_block_text: None,
+            caret_opacity: 1.0,
+            caret_metric_height: line_height,
             id: id.into(),
             text,
             runs,
@@ -473,6 +482,18 @@ impl LiveLine {
     ) -> Self {
         self.caret_block_width = block_width;
         self.caret_block_text = block_text;
+        self
+    }
+
+    /// 闪烁不透明度（相位末尾淡出 / 淡入）。
+    pub fn with_caret_opacity(mut self, opacity: f32) -> Self {
+        self.caret_opacity = opacity;
+        self
+    }
+
+    /// 动画名义行高（固定，与行类型无关；见字段说明）。
+    pub fn with_caret_metric_height(mut self, height: Pixels) -> Self {
+        self.caret_metric_height = height;
         self
     }
 }
@@ -613,6 +634,54 @@ impl Element for LiveLine {
                 } else {
                     self.caret_block_width.max(self.caret_width)
                 };
+
+                // ── 光标弹簧动画 ────────────────────────────────────────────
+                // 目标用屏幕坐标（`pos` 已折入 `bounds.origin`），滚动偏移
+                // 单独经 `scroll_offset` 交给动画器：它按变化量平移四角，
+                // 而 `destination` 同时也在变，两者相抵 → 滚动不算移动、
+                // 不产生动画，光标钉在内容上（与终端 / 代码编辑器同一模型）。
+                let scroll = prepaint.element_offset;
+                let shape: crate::components::cursor_animation::CursorShape =
+                    self.caret_shape.into();
+                let span_w = block_width.as_f32();
+                let span_h = self.caret_metric_height.as_f32();
+                // 形状比例按**名义**尺寸算（Bar 宽 / Underline 高），
+                // 与行类型无关，跨块移动不会因行高变化触发瞬移。
+                let cell_percentage = match self.caret_shape {
+                    CursorShape::Bar => {
+                        (self.caret_width.as_f32() / span_w.max(1.0)).clamp(0.0, 1.0)
+                    }
+                    CursorShape::Underline => (2.0 / span_h.max(1.0)).clamp(0.0, 1.0),
+                    _ => 1.0,
+                };
+                let target = crate::components::cursor_animation::CursorTarget {
+                    destination: gpui::point(pos.x.as_f32(), pos.y.as_f32()),
+                    cell: (span_w, self.line_height.as_f32()),
+                    shape_span: (span_w, span_h),
+                    scroll_offset: gpui::point(scroll.x.as_f32(), scroll.y.as_f32()),
+                    shape,
+                    cell_percentage,
+                    // 度量用固定名义值：真实行高随块类型变化，作为度量会
+                    // 让跨块移动被误判成布局变化而瞬移。
+                    metrics: (block_width, self.caret_metric_height),
+                    // 布局判据：markdown 每行是**独立元素**，`bounds` 随光标
+                    // 所在行移动——用它做判据会每帧判定「布局变化」而永远瞬移。
+                    // 这里只保留横向位置（窄栏居中时同一列内稳定），纵向交给
+                    // `metrics`（字号 / 主题变化会改它）。
+                    layout_origin: gpui::point(bounds.left(), gpui::px(0.0)),
+                };
+                let now = cx.background_executor().now();
+                let reduce_motion = cx.reduce_motion();
+                let (quad, animating) = self.view.update(cx, |view, _cx| {
+                    view.step_caret_animation(target, reduce_motion, now)
+                });
+
+                // 仍在运动 → 请求下一帧（平台帧源，与 vsync 对齐，收敛即停）。
+                if animating {
+                    let view_id = self.view.entity_id();
+                    window.on_next_frame(move |_, cx| cx.notify(view_id));
+                }
+
                 let mut caret = CursorLayout::new(
                     pos,
                     block_width,
@@ -621,7 +690,10 @@ impl Element for LiveLine {
                     self.caret_shape,
                     self.caret_block_text.clone(),
                 );
-                caret.paint(window, cx);
+                if let Some(quad) = quad {
+                    caret = caret.with_quad(quad);
+                }
+                caret.paint_with_opacity(self.caret_opacity, window, cx);
             }
         }
 

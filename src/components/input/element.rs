@@ -3519,8 +3519,8 @@ impl TextElement {
         // 闪烁不透明度由 `cursor_opacity` 给出（相位末尾淡出/淡入）；透明度
         // 为 0 时跳过绘制，避免画一个全透明的光标。
         //
-        // 用 `should_paint_cursor` 而非 `show_cursor`：淡入窗口内 `visible()`
-        // 仍为 false，但透明度已大于 0，必须绘制才不会「到点突然出现」。
+        // 用 `should_paint_cursor` 而非单纯的 `blink.visible()`：淡入窗口内
+        // 后者仍为 false，但透明度已大于 0，必须绘制才不会「到点突然出现」。
         if paint_cursor && cursor_opacity > 0.0 {
             if let Some(mut cursor_layout) = prepaint.cursor_bounds_with_scroll() {
                 cursor_layout.paint_with_opacity(cursor_opacity, window, cx);
@@ -4052,7 +4052,6 @@ pub(super) fn measure_guide_xs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::prelude::*;
     use std::time::Duration;
 
     #[test]

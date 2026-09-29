@@ -197,6 +197,9 @@ pub struct LiveMarkdownView {
     cursor_shape: CursorShape,
     cursor_blink: bool,
     blink_on: bool,
+    /// 光标四角弹簧动画状态（跨帧存活；光标行的 `LiveLine::paint` 每帧
+    /// 只推进一次）。
+    cursor_animator: crate::components::cursor_animation::CursorAnimator,
     /// Typora 风格大纲侧栏是否展开（`Cmd+Shift+O` / 状态条切换）。
     show_outline: bool,
     /// 本文档路径（编辑器传入）：图片粘贴/拖拽按 Typora 存入 `<stem>.assets/`。
@@ -343,6 +346,7 @@ impl LiveMarkdownView {
             cursor_shape: CursorShape::Bar,
             cursor_blink: true,
             blink_on: false,
+            cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             show_outline: false,
             doc_path: None,
             show_source: false,
@@ -498,11 +502,48 @@ impl LiveMarkdownView {
         }
     }
 
-    fn show_caret(&self, window: &Window, cx: &App) -> bool {
-        !self.read_only
-            && self.focus.is_focused(window)
-            && window.is_window_active()
-            && self.blink.read(cx).visible()
+    /// 本帧是否应当绘制光标。
+    ///
+    /// 比单纯的 `blink.visible()` 宽：淡入窗口内后者仍为 false（相位尚未
+    /// 翻转），但透明度已大于 0——此时必须绘制，否则淡入会变成「到点突然
+    /// 出现」。
+    fn should_paint_caret(&self, window: &Window, cx: &App) -> bool {
+        if self.read_only || !self.focus.is_focused(window) || !window.is_window_active() {
+            return false;
+        }
+        let blink = self.blink.read(cx);
+        blink.visible() || blink.needs_repaint()
+    }
+
+    /// 光标当前的绘制不透明度（0.0 = 完全隐藏，1.0 = 实心）。
+    ///
+    /// 与终端 / 代码编辑器一致：闪烁相位末尾 100ms 线性淡出 / 淡入。
+    /// 只读、失焦、窗口非活动时恒为 1.0（由 [`Self::should_paint_caret`]
+    /// 决定是否绘制）。
+    fn caret_opacity(&self, window: &Window, cx: &App) -> f32 {
+        if self.read_only || !self.focus.is_focused(window) || !window.is_window_active() {
+            return 1.0;
+        }
+        self.blink.read(cx).opacity()
+    }
+
+    /// 推进光标弹簧一帧，返回本帧四边形与是否仍在运动。
+    ///
+    /// 由光标行的 `LiveLine::paint` 调用（那里才有光标几何）。
+    pub(crate) fn step_caret_animation(
+        &mut self,
+        target: crate::components::cursor_animation::CursorTarget,
+        reduce_motion: bool,
+        now: std::time::Instant,
+    ) -> (
+        Option<crate::components::cursor_animation::CursorQuad>,
+        bool,
+    ) {
+        if reduce_motion {
+            self.cursor_animator.reset();
+        }
+        let quad = self.cursor_animator.step(Some(target), now);
+        (quad, self.cursor_animator.is_animating())
     }
 
     // ---- image paste / drop (Typora parity) -----------------------------
@@ -5648,7 +5689,26 @@ impl Render for LiveMarkdownView {
             self.blink.update(cx, |b, cx| b.disable(cx));
             self.blink_on = false;
         }
-        let show_caret = self.show_caret(window, cx);
+        let show_caret = self.should_paint_caret(window, cx);
+        let caret_opacity = self.caret_opacity(window, cx);
+        // 闪烁淡入淡出窗口内需要连续帧（与光标动画同一套「按需续帧」约定：
+        // 相位中间 `needs_repaint()` 为 false，静止即停、不空转）。
+        if self.blink.read(cx).needs_repaint() {
+            let view_id = cx.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(view_id));
+        }
+        // 光标动画的**名义**度量：一律用基础正文行高，与行类型无关。
+        // 标题/代码/表格行的真实行高各不相同，若把本行实际行高当动画度量，
+        // 跨块移动会被误判成「布局变化」而瞬移（动画退化成跳变）。
+        let caret_metric_height = {
+            let font_size = style.base_text_style.font_size.to_pixels(window.rem_size());
+            window.pixel_snap(
+                style
+                    .base_text_style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            )
+        };
         // 文档级宽度：本帧全宽（所有行脱离 780px 窄栏）。逐块「全宽」按钮在
         // 此状态下隐藏（见 mermaid 卡片 / 表格工具栏）。
         let wide_doc = self.wide_doc;
@@ -5927,6 +5987,8 @@ impl Render for LiveMarkdownView {
             .with_drag_fallback(drag_fallback)
             .with_caret_shape(cursor_shape)
             .with_caret_block(paint.caret_block_width, paint.caret_block_text.clone())
+            .with_caret_opacity(caret_opacity)
+            .with_caret_metric_height(caret_metric_height)
         };
 
         if virtualized && v_top_px > 0.0 {
@@ -7452,6 +7514,8 @@ impl Render for LiveMarkdownView {
                                     )
                                     .with_cell_segs(plan.segs.clone(), content.clone())
                                     .with_caret_shape(self.cursor_shape)
+                                    .with_caret_opacity(caret_opacity)
+                                    .with_caret_metric_height(caret_metric_height)
                                     .with_cell_key(row_line, col),
                                 );
                             } else {
@@ -7812,6 +7876,8 @@ impl Render for LiveMarkdownView {
                                 px(26.),
                             )
                             .with_caret_shape(self.cursor_shape)
+                            .with_caret_opacity(caret_opacity)
+                            .with_caret_metric_height(caret_metric_height)
                             .with_caret_block(
                                 if self.cursor_shape.is_block_like() {
                                     (px(26.) * 0.6).max(CURSOR_WIDTH)
@@ -10268,6 +10334,148 @@ mod live_frame_tests {
         let view = cell.into_inner().unwrap();
         let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
         assert_frames(&mut vc, &view);
+    }
+}
+
+#[cfg(test)]
+mod live_caret_animation_tests {
+    use super::*;
+
+    const SAMPLE: &str = "# Title\n\npara one\n\npara two\n\n```rust\nfn main() {}\n```\n";
+
+    struct Host(gpui::Entity<LiveMarkdownView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.0.clone()
+        }
+    }
+
+    /// 开一个测试窗口、激活并聚焦（测试窗口默认不活跃，光标不会绘制）。
+    fn setup_with(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<LiveMarkdownView>, gpui::VisualTestContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let cell = std::cell::RefCell::new(None);
+        let handle = cx.open_window(gpui::size(px(800.), px(600.)), |_, cx| {
+            let view = cx.new(|cx| LiveMarkdownView::with_text(text, cx));
+            *cell.borrow_mut() = Some(view.clone());
+            Host(view)
+        });
+        let view = cell.into_inner().unwrap();
+        let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
+        vc.update(|window, cx| {
+            window.activate_window();
+            window.focus(&view.read(cx).focus_handle(), cx);
+        });
+        (view, vc)
+    }
+
+    /// 推进一帧：消费 `on_next_frame` 回调 → 推进模拟时钟 → 重绘。
+    ///
+    /// 动画的续帧靠 `on_next_frame`，测试里必须显式 `simulate_next_frame`
+    /// 消费（`refresh` 只标脏、不跑绘制）。
+    fn tick(vc: &mut gpui::VisualTestContext) {
+        vc.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        vc.executor()
+            .advance_clock(std::time::Duration::from_millis(16));
+        vc.refresh().unwrap();
+        vc.run_until_parked();
+    }
+
+    /// 光标移动应产生弹簧动画并收敛。
+    #[gpui::test]
+    fn caret_move_animates_and_settles(cx: &mut gpui::TestAppContext) {
+        let (view, mut vc) = setup_with(cx, SAMPLE);
+        tick(&mut vc);
+
+        // 首帧：光标就位、无动画。
+        assert!(
+            !view.read_with(&vc, |v, _| v.cursor_animator.is_animating()),
+            "首帧不应处于动画中"
+        );
+
+        // 光标下移到下一段（跨行）：应起动画。
+        vc.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.edit(cx, |m| m.move_to(2, 0, false));
+            });
+        });
+        tick(&mut vc);
+        assert!(
+            view.read_with(&vc, |v, _| v.cursor_animator.is_animating()),
+            "光标移动应产生动画"
+        );
+
+        // 推进到收敛。
+        let mut frames = 0;
+        for _ in 0..300 {
+            if !view.read_with(&vc, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+            tick(&mut vc);
+            frames += 1;
+        }
+        assert!(frames > 1, "应有多帧中间态，实际 {frames} 帧");
+        assert!(
+            !view.read_with(&vc, |v, _| v.cursor_animator.is_animating()),
+            "动画应收敛"
+        );
+    }
+
+    /// 滚动不应产生光标动画（光标应钉在内容上）。
+    #[gpui::test]
+    fn caret_scroll_does_not_animate(cx: &mut gpui::TestAppContext) {
+        // 长文档才滚得动。
+        let long: String = (0..200)
+            .map(|i| format!("paragraph number {i} with some filler text\n\n"))
+            .collect();
+        let (view, mut vc) = setup_with(cx, &long);
+
+        // 就位并收敛。
+        for _ in 0..300 {
+            tick(&mut vc);
+            if !view.read_with(&vc, |v, _| v.cursor_animator.is_animating()) {
+                break;
+            }
+        }
+
+        let before = view.read_with(&vc, |v, _| v.cursor_animator.last_quad());
+
+        // 只滚动，不移动光标。
+        vc.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let cur = v.scroll.offset();
+                v.scroll.set_offset(gpui::point(cur.x, cur.y - px(120.0)));
+                cx.notify();
+            });
+        });
+        tick(&mut vc);
+
+        assert!(
+            !view.read_with(&vc, |v, _| v.cursor_animator.is_animating()),
+            "滚动不应产生光标动画（光标应钉在内容上）"
+        );
+
+        // 滚动量必须真的被动画器看到：四边形应整体上移 120px。
+        let after = view.read_with(&vc, |v, _| v.cursor_animator.last_quad());
+        match (before, after) {
+            (Some(b), Some(a)) => {
+                let dy = a.corners[0].1 - b.corners[0].1;
+                assert!(
+                    (dy - (-120.0)).abs() < 2.0,
+                    "滚动应把光标整体平移 -120px，实际 {dy}（before={:?} after={:?}）",
+                    b.corners[0],
+                    a.corners[0]
+                );
+            }
+            other => panic!("两侧都应有四边形: {other:?}"),
+        }
     }
 }
 

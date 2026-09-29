@@ -4048,20 +4048,12 @@ impl InputState {
         self.clamp_offset_to_visible_forward(offset)
     }
 
-    /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
-    pub(crate) fn show_cursor(&self, window: &Window, cx: &App) -> bool {
-        self.focus_handle.is_focused(window)
-            && !self.disabled
-            && self.blink_cursor.read(cx).visible()
-            && window.is_window_active()
-    }
-
     /// 光标当前的绘制不透明度（0.0 = 完全隐藏，1.0 = 实心）。
     ///
     /// 与终端一致：闪烁相位末尾 100ms 线性淡出 / 淡入。失焦 / 禁用 / 常显
     /// 模式下恒为 1.0。
     ///
-    /// 注意淡入窗口内 `show_cursor` 仍为 false（`visible()` 是布尔语义），
+    /// 注意淡入窗口内 `blink.visible()` 仍为 false（它是布尔语义），
     /// 所以绘制侧要同时接受「淡入中」：见 [`Self::should_paint_cursor`]。
     pub(crate) fn cursor_opacity(&self, window: &Window, cx: &App) -> f32 {
         if !self.focus_handle.is_focused(window) || self.disabled || !window.is_window_active()
@@ -4073,7 +4065,7 @@ impl InputState {
 
     /// 本帧是否应当绘制光标。
     ///
-    /// 与 [`Self::show_cursor`] 的区别：淡入窗口内 `visible()` 仍是 false
+    /// 与单纯的 `blink.visible()` 的区别：淡入窗口内它仍是 false
     /// （相位尚未翻转），但透明度已经大于 0——此时必须绘制，否则淡入会
     /// 变成「到点突然出现」。
     pub(crate) fn should_paint_cursor(&self, window: &Window, cx: &App) -> bool {
