@@ -16,6 +16,17 @@ pub struct FontSettings {
 
     #[serde(default = "default_terminal_font_weight")]
     pub terminal_font_weight: f32,
+
+    /// 代码编辑器正文的字体族（独立于终端字体与 UI 字体）。
+    ///
+    /// 缩进参考线、列对齐都以等宽字体为前提，所以默认取平台等宽字体，
+    /// 而不是 UI 的比例字体（SF Pro 等）。
+    #[serde(default = "default_editor_font_family")]
+    pub editor_font_family: String,
+
+    /// 代码编辑器正文的字号。
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: f32,
 }
 
 impl Default for FontSettings {
@@ -25,6 +36,8 @@ impl Default for FontSettings {
             terminal_font_size: default_terminal_font_size(),
             terminal_line_height: default_terminal_line_height(),
             terminal_font_weight: default_terminal_font_weight(),
+            editor_font_family: default_editor_font_family(),
+            editor_font_size: default_editor_font_size(),
         }
     }
 }
@@ -68,6 +81,15 @@ fn default_terminal_line_height() -> f32 {
 
 fn default_terminal_font_weight() -> f32 {
     400.0
+}
+
+/// 编辑器默认字体 = 平台默认等宽字体（与终端默认一致）。
+fn default_editor_font_family() -> String {
+    default_terminal_font_family()
+}
+
+fn default_editor_font_size() -> f32 {
+    16.0
 }
 
 /// 获取 Linux 系统默认等宽字体名称（带缓存）

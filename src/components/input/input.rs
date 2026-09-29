@@ -4,6 +4,7 @@ use gpui::{
 };
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
+use crate::sidebar_view::font_settings::FontState;
 use crate::theme::ActiveTheme;
 
 use super::{InputState, element::TextElement};
@@ -103,6 +104,20 @@ impl RenderOnce for EditorInput {
         let is_multi_line = state.mode.is_multi_line();
         let theme = cx.theme().ui;
         const LINE_HEIGHT: gpui::DefiniteLength = relative(1.618);
+
+        // 代码编辑器用独立的「编辑器字体」（等宽字体 + 独立字号），
+        // 与 UI 字体解耦：缩进参考线、列对齐都以等宽字体为前提。
+        // 单行输入框（搜索框、设置项等）继续用 UI 字体。
+        let editor_font = if state.mode.is_code_editor() {
+            cx.try_global::<FontState>().map(|font_state| {
+                (
+                    font_state.settings.editor_font_family.clone(),
+                    font_state.settings.editor_font_size,
+                )
+            })
+        } else {
+            None
+        };
 
         let input_py = match self.size {
             Size::Large => px(10.0),
@@ -208,6 +223,9 @@ impl RenderOnce for EditorInput {
                 window.listener_for(&self.state, InputState::on_mouse_up),
             )
             .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel))
+            .when_some(editor_font, |this, (family, size)| {
+                this.font_family(family).text_size(px(size))
+            })
             .when(self.transparent, |this| this.flex_1());
 
         if is_multi_line {

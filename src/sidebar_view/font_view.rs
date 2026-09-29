@@ -26,11 +26,14 @@ const WEIGHT_OPTIONS: &[(FontWeight, &str)] = &[
 pub struct FontSettingsView {
     focus_handle: FocusHandle,
     font_select: Entity<MacosSelect>,
+    editor_font_select: Entity<MacosSelect>,
     weight_select: Entity<MacosSelect>,
     font_size_input: Entity<InputState>,
+    editor_size_input: Entity<InputState>,
     line_height_input: Entity<InputState>,
     _subscriptions: Vec<gpui::Subscription>,
     font_size_valid: bool,
+    editor_size_valid: bool,
     line_height_valid: bool,
 }
 
@@ -39,6 +42,8 @@ impl FontSettingsView {
         let terminal_font_size = FontState::global(cx).settings.terminal_font_size;
         let terminal_line_height = FontState::global(cx).settings.terminal_line_height;
         let current_family = FontState::global(cx).settings.terminal_font_family.clone();
+        let editor_family = FontState::global(cx).settings.editor_font_family.clone();
+        let editor_font_size = FontState::global(cx).settings.editor_font_size;
 
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
@@ -72,12 +77,29 @@ impl FontSettingsView {
                 current_family.clone()
             };
 
-            let font_select = MacosSelect::new(window, cx, default_fonts, selected_label);
+            let font_select = MacosSelect::new(window, cx, default_fonts.clone(), selected_label);
             font_select.update(cx, |select, _cx| {
                 select.on_select(move |family, _index, _window, cx| {
                     let family = clean_font_choice(&family).to_string();
                     FontState::update(cx, |settings| {
                         settings.terminal_font_family = family;
+                    });
+                });
+            });
+
+            // 编辑器字体：独立于终端字体，单独持久化。
+            let editor_selected_label = if editor_family == default_font {
+                format_font_choice(&default_font, true)
+            } else {
+                editor_family
+            };
+            let editor_font_select =
+                MacosSelect::new(window, cx, default_fonts, editor_selected_label);
+            editor_font_select.update(cx, |select, _cx| {
+                select.on_select(move |family, _index, _window, cx| {
+                    let family = clean_font_choice(&family).to_string();
+                    FontState::update(cx, |settings| {
+                        settings.editor_font_family = family;
                     });
                 });
             });
@@ -115,6 +137,15 @@ impl FontSettingsView {
                 input.set_text(format!("{}", terminal_font_size), cx);
             });
 
+            let editor_size_input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("16")
+                    .placeholder_font_size(px(14.0))
+            });
+            editor_size_input.update(cx, |input, cx| {
+                input.set_text(format!("{}", editor_font_size), cx);
+            });
+
             let line_height_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("1.3")
@@ -127,11 +158,14 @@ impl FontSettingsView {
             let mut view = Self {
                 focus_handle,
                 font_select,
+                editor_font_select,
                 weight_select,
                 font_size_input,
+                editor_size_input,
                 line_height_input,
                 _subscriptions: Vec::new(),
                 font_size_valid: true,
+                editor_size_valid: true,
                 line_height_valid: true,
             };
 
@@ -174,6 +208,38 @@ impl FontSettingsView {
         );
         self._subscriptions.push(size_subscription);
 
+        let editor_size_subscription = cx.subscribe(
+            &self.editor_size_input.clone(),
+            |this: &mut Self, _, event: &InputEvent, cx| {
+                let text = this.editor_size_input.read(cx).value().to_string();
+                let (valid, size) = match text.parse::<f32>() {
+                    Ok(size) if (6.0..=72.0).contains(&size) => (true, Some(size)),
+                    _ => (false, None),
+                };
+                match event {
+                    InputEvent::Change => {
+                        if valid != this.editor_size_valid {
+                            this.editor_size_valid = valid;
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::Blur => {
+                        if valid != this.editor_size_valid {
+                            this.editor_size_valid = valid;
+                            cx.notify();
+                        }
+                        if let Some(size) = size {
+                            FontState::update(cx, |settings| {
+                                settings.editor_font_size = size;
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            },
+        );
+        self._subscriptions.push(editor_size_subscription);
+
         let lh_subscription = cx.subscribe(
             &self.line_height_input.clone(),
             |this: &mut Self, _, event: &InputEvent, cx| {
@@ -208,24 +274,28 @@ impl FontSettingsView {
     }
 
     fn load_system_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.font_select.update(cx, |select, cx| {
-            let default_font = platform_default_font_family().to_string();
-            let mut fonts: Vec<_> = window
-                .text_system()
-                .all_font_names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
-            fonts.sort();
-            fonts.dedup();
-            fonts.retain(|f| f != &default_font);
-            let mut final_fonts: Vec<SharedString> =
-                vec![format_font_choice(&default_font, true).into()];
-            final_fonts.extend(fonts.into_iter().map(|s| s.into()));
-            if !final_fonts.is_empty() {
-                select.set_items(final_fonts, cx);
+        for select in [&self.font_select, &self.editor_font_select] {
+            let select = select.clone();
+            let items = {
+                let default_font = platform_default_font_family().to_string();
+                let mut fonts: Vec<_> = window
+                    .text_system()
+                    .all_font_names()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                fonts.sort();
+                fonts.dedup();
+                fonts.retain(|f| f != &default_font);
+                let mut final_fonts: Vec<SharedString> =
+                    vec![format_font_choice(&default_font, true).into()];
+                final_fonts.extend(fonts.into_iter().map(|s| s.into()));
+                final_fonts
+            };
+            if !items.is_empty() {
+                select.update(cx, |select, cx| select.set_items(items, cx));
             }
-        });
+        }
     }
 
     fn render_compact_row(&self, label: &str, control: impl IntoElement, cx: &App) -> gpui::Div {
@@ -324,6 +394,41 @@ impl Render for FontSettingsView {
                                         .text_xs()
                                         .text_color(error_color)
                                         .child("Value must be between 0.8 and 3.0"),
+                                )
+                            }),
+                    ),
+            )
+            // 编辑器字体（独立于终端字体，作用于代码编辑器正文）
+            .child(self.render_compact_row("编辑器字体", self.editor_font_select.clone(), cx))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div().w(px(80.)).flex().child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child("编辑器字号"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(EditorInput::new(&self.editor_size_input))
+                            .when(!self.editor_size_valid, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(error_color)
+                                        .child("Value must be between 6 and 72"),
                                 )
                             }),
                     ),

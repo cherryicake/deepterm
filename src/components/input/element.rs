@@ -4,8 +4,8 @@ use gpui::{
     App, Bounds, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ShapedLine,
-    SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window, fill, point,
-    px, relative, size,
+    SharedString, Size, Style, TextAlign, TextRun, TextStyle, TextStyleRefinement, UnderlineStyle,
+    Window, fill, point, px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -18,6 +18,7 @@ use crate::{
         cursor::{CursorLayout, CursorShape},
         display_map::LineLayout,
     },
+    sidebar_view::font_settings::FontState,
     theme::ActiveTheme as _,
 };
 
@@ -287,6 +288,7 @@ impl TextElement {
     /// Handles pending updates (moved from InputState::render) and ensures
     /// the display map is ready for layout.
     fn prepare_if_needed(&mut self, window: &mut Window, cx: &mut App) {
+        let editor_font = self.editor_font_settings(cx);
         self.state.update(cx, |state, cx| {
             if state._pending_update {
                 let bg = state
@@ -297,15 +299,54 @@ impl TextElement {
                 }
                 state._pending_update = false;
             }
-            state.display_map.set_font(
-                window.text_style().font(),
-                state
-                    .font_size
-                    .unwrap_or_else(|| window.text_style().font_size.to_pixels(window.rem_size())),
-                cx,
-            );
+            // 字体解析：request_layout 阶段不能 push 文本样式栈（gpui 只允许
+            // prepaint/paint 阶段调用 `with_text_style`），所以这里显式解析。
+            // 代码编辑器用独立的「编辑器字体」，与容器文本样式解耦；非代码
+            // 编辑器维持原语义（`state.font_size` 覆盖，否则用环境样式）。
+            let ambient = window.text_style();
+            let size = state.font_size.unwrap_or_else(|| match &editor_font {
+                Some((_, size)) => *size,
+                None => ambient.font_size.to_pixels(window.rem_size()),
+            });
+            let mut font = ambient.font();
+            if let Some((family, _)) = &editor_font {
+                font.family = family.clone();
+            }
+            state.display_map.set_font(font, size, cx);
             state.display_map.ensure_text_prepared(&state.text, cx);
         });
+    }
+
+    /// 代码编辑器的独立字体（`font.json` 的编辑器字体设置）：`(family, size)`。
+    ///
+    /// 非代码编辑器、或设置尚未初始化（`FontState` 全局未注册）时返回
+    /// `None`，调用方回落到环境文本样式。
+    fn editor_font_settings(&self, cx: &App) -> Option<(SharedString, Pixels)> {
+        if !self.state.read(cx).mode.is_code_editor() {
+            return None;
+        }
+        let font_state = cx.try_global::<FontState>()?;
+        Some((
+            font_state.settings.editor_font_family.clone().into(),
+            px(font_state.settings.editor_font_size),
+        ))
+    }
+
+    /// prepaint/paint 阶段的文本样式 refinement：把编辑器字体压到当前环境
+    /// 样式之上。
+    ///
+    /// 关键约束：同一 `InputState` 可能从不同容器渲染（生产里是 `EditorInput`
+    /// 的样式容器，测试里还有裸 `TextElement` 直绘）。若字体跟随容器，两条
+    /// 路径会交替往 display map 写不同的字体，行高/装订线宽度逐帧抖动，
+    /// 光标动画器会把它判成「布局变化」而瞬移收敛。字体由编辑器自身决定后，
+    /// 无论从哪条路径渲染度量都一致。
+    fn editor_font_refinement(&self, cx: &App) -> Option<TextStyleRefinement> {
+        self.editor_font_settings(cx)
+            .map(|(family, size)| TextStyleRefinement {
+                font_family: Some(family),
+                font_size: Some(size.into()),
+                ..Default::default()
+            })
     }
 
     /// Returns the:
@@ -2266,6 +2307,40 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // 编辑器字体收敛到 TextElement 自身（见 editor_font_refinement）：
+        // 同一 InputState 无论从哪条渲染路径画出来，字体/行高必须一致。
+        let refinement = self.editor_font_refinement(cx);
+        window.with_text_style(refinement, |window| {
+            self.prepaint_inner(bounds, _request_layout, window, cx)
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        input_bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 同 prepaint：把编辑器字体压到环境样式上，保证与其它渲染路径一致。
+        let refinement = self.editor_font_refinement(cx);
+        window.with_text_style(refinement, |window| {
+            self.paint_inner(input_bounds, _request_layout, prepaint, window, cx)
+        })
+    }
+}
+
+impl TextElement {
+    fn prepaint_inner(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> PrepaintState {
         let style = window.text_style();
 
         let state = self.state.read(cx);
@@ -2854,13 +2929,11 @@ impl Element for TextElement {
         }
     }
 
-    fn paint(
+    fn paint_inner(
         &mut self,
-        _id: Option<&GlobalElementId>,
-        _: Option<&gpui::InspectorElementId>,
         input_bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
+        _request_layout: &mut (),
+        prepaint: &mut PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
