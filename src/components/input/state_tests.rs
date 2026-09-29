@@ -32,8 +32,9 @@ fn indent_level_bounds(line_text: &str) -> Vec<usize> {
 }
 
 
-    /// 反缩进的长度语义现在由 `TabSize` 承载（审计 3.14），这里验证默认配置
-    /// （硬 Tab，列宽 4）下的行为不变；`indent.rs` 的测试覆盖空格配置。
+    /// 反缩进的长度语义由 `TabSize` 承载（审计 3.14），这里验证默认配置
+    /// （4 空格软缩进，行首 Tab 也按一级删除）下的行为；`indent.rs` 的
+    /// 测试覆盖其它宽度与硬 Tab 配置。
     #[test]
     fn outdent_unit_len_prefers_tab() {
         let tab = TabSize::default();

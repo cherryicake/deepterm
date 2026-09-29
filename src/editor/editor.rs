@@ -1453,6 +1453,13 @@ impl Editor {
                 Language::from_id(&id).display_name().to_string()
             })
             .unwrap_or_else(|| "纯文本".to_string());
+        // 缩进单元：硬 Tab 显示 "Tab"，空格缩进显示单元宽度。
+        let tab_size = state.tab_size;
+        let indent_label = if tab_size.hard_tabs {
+            "缩进: Tab".to_string()
+        } else {
+            format!("缩进: {} 空格", tab_size.tab_size)
+        };
 
         div()
             .id("editor-status-bar")
@@ -1502,7 +1509,7 @@ impl Editor {
                             .px(px(8.0))
                             .py(px(2.0))
                             .rounded(px(6.0))
-                            .child("缩进: Tab"),
+                            .child(indent_label),
                     )
                     .child(
                         div()

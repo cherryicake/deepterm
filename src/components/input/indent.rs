@@ -16,7 +16,10 @@ pub struct TabSize {
 }
 
 impl TabSize {
-    /// 硬 Tab 缩进 —— 编辑器当前默认（Makefile 等依赖制表符的格式需要它）。
+    /// 硬 Tab 缩进（Makefile 等依赖制表符的格式需要它）。
+    ///
+    /// 已不是默认值：默认走 [`Default`]，即 4 空格软缩进（与 Zed 一致），
+    /// 保证一个缩进单元恰好是 4 个等宽字符宽。
     pub const HARD_TABS: Self = Self {
         tab_size: 4,
         hard_tabs: true,
@@ -45,12 +48,12 @@ impl TabSize {
 
     /// 行首反缩进一次要删掉的字节数（0 表示行首没有缩进单元）。
     ///
-    /// 硬 Tab 模式下优先删掉行首的 Tab；若行首不是 Tab（混合缩进、或该行本就
-    /// 用空格缩进），则退回删掉至多 `width()` 个空格 —— 否则这类行会完全无法
-    /// 反缩进。空格模式只认前导空格。
+    /// 行首是 Tab 时删掉它（一个 Tab 就是一级缩进，空格模式下打开的硬 Tab
+    /// 缩进文件同样要能反缩进）；否则删掉行首至多 `width()` 个空格 —— 混合
+    /// 缩进、或该行本就用空格缩进的行都不会因此卡住。
     pub fn outdent_len(self, line: &str) -> usize {
         let bytes = line.as_bytes();
-        if self.hard_tabs && bytes.first() == Some(&b'\t') {
+        if bytes.first() == Some(&b'\t') {
             1
         } else {
             bytes
@@ -76,8 +79,10 @@ impl TabSize {
 }
 
 impl Default for TabSize {
+    /// 默认 4 空格软缩进 —— 与 Zed 默认一致（`hard_tabs: false`、
+    /// `tab_size: 4`），且等宽字体下一个缩进单元恰好 4 个字符宽。
     fn default() -> Self {
-        Self::HARD_TABS
+        Self::spaces(4)
     }
 }
 
@@ -109,10 +114,12 @@ mod tests {
         assert_eq!(tab.outdent_len("      foo"), 4);
     }
 
-    /// 空格模式下行首的 Tab 不构成缩进单元，避免把 `\t` 当成一个空格删掉。
+    /// 空格配置下行首的 Tab 同样反缩进（删掉 1 字节 = 一级），但混合缩进
+    /// （空格在前）时先按空格算，不会跳过前导空格去吃 Tab。
     #[test]
-    fn outdent_len_spaces_ignores_leading_tab() {
-        assert_eq!(TabSize::spaces(4).outdent_len("\tfoo"), 0);
+    fn outdent_len_spaces_handles_leading_tab() {
+        assert_eq!(TabSize::spaces(4).outdent_len("\tfoo"), 1);
+        assert_eq!(TabSize::spaces(4).outdent_len("\t\tfoo"), 1);
         assert_eq!(TabSize::spaces(4).outdent_len("  \tfoo"), 2);
     }
 
@@ -125,12 +132,20 @@ mod tests {
         assert_eq!(two.outdent_len(" foo"), 1);
         assert_eq!(two.outdent_len("foo"), 0);
         assert_eq!(two.outdent_len(""), 0);
-        assert_eq!(two.outdent_len("\tfoo"), 0);
+        assert_eq!(two.outdent_len("\tfoo"), 1);
 
         let four = TabSize::spaces(4);
         assert_eq!(four.outdent_len("    foo"), 4);
         assert_eq!(four.outdent_len("      foo"), 4);
         assert_eq!(four.outdent_len("  foo"), 2);
+    }
+
+    /// 默认配置 = 4 空格软缩进。
+    #[test]
+    fn default_is_four_spaces() {
+        assert_eq!(TabSize::default(), TabSize::spaces(4));
+        assert!(!TabSize::default().hard_tabs);
+        assert_eq!(TabSize::default().indent_unit(), "    ");
     }
 
     #[test]

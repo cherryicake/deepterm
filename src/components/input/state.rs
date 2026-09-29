@@ -596,7 +596,7 @@ pub struct InputState {
     pub(crate) indent_guides: bool,
     /// 缩进单元配置（硬 Tab / 空格，以及单元列宽）。
     ///
-    /// 默认 [`TabSize::HARD_TABS`]，即与历史行为一致的「Tab 字符 + 4 列」。
+    /// 默认 [`TabSize::default`]（4 空格软缩进，与 Zed 一致）。
     pub(crate) tab_size: TabSize,
     /// 悬浮滚动条。
     pub(crate) scrollbar: bool,
@@ -866,8 +866,8 @@ impl InputState {
     /// Default options:
     ///
     /// - line_number: true
-    /// - 缩进单元：Tab 字符、4 列宽（[`TabSize::HARD_TABS`]，可用
-    ///   [`Self::tab_size`] 改成空格缩进）
+    /// - 缩进单元：4 个空格（[`TabSize::default`]，可用
+    ///   [`Self::tab_size`] 改成硬 Tab 或其它宽度）
     /// - height: 100%
     /// - multi_line: true
     /// - indent_guides: true
@@ -1414,7 +1414,7 @@ impl InputState {
         self
     }
 
-    /// 缩进单元配置（默认 [`TabSize::HARD_TABS`]）。
+    /// 缩进单元配置（默认 [`TabSize::default`]，即 4 空格）。
     ///
     /// 影响 Tab / Shift+Tab、回车智能缩进、闭合括号自动反缩进与缩进参考线层级。
     pub fn tab_size(mut self, tab_size: TabSize) -> Self {
@@ -3197,8 +3197,8 @@ impl InputState {
     }
 
     /// 代码编辑器中 Tab / Shift+Tab 的缩进单元由 [`Self::tab_size`] 决定：
-    /// 默认 [`TabSize::HARD_TABS`]（Makefile 等对制表符敏感的格式依赖它），
-    /// 也可切成空格缩进。
+    /// 默认 [`TabSize::default`]（4 空格，与 Zed 一致），Makefile 等对
+    /// 制表符敏感的文件可切成 [`TabSize::HARD_TABS`]。
     pub(crate) fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
         self.indent_or_outdent_lines(false, window, cx);
     }
