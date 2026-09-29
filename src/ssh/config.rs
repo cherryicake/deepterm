@@ -145,9 +145,13 @@ pub struct SshConnectionConfig {
     /// 本次连接是否经系统代理（见 [`crate::ssh::system_proxy`]）。
     ///
     /// **只存在于内存**：Host 菜单的「使用系统代理连接」是对这一次连接的指定，
-    /// 不是主机的持久属性，因此 `serde(skip)` 不落盘。代价是会话恢复
-    /// （`session_state.json`）与重新连接会退回直连——那两条路径都不是用户
-    /// 刚刚点过代理的上下文。
+    /// 不是主机的持久属性，因此 `serde(skip)` 不落盘——写进 `ssh.json` 会让
+    /// 「用代理连过一次」变成这台主机的永久设置。
+    ///
+    /// 代价与对策：
+    /// - Tab 菜单「重新连接」与「复制标签页」走内存，标记天然保留；
+    /// - 退出重启走 `session_state.json`，那里的 `TerminalSessionState::Ssh`
+    ///   自己存了一份并在此合回（见 `TerminalSessionState::ssh_config_with_proxy`）。
     #[serde(skip)]
     pub use_system_proxy: bool,
 }

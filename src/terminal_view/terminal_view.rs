@@ -1433,10 +1433,7 @@ impl TerminalView {
 
     pub fn session_state(&self, cx: &App) -> TerminalSessionState {
         if let Some(config) = self.ssh_config.clone() {
-            return TerminalSessionState::Ssh {
-                config,
-                remote_cwd: self.current_remote_working_directory(cx),
-            };
+            return TerminalSessionState::ssh(config, self.current_remote_working_directory(cx));
         }
 
         let cwd = self.current_local_working_directory(cx);
@@ -5867,5 +5864,37 @@ mod tests {
             SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
         let resolved = resolve_current_ssh_config(&plain_snapshot, &[proxied_disk]);
         assert!(!resolved.use_system_proxy, "未选代理时不得凭空开启代理");
+    }
+
+    /// 会话恢复的完整链路：会话文件 → 还原配置 → 对齐磁盘配置，代理标记不丢。
+    ///
+    /// 这是「退出重启后是否还用系统代理」的端到端判定。两段都可能丢标记：
+    /// 会话文件不存（`SshConnectionConfig` 上该字段 `serde(skip)`），或
+    /// `resolve_current_ssh_config` 对齐磁盘配置时没带过来。
+    #[test]
+    fn restored_session_keeps_the_proxy_choice_through_config_alignment() {
+        use crate::ssh::SshConnectionConfig;
+        use crate::ssh::config::AuthMethod;
+        use crate::workspace::session_state::TerminalSessionState;
+
+        // 用户点了「使用系统代理连接」后保存会话
+        let mut live = SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
+        live.use_system_proxy = true;
+        let saved = TerminalSessionState::ssh(live.clone(), None);
+        let json = serde_json::to_string(&saved).unwrap();
+
+        // 重启：读回会话文件
+        let restored: TerminalSessionState = serde_json::from_str(&json).unwrap();
+        let restored_config = restored.ssh_config_with_proxy().expect("Ssh 分支应有配置");
+
+        // 恢复时按 id 对齐磁盘配置（磁盘上该字段恒为 false）
+        let mut on_disk = restored_config.clone();
+        on_disk.use_system_proxy = false;
+        let resolved = resolve_current_ssh_config(&restored_config, &[on_disk]);
+
+        assert!(
+            resolved.use_system_proxy,
+            "重启恢复后仍须经系统代理（用户点的就是这个）"
+        );
     }
 }

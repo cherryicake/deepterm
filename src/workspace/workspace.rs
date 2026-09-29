@@ -2381,8 +2381,11 @@ impl Workspace {
         };
 
         let state = terminal_view.read(cx).session_state(cx);
-        match state {
-            TerminalSessionState::Ssh { config, remote_cwd } => {
+        match &state {
+            TerminalSessionState::Ssh { remote_cwd, .. } => {
+                // 复制标签页继承代理选择：复制出来的标签连的是同一台海外主机，
+                // 丢掉标记等于复制出一个必然不稳的直连会话。
+                let config = state.ssh_config_with_proxy().expect("Ssh 分支必有配置");
                 let workspace_id = self.workspace_id.clone();
                 let panel = cx.new(|cx| {
                     Panel::with_ssh_terminal(
@@ -2391,7 +2394,7 @@ impl Workspace {
                         Some(format!("tab-{}", self.next_tab_id).into()),
                         Some(config.display_name().into()),
                         &config,
-                        remote_cwd,
+                        remote_cwd.clone(),
                         cx,
                     )
                 });
@@ -2409,7 +2412,7 @@ impl Workspace {
                             workspace_id,
                             Some(format!("tab-{}", self.next_tab_id).into()),
                             None,
-                            cwd.map(std::path::PathBuf::from),
+                            cwd.clone().map(std::path::PathBuf::from),
                             cx,
                         )
                     });

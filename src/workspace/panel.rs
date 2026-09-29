@@ -449,21 +449,27 @@ impl Panel {
         let state = terminal_view.read(cx).session_state(cx);
         // 主动终止被替换的旧终端，避免进程/连接泄漏（旧实体随后被 set_content 释放）
         terminal_view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
-        let new_terminal_view = match state {
-            TerminalSessionState::Ssh { config, remote_cwd } => {
+        let new_terminal_view = match &state {
+            TerminalSessionState::Ssh { remote_cwd, .. } => {
+                // 经 `ssh_config_with_proxy` 还原代理标记：重连必须与首次连接走
+                // 同一条传输路径，否则海外主机重连就退回直连。
+                let config = state.ssh_config_with_proxy().expect("Ssh 分支必有配置");
                 log::info!(
                     "重新连接面板 {} 的 SSH 会话: {}",
                     self.panel_id,
                     config.host_label()
                 );
-                TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd)
+                TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone())
             }
             TerminalSessionState::Local { cwd, command, args } => {
                 log::info!("重新启动面板 {} 的本地会话", self.panel_id);
                 if let Some(cmd) = command {
-                    TerminalView::new_with_command(cx, &cmd, &args)
+                    TerminalView::new_with_command(cx, cmd, args)
                 } else {
-                    TerminalView::new_with_working_directory(cx, cwd.map(std::path::PathBuf::from))
+                    TerminalView::new_with_working_directory(
+                        cx,
+                        cwd.clone().map(std::path::PathBuf::from),
+                    )
                 }
             }
         };
@@ -521,12 +527,18 @@ impl Panel {
                 )
             }
             PanelContentSessionState::Terminal(TerminalSessionState::Ssh {
-                config,
-                remote_cwd,
+                remote_cwd, ..
             }) => {
                 let panel_id = state.id.clone();
+                // 经 `ssh_config_with_proxy` 还原代理标记：`config` 上的
+                // `use_system_proxy` 是 `serde(skip)` 的，标记存在会话状态的同级
+                // 字段里，不合回去的话恢复出来的海外主机是直连。
+                let config = state
+                    .content
+                    .ssh_config_with_proxy()
+                    .expect("Ssh 分支必有配置");
                 let terminal_view =
-                    TerminalView::new_ssh_with_remote_cwd(cx, config, remote_cwd.clone());
+                    TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone());
                 Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
                 let mut panel = Self::new_common(
                     panel_id,
