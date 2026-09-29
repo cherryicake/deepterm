@@ -88,7 +88,7 @@ impl MacosSidebar {
                 }
                 FileTreeEvent::RootChanged => {
                     this.ensure_git_panel(cx);
-                    this.ensure_search_panel(cx);
+                    this.ensure_file_search_panel(cx);
                 }
             },
         );
@@ -118,7 +118,7 @@ impl MacosSidebar {
         self.file_tree_target_label = Some(target_label);
         self.current_view = SidebarView::FileTree;
         self.ensure_git_panel(cx);
-        self.ensure_search_panel(cx);
+        self.ensure_file_search_panel(cx);
         cx.notify();
         let app_window = self.app_window.clone();
         cx.defer(move |cx| {
@@ -128,18 +128,18 @@ impl MacosSidebar {
         });
     }
 
-    /// 确保项目搜索面板已创建，并让它指向当前文件树的根目录。
+    /// 确保文件名搜索面板已创建，并让它指向当前文件树的根目录。
     ///
     /// 与 `ensure_git_panel` 同款生命周期：懒建 + 根变化时同步。
-    /// 只支持本地根：项目级搜索走 `ignore` 的本地遍历，远程仓库要经 SFTP
-    /// 逐文件读，成本与本地不在一个量级，留待后续按需实现。
-    fn ensure_search_panel(&mut self, cx: &mut Context<Self>) {
-        if self.search_panel.is_none() {
-            let panel = cx.new(crate::sidebar_view::project_search_panel::ProjectSearchPanel::new);
-            self.search_panel = Some(panel);
+    /// 只支持本地根：遍历走 `ignore` 的本地 walker，远程仓库要经 SFTP
+    /// 逐目录列，成本与本地不在一个量级。
+    fn ensure_file_search_panel(&mut self, cx: &mut Context<Self>) {
+        if self.file_search_panel.is_none() {
+            let panel = cx.new(|_| crate::sidebar_view::file_search_panel::FileSearchPanel::new());
+            self.file_search_panel = Some(panel);
         }
 
-        let Some(ref search_panel) = self.search_panel else {
+        let Some(ref search_panel) = self.file_search_panel else {
             return;
         };
         let Some(ref file_tree) = self.file_tree_view else {
@@ -151,21 +151,17 @@ impl MacosSidebar {
             tree.is_local().then(|| tree.root_path().to_path_buf())
         };
 
-        // 事件转发：命中行点击 → 打开编辑器对应位置。
-        if self.search_panel_subscription.is_none() {
+        // 事件转发：命中行点击 → 打开文件。
+        if self.file_search_panel_subscription.is_none() {
             let sub = cx.subscribe(
                 search_panel,
-                |this, _, event: &crate::sidebar_view::project_search_panel::ProjectSearchEvent, cx| {
+                |this, _, event: &crate::sidebar_view::file_search_panel::FileSearchEvent, cx| {
                     match event {
-                        crate::sidebar_view::project_search_panel::ProjectSearchEvent::OpenMatch {
+                        crate::sidebar_view::file_search_panel::FileSearchEvent::OpenFile {
                             path,
-                            line,
-                            column,
                         } => {
-                            cx.emit(SidebarEvent::OpenFileAt {
+                            cx.emit(SidebarEvent::OpenFile {
                                 path: path.clone(),
-                                line: Some(*line),
-                                column: Some(*column),
                                 ssh_config: None,
                             });
                         }
@@ -173,7 +169,7 @@ impl MacosSidebar {
                     let _ = this;
                 },
             );
-            self.search_panel_subscription = Some(sub);
+            self.file_search_panel_subscription = Some(sub);
         }
 
         search_panel.update(cx, |panel, cx| {
@@ -275,7 +271,7 @@ impl MacosSidebar {
     /// 懒创建 Git 提交输入框（需要 Window；在 Git Tab 选中等有窗口的回调中调用）。
     pub fn ensure_git_commit_editor(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
         self.ensure_git_panel(cx);
-        self.ensure_search_panel(cx);
+        self.ensure_file_search_panel(cx);
         if let Some(ref panel) = self.git_panel {
             panel.update(cx, |p, cx| p.ensure_commit_editor(window, cx));
         }
@@ -314,7 +310,7 @@ impl MacosSidebar {
                     self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
                     self.file_tree_target_label = Some(display_name);
                     self.ensure_git_panel(cx);
-        self.ensure_search_panel(cx);
+                    self.ensure_file_search_panel(cx);
 
                     // 文件树 key 发生变化时才触发编辑器状态保存/恢复
                     let new_key = crate::editor::FileTreeKey::new(
@@ -384,7 +380,7 @@ impl MacosSidebar {
         self.current_view = SidebarView::FileTree;
 
         self.ensure_git_panel(cx);
-        self.ensure_search_panel(cx);
+        self.ensure_file_search_panel(cx);
 
         // 触发编辑器状态保存/恢复
         let new_key = crate::editor::FileTreeKey::new(path, is_local, ssh_config);
@@ -475,7 +471,7 @@ impl MacosSidebar {
                 file_tree_content.into_any_element()
             }
             FileTreePanel::Search => {
-                if let Some(ref search_panel) = self.search_panel {
+                if let Some(ref search_panel) = self.file_search_panel {
                     div()
                         .w_full()
                         .h_full()
@@ -561,8 +557,15 @@ impl MacosSidebar {
                             // 同时懒创建提交输入框（需要 Window）。
                             if panel_clone == FileTreePanel::Git {
                                 this.ensure_git_panel(cx);
-                    this.ensure_search_panel(cx);
                                 this.ensure_git_commit_editor(window, cx);
+                            }
+                            // 切到搜索标签：确保面板已创建，并把焦点交给查询框
+                            // （点击标签后直接开始输入是这里的预期交互）。
+                            if panel_clone == FileTreePanel::Search {
+                                this.ensure_file_search_panel(cx);
+                                if let Some(panel) = this.file_search_panel.clone() {
+                                    panel.update(cx, |panel, cx| panel.request_focus(cx));
+                                }
                             }
                             cx.notify();
                             this.notify_app_window(cx);
