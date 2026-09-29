@@ -503,7 +503,7 @@ pub struct TerminalView {
     ///
     /// 与行缓存 / Kitty 缓存同处视图上：元素是每帧新建的临时对象，
     /// 弹簧必须跨帧存活才有意义。元素在 prepaint 里借它推进一帧。
-    pub cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator,
+    pub cursor_animator: crate::components::cursor_animation::CursorAnimator,
     // ── Scrollbar thumb animation ───────────────────────────────────────────
     /// Current animated thumb Y offset (relative to track top).
     pub scrollbar_thumb_y: Pixels,
@@ -976,7 +976,7 @@ impl TerminalView {
             scratch_dirty_row_bounds: Vec::new(),
             kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
             kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
-            cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator::new(),
+            cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             scrollbar_thumb_y: px(0.0),
             scrollbar_target_y: px(0.0),
             scrollbar_anim_from_y: px(0.0),
@@ -1234,7 +1234,7 @@ impl TerminalView {
                 scratch_dirty_row_bounds: Vec::new(),
                 kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
                 kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
-                cursor_animator: crate::terminal_view::cursor_animation::CursorAnimator::new(),
+                cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
                 scrollbar_thumb_y: px(0.0),
                 scrollbar_target_y: px(0.0),
                 scrollbar_anim_from_y: px(0.0),

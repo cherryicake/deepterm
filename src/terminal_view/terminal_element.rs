@@ -4,7 +4,7 @@ use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
-use crate::terminal_view::cursor_animation::{CursorQuad, CursorShape, CursorTarget};
+use crate::components::cursor_animation::{CursorQuad, CursorShape, CursorTarget};
 use crate::terminal_view::terminal_view::TerminalView;
 use crate::theme::{ActiveTheme, TerminalTheme};
 #[cfg(test)]
@@ -1945,7 +1945,11 @@ impl Element for TerminalElement {
                 ),
                 // beam / underline 的粗细取「单格」比例，与 cell 是否加宽无关。
                 shape_span: (cell_width.as_f32(), line_height.as_f32()),
-                display_offset: display_offset as i32,
+                // 终端只有纵向滚动；换算成像素偏移交给动画器做平移。
+                scroll_offset: Point::new(
+                    0.0,
+                    line_height.as_f32() * display_offset as f32,
+                ),
                 shape: overlay_cursor_shape,
                 cell_percentage: overlay_cell_percentage,
                 metrics: (cell_width, line_height),
@@ -1963,7 +1967,11 @@ impl Element for TerminalElement {
                 destination: Point::new(x.as_f32(), y.as_f32()),
                 cell: (cell_width.as_f32(), line_height.as_f32()),
                 shape_span: (cell_width.as_f32(), line_height.as_f32()),
-                display_offset: display_offset as i32,
+                // 终端只有纵向滚动；换算成像素偏移交给动画器做平移。
+                scroll_offset: Point::new(
+                    0.0,
+                    line_height.as_f32() * display_offset as f32,
+                ),
                 shape: overlay.cursor_shape,
                 cell_percentage: overlay_cell_percentage,
                 metrics: (cell_width, line_height),
@@ -3142,6 +3150,6 @@ mod tests {
 }
 
 /// 光标四边形的静止宽度（右缘 − 左缘）。
-fn origin_width(quad: &crate::terminal_view::cursor_animation::CursorQuad) -> f32 {
+fn origin_width(quad: &crate::components::cursor_animation::CursorQuad) -> f32 {
     quad.corners[1].0 - quad.corners[0].0
 }

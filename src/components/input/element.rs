@@ -2192,10 +2192,16 @@ pub(crate) struct PrepaintState {
 }
 
 impl PrepaintState {
-    /// Returns cursor layout adjusted for scroll offset, if available.
+    /// 把光标折成「屏幕坐标」。
+    ///
+    /// 有动画四边形时它**已经是屏幕坐标**（动画目标即屏幕位置，滚动由
+    /// 动画器内部平移吸收），不能再叠加滚动偏移；无动画时按原有约定
+    /// 补 y 方向滚动（x 已含在 origin 里）。
     fn cursor_bounds_with_scroll(&self) -> Option<CursorLayout> {
         self.cursor_bounds.clone().map(|mut layout| {
-            layout.shift_y(self.cursor_scroll_offset.y);
+            if !layout.has_quad() {
+                layout.shift_y(self.cursor_scroll_offset.y);
+            }
             layout
         })
     }
@@ -2322,6 +2328,7 @@ impl Element for TextElement {
 
         let input_bounds = bounds; // 未滚动的元素 bounds（sticky scroll 锚定用）
         let mut bounds = bounds;
+
         let wrap_width = if multi_line && state.soft_wrap {
             Some(bounds.size.width - line_number_width - RIGHT_MARGIN)
         } else {
@@ -2615,6 +2622,83 @@ impl Element for TextElement {
             self.layout_cursor(&last_layout, &fold_placeholders, &mut bounds, window, cx);
         last_layout.cursor_bounds = cursor_bounds.clone().map(|layout| layout.bounding_rect());
 
+        // ── 光标弹簧动画 ────────────────────────────────────────────────────
+        // 推进四角弹簧（位置平滑 + 形状 morph），把结果四边形挂到 cursor_bounds。
+        // 滚动不算移动：这里把滚动偏移单独传给动画器，它会把四角与目标一起
+        // 平移，光标钉在内容上、不产生动画。
+        let cursor_bounds = cursor_bounds.map(|layout| {
+            let shape: crate::components::cursor_animation::CursorShape =
+                layout.shape().into();
+            // 形状基准尺寸：Bar 用固定宽度、Underline 用固定高度（编辑器两者
+            // 都与字号无关），Block/Hollow 用整块宽高。`cell` 决定 Block 宽度，
+            // `shape_span` 决定 beam/underline 的粗细比例，两者在编辑器里相同。
+            let block_w = layout.block_width().as_f32();
+            let line_h = layout.line_height().as_f32();
+            let (span_w, span_h) = match layout.shape() {
+                CursorShape::Bar => (block_w.max(1.0), line_h),
+                _ => (block_w, line_h),
+            };
+            let cell_percentage = match layout.shape() {
+                CursorShape::Bar => (CURSOR_WIDTH.as_f32() / span_w).clamp(0.0, 1.0),
+                CursorShape::Underline => (2.0 / span_h).clamp(0.0, 1.0),
+                _ => 1.0,
+            };
+            let origin = layout.origin();
+            // ── 坐标空间（与 neovide 一致：目标即屏幕坐标） ────────────────
+            // `layout_cursor` 产出的 origin.x 含横向滚动、y 不含；这里补齐 y，
+            // 得到完整的屏幕坐标。滚动时 `scroll_offset` 会变化，动画器把
+            // 「四角 + 静止目标」一起平移，所以滚动不算移动、不产生动画。
+            let screen_x = origin.x;
+            let screen_y = origin.y + cursor_scroll_offset.y;
+            let target = crate::components::cursor_animation::CursorTarget {
+                destination: point(screen_x.as_f32(), screen_y.as_f32()),
+                cell: (block_w, line_h),
+                shape_span: (span_w, span_h),
+                scroll_offset: point(
+                    cursor_scroll_offset.x.as_f32(),
+                    cursor_scroll_offset.y.as_f32(),
+                ),
+                shape,
+                cell_percentage,
+                metrics: (layout.block_width(), layout.line_height()),
+                // 用**未滚动的**元素 bounds：`bounds` 在 layout_cursor 里
+                // 已被 `+= scroll_offset`，滚动时它跟着变，会被误判成
+                // 「布局变化」而触发瞬移（光标本该跟着内容走）。
+                layout_origin: point(input_bounds.left(), input_bounds.top()),
+            };
+            let now = cx.background_executor().now();
+            let reduce_motion = cx.reduce_motion();
+            let (quad, animating) = self.state.update(cx, |state, _cx| {
+                if reduce_motion {
+                    state.cursor_animator.reset();
+                }
+                let quad = state.cursor_animator.step(Some(target), now);
+                (quad, state.cursor_animator.is_animating())
+            });
+            // 仍在运动 → 请求下一帧（走平台帧源，与 vsync 对齐）。
+            if animating {
+                let state_id = self.state.entity_id();
+                window.on_next_frame(move |_, cx| cx.notify(state_id));
+            }
+            match quad {
+                Some(quad) => layout.with_quad(quad),
+                None => layout,
+            }
+        });
+
+        // 闪烁淡入淡出窗口内需要连续帧：与光标动画同一套「按需续帧」约定。
+        // 相位中间 `needs_repaint()` 为 false，静止即停，不会让渲染循环空转。
+        if self
+            .state
+            .read(cx)
+            .blink_cursor
+            .read(cx)
+            .needs_repaint()
+        {
+            let state_id = self.state.entity_id();
+            window.on_next_frame(move |_, cx| cx.notify(state_id));
+        }
+
         // Pills are positioned where the header lines are painted, so this
         // must run after the cursor layout has scrolled `bounds`.
         self.layout_fold_placeholder_bounds(
@@ -2786,7 +2870,10 @@ impl Element for TextElement {
         let scrollbar_dragging = state.scrollbar_drag.is_some();
         let scrollbar_scroll_y = (-state.scroll_handle.offset().y).max(px(0.));
         let focus_handle = state.focus_handle.clone();
-        let show_cursor = state.show_cursor(window, cx);
+        // 光标绘制条件与不透明度提前取出（同上：后面要用 `&mut cx` 绘制）。
+        // `should_paint_cursor` 覆盖「淡入窗口内 visible() 仍为 false」的情况。
+        let paint_cursor = state.should_paint_cursor(window, cx);
+        let cursor_opacity = state.cursor_opacity(window, cx);
         let focused = focus_handle.is_focused(window);
         let bounds = prepaint.bounds;
         let selected_range = state.selected_range;
@@ -2985,7 +3072,7 @@ impl Element for TextElement {
             && !state.masked
             && state.text.len() > 0
         {
-            // 层级宽度跟随缩进配置（`TabSize`，默认硬 Tab / 4 列），而不是
+            // 层级宽度跟随缩进配置（`TabSize`，默认 4 空格），而不是
             // 写死常量 —— 否则把缩进切成 2 空格后参考线仍按 4 列画。
             let indent_size = state.indent_width();
             let style = window.text_style();
@@ -3009,9 +3096,10 @@ impl Element for TextElement {
                 )
                 .width;
             if space_width > px(0.) {
-                // Tab 的真实推进宽度：默认缩进单元就是 `"\t"`（`TabSize::HARD_TABS`），
-                // 若字体给 Tab 的推进量不等于 `indent_size` 个空格，按空格宽度
-                // 线性外推算出来的参考线 x 就会与正文整体错位。
+                // Tab 的真实推进宽度：默认缩进单元已是 4 空格，但打开的历史
+                // 文件里仍可能有 Tab 缩进；若字体给 Tab 的推进量不等于
+                // `indent_size` 个空格，按空格宽度线性外推算出来的参考线 x
+                // 就会与正文整体错位。
                 let tab_width = window
                     .text_system()
                     .shape_line(
@@ -3238,13 +3326,14 @@ impl Element for TextElement {
                         &[]
                     };
                     for level in 1..=count {
-                        let visible_column = (level - 1) * indent_size + 1;
+                        // 与 Zed 一致：第 k 层参考线画在缩进单元的起始列
+                        // （0、indent_size、2*indent_size…，即
+                        // `single_indent_width * depth`），不偏移。
+                        let visible_column = (level - 1) * indent_size;
                         // 优先用实测推进量；层级超出缩进前缀（窗口边缘的
                         // 空行插值）时退回按空格宽度外推。外推基准是
-                        // `visible_column` 本身——实测值恰好是
-                        // `space_width * visible_column`（第 1 层参考线在
-                        // 0 起第 1 列，即块左缘右移一格），此前多减了 1，
-                        // 空行上的参考线整体左移一个空格宽。
+                        // `visible_column` 本身——列 0 处 x 为 0，空格缩进
+                        // 时实测值恰好是 `space_width * visible_column`。
                         let offset = match xs.get(level - 1) {
                             Some(x) => *x,
                             None => space_width * visible_column as f32,
@@ -3354,9 +3443,14 @@ impl Element for TextElement {
         }
 
         // Paint blinking cursor (Zed `CursorLayout::paint` + VSCode cursorStyle).
-        if focused && show_cursor {
+        // 闪烁不透明度由 `cursor_opacity` 给出（相位末尾淡出/淡入）；透明度
+        // 为 0 时跳过绘制，避免画一个全透明的光标。
+        //
+        // 用 `should_paint_cursor` 而非 `show_cursor`：淡入窗口内 `visible()`
+        // 仍为 false，但透明度已大于 0，必须绘制才不会「到点突然出现」。
+        if paint_cursor && cursor_opacity > 0.0 {
             if let Some(mut cursor_layout) = prepaint.cursor_bounds_with_scroll() {
-                cursor_layout.paint(window, cx);
+                cursor_layout.paint_with_opacity(cursor_opacity, window, cx);
             }
         }
 
@@ -3836,21 +3930,25 @@ pub(super) fn runs_for_range(
     result
 }
 
-/// 一行缩进前缀的参考线实测 x 坐标（相对正文左缘）：第 k 项 = 第 k 层
-/// 参考线的 x。
+/// 一行缩进前缀的参考线 x 坐标（相对正文左缘）：第 k 项 = 第 k 层
+/// 参考线的 x，即列 `k * indent_size` 处的实测位置。
 ///
-/// 层级规则与 `visible_column = (level-1) * indent_size + 1` 一致：第 k 层
-/// 参考线落在 0 起第 `(k-1) * indent_size + 1` 列（块左缘右移一格），Tab
-/// 向上取整到 `indent_size` 的倍数、x 用 Tab 字形的真实推进量。空格缩进
-/// 时恒有 `xs[k-1] == space_width * ((k-1) * indent_size + 1)`，这是空行
-/// 插值回退公式的对齐基准。
+/// 与 Zed 一致：参考线画在缩进单元的**起始列**（0、indent_size、
+/// 2*indent_size…，Zed 里是 `single_indent_width * depth`，depth 从 0 起），
+/// 不再右移一格。空格缩进时恒有 `xs[k] == space_width * (k * indent_size)`，
+/// 这是空行插值回退公式的对齐基准。
+///
+/// 层级起点列一定落在字符边界上（空格逐列推进、Tab 落在 `indent_size`
+/// 的倍数上），所以每个起点都能拿到该列的精确 x；返回值可能比该行的
+/// 层数（`ceil(前缀列数 / indent_size)`）多一项——多出的是前缀终点，
+/// 绘制时按层数取用，不会读到。
 pub(super) fn measure_guide_xs(
     line: &str,
     indent_size: usize,
     space_width: Pixels,
     tab_width: Pixels,
 ) -> Vec<Pixels> {
-    let mut out = Vec::new();
+    let mut out: Vec<Pixels> = Vec::new();
     let mut cols = 0usize;
     let mut width = px(0.);
     for ch in line.chars() {
@@ -3865,9 +3963,13 @@ pub(super) fn measure_guide_xs(
             }
             _ => break,
         }
-        // Tab 与制表位、参考线层级都是 `indent_size` 的倍数，
-        // 所以层级边界一定落在某个字符之后。
-        while out.len() * indent_size < cols {
+        // 第 0 层：列 0，x 恒为 0（行首一旦有缩进前缀就存在）。
+        if out.is_empty() && cols > 0 {
+            out.push(px(0.));
+        }
+        // 本轮字符刚好落在 `out.len() * indent_size` 列上：补上该层级起点。
+        // Tab 跳到的是上一个 `indent_size` 倍数，不会越过任何起点列。
+        if out.len() * indent_size == cols {
             out.push(width);
         }
     }
@@ -3877,19 +3979,24 @@ pub(super) fn measure_guide_xs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::prelude::*;
+    use std::time::Duration;
 
     #[test]
     fn measure_guide_xs_pure_spaces_matches_fallback_formula() {
         let s = px(8.);
         let t = px(32.);
-        // 4 空格缩进：第 1 层参考线在第 1 列
-        assert_eq!(measure_guide_xs("    x", 4, s, t), vec![s * 1.]);
-        // 8 空格：第 1 层在第 1 列、第 2 层在第 5 列
-        assert_eq!(measure_guide_xs("        x", 4, s, t), vec![s * 1., s * 5.]);
-        // 5 空格（不成层级的前缀）：仍产出 2 层，第 2 层落在第 5 列
-        assert_eq!(measure_guide_xs("     x", 4, s, t), vec![s * 1., s * 5.]);
-        // 不足一级缩进（3 空格）：只有第 1 层
-        assert_eq!(measure_guide_xs("   x", 4, s, t), vec![s * 1.]);
+        // 4 空格：第 1 层在列 0（x=0）；第 2 项是前缀终点，层数为 1 时读不到
+        assert_eq!(measure_guide_xs("    x", 4, s, t), vec![px(0.), s * 4.]);
+        // 8 空格：第 1 层在列 0、第 2 层在列 4（前缀终点列 8 只作余量）
+        assert_eq!(
+            measure_guide_xs("        x", 4, s, t),
+            vec![px(0.), s * 4., s * 8.]
+        );
+        // 5 空格（不成整级的前缀）：层数 ceil(5/4)=2，读到列 0 与列 4
+        assert_eq!(measure_guide_xs("     x", 4, s, t), vec![px(0.), s * 4.]);
+        // 不足一级缩进（3 空格）：层数 1，只有列 0
+        assert_eq!(measure_guide_xs("   x", 4, s, t), vec![px(0.)]);
         // 顶格行：无参考线
         assert!(measure_guide_xs("x", 4, s, t).is_empty());
     }
@@ -3898,13 +4005,194 @@ mod tests {
     fn measure_guide_xs_tabs_use_tab_advance() {
         let s = px(8.);
         let t = px(32.);
-        // 两个 Tab：第 1 层在 Tab 推进量处（列 4），第 2 层在两个 Tab 处
-        assert_eq!(measure_guide_xs("\t\tx", 4, s, t), vec![t, t * 2.]);
-        // Tab + 2 空格（混合缩进）：第 2 层 = Tab 推进 + 1 个空格
-        assert_eq!(measure_guide_xs("\t  x", 4, s, t), vec![t, t + s]);
-        // Tab + 4 空格（混合缩进）：层级边界仍按列规则 `(k-1)*indent+1`，
-        // 第 2 层在列 5 = Tab 推进 + 1 个空格（与纯空格行的列位一致）
-        assert_eq!(measure_guide_xs("\t    x", 4, s, t), vec![t, t + s]);
+        // 两个 Tab：列 0 → 0，列 4 → 第一个 Tab 的推进量，列 8 → 两个 Tab
+        assert_eq!(
+            measure_guide_xs("\t\tx", 4, s, t),
+            vec![px(0.), t, t * 2.]
+        );
+        // Tab + 2 空格（6 列）：层数 2，列 4 落在 Tab 终点
+        assert_eq!(measure_guide_xs("\t  x", 4, s, t), vec![px(0.), t]);
+        // Tab + 4 空格（8 列）：层数 2，列 4 = Tab 终点；列 8 为余量
+        assert_eq!(
+            measure_guide_xs("\t    x", 4, s, t),
+            vec![px(0.), t, t + s * 4.]
+        );
+        // 单 Tab：层数 1，读到列 0
+        assert_eq!(measure_guide_xs("\tx", 4, s, t), vec![px(0.), t]);
+    }
+
+    // ── 编辑器光标动画（端到端） ──────────────────────────────────────────
+
+    /// 通过真实的 `TextElement` prepaint/paint 驱动，验证：
+    /// 1. 首帧光标直接就位（不从中途飞入）；
+    /// 2. 光标移动产生动画，四边形落在起止之间；
+    /// 3. 动画收敛后精确落在新位置。
+    #[gpui::test]
+    fn cursor_animation_through_text_element(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::{AppContext as _, VisualTestContext};
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                s.set_text("hello world", cx);
+                s
+            });
+            Host { state }
+        });
+
+        let state = host.read_with(cx, |h, _| h.state.clone());
+        let bounds = size(px(600.0), px(200.0));
+
+        let draw = |cx: &mut VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            cx.draw(point(px(0.0), px(0.0)), bounds, |_, _| {
+                // 用固定尺寸容器包一层：生产里 TextElement 由 `relative(1.)`
+                // 撑满父容器，而 `cx.draw` 直接布局元素时会按内容 auto 尺寸
+                // 来回解析，导致 bounds 在帧间抖动。
+                TextElement::new(state.clone())
+            })
+        };
+
+        // 首帧就位。
+        draw(cx, Duration::from_millis(16));
+        assert!(
+            !state.read_with(cx, |s, _| s.cursor_animator.is_animating()),
+            "首帧不应处于动画中"
+        );
+
+        // 光标右移（End 键）：应起动画。
+        state.update_in(cx, |state, window, cx| {
+            state.move_to_end(&crate::components::input::MoveToEnd, window, cx);
+        });
+        draw(cx, Duration::from_millis(16));
+        assert!(
+            state.read_with(cx, |s, _| s.cursor_animator.is_animating()),
+            "光标移动应产生动画"
+        );
+
+        // 推进到收敛。
+        for _ in 0..200 {
+            if !state.read_with(cx, |s, _| s.cursor_animator.is_animating()) {
+                break;
+            }
+            draw(cx, Duration::from_millis(16));
+        }
+        assert!(
+            !state.read_with(cx, |s, _| s.cursor_animator.is_animating()),
+            "动画应收敛"
+        );
+    }
+
+    /// 滚动不应产生光标动画（滚动是内容平移，不是光标移动）。
+    #[gpui::test]
+    fn scroll_does_not_animate_cursor(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::{AppContext as _, VisualTestContext};
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                // 内容要足够长，否则滚动会被钳制到 0（测不到滚动通道）。
+                let long: String = (0..60)
+                    .map(|i| format!("line {i}\n"))
+                    .collect();
+                s.set_text(&long, cx);
+                s
+            });
+            Host { state }
+        });
+
+        let state = host.read_with(cx, |h, _| h.state.clone());
+        let bounds = size(px(600.0), px(200.0));
+
+        let draw = |cx: &mut VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            cx.draw(point(px(0.0), px(0.0)), bounds, |_, _| {
+                // 用固定尺寸容器包一层：生产里 TextElement 由 `relative(1.)`
+                // 撑满父容器，而 `cx.draw` 直接布局元素时会按内容 auto 尺寸
+                // 来回解析，导致 bounds 在帧间抖动。
+                TextElement::new(state.clone())
+            })
+        };
+
+        // 就位并收敛。
+        draw(cx, Duration::from_millis(16));
+        for _ in 0..50 {
+            if !state.read_with(cx, |s, _| s.cursor_animator.is_animating()) {
+                break;
+            }
+            draw(cx, Duration::from_millis(16));
+        }
+
+        // 记录滚动前光标的**绘制位置**（内容坐标 + 滚动）。
+        let quad_before = state.read_with(cx, |s, _| s.cursor_animator.last_quad());
+
+        // 只滚动，不移动光标。
+        state.update_in(cx, |state, _window, cx| {
+            state.scroll_handle.set_offset(point(px(0.0), px(-40.0)));
+            cx.notify();
+        });
+        draw(cx, Duration::from_millis(16));
+        assert!(
+            !state.read_with(cx, |s, _| s.cursor_animator.is_animating()),
+            "滚动不应产生光标动画（光标应钉在内容上）"
+        );
+
+        // 滚动量必须真的被动画器看到：四边形应整体上移 40px。
+        let quad_after = state.read_with(cx, |s, _| s.cursor_animator.last_quad());
+        match (quad_before, quad_after) {
+            (Some(before), Some(after)) => {
+                let dy = after.corners[0].1 - before.corners[0].1;
+                assert!(
+                    (dy - (-40.0)).abs() < 1.0,
+                    "滚动应把光标整体平移 -40px，实际 {dy}（before={:?} after={:?}）",
+                    before.corners[0],
+                    after.corners[0]
+                );
+            }
+            other => panic!("两侧都应有四边形: {other:?}"),
+        }
     }
 }
 

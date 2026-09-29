@@ -227,6 +227,18 @@ impl Corner {
         animating
     }
 
+    /// 整体平移本角（滚动同步，neovide `corner.current_position += scroll_delta`）。
+    ///
+    /// 调用方必须同时平移 `destination`（滚动已折入其中），这样
+    /// `corner_destination` 与本角一起移动、弹簧剩余位移不变，
+    /// 于是「滚动」不会被误判成「移动」而触发动画。
+    fn shift(&mut self, delta: Point<f32>) {
+        self.current_position.x += delta.x;
+        self.current_position.y += delta.y;
+        self.previous_destination.x += delta.x;
+        self.previous_destination.y += delta.y;
+    }
+
     /// 与 neovide `Corner::jump` 等价：按跳变距离与对齐度决定本角时长。
     fn jump(&mut self, destination: Point<f32>, cell: (f32, f32), alignment: f32, trail_size: f32) {
         let corner_destination = self.destination(destination, cell);
@@ -286,11 +298,15 @@ pub struct CursorTarget {
     /// beam / underline 的粗细按它的比例算——宽字符下 beam 不应变粗，
     /// 与 neovide 只在 Block 上翻倍 `cursor_width` 的行为一致。
     pub shape_span: (f32, f32),
-    /// 本帧 `display_offset`。
+    /// 本帧的滚动偏移（像素，内容相对视口平移的量）。
     ///
     /// 与上一帧不同即视为「滚动」：四角与静止目标一起平移，不产生动画
     /// （对应 neovide `update_cursor_destination` 的 `scroll_delta`）。
-    pub display_offset: i32,
+    ///
+    /// 终端传 `(0, line_height * display_offset)`；编辑器传滚动句柄的
+    /// 当前偏移（横向 + 纵向）。`destination` 里已含该偏移，所以滚动时
+    /// 两者一起平移、差值不变 → 光标钉在内容上。
+    pub scroll_offset: Point<f32>,
     pub shape: CursorShape,
     /// 形状宽度比例（`cell_percentage`，0..1），beam / underline 用。
     pub cell_percentage: f32,
@@ -335,7 +351,8 @@ pub struct CursorAnimator {
     destination: Option<Point<f32>>,
     /// 上一次的静止目标，用于计算位移（neovide `previous_destination`）。
     previous_destination: Point<f32>,
-    last_offset: i32,
+    /// 上一帧的滚动偏移，用于算滚动位移（滚动不算移动，不产生动画）。
+    last_scroll_offset: Point<f32>,
     last_shape: Option<CursorShape>,
     last_cell_percentage: f32,
     last_metrics: Option<(Pixels, Pixels)>,
@@ -344,6 +361,9 @@ pub struct CursorAnimator {
     jumped: bool,
     last_step: Option<Instant>,
     animating: bool,
+    /// 最近一帧的四边形（测试断言用；生产不读）。
+    #[cfg(test)]
+    last_quad: Option<CursorQuad>,
 }
 
 impl Default for CursorAnimator {
@@ -358,7 +378,7 @@ impl CursorAnimator {
             corners: [Corner::default(); 4],
             destination: None,
             previous_destination: Point::new(0.0, 0.0),
-            last_offset: 0,
+            last_scroll_offset: Point::new(0.0, 0.0),
             last_shape: None,
             last_cell_percentage: 1.0,
             last_metrics: None,
@@ -366,12 +386,20 @@ impl CursorAnimator {
             jumped: false,
             last_step: None,
             animating: false,
+            #[cfg(test)]
+            last_quad: None,
         }
     }
 
     /// 是否仍在运动（供上层决定要不要请求下一帧）。
     pub fn is_animating(&self) -> bool {
         self.animating
+    }
+
+    /// 最近一帧的四边形（测试用：断言滚动平移量等）。
+    #[cfg(test)]
+    pub fn last_quad(&self) -> Option<CursorQuad> {
+        self.last_quad
     }
 
     /// 丢弃全部动画状态：下一次 [`Self::step`] 会直接就位。
@@ -381,11 +409,16 @@ impl CursorAnimator {
         self.corners = [Corner::default(); 4];
         self.destination = None;
         self.previous_destination = Point::new(0.0, 0.0);
+        self.last_scroll_offset = Point::new(0.0, 0.0);
         self.last_shape = None;
         self.last_metrics = None;
         self.last_layout_origin = None;
         self.jumped = false;
         self.animating = false;
+        #[cfg(test)]
+        {
+            self.last_quad = None;
+        }
     }
 
     /// 推进一帧，返回本帧应绘制的四边形（四角）。
@@ -417,16 +450,24 @@ impl CursorAnimator {
             raw_dt.min(START_FRAME_STEP)
         };
 
-        // ── 滚动：把四角与静止目标一起平移（neovide `update_cursor_destination`）。
-        // `display_offset` 变化只改视口行号，绝对网格坐标没变——所以这不是
-        // 「移动」，不产生动画，光标钉在网格上。
-        if self.last_offset != target.display_offset {
-            let dy = target.metrics.1.as_f32() * (target.display_offset - self.last_offset) as f32;
+        // ── 滚动：把四角与「上一帧目标」一起平移
+        // （neovide `update_cursor_destination` 的 scroll_delta 处理）。
+        //
+        // 滚动只是内容整体平移，光标相对内容没动——所以这不是「移动」，
+        // 不产生动画。做法：把四角与 `previous_destination` 平移同样的量，
+        // 于是下面算出的 `motion` 不含滚动分量（`jumped` 不置位），
+        // 而 `destination` 本身已含滚动，光标因此钉在内容上。
+        if target.scroll_offset != self.last_scroll_offset {
+            let delta = Point::new(
+                target.scroll_offset.x - self.last_scroll_offset.x,
+                target.scroll_offset.y - self.last_scroll_offset.y,
+            );
             for corner in self.corners.iter_mut() {
-                corner.current_position.y += dy;
-                corner.previous_destination.y += dy;
+                corner.shift(delta);
             }
-            self.previous_destination.y += dy;
+            self.previous_destination.x += delta.x;
+            self.previous_destination.y += delta.y;
+            self.last_scroll_offset = target.scroll_offset;
         }
 
         let destination = Point::new(target.destination.x, target.destination.y);
@@ -470,7 +511,6 @@ impl CursorAnimator {
         }
         self.previous_destination = destination;
         self.destination = Some(destination);
-        self.last_offset = target.display_offset;
         self.last_metrics = Some(target.metrics);
         self.last_layout_origin = Some(target.layout_origin);
 
@@ -511,10 +551,15 @@ impl CursorAnimator {
 
         self.jumped = false;
         self.animating = animating;
-        Some(CursorQuad {
+        let quad = CursorQuad {
             corners,
             destination,
-        })
+        };
+        #[cfg(test)]
+        {
+            self.last_quad = Some(quad);
+        }
+        Some(quad)
     }
 
     /// 本帧距上一帧的时长（秒），首次为 0。
@@ -655,14 +700,14 @@ mod tests {
         destination: (f32, f32),
         cell: (f32, f32),
         _grid: (i32, i32),
-        display_offset: i32,
+        scroll_rows: i32,
         shape: CursorShape,
     ) -> CursorTarget {
         CursorTarget {
             destination: Point::new(destination.0, destination.1),
             cell,
             shape_span: cell,
-            display_offset,
+            scroll_offset: Point::new(0.0, cell.1 * scroll_rows as f32),
             shape,
             cell_percentage: 0.125,
             metrics: (px(10.0), px(20.0)),
@@ -891,7 +936,7 @@ mod tests {
             destination: Point::new(destination.0, destination.1),
             cell,
             shape_span,
-            display_offset: 0,
+            scroll_offset: Point::new(0.0, 0.0),
             shape,
             cell_percentage: 0.15,
             metrics: (px(cell.0), px(cell.1)),
